@@ -127,6 +127,95 @@ export function pathArguments(args: unknown): string[] {
   return out;
 }
 
+function unquote(value: string): string {
+  const first = value[0];
+  return value.length >= 2 && (first === '"' || first === "'") && value.endsWith(first)
+    ? value.slice(1, -1)
+    : value;
+}
+
+/**
+ * Every file a hashline patch names: each `[path#TAG]` section header and each
+ * `MV` destination (grammar: docs/hashline.md). Lines are classified in the
+ * engine parser's order (envelope, header, directive, `+` body row), so every
+ * path the engine would act on is listed. Undefined when the patch cannot be
+ * parsed: the caller must then fail toward asking.
+ */
+export function hashlinePatchPaths(patch: string): string[] | undefined {
+  if (patch.trim().length === 0) return undefined;
+  const paths: string[] = [];
+  let sections = 0;
+  const rows = patch.split("\n");
+  for (let index = 0; index < rows.length; index++) {
+    const raw = rows[index] as string;
+    // A terminal newline leaves one empty last row; it is not a body row.
+    if (raw.length === 0 && index === rows.length - 1) continue;
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    const trimmed = line.trim();
+    if (trimmed === "*** Begin Patch" || trimmed === "*** End Patch") continue;
+    if (trimmed.length >= 2 && trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      const inner = trimmed.slice(1, -1);
+      const hash = inner.indexOf("#");
+      if (hash <= 0) return undefined;
+      paths.push(inner.slice(0, hash));
+      sections++;
+      continue;
+    }
+    const directive = /^(PUT|CUT|REM|MV)(?:\s|$)/.exec(line);
+    if (directive) {
+      if (sections === 0) return undefined;
+      if (directive[1] === "MV") {
+        const destination = line.slice(2).trim();
+        if (destination.length === 0 || /\s/.test(destination)) return undefined;
+        paths.push(unquote(destination));
+      }
+      continue;
+    }
+    if (trimmed.length === 0 && sections === 0) continue;
+    if (sections === 0 || !line.startsWith("+")) return undefined;
+  }
+  return sections > 0 ? paths : undefined;
+}
+
+const APPLY_PATCH_TARGETS = [
+  "*** Add File:",
+  "*** Update File:",
+  "*** Delete File:",
+  "*** Move to:",
+];
+
+/**
+ * Every file an `apply_patch` patch names: `*** Add/Update/Delete File:` and
+ * `*** Move to:` lines, wherever they appear. Undefined when it names none or
+ * a target is empty, so the caller fails toward asking.
+ */
+export function applyPatchPaths(patch: string): string[] | undefined {
+  const paths: string[] = [];
+  for (const raw of patch.split("\n")) {
+    const line = raw.trim();
+    const prefix = APPLY_PATCH_TARGETS.find((candidate) => line.startsWith(candidate));
+    if (prefix === undefined) continue;
+    const path = line.slice(prefix.length).trim();
+    if (path.length === 0) return undefined;
+    paths.push(path);
+  }
+  return paths.length > 0 ? paths : undefined;
+}
+
+/**
+ * The files a call's patch argument names, `[]` when it carries no patch, or
+ * undefined when the patch cannot be parsed.
+ */
+function patchTargets(tool: string, args: unknown): string[] | undefined {
+  if (args === null || typeof args !== "object") return [];
+  const record = args as Record<string, unknown>;
+  if (tool === "apply_patch") {
+    const text = record.patchText ?? record.patch;
+    return typeof text === "string" ? applyPatchPaths(text) : [];
+  }
+  return typeof record.patch === "string" ? hashlinePatchPaths(record.patch) : [];
+}
+
 /**
  * The tier OMP should see for one call of `tool`: `exec` when any path it names
  * is outside `root`, else the tool's own tier. Never throws: OMP calls this
@@ -142,7 +231,12 @@ export function ompCallTier(
   if (natural === "exec" || !root) return natural;
   try {
     const prepared = prepare ? prepare(args) : args;
-    const outside = pathArguments(prepared).some((path) => namesOutsidePath(root, path));
+    const patched = patchTargets(tool, prepared);
+    // A patch the gate cannot read may name any file: fail toward asking.
+    if (patched === undefined) return "exec";
+    const outside = [...pathArguments(prepared), ...patched].some((path) =>
+      namesOutsidePath(root, path),
+    );
     return outside && TIER_RANK.exec > TIER_RANK[natural] ? "exec" : natural;
   } catch {
     // Arguments OMP will reject anyway; the tool's own tier is enough here.

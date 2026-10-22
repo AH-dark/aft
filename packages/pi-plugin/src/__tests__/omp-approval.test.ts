@@ -10,7 +10,7 @@ import type {
 import { Type } from "typebox";
 import type { AftConfig } from "../config.js";
 import { resetRecordedExtensionApi, setHarnessOverrideForTesting } from "../harness.js";
-import { OMP_TOOL_TIERS, type OmpToolTier } from "../omp-approval.js";
+import { OMP_TOOL_TIERS, type OmpToolTier, ompCallTier } from "../omp-approval.js";
 import {
   bindToolRegistrationFunnel,
   registerPiToolSurface,
@@ -246,5 +246,71 @@ describe("OMP outside access end to end", () => {
     expect((outcome.content[0] as { text: string }).text).toBe("notes body");
     expect(confirm).toHaveBeenCalledTimes(1);
     expect(sends[1]?.permissions_granted).toEqual(["outside:notes"]);
+  });
+});
+
+describe("OMP tiers for patch targets", () => {
+  function hashlineEdit() {
+    const config: AftConfig = { disabled_tools: [], edit_mode: "hashline" };
+    const { api, tools } = makeMockApi();
+    const { bridge } = makeMockBridge(() => ({ success: true, text: "ok" }));
+    registerPiToolSurface(
+      api,
+      makePluginContext(bridge, { config, hashlineEffective: true }),
+      resolvePiToolSurface(config),
+      "omp",
+    );
+    const approval = (tools as unknown as Map<string, { approval?: Approval }>).get("edit")
+      ?.approval as (args: unknown) => unknown;
+    return (patch: string) => approval({ patch });
+  }
+
+  test("an MV from a project file to an outside path is exec", () => {
+    const tier = hashlineEdit();
+    expect(tier("[src/a.ts#CAFE]\nMV /elsewhere/a.ts\n")).toBe("exec");
+    expect(tier("*** Begin Patch\n[src/a.ts#CAFE]\nMV '../sibling/a.ts'\n*** End Patch\n")).toBe(
+      "exec",
+    );
+  });
+
+  test("a section editing an outside file is exec", () => {
+    const tier = hashlineEdit();
+    expect(tier("[/elsewhere/a.ts#CAFE]\nPUT 1:\n+x\n")).toBe("exec");
+    // The outside file is the second section, after an in-project one.
+    expect(tier("[src/a.ts#CAFE]\nREM\n[~/notes.md#BEEF]\nCUT 2\n")).toBe("exec");
+  });
+
+  test("an unparseable patch is exec", () => {
+    const tier = hashlineEdit();
+    expect(tier("")).toBe("exec");
+    expect(tier("PUT 1:\n+x\n")).toBe("exec");
+    expect(tier("[src/a.ts]\nPUT 1:\n+x\n")).toBe("exec");
+    expect(tier("[src/a.ts#CAFE]\nPUT 1:\nnot a body row\n")).toBe("exec");
+    expect(tier("[src/a.ts#CAFE]\nMV\n")).toBe("exec");
+    expect(tier("[src/a.ts#CAFE]\nMV two words\n")).toBe("exec");
+  });
+
+  test("an in-project patch stays write", () => {
+    const tier = hashlineEdit();
+    expect(
+      tier(
+        "*** Begin Patch\n[src/a.ts#CAFE]\nPUT >25:\n+inserted\n+\nCUT 13.=14 @fragment\nMV src/b.ts\n[src/c.ts#BEEF]\nPUT $ @fragment\n*** End Patch\n",
+      ),
+    ).toBe("write");
+  });
+
+  test("apply_patch file and move targets are checked the same way", () => {
+    const tier = (patchText: string) => ompCallTier("apply_patch", { patchText }, ROOT);
+    expect(tier("*** Begin Patch\n*** Add File: src/new.ts\n+x\n*** End Patch\n")).toBe("write");
+    expect(tier("*** Begin Patch\n*** Add File: /elsewhere/new.ts\n+x\n*** End Patch\n")).toBe(
+      "exec",
+    );
+    expect(
+      tier(
+        "*** Begin Patch\n*** Update File: src/a.ts\n*** Move to: ../out/a.ts\n@@\n-a\n+b\n*** End Patch\n",
+      ),
+    ).toBe("exec");
+    expect(tier("*** Begin Patch\n*** Delete File: ~/notes.md\n*** End Patch\n")).toBe("exec");
+    expect(tier("not a patch")).toBe("exec");
   });
 });
