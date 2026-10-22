@@ -58,6 +58,7 @@ pub mod ast_grep_hints;
 pub mod ast_grep_lang;
 pub mod backup;
 pub mod bash_background;
+pub(crate) mod bash_changed_files;
 #[cfg(unix)]
 pub(crate) mod bash_db_hints;
 pub(crate) mod bash_env;

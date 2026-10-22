@@ -554,6 +554,11 @@ fn wait_on_finished_delete_gate_for_test(task_id: &str) {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BgCompletion {
+    #[serde(
+        rename = "_bash_changed_files",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub changed_files: Option<crate::bash_changed_files::Report>,
     pub task_id: String,
     /// Intentionally omitted from serialized completion payloads: push frames
     /// carry `session_id` at the BashCompletedFrame envelope level for routing.
@@ -659,6 +664,11 @@ pub(crate) struct RunonLaunchState {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BgTaskSnapshot {
+    #[serde(
+        rename = "_bash_changed_files",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub changed_files: Option<crate::bash_changed_files::Report>,
     #[serde(flatten)]
     pub info: BgTaskInfo,
     pub exit_code: Option<i64>,
@@ -1273,6 +1283,7 @@ impl BashDrainReplyCache {
 }
 
 pub(crate) struct BgTask {
+    changed_files: Option<Arc<crate::bash_changed_files::Capture>>,
     /// Absent after replay: secret values must never be persisted or recovered
     /// from payload files. Completion notices withhold output when this is absent.
     completion_secrets: Mutex<Option<crate::log_redact::SecretValues>>,
@@ -1633,6 +1644,17 @@ fn completion_matches_session(completion: &BgCompletion, session_id: Option<&str
 }
 
 impl BgTaskRegistry {
+    fn changed_files_report(&self, task_id: &str) -> Option<crate::bash_changed_files::Report> {
+        let task = self.task(task_id)?;
+        let mut report = task.changed_files.as_ref()?.finish().clone();
+        self.mask_completion_text(task_id, &mut report.text);
+        for file in &mut report.files {
+            if let Some(diff) = &mut file.diff {
+                self.mask_completion_text(task_id, diff);
+            }
+        }
+        Some(report)
+    }
     /// The watchdog pass cause recorded when `task_id` was first observed
     /// terminal, if the watchdog (rather than a status poll) observed it.
     pub fn completion_pass_cause(&self, task_id: &str) -> Option<WatchdogPassCause> {
@@ -2571,6 +2593,9 @@ impl BgTaskRegistry {
         self.inner.snapshots_built.fetch_add(1, Ordering::Relaxed);
         let mut snapshot = task.snapshot(preview_bytes);
         self.maybe_compress_snapshot(task, &mut snapshot);
+        if snapshot.info.status.is_terminal() {
+            snapshot.changed_files = self.changed_files_report(&task.task_id);
+        }
         if let Ok(state) = task.lock_state() {
             if let Some(note) = rendered_execution_note(&state.metadata) {
                 snapshot.output_preview = format!("{note}\n{}", snapshot.output_preview);
@@ -2705,6 +2730,9 @@ impl BgTaskRegistry {
             }
         };
 
+        if let Some(capture) = &task.changed_files {
+            capture.finish();
+        }
         // The wrapper shell waits for every pipeline member before it exits, so
         // at the terminal transition the only survivors in the task's process
         // group are reparented grandchildren (pool workers a SIGPIPE'd producer
@@ -4298,6 +4326,7 @@ impl BgTaskRegistry {
         }
 
         let task = Arc::new(BgTask {
+            changed_files: crate::bash_changed_files::current(),
             completion_secrets: Mutex::new(Some(completion_secrets.values)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
@@ -4659,6 +4688,7 @@ impl BgTaskRegistry {
 
         let terminal_reader_done = Arc::clone(&runtime.reader_done);
         let task = Arc::new(BgTask {
+            changed_files: crate::bash_changed_files::current(),
             completion_secrets: Mutex::new(Some(completion_secrets.values)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
@@ -4919,6 +4949,7 @@ impl BgTaskRegistry {
         }
 
         let task = Arc::new(BgTask {
+            changed_files: crate::bash_changed_files::current(),
             completion_secrets: Mutex::new(Some(completion_secrets.values)),
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
@@ -9237,6 +9268,7 @@ impl BgTaskRegistry {
                 )
             };
         Some(BgCompletion {
+            changed_files: self.changed_files_report(&metadata.task_id),
             task_id: snapshot.info.task_id,
             session_id: task.session_id.clone(),
             status: snapshot.info.status,
@@ -10412,6 +10444,7 @@ impl BgTaskRegistry {
         #[cfg(test)]
         wait_on_rehydrated_registration_gate_for_test(&task_id);
         let mut task = BgTask {
+            changed_files: None,
             completion_secrets: Mutex::new(
                 metadata
                     .has_safe_completion_redaction_after_restart()
@@ -11523,6 +11556,7 @@ impl BgTaskRegistry {
             render.map(|render| render.output_preview.as_str()),
         );
         let completion = BgCompletion {
+            changed_files: self.changed_files_report(&metadata.task_id),
             task_id: metadata.task_id.clone(),
             session_id: metadata.session_id.clone(),
             status: metadata.status.clone(),
@@ -11925,6 +11959,7 @@ impl BgTaskRegistry {
             completion.tokens_skipped,
         );
         frame.bash_output_list_envelope = completion.bash_output_list_envelope;
+        frame.changed_files = completion.changed_files;
         frame.status_reason = completion.status_reason;
         frame.output_incomplete = completion.output_incomplete;
         frame.live_descendants = completion.live_descendants;
@@ -13848,6 +13883,7 @@ fn terminal_metadata_snapshot(metadata: PersistedTask) -> BgTaskSnapshot {
         .map(|r| r.accepted);
     let remote_job_id = remote_job_id(&metadata);
     BgTaskSnapshot {
+        changed_files: None,
         info: BgTaskInfo {
             task_id: metadata.task_id,
             status: metadata.status,
@@ -14008,6 +14044,7 @@ impl BgTask {
             state.buffer.read_tail(preview_bytes)
         };
         BgTaskSnapshot {
+            changed_files: None,
             info: BgTaskInfo {
                 task_id: self.task_id.clone(),
                 status: if !metadata.is_terminal()
@@ -14146,6 +14183,9 @@ impl BgTask {
     }
 
     fn mark_terminal_now(&self) {
+        if let Some(capture) = &self.changed_files {
+            capture.seal();
+        }
         if let Ok(mut terminal_at) = self.terminal_at.lock() {
             if terminal_at.is_none() {
                 *terminal_at = Some(Instant::now());
@@ -15155,6 +15195,7 @@ mod tests {
             .lock()
             .unwrap()
             .push_back(BgCompletion {
+                changed_files: None,
                 task_id: "bash-memory".to_string(),
                 session_id: "session-memory".to_string(),
                 status: BgTaskStatus::Completed,

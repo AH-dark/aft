@@ -730,9 +730,20 @@ pub struct RemoteExecConfig {
     pub project_off: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BashChangedFiles {
+    #[default]
+    Off,
+    List,
+    Diff,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BashConfig {
+    /// Optional watcher-based reporting after shell commands. Disabled by default.
+    pub changed_files: BashChangedFiles,
     /// Runtime gate for every bash-execution operation, including the
     /// background companions. When false those operations report
     /// `bash_disabled`; registration is decided by `disabled_tools` alone.
@@ -778,6 +789,7 @@ pub struct BashConfig {
 impl Default for BashConfig {
     fn default() -> Self {
         Self {
+            changed_files: BashChangedFiles::Off,
             enabled: true,
             host_fallback: false,
             runon_enabled: false,

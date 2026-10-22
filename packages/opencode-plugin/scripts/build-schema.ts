@@ -427,6 +427,13 @@ function buildSchema(): Record<string, unknown> {
                 description:
                   "Detach a `wait: true` bash call when a new user message arrives. Default true. Set false to keep the wait blocking; a message containing the literal `&detach` still forces detachment, the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Project-safe.",
               },
+              changed_files: {
+                type: "string",
+                enum: ["off", "list", "diff"],
+                default: "off",
+                description:
+                  "Report watcher-observed project changes after bash commands. User opt-in; projects may only set off. Diff mode uses clean git before-images and bounded output.",
+              },
               db_schema_hints: {
                 type: "boolean",
                 default: true,

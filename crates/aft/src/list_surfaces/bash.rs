@@ -156,3 +156,28 @@ pub fn produce_bash_reply_data(
     attach_bash_output_envelope(&mut map, &envelope);
     map
 }
+
+/// Envelope for the optional watcher file list and its per-file diff lines.
+/// Callers supply measured retained and observed counts after applying caps.
+pub fn build_changed_files_envelope(
+    shown: usize,
+    total: usize,
+    lines: bool,
+    incomplete: bool,
+) -> ListEnvelope {
+    ListEnvelope::new(
+        shown,
+        if incomplete {
+            Total::AtLeast(total)
+        } else {
+            Total::Exact(total)
+        },
+        if lines { Unit::Lines } else { Unit::Files },
+        if shown < total {
+            vec![Reason::Cap]
+        } else {
+            vec![]
+        },
+        &[],
+    )
+}

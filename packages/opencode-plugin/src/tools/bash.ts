@@ -1005,6 +1005,7 @@ function foregroundMetadata(
     exit: data.exit_code as number | undefined,
     truncated,
     ...(outputPath ? { outputPath } : {}),
+    ...(data._bash_changed_files ? { _bash_changed_files: data._bash_changed_files } : {}),
   };
 }
 

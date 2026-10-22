@@ -2337,6 +2337,9 @@ impl WatcherFilterThread {
                     #[cfg(feature = "test-timing-hooks")]
                     hold_watcher_intake_for_test(&self.shutdown);
                     self.config.counters.note_raw_event();
+                    if let Some(journal) = self.config.counters.bash_changes.get() {
+                        journal.event(&event);
+                    }
                     if event.need_rescan() {
                         // Delay only this test's overflow notification so its
                         // timeout is exercised against worker scheduling.
@@ -2384,6 +2387,9 @@ impl WatcherFilterThread {
                     }
                 }
                 Ok(Err(error)) => {
+                    if let Some(journal) = self.config.counters.bash_changes.get() {
+                        journal.gap();
+                    }
                     let _ =
                         self.send_dispatch_final(WatcherDispatchEvent::Error(error.to_string()));
                     return;

@@ -903,3 +903,119 @@ fn bash_timeout_terminates_shell_process_group_grandchild() {
 
     assert!(aft.shutdown().success());
 }
+
+#[cfg(unix)]
+#[test]
+fn bash_changed_files_foreground_and_background_completion_notice() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "test@example.invalid"],
+        vec!["config", "user.name", "Test"],
+    ] {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(project.path())
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    std::fs::write(project.path().join("file.txt"), "old\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-qm", "initial"]] {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(project.path())
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("AFT_TEST_DISABLE_FILE_WATCHER", std::ffi::OsStr::new("0")),
+        (
+            "AFT_TEST_SYNC_FILE_WATCHER_START",
+            std::ffi::OsStr::new("1"),
+        ),
+    ]);
+    let configured = aft.send(&serde_json::json!({
+        "id": "changed-files-config", "command": "configure", "harness": "opencode",
+        "project_root": project.path(), "storage_dir": storage.path(),
+        "config": user_config(serde_json::json!({"bash": {"changed_files": "diff", "rewrite": false}, "sandbox": {"profile": "off"}}))
+    }).to_string());
+    assert_eq!(configured["success"], true, "{configured}");
+    for background in [false, true] {
+        let name = if background {
+            "background.txt"
+        } else {
+            "foreground.txt"
+        };
+        // Leave a delivery window after the write, exercising the real root
+        // watcher rather than manufacturing the command's observed events.
+        let result = aft.send(&serde_json::json!({"id": name, "method": "bash", "params": {
+            "command": format!("printf 'hello\\n' > {name}; sleep 0.3; printf done"), "background": background, "wait": !background,
+            "compressed": false, "notify_on_completion": background
+        }}).to_string());
+        assert_eq!(result["success"], true, "{result}");
+        if background {
+            assert!(result.get("_bash_changed_files").is_none(), "{result}");
+            wait_for_terminal_status(&mut aft, result["task_id"].as_str().unwrap());
+            let completions = aft.send(
+                &serde_json::json!({"id":"drain-changes", "command":"bash_drain_completions"})
+                    .to_string(),
+            );
+            let completion = completions["bg_completions"]
+                .as_array()
+                .expect("completion array")
+                .iter()
+                .find(|item| item["task_id"] == result["task_id"])
+                .unwrap();
+            assert!(
+                completion["_bash_changed_files"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(name),
+                "{completion}"
+            );
+            assert!(
+                completion["_bash_changed_files"]["files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|file| file["path"] == name
+                        && file["diff"]
+                            .as_str()
+                            .is_some_and(|diff| diff.contains("+hello"))),
+                "{completion}"
+            );
+            let ack = aft.send(&serde_json::json!({"id":"ack-changes", "command":"bash_ack_completions", "params":{"task_ids":[result["task_id"]]}}).to_string());
+            assert_eq!(ack["success"], true);
+            let drained = aft.send(&serde_json::json!({"id":"drain-changes-again", "command":"bash_drain_completions"}).to_string());
+            assert!(
+                drained["bg_completions"].as_array().unwrap().is_empty(),
+                "{drained}"
+            );
+        } else {
+            let result = wait_for_terminal_status(&mut aft, result["task_id"].as_str().unwrap());
+            assert!(
+                result["_bash_changed_files"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Files changed while the command ran"),
+                "{result}"
+            );
+            assert!(
+                result["_bash_changed_files"]["files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|file| file["path"] == name
+                        && file["diff"]
+                            .as_str()
+                            .is_some_and(|diff| diff.contains("+hello"))),
+                "{result}"
+            );
+        }
+    }
+}

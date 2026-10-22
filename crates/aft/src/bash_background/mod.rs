@@ -1213,6 +1213,8 @@ pub(crate) fn spawn(
     // handle, which reads the registry as it is. An idle-evicted root has
     // released its registry, so load it again before the task can finish.
     ctx.reload_released_filter_registry();
+    let _changed_files = crate::bash_changed_files::Capture::start(ctx)
+        .map(|capture| crate::bash_changed_files::scope(Some(capture)));
     #[cfg(unix)]
     ctx.bash_background()
         .set_db_schema_hints(ctx.config().bash.db_schema_hints);

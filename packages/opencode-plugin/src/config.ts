@@ -374,6 +374,7 @@ const BashFeaturesSchema = z.object({
    * forces detachment; a token-only message becomes `(requested background detach)`.
    */
   detach_on_user_message: z.boolean().optional(),
+  changed_files: z.enum(["off", "list", "diff"]).optional(),
   db_schema_hints: z.boolean().optional(),
   long_running_reminder_enabled: z.boolean().optional(),
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
@@ -985,6 +986,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
       config.bash.runon_enabled !== undefined ||
       config.bash.host_fallback !== undefined ||
       config.bash.detach_on_user_message !== undefined ||
+      config.bash.changed_files !== undefined ||
       config.bash.db_schema_hints !== undefined ||
       config.bash.watch_sync_max_ms !== undefined ||
       config.bash.worker_wait_max_ms !== undefined ||
@@ -1005,6 +1007,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
         : {}),
       ...(config.bash.detach_on_user_message !== undefined
         ? { detach_on_user_message: config.bash.detach_on_user_message }
+        : {}),
+      ...(config.bash.changed_files !== undefined
+        ? { changed_files: config.bash.changed_files }
         : {}),
       ...(config.bash.db_schema_hints !== undefined
         ? { db_schema_hints: config.bash.db_schema_hints }
@@ -1071,6 +1076,7 @@ export interface ResolvedBashConfig {
   /** Detach wait:true bash calls on user messages; `&detach` overrides and is stripped before delivery. */
   detach_on_user_message: boolean;
   /** Read-only database CLI schema hints after missing-table/column errors. */
+  changed_files: "off" | "list" | "diff";
   db_schema_hints: boolean;
   long_running_reminder_enabled?: boolean;
   long_running_reminder_interval_ms?: number;
@@ -1171,6 +1177,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     runon_enabled: false,
     subagent_background: true,
     detach_on_user_message: true,
+    changed_files: typeof top === "object" && top !== null ? (top.changed_files ?? "off") : "off",
     db_schema_hints: typeof top === "object" && top !== null ? (top.db_schema_hints ?? true) : true,
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
@@ -1937,6 +1944,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     delete projectBash.disclaim_privacy;
   // Strip only the weakening direction before the usual field-wise merge.
   if (typeof projectBash === "object") {
+    if (projectBash.changed_files !== "off") delete projectBash.changed_files;
     delete projectBash.runon_enabled;
     delete projectBash.env;
   }

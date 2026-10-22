@@ -298,6 +298,22 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         narrow: &[],
         reasons: CAP_SELECTING,
     },
+    SurfaceSpec {
+        command: "bash",
+        mode: "changed_files",
+        list_id: "bash.changed_files",
+        unit: Unit::Files,
+        narrow: &[],
+        reasons: CAP_SELECTING,
+    },
+    SurfaceSpec {
+        command: "bash",
+        mode: "diff_lines",
+        list_id: "bash.diff_lines",
+        unit: Unit::Lines,
+        narrow: &[],
+        reasons: CAP_SELECTING,
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -422,6 +438,14 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
             has(Reason::Walk),
         ),
         ("inspect", "") => build_inspect_envelope(2, 4),
+        ("bash", "changed_files" | "diff_lines") => {
+            Some(aft::list_surfaces::bash::build_changed_files_envelope(
+                2,
+                if has(Reason::Cap) { 4 } else { 2 },
+                surface.mode == "diff_lines",
+                false,
+            ))
+        }
         ("bash", "") => build_bash_output_envelope(61, 4000),
         other => panic!("no conformance builder for {other:?}"),
     }
@@ -483,6 +507,9 @@ fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
             }
         }
         ("inspect", "") => Total::Exact(4),
+        ("bash", "changed_files" | "diff_lines") => {
+            Total::Exact(if has(Reason::Cap) { 4 } else { 2 })
+        }
         ("bash", "") => Total::Exact(4000),
         other => panic!("no expected total for {other:?}"),
     }
@@ -796,6 +823,18 @@ fn push_root_fixture(
 
 pub fn capped_fixtures() -> Vec<FixtureRecord> {
     let mut fixtures = Vec::new();
+    for mode in ["changed_files", "diff_lines"] {
+        let reply = changed_files_fixture(mode);
+        fixtures.push(FixtureRecord {
+            name: format!("bash/{mode}"),
+            surface: registered_surface("bash", mode),
+            list_id: format!("bash.{mode}"),
+            rendered: render("bash", mode, &reply),
+            reply,
+            owner_path: vec!["_bash_changed_files".into()],
+            wire_key: format!("{mode}_list_envelope"),
+        });
+    }
     for name in ["cap", "walk", "walk_and_cap"] {
         push_root_fixture(
             &mut fixtures,
@@ -1182,7 +1221,7 @@ fn walk_envelope_keys(value: &Value, path: &mut Vec<String>, errors: &mut Vec<St
                     } else {
                         LIST_SURFACES.iter().any(|surface| {
                             surface.command != "inspect"
-                                && surface.command != "bash"
+                                && surface.list_id != "bash.output"
                                 && derive_wire_key(surface.list_id, false) == *key
                         })
                     };
@@ -1601,8 +1640,32 @@ pub struct CappedParityFixture {
     pub reply: Value,
 }
 
+fn changed_files_fixture(mode: &str) -> Value {
+    let envelope =
+        aft::list_surfaces::bash::build_changed_files_envelope(2, 4, mode == "diff_lines", false);
+    let text = format!(
+        "Observed changes\n{}",
+        aft::list_envelope::render_trailer(&envelope).unwrap()
+    );
+    json!({"output": text, "_bash_changed_files": {format!("{mode}_list_envelope"): envelope}})
+}
+
 pub fn capped_parity_fixtures() -> Vec<CappedParityFixture> {
     vec![
+        CappedParityFixture {
+            name: "bash/changed_files",
+            command: "bash",
+            mode: "changed_files",
+            list_id: "bash.changed_files",
+            reply: changed_files_fixture("changed_files"),
+        },
+        CappedParityFixture {
+            name: "bash/diff_lines",
+            command: "bash",
+            mode: "diff_lines",
+            list_id: "bash.diff_lines",
+            reply: changed_files_fixture("diff_lines"),
+        },
         CappedParityFixture {
             name: "read/walk_and_cap",
             command: "read",
@@ -2231,6 +2294,7 @@ fn enclosing_item(lines: &[&str], target: usize) -> String {
 pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let source_dir = aft_src_dir();
     let mut paths = collect_rs_files(&source_dir.join("commands"));
+    paths.push(source_dir.join("bash_changed_files.rs"));
     paths.push(source_dir.join("run_tool_call.rs"));
     paths.push(source_dir.join("subc_format.rs"));
     paths.push(source_dir.join("runtime_drain.rs"));
@@ -2310,7 +2374,10 @@ fn surface_matches_file(command: &str, file: &str) -> bool {
         "outline" => file == "commands/outline.rs" || file == "subc_format.rs",
         "inspect" => file == "commands/inspect.rs" || file == "subc_format.rs",
         "bash" => {
-            file.starts_with("compress/") || file == "commands/bash.rs" || file == "subc_format.rs"
+            file == "bash_changed_files.rs"
+                || file.starts_with("compress/")
+                || file == "commands/bash.rs"
+                || file == "subc_format.rs"
         }
         _ => false,
     }
