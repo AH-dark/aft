@@ -181,6 +181,11 @@ rayon = "1"
 # Use rustls-platform-verifier for per-connection OS trust checks instead of
 # enumerating native roots while every reqwest client is built.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# The connector layer reqwest accepts is a tower layer; the URL fetcher wraps
+# connection setup with one to tell a stalled connect from a silent server.
+# Both crates are already in the tree through reqwest.
+tower-layer = "0.3"
+tower-service = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-platform-verifier = "0.6"
 # Verify fleet-served gh routing manifests with a public-key signature before

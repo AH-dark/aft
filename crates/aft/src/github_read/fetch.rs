@@ -45,6 +45,9 @@ pub enum GithubReadError {
     GithubCliMissing,
     FetchFailed(String),
     InvalidStructuredResponse(String),
+    /// The live fetch was still running when the caller stopped waiting and
+    /// no cached copy could stand in. The fetch continues in the background.
+    Pending(String),
 }
 
 impl GithubReadError {
@@ -55,6 +58,7 @@ impl GithubReadError {
             Self::InvalidCommentSelector(_) => "invalid_comment_selector",
             Self::GithubCliMissing => "github_cli_missing",
             Self::FetchFailed(_) | Self::InvalidStructuredResponse(_) => "github_fetch_failed",
+            Self::Pending(_) => "github_read_pending",
         }
     }
 
@@ -71,7 +75,8 @@ impl fmt::Display for GithubReadError {
             Self::InvalidResource(message)
             | Self::InvalidCommentSelector(message)
             | Self::FetchFailed(message)
-            | Self::InvalidStructuredResponse(message) => formatter.write_str(message),
+            | Self::InvalidStructuredResponse(message)
+            | Self::Pending(message) => formatter.write_str(message),
             Self::GithubCliMissing => formatter.write_str(
                 "GitHub reads require the `gh` CLI. Install GitHub CLI and authenticate it with `gh auth login`.",
             ),
@@ -114,6 +119,11 @@ pub trait GhCommandRunner: Send + Sync {
     ) -> Result<(GhCommandOutput, bool), GhCommandError>;
 }
 
+/// Longest one `gh` command may run before it is killed. A `gh` stalled on a
+/// connection would otherwise keep its read, and the thread that runs it,
+/// alive indefinitely.
+const GH_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Production runner that executes the bare `gh` command in the caller's
 /// working directory so the CLI owns short-form repository resolution.
 #[derive(Default)]
@@ -125,19 +135,9 @@ impl GhCommandRunner for SystemGhCommandRunner {
         working_directory: &std::path::Path,
         args: &[String],
     ) -> Result<GhCommandOutput, GhCommandError> {
-        let output = Command::new("gh")
-            .args(args)
-            .current_dir(working_directory)
-            .output()
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::NotFound => GhCommandError::NotFound,
-                _ => GhCommandError::Other(error.to_string()),
-            })?;
-        Ok(GhCommandOutput {
-            success: output.status.success(),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
+        let mut command = Command::new("gh");
+        command.args(args).current_dir(working_directory);
+        run_command(command, None, GH_COMMAND_TIMEOUT).map(|(output, _)| output)
     }
 
     fn run_bounded(
@@ -153,42 +153,99 @@ impl GhCommandRunner for SystemGhCommandRunner {
 }
 
 fn run_bounded_command(
-    mut command: Command,
+    command: Command,
     byte_cap: usize,
 ) -> Result<(GhCommandOutput, bool), GhCommandError> {
-    let mut child = command
+    run_command(command, Some(byte_cap), GH_COMMAND_TIMEOUT)
+}
+
+enum PipeRead {
+    Stdout(Result<Vec<u8>, GhCommandError>),
+    Stderr(Result<Vec<u8>, GhCommandError>),
+}
+
+/// Run `command` with its output captured, `stdout` cut at `byte_cap` when
+/// one is given, and the whole process tree killed if it is still running
+/// after `timeout`. Returns the output and whether `stdout` was cut.
+fn run_command(
+    mut command: Command,
+    byte_cap: Option<usize>,
+    timeout: std::time::Duration,
+) -> Result<(GhCommandOutput, bool), GhCommandError> {
+    let deadline = std::time::Instant::now() + timeout;
+    // No stdin: `gh` must fail rather than wait for an answer to a prompt.
+    command
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(command_error)?;
-    let stderr = child.stderr.take().expect("piped gh stderr");
+        .stderr(Stdio::piped());
+    crate::format::isolate_in_process_group(&mut command);
+    let mut child = command.spawn().map_err(command_error)?;
+    let stdout_pipe = child.stdout.take().expect("piped gh stdout");
+    let stderr_pipe = child.stderr.take().expect("piped gh stderr");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let stderr_sender = sender.clone();
     // Drain stderr concurrently so a diagnostic cannot block stdout. Its
     // own iterator is bounded; credentials are redacted by the fetcher.
-    let errors = std::thread::spawn(move || read_capped(stderr, 64 * 1024));
+    std::thread::spawn(move || {
+        let _ = stderr_sender.send(PipeRead::Stderr(read_capped(stderr_pipe, 64 * 1024)));
+    });
     // A lookahead byte distinguishes exact-cap EOF from real overflow.
-    let mut stdout = read_capped(
-        child.stdout.take().expect("piped gh stdout"),
-        byte_cap.saturating_add(1),
-    );
-    let cap_hit = stdout.as_ref().is_ok_and(|bytes| bytes.len() > byte_cap);
-    if cap_hit {
-        stdout
-            .as_mut()
-            .expect("overflow requires captured bytes")
-            .pop();
+    let stdout_limit = byte_cap.map_or(usize::MAX, |cap| cap.saturating_add(1));
+    std::thread::spawn(move || {
+        let _ = sender.send(PipeRead::Stdout(read_capped(stdout_pipe, stdout_limit)));
+    });
+
+    let timed_out = |child: &mut std::process::Child| {
+        crate::format::kill_process_tree(child);
+        let _ = child.wait();
+        // The reader threads are not joined: a descendant that escaped the
+        // kill could hold a pipe open, and they end when it closes.
+        GhCommandError::Other(format!(
+            "GitHub CLI did not finish within {}s and was stopped",
+            timeout.as_secs()
+        ))
+    };
+    let mut stdout = None;
+    let mut stderr = None;
+    let mut cap_hit = false;
+    while stdout.is_none() || stderr.is_none() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match receiver.recv_timeout(left) {
+            Ok(PipeRead::Stdout(mut read)) => {
+                if let (Some(cap), Ok(bytes)) = (byte_cap, read.as_mut()) {
+                    if bytes.len() > cap {
+                        bytes.pop();
+                        cap_hit = true;
+                    }
+                }
+                if cap_hit || read.is_err() {
+                    crate::format::kill_process_tree(&mut child);
+                }
+                stdout = Some(read);
+            }
+            Ok(PipeRead::Stderr(read)) => stderr = Some(read),
+            Err(_) => return Err(timed_out(&mut child)),
+        }
     }
-    if cap_hit || stdout.is_err() {
-        let _ = child.kill();
-    }
-    let status = child.wait().map_err(command_error)?;
-    let stderr = errors
-        .join()
-        .map_err(|_| GhCommandError::Other("GitHub CLI stderr reader stopped".to_string()))??;
+    // Both pipes are closed, so the process is exiting; its status can lag
+    // the close by a moment.
+    let mut pause = std::time::Duration::from_millis(1);
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(command_error)? {
+            break status;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(timed_out(&mut child));
+        }
+        std::thread::sleep(pause.min(left));
+        pause = (pause * 2).min(std::time::Duration::from_millis(50));
+    };
     Ok((
         GhCommandOutput {
             success: status.success(),
-            stdout: stdout?,
-            stderr,
+            stdout: stdout.expect("stdout read")?,
+            stderr: stderr.expect("stderr read")?,
         },
         cap_hit,
     ))
@@ -463,6 +520,27 @@ mod tests {
                 assert!(output.success);
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_still_running_at_its_timeout_is_killed() {
+        // The background child keeps the output pipes open after the shell
+        // itself is gone, as a hung helper of `gh` would.
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 & sleep 30"]);
+        let started = std::time::Instant::now();
+        let error = run_command(command, Some(1024), std::time::Duration::from_millis(300))
+            .expect_err("a hung command must be stopped");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(&error, GhCommandError::Other(message) if message.contains("did not finish")),
+            "{error:?}"
+        );
     }
 
     #[test]

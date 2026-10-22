@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use htmd::{
     element_handler::{HandlerResult, Handlers},
@@ -26,9 +26,32 @@ use crate::parser::detect_language;
 
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(30_000);
+/// Longest a request may take to set up its connection (name lookup, TCP
+/// and TLS), within the fetch deadline.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(10_000);
+/// Longest a request may wait for the response headers, counted from the
+/// start of the request, within the fetch deadline. reqwest applies the same
+/// limit to each later read of the body.
+const HEADERS_TIMEOUT: Duration = Duration::from_millis(15_000);
 const BODY_CHUNK_TIMEOUT: Duration = Duration::from_millis(15_000);
 const MAX_REDIRECTS: usize = 5;
+
+/// Longest one URL fetch may take, whatever budget the call has left. Every
+/// phase (name lookup, connect, response headers, body) shares this one
+/// deadline, so redirects and retries cannot multiply it.
+const URL_FETCH_CEILING: Duration = Duration::from_secs(20);
+/// The last part of the call's budget, kept for building and sending the
+/// reply. Neither the download nor reading the downloaded document back may
+/// use it, so the reply reaches the caller before the call's own deadline.
+pub(crate) const URL_REPLY_MARGIN: Duration = Duration::from_secs(1);
+/// The part of the call's budget before the reply margin that the download
+/// leaves for the work after it: converting HTML, writing the cache, and
+/// reading the document back. A download that ends at its deadline still has
+/// this much time for that work.
+const URL_READ_BACK_RESERVE: Duration = Duration::from_secs(2);
+/// A transient failure is retried only when the backoff plus at least this
+/// much time for the next attempt still fit before the fetch deadline.
+const MIN_USEFUL_ATTEMPT: Duration = Duration::from_secs(1);
 
 /// Retry budget for transient connect/transport failures only. Agents
 /// shouldn't have to retry manually for a single TCP/TLS hiccup. We cap
@@ -60,17 +83,169 @@ pub struct UrlFetchOptions {
     /// Test hook: observes the temp path immediately before the atomic rename.
     #[doc(hidden)]
     pub atomic_write_observer: Option<Arc<dyn Fn(&Path, &Path) + Send + Sync>>,
+    /// Test hook: answers host name lookups in place of the system resolver,
+    /// so a test can stall or redirect name resolution without a network.
+    #[doc(hidden)]
+    pub lookup_override: Option<HostLookup>,
+    /// Test hook: holds every connection attempt this long before it starts
+    /// connecting, standing in for a host that does not answer the connect.
+    #[doc(hidden)]
+    pub connect_delay: Option<Duration>,
+}
+
+/// A host name lookup: the host's addresses, or the lookup's error.
+pub type HostLookup = Arc<dyn Fn(&str) -> io::Result<Vec<IpAddr>> + Send + Sync>;
+
+/// The part of a fetch that was running when its deadline or a stall limit
+/// stopped it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchPhase {
+    Dns,
+    Connect,
+    Headers,
+    Body,
+}
+
+impl FetchPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dns => "dns",
+            Self::Connect => "connect",
+            Self::Headers => "headers",
+            Self::Body => "body",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct UrlFetchError {
+    code: &'static str,
     message: String,
+    phase: Option<FetchPhase>,
+    /// HTTP status of a server that answered with an error.
+    status: Option<u16>,
+    /// Set on a remembered failure: how long until a call fetches again.
+    retry_after: Option<Duration>,
+    /// Set when the fetch stopped (or never started) only because the
+    /// calling tool call had too little budget left. Such a failure says
+    /// nothing about the server, so it is never remembered.
+    cut_by_call_budget: bool,
 }
 
 impl UrlFetchError {
     fn new(message: impl Into<String>) -> Self {
         Self {
+            code: "url_fetch_failed",
             message: message.into(),
+            phase: None,
+            status: None,
+            retry_after: None,
+            cut_by_call_budget: false,
+        }
+    }
+
+    fn timeout(phase: FetchPhase, message: impl Into<String>) -> Self {
+        Self {
+            code: "url_fetch_timeout",
+            phase: Some(phase),
+            ..Self::new(message)
+        }
+    }
+
+    fn http_status(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status: Some(status),
+            ..Self::new(message)
+        }
+    }
+
+    /// Response error code: `url_fetch_timeout` when a deadline or stall
+    /// limit stopped the fetch, otherwise `url_fetch_failed`.
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// The phase a timed-out fetch was in; `None` for other failures.
+    pub fn phase(&self) -> Option<FetchPhase> {
+        self.phase
+    }
+
+    /// For a failure repeated from memory instead of a new fetch, the time
+    /// until a call for the same URL fetches it again.
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+
+    /// Failures that would very likely repeat on an immediate retry, and
+    /// cost the retry the same wait: timeouts, server errors (5xx), and
+    /// client errors (4xx) other than 408 Request Timeout and 429 Too Many
+    /// Requests. Refusals by the SSRF check and other local errors are cheap
+    /// to reproduce and are not remembered.
+    ///
+    /// Only failures the server or network caused are remembered: a timeout
+    /// cut short by the caller's budget is not, and neither is a failure
+    /// that is itself being repeated from memory.
+    fn worth_remembering(&self) -> bool {
+        if self.cut_by_call_budget || self.retry_after.is_some() {
+            return false;
+        }
+        self.code == "url_fetch_timeout"
+            || self
+                .status
+                .is_some_and(|status| status >= 400 && status != 408 && status != 429)
+    }
+}
+
+/// One deadline for a whole fetch, taken from the call's filesystem budget
+/// (less the read-back reserve and the reply margin) and capped at
+/// [`URL_FETCH_CEILING`]. A call with no budget gets the ceiling.
+#[derive(Debug, Clone, Copy)]
+struct FetchDeadline {
+    at: Instant,
+    allowed: Duration,
+    /// The call's budget, not the URL ceiling, set this deadline: a fetch it
+    /// stops was stopped by the caller, not by a slow server.
+    set_by_call: bool,
+}
+
+impl FetchDeadline {
+    fn for_current_call() -> Self {
+        let now = Instant::now();
+        let ceiling = now + URL_FETCH_CEILING;
+        let at = match crate::bounded_io::current() {
+            Some(budget) => budget
+                .deadline
+                .checked_sub(URL_REPLY_MARGIN + URL_READ_BACK_RESERVE)
+                .unwrap_or(now)
+                .clamp(now, ceiling),
+            None => ceiling,
+        };
+        Self {
+            at,
+            allowed: at.saturating_duration_since(now),
+            set_by_call: at < ceiling,
+        }
+    }
+
+    fn remaining(&self) -> Duration {
+        self.at.saturating_duration_since(Instant::now())
+    }
+
+    fn expired(&self) -> bool {
+        self.remaining().is_zero()
+    }
+
+    fn timeout_error(&self, phase: FetchPhase, url: &str) -> UrlFetchError {
+        UrlFetchError {
+            cut_by_call_budget: self.set_by_call,
+            ..UrlFetchError::timeout(
+                phase,
+                format!(
+                    "URL fetch timed out in the {} phase: the {}ms fetch deadline elapsed fetching {url}",
+                    phase.as_str(),
+                    self.allowed.as_millis()
+                ),
+            )
         }
     }
 }
@@ -103,14 +278,308 @@ pub fn is_http_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
 
+/// Fetch `url` into the URL cache under `storage_dir` and return the cached
+/// document's path. A failure worth remembering (see
+/// [`UrlFetchError::worth_remembering`]) is repeated for
+/// [`FAILURE_MEMORY`] instead of a new fetch, so an agent that retries a
+/// page the server failed gets its answer at once instead of waiting again.
+/// A document already in the cache is served regardless.
 pub fn fetch_url_to_cache(
     url: &str,
     storage_dir: &Path,
     options: UrlFetchOptions,
 ) -> Result<PathBuf, UrlFetchError> {
+    let key = FailureKey::new(storage_dir, url, options.allow_private);
+    let result = download_to_cache(url, storage_dir, options, &key);
+    match &result {
+        Ok(_) => forget_failure(&key),
+        Err(error) if error.worth_remembering() => remember_failure(key, error),
+        Err(_) => {}
+    }
+    result
+}
+
+/// How long a remembered failure stands in for a new fetch of its URL.
+const FAILURE_MEMORY: Duration = Duration::from_secs(60);
+
+/// A remembered failure is specific to the cache it would have filled and to
+/// whether private addresses were allowed.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FailureKey {
+    storage_dir: PathBuf,
+    url: String,
+    allow_private: bool,
+}
+
+impl FailureKey {
+    fn new(storage_dir: &Path, url: &str, allow_private: bool) -> Self {
+        Self {
+            storage_dir: storage_dir.to_path_buf(),
+            url: url.to_string(),
+            allow_private,
+        }
+    }
+}
+
+struct RememberedFailure {
+    error: UrlFetchError,
+    at: Instant,
+}
+
+/// Remembered failures. Expired entries are dropped on every insert, and a
+/// lookup ignores an entry older than [`FAILURE_MEMORY`].
+fn failure_memory() -> &'static std::sync::Mutex<HashMap<FailureKey, RememberedFailure>> {
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<HashMap<FailureKey, RememberedFailure>>> =
+        std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn remembered_failure(key: &FailureKey) -> Option<UrlFetchError> {
+    let failures = failure_memory()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let remembered = failures.get(key)?;
+    let age = remembered.at.elapsed();
+    let retry_after = FAILURE_MEMORY
+        .checked_sub(age)
+        .filter(|left| !left.is_zero())?;
+    let mut error = remembered.error.clone();
+    error.message = format!(
+        "{} (cached failure from {}s ago; this URL is fetched again after {}s)",
+        error.message,
+        age.as_secs(),
+        retry_after.as_secs_f64().ceil() as u64
+    );
+    error.retry_after = Some(retry_after);
+    Some(error)
+}
+
+fn remember_failure(key: FailureKey, error: &UrlFetchError) {
+    let mut failures = failure_memory()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    failures.retain(|_, remembered| remembered.at.elapsed() < FAILURE_MEMORY);
+    failures.insert(
+        key,
+        RememberedFailure {
+            error: error.clone(),
+            at: Instant::now(),
+        },
+    );
+}
+
+fn forget_failure(key: &FailureKey) {
+    failure_memory()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(key);
+}
+
+/// Test hook: a document-cache read under `storage_dir` that blocks until
+/// released (or for at most 10 s, so a broken test cannot hang the suite),
+/// standing in for a cache filesystem that stops answering.
+#[cfg(test)]
+#[derive(Default)]
+struct CacheReadStall {
+    reached: std::sync::atomic::AtomicUsize,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl CacheReadStall {
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_all();
+    }
+}
+
+#[cfg(test)]
+fn cache_read_stalls() -> &'static std::sync::Mutex<HashMap<PathBuf, Arc<CacheReadStall>>> {
+    static STALLS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<CacheReadStall>>>> =
+        std::sync::OnceLock::new();
+    STALLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn stall_cache_reads(storage_dir: &Path) -> Arc<CacheReadStall> {
+    let stall = Arc::new(CacheReadStall::default());
+    cache_read_stalls()
+        .lock()
+        .unwrap()
+        .insert(storage_dir.to_path_buf(), Arc::clone(&stall));
+    stall
+}
+
+#[cfg(test)]
+fn stall_cache_read_if_requested(storage_dir: &Path) {
+    let Some(stall) = cache_read_stalls()
+        .lock()
+        .unwrap()
+        .get(storage_dir)
+        .cloned()
+    else {
+        return;
+    };
+    stall
+        .reached
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let released = stall.released.lock().unwrap();
+    let _ = stall
+        .release
+        .wait_timeout_while(released, Duration::from_secs(10), |released| !*released);
+}
+
+/// Test hook: make one remembered failure `by` older.
+#[cfg(test)]
+fn age_remembered_failure(key: &FailureKey, by: Duration) {
+    if let Some(remembered) = failure_memory()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(key)
+    {
+        remembered.at = remembered
+            .at
+            .checked_sub(by)
+            .expect("clock far enough along");
+    }
+}
+
+/// What a document-cache check needs, owned so a helper thread can run it.
+struct CacheCheckInput {
+    storage_dir: PathBuf,
+    hash: String,
+    meta_file: PathBuf,
+    url: Url,
+}
+
+type CacheCheckResult = Result<Option<PathBuf>, UrlFetchError>;
+
+/// A document-cache check running on a helper thread. Calls that find one
+/// running for their URL wait for it instead of starting another, so a cache
+/// filesystem that stops answering holds at most one thread per URL.
+#[derive(Default)]
+struct CacheCheck {
+    result: std::sync::Mutex<Option<CacheCheckResult>>,
+    done: std::sync::Condvar,
+}
+
+fn cache_checks() -> &'static std::sync::Mutex<HashMap<FailureKey, Arc<CacheCheck>>> {
+    static CHECKS: std::sync::OnceLock<std::sync::Mutex<HashMap<FailureKey, Arc<CacheCheck>>>> =
+        std::sync::OnceLock::new();
+    CHECKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// The latest a bounded cache check may answer: the call's deadline less the
+/// reply margin, or the URL ceiling for a call without a budget.
+fn cache_check_deadline() -> Instant {
+    let now = Instant::now();
+    let ceiling = now + URL_FETCH_CEILING;
+    match crate::bounded_io::current() {
+        Some(budget) => budget
+            .deadline
+            .checked_sub(URL_REPLY_MARGIN)
+            .unwrap_or(now)
+            .clamp(now, ceiling),
+        None => ceiling,
+    }
+}
+
+/// Run (or join) the document-cache check for `key` and wait for it until
+/// `deadline`. `Ok(None)` means no usable cached copy, including a check
+/// that did not finish in time.
+fn bounded_cache_check(
+    key: &FailureKey,
+    input: CacheCheckInput,
+    deadline: Instant,
+) -> CacheCheckResult {
+    let check = {
+        let mut checks = cache_checks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match checks.get(key) {
+            Some(running) => Arc::clone(running),
+            None => {
+                let check = Arc::new(CacheCheck::default());
+                checks.insert(key.clone(), Arc::clone(&check));
+                let worker = Arc::clone(&check);
+                let worker_key = key.clone();
+                thread::spawn(move || {
+                    let result = fresh_cached_path(
+                        &input.storage_dir,
+                        &input.hash,
+                        &input.meta_file,
+                        &input.url,
+                    );
+                    *worker
+                        .result
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+                    worker.done.notify_all();
+                    cache_checks()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&worker_key);
+                });
+                check
+            }
+        }
+    };
+    let mut result = check
+        .result
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        if let Some(result) = result.as_ref() {
+            return result.clone();
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        result = check
+            .done
+            .wait_timeout(result, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+}
+
+/// A document that is cached is served (after the SSRF check) even while a
+/// failure of the same URL is remembered; only a cache miss is answered by a
+/// remembered failure. With a failure remembered, the call waits for the
+/// cache check only until its deadline less the reply margin; a check still
+/// running then counts as a miss, and its helper thread may run on.
+fn download_to_cache(
+    url: &str,
+    storage_dir: &Path,
+    options: UrlFetchOptions,
+    failure_key: &FailureKey,
+) -> Result<PathBuf, UrlFetchError> {
     let parsed = Url::parse(url).map_err(|_| UrlFetchError::new(format!("Invalid URL: {url}")))?;
+    let deadline = FetchDeadline::for_current_call();
     let fetch_url = rewrite_url_for_fetch(&parsed);
-    validate_public_url(&fetch_url, &options)?;
+    let approved = Arc::new(ApprovedHosts::default());
+    let hash = hash_url(url);
+    let meta_file = meta_path(storage_dir, &hash);
+
+    // With a failure remembered, the answer is already in memory, so the call
+    // must not wait on the cache check past its deadline; the check runs on
+    // a helper thread that may outlive the call. No directory is created:
+    // nothing will be written.
+    if let Some(remembered) = remembered_failure(failure_key) {
+        let check = CacheCheckInput {
+            storage_dir: storage_dir.to_path_buf(),
+            hash,
+            meta_file,
+            url: fetch_url.clone(),
+        };
+        let Some(cached) = bounded_cache_check(failure_key, check, cache_check_deadline())? else {
+            return Err(remembered);
+        };
+        validate_public_url(&fetch_url, &options, &deadline, &approved)?;
+        return Ok(cached);
+    }
 
     let dir = cache_dir(storage_dir);
     crate::private_storage::open_dir(storage_dir, &dir).map_err(|error| {
@@ -120,19 +589,24 @@ pub fn fetch_url_to_cache(
         ))
     })?;
 
-    let hash = hash_url(url);
-    let meta_file = meta_path(storage_dir, &hash);
-    if let Some(cached) = fresh_cached_path(storage_dir, &hash, &meta_file, &fetch_url)? {
+    let cached = fresh_cached_path(storage_dir, &hash, &meta_file, &fetch_url)?;
+    // A cache hit is checked too: the request may refuse private addresses
+    // that the call which filled the cache allowed.
+    validate_public_url(&fetch_url, &options, &deadline, &approved)?;
+    if let Some(cached) = cached {
         return Ok(cached);
     }
 
-    let response = fetch_with_redirects(&fetch_url, url, &options)?;
+    let response = fetch_with_redirects(&fetch_url, url, &options, &deadline, approved)?;
     if !response.status().is_success() {
-        return Err(UrlFetchError::new(format!(
-            "HTTP {} {} fetching {url}",
+        return Err(UrlFetchError::http_status(
             response.status().as_u16(),
-            response.status().canonical_reason().unwrap_or("")
-        )));
+            format!(
+                "HTTP {} {} fetching {url}",
+                response.status().as_u16(),
+                response.status().canonical_reason().unwrap_or("")
+            ),
+        ));
     }
 
     let content_type = response
@@ -149,7 +623,7 @@ pub fn fetch_url_to_cache(
         })?;
 
     let total_bytes = response.content_length();
-    let (mut body, download_truncated) = read_response_body(response, url)?;
+    let (mut body, download_truncated) = read_response_body(response, url, &deadline)?;
     let downloaded_bytes = body.len();
     // A byte ceiling can bisect the final UTF-8 character. Do not turn an
     // otherwise valid document prefix into an unreadable cache entry.
@@ -442,6 +916,8 @@ fn fresh_cached_path(
     meta_file: &Path,
     url: &Url,
 ) -> Result<Option<PathBuf>, UrlFetchError> {
+    #[cfg(test)]
+    stall_cache_read_if_requested(storage_dir);
     if !meta_file.exists() {
         return Ok(None);
     }
@@ -460,7 +936,11 @@ fn fresh_cached_path(
 
     let content_type = meta.content_type.as_str();
     let current = resolve_fetch_extension(url, content_type);
-    let expected_ext = current.map(|(ext, _)| ext);
+    // An HTML page is stored converted to Markdown, so a URL whose path ends
+    // in .html or .htm finds its cached copy under .md. Comparing against
+    // .html would miss the cache on every call and fetch, convert and
+    // re-parse the whole page again.
+    let expected_ext = current.map(|(ext, _)| if ext == ".html" { ".md" } else { ext });
     if expected_ext != Some(meta.extension.as_str()) {
         return Ok(None);
     }
@@ -480,13 +960,16 @@ fn fetch_with_redirects(
     start_url: &Url,
     original_url: &str,
     options: &UrlFetchOptions,
+    deadline: &FetchDeadline,
+    approved: Arc<ApprovedHosts>,
 ) -> Result<HttpResponse, UrlFetchError> {
-    let client = build_client(options)?;
+    let progress = Arc::new(ConnectProgress::default());
+    let client = build_client(options, Arc::clone(&approved), Arc::clone(&progress))?;
     let mut current_url = start_url.clone();
 
     for redirect_count in 0..=MAX_REDIRECTS {
-        validate_public_url(&current_url, options)?;
-        let response = send_with_transient_retries(&client, &current_url)?;
+        validate_public_url(&current_url, options, deadline, &approved)?;
+        let response = send_with_transient_retries(&client, &current_url, deadline, &progress)?;
 
         if !response.status().is_redirection() {
             return Ok(response);
@@ -528,44 +1011,98 @@ fn fetch_with_redirects(
 /// reqwest still surfaces as Err, or a TLS handshake fault that doesn't read
 /// as `is_connect`), the original error is returned immediately so the user
 /// sees the real failure without an artificial 800ms-plus delay.
+///
+/// Every attempt is limited to the time left before `deadline`, and a retry
+/// runs only when its backoff plus [`MIN_USEFUL_ATTEMPT`] still fit, so
+/// retries can never stretch a fetch past its deadline.
 fn send_with_transient_retries(
     client: &Client,
     target: &Url,
+    deadline: &FetchDeadline,
+    progress: &ConnectProgress,
 ) -> Result<HttpResponse, UrlFetchError> {
-    let mut last_error: Option<reqwest::Error> = None;
-    for attempt in 0..=TRANSIENT_RETRY_ATTEMPTS {
+    let mut attempt = 0;
+    loop {
+        let remaining = deadline.remaining();
+        if remaining.is_zero() {
+            return Err(deadline.timeout_error(FetchPhase::Connect, target.as_str()));
+        }
+        // A per-request timeout replaces reqwest's default 30 s, which would
+        // otherwise let one silent server hold each attempt for 30 s.
+        progress.begin_attempt();
         let result = client
             .get(target.clone())
             .header(USER_AGENT, USER_AGENT_VALUE)
             .header(ACCEPT, ACCEPT_HEADER)
+            .timeout(remaining.min(HEADERS_TIMEOUT))
             .send();
-        match result {
+        let error = match result {
             Ok(response) => return Ok(response),
-            Err(error) => {
-                if attempt < TRANSIENT_RETRY_ATTEMPTS && is_transient_reqwest_error(&error) {
-                    thread::sleep(Duration::from_millis(TRANSIENT_RETRY_BACKOFFS_MS[attempt]));
-                    last_error = Some(error);
-                    continue;
-                }
-                return Err(UrlFetchError::new(format!(
-                    "Failed to fetch {}: {}",
-                    target.as_str(),
-                    reqwest_error_detail(&error)
-                )));
-            }
+            Err(error) => error,
+        };
+        let phase = error
+            .is_timeout()
+            .then(|| timed_out_phase(&error, progress));
+        // A server that accepted the request and stayed silent until the
+        // headers limit is not a passing connection fault; retrying it would
+        // only spend the rest of the deadline the same way.
+        let retryable = is_transient_reqwest_error(&error) && phase != Some(FetchPhase::Headers);
+        let backoff = TRANSIENT_RETRY_BACKOFFS_MS
+            .get(attempt)
+            .map(|ms| Duration::from_millis(*ms))
+            .filter(|backoff| retryable && *backoff + MIN_USEFUL_ATTEMPT <= deadline.remaining());
+        if let Some(backoff) = backoff {
+            thread::sleep(backoff);
+            attempt += 1;
+            continue;
         }
+        if let Some(phase) = phase {
+            return Err(request_timeout_error(&error, phase, deadline, target));
+        }
+        return Err(UrlFetchError::new(format!(
+            "Failed to fetch {}: {}",
+            target.as_str(),
+            reqwest_error_detail(&error)
+        )));
     }
-    // Loop fell through after the last allowed retry exhausted — surface the
-    // most recent transient error rather than swallowing it.
-    Err(UrlFetchError::new(format!(
-        "Failed to fetch {} after {} retries: {}",
-        target.as_str(),
-        TRANSIENT_RETRY_ATTEMPTS,
-        last_error
-            .as_ref()
-            .map(reqwest_error_detail)
-            .unwrap_or_else(|| "unknown transient error".to_string())
-    )))
+}
+
+/// Name the phase a timed-out request was in: a name lookup still running in
+/// the resolver, then connection setup still running (or reported by reqwest
+/// as the cause), and otherwise the wait for the response headers.
+fn timed_out_phase(error: &reqwest::Error, progress: &ConnectProgress) -> FetchPhase {
+    if progress.lookup_pending() {
+        FetchPhase::Dns
+    } else if progress.connect_pending() || error.is_connect() {
+        FetchPhase::Connect
+    } else {
+        FetchPhase::Headers
+    }
+}
+
+fn request_timeout_error(
+    error: &reqwest::Error,
+    phase: FetchPhase,
+    deadline: &FetchDeadline,
+    target: &Url,
+) -> UrlFetchError {
+    if deadline.expired() {
+        return deadline.timeout_error(phase, target.as_str());
+    }
+    let limit = match phase {
+        FetchPhase::Dns | FetchPhase::Connect => CONNECT_TIMEOUT,
+        FetchPhase::Headers | FetchPhase::Body => HEADERS_TIMEOUT,
+    };
+    UrlFetchError::timeout(
+        phase,
+        format!(
+            "URL fetch timed out in the {} phase after the {}ms limit fetching {}: {}",
+            phase.as_str(),
+            limit.as_millis(),
+            target.as_str(),
+            reqwest_error_detail(error)
+        ),
+    )
 }
 
 /// Classify a reqwest error as transient (worth a quick retry) vs terminal.
@@ -581,14 +1118,25 @@ fn is_transient_reqwest_error(error: &reqwest::Error) -> bool {
     error.is_connect() || error.is_timeout() || error.is_request()
 }
 
-fn build_client(options: &UrlFetchOptions) -> Result<Client, UrlFetchError> {
-    let mut builder = Client::builder()
+fn build_client(
+    options: &UrlFetchOptions,
+    approved: Arc<ApprovedHosts>,
+    progress: Arc<ConnectProgress>,
+) -> Result<Client, UrlFetchError> {
+    let resolver = GuardedResolver {
+        approved,
+        connect_overrides: options.connect_overrides.clone(),
+        lookup_override: options.lookup_override.clone(),
+        progress: Arc::clone(&progress),
+    };
+    let builder = Client::builder()
         .redirect(Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT);
-
-    for (host, address) in &options.connect_overrides {
-        builder = builder.resolve(host, *address);
-    }
+        .connect_timeout(CONNECT_TIMEOUT)
+        .connector_layer(TrackConnect {
+            progress,
+            delay: options.connect_delay,
+        })
+        .dns_resolver(Arc::new(resolver));
 
     let tls_config = crate::platform_tls::client_config().map_err(|error| {
         UrlFetchError::new(format!("Failed to configure URL fetch TLS: {error}"))
@@ -600,7 +1148,237 @@ fn build_client(options: &UrlFetchOptions) -> Result<Client, UrlFetchError> {
         .map_err(|error| UrlFetchError::new(format!("Failed to build URL fetch client: {error}")))
 }
 
-fn validate_public_url(url: &Url, options: &UrlFetchOptions) -> Result<(), UrlFetchError> {
+/// Host names the SSRF check resolved and approved during one fetch, with
+/// the addresses it approved. The resolver hands reqwest exactly these, so
+/// the connection cannot reach an address that a second lookup returned (a
+/// DNS-rebinding answer), and a redirect back to the same host needs no new
+/// lookup.
+#[derive(Default)]
+struct ApprovedHosts(std::sync::Mutex<HashMap<String, Vec<IpAddr>>>);
+
+impl ApprovedHosts {
+    fn get(&self, host: &str) -> Option<Vec<IpAddr>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(host)
+            .cloned()
+    }
+
+    fn insert(&self, host: &str, addresses: Vec<IpAddr>) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(host.to_string(), addresses);
+    }
+}
+
+/// Connection-setup progress of the current request attempt, read when the
+/// request times out to name the phase it was in. A step that a timeout
+/// abandoned never reports its end, so each attempt starts from a clean
+/// state and a step reports its end only to the attempt that started it.
+#[derive(Default)]
+struct ConnectProgress(std::sync::Mutex<AttemptProgress>);
+
+#[derive(Default)]
+struct AttemptProgress {
+    attempt: u64,
+    lookup_pending: bool,
+    connect_pending: bool,
+}
+
+impl ConnectProgress {
+    fn state(&self) -> std::sync::MutexGuard<'_, AttemptProgress> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn begin_attempt(&self) {
+        let mut state = self.state();
+        state.attempt += 1;
+        state.lookup_pending = false;
+        state.connect_pending = false;
+    }
+
+    /// Returns the attempt the connection belongs to.
+    fn connect_started(&self) -> u64 {
+        let mut state = self.state();
+        state.connect_pending = true;
+        state.attempt
+    }
+
+    fn connected(&self, attempt: u64) {
+        let mut state = self.state();
+        if state.attempt == attempt {
+            state.connect_pending = false;
+        }
+    }
+
+    fn connect_pending(&self) -> bool {
+        self.state().connect_pending
+    }
+
+    /// Returns the attempt the lookup belongs to.
+    fn lookup_started(&self) -> u64 {
+        let mut state = self.state();
+        state.lookup_pending = true;
+        state.attempt
+    }
+
+    fn lookup_answered(&self, attempt: u64) {
+        let mut state = self.state();
+        if state.attempt == attempt {
+            state.lookup_pending = false;
+        }
+    }
+
+    fn lookup_pending(&self) -> bool {
+        self.state().lookup_pending
+    }
+}
+
+/// Connector layer that records when a request starts and finishes setting
+/// up its connection, so a timeout can tell a stalled connect from a server
+/// that accepted the connection and never answered.
+#[derive(Clone)]
+struct TrackConnect {
+    progress: Arc<ConnectProgress>,
+    delay: Option<Duration>,
+}
+
+impl<S> tower_layer::Layer<S> for TrackConnect {
+    type Service = TrackedConnector<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TrackedConnector {
+            inner,
+            progress: Arc::clone(&self.progress),
+            delay: self.delay,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TrackedConnector<S> {
+    inner: S,
+    progress: Arc<ConnectProgress>,
+    delay: Option<Duration>,
+}
+
+impl<S, Target> tower_service::Service<Target> for TrackedConnector<S>
+where
+    S: tower_service::Service<Target>,
+    S::Future: Send + 'static,
+    S::Response: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, target: Target) -> Self::Future {
+        let attempt = self.progress.connect_started();
+        let progress = Arc::clone(&self.progress);
+        let delay = self.delay;
+        let connecting = self.inner.call(target);
+        Box::pin(async move {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            let connection = connecting.await;
+            if connection.is_ok() {
+                progress.connected(attempt);
+            }
+            connection
+        })
+    }
+}
+
+/// The resolver reqwest uses for every connection of a fetch.
+///
+/// A host the SSRF check approved gets exactly the approved addresses. Any
+/// other host is looked up here without the SSRF check: that is a proxy host,
+/// or any host when private addresses are allowed. The lookup runs on its own
+/// thread so the request's timeout can abandon it: the request stops waiting
+/// at the fetch deadline, although the system resolver's thread may run on
+/// until its lookup returns.
+struct GuardedResolver {
+    approved: Arc<ApprovedHosts>,
+    connect_overrides: Vec<(String, SocketAddr)>,
+    lookup_override: Option<HostLookup>,
+    progress: Arc<ConnectProgress>,
+}
+
+impl reqwest::dns::Resolve for GuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        // Port 0 tells reqwest to use the URL's port.
+        let ready = |addresses: Vec<SocketAddr>| -> reqwest::dns::Resolving {
+            Box::pin(std::future::ready(Ok(
+                Box::new(addresses.into_iter()) as reqwest::dns::Addrs
+            )))
+        };
+        if let Some((_, address)) = self
+            .connect_overrides
+            .iter()
+            .find(|(override_host, _)| *override_host == host)
+        {
+            return ready(vec![*address]);
+        }
+        if let Some(addresses) = self.approved.get(&host) {
+            return ready(
+                addresses
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(ip, 0))
+                    .collect(),
+            );
+        }
+        let progress = Arc::clone(&self.progress);
+        let attempt = progress.lookup_started();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let lookup = self.lookup_override.clone();
+        thread::spawn(move || {
+            let _ = sender.send(lookup_host(&host, lookup.as_ref()));
+        });
+        Box::pin(async move {
+            let answer: Result<io::Result<Vec<IpAddr>>, _> = receiver.await;
+            progress.lookup_answered(attempt);
+            let addresses = answer
+                .unwrap_or_else(|_| Err(io::Error::other("host lookup stopped before answering")))
+                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
+            Ok(
+                Box::new(addresses.into_iter().map(|ip| SocketAddr::new(ip, 0)))
+                    as reqwest::dns::Addrs,
+            )
+        })
+    }
+}
+
+fn lookup_host(host: &str, lookup_override: Option<&HostLookup>) -> io::Result<Vec<IpAddr>> {
+    if let Some(lookup) = lookup_override {
+        return lookup(host);
+    }
+    Ok((host, 0).to_socket_addrs()?.map(|addr| addr.ip()).collect())
+}
+
+/// Refuse a URL that is not http(s) or that points at a private address.
+/// A host name is resolved under the fetch deadline and its approved
+/// addresses are recorded in `approved` for the resolver.
+fn validate_public_url(
+    url: &Url,
+    options: &UrlFetchOptions,
+    deadline: &FetchDeadline,
+    approved: &ApprovedHosts,
+) -> Result<(), UrlFetchError> {
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err(UrlFetchError::new(format!(
             "Only http:// and https:// URLs are supported, got: {}:",
@@ -629,29 +1407,30 @@ fn validate_public_url(url: &Url, options: &UrlFetchOptions) -> Result<(), UrlFe
             "Blocked private URL host {host} ({host_for_parse})"
         )));
     }
+    if approved.get(host_for_parse).is_some() {
+        return Ok(());
+    }
 
-    let addresses = resolve_host_ips(host_for_parse, url.port_or_known_default(), options)?;
+    let addresses = resolve_host_ips(host_for_parse, url.as_str(), options, deadline)?;
     if addresses.is_empty() {
         return Err(UrlFetchError::new(format!(
             "Failed to resolve URL host {host}"
         )));
     }
-    for ip in addresses {
-        reject_private_ip(host, ip)?;
+    for ip in &addresses {
+        reject_private_ip(host, *ip)?;
     }
-
-    // We validate all resolved addresses before issuing the request. Reqwest's
-    // default resolver runs again during TCP connect, leaving the same small
-    // DNS-rebinding window the old Bun fallback accepted. A custom per-request
-    // resolver hook would close that window but adds complexity for marginal
-    // value in this opt-in agent-tooling surface.
+    approved.insert(host_for_parse, addresses);
     Ok(())
 }
 
+/// Resolve `host` on a helper thread and wait for it no longer than the
+/// fetch deadline; the system resolver itself has no timeout.
 fn resolve_host_ips(
     host: &str,
-    port: Option<u16>,
+    url: &str,
     options: &UrlFetchOptions,
+    deadline: &FetchDeadline,
 ) -> Result<Vec<IpAddr>, UrlFetchError> {
     if let Some((_, ips)) = options
         .public_host_overrides
@@ -661,11 +1440,26 @@ fn resolve_host_ips(
         return Ok(ips.clone());
     }
 
-    let port = port.unwrap_or(80);
-    let addrs = (host, port).to_socket_addrs().map_err(|error| {
-        UrlFetchError::new(format!("Failed to resolve URL host {host}: {error}"))
-    })?;
-    Ok(addrs.map(|addr| addr.ip()).collect())
+    let remaining = deadline.remaining();
+    if remaining.is_zero() {
+        return Err(deadline.timeout_error(FetchPhase::Dns, url));
+    }
+    let (sender, receiver) = mpsc::channel();
+    let owned_host = host.to_string();
+    let lookup = options.lookup_override.clone();
+    thread::spawn(move || {
+        let _ = sender.send(lookup_host(&owned_host, lookup.as_ref()));
+    });
+    match receiver.recv_timeout(remaining) {
+        Ok(Ok(addresses)) => Ok(addresses),
+        Ok(Err(error)) => Err(UrlFetchError::new(format!(
+            "Failed to resolve URL host {host}: {error}"
+        ))),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(deadline.timeout_error(FetchPhase::Dns, url)),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(UrlFetchError::new(format!(
+            "Failed to resolve URL host {host}: lookup stopped before answering"
+        ))),
+    }
 }
 
 fn reject_private_ip(host: &str, ip: IpAddr) -> Result<(), UrlFetchError> {
@@ -1182,10 +1976,28 @@ fn element_attr_value<'a>(element: &'a Element<'_>, name: &str) -> Option<&'a st
 enum BodyReadEvent {
     Chunk(Vec<u8>),
     Done,
-    Error(io::ErrorKind, String),
+    /// A read failed after waiting this long for data.
+    Error(io::ErrorKind, String, Duration),
 }
 
-fn read_response_body(response: HttpResponse, url: &str) -> Result<(Vec<u8>, bool), UrlFetchError> {
+/// Read at most [`MAX_RESPONSE_BYTES`] (plus one lookahead byte) of the body.
+/// Two limits stop a slow body: no data for [`BODY_CHUNK_TIMEOUT`], and the
+/// fetch deadline, which also stops a server that sends a little data just
+/// often enough to avoid the stall limit.
+///
+/// Whether a failed read was a timeout is decided mainly by time: reqwest
+/// reports both its per-read limit and its whole-request limit as an
+/// `io::Error` of kind `Other` (its blocking `Read` impl wraps the timeout
+/// with `into_io`), and which of those timers or this function's own wait
+/// fires first differs between platforms. So a failed read is a body-phase
+/// timeout when the fetch deadline has passed, when the read had waited at
+/// least [`BODY_CHUNK_TIMEOUT`] for data, or when its kind is `TimedOut` or
+/// `WouldBlock`.
+fn read_response_body(
+    response: impl Read + Send + 'static,
+    url: &str,
+    deadline: &FetchDeadline,
+) -> Result<(Vec<u8>, bool), UrlFetchError> {
     // Bound the producer, not just its consumer: an unbounded channel can
     // queue the entire response before the caller notices the byte ceiling.
     let (tx, rx) = mpsc::sync_channel(1);
@@ -1195,6 +2007,7 @@ fn read_response_body(response: HttpResponse, url: &str) -> Result<(Vec<u8>, boo
         let mut response = response.take(MAX_RESPONSE_BYTES + 1);
         let mut buffer = [0u8; 16 * 1024];
         loop {
+            let read_started = Instant::now();
             match response.read(&mut buffer) {
                 Ok(0) => {
                     let _ = tx.send(BodyReadEvent::Done);
@@ -1208,7 +2021,8 @@ fn read_response_body(response: HttpResponse, url: &str) -> Result<(Vec<u8>, boo
                 Err(error) => {
                     let kind = error.kind();
                     let message = error.to_string();
-                    let _ = tx.send(BodyReadEvent::Error(kind, message));
+                    let waited = read_started.elapsed();
+                    let _ = tx.send(BodyReadEvent::Error(kind, message, waited));
                     break;
                 }
             }
@@ -1217,8 +2031,19 @@ fn read_response_body(response: HttpResponse, url: &str) -> Result<(Vec<u8>, boo
 
     let mut chunks = Vec::new();
     let mut total = 0u64;
+    let slow_body_error = || {
+        if deadline.expired() {
+            deadline.timeout_error(FetchPhase::Body, url)
+        } else {
+            body_stall_error(url)
+        }
+    };
     loop {
-        match rx.recv_timeout(BODY_CHUNK_TIMEOUT) {
+        let wait = BODY_CHUNK_TIMEOUT.min(deadline.remaining());
+        if wait.is_zero() {
+            return Err(deadline.timeout_error(FetchPhase::Body, url));
+        }
+        match rx.recv_timeout(wait) {
             Ok(BodyReadEvent::Chunk(chunk)) => {
                 let remaining = (MAX_RESPONSE_BYTES - total) as usize;
                 chunks.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
@@ -1228,15 +2053,10 @@ fn read_response_body(response: HttpResponse, url: &str) -> Result<(Vec<u8>, boo
                 }
             }
             Ok(BodyReadEvent::Done) => return Ok((chunks, false)),
-            Ok(BodyReadEvent::Error(kind, _message)) if is_body_stall_kind(kind) => {
-                return Err(body_stall_error(url));
+            Ok(BodyReadEvent::Error(kind, message, waited)) => {
+                return Err(body_read_failure(deadline, url, kind, &message, waited));
             }
-            Ok(BodyReadEvent::Error(_, message)) => {
-                return Err(UrlFetchError::new(format!(
-                    "Failed to read response body for {url}: {message}"
-                )));
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => return Err(body_stall_error(url)),
+            Err(mpsc::RecvTimeoutError::Timeout) => return Err(slow_body_error()),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(UrlFetchError::new(format!(
                     "Failed to read response body for {url}: body reader stopped unexpectedly"
@@ -1246,11 +2066,34 @@ fn read_response_body(response: HttpResponse, url: &str) -> Result<(Vec<u8>, boo
     }
 }
 
+/// How a failed body read is reported. It is a body-phase timeout when the
+/// fetch deadline has passed or the read had waited at least
+/// [`BODY_CHUNK_TIMEOUT`], whatever its kind (see [`read_response_body`]);
+/// the kinds `TimedOut` and `WouldBlock` also count as a body stall.
+fn body_read_failure(
+    deadline: &FetchDeadline,
+    url: &str,
+    kind: io::ErrorKind,
+    message: &str,
+    waited: Duration,
+) -> UrlFetchError {
+    if deadline.expired() {
+        return deadline.timeout_error(FetchPhase::Body, url);
+    }
+    if waited >= BODY_CHUNK_TIMEOUT || is_body_stall_kind(kind) {
+        return body_stall_error(url);
+    }
+    UrlFetchError::new(format!("Failed to read response body for {url}: {message}"))
+}
+
 fn body_stall_error(url: &str) -> UrlFetchError {
-    UrlFetchError::new(format!(
-        "Body read stalled (no data for {}ms) fetching {url}",
-        BODY_CHUNK_TIMEOUT.as_millis()
-    ))
+    UrlFetchError::timeout(
+        FetchPhase::Body,
+        format!(
+            "Body read stalled (no data for {}ms) fetching {url}",
+            BODY_CHUNK_TIMEOUT.as_millis()
+        ),
+    )
 }
 
 fn is_body_stall_kind(kind: io::ErrorKind) -> bool {
@@ -1738,3 +2581,7 @@ mod tests {
         assert_eq!(code_fence_for("``` and ````"), "`````");
     }
 }
+
+#[cfg(test)]
+#[path = "url_fetch_deadline_tests.rs"]
+mod deadline_tests;

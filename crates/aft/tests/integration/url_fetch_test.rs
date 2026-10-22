@@ -347,15 +347,15 @@ fn body_read_stall_aborts_within_timeout() {
     );
 
     assert_eq!(resp["success"], false, "stall should fail: {resp:?}");
-    assert!(resp["message"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("Body read stalled"));
-    // The product timeout is BODY_CHUNK_TIMEOUT (15s). The bound checks that
-    // the abort FIRED (vs riding out the mock's 120s stall), not its
-    // precision — a contended Windows CI runner adds tens of seconds of
-    // scheduling overhead on top of the timer (memory 6987), which flaked the
-    // old 22s bound.
+    // The stall now ends at the fetch deadline (the call budget less a reply
+    // margin) or at the per-chunk stall limit, whichever comes first; both
+    // are reported as a body-phase timeout.
+    assert_eq!(resp["code"], "url_fetch_timeout", "{resp:?}");
+    assert_eq!(resp["phase"], "body", "{resp:?}");
+    // The bound checks that the abort FIRED (vs riding out the mock's 120s
+    // stall), not its precision — a contended Windows CI runner adds tens of
+    // seconds of scheduling overhead on top of the timer (memory 6987), which
+    // flaked the old 22s bound.
     assert!(
         started.elapsed() < Duration::from_secs(75),
         "stall timeout took too long: {:?}",

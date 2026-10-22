@@ -206,26 +206,81 @@ pub struct GithubReadDeferred {
     receiver: crate::response_finalize::PendingResponseReceiver<
         Result<GithubReadCompletion, GithubReadError>,
     >,
+    late: GithubReadLateAnswer,
+}
+
+/// The answer for a caller who stops waiting before the live fetch finishes:
+/// the cached copy, with the caller's selection and labelled as a copy, or
+/// [`GithubReadError::Pending`] when there is none. The fetch itself keeps
+/// running and stores its result in the cache.
+pub struct GithubReadLateAnswer {
+    fallback: Option<(GithubReadCacheEntry, GithubReadSelector)>,
+}
+
+impl GithubReadLateAnswer {
+    /// `waited` is how long the caller waited, for the label.
+    pub fn answer(
+        &self,
+        waited: std::time::Duration,
+    ) -> Result<GithubReadCompletion, GithubReadError> {
+        let still_running = format!(
+            "GitHub did not answer within {}s; the read continues in the background",
+            waited.as_secs_f64().ceil() as u64
+        );
+        match &self.fallback {
+            Some((entry, selector)) => Ok(complete(
+                cached_fallback_text(entry, &GithubReadError::FetchFailed(still_running)),
+                selector.clone(),
+                GithubReadFreshness::CachedFallback,
+                Vec::new(),
+                None,
+            )),
+            None => Err(GithubReadError::Pending(format!(
+                "{still_running} and its result will be cached; retry this call shortly"
+            ))),
+        }
+    }
 }
 
 impl GithubReadDeferred {
-    pub(crate) fn into_receiver(
+    /// Split the handle for a caller that polls the result channel itself and
+    /// gives the late answer when its own deadline passes.
+    pub(crate) fn into_parts(
         self,
-    ) -> crate::response_finalize::PendingResponseReceiver<
-        Result<GithubReadCompletion, GithubReadError>,
-    > {
-        self.receiver
+    ) -> (
+        crate::response_finalize::PendingResponseReceiver<
+            Result<GithubReadCompletion, GithubReadError>,
+        >,
+        GithubReadLateAnswer,
+    ) {
+        (self.receiver, self.late)
     }
 
     pub fn try_complete(&self) -> Option<Result<GithubReadCompletion, GithubReadError>> {
         match self.receiver.try_recv() {
             Ok(result) => Some(result),
             Err(mpsc::TryRecvError::Empty) => None,
-            Err(mpsc::TryRecvError::Disconnected) => Some(Err(GithubReadError::FetchFailed(
-                "GitHub read worker stopped before completing".to_string(),
-            ))),
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err(worker_stopped())),
         }
     }
+
+    /// Wait for the read until `deadline`. If the live fetch is still running
+    /// then, give the late answer (see [`GithubReadLateAnswer`]).
+    pub fn wait_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<GithubReadCompletion, GithubReadError> {
+        let waited = deadline.saturating_duration_since(std::time::Instant::now());
+        match self.receiver.recv_timeout(waited) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(worker_stopped()),
+            Err(mpsc::RecvTimeoutError::Timeout) => self.late.answer(waited),
+        }
+    }
+}
+
+pub(crate) fn worker_stopped() -> GithubReadError {
+    GithubReadError::FetchFailed("GitHub read worker stopped before completing".to_string())
 }
 
 /// The initial outcome for a GitHub read. Every read is deferred because it
@@ -384,7 +439,10 @@ impl GithubReadEngine {
                     .map(|diff| diff.page(selector));
                 let _ = sender.send(result);
             });
-            return Ok(GithubReadStart::Deferred(GithubReadDeferred { receiver }));
+            return Ok(GithubReadStart::Deferred(GithubReadDeferred {
+                receiver,
+                late: GithubReadLateAnswer { fallback: None },
+            }));
         }
         let fallback = self.cache_fallback_for_request(&request);
         Ok(self.defer_fetch(request, selector, view, fallback))
@@ -473,6 +531,7 @@ impl GithubReadEngine {
     ) -> GithubReadStart {
         let slot = self.flight_slot_for_request(&request);
         let fetch_request = request.clone();
+        let timeout_fallback = fallback.clone().map(|entry| (entry, selector.clone()));
         // Every coalesced caller owns its own wake-bound sender. Capturing only
         // the leader's connection would leave followers waiting on idle routes.
         let (sender, receiver) = crate::response_finalize::pending_response_channel();
@@ -546,7 +605,12 @@ impl GithubReadEngine {
                 }
             });
         }
-        GithubReadStart::Deferred(GithubReadDeferred { receiver })
+        GithubReadStart::Deferred(GithubReadDeferred {
+            receiver,
+            late: GithubReadLateAnswer {
+                fallback: timeout_fallback,
+            },
+        })
     }
 }
 
@@ -1417,5 +1481,93 @@ mod tests {
             }
         }
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A gated fetcher whose live fetch stays running until the test lets it
+    /// finish, the sender that does so, and the receiver of its start reports
+    /// (kept alive so the fetcher can report).
+    fn running_fetch() -> (
+        Arc<GatedFetcher>,
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(8);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let fetcher = Arc::new(GatedFetcher {
+            calls: AtomicUsize::new(0),
+            started: started_tx,
+            release: Mutex::new(Some(release_rx)),
+        });
+        (fetcher, release_tx, started_rx)
+    }
+
+    #[test]
+    fn a_read_still_running_at_the_deadline_answers_with_the_labelled_cached_copy() {
+        let (fetcher, release, _started) = running_fetch();
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::with_entry("# Cached issue\n", 1_234)),
+            fetcher,
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(2_000)),
+        );
+        let GithubReadStart::Deferred(pending) = engine
+            .start(
+                &enabled_gh_read(),
+                GithubReadRequest::parse("issue://owner/repo/1", "/fixture", "identity", None)
+                    .unwrap(),
+                GithubReadSelector::default(),
+            )
+            .unwrap()
+        else {
+            panic!("a live read defers");
+        };
+        let started = std::time::Instant::now();
+        let completion = pending
+            .wait_until(started + std::time::Duration::from_millis(200))
+            .expect("the cached copy answers");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(completion.freshness, GithubReadFreshness::CachedFallback);
+        assert!(
+            completion.content.starts_with(
+                "[cached copy from 1970-01-01T00:00:01.234Z; live fetch failed: GitHub did not answer within 1s; the read continues in the background]\n"
+            ),
+            "{}",
+            completion.content
+        );
+        assert!(completion.content.ends_with("# Cached issue\n"));
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn a_read_still_running_at_the_deadline_without_a_cached_copy_is_pending() {
+        let (fetcher, release, _started) = running_fetch();
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            fetcher,
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(2_000)),
+        );
+        let start = engine
+            .start(
+                &enabled_gh_read(),
+                request(None),
+                GithubReadSelector::default(),
+            )
+            .unwrap();
+        // The call budget, less the reply margin, bounds the wait.
+        let _call = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(
+            std::time::Duration::from_millis(1_300),
+        )));
+        let started = std::time::Instant::now();
+        let error = crate::commands::read::wait_for_github_read(start)
+            .expect_err("no copy can stand in for the running read");
+        // The wait ends one reply margin before the 1.3 s call budget.
+        assert!(started.elapsed() < std::time::Duration::from_millis(1_300));
+        assert_eq!(error.code(), "github_read_pending", "{error}");
+        assert!(
+            error.to_string().contains("retry this call shortly"),
+            "{error}"
+        );
+        release.send(()).unwrap();
     }
 }
