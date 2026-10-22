@@ -1233,6 +1233,11 @@ pub(crate) struct BgTask {
     /// that lock. Reply deadlines must not confuse a queued state read with a
     /// runner that has not accepted the job.
     runon_launch_state: Mutex<Option<RunonLaunchState>>,
+    /// A remote worker thread is running for this task. At most one may run
+    /// per task: `start_remote_worker` claims this flag before spawning one,
+    /// and the worker clears it as its last step.
+    #[cfg(unix)]
+    pub(crate) remote_worker_running: AtomicBool,
     /// Cache construction is serialized independently of task state: renderers
     /// can read artifacts and invoke callbacks without holding the state lock.
     terminal_render: Mutex<()>,
@@ -4140,6 +4145,8 @@ impl BgTaskRegistry {
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
+            #[cfg(unix)]
+            remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -4498,6 +4505,8 @@ impl BgTaskRegistry {
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
+            #[cfg(unix)]
+            remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -4753,6 +4762,8 @@ impl BgTaskRegistry {
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
+            #[cfg(unix)]
+            remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -5835,12 +5846,7 @@ impl BgTaskRegistry {
         }
         #[cfg(unix)]
         if metadata.remote.is_some() && !metadata.is_terminal() {
-            let task_id = metadata.task_id.clone();
-            self.insert_rehydrated_task(metadata, paths, true)?;
-            if !self.hold_remote_worker(&task_id) {
-                self.resume_remote_task(&task_id)?;
-            }
-            return Ok(());
+            return self.restore_claimed_remote_task(metadata, paths);
         }
         let (marker, process_alive) = if matches!(
             metadata.status,
@@ -9543,10 +9549,11 @@ impl BgTaskRegistry {
     /// local fallback) without running anything.
     ///
     /// A held task with no recorded cancellation (its pause failed part way)
-    /// is left without a worker. Its saved record stays unfinished, so the
-    /// replay of its project resumes it later, as it would have without this
-    /// call; starting it here would run a command of a scope its owner is
-    /// stopping.
+    /// gets no worker here; starting one would run a command of a scope its
+    /// owner is stopping. If a project's replay already registered the same
+    /// task (see [`SavedRemoteTaskClaim`]), that project registry runs its
+    /// worker, as its replay would have. Otherwise the task's saved record
+    /// stays unfinished, so a later replay of its project resumes it.
     pub(crate) fn start_held_remote_workers(&self) {
         let held = self
             .inner
@@ -9566,18 +9573,155 @@ impl BgTaskRegistry {
                         .is_some_and(|remote| remote.cancel_requested)
                 })
             });
-            if !cancel_recorded {
-                log::warn!(
-                    "saved remote task {task_id} was not paused; left for its project's replay"
-                );
-                continue;
-            }
-            if let Err(error) = self.resume_remote_task(&task_id) {
+            // Settled under the claim lock, so a replay registering the task
+            // at the same moment sees either the hold or its outcome.
+            let mut claims = saved_remote_task_claims()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let started = if cancel_recorded {
+                if let Some(claim) = claims.get_mut(&task_id) {
+                    claim.held = false;
+                }
+                self.resume_remote_task(&task_id)
+            } else {
+                let adopter = claims.get(&task_id).and_then(|claim| {
+                    claim
+                        .adopters
+                        .iter()
+                        .filter_map(std::sync::Weak::upgrade)
+                        .map(|inner| BgTaskRegistry { inner })
+                        .find(|registry| {
+                            registry.task(&task_id).is_some() && !registry.holds_remote_workers()
+                        })
+                });
+                match adopter {
+                    Some(adopter) => {
+                        if let Some(claim) = claims.get_mut(&task_id) {
+                            claim.held = false;
+                        }
+                        adopter.resume_remote_task(&task_id)
+                    }
+                    None => {
+                        // This registry is detached next, which drops the
+                        // task; a later replay builds it again from its record.
+                        claims.remove(&task_id);
+                        log::warn!(
+                            "saved remote task {task_id} was not paused; left for its project's replay"
+                        );
+                        Ok(())
+                    }
+                }
+            };
+            drop(claims);
+            if let Err(error) = started {
                 log::warn!("saved remote task {task_id}: worker could not start: {error}");
             }
         }
         #[cfg(not(unix))]
         let _ = held;
+    }
+
+    /// Whether this registry is holding restored remote tasks without
+    /// workers for an owner's pause (see `recover_saved_scope_tasks`).
+    #[cfg(unix)]
+    fn holds_remote_workers(&self) -> bool {
+        self.inner
+            .held_remote_workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Restore an unfinished saved remote task into this registry, sharing
+    /// one in-memory task with any other registry that restored it (see
+    /// [`SavedRemoteTaskClaim`]).
+    ///
+    /// The first registry to restore the task builds it from `metadata` and
+    /// owns its worker: it starts the worker now, or holds it back for a
+    /// pause. A later registry registers that same task instead, so a stop
+    /// recorded through either registry reaches the one state every worker
+    /// check reads, and it starts no worker of its own while the owner holds
+    /// the task or a worker runs.
+    #[cfg(unix)]
+    fn restore_claimed_remote_task(
+        &self,
+        metadata: PersistedTask,
+        paths: TaskPaths,
+    ) -> Result<(), String> {
+        let task_id = metadata.task_id.clone();
+        // Held while the task is built and its worker started, so another
+        // registry can neither build a second copy nor start a worker first.
+        let mut claims = saved_remote_task_claims()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        claims.retain(|_, claim| claim.task.strong_count() > 0);
+        if let Some(claim) = claims.get_mut(&task_id) {
+            if let Some(task) = claim.task.upgrade() {
+                claim.adopters.push(Arc::downgrade(&self.inner));
+                let held = claim.held;
+                self.register_claimed_task(&task)?;
+                // The owner's worker stopped without finishing the task: run
+                // it here, unless this registry is itself holding tasks for a
+                // pause, which must reach a task before its worker does.
+                if !held
+                    && !self.holds_remote_workers()
+                    && !task.remote_worker_running.load(Ordering::Acquire)
+                    && !task.is_terminal()
+                {
+                    self.resume_remote_task(&task_id)?;
+                }
+                return Ok(());
+            }
+        }
+        self.insert_rehydrated_task(metadata, paths, true)?;
+        let task = self
+            .task(&task_id)
+            .ok_or_else(|| format!("{task_id}: restored remote task missing"))?;
+        let held = self.hold_remote_worker(&task_id);
+        claims.insert(
+            task_id.clone(),
+            SavedRemoteTaskClaim {
+                task: Arc::downgrade(&task),
+                held,
+                adopters: Vec::new(),
+            },
+        );
+        if !held {
+            self.resume_remote_task(&task_id)?;
+        }
+        Ok(())
+    }
+
+    /// Make a task another registry restored addressable here too, as
+    /// `insert_rehydrated_task` registers a task it builds.
+    #[cfg(unix)]
+    fn register_claimed_task(&self, task: &Arc<BgTask>) -> Result<(), String> {
+        self.record_live_delivery_session(&task.session_id);
+        self.remember_session_harness(task);
+        {
+            let mut tasks = self
+                .inner
+                .tasks
+                .lock()
+                .map_err(|_| "background task registry lock poisoned".to_string())?;
+            if tasks.contains_key(&task.task_id) {
+                return Ok(());
+            }
+            tasks.insert(task.task_id.clone(), Arc::clone(task));
+        }
+        self.inner
+            .cleanup_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(task.task_id.clone());
+        if task.is_running() {
+            self.inner
+                .watchdog_tasks
+                .lock()
+                .map_err(|_| "background watchdog lock poisoned")?
+                .insert(task.task_id.clone(), Arc::clone(task));
+        }
+        Ok(())
     }
 
     pub(crate) fn wait_owner_pause_cancel(
@@ -9811,6 +9955,8 @@ impl BgTaskRegistry {
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
+            #[cfg(unix)]
+            remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -12708,6 +12854,36 @@ type PersistedGcSlots = HashMap<PathBuf, PersistedGcSlot>;
 fn persisted_gc_slots() -> &'static Mutex<PersistedGcSlots> {
     static SLOTS: std::sync::OnceLock<Mutex<PersistedGcSlots>> = std::sync::OnceLock::new();
     SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The one in-memory task for an unfinished saved remote task, shared by
+/// every registry in this process that restores it.
+///
+/// Two paths restore saved remote tasks: a project's replay when it binds,
+/// and `recover_saved_scope_tasks` when the owner pauses a scope whose
+/// project has not bound since the module restarted. Both can run at once.
+/// If each built its own copy of a task, the copy the pause did not reach
+/// would have its own worker, which reads its own uncancelled state and can
+/// send the command to the runner after the owner stopped it. Instead the
+/// first path to restore a task builds it and owns its worker, and the other
+/// path registers the same task (see `restore_claimed_remote_task`).
+#[cfg(unix)]
+struct SavedRemoteTaskClaim {
+    task: std::sync::Weak<BgTask>,
+    /// The owning registry holds the task without a worker until an owner's
+    /// pause is recorded (see `hold_remote_worker`).
+    held: bool,
+    /// Registries that registered the task after it was built.
+    adopters: Vec<std::sync::Weak<RegistryInner>>,
+}
+
+/// Claims by task id. An entry lives while some registry or worker still
+/// holds its task; dead entries are dropped on the next restore.
+#[cfg(unix)]
+fn saved_remote_task_claims() -> &'static Mutex<HashMap<String, SavedRemoteTaskClaim>> {
+    static CLAIMS: std::sync::OnceLock<Mutex<HashMap<String, SavedRemoteTaskClaim>>> =
+        std::sync::OnceLock::new();
+    CLAIMS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn modified_within(path: &Path, grace: Duration) -> bool {

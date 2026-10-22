@@ -1876,7 +1876,16 @@ impl BgTaskRegistry {
         task: Arc<BgTask>,
         initial: Option<(Result<RunRequest, exec::Error>, LocalFallback)>,
     ) -> Result<(), String> {
+        // Two recovery paths can restore the same saved task (see
+        // `SavedRemoteTaskClaim`); a second worker would act on the task
+        // without seeing what the first one decided, so only one may run.
+        if task.remote_worker_running.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        tests::note_remote_worker_start(&task.task_id);
         let registry = self.clone();
+        let spawned = Arc::clone(&task);
         std::thread::Builder::new()
             .name(format!("aft-remote-{}", task.task_id))
             .spawn(move || {
@@ -1888,6 +1897,7 @@ impl BgTaskRegistry {
                 if let Err(error) = result {
                     if registry.finish_owner_pause_cancel(&task, Err(error.clone())) {
                         task.remote_launch_ready.store(true, Ordering::Release);
+                        task.remote_worker_running.store(false, Ordering::Release);
                         #[cfg(test)]
                         tests::note_remote_worker_exit(&task.task_id);
                         return;
@@ -1918,10 +1928,16 @@ impl BgTaskRegistry {
                 // Refusals must be rendered from their settled terminal state,
                 // not raced against the worker that is still recording them.
                 task.remote_launch_ready.store(true, Ordering::Release);
+                task.remote_worker_running.store(false, Ordering::Release);
                 #[cfg(test)]
                 tests::note_remote_worker_exit(&task.task_id);
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                spawned
+                    .remote_worker_running
+                    .store(false, Ordering::Release);
+                e.to_string()
+            })?;
         Ok(())
     }
 

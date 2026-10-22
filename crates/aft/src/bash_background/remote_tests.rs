@@ -161,6 +161,40 @@ pub(super) fn note_remote_worker_exit(task: &str) {
         .lock()
         .unwrap()
         .insert(task.to_owned());
+    remote_worker_counts()
+        .lock()
+        .unwrap()
+        .entry(task.to_owned())
+        .or_default()
+        .1 += 1;
+}
+
+/// Per task id: remote worker threads started, and those that reached their
+/// last step.
+fn remote_worker_counts() -> &'static Mutex<HashMap<String, (usize, usize)>> {
+    static COUNTS: std::sync::OnceLock<Mutex<HashMap<String, (usize, usize)>>> =
+        std::sync::OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Called as a remote worker thread for `task` is about to be spawned.
+pub(super) fn note_remote_worker_start(task: &str) {
+    remote_worker_counts()
+        .lock()
+        .unwrap()
+        .entry(task.to_owned())
+        .or_default()
+        .0 += 1;
+}
+
+/// How many remote workers were started for `task`, and how many stopped.
+fn remote_workers(task: &str) -> (usize, usize) {
+    remote_worker_counts()
+        .lock()
+        .unwrap()
+        .get(task)
+        .copied()
+        .unwrap_or_default()
 }
 
 /// Wait until the task's remote worker reaches its last step, so a test can
@@ -6981,22 +7015,31 @@ async fn kill_scope_with_saved_tasks(
     storage: &Path,
     scope: &subc_protocol::scope::ScopeStamp,
 ) -> crate::protocol::Response {
-    let storage = storage.to_path_buf();
-    let scope = scope.clone();
     tokio::time::timeout(
         Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || {
-            crate::commands::bash_kill_scope::handle_bash_kill_scope_with_saved_tasks(
-                serde_json::json!({"scope": scope}),
-                Some(&scope.owner),
-                &[],
-                Some(&storage),
-            )
-        }),
+        start_kill_scope_with_saved_tasks(storage, scope),
     )
     .await
     .expect("bash.kill_scope must reply")
     .unwrap()
+}
+
+/// Start the owner's `bash.kill_scope` as `kill_scope_with_saved_tasks`
+/// runs it, off the test runtime, without waiting for its reply.
+fn start_kill_scope_with_saved_tasks(
+    storage: &Path,
+    scope: &subc_protocol::scope::ScopeStamp,
+) -> tokio::task::JoinHandle<crate::protocol::Response> {
+    let storage = storage.to_path_buf();
+    let scope = scope.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::commands::bash_kill_scope::handle_bash_kill_scope_with_saved_tasks(
+            serde_json::json!({"scope": scope}),
+            Some(&scope.owner),
+            &[],
+            Some(&storage),
+        )
+    })
 }
 
 /// The reply names both stopped tasks, the remote one settled as sent, and
@@ -7079,6 +7122,137 @@ async fn bash_kill_scope_never_resubmits_a_due_saved_draining_retry() {
         "the paused draining retry was resubmitted: {reply:?}"
     );
     assert_saved_pause_reply(&reply, &task_id, &local_task, local_pid).await;
+    assert_saved_paused(&json);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
+/// A `runon` task of `scope` whose draining retry is saved and due, as a
+/// module restart leaves it: its worker stopped and its registry is gone.
+/// Returns the runner, the paused retry clock, the task id and the path of
+/// its saved record. The runner keeps refusing as draining, and accepts a
+/// second connection, so a wrongly started worker can reach it.
+async fn saved_due_draining_retry(
+    dir: &Path,
+    scope: &subc_protocol::scope::ScopeStamp,
+) -> (
+    crate::exec_remote::wire_tests::Daemon,
+    PausedDrainingClock,
+    String,
+    PathBuf,
+) {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+        Script::Draining {
+            refusals: u32::MAX,
+            retry_after_ms: Some(200),
+        },
+        "exec-remote/v1",
+        2,
+    )
+    .await;
+    let mut clock = PausedDrainingClock::new(dir);
+    stopped_draining_roots().lock().unwrap().insert(dir.into());
+    let original = registry();
+    let task_id = start_scoped_runon_retry(&original, dir, daemon.connection.clone(), scope);
+    clock.expect_event(DrainingClockEvent::Stopped).await;
+    wait_for("the original worker must stop", || {
+        (remote_workers(&task_id) == (1, 1)).then_some(())
+    })
+    .await;
+    let json = original.task(&task_id).unwrap().paths.json.clone();
+    original.detach();
+    clock.advance(200);
+    (daemon, clock, task_id, json)
+}
+
+/// The reply of a pause that stopped the saved task `task` and settled it.
+fn assert_one_saved_task_paused(reply: &crate::protocol::Response, task: &str) {
+    assert!(reply.success, "{reply:?}");
+    let killed = reply.data["killed"].as_array().unwrap();
+    assert_eq!(killed.len(), 1, "{reply:?}");
+    assert_eq!(killed[0]["task_id"], task, "{reply:?}");
+    assert_eq!(killed[0]["from_saved_record"], true, "{reply:?}");
+    assert_eq!(killed[0]["remote"]["cancel"], "sent", "{reply:?}");
+}
+
+/// After a module restart, the owner pauses a scope whose saved draining
+/// retry is due, and the task's project binds while `bash.kill_scope` holds
+/// the copy it recovered, not yet paused. The bind must register that same
+/// task, held without a worker, not build a second copy whose worker would
+/// resubmit the command the owner is stopping.
+#[tokio::test]
+async fn bash_kill_scope_recovery_then_a_bind_share_one_saved_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = owner_scope("saved-recovery-then-bind");
+    let (daemon, _clock, task_id, json) = saved_due_draining_retry(dir.path(), &scope).await;
+    let (reached, release) = crate::commands::bash_kill_scope::saved_recovery_gate::arm(dir.path());
+    let operation = start_kill_scope_with_saved_tasks(dir.path(), &scope);
+    tokio::time::timeout(Duration::from_secs(30), reached)
+        .await
+        .expect("bash.kill_scope must recover the saved task")
+        .unwrap();
+    let project = registry();
+    project.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        remote_workers(&task_id),
+        (1, 1),
+        "the bind started a worker before the pause"
+    );
+    release.send(()).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(30), operation)
+        .await
+        .expect("bash.kill_scope must reply")
+        .unwrap();
+    assert_one_saved_task_paused(&reply, &task_id);
+    // One worker since the restart: the one the pause started to settle it.
+    assert_eq!(remote_workers(&task_id).0, 2, "{reply:?}");
+    wait_for("the paused task's worker must stop", || {
+        (remote_workers(&task_id) == (2, 2)).then_some(())
+    })
+    .await;
+    // The bound project sees the owner's stop on the task it registered.
+    assert_paused(&project, &task_id);
+    assert_saved_paused(&json);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
+/// After a module restart, the task's project binds and its worker is about
+/// to resubmit the saved, due draining retry when the owner's
+/// `bash.kill_scope` recovers the scope's saved tasks, before the module
+/// lists the project's registry as live. The pause must register the bound
+/// project's task, so that its worker sees the stop; a private copy would be
+/// paused while that worker resubmits.
+#[tokio::test]
+async fn a_bind_then_bash_kill_scope_recovery_share_one_saved_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = owner_scope("saved-bind-then-recovery");
+    let (daemon, _clock, task_id, json) = saved_due_draining_retry(dir.path(), &scope).await;
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeBudgetCheck);
+    let project = registry();
+    project.replay_session(dir.path(), "session").unwrap();
+    gate.reached().await;
+    assert_eq!(remote_workers(&task_id), (2, 1));
+    let operation = start_kill_scope_with_saved_tasks(dir.path(), &scope);
+    wait_for("the pause must be saved", || {
+        let saved = read_task(&json).ok()?;
+        (saved.status == BgTaskStatus::Killed
+            && saved.status_reason.as_deref()
+                == Some(crate::bash_background::registry::OWNER_PAUSED_REASON))
+        .then_some(())
+    })
+    .await;
+    gate.release();
+    let reply = tokio::time::timeout(Duration::from_secs(30), operation)
+        .await
+        .expect("bash.kill_scope must reply")
+        .unwrap();
+    assert_one_saved_task_paused(&reply, &task_id);
+    // The bound project's worker is the only one since the restart.
+    assert_eq!(remote_workers(&task_id).0, 2, "{reply:?}");
+    wait_for("the paused task's worker must stop", || {
+        (remote_workers(&task_id) == (2, 2)).then_some(())
+    })
+    .await;
+    assert_paused(&project, &task_id);
     assert_saved_paused(&json);
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
 }
