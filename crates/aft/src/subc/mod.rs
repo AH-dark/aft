@@ -201,6 +201,7 @@ mod access_grants;
 mod bash;
 mod bind_log;
 mod call_policy;
+mod carrier_read_only;
 #[cfg(test)]
 mod tool_result_tests;
 // The grant tests run real shell commands, which need a POSIX shell.
@@ -5547,6 +5548,14 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
+                        if let (Some(identity), Ok(body)) = (routes.get(&route), decoded.body()) {
+                            if let Err(error) = carrier_read_only::admit(identity, body) {
+                                if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                        }
                         // A codemode program's tool call runs with its head agent's
                         // access: every step below sees the head-derived identity.
                         let codemode_routes;
@@ -9649,6 +9658,9 @@ async fn handle_tool_call(
         phase_trace.received_at(),
         &envelope,
     );
+    if let Err(error) = carrier_read_only::admit(&identity, &envelope) {
+        return send_provider_error(tx, metrics, frame, error).await;
+    }
     if envelope
         .get("name")
         .and_then(Value::as_str)
@@ -9772,6 +9784,9 @@ async fn handle_tool_call(
         ) {
             return send_provider_error(tx, metrics, frame, error).await;
         }
+        if carrier_read_only::restricted(&identity) {
+            call.name = carrier_read_only::internal_name(&call.name).to_owned();
+        }
         if let Err(error) =
             admit_confined_call_name(executor, &identity, &mut call.name, confinement.as_ref())
         {
@@ -9844,6 +9859,9 @@ async fn handle_tool_call(
     };
     if identity.role == tool_provider::RouteRole::Legacy {
         if let RouteRequest::ToolCall(call) = &mut route_request {
+            if carrier_read_only::restricted(&identity) {
+                call.name = carrier_read_only::internal_name(&call.name).to_owned();
+            }
             if let Err(error) =
                 admit_confined_call_name(executor, &identity, &mut call.name, confinement.as_ref())
             {
@@ -10102,6 +10120,7 @@ async fn handle_tool_call(
 
     if matches!(bind_trust, BindTrust::Untrusted)
         && is_bash_family_tool(&bare_name)
+        && !carrier_read_only::observes_tasks(&identity, &bare_name)
         && (!matches!(bare_name.as_str(), "bash" | "powershell")
             || !identity.consumer_elicitation_capable)
     {

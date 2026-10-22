@@ -720,6 +720,34 @@ fn code(reply: &Value) -> &str {
     reply["structuredContent"]["code"].as_str().unwrap_or("")
 }
 
+#[tokio::test]
+async fn occipital_outside_read_refuses_without_any_permission_ask() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let mut carrier = identity(&f.worker.project_root, f.worker.scope.clone());
+    let data = Arc::get_mut(&mut carrier.0).unwrap();
+    if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
+        *principal_id = Some("reserved:occipital".into());
+    }
+    data.consumer_elicitation_capable = true;
+    let target = f.head_root.join("shared.txt");
+    let denied = f.read(&carrier, &target, 801).await;
+    assert_eq!(denied["isError"], true, "{denied}");
+    assert!(!text(&denied).contains("head-owned contents"), "{denied}");
+    assert!(!code(&denied).is_empty(), "{denied}");
+    assert!(f.fake.calls("consent.request").is_empty());
+    assert!(f.asks().is_empty());
+    assert!(f.worker_grants().is_empty());
+    assert!(!text(&denied).contains("permission_required"), "{denied}");
+
+    std::fs::write(carrier.project_root.join("local.txt"), "local-read-marker").unwrap();
+    let local = f
+        .read(&carrier, &carrier.project_root.join("local.txt"), 802)
+        .await;
+    assert_eq!(local["isError"], false, "{local}");
+    assert!(text(&local).contains("local-read-marker"), "{local}");
+}
+
 fn text(reply: &Value) -> String {
     reply["content"]
         .as_array()

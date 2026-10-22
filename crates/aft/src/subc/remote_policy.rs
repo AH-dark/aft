@@ -136,6 +136,26 @@ pub(super) fn catalog(
     let powershell = crate::bash_background::powershell_available();
     let worker_wait_max_ms = ctx.config().bash.worker_wait_max_ms;
     let (request, catalog_preset) = tool_provider::validate_catalog_request(body)?;
+    if super::carrier_read_only::restricted(identity) {
+        // Catalog discovery must not let a read-only route persist policy or
+        // grants on behalf of the session it is observing.
+        for name in ["allow_paths", "mode", "remote_exec", "siblings", "confine"] {
+            if original.contains_key(name) {
+                return Err(cortexkit_role_tool_provider::errors::invalid_request(
+                    &format!("params.{name}"),
+                    "read-only routes cannot change session policy",
+                ));
+            }
+        }
+        return tool_provider::catalog_for_rich_ui_request(
+            request,
+            catalog_preset,
+            &identity.disabled_tools,
+            ctx.config().revision_reads,
+            worker_wait_max_ms,
+            confined(ctx, identity)?,
+        );
+    }
     let routing_policy = if preset == "worker"
         && (original.contains_key("remote_exec")
             || original.contains_key("siblings")
