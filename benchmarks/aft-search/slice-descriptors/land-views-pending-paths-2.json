@@ -1,0 +1,13 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/semantic_index.rs"
+  ],
+  "note": "Touches ranking-fenced search_index.rs (project_walk_lists, shared with the semantic walk) and semantic_index.rs only to classify paths the index never keys; no ranking or row change. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}
