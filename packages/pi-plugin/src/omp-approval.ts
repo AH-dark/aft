@@ -16,8 +16,10 @@
  * asked about (prompted in `write` and `always-ask`, never in `yolo`). Because
  * AFT approves the engine's outside-access asks itself on OMP, this tier is the
  * only place OMP's mode can decide outside access, so the check follows
- * symbolic links, reads patch targets, and reports `exec` whenever it cannot
- * tell. The engine still enforces its floors and `restrict_to_project_root`.
+ * symbolic links, reads patch targets, and reports `exec` when a path cannot
+ * be resolved or a patch's targets cannot be read. (Arguments the tool's own
+ * preparation rejects keep the tool's tier: that call fails before running.)
+ * The engine still enforces its floors and `restrict_to_project_root`.
  *
  * Upstream Pi has no approval gate and gets no `approval` field.
  */
@@ -173,8 +175,10 @@ function unquote(value: string): string {
  * Every file a hashline patch names: each `[path#TAG]` section header and each
  * `MV` destination (grammar: docs/hashline.md). Lines are classified in the
  * engine parser's order (envelope, header, directive, `+` body row), so every
- * path the engine would act on is listed. Undefined when the patch cannot be
- * parsed: the caller must then fail toward asking.
+ * path the engine would act on is listed. It extracts targets and does not
+ * validate the rest of the grammar, so it may list paths for a patch the
+ * engine later rejects. Undefined when a line fits none of those forms or a
+ * header or `MV` target is malformed: the caller must then fail toward asking.
  */
 export function hashlinePatchPaths(patch: string): string[] | undefined {
   if (patch.trim().length === 0) return undefined;
@@ -239,7 +243,7 @@ export function applyPatchPaths(patch: string): string[] | undefined {
 
 /**
  * The files a call's patch argument names, `[]` when it carries no patch, or
- * undefined when the patch cannot be parsed.
+ * undefined when its targets cannot be read.
  */
 function patchTargets(tool: string, args: unknown): string[] | undefined {
   if (args === null || typeof args !== "object") return [];
