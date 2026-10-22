@@ -1,0 +1,1632 @@
+root=set route=lowered forced=false inside-absolute read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=lowered forced=false inside-absolute mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=lowered forced=false inside-absolute write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=lowered forced=false inside-missing-absolute read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=lowered forced=false inside-missing-absolute mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=lowered forced=false inside-missing-absolute write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=lowered forced=false outside-existing read
+  absent: ok <dir>/outside/outside.txt
+  false: ok <dir>/outside/outside.txt
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false outside-existing mutate
+  absent: ok <dir>/outside/outside.txt
+  false: ok <dir>/outside/outside.txt
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false outside-existing write-location
+  absent: ok <dir>/outside/outside.txt
+  false: ok <dir>/outside/outside.txt
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false outside-missing read
+  absent: ok <dir>/outside/missing.txt
+  false: ok <dir>/outside/missing.txt
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false outside-missing mutate
+  absent: ok <dir>/outside/missing.txt
+  false: ok <dir>/outside/missing.txt
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false outside-missing write-location
+  absent: ok <dir>/outside/missing.txt
+  false: ok <dir>/outside/missing.txt
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false outside-floor read
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false outside-floor mutate
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false outside-floor write-location
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false temp-scratch read
+  absent: ok <dir>/tmp/scratch.txt
+  false: ok <dir>/tmp/scratch.txt
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false temp-scratch mutate
+  absent: ok <dir>/tmp/scratch.txt
+  false: ok <dir>/tmp/scratch.txt
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false temp-scratch write-location
+  absent: ok <dir>/tmp/scratch.txt
+  false: ok <dir>/tmp/scratch.txt
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false inside-relative read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=lowered forced=false inside-relative mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=lowered forced=false inside-relative write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=lowered forced=false inside-missing-relative read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=lowered forced=false inside-missing-relative mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=lowered forced=false inside-missing-relative write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=lowered forced=false dotdot-escape read
+  absent: ok <dir>/root/../outside/outside.txt
+  false: ok <dir>/root/../outside/outside.txt
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false dotdot-escape mutate
+  absent: ok <dir>/root/../outside/outside.txt
+  false: ok <dir>/root/../outside/outside.txt
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false dotdot-escape write-location
+  absent: ok <dir>/root/../outside/outside.txt
+  false: ok <dir>/root/../outside/outside.txt
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false symlink-file-escape read
+  absent: ok <dir>/root/link.txt
+  false: ok <dir>/root/link.txt
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false symlink-file-escape mutate
+  absent: ok <dir>/root/link.txt
+  false: ok <dir>/root/link.txt
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false symlink-file-escape write-location
+  absent: ok <dir>/root/link.txt
+  false: ok <dir>/root/link.txt
+  true: ok <dir>/root/link.txt
+root=set route=lowered forced=false symlink-dir-escape read
+  absent: ok <dir>/root/link-dir/missing.txt
+  false: ok <dir>/root/link-dir/missing.txt
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false symlink-dir-escape mutate
+  absent: ok <dir>/root/link-dir/missing.txt
+  false: ok <dir>/root/link-dir/missing.txt
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=false symlink-dir-escape write-location
+  absent: ok <dir>/root/link-dir/missing.txt
+  false: ok <dir>/root/link-dir/missing.txt
+  true: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true inside-absolute read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=lowered forced=true inside-absolute mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=lowered forced=true inside-absolute write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=lowered forced=true inside-missing-absolute read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=lowered forced=true inside-missing-absolute mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=lowered forced=true inside-missing-absolute write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=lowered forced=true outside-existing read
+  absent: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true outside-existing mutate
+  absent: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true outside-existing write-location
+  absent: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true outside-missing read
+  absent: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true outside-missing mutate
+  absent: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true outside-missing write-location
+  absent: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true outside-floor read
+  absent: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true outside-floor mutate
+  absent: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true outside-floor write-location
+  absent: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true temp-scratch read
+  absent: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true temp-scratch mutate
+  absent: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true temp-scratch write-location
+  absent: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true inside-relative read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=lowered forced=true inside-relative mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=lowered forced=true inside-relative write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=lowered forced=true inside-missing-relative read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=lowered forced=true inside-missing-relative mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=lowered forced=true inside-missing-relative write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=lowered forced=true dotdot-escape read
+  absent: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true dotdot-escape mutate
+  absent: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true dotdot-escape write-location
+  absent: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true symlink-file-escape read
+  absent: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true symlink-file-escape mutate
+  absent: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true symlink-file-escape write-location
+  absent: ok <dir>/root/link.txt
+  false: ok <dir>/root/link.txt
+  true: ok <dir>/root/link.txt
+root=set route=lowered forced=true symlink-dir-escape read
+  absent: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true symlink-dir-escape mutate
+  absent: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=lowered forced=true symlink-dir-escape write-location
+  absent: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false inside-absolute read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=plugin forced=false inside-absolute mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=plugin forced=false inside-absolute write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=plugin forced=false inside-missing-absolute read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=plugin forced=false inside-missing-absolute mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=plugin forced=false inside-missing-absolute write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=plugin forced=false outside-existing read
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false outside-existing mutate
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false outside-existing write-location
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false outside-missing read
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false outside-missing mutate
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false outside-missing write-location
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false outside-floor read
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false outside-floor mutate
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false outside-floor write-location
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false temp-scratch read
+  absent: ok <dir>/tmp/scratch.txt
+  false: ok <dir>/tmp/scratch.txt
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false temp-scratch mutate
+  absent: ok <dir>/tmp/scratch.txt
+  false: ok <dir>/tmp/scratch.txt
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false temp-scratch write-location
+  absent: ok <dir>/tmp/scratch.txt
+  false: ok <dir>/tmp/scratch.txt
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false inside-relative read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=plugin forced=false inside-relative mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=plugin forced=false inside-relative write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=plugin forced=false inside-missing-relative read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=plugin forced=false inside-missing-relative mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=plugin forced=false inside-missing-relative write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=plugin forced=false dotdot-escape read
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false dotdot-escape mutate
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false dotdot-escape write-location
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false symlink-file-escape read
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false symlink-file-escape mutate
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false symlink-file-escape write-location
+  absent: ok <dir>/root/link.txt
+  false: ok <dir>/root/link.txt
+  true: ok <dir>/root/link.txt
+root=set route=plugin forced=false symlink-dir-escape read
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false symlink-dir-escape mutate
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=false symlink-dir-escape write-location
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true inside-absolute read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=plugin forced=true inside-absolute mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=plugin forced=true inside-absolute write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=plugin forced=true inside-missing-absolute read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=plugin forced=true inside-missing-absolute mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=plugin forced=true inside-missing-absolute write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=plugin forced=true outside-existing read
+  absent: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true outside-existing mutate
+  absent: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true outside-existing write-location
+  absent: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true outside-missing read
+  absent: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true outside-missing mutate
+  absent: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true outside-missing write-location
+  absent: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true outside-floor read
+  absent: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true outside-floor mutate
+  absent: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true outside-floor write-location
+  absent: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true temp-scratch read
+  absent: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true temp-scratch mutate
+  absent: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true temp-scratch write-location
+  absent: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true inside-relative read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=plugin forced=true inside-relative mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=plugin forced=true inside-relative write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=plugin forced=true inside-missing-relative read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=plugin forced=true inside-missing-relative mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=plugin forced=true inside-missing-relative write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=plugin forced=true dotdot-escape read
+  absent: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true dotdot-escape mutate
+  absent: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true dotdot-escape write-location
+  absent: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true symlink-file-escape read
+  absent: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true symlink-file-escape mutate
+  absent: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true symlink-file-escape write-location
+  absent: ok <dir>/root/link.txt
+  false: ok <dir>/root/link.txt
+  true: ok <dir>/root/link.txt
+root=set route=plugin forced=true symlink-dir-escape read
+  absent: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true symlink-dir-escape mutate
+  absent: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=plugin forced=true symlink-dir-escape write-location
+  absent: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false inside-absolute read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=elicitation forced=false inside-absolute mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=elicitation forced=false inside-absolute write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=elicitation forced=false inside-missing-absolute read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=elicitation forced=false inside-missing-absolute mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=elicitation forced=false inside-missing-absolute write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=elicitation forced=false outside-existing read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false outside-existing mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false outside-existing write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false outside-missing read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false outside-missing mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false outside-missing write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false outside-floor read
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false outside-floor mutate
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false outside-floor write-location
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false temp-scratch read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false temp-scratch mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false temp-scratch write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false inside-relative read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=elicitation forced=false inside-relative mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=elicitation forced=false inside-relative write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=elicitation forced=false inside-missing-relative read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=elicitation forced=false inside-missing-relative mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=elicitation forced=false inside-missing-relative write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=elicitation forced=false dotdot-escape read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false dotdot-escape mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false dotdot-escape write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false symlink-file-escape read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false symlink-file-escape mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false symlink-file-escape write-location
+  absent: ok <dir>/root/link.txt
+  false: ok <dir>/root/link.txt
+  true: ok <dir>/root/link.txt
+root=set route=elicitation forced=false symlink-dir-escape read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false symlink-dir-escape mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=false symlink-dir-escape write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true inside-absolute read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=elicitation forced=true inside-absolute mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=elicitation forced=true inside-absolute write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=elicitation forced=true inside-missing-absolute read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=elicitation forced=true inside-missing-absolute mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=elicitation forced=true inside-missing-absolute write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=elicitation forced=true outside-existing read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true outside-existing mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true outside-existing write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true outside-missing read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true outside-missing mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true outside-missing write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true outside-floor read
+  absent: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true outside-floor mutate
+  absent: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true outside-floor write-location
+  absent: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true temp-scratch read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true temp-scratch mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true temp-scratch write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true inside-relative read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=elicitation forced=true inside-relative mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=elicitation forced=true inside-relative write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=elicitation forced=true inside-missing-relative read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=elicitation forced=true inside-missing-relative mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=elicitation forced=true inside-missing-relative write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=elicitation forced=true dotdot-escape read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true dotdot-escape mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true dotdot-escape write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true symlink-file-escape read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true symlink-file-escape mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true symlink-file-escape write-location
+  absent: ok <dir>/root/link.txt
+  false: ok <dir>/root/link.txt
+  true: ok <dir>/root/link.txt
+root=set route=elicitation forced=true symlink-dir-escape read
+  absent: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true symlink-dir-escape mutate
+  absent: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=elicitation forced=true symlink-dir-escape write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false inside-absolute read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=deny forced=false inside-absolute mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=deny forced=false inside-absolute write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=deny forced=false inside-missing-absolute read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=deny forced=false inside-missing-absolute mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=deny forced=false inside-missing-absolute write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=deny forced=false outside-existing read
+  absent: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false outside-existing mutate
+  absent: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false outside-existing write-location
+  absent: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false outside-missing read
+  absent: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false outside-missing mutate
+  absent: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false outside-missing write-location
+  absent: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false outside-floor read
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false outside-floor mutate
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false outside-floor write-location
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false temp-scratch read
+  absent: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false temp-scratch mutate
+  absent: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false temp-scratch write-location
+  absent: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false inside-relative read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=deny forced=false inside-relative mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=deny forced=false inside-relative write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=deny forced=false inside-missing-relative read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=deny forced=false inside-missing-relative mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=deny forced=false inside-missing-relative write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=deny forced=false dotdot-escape read
+  absent: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false dotdot-escape mutate
+  absent: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false dotdot-escape write-location
+  absent: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false symlink-file-escape read
+  absent: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false symlink-file-escape mutate
+  absent: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false symlink-file-escape write-location
+  absent: ok <dir>/root/link.txt
+  false: ok <dir>/root/link.txt
+  true: ok <dir>/root/link.txt
+root=set route=deny forced=false symlink-dir-escape read
+  absent: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false symlink-dir-escape mutate
+  absent: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=false symlink-dir-escape write-location
+  absent: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true inside-absolute read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=deny forced=true inside-absolute mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=deny forced=true inside-absolute write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=deny forced=true inside-missing-absolute read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=deny forced=true inside-missing-absolute mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=deny forced=true inside-missing-absolute write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=deny forced=true outside-existing read
+  absent: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true outside-existing mutate
+  absent: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true outside-existing write-location
+  absent: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true outside-missing read
+  absent: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true outside-missing mutate
+  absent: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true outside-missing write-location
+  absent: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true outside-floor read
+  absent: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true outside-floor mutate
+  absent: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true outside-floor write-location
+  absent: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/outside/floor.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true temp-scratch read
+  absent: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true temp-scratch mutate
+  absent: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true temp-scratch write-location
+  absent: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true inside-relative read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=deny forced=true inside-relative mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=deny forced=true inside-relative write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=set route=deny forced=true inside-missing-relative read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=deny forced=true inside-missing-relative mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=deny forced=true inside-missing-relative write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=set route=deny forced=true dotdot-escape read
+  absent: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true dotdot-escape mutate
+  absent: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true dotdot-escape write-location
+  absent: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '../outside/outside.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true symlink-file-escape read
+  absent: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true symlink-file-escape mutate
+  absent: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path 'link.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true symlink-file-escape write-location
+  absent: ok <dir>/root/link.txt
+  false: ok <dir>/root/link.txt
+  true: ok <dir>/root/link.txt
+root=set route=deny forced=true symlink-dir-escape read
+  absent: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true symlink-dir-escape mutate
+  absent: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path '<dir>/root/link-dir/missing.txt' is outside the project root '<dir>/root'
+root=set route=deny forced=true symlink-dir-escape write-location
+  absent: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+  false: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+  true: err path_outside_root: path 'link-dir/missing.txt' is outside the project root '<dir>/root'
+root=none route=lowered forced=false inside-absolute read
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=none route=lowered forced=false inside-absolute mutate
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=none route=lowered forced=false inside-absolute write-location
+  absent: ok <dir>/root/inside.txt
+  false: ok <dir>/root/inside.txt
+  true: ok <dir>/root/inside.txt
+root=none route=lowered forced=false inside-missing-absolute read
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=none route=lowered forced=false inside-missing-absolute mutate
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=none route=lowered forced=false inside-missing-absolute write-location
+  absent: ok <dir>/root/new.txt
+  false: ok <dir>/root/new.txt
+  true: ok <dir>/root/new.txt
+root=none route=lowered forced=false outside-existing read
+  absent: ok <dir>/outside/outside.txt
+  false: ok <dir>/outside/outside.txt
+  true: ok <dir>/outside/outside.txt
+root=none route=lowered forced=false outside-existing mutate
+  absent: ok <dir>/outside/outside.txt
+  false: ok <dir>/outside/outside.txt
+  true: ok <dir>/outside/outside.txt
+root=none route=lowered forced=false outside-existing write-location
+  absent: ok <dir>/outside/outside.txt
+  false: ok <dir>/outside/outside.txt
+  true: ok <dir>/outside/outside.txt
+root=none route=lowered forced=false outside-missing read
+  absent: ok <dir>/outside/missing.txt
+  false: ok <dir>/outside/missing.txt
+  true: ok <dir>/outside/missing.txt
+root=none route=lowered forced=false outside-missing mutate
+  absent: ok <dir>/outside/missing.txt
+  false: ok <dir>/outside/missing.txt
+  true: ok <dir>/outside/missing.txt
+root=none route=lowered forced=false outside-missing write-location
+  absent: ok <dir>/outside/missing.txt
+  false: ok <dir>/outside/missing.txt
+  true: ok <dir>/outside/missing.txt
+root=none route=lowered forced=false outside-floor read
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+root=none route=lowered forced=false outside-floor mutate
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+root=none route=lowered forced=false outside-floor write-location
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+root=none route=lowered forced=false temp-scratch read
+  absent: ok <dir>/tmp/scratch.txt
+  false: ok <dir>/tmp/scratch.txt
+  true: ok <dir>/tmp/scratch.txt
+root=none route=lowered forced=false temp-scratch mutate
+  absent: ok <dir>/tmp/scratch.txt
+  false: ok <dir>/tmp/scratch.txt
+  true: ok <dir>/tmp/scratch.txt
+root=none route=lowered forced=false temp-scratch write-location
+  absent: ok <dir>/tmp/scratch.txt
+  false: ok <dir>/tmp/scratch.txt
+  true: ok <dir>/tmp/scratch.txt
+root=none route=lowered forced=true inside-absolute read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true inside-absolute mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true inside-absolute write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true inside-missing-absolute read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true inside-missing-absolute mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true inside-missing-absolute write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true outside-existing read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true outside-existing mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true outside-existing write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true outside-missing read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true outside-missing mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true outside-missing write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true outside-floor read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true outside-floor mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true outside-floor write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true temp-scratch read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true temp-scratch mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=lowered forced=true temp-scratch write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=false inside-absolute read
+  absent: ask permission_required
+  false: ask permission_required
+  true: ask permission_required
+root=none route=plugin forced=false inside-absolute mutate
+  absent: ask permission_required
+  false: ask permission_required
+  true: ask permission_required
+root=none route=plugin forced=false inside-absolute write-location
+  absent: ask permission_required
+  false: ask permission_required
+  true: ask permission_required
+root=none route=plugin forced=false inside-missing-absolute read
+  absent: ask permission_required
+  false: ask permission_required
+  true: ask permission_required
+root=none route=plugin forced=false inside-missing-absolute mutate
+  absent: ask permission_required
+  false: ask permission_required
+  true: ask permission_required
+root=none route=plugin forced=false inside-missing-absolute write-location
+  absent: ask permission_required
+  false: ask permission_required
+  true: ask permission_required
+root=none route=plugin forced=false outside-existing read
+  absent: ask permission_required
+  false: ask permission_required
+  true: ask permission_required
+root=none route=plugin forced=false outside-existing mutate
+  absent: ask permission_required
+  false: ask permission_required
+  true: ask permission_required
+root=none route=plugin forced=false outside-existing write-location
+  absent: ask permission_required
+  false: ask permission_required
+  true: ask permission_required
+root=none route=plugin forced=false outside-missing read
+  absent: ask permission_required
+  false: ask permission_required
+  true: ask permission_required
+root=none route=plugin forced=false outside-missing mutate
+  absent: ask permission_required
+  false: ask permission_required
+  true: ask permission_required
+root=none route=plugin forced=false outside-missing write-location
+  absent: ask permission_required
+  false: ask permission_required
+  true: ask permission_required
+root=none route=plugin forced=false outside-floor read
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+root=none route=plugin forced=false outside-floor mutate
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+root=none route=plugin forced=false outside-floor write-location
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+root=none route=plugin forced=false temp-scratch read
+  absent: ok <dir>/tmp/scratch.txt
+  false: ok <dir>/tmp/scratch.txt
+  true: ask permission_required
+root=none route=plugin forced=false temp-scratch mutate
+  absent: ok <dir>/tmp/scratch.txt
+  false: ok <dir>/tmp/scratch.txt
+  true: ask permission_required
+root=none route=plugin forced=false temp-scratch write-location
+  absent: ok <dir>/tmp/scratch.txt
+  false: ok <dir>/tmp/scratch.txt
+  true: ask permission_required
+root=none route=plugin forced=true inside-absolute read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true inside-absolute mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true inside-absolute write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true inside-missing-absolute read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true inside-missing-absolute mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true inside-missing-absolute write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true outside-existing read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true outside-existing mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true outside-existing write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true outside-missing read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true outside-missing mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true outside-missing write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true outside-floor read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true outside-floor mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true outside-floor write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true temp-scratch read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true temp-scratch mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=plugin forced=true temp-scratch write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=false inside-absolute read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: ask access_ask_required
+root=none route=elicitation forced=false inside-absolute mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: ask access_ask_required
+root=none route=elicitation forced=false inside-absolute write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: ask access_ask_required
+root=none route=elicitation forced=false inside-missing-absolute read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: ask access_ask_required
+root=none route=elicitation forced=false inside-missing-absolute mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: ask access_ask_required
+root=none route=elicitation forced=false inside-missing-absolute write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: ask access_ask_required
+root=none route=elicitation forced=false outside-existing read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: ask access_ask_required
+root=none route=elicitation forced=false outside-existing mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: ask access_ask_required
+root=none route=elicitation forced=false outside-existing write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: ask access_ask_required
+root=none route=elicitation forced=false outside-missing read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: ask access_ask_required
+root=none route=elicitation forced=false outside-missing mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: ask access_ask_required
+root=none route=elicitation forced=false outside-missing write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: ask access_ask_required
+root=none route=elicitation forced=false outside-floor read
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+root=none route=elicitation forced=false outside-floor mutate
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+root=none route=elicitation forced=false outside-floor write-location
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+root=none route=elicitation forced=false temp-scratch read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: ask access_ask_required
+root=none route=elicitation forced=false temp-scratch mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: ask access_ask_required
+root=none route=elicitation forced=false temp-scratch write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: ask access_ask_required
+root=none route=elicitation forced=true inside-absolute read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true inside-absolute mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true inside-absolute write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true inside-missing-absolute read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true inside-missing-absolute mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true inside-missing-absolute write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true outside-existing read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true outside-existing mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true outside-existing write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true outside-missing read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true outside-missing mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true outside-missing write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true outside-floor read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true outside-floor mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true outside-floor write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true temp-scratch read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true temp-scratch mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=elicitation forced=true temp-scratch write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=false inside-absolute read
+  absent: err path_outside_root: path '<dir>/root/inside.txt' is outside the project root ''
+  false: err path_outside_root: path '<dir>/root/inside.txt' is outside the project root ''
+  true: err path_outside_root: path '<dir>/root/inside.txt' is outside the project root ''
+root=none route=deny forced=false inside-absolute mutate
+  absent: err path_outside_root: path '<dir>/root/inside.txt' is outside the project root ''
+  false: err path_outside_root: path '<dir>/root/inside.txt' is outside the project root ''
+  true: err path_outside_root: path '<dir>/root/inside.txt' is outside the project root ''
+root=none route=deny forced=false inside-absolute write-location
+  absent: err path_outside_root: path '<dir>/root/inside.txt' is outside the project root ''
+  false: err path_outside_root: path '<dir>/root/inside.txt' is outside the project root ''
+  true: err path_outside_root: path '<dir>/root/inside.txt' is outside the project root ''
+root=none route=deny forced=false inside-missing-absolute read
+  absent: err path_outside_root: path '<dir>/root/new.txt' is outside the project root ''
+  false: err path_outside_root: path '<dir>/root/new.txt' is outside the project root ''
+  true: err path_outside_root: path '<dir>/root/new.txt' is outside the project root ''
+root=none route=deny forced=false inside-missing-absolute mutate
+  absent: err path_outside_root: path '<dir>/root/new.txt' is outside the project root ''
+  false: err path_outside_root: path '<dir>/root/new.txt' is outside the project root ''
+  true: err path_outside_root: path '<dir>/root/new.txt' is outside the project root ''
+root=none route=deny forced=false inside-missing-absolute write-location
+  absent: err path_outside_root: path '<dir>/root/new.txt' is outside the project root ''
+  false: err path_outside_root: path '<dir>/root/new.txt' is outside the project root ''
+  true: err path_outside_root: path '<dir>/root/new.txt' is outside the project root ''
+root=none route=deny forced=false outside-existing read
+  absent: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root ''
+  false: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root ''
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root ''
+root=none route=deny forced=false outside-existing mutate
+  absent: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root ''
+  false: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root ''
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root ''
+root=none route=deny forced=false outside-existing write-location
+  absent: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root ''
+  false: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root ''
+  true: err path_outside_root: path '<dir>/outside/outside.txt' is outside the project root ''
+root=none route=deny forced=false outside-missing read
+  absent: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root ''
+  false: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root ''
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root ''
+root=none route=deny forced=false outside-missing mutate
+  absent: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root ''
+  false: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root ''
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root ''
+root=none route=deny forced=false outside-missing write-location
+  absent: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root ''
+  false: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root ''
+  true: err path_outside_root: path '<dir>/outside/missing.txt' is outside the project root ''
+root=none route=deny forced=false outside-floor read
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+root=none route=deny forced=false outside-floor mutate
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+root=none route=deny forced=false outside-floor write-location
+  absent: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  false: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+  true: err denied_floor: path '<dir>/outside/floor.txt' is denied by the access policy floor
+root=none route=deny forced=false temp-scratch read
+  absent: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root ''
+  false: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root ''
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root ''
+root=none route=deny forced=false temp-scratch mutate
+  absent: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root ''
+  false: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root ''
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root ''
+root=none route=deny forced=false temp-scratch write-location
+  absent: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root ''
+  false: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root ''
+  true: err path_outside_root: path '<dir>/tmp/scratch.txt' is outside the project root ''
+root=none route=deny forced=true inside-absolute read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true inside-absolute mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true inside-absolute write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true inside-missing-absolute read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true inside-missing-absolute mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true inside-missing-absolute write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true outside-existing read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true outside-existing mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true outside-existing write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true outside-missing read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true outside-missing mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true outside-missing write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true outside-floor read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true outside-floor mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true outside-floor write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true temp-scratch read
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true temp-scratch mutate
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced
+root=none route=deny forced=true temp-scratch write-location
+  absent: err path_outside_root: project root is required when path restriction is forced
+  false: err path_outside_root: project root is required when path restriction is forced
+  true: err path_outside_root: project root is required when path restriction is forced

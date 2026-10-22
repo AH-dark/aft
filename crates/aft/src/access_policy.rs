@@ -1716,3 +1716,7 @@ mod worker_rust_tests;
 #[cfg(test)]
 #[path = "access_policy_audit2_tests.rs"]
 mod audit2_tests;
+
+#[cfg(test)]
+#[path = "access_policy_outside_roots_tests.rs"]
+mod outside_roots_tests;
