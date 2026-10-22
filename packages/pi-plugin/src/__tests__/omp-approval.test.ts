@@ -1,6 +1,9 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AftProjectTransport } from "@cortexkit/aft-bridge";
 import type {
   ExtensionAPI,
@@ -312,5 +315,51 @@ describe("OMP tiers for patch targets", () => {
     ).toBe("exec");
     expect(tier("*** Begin Patch\n*** Delete File: ~/notes.md\n*** End Patch\n")).toBe("exec");
     expect(tier("not a patch")).toBe("exec");
+  });
+});
+
+// Creating symbolic links needs extra privileges on Windows.
+describe.skipIf(process.platform === "win32")("OMP tiers through symbolic links", () => {
+  let base: string;
+  let project: string;
+  beforeEach(() => {
+    base = mkdtempSync(join(tmpdir(), "aft-omp-links-"));
+    project = join(base, "project");
+    const outside = join(base, "outside");
+    mkdirSync(project);
+    mkdirSync(outside);
+    writeFileSync(join(outside, "secret.txt"), "outside\n");
+    writeFileSync(join(project, "a.ts"), "export {};\n");
+    symlinkSync(join(outside, "secret.txt"), join(project, "link.txt"));
+    symlinkSync(outside, join(project, "linkdir"));
+    symlinkSync(join(project, "loop"), join(project, "loop"));
+    recordSessionCwd(project);
+  });
+  afterEach(() => rmSync(base, { recursive: true, force: true }));
+
+  const tier = (tool: string, path: string) =>
+    (registered("omp").get(tool)?.approval as (args: unknown) => unknown)({ path });
+
+  test("an in-project link to an outside file is exec for a read", () => {
+    expect(tier("read", "link.txt")).toBe("exec");
+    expect(tier("read", join(project, "link.txt"))).toBe("exec");
+  });
+
+  test("a file under an in-project directory link pointing outside is exec", () => {
+    expect(tier("read", "linkdir/secret.txt")).toBe("exec");
+  });
+
+  test("a new file under a linked parent directory is exec", () => {
+    expect(tier("write", "linkdir/new/file.ts")).toBe("exec");
+  });
+
+  test("a path that cannot be resolved for another reason than not-found is exec", () => {
+    expect(tier("read", "loop")).toBe("exec");
+  });
+
+  test("a plain in-project read stays read, and a new in-project file stays write", () => {
+    expect(tier("read", "a.ts")).toBe("read");
+    expect(tier("read", join(project, "a.ts"))).toBe("read");
+    expect(tier("write", "src/new/file.ts")).toBe("write");
   });
 });

@@ -13,15 +13,18 @@
  * so AFT never raises its own outside-access prompt on OMP. Instead the tier is
  * a function of the call's arguments: a call naming a path outside the
  * session's project reports `exec`, so OMP's own mode decides whether it is
- * asked about (prompted in `write` and `always-ask`, never in `yolo`). The
- * outside check is lexical and advisory only: it decides whether OMP prompts,
- * while the engine still enforces its floors and `restrict_to_project_root`.
+ * asked about (prompted in `write` and `always-ask`, never in `yolo`). Because
+ * AFT approves the engine's outside-access asks itself on OMP, this tier is the
+ * only place OMP's mode can decide outside access, so the check follows
+ * symbolic links, reads patch targets, and reports `exec` whenever it cannot
+ * tell. The engine still enforces its floors and `restrict_to_project_root`.
  *
  * Upstream Pi has no approval gate and gets no `approval` field.
  */
 
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { decodeFileUrl, relativePathEscapesRoot } from "@cortexkit/aft-bridge";
 
 /** OMP's capability tiers, least to most privileged. */
@@ -94,14 +97,46 @@ function expandPath(value: string): string {
   return decoded;
 }
 
-/** Whether `value`, resolved against `root`, lies outside it. Purely lexical. */
+/**
+ * Where `path` really is on disk: its real path when it exists, else the real
+ * path of its nearest existing ancestor joined with the components that do
+ * not exist yet. Throws for any failure other than not-found (a link loop, a
+ * permission error, a file used as a directory).
+ */
+function realLocation(path: string): string {
+  const missing: string[] = [];
+  let current = path;
+  for (;;) {
+    try {
+      return missing.length > 0 ? join(realpathSync(current), ...missing) : realpathSync(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const parent = dirname(current);
+    if (parent === current) return path;
+    missing.unshift(basename(current));
+    current = parent;
+  }
+}
+
+/**
+ * Whether `value`, resolved against `root`, lies outside it: as written, or
+ * once symbolic links in it (and in `root`) are followed. A path that cannot
+ * be resolved for a reason other than not existing counts as outside, so the
+ * gate fails toward asking. Synchronous and never throws.
+ */
 export function namesOutsidePath(root: string, value: string): boolean {
   if (value.length === 0) return false;
   if (!value.startsWith("file:") && NON_FILE_URL.test(value)) return false;
   const expanded = expandPath(value);
   if (expanded.startsWith("file:")) return false;
   const absolute = isAbsolute(expanded) ? expanded : resolve(root, expanded);
-  return relativePathEscapesRoot(relative(root, absolute));
+  if (relativePathEscapesRoot(relative(root, absolute))) return true;
+  try {
+    return relativePathEscapesRoot(relative(realLocation(root), realLocation(absolute)));
+  } catch {
+    return true;
+  }
 }
 
 function collectPaths(value: unknown, key: string | undefined, out: string[], depth: number): void {
