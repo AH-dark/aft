@@ -6198,6 +6198,11 @@ impl BgTaskRegistry {
                 )
             }
         };
+        #[cfg(feature = "test-timing-hooks")]
+        let entry_budget = std::env::var("AFT_TEST_BASH_REPLAY_SCAN_ENTRY_BUDGET")
+            .ok()
+            .map(|value| value.parse().expect("replay scan entry budget"))
+            .unwrap_or(entry_budget);
         let entry_budget = entry_budget.max(1);
         let mut scan_slot = self
             .inner
