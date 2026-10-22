@@ -4457,6 +4457,10 @@ pub struct AppContext {
     /// background bash spawn has loaded it again (see
     /// [`AppContext::reload_released_filter_registry`]).
     filter_registry_released: std::sync::atomic::AtomicBool,
+    /// Set when an idle release kept the filters because the root still held
+    /// background task records. The idle reaper retries the release once the
+    /// last record is gone (see [`AppContext::retry_deferred_idle_release`]).
+    filter_release_deferred: AtomicBool,
     /// Live `experimental.bash.compress` flag, kept in sync with `config`
     /// from the configure handler. Exposed via [`AppContext::bash_compress_flag`]
     /// so the BgTaskRegistry's watchdog-thread compressor can read it without
@@ -5158,6 +5162,7 @@ impl AppContext {
             filter_registry_rebuild_count: AtomicU64::new(0),
             filter_registry_loaded: std::sync::atomic::AtomicBool::new(false),
             filter_registry_released: std::sync::atomic::AtomicBool::new(false),
+            filter_release_deferred: AtomicBool::new(false),
             bash_compress_flag: Arc::new(std::sync::atomic::AtomicBool::new(bash_compress_enabled)),
             gitignore: Arc::new(std::sync::RwLock::new(None)),
             gitignore_generation: Arc::new(AtomicU64::new(0)),
@@ -13381,14 +13386,37 @@ impl AppContext {
                 // root that still holds task records keeps its filters, so a
                 // later render of that output compresses exactly as it would
                 // have without the eviction.
-                let filters =
-                    (!ctx.bash_background.has_task_records()).then(|| ctx.take_filter_registry());
+                let deferred = ctx.bash_background.has_task_records();
+                ctx.filter_release_deferred
+                    .store(deferred, Ordering::Release);
+                let filters = (!deferred).then(|| ctx.take_filter_registry());
                 (watches, model, filters)
             });
             // Dropped after the lifecycle check releases, so their shutdown
             // never holds up a rebind.
             drop(released);
         });
+    }
+
+    /// Run the idle release again for an evicted root whose filters were kept
+    /// because it still held background task records, once the last record
+    /// is gone. The idle reaper calls this on every sweep for evicted,
+    /// unbound roots: an evicted root is not reaped again, so nothing else
+    /// would retry. Returns whether a release was started. Waits on nothing;
+    /// a locked task map means "not yet".
+    pub(crate) fn retry_deferred_idle_release(self: &Arc<Self>) -> bool {
+        if !self.filter_release_deferred.load(Ordering::Acquire)
+            || self.bash_background.try_has_task_records() != Some(false)
+        {
+            return false;
+        }
+        // Cleared before the release starts, so the next sweep does not start
+        // a second one; the release sets it again if records came back.
+        if !self.filter_release_deferred.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        self.release_idle_reopenable_resources_in_background();
+        true
     }
 
     /// Final cleanup for an actor whose project directory no longer exists.

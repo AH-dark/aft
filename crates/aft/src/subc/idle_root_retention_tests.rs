@@ -623,3 +623,144 @@ fn background_task_output_compresses_the_same_after_idle_eviction() {
         "the finished task's output must compress as it did before eviction"
     );
 }
+
+/// A root with background tasks enabled and the output filters compiled, as
+/// configure leaves it.
+#[cfg(unix)]
+fn background_task_root(project: &Path, storage: &Path) -> (ProjectRootId, Arc<AppContext>) {
+    let root = ProjectRootId::from_path(project).unwrap();
+    let mut config = Config {
+        project_root: Some(root.as_path().to_path_buf()),
+        storage_dir: Some(storage.to_path_buf()),
+        experimental_bash_background: true,
+        experimental_bash_compress: true,
+        ..Config::default()
+    };
+    config.sandbox.profile.head = crate::config::SandboxMode::Off;
+    let ctx = Arc::new(AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        config,
+    ));
+    install_bash_compressor(&ctx);
+    ctx.reset_filter_registry();
+    (root, ctx)
+}
+
+/// Run `command` as a background task and wait until it has finished and
+/// left the watchdog.
+#[cfg(unix)]
+fn run_background_task(ctx: &AppContext, command: &str) -> String {
+    let launched = crate::bash_background::spawn(
+        "req-idle-eviction",
+        SESSION,
+        command,
+        crate::bash_background::BashShell::Bash,
+        PathBuf::from("/bin/sh"),
+        None,
+        None,
+        crate::bash_background::HardKill::After(Duration::from_secs(60)),
+        ctx,
+        true,
+        false,
+        false,
+        false,
+        24,
+        80,
+        Vec::new(),
+        false,
+        None,
+        None,
+    );
+    assert!(launched.success, "launch failed: {:?}", launched.data);
+    let task_id = launched.data["task_id"].as_str().unwrap().to_string();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let snapshot = ctx
+            .bash_background()
+            .observed_status(&task_id, SESSION, 4096)
+            .expect("task is registered");
+        if snapshot.info.status.is_terminal()
+            && ctx.bash_background().try_has_running_tasks() == Some(false)
+        {
+            return task_id;
+        }
+        assert!(Instant::now() < deadline, "the task never finished");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Give the root a cached query embedding model. The idle release takes it in
+/// the same step that decides about the filters, so its absence marks that a
+/// release has run.
+#[cfg(unix)]
+fn install_release_probe(ctx: &AppContext) {
+    let mut semantic = ctx.config().semantic.clone();
+    semantic.backend = crate::config::SemanticBackend::OpenAiCompatible;
+    semantic.base_url = Some("http://127.0.0.1:9".to_string());
+    *ctx.semantic_embedding_model().lock() = Some(
+        crate::semantic_index::EmbeddingModel::from_config(&semantic).expect("embedding model"),
+    );
+}
+
+/// An evicted root that kept its filters for a finished task's record
+/// releases them once cleanup has removed the last record, although the
+/// reaper does not evict an evicted root again.
+#[cfg(unix)]
+#[test]
+fn deferred_filter_release_runs_after_the_last_task_record_is_gone() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let (root, ctx) = background_task_root(project.path(), storage.path());
+    let executor = Arc::new(Executor::new());
+    assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+    let task_id = run_background_task(&ctx, "true");
+
+    let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+    quiesce_unbound_root(&root, &mut live_roots, &executor);
+    live_roots.get_mut(&root).unwrap().last_touched =
+        Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
+    let metrics = DispatchPathMetrics::new();
+    let sweep_until = |live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+                       done: &dyn Fn(&HashMap<ProjectRootId, RootMeta>) -> bool,
+                       what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done(live_roots) {
+            assert!(Instant::now() < deadline, "{what}");
+            reap_idle_roots(
+                Instant::now(),
+                live_roots,
+                &HashMap::new(),
+                &HashMap::new(),
+                &executor,
+                &metrics,
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    install_release_probe(&ctx);
+    sweep_until(
+        &mut live_roots,
+        &|live_roots| {
+            live_roots[&root].idle_artifacts_evicted
+                && ctx.semantic_embedding_model().lock().is_none()
+        },
+        "the root was not evicted and released",
+    );
+    assert!(
+        ctx.filter_registry_loaded(),
+        "a root holding a task record keeps its filters"
+    );
+
+    ctx.bash_background().forget_task_record_for_test(&task_id);
+    install_release_probe(&ctx);
+    sweep_until(
+        &mut live_roots,
+        &|_| ctx.semantic_embedding_model().lock().is_none(),
+        "the deferred release never ran after the last task record went away",
+    );
+    assert!(
+        !ctx.filter_registry_loaded(),
+        "the deferred release must take the filters once no task record remains"
+    );
+}
