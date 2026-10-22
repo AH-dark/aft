@@ -2210,26 +2210,137 @@ fn storage_lock_error(error: std::fs::TryLockError) -> io::Error {
 #[cfg(test)]
 // Unit tests supply process snapshots instead of inspecting unrelated daemons
 // on the operator's machine; the same classifier and cleanup refusal still run.
-thread_local! { static LEGACY_DAEMON_PROCESSES: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
+// An empty snapshot means the test supplied none, and the scan is skipped.
+thread_local! { static LEGACY_DAEMON_PROCESSES: std::cell::RefCell<(ProcessListing, String)> = const { std::cell::RefCell::new((ProcessListing::Ps, String::new())) }; }
 
-fn legacy_daemon_present(processes: &str, current_pid: u32) -> bool {
-    processes.lines().any(|line| {
-        let mut words = line.split_whitespace();
-        let Some(pid) = words.next().and_then(|pid| pid.parse::<u32>().ok()) else {
-            return false;
-        };
-        let name = Path::new(words.next().unwrap_or_default())
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        pid != current_pid
-            && (matches!(name, "subc" | "subc.exe")
-                || matches!(name, "aft" | "aft.exe" | "ck-aft")
-                    && words.any(|word| word == "--subc" || word.starts_with("--subc=")))
+/// The layout of a process snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessListing {
+    /// `ps -axo pid=,command=`: the pid, then the command line.
+    // Each platform's scan produces one layout; tests parse both.
+    #[cfg_attr(all(windows, not(test)), allow(dead_code))]
+    Ps,
+    /// One `Win32_Process` row per line: `ProcessId`, `Name` and `CommandLine`
+    /// separated by tabs. `Name` is the executable's file name as Windows
+    /// records it, so an executable whose quoted path contains spaces
+    /// (`"C:\Program Files\AFT\subc.exe" ...`) is still named correctly;
+    /// splitting `CommandLine` on whitespace would yield `"C:\Program`.
+    #[cfg_attr(all(not(windows), not(test)), allow(dead_code))]
+    Win32Process,
+}
+
+struct ListedProcess<'a> {
+    pid: u32,
+    /// File name of the executable, without its directory.
+    executable: &'a str,
+    /// The command line after the executable.
+    args: &'a str,
+}
+
+fn listed_processes(
+    processes: &str,
+    listing: ProcessListing,
+) -> impl Iterator<Item = ListedProcess<'_>> {
+    processes.lines().filter_map(move |line| match listing {
+        ProcessListing::Ps => {
+            let line = line.trim_start();
+            let (pid, rest) = line.split_once(char::is_whitespace)?;
+            let rest = rest.trim_start();
+            let (program, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            Some(ListedProcess {
+                pid: pid.parse().ok()?,
+                executable: Path::new(program).file_name()?.to_str()?,
+                args,
+            })
+        }
+        ProcessListing::Win32Process => {
+            let mut fields = line.trim_end_matches('\r').splitn(3, '\t');
+            let pid = fields.next()?.trim().parse().ok()?;
+            let executable = fields.next()?.trim();
+            let command_line = fields.next().unwrap_or_default();
+            Some(ListedProcess {
+                pid,
+                executable,
+                args: windows_command_line_args(command_line),
+            })
+        }
     })
 }
 
-#[cfg(any(not(test), unix))]
+/// The arguments of a Windows command line: everything after the program,
+/// which is either a quoted string (and may contain spaces) or the first word.
+fn windows_command_line_args(command_line: &str) -> &str {
+    let command_line = command_line.trim_start();
+    if let Some(quoted) = command_line.strip_prefix('"') {
+        return quoted.split_once('"').map_or("", |(_, rest)| rest);
+    }
+    command_line
+        .split_once(char::is_whitespace)
+        .map_or("", |(_, rest)| rest)
+}
+
+/// Whether the snapshot lists a subc daemon other than this process.
+///
+/// A snapshot that does not list this process is incomplete (the scan failed
+/// partway, returned nothing, or could not see every process), so it cannot
+/// show that no older daemon is running; that is an error, and cleanup holds.
+fn legacy_daemon_present(
+    processes: &str,
+    listing: ProcessListing,
+    current_pid: u32,
+) -> io::Result<bool> {
+    let mut lists_this_process = false;
+    let mut present = false;
+    for process in listed_processes(processes, listing) {
+        if process.pid == current_pid {
+            lists_this_process = true;
+            continue;
+        }
+        // Windows file names are case-insensitive.
+        let name = match listing {
+            ProcessListing::Ps => std::borrow::Cow::Borrowed(process.executable),
+            ProcessListing::Win32Process => {
+                std::borrow::Cow::Owned(process.executable.to_ascii_lowercase())
+            }
+        };
+        present |= matches!(name.as_ref(), "subc" | "subc.exe")
+            || matches!(name.as_ref(), "aft" | "aft.exe" | "ck-aft")
+                && process
+                    .args
+                    .split_whitespace()
+                    .any(|word| word == "--subc" || word.starts_with("--subc="));
+    }
+    if !lists_this_process {
+        return Err(io::Error::other(
+            "legacy_daemon_upgrade_window: cannot tell whether an older subc daemon is running (the process scan did not list this process); cleanup refused",
+        ));
+    }
+    Ok(present)
+}
+
+/// The command that lists every process, and the layout it prints.
+fn legacy_process_command() -> (std::process::Command, ProcessListing) {
+    #[cfg(windows)]
+    {
+        let mut command = std::process::Command::new("powershell.exe");
+        // Tabs separate the fields, and line breaks inside a command line are
+        // flattened, so each process is exactly one parseable line.
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process | ForEach-Object { \"{0}`t{1}`t{2}\" -f $_.ProcessId, $_.Name, ($_.CommandLine -replace '[\\r\\n\\t]+', ' ') }",
+        ]);
+        (command, ProcessListing::Win32Process)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = std::process::Command::new("ps");
+        command.args(["-axo", "pid=,command="]);
+        (command, ProcessListing::Ps)
+    }
+}
+
 fn legacy_process_snapshot(
     command: &mut std::process::Command,
     label: &str,
@@ -2316,28 +2427,22 @@ fn ensure_no_legacy_daemon() -> io::Result<()> {
     // Upgrade-window protection: older daemons do not hold the durable-root
     // lock and cannot be excluded by it. Keep this host-wide refusal for this release.
     #[cfg(test)]
-    let processes = LEGACY_DAEMON_PROCESSES.with(|processes| processes.borrow().clone());
+    let (listing, processes) = LEGACY_DAEMON_PROCESSES.with(|processes| processes.borrow().clone());
+    #[cfg(test)]
+    if processes.is_empty() {
+        return Ok(());
+    }
     #[cfg(not(test))]
-    let processes = {
-        #[cfg(unix)]
-        let mut command = {
-            let mut command = std::process::Command::new("ps");
-            command.args(["-axo", "pid=,command="]);
-            command
-        };
-        #[cfg(windows)]
-        let mut command = {
-            let mut command = std::process::Command::new("powershell.exe");
-            command.args(["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }"]);
-            command
-        };
-        legacy_process_snapshot(
+    let (listing, processes) = {
+        let (mut command, listing) = legacy_process_command();
+        let processes = legacy_process_snapshot(
             &mut command,
             "legacy-daemon process scan",
             Duration::from_secs(10),
-        )?
+        )?;
+        (listing, processes)
     };
-    if legacy_daemon_present(&processes, std::process::id()) {
+    if legacy_daemon_present(&processes, listing, std::process::id())? {
         return Err(io::Error::other(
             "legacy_daemon_upgrade_window: stop the running subc daemon before cache cleanup",
         ));

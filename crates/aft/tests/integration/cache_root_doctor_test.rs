@@ -164,7 +164,13 @@ fn process_snapshot_fixture(temp: &Path, snapshot: &str) -> std::ffi::OsString {
     fs::create_dir(&bin).unwrap();
     let ps = bin.join("ps");
     // Exercise the normal scan subprocess without consulting the host's daemons.
-    fs::write(&ps, "#!/bin/sh\nexec /bin/cat \"$0.snapshot\"\n").unwrap();
+    // A real scan lists the scanning aft process itself (the script's parent),
+    // and a scan that does not is refused as incomplete, so list it first.
+    fs::write(
+        &ps,
+        "#!/bin/sh\necho \"$PPID /opt/aft fix-config\"\nexec /bin/cat \"$0.snapshot\"\n",
+    )
+    .unwrap();
     fs::write(bin.join("ps.snapshot"), snapshot).unwrap();
     fs::set_permissions(ps, fs::Permissions::from_mode(0o700)).unwrap();
     let mut paths = vec![bin];
@@ -295,7 +301,7 @@ fn cache_root_doctor_prelease_process_snapshot_refuses_cleanup() {
         report["cache_cleanup"]["error"]
             .as_str()
             .unwrap()
-            .starts_with("legacy_daemon_upgrade_window:"),
+            .starts_with("legacy_daemon_upgrade_window: stop the running subc daemon"),
         "{report}"
     );
     assert!(precious.is_file());

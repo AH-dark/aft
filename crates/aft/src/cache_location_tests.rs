@@ -1178,34 +1178,141 @@ fn cache_cleanup_upgrade_window_refuses_a_prelease_daemon() {
     let old = canary(&storage, "index/old");
     canary(&storage, "aft.db");
     drop(config);
+    // The scan lists this process too; one that does not cannot tell whether
+    // a daemon is running, which would refuse for a different reason.
     let processes = format!(
-        "{} /opt/aft --subc /run/connection.json\n",
+        "{} /opt/test-runner\n{} /opt/aft --subc /run/connection.json\n",
+        std::process::id(),
         std::process::id() ^ 1
     );
-    LEGACY_DAEMON_PROCESSES.with(|text| *text.borrow_mut() = processes);
+    LEGACY_DAEMON_PROCESSES.with(|text| *text.borrow_mut() = (ProcessListing::Ps, processes));
     let doctor = reclaim_configured_inactive_caches(&tiers, &storage);
     let mut confirmed = false;
     let report = clean_old_caches(&tiers, &storage, |_| {
         confirmed = true;
         true
     });
-    LEGACY_DAEMON_PROCESSES.with(|text| text.borrow_mut().clear());
+    LEGACY_DAEMON_PROCESSES.with(|text| text.borrow_mut().1.clear());
     assert!(
         doctor
             .error
             .as_deref()
-            .is_some_and(|error| error.starts_with("legacy_daemon_upgrade_window:")),
+            .is_some_and(|error| error
+                .starts_with("legacy_daemon_upgrade_window: stop the running subc daemon")),
         "{doctor:?}"
     );
     assert!(
         report
             .error
             .as_deref()
-            .is_some_and(|error| error.starts_with("legacy_daemon_upgrade_window:")),
+            .is_some_and(|error| error
+                .starts_with("legacy_daemon_upgrade_window: stop the running subc daemon")),
         "{report:?}"
     );
     assert!(!confirmed);
     assert!(old.is_file());
+}
+
+#[test]
+fn cache_location_process_scan_names_windows_executables_from_win32_process() {
+    // `Name` names the executable; a quoted `CommandLine` path with spaces
+    // must not be split into `"C:\Program`.
+    let me = 4000;
+    let listing =
+        |rows: &[&str]| format!("{me}\tcargo-test.exe\tcargo test\r\n{}", rows.join("\r\n"));
+    for row in [
+        "4100\tsubc.exe\t\"C:\\Program Files\\AFT\\subc.exe\" --connection C:\\run\\c.json",
+        "4101\tsubc.exe\t\"C:\\AFT\\subc.exe\" --connection C:\\run\\c.json",
+        "4102\tSUBC.EXE\tC:\\AFT\\SUBC.EXE",
+        "4103\taft.exe\t\"C:\\Program Files\\AFT\\aft.exe\" --subc C:\\run\\c.json",
+        "4104\taft.exe\t\"C:\\AFT\\aft.exe\" --subc=C:\\run\\c.json",
+    ] {
+        assert!(
+            legacy_daemon_present(&listing(&[row]), ProcessListing::Win32Process, me).unwrap(),
+            "daemon not recognised: {row}"
+        );
+    }
+    for row in [
+        // An aft process that is not a daemon.
+        "4200\taft.exe\t\"C:\\Program Files\\AFT\\aft.exe\" index",
+        // `--subc` inside the quoted program path is not an argument.
+        "4201\taft.exe\t\"C:\\x --subc\\aft.exe\" index",
+        // A process whose command line Windows did not disclose.
+        "4202\tnotepad.exe\t",
+    ] {
+        assert!(
+            !legacy_daemon_present(&listing(&[row]), ProcessListing::Win32Process, me).unwrap(),
+            "not a daemon: {row}"
+        );
+    }
+    // This process is never its own blocker.
+    assert!(!legacy_daemon_present(
+        &format!("{me}\tsubc.exe\t\"C:\\Program Files\\AFT\\subc.exe\""),
+        ProcessListing::Win32Process,
+        me
+    )
+    .unwrap());
+}
+
+#[test]
+fn cache_location_process_scan_that_misses_this_process_cannot_tell() {
+    // An empty or partial scan is no evidence that no daemon runs: cleanup
+    // must hold rather than read it as "no daemon".
+    let me = 4000;
+    for (listing, processes) in [
+        (ProcessListing::Win32Process, String::new()),
+        (
+            ProcessListing::Win32Process,
+            "4300\tsvchost.exe\tC:\\Windows\\svchost.exe".to_string(),
+        ),
+        (ProcessListing::Ps, "4300 /usr/bin/sshd\n".to_string()),
+        (ProcessListing::Ps, "ps: permission denied\n".to_string()),
+    ] {
+        let error = legacy_daemon_present(&processes, listing, me)
+            .expect_err("an incomplete scan must not read as no daemon");
+        assert!(
+            error
+                .to_string()
+                .starts_with("legacy_daemon_upgrade_window: cannot tell"),
+            "{error}"
+        );
+    }
+    assert!(!legacy_daemon_present(
+        &format!("{me} /opt/test-runner\n4300 /usr/bin/sshd\n"),
+        ProcessListing::Ps,
+        me
+    )
+    .unwrap());
+}
+
+/// Runs the real process query on this machine: the scan must list this
+/// test process, and on Windows by its executable's file name.
+#[test]
+fn cache_location_process_scan_lists_this_process() {
+    let (mut command, listing) = legacy_process_command();
+    let processes =
+        legacy_process_snapshot(&mut command, "test process scan", Duration::from_secs(60))
+            .expect("process scan");
+    let me = std::process::id();
+    let listed = listed_processes(&processes, listing)
+        .find(|process| process.pid == me)
+        .map(|process| process.executable.to_string());
+    let listed = listed.unwrap_or_else(|| {
+        panic!(
+            "scan did not list pid {me} among {} lines",
+            processes.lines().count()
+        )
+    });
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().unwrap();
+        let name = exe.file_name().unwrap().to_str().unwrap();
+        assert!(listed.eq_ignore_ascii_case(name), "{listed} != {name}");
+    }
+    #[cfg(not(windows))]
+    drop(listed);
+    // A daemon may really be running here; the scan only has to be usable.
+    assert!(legacy_daemon_present(&processes, listing, me).is_ok());
 }
 
 #[cfg(unix)]
