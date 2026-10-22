@@ -5448,10 +5448,17 @@ fn scoped_python_progress_silent_open_cannot_reuse_cached_report_or_poison_serve
         response["summary"]["diagnostics"]["coverage"]["authoritative"], 0,
         "{response:#}"
     );
+    // Keyed by the normalized root the manager uses (no Windows `\\?\`
+    // prefix). With the verbatim spelling no client matches, and both checks
+    // below pass without looking at a server.
     let key = ServerKey {
         kind: ServerKind::Python,
-        root,
+        root: crate::helpers::canonicalize_like_product(&root),
     };
+    assert!(
+        ctx.lsp().active_server_keys().contains(&key),
+        "the key must name the running Python server: {key:?}"
+    );
     assert!(
         !ctx.lsp().server_is_warming(&key),
         "absence of a publication is a file gap, not a permanent producer run"
@@ -5542,6 +5549,10 @@ fn scoped_python_progress_reanalysis_keeps_warm_counts_and_alert_episode() {
         kind: ServerKind::Python,
         root: crate::helpers::canonicalize_like_product(&root),
     };
+    assert!(
+        ctx.lsp().active_server_keys().contains(&key),
+        "the key must name the running Python server: {key:?}"
+    );
     let diagnostics = ctx
         .lsp()
         .get_diagnostics_for_file(&file)
