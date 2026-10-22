@@ -113,7 +113,8 @@ impl Fixture {
             reader_eof.clone(),
             coordinator.clone(),
             None,
-        );
+        )
+        .unwrap();
         reached_rx
             .recv_timeout(WAIT)
             .expect("reader held before capture");

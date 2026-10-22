@@ -4399,10 +4399,15 @@ mod tests {
             include_str!("../commands/bash_status.rs"),
         ];
         for source in rust_sources {
+            // A Windows checkout can have CRLF line endings. Without this the
+            // split marker never matches there, so the guard would scan test
+            // modules on Windows but not elsewhere. Scan the same production
+            // text on every platform.
+            let source = source.replace("\r\n", "\n");
             let production = source
                 .split("#[cfg(test)]\nmod tests")
                 .next()
-                .unwrap_or(source);
+                .unwrap_or(&source);
             for forbidden in [
                 "File::open(&task.paths",
                 "fs::read(&task.paths",

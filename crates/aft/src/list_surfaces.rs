@@ -733,6 +733,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "bash live-tail (bash_status polling) output is shown raw by design and carries no truncation envelope",
     },
     ExclusionEntry {
+        file: "bash_background/registry.rs",
+        enclosing_item: "read_artifact_page",
+        location_or_primitive: "ARTIFACT_PAGE_BYTES",
+        reason: "raw artifact transport is paged in bytes, not output lines or list records; callers continue at the actual returned byte offset and has_more discloses a captured backlog rather than claiming exhaustion",
+    },
+    ExclusionEntry {
+        file: "commands/bash_status.rs",
+        enclosing_item: "read_status_artifact_page",
+        location_or_primitive: "ARTIFACT_PAGE_BYTES",
+        reason: "store-unavailable status reads use the same bounded byte pages as registered tasks; next_offset and has_more describe the remaining artifact rather than a list truncation envelope",
+    },
+    ExclusionEntry {
         file: "commands/status.rs",
         enclosing_item: "handle",
         location_or_primitive: "summary count arrays",

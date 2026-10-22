@@ -1,4 +1,5 @@
 import {
+  BashOutputPageDecoder,
   type BridgeRequestOptions,
   coerceBoolean,
   formatWatchWaited,
@@ -6,7 +7,9 @@ import {
   isBridgeTransportTimeout,
   isTerminalStatus,
   maxWatchTimeoutMs,
+  REGEX_WINDOW_SCAN_INCOMPLETE_TEXT,
   resolveWatchTimeoutMs,
+  TERMINAL_SCAN_INCOMPLETE_TEXT,
   taskKillDeadlineText,
   taskKillDeadlineWithinHandoffMargin,
   WATCH_SYNC_DEFAULTS_DESCRIPTION,
@@ -45,6 +48,14 @@ import { bashCompanionRegistered } from "./bash.js";
 
 const z = tool.schema;
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
+/**
+ * Most bytes a held regex match may keep in the scan buffer: the window plus
+ * one 64 KiB bash_status page. The engine's own watch never holds more than
+ * that either (it cuts to its window after every page). A held match that
+ * would need more is let go, the buffer is trimmed as usual, and the trimmed
+ * bytes mark the scan incomplete.
+ */
+const REGEX_WAIT_HELD_MATCH_CAP_BYTES = 2 * REGEX_WAIT_SCAN_WINDOW_BYTES;
 
 export type BashWaitPattern =
   | { kind: "substring"; value: string }
@@ -58,6 +69,9 @@ export type BashStatusWaited = {
   match?: string;
   match_offset?: number;
   match_stream?: "stdout" | "stderr";
+  /** The task exited without a match, but a regex scan dropped older output
+   * from its window, so the non-match is not a complete answer. */
+  scan_incomplete?: boolean;
 };
 
 /**
@@ -72,7 +86,12 @@ type BashStatusWithWait = Record<string, unknown> & { waited?: BashStatusWaited 
 type OutputStream = "output" | "stderr";
 type OutputCursor = { output: number; stderr: number };
 type OutputScanChunk = { stream: OutputStream; text: string; baseOffset: number };
-type OutputScanState = Record<OutputStream, { text: string; baseOffset: number }>;
+/**
+ * One stream's scan buffer. `context` is the character just before a trimmed
+ * regex window: it is sent with the text but the search starts after it, so
+ * the trimmed start never looks like the start of the output.
+ */
+type OutputScanState = Record<OutputStream, { text: string; baseOffset: number; context: string }>;
 
 function coerceConfiguredWatchTimeout(
   value: unknown,
@@ -353,6 +372,10 @@ function formatWatchResultText(
     if (waited.reason === "matched") {
       const stream = waited.match_stream ? ` in ${waited.match_stream}` : "";
       text += `\n${waitedText}; matched ${JSON.stringify(waited.match ?? "")}${stream} at offset ${waited.match_offset ?? 0}.`;
+    } else if (waited.reason === "timeout" && isTerminalStatus(data.status)) {
+      // The task exited, but the watch ran out of time before it scanned all
+      // of the captured output: neither "still running" nor "no match" is true.
+      text += `\n${waitedText}; ${TERMINAL_SCAN_INCOMPLETE_TEXT}`;
     } else if (waited.reason === "timeout" && role === "worker") {
       // A watch deadline is not a failure of the command, and a delegated
       // worker that reads it as one declares a failed result mid-run. Tell it
@@ -374,6 +397,7 @@ function formatWatchResultText(
       const stat = String(data.status ?? "unknown");
       const e = typeof data.exit_code === "number" ? `, exit ${data.exit_code}` : "";
       text += `\n${waitedText}; task exited (${stat}${e}).`;
+      if (waited.scan_incomplete) text += ` ${REGEX_WINDOW_SCAN_INCOMPLETE_TEXT}`;
     }
   }
   const preview = data.output_preview as string | undefined;
@@ -445,10 +469,21 @@ export async function waitForBashStatus(
     ...extra,
   });
   let spillCursor: OutputCursor = { output: 0, stderr: 0 };
+  // One decoder per stream, so a character split across two pages decodes whole.
+  const decoders = { output: new BashOutputPageDecoder(), stderr: new BashOutputPageDecoder() };
   const scanState: OutputScanState = {
-    output: { text: "", baseOffset: 0 },
-    stderr: { text: "", baseOffset: 0 },
+    output: { text: "", baseOffset: 0, context: "" },
+    stderr: { text: "", baseOffset: 0, context: "" },
   };
+  // Stream byte offset of a regex match held back at a page edge, per stream
+  // (see the scan below).
+  const heldMatchAt: Record<OutputStream, number | undefined> = {
+    output: undefined,
+    stderr: undefined,
+  };
+  // Set once a regex scan trims older output out of its window; a later
+  // no-match exit then cannot rule out a match longer than the window.
+  let regexWindowDropped = false;
   const bridgeOptions: BridgeRequestOptions = {};
   if (waitFor?.kind === "regex") {
     await validateWaitRegex(ctx, runtime, waitFor);
@@ -507,58 +542,84 @@ export async function waitForBashStatus(
       }
       const terminal = isTerminalStatus(data.status);
       if (waitFor) {
-        const scan = await readNewTaskOutput(data, spillCursor);
-        if (scan) {
-          spillCursor = scan.nextCursor;
-          // Independent buffers prevent a stdout suffix and stderr prefix from
-          // becoming a fabricated match. When both streams match in one poll,
-          // readNewTaskOutput's stdout-first chunk order is the tie-breaker.
-          for (const chunk of scan.chunks) {
-            const state = scanState[chunk.stream];
+        const scan = await readNewTaskOutput(data, spillCursor, decoders);
+        spillCursor = scan.nextCursor;
+        // Independent buffers prevent a stdout suffix and stderr prefix from
+        // becoming a fabricated match. When both streams match in one poll,
+        // stdout is checked first and wins.
+        for (const stream of OUTPUT_STREAMS) {
+          const chunk = scan.chunks.find((candidate) => candidate.stream === stream);
+          const more = streamHasMore(data, stream);
+          // A held-back match is checked again once its stream is known to end there.
+          const held = heldMatchAt[stream];
+          if (!chunk && !(held !== undefined && !more)) continue;
+          heldMatchAt[stream] = undefined;
+          const state = scanState[stream];
+          if (chunk) {
             if (state.text.length === 0) state.baseOffset = chunk.baseOffset;
             state.text += chunk.text;
             if (waitFor.kind === "regex") {
-              const trimmed = trimWaitScanBuffer(state.text, state.baseOffset, waitFor);
+              const trimmed = trimWaitScanBuffer(
+                state.text,
+                state.baseOffset,
+                waitFor,
+                held,
+                state.context,
+              );
+              if (trimmed.baseOffset !== state.baseOffset) regexWindowDropped = true;
               state.text = trimmed.text;
               state.baseOffset = trimmed.baseOffset;
+              state.context = trimmed.context;
             }
-            const match = await findWaitMatch(ctx, runtime, state.text, waitFor);
-            if (match) {
-              if (terminal) {
-                sawTerminal = true;
-                consumeBgCompletion(runtime.sessionID, taskId);
-                await markBgCompletionDelivered(
-                  { ctx, directory: projectRootFor(runtime), sessionID: runtime.sessionID },
-                  taskId,
-                );
-              }
-              const matchStream: "stdout" | "stderr" | undefined =
-                data.mode === "pty" ? undefined : chunk.stream === "output" ? "stdout" : "stderr";
-              return withWaited(
-                data,
-                waited("matched", {
-                  match: match.text,
-                  match_offset: state.baseOffset + match.byteOffset,
-                  match_stream: matchStream,
-                }),
+          }
+          const match = await findWaitMatch(ctx, runtime, state.text, waitFor, state.context);
+          if (match && more && regexMatchReachesBufferEnd(waitFor, match, state.text)) {
+            // A page ends where the read stopped, not where the output ends.
+            // A regex match reaching the end of the buffer may depend on what
+            // follows ($, \z, \b, a greedy repeat), so it waits for the next page.
+            heldMatchAt[stream] = state.baseOffset + match.byteOffset;
+          } else if (match) {
+            if (terminal) {
+              sawTerminal = true;
+              consumeBgCompletion(runtime.sessionID, taskId);
+              await markBgCompletionDelivered(
+                { ctx, directory: projectRootFor(runtime), sessionID: runtime.sessionID },
+                taskId,
               );
             }
-            if (waitFor.kind === "substring") {
-              const trimmed = trimWaitScanBuffer(state.text, state.baseOffset, waitFor);
-              state.text = trimmed.text;
-              state.baseOffset = trimmed.baseOffset;
-            }
+            const matchStream: "stdout" | "stderr" | undefined =
+              data.mode === "pty" ? undefined : stream === "output" ? "stdout" : "stderr";
+            return withWaited(
+              data,
+              waited("matched", {
+                match: match.text,
+                match_offset: state.baseOffset + match.byteOffset,
+                match_stream: matchStream,
+              }),
+            );
+          }
+          if (waitFor.kind === "substring") {
+            const trimmed = trimWaitScanBuffer(state.text, state.baseOffset, waitFor);
+            state.text = trimmed.text;
+            state.baseOffset = trimmed.baseOffset;
           }
         }
       }
-      if (terminal) {
+      // An exited task can still have captured output past this page. Scan
+      // it all, within the watch's deadline, before reporting the exit.
+      const outputPending =
+        !!waitFor && (data.output_has_more === true || data.stderr_has_more === true);
+      if (terminal && !outputPending) {
         sawTerminal = true;
         consumeBgCompletion(runtime.sessionID, taskId);
         await markBgCompletionDelivered(
           { ctx, directory: projectRootFor(runtime), sessionID: runtime.sessionID },
           taskId,
         );
-        return withWaited(data, waited("exited"));
+        return withWaited(
+          data,
+          waited("exited", regexWindowDropped ? { scan_incomplete: true } : {}),
+        );
       }
       // User-message abort: if the user sent a message while we were
       // blocking, convert this sync wait to an async watch so the agent's
@@ -575,6 +636,7 @@ export async function waitForBashStatus(
       if (watchClock.now() >= deadline && !waitPastDeadline) {
         return withWaited(data, waited("timeout"));
       }
+      if (outputPending) continue;
       await pause(waitPastDeadline);
     }
   } finally {
@@ -585,7 +647,8 @@ export async function waitForBashStatus(
 async function readNewTaskOutput(
   data: Record<string, unknown>,
   cursor: OutputCursor,
-): Promise<{ chunks: OutputScanChunk[]; nextCursor: OutputCursor } | undefined> {
+  decoders: Record<OutputStream, BashOutputPageDecoder>,
+): Promise<{ chunks: OutputScanChunk[]; nextCursor: OutputCursor }> {
   const stdoutBytes =
     typeof data.output_chunk_base64 === "string"
       ? Buffer.from(data.output_chunk_base64, "base64")
@@ -594,21 +657,25 @@ async function readNewTaskOutput(
     typeof data.stderr_chunk_base64 === "string"
       ? Buffer.from(data.stderr_chunk_base64, "base64")
       : Buffer.alloc(0);
-  if (stdoutBytes.length + stderrBytes.length === 0) return undefined;
+  // A stream really ends only when its task has exited and no captured
+  // bytes remain; only then may a held-back partial character be flushed.
+  const terminal = isTerminalStatus(data.status);
+  const stdout = decoders.output.decode(
+    stdoutBytes,
+    cursor.output,
+    terminal && data.output_has_more !== true,
+  );
+  const stderr = decoders.stderr.decode(
+    stderrBytes,
+    cursor.stderr,
+    terminal && data.stderr_has_more !== true,
+  );
   const chunks: OutputScanChunk[] = [];
-  if (stdoutBytes.length > 0) {
-    chunks.push({
-      stream: "output",
-      text: stdoutBytes.toString("utf8"),
-      baseOffset: cursor.output,
-    });
+  if (stdout.text.length > 0) {
+    chunks.push({ stream: "output", text: stdout.text, baseOffset: stdout.baseOffset });
   }
-  if (stderrBytes.length > 0) {
-    chunks.push({
-      stream: "stderr",
-      text: stderrBytes.toString("utf8"),
-      baseOffset: cursor.stderr,
-    });
+  if (stderr.text.length > 0) {
+    chunks.push({ stream: "stderr", text: stderr.text, baseOffset: stderr.baseOffset });
   }
   return {
     chunks,
@@ -641,6 +708,26 @@ function isRegexWaitObject(value: unknown): value is { regex: string } {
 
 type WaitMatch = { text: string; byteOffset: number };
 
+const OUTPUT_STREAMS: readonly OutputStream[] = ["output", "stderr"];
+
+/** Whether bash_status reported captured bytes past this page for `stream`. */
+function streamHasMore(data: Record<string, unknown>, stream: OutputStream): boolean {
+  return (stream === "output" ? data.output_has_more : data.stderr_has_more) === true;
+}
+
+/** A regex match that ends exactly at the end of the scanned text. A literal
+ * is complete once its bytes are in, so it never qualifies. */
+function regexMatchReachesBufferEnd(
+  pattern: BashWaitPattern,
+  match: WaitMatch,
+  text: string,
+): boolean {
+  return (
+    pattern.kind === "regex" &&
+    match.byteOffset + Buffer.byteLength(match.text, "utf8") === Buffer.byteLength(text, "utf8")
+  );
+}
+
 async function validateWaitRegex(
   ctx: PluginContext,
   runtime: ToolContext,
@@ -654,6 +741,7 @@ async function findWaitMatch(
   runtime: ToolContext,
   text: string,
   pattern: BashWaitPattern,
+  context = "",
 ): Promise<WaitMatch | undefined> {
   if (pattern.kind === "substring") {
     const index = text.indexOf(pattern.value);
@@ -661,7 +749,7 @@ async function findWaitMatch(
       ? { text: pattern.value, byteOffset: Buffer.byteLength(text.slice(0, index), "utf8") }
       : undefined;
   }
-  return await matchRegexWithBridge(ctx, runtime, pattern.source, text);
+  return await matchRegexWithBridge(ctx, runtime, pattern.source, text, context);
 }
 
 async function matchRegexWithBridge(
@@ -669,8 +757,15 @@ async function matchRegexWithBridge(
   runtime: ToolContext,
   pattern: string,
   text: string,
+  context = "",
 ): Promise<WaitMatch | undefined> {
-  const result = await callBashBridge(ctx, runtime, "bash_regex_match", { pattern, text });
+  const start = Buffer.byteLength(context, "utf8");
+  const result = await callBashBridge(
+    ctx,
+    runtime,
+    "bash_regex_match",
+    start === 0 ? { pattern, text } : { pattern, text: context + text, start },
+  );
   if (result.success === false) {
     const code = String(result.code ?? "invalid_request");
     const message = String(result.message ?? "bash_regex_match failed");
@@ -678,9 +773,25 @@ async function matchRegexWithBridge(
     throw new Error(`${code}: ${message}`);
   }
   if (result.matched !== true) return undefined;
+  return contextRelativeMatch(result, start);
+}
+
+/**
+ * A bash_regex_match reply as a match in the text after `start` bytes of
+ * context. An engine that echoes `start` searched from there. An older engine
+ * ignores `start` and searches from the beginning, so a match it reports
+ * inside the context may rest on a false start of input; it is dropped,
+ * missing a match rather than inventing one.
+ */
+function contextRelativeMatch(
+  result: Record<string, unknown>,
+  start: number,
+): WaitMatch | undefined {
+  const offset = coerceMatchOffset(result.match_offset);
+  if (offset < start) return undefined;
   return {
     text: typeof result.match_text === "string" ? result.match_text : "",
-    byteOffset: coerceMatchOffset(result.match_offset),
+    byteOffset: offset - start,
   };
 }
 
@@ -689,21 +800,59 @@ function coerceMatchOffset(value: unknown): number {
   return Number.isFinite(offset) && offset >= 0 ? offset : 0;
 }
 
+/**
+ * Trims the scan buffer to what a later match still needs. `heldAt`, the
+ * stream byte offset of a regex match held back at a page edge, keeps that
+ * match whole until the next page settles it, as long as the kept text stays
+ * within REGEX_WAIT_HELD_MATCH_CAP_BYTES. An open-ended match (for example
+ * `BEGIN[\s\S]*`) would otherwise pin the buffer start and grow it by a page
+ * on every poll.
+ */
 function trimWaitScanBuffer(
   text: string,
   baseOffset: number,
   pattern: BashWaitPattern,
-): { text: string; baseOffset: number } {
-  const keepFrom =
+  heldAt?: number,
+  context = "",
+): { text: string; baseOffset: number; context: string } {
+  let keepFrom =
     pattern.kind === "substring"
       ? substringKeepStart(text, pattern.value)
       : regexKeepStart(text, REGEX_WAIT_SCAN_WINDOW_BYTES);
-  if (keepFrom <= 0) return { text, baseOffset };
+  if (
+    heldAt !== undefined &&
+    heldAt >= baseOffset &&
+    Buffer.byteLength(text, "utf8") - (heldAt - baseOffset) <= REGEX_WAIT_HELD_MATCH_CAP_BYTES
+  ) {
+    keepFrom = Math.min(keepFrom, charIndexAtByteOffset(text, heldAt - baseOffset));
+  }
+  if (keepFrom <= 0) return { text, baseOffset, context };
 
   return {
     text: text.slice(keepFrom),
     baseOffset: baseOffset + Buffer.byteLength(text.slice(0, keepFrom), "utf8"),
+    context: characterBefore(text, keepFrom),
   };
+}
+
+/**
+ * The whole character (one or two UTF-16 units) just before `index`. A lone
+ * surrogate is never returned, because it cannot be sent as JSON text.
+ */
+function characterBefore(text: string, index: number): string {
+  if (index <= 0) return "";
+  const last = text.charCodeAt(index - 1);
+  if (isLowSurrogate(last)) {
+    return index >= 2 && isHighSurrogate(text.charCodeAt(index - 2))
+      ? text.slice(index - 2, index)
+      : "";
+  }
+  return isHighSurrogate(last) ? "" : text.slice(index - 1, index);
+}
+
+/** The string index of the character that starts `byteOffset` bytes into `text`. */
+function charIndexAtByteOffset(text: string, byteOffset: number): number {
+  return Buffer.from(text, "utf8").subarray(0, byteOffset).toString("utf8").length;
 }
 
 function substringKeepStart(text: string, pattern: string): number {
@@ -724,14 +873,26 @@ function regexKeepStart(text: string, maxBytes: number): number {
       high = mid;
     }
   }
-  return low;
+  // Never start the window inside a surrogate pair: a lone surrogate cannot
+  // be sent as JSON text. Moving forward past the pair keeps the byte bound.
+  return isLowSurrogate(text.charCodeAt(low)) && isHighSurrogate(text.charCodeAt(low - 1))
+    ? low + 1
+    : low;
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
 }
 
 export function __trimWaitScanBufferForTests(
   text: string,
   baseOffset: number,
   pattern: BashWaitPattern,
-): { text: string; baseOffset: number } {
+): { text: string; baseOffset: number; context: string } {
   return trimWaitScanBuffer(text, baseOffset, pattern);
 }
 

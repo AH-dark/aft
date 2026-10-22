@@ -1411,6 +1411,14 @@ pub(crate) struct BgTaskState {
     pub(crate) pending_terminal_override: Option<BgTaskStatus>,
 }
 
+pub(crate) const ARTIFACT_PAGE_BYTES: usize = 64 * 1024;
+
+pub(crate) struct ArtifactPage {
+    pub bytes: Vec<u8>,
+    pub next_offset: u64,
+    pub has_more: bool,
+}
+
 fn completion_matches_session(completion: &BgCompletion, session_id: Option<&str>) -> bool {
     session_id
         .map(|session_id| completion.session_id == session_id)
@@ -1684,6 +1692,8 @@ impl BgTaskRegistry {
         Some(self.read_artifact(&task.task_id, session_id, artifact))
     }
 
+    /// Read one bounded raw page. Continue at the returned byte offset; it is
+    /// the actual read endpoint, not a promise that the artifact is exhausted.
     pub fn read_artifact_range(
         &self,
         task_id: &str,
@@ -1691,6 +1701,17 @@ impl BgTaskRegistry {
         artifact: TaskArtifact,
         offset: u64,
     ) -> Result<(Vec<u8>, u64), String> {
+        let page = self.read_artifact_page(task_id, session_id, artifact, offset)?;
+        Ok((page.bytes, page.next_offset))
+    }
+
+    pub(crate) fn read_artifact_page(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        artifact: TaskArtifact,
+        offset: u64,
+    ) -> Result<ArtifactPage, String> {
         validate_task_id(task_id).map_err(|error| error.to_string())?;
         let task = self
             .task_for_session(task_id, session_id)
@@ -1700,11 +1721,30 @@ impl BgTaskRegistry {
         let len = file
             .len()
             .map_err(|error| format!("artifact_refused: {error}"))?;
+        #[cfg(test)]
+        ARTIFACT_RANGE_AFTER_STAT.with(|hook| {
+            if let Some(run) = hook.borrow_mut().take() {
+                run(&task.paths);
+            }
+        });
+        #[cfg(test)]
+        if let Some(delay) = ARTIFACT_PAGE_DELAY.with(std::cell::Cell::get) {
+            std::thread::sleep(delay);
+        }
         let start = offset.min(len);
+        let requested = len.saturating_sub(start).min(ARTIFACT_PAGE_BYTES as u64);
         let bytes = file
-            .read_range(start, len.saturating_sub(start))
+            .read_range(start, requested)
             .map_err(|error| format!("artifact_refused: {error}"))?;
-        Ok((bytes, len))
+        let next_offset = start + bytes.len() as u64;
+        // A short/empty read reached the handle's current EOF, even if its
+        // length shrank after the sample. Do not spin on a stale sampled end.
+        let has_more = bytes.len() as u64 == requested && !bytes.is_empty() && next_offset < len;
+        Ok(ArtifactPage {
+            bytes,
+            next_offset,
+            has_more,
+        })
     }
 
     pub fn read_artifact(
@@ -1719,6 +1759,8 @@ impl BgTaskRegistry {
             .ok_or_else(|| "task_not_found".to_string())?;
         let mut file = open_task_artifact(&task.paths, artifact)
             .map_err(|error| format!("artifact_refused: {error}"))?;
+        #[cfg(test)]
+        ARTIFACT_READ_ALL_CALLS.with(|calls| calls.set(calls.get() + 1));
         file.read_all()
             .map_err(|error| format!("artifact_refused: {error}"))
     }
@@ -8689,8 +8731,23 @@ impl BgTaskRegistry {
                                 if handles.artifact_len(TaskArtifact::Exit).unwrap_or(1) == 0 {
                                     let marker = status
                                         .code()
-                                        .map(|code| code.to_string())
-                                        .unwrap_or_else(|| "1".to_string());
+                                        .unwrap_or_else(|| {
+                                            #[cfg(unix)]
+                                            {
+                                                use std::os::unix::process::ExitStatusExt;
+                                                // Match shell-written markers when the wrapper
+                                                // itself died before it could record its status.
+                                                status
+                                                    .signal()
+                                                    .map(|signal| 128 + signal)
+                                                    .unwrap_or(1)
+                                            }
+                                            #[cfg(not(unix))]
+                                            {
+                                                1
+                                            }
+                                        })
+                                        .to_string();
                                     let _ = handles.write(TaskArtifact::Exit, marker.as_bytes());
                                 }
                             }
@@ -12050,6 +12107,19 @@ fn canonicalized_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
+thread_local! {
+    static ARTIFACT_RANGE_AFTER_STAT: std::cell::RefCell<Option<Box<dyn FnOnce(&TaskPaths)>>> = const { std::cell::RefCell::new(None) };
+    static ARTIFACT_READ_ALL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Sleep added to every page read on this thread, so a test can make
+    /// draining a captured backlog slower than a caller's reply budget.
+    pub(crate) static ARTIFACT_PAGE_DELAY: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
 thread_local! { static ROOT_LOCK_PROBE: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) }; }
 
 fn started_instant_from_unix_millis(started_at: u64) -> Instant {
@@ -13590,6 +13660,182 @@ mod tests {
         drop(state);
         task.holds_background_slot.store(false, Ordering::SeqCst);
         task
+    }
+
+    #[cfg(unix)]
+    fn approved_reap_fixture(command: &str) -> (tempfile::TempDir, BgTaskRegistry, Arc<BgTask>) {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let layout =
+            create_task_layout(dir.path(), "signal-session", "bash-0000000000000008").unwrap();
+        let handles = TaskIoHandles::create(&layout, BgMode::Pipes, false).unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", command])
+            .spawn()
+            .unwrap();
+        let exit = child.wait().unwrap();
+        match command {
+            "kill -TERM $$" => assert_eq!(exit.signal(), Some(libc::SIGTERM)),
+            "kill -KILL $$" => assert_eq!(exit.signal(), Some(libc::SIGKILL)),
+            _ => assert_eq!(exit.code(), Some(7)),
+        }
+        let mut metadata = PersistedTask::starting(
+            layout.paths.task_id.clone(),
+            "signal-session".into(),
+            command.into(),
+            dir.path().into(),
+            Some(dir.path().into()),
+            Some(30_000),
+            false,
+            false,
+        );
+        metadata.mark_running(child.id(), child.id() as i32);
+        write_task_at(&layout, &metadata).unwrap();
+        registry
+            .insert_rehydrated_task(metadata, layout.paths, false)
+            .unwrap();
+        let task = registry
+            .task_for_session("bash-0000000000000008", "signal-session")
+            .unwrap();
+        {
+            let mut state = task.lock_state().unwrap();
+            state.runtime = TaskRuntime::Piped(Some(child.into()));
+            state.io_handles = Some(handles);
+        }
+        (dir, registry, task)
+    }
+
+    /// The exit marker as written, read through the registered-artifact
+    /// opener like every other consumer of task artifacts.
+    #[cfg(unix)]
+    fn registered_exit_marker(task: &BgTask) -> String {
+        let bytes = open_task_artifact(&task.paths, TaskArtifact::Exit)
+            .unwrap()
+            .read_all()
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_signal_death_synthesizes_shell_exit_code() {
+        for (command, expected) in [("kill -TERM $$", 143), ("kill -KILL $$", 137)] {
+            let (_dir, registry, task) = approved_reap_fixture(command);
+            registry.reap_child(&task);
+            assert_eq!(registered_exit_marker(&task), expected.to_string());
+            registry.poll_task(&task).unwrap();
+            let snapshot = task.snapshot(0);
+            assert_eq!(snapshot.info.status, BgTaskStatus::Failed);
+            assert_eq!(snapshot.exit_code, Some(expected));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_numeric_exit_code_is_preserved() {
+        let (_dir, registry, task) = approved_reap_fixture("exit 7");
+        registry.reap_child(&task);
+        assert_eq!(registered_exit_marker(&task), "7");
+        registry.poll_task(&task).unwrap();
+        assert_eq!(task.snapshot(0).exit_code, Some(7));
+    }
+
+    #[test]
+    fn approved_artifact_range_pages_without_skipping_bytes() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let output = "abcdefgh".repeat(32 * 1024);
+        let (id, _task) = insert_terminal_piped_task(&registry, &dir, "true", &output, "", false);
+        let mut cursor = 11;
+        let mut collected = Vec::new();
+        loop {
+            let (bytes, next) = registry
+                .read_artifact_range(&id, "session", TaskArtifact::Stdout, cursor)
+                .unwrap();
+            assert!(
+                bytes.len() <= 64 * 1024,
+                "one read allocated {} bytes",
+                bytes.len()
+            );
+            assert_eq!(next, cursor + bytes.len() as u64);
+            if bytes.is_empty() {
+                break;
+            }
+            collected.extend(bytes);
+            cursor = next;
+        }
+        assert_eq!(collected, &output.as_bytes()[11..]);
+    }
+
+    #[test]
+    fn approved_artifact_short_read_returns_actual_next_offset() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (id, _task) =
+            insert_terminal_piped_task(&registry, &dir, "true", "abcdefghij", "", false);
+        ARTIFACT_RANGE_AFTER_STAT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|paths| {
+                fs::write(&paths.stdout, "abcde").unwrap();
+            }))
+        });
+        let (bytes, next) = registry
+            .read_artifact_range(&id, "session", TaskArtifact::Stdout, 2)
+            .unwrap();
+        assert_eq!(bytes, b"cde");
+        assert_eq!(next, 5, "sampled EOF skipped unread bytes after shortening");
+    }
+
+    #[test]
+    fn approved_head_status_paging_does_not_renew_default_kill() {
+        let (_dir, ctx, task) = super::default_kill_tests::wait_fixture(None);
+        fs::write(&task.paths.stdout, "output").unwrap();
+        fs::write(&task.paths.stderr, "").unwrap();
+        let request = serde_json::from_value(serde_json::json!({"id": "head-page", "command": "bash_status", "session_id": task.session_id, "worker_session": false, "params": {"task_id": task.task_id, "output_offset": 0}})).unwrap();
+        let response = crate::commands::bash_status::handle(&request, &ctx);
+        assert!(response.success, "status failed: {:?}", response.data);
+        assert_eq!(
+            ctx.bash_background()
+                .hard_kill_deadline(&task.task_id, &task.session_id)
+                .unwrap()
+                .limit_ms,
+            1_800_000
+        );
+    }
+
+    #[test]
+    fn approved_pty_offset_status_does_not_also_return_entire_raw_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::context::AppContext::from_app(
+            crate::context::App::default_shared(),
+            crate::config::Config {
+                project_root: Some(dir.path().into()),
+                storage_dir: Some(dir.path().into()),
+                ..Default::default()
+            },
+        );
+        let (id, task) =
+            insert_terminal_piped_task(ctx.bash_background(), &dir, "true", "", "", false);
+        {
+            let mut state = task.lock_state().unwrap();
+            state.metadata.mode = BgMode::Pty;
+            state.runtime = TaskRuntime::Pty(None);
+            state.buffer = BgBuffer::registered(&task.paths, BgMode::Pty);
+            write_task(&task.paths.json, &state.metadata).unwrap();
+        }
+        fs::write(&task.paths.pty, vec![b'x'; 3 * 64 * 1024]).unwrap();
+        let request = serde_json::from_value(serde_json::json!({"id": "pty-page", "command": "bash_status", "session_id": "session", "params": {"task_id": id, "output_offset": 0, "output_mode": "raw"}})).unwrap();
+        ARTIFACT_READ_ALL_CALLS.with(|calls| calls.set(0));
+        let response = crate::commands::bash_status::handle(&request, &ctx);
+        assert!(response.success, "status failed: {:?}", response.data);
+        assert_eq!(response.data["pty_raw"].as_str().unwrap().len(), 64 * 1024);
+        assert_eq!(response.data["output_next_offset"], 65536);
+        assert_eq!(response.data["output_has_more"], true);
+        assert_eq!(
+            ARTIFACT_READ_ALL_CALLS.with(std::cell::Cell::get),
+            0,
+            "paged status also replayed the whole PTY artifact"
+        );
     }
 
     #[test]

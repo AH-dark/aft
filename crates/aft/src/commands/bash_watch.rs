@@ -38,6 +38,13 @@ pub(crate) const DEFAULT_PRIMARY_WATCH_TIMEOUT_MS: u64 = 30_000;
 pub(crate) const MAX_WATCH_TIMEOUT_MS: u64 = 1_800_000;
 /// How much recent output a regex watch keeps for matching across reads.
 const REGEX_SCAN_WINDOW_BYTES: usize = 64 * 1024;
+/// Bytes kept before a trimmed regex window as context only. `^`, `\b` and
+/// `\B` look back one character, and a UTF-8 character is at most 4 bytes.
+const REGEX_SCAN_CONTEXT_BYTES: usize = 4;
+/// Added to an exited task's no-match result when a regex scan had to drop
+/// older output from its window, so the non-match is not a complete answer.
+/// Literal patterns never set it: their kept tail is exact.
+const REGEX_WINDOW_SCAN_INCOMPLETE: &str = "No match found, but the scan is incomplete: a regex match longer than 64 KiB may have been missed. Literal patterns are always scanned in full.";
 /// Most lines of a still-running command's output shown to a worker.
 const WORKER_OUTPUT_TAIL_LINES: usize = 20;
 /// Output preview a watch result carries for a finished task.
@@ -98,6 +105,8 @@ struct Waited {
     elapsed_ms: u64,
     limit_ms: u64,
     matched: Option<(String, u64, Option<&'static str>)>,
+    /// The task exited without a match, but the regex window dropped bytes.
+    scan_incomplete: bool,
 }
 
 fn wait_limit_outcome(
@@ -124,6 +133,18 @@ struct StreamScan {
     buffer: Vec<u8>,
     base: u64,
     next: u64,
+    has_more: bool,
+    /// A regex match ended exactly at the end of the buffer while more
+    /// captured bytes were still to be read. It is checked again once the
+    /// next page arrives or the stream is known to end there.
+    deferred: bool,
+    /// A regex scan cut older bytes out of its window, so a match longer
+    /// than the window could have been missed.
+    dropped: bool,
+    /// Leading buffer bytes that are context from before a trimmed window.
+    /// The search starts after them, so the trimmed start never looks like
+    /// the start of the output to `^`, `\b` or `\B`.
+    search_from: usize,
 }
 
 fn parse_params(req: &RawRequest) -> Result<BashWatchParams, String> {
@@ -313,67 +334,76 @@ pub(crate) fn handle_deferred_with_budget(
     let thread_id = id.clone();
     let ask_route = crate::access_policy::capture_ask_route();
     let grant_scope = crate::access_policy::current_scope();
-    std::thread::spawn(move || {
-        let _ask_route = ask_route.install();
-        let _grant_scope = crate::access_policy::scope_guard(grant_scope);
-        crate::sandbox_spawn::with_authenticated_principal(principal, || {
-            // Configure acknowledges the route before its replay tail finishes.
-            // Resolve the durable record before starting the wait, off executor
-            // slots, and without replaying unrelated tasks or relaxing the session.
-            if registry.observed_status(&task_id, &session, 0).is_none() {
-                registry.set_worker_wait_window(Duration::from_millis(worker_limit_ms));
-                if let Err(error) = registry.recover_watch_task(
-                    &storage_dir,
-                    &session,
-                    &task_id,
-                    project_root.as_deref(),
-                    harness.as_deref(),
-                ) {
-                    let _ = tx.send(Response::error(&thread_id, "task_recovery_failed", error));
+    if let Err(error) = crate::bash_background::worker_thread::spawn(
+        crate::bash_background::worker_thread::Worker::Watch,
+        move || {
+            let _ask_route = ask_route.install();
+            let _grant_scope = crate::access_policy::scope_guard(grant_scope);
+            crate::sandbox_spawn::with_authenticated_principal(principal, || {
+                // Configure acknowledges the route before its replay tail finishes.
+                // Resolve the durable record before starting the wait, off executor
+                // slots, and without replaying unrelated tasks or relaxing the session.
+                if registry.observed_status(&task_id, &session, 0).is_none() {
+                    registry.set_worker_wait_window(Duration::from_millis(worker_limit_ms));
+                    if let Err(error) = registry.recover_watch_task(
+                        &storage_dir,
+                        &session,
+                        &task_id,
+                        project_root.as_deref(),
+                        harness.as_deref(),
+                    ) {
+                        let _ = tx.send(Response::error(&thread_id, "task_recovery_failed", error));
+                        return;
+                    }
+                }
+                if registry.observed_status(&task_id, &session, 0).is_none() {
+                    let _ = tx.send(Response::error(
+                        &thread_id,
+                        "task_not_found",
+                        format_unknown_polled_task_message(&task_id, &shell_tool),
+                    ));
                     return;
                 }
-            }
-            if registry.observed_status(&task_id, &session, 0).is_none() {
-                let _ = tx.send(Response::error(
-                    &thread_id,
-                    "task_not_found",
-                    format_unknown_polled_task_message(&task_id, &shell_tool),
-                ));
-                return;
-            }
-            let watch = WatchJob {
-                registry,
-                task_id,
-                session,
-                pattern,
-                limit_ms,
-                worker,
-                worker_limit_ms,
-                primary_cap_ms,
-                budget,
-            };
-            let Some(waited) = watch.wait(&worker_cancellation) else {
-                // Cancelled: the transport already answered the call.
-                return;
-            };
-            // The task was already resolved under this route's identity. Do not
-            // re-adopt another session's task through status's relaxed fallback if
-            // the record disappears while the watch is waiting.
-            let snapshot =
-                watch
-                    .registry
-                    .observed_status(&watch.task_id, &watch.session, PREVIEW_BYTES);
-            let response = match snapshot {
-                Some(snapshot) => watch.reply(&thread_id, snapshot, &waited),
-                None => Response::error(
-                    &thread_id,
-                    "task_not_found",
-                    format_unknown_polled_task_message(&watch.task_id, &shell_tool),
-                ),
-            };
-            let _ = tx.send(response);
-        })
-    });
+                let watch = WatchJob {
+                    registry,
+                    task_id,
+                    session,
+                    pattern,
+                    limit_ms,
+                    worker,
+                    worker_limit_ms,
+                    primary_cap_ms,
+                    budget,
+                };
+                let Some(waited) = watch.wait(&worker_cancellation) else {
+                    // Cancelled: the transport already answered the call.
+                    return;
+                };
+                // The task was already resolved under this route's identity. Do not
+                // re-adopt another session's task through status's relaxed fallback if
+                // the record disappears while the watch is waiting.
+                let snapshot =
+                    watch
+                        .registry
+                        .observed_status(&watch.task_id, &watch.session, PREVIEW_BYTES);
+                let response = match snapshot {
+                    Some(snapshot) => watch.reply(&thread_id, snapshot, &waited),
+                    None => Response::error(
+                        &thread_id,
+                        "task_not_found",
+                        format_unknown_polled_task_message(&watch.task_id, &shell_tool),
+                    ),
+                };
+                let _ = tx.send(response);
+            })
+        },
+    ) {
+        return DispatchOutcome::Immediate(Response::error(
+            &id,
+            "internal_error",
+            format!("failed to start bash watch worker: {error}"),
+        ));
+    }
 
     let mut settled = false;
     let disconnect_id = id.clone();
@@ -432,6 +462,7 @@ impl WatchJob {
             elapsed_ms: started.elapsed().as_millis() as u64,
             limit_ms: deadline.saturating_duration_since(started).as_millis() as u64,
             matched,
+            scan_incomplete: false,
         };
         loop {
             if cancellation.cancel_already_requested() {
@@ -450,26 +481,32 @@ impl WatchJob {
             let snapshot = self
                 .registry
                 .observed_status(&self.task_id, &self.session, 0);
-            let terminal = snapshot
+            let mut terminal = snapshot
                 .as_ref()
                 .is_none_or(|snapshot| snapshot.info.status.is_terminal());
             if let (Some(pattern), Some(snapshot)) = (&self.pattern, &snapshot) {
                 if let Some(found) = self.scan(pattern, snapshot, &mut stdout, &mut stderr) {
                     return Some(waited(WaitReason::Matched, Some(found)));
                 }
+                // Task exit is not the end of a paged scan. Check unread
+                // captured bytes before reporting a terminal non-match.
+                terminal &= !stdout.has_more && !stderr.has_more;
             }
             let now = Instant::now();
             // A nearby process kill may extend an ordinary watch limit, never
             // the reply deadline: the caller must receive its task id in time.
+            let window_dropped = stdout.dropped || stderr.dropped;
             if now >= self.budget.deadline {
-                return Some(waited(
+                let mut result = waited(
                     if terminal {
                         WaitReason::Exited
                     } else {
                         WaitReason::Timeout
                     },
                     None,
-                ));
+                );
+                result.scan_incomplete = terminal && window_dropped;
+                return Some(result);
             }
             let kill_remaining = if self.worker {
                 self.registry
@@ -480,7 +517,12 @@ impl WatchJob {
             if let Some(reason) =
                 wait_limit_outcome(now >= deadline, terminal, self.worker, kill_remaining)
             {
-                return Some(waited(reason, None));
+                let mut result = waited(reason, None);
+                result.scan_incomplete = reason == WaitReason::Exited && window_dropped;
+                return Some(result);
+            }
+            if stdout.has_more || stderr.has_more {
+                continue;
             }
             let pause = if now >= deadline {
                 // The command is about to be killed; keep polling until the
@@ -522,33 +564,60 @@ impl WatchJob {
             if pty && index == 1 {
                 break;
             }
-            let Ok((bytes, next)) = self.registry.read_artifact_range(
-                &self.task_id,
-                &self.session,
-                artifact,
-                scan.next,
-            ) else {
+            let Ok(page) =
+                self.registry
+                    .read_artifact_page(&self.task_id, &self.session, artifact, scan.next)
+            else {
+                scan.has_more = false;
                 continue;
             };
+            scan.has_more = page.has_more;
+            let bytes = page.bytes;
+            let next = page.next_offset;
             if bytes.is_empty() {
-                continue;
+                // A deferred match whose stream turned out to end there is a
+                // real match of the whole output; nothing new needs reading.
+                if !(scan.deferred && !scan.has_more) {
+                    continue;
+                }
+            } else {
+                if scan.buffer.is_empty() {
+                    scan.base = scan.next;
+                }
+                scan.next = next.max(scan.next + bytes.len() as u64);
+                scan.buffer.extend_from_slice(&bytes);
             }
-            if scan.buffer.is_empty() {
-                scan.base = scan.next;
-            }
-            scan.next = next.max(scan.next + bytes.len() as u64);
-            scan.buffer.extend_from_slice(&bytes);
-            if let Some(found) = pattern.regex().find(&scan.buffer) {
-                return Some((
-                    String::from_utf8_lossy(found.as_bytes()).into_owned(),
-                    scan.base + found.start() as u64,
-                    label,
-                ));
+            scan.deferred = false;
+            if let Some(found) = pattern.regex().find_at(&scan.buffer, scan.search_from) {
+                // A page ends where the read stopped, not where the output
+                // ends. A regex match that reaches the end of the buffer may
+                // depend on what follows ($, \z, \b, a greedy repeat), so while
+                // more captured bytes follow it is not yet a match of the
+                // whole output. A literal is complete once all its bytes are in.
+                let end_dependent = matches!(pattern, WaitPattern::Regex(_))
+                    && scan.has_more
+                    && found.end() == scan.buffer.len();
+                if !end_dependent {
+                    return Some((
+                        String::from_utf8_lossy(found.as_bytes()).into_owned(),
+                        scan.base + found.start() as u64,
+                        label,
+                    ));
+                }
+                scan.deferred = true;
             }
             let cut = pattern.keep_from(scan.buffer.len());
             if cut > 0 {
-                scan.buffer.drain(..cut);
-                scan.base += cut as u64;
+                let regex = matches!(pattern, WaitPattern::Regex(_));
+                let context = if regex {
+                    cut.min(REGEX_SCAN_CONTEXT_BYTES)
+                } else {
+                    0
+                };
+                scan.buffer.drain(..cut - context);
+                scan.base += (cut - context) as u64;
+                scan.search_from = context;
+                scan.dropped |= regex;
             }
         }
         None
@@ -568,6 +637,9 @@ impl WatchJob {
             "elapsed_ms": waited.elapsed_ms,
             "limit_ms": waited.limit_ms,
         });
+        if waited.scan_incomplete {
+            data["waited"]["scan_incomplete"] = json!(true);
+        }
         if let Some((text, offset, stream)) = &waited.matched {
             data["waited"]["match"] = json!(text);
             data["waited"]["match_offset"] = json!(offset);
@@ -619,6 +691,11 @@ impl WatchJob {
                     "\n{waited_text}; timeout reached without match. The task is still submitting; the runner has not confirmed input capture. Call bash_watch again to keep waiting."
                 ));
             }
+            // A terminal task can still time out here when the watch ran out of
+            // time while scanning output pages captured before the task exited.
+            WaitReason::Timeout if !running => {
+                text.push_str(&format!("\n{waited_text}; watch limit reached while scanning captured output. The task already exited; the pattern scan is incomplete. Use a longer watch or paged raw output to inspect the remaining bytes."));
+            }
             WaitReason::Timeout if self.worker => {
                 text.push_str(&format!(
                     "\n{waited_text}; timeout reached without match. {}",
@@ -636,6 +713,10 @@ impl WatchJob {
                     .map(|code| format!(", exit {code}"))
                     .unwrap_or_default();
                 text.push_str(&format!("\n{waited_text}; task exited ({status}{exit})."));
+                if waited.scan_incomplete {
+                    text.push(' ');
+                    text.push_str(REGEX_WINDOW_SCAN_INCOMPLETE);
+                }
             }
         }
         if !running && !snapshot.output_preview.is_empty() {
@@ -776,6 +857,452 @@ mod tests {
             "timeout_ms": MAX_WATCH_TIMEOUT_MS,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn approved_watch_worker_admission_failure_is_immediate_internal_error() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = context(project.path(), storage.path());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::bash_background::worker_thread::with_refusal(
+                crate::bash_background::worker_thread::Worker::Watch,
+                || handle_deferred(&request(TASK, SESSION), ctx),
+            )
+        }));
+        assert!(
+            result.is_ok(),
+            "worker admission panicked instead of answering the call"
+        );
+        let DispatchOutcome::Immediate(response) = result.unwrap() else {
+            panic!("a refused worker must not leave a pending response");
+        };
+        assert!(!response.success);
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(wire["code"], "internal_error");
+        assert!(wire["message"]
+            .as_str()
+            .unwrap()
+            .contains("injected worker admission failure"));
+    }
+
+    fn approved_terminal_watch_fixture() -> (tempfile::TempDir, WatchJob, BgTaskSnapshot) {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path(), dir.path());
+        let bound = principal(dir.path());
+        with_authenticated_principal(bound, || {
+            persist_failed_task(&ctx);
+            let storage = crate::bash_background::task_storage_dir(&ctx);
+            let session = crate::bash_background::persistence::session_tasks_dir(&storage, SESSION);
+            let layout =
+                crate::bash_background::persistence::resolve_task_layout(&session, TASK).unwrap();
+            let mut output = vec![b'x'; 3 * 64 * 1024];
+            output[65534..65545].copy_from_slice(b"FINAL-MATCH");
+            std::fs::write(&layout.paths.stdout, output).unwrap();
+            std::fs::write(&layout.paths.stderr, "").unwrap();
+            ctx.bash_background()
+                .recover_watch_task(&storage, SESSION, TASK, Some(dir.path()), Some("runner"))
+                .unwrap();
+            let snapshot = ctx
+                .bash_background()
+                .observed_status(TASK, SESSION, 0)
+                .unwrap();
+            let job = WatchJob {
+                registry: ctx.bash_background().clone(),
+                task_id: TASK.into(),
+                session: SESSION.into(),
+                pattern: Some(WaitPattern::Substring(
+                    regex::bytes::Regex::new("FINAL-MATCH").unwrap(),
+                    11,
+                )),
+                limit_ms: 30_000,
+                worker: false,
+                worker_limit_ms: 1_800_000,
+                primary_cap_ms: 120_000,
+                budget: Instant::now().into(),
+            };
+            (dir, job, snapshot)
+        })
+    }
+
+    #[test]
+    fn approved_watch_scan_buffer_is_bounded_across_pages() {
+        let (_dir, job, snapshot) = approved_terminal_watch_fixture();
+        let mut stdout = StreamScan::default();
+        let mut stderr = StreamScan::default();
+        let mut matched = None;
+        for _ in 0..8 {
+            matched = job.scan(
+                job.pattern.as_ref().unwrap(),
+                &snapshot,
+                &mut stdout,
+                &mut stderr,
+            );
+            assert!(
+                stdout.buffer.len() <= 64 * 1024 + 11,
+                "scan allocated an unbounded output suffix: {}",
+                stdout.buffer.len()
+            );
+            if matched.is_some() {
+                break;
+            }
+        }
+        assert_eq!(matched, Some(("FINAL-MATCH".into(), 65534, Some("stdout"))));
+    }
+
+    #[test]
+    fn approved_terminal_watch_drains_pages_before_reporting_exit() {
+        let (_dir, job, _snapshot) = approved_terminal_watch_fixture();
+        let result = job.wait(&crate::executor::JobCancellation::new()).unwrap();
+        assert!(matches!(result.reason, WaitReason::Matched));
+        assert_eq!(
+            result.matched,
+            Some(("FINAL-MATCH".into(), 65534, Some("stdout")))
+        );
+    }
+
+    #[test]
+    fn approved_paged_watch_obeys_cancellation_and_its_original_deadline() {
+        let (_dir, mut job, _snapshot) = approved_terminal_watch_fixture();
+        job.pattern = Some(WaitPattern::Substring(
+            regex::bytes::Regex::new("NEVER").unwrap(),
+            5,
+        ));
+        let cancelled = crate::executor::JobCancellation::new();
+        cancelled.request_cancel();
+        assert!(job.wait(&cancelled).is_none());
+        job.limit_ms = 0;
+        let result = job.wait(&crate::executor::JobCancellation::new()).unwrap();
+        assert!(matches!(result.reason, WaitReason::Timeout));
+        assert!(result.matched.is_none());
+    }
+
+    #[test]
+    fn approved_terminal_paging_timeout_does_not_claim_task_is_running() {
+        let (_dir, mut job, snapshot) = approved_terminal_watch_fixture();
+        job.pattern = Some(WaitPattern::Substring(
+            regex::bytes::Regex::new("NEVER").unwrap(),
+            5,
+        ));
+        job.limit_ms = 0;
+        let result = job.wait(&crate::executor::JobCancellation::new()).unwrap();
+        let text = job.render(&snapshot, &result);
+        assert!(
+            !text.contains("still running"),
+            "terminal paging produced a false liveness claim: {text}"
+        );
+        assert!(text.contains("captured output"));
+    }
+
+    const PAGE: usize = 64 * 1024;
+    const BUDGET_PAGES: usize = 6;
+    /// The match sits inside the last of `BUDGET_PAGES` captured pages.
+    const LAST_PAGE_MATCH: u64 = ((BUDGET_PAGES - 1) * PAGE + 100) as u64;
+    /// Each page read (stdout and stderr per scan pass) sleeps this long, so a
+    /// full drain takes about `BUDGET_PAGES * 2 * PAGE_DELAY`.
+    const PAGE_DELAY: Duration = Duration::from_millis(150);
+
+    /// An exited task with `BUDGET_PAGES` pages of stdout, watched by a primary
+    /// call with a long `limit_ms` and a reply budget parsed from `deadline_ms`
+    /// the way the transport parses it.
+    fn budgeted_terminal_watch(client_window: Duration) -> (tempfile::TempDir, WatchJob) {
+        let mut output = vec![b'x'; BUDGET_PAGES * PAGE];
+        let at = LAST_PAGE_MATCH as usize;
+        output[at..at + 11].copy_from_slice(b"FINAL-MATCH");
+        let (dir, mut job) = terminal_watch_with_stdout(&output);
+        let wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        job.budget = crate::commands::blocking_wait::ReplyBudget::from_envelope(
+            Instant::now(),
+            &json!({ "deadline_ms": wall_ms + client_window.as_millis() as u64 }),
+        );
+        job.limit_ms = 30_000;
+        (dir, job)
+    }
+
+    /// The exited-task fixture with its stdout replaced by `output`.
+    fn terminal_watch_with_stdout(output: &[u8]) -> (tempfile::TempDir, WatchJob) {
+        let (dir, job, _snapshot) = approved_terminal_watch_fixture();
+        let ctx = context(dir.path(), dir.path());
+        let layout = with_authenticated_principal(principal(dir.path()), || {
+            let storage = crate::bash_background::task_storage_dir(&ctx);
+            let session = crate::bash_background::persistence::session_tasks_dir(&storage, SESSION);
+            crate::bash_background::persistence::resolve_task_layout(&session, TASK).unwrap()
+        });
+        std::fs::write(&layout.paths.stdout, output).unwrap();
+        (dir, job)
+    }
+
+    fn regex_pattern(source: &str) -> WaitPattern {
+        match parse_pattern(Some(&json!({ "regex": source }))) {
+            Ok(Some(pattern)) => pattern,
+            _ => panic!("test regex {source:?} must parse"),
+        }
+    }
+
+    /// Runs a full terminal watch of `output` for a regex pattern.
+    fn watch_exited_output(output: &[u8], source: &str) -> Waited {
+        let (_dir, mut job) = terminal_watch_with_stdout(output);
+        job.pattern = Some(regex_pattern(source));
+        job.wait(&crate::executor::JobCancellation::new()).unwrap()
+    }
+
+    /// `head` ends exactly at the first page boundary and `tail` follows it.
+    fn across_first_page(head: &[u8], tail: &[u8]) -> Vec<u8> {
+        let mut output = vec![b'.'; PAGE - head.len()];
+        output.extend_from_slice(head);
+        output.extend_from_slice(tail);
+        output
+    }
+
+    #[test]
+    fn approved_end_anchor_at_page_boundary_is_not_a_match_when_output_continues() {
+        let output = across_first_page(b"READY", b"-NOT\n");
+        let waited = watch_exited_output(&output, "READY$");
+        assert!(
+            matches!(waited.reason, WaitReason::Exited),
+            "READY$ falsely matched at a page edge: {:?}",
+            waited.matched
+        );
+        assert!(waited.matched.is_none());
+    }
+
+    #[test]
+    fn approved_text_end_anchor_at_page_boundary_is_not_a_match_when_output_continues() {
+        let output = across_first_page(b"READY", b"-NOT\n");
+        let waited = watch_exited_output(&output, r"READY\z");
+        assert!(waited.matched.is_none(), "{:?}", waited.matched);
+        // The same anchor still matches at the true end of the output.
+        let waited = watch_exited_output(&across_first_page(b"READY", b""), r"READY\z");
+        assert_eq!(
+            waited.matched,
+            Some(("READY".into(), (PAGE - 5) as u64, Some("stdout")))
+        );
+    }
+
+    #[test]
+    fn approved_word_boundary_at_page_boundary_is_not_a_match_when_the_word_continues() {
+        let output = across_first_page(b" READY", b"NESS\n");
+        let waited = watch_exited_output(&output, r"\bREADY\b");
+        assert!(waited.matched.is_none(), "{:?}", waited.matched);
+        // A real word boundary just past the page edge is still found.
+        let output = across_first_page(b" READY", b" now\n");
+        let waited = watch_exited_output(&output, r"\bREADY\b");
+        assert_eq!(
+            waited.matched,
+            Some(("READY".into(), (PAGE - 5) as u64, Some("stdout")))
+        );
+    }
+
+    /// Three pages: `before` ends the first 64 KiB page, the second page
+    /// starts with `head` and is padded to a full page, and `tail` is on the
+    /// third page. After the second page is scanned the window is trimmed to
+    /// start exactly at `head`.
+    fn trimmed_start_output(before: u8, head: &[u8], tail: &[u8]) -> Vec<u8> {
+        let mut output = vec![b'x'; PAGE - 1];
+        output.push(before);
+        output.extend_from_slice(head);
+        output.extend(std::iter::repeat_n(b'y', PAGE - head.len()));
+        output.extend_from_slice(tail);
+        output
+    }
+
+    #[test]
+    fn approved_line_anchor_at_a_trimmed_window_start_sees_the_real_preceding_byte() {
+        let pattern = r"^READY[\s\S]*tail";
+        let output = trimmed_start_output(b'x', b"READY", b"tail\n");
+        let waited = watch_exited_output(&output, pattern);
+        assert!(
+            waited.matched.is_none(),
+            "^ matched at a trimmed start that follows 'x': {:?}",
+            waited.matched
+        );
+        let output = trimmed_start_output(b'\n', b"READY", b"tail\n");
+        let waited = watch_exited_output(&output, pattern);
+        assert_eq!(waited.matched.map(|found| found.1), Some(PAGE as u64));
+    }
+
+    #[test]
+    fn approved_word_boundary_at_a_trimmed_window_start_sees_the_real_preceding_byte() {
+        let pattern = r"\bREADY[\s\S]*tail";
+        let output = trimmed_start_output(b'x', b"READY", b"tail\n");
+        let waited = watch_exited_output(&output, pattern);
+        assert!(waited.matched.is_none(), "{:?}", waited.matched);
+        let output = trimmed_start_output(b' ', b"READY", b"tail\n");
+        let waited = watch_exited_output(&output, pattern);
+        assert_eq!(waited.matched.map(|found| found.1), Some(PAGE as u64));
+    }
+
+    #[test]
+    fn approved_end_anchor_held_at_a_page_edge_is_found_when_the_next_page_starts_a_line() {
+        let mut output = across_first_page(b"READY", b"\n");
+        output.extend(std::iter::repeat_n(b'z', PAGE - 1));
+        let waited = watch_exited_output(&output, "READY$");
+        assert_eq!(
+            waited.matched,
+            Some(("READY".into(), (PAGE - 5) as u64, Some("stdout")))
+        );
+    }
+
+    #[test]
+    fn approved_open_ended_held_match_does_not_pin_the_engine_scan_buffer() {
+        // BEGIN[\s\S]* reaches the end of every page, so it is held on each
+        // one. The cut after each page depends only on the buffer length,
+        // never on the held match, so the buffer stays bounded.
+        let mut output = b"BEGIN".to_vec();
+        output.extend(std::iter::repeat_n(b'x', 8 * PAGE));
+        let (_dir, mut job) = terminal_watch_with_stdout(&output);
+        job.pattern = Some(regex_pattern(r"BEGIN[\s\S]*"));
+        let snapshot = job
+            .registry
+            .observed_status(&job.task_id, &job.session, 0)
+            .unwrap();
+        let mut stdout = StreamScan::default();
+        let mut stderr = StreamScan::default();
+        for _ in 0..9 {
+            let found = job.scan(
+                job.pattern.as_ref().unwrap(),
+                &snapshot,
+                &mut stdout,
+                &mut stderr,
+            );
+            assert!(found.is_none(), "{found:?}");
+            assert!(
+                stdout.buffer.len() <= PAGE + REGEX_SCAN_CONTEXT_BYTES,
+                "scan buffer grew to {} bytes",
+                stdout.buffer.len()
+            );
+        }
+        let (waited, text) = exited_watch_text(&output, regex_pattern(r"BEGIN[\s\S]*"));
+        assert!(waited.matched.is_none());
+        assert!(waited.scan_incomplete, "{text}");
+        assert!(text.contains(REGEX_WINDOW_SCAN_INCOMPLETE), "{text}");
+    }
+
+    #[test]
+    fn approved_regex_match_straddling_two_pages_is_found_once_at_its_offset() {
+        let output = across_first_page(b"BOUND", b"ARY-7\nmore\nBOUNDARY-8\n");
+        let waited = watch_exited_output(&output, r"BOUNDARY-\d");
+        assert_eq!(
+            waited.matched,
+            Some(("BOUNDARY-7".into(), (PAGE - 5) as u64, Some("stdout")))
+        );
+    }
+
+    /// A full terminal watch of `output` for `pattern`, with its rendered text.
+    fn exited_watch_text(output: &[u8], pattern: WaitPattern) -> (Waited, String) {
+        let (_dir, mut job) = terminal_watch_with_stdout(output);
+        job.pattern = Some(pattern);
+        let waited = job.wait(&crate::executor::JobCancellation::new()).unwrap();
+        let snapshot = job
+            .registry
+            .observed_status(&job.task_id, &job.session, 0)
+            .unwrap();
+        let text = job.render(&snapshot, &waited);
+        (waited, text)
+    }
+
+    fn literal_pattern(text: &str) -> WaitPattern {
+        match parse_pattern(Some(&json!(text))) {
+            Ok(Some(pattern)) => pattern,
+            _ => panic!("literal {text:?} must parse"),
+        }
+    }
+
+    #[test]
+    fn approved_regex_match_longer_than_window_reports_incomplete_not_no_match() {
+        let mut output = b"BEGIN\n".to_vec();
+        output.extend(std::iter::repeat_n(b'x', 200 * 1024));
+        output.extend_from_slice(b"\nEND\n");
+        let (waited, text) = exited_watch_text(&output, regex_pattern(r"BEGIN[\s\S]*END"));
+        assert!(matches!(waited.reason, WaitReason::Exited));
+        assert!(waited.matched.is_none());
+        assert!(
+            waited.scan_incomplete,
+            "a 200 KiB match was ruled out by a 64 KiB window"
+        );
+        assert!(text.contains(REGEX_WINDOW_SCAN_INCOMPLETE), "{text}");
+    }
+
+    #[test]
+    fn approved_absent_regex_is_incomplete_only_when_the_window_dropped_bytes() {
+        let large = vec![b'x'; 200 * 1024];
+        let (waited, text) = exited_watch_text(&large, regex_pattern("NEVER"));
+        assert!(waited.matched.is_none());
+        assert!(waited.scan_incomplete, "{text}");
+        assert!(text.contains(REGEX_WINDOW_SCAN_INCOMPLETE), "{text}");
+
+        let small = vec![b'x'; 1024];
+        let (waited, text) = exited_watch_text(&small, regex_pattern("NEVER"));
+        assert!(matches!(waited.reason, WaitReason::Exited));
+        assert!(!waited.scan_incomplete, "{text}");
+        assert!(!text.contains("incomplete"), "{text}");
+
+        // A literal keeps an exact tail, so dropping bytes loses nothing.
+        let (waited, text) = exited_watch_text(&large, literal_pattern("NEVER"));
+        assert!(!waited.scan_incomplete, "{text}");
+        assert!(!text.contains("incomplete"), "{text}");
+    }
+
+    /// Runs the wait on its own thread with slowed page reads. The hard
+    /// deadline keeps a wait that ignores its budget from hanging the suite.
+    fn wait_with_slow_pages(job: WatchJob) -> (WatchJob, Waited, Duration) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            crate::bash_background::registry::ARTIFACT_PAGE_DELAY
+                .with(|delay| delay.set(Some(PAGE_DELAY)));
+            let started = Instant::now();
+            let waited = job.wait(&crate::executor::JobCancellation::new());
+            let _ = tx.send((job, waited, started.elapsed()));
+        });
+        let (job, waited, elapsed) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("watch did not answer within the test's hard deadline");
+        (job, waited.expect("watch was not cancelled"), elapsed)
+    }
+
+    #[test]
+    fn approved_terminal_drain_answers_within_short_reply_budget() {
+        // A 1s client window leaves a 500ms reply deadline; a full drain of the
+        // backlog would take about 1.8s, well past the client's deadline.
+        let client_window = Duration::from_millis(1_000);
+        let (_dir, job) = budgeted_terminal_watch(client_window);
+        let (job, waited, elapsed) = wait_with_slow_pages(job);
+        assert!(
+            elapsed + Duration::from_millis(100) < client_window,
+            "reply took {elapsed:?}, too close to the {client_window:?} client deadline"
+        );
+        assert!(
+            matches!(waited.reason, WaitReason::Timeout),
+            "the backlog could not be drained inside the budget, so the scan is incomplete"
+        );
+        assert!(waited.matched.is_none());
+        let snapshot = job
+            .registry
+            .observed_status(&job.task_id, &job.session, 0)
+            .unwrap();
+        let text = job.render(&snapshot, &waited);
+        assert!(
+            text.contains("task already exited; the pattern scan is incomplete"),
+            "{text}"
+        );
+        assert!(!text.contains("still running"), "{text}");
+        // An unfinished scan must not read as a completed scan that found nothing.
+        assert!(!text.contains("without match"), "{text}");
+        assert!(!text.contains("task exited ("), "{text}");
+    }
+
+    #[test]
+    fn approved_terminal_drain_finds_last_page_match_within_long_reply_budget() {
+        let (_dir, job) = budgeted_terminal_watch(Duration::from_secs(20));
+        let (_job, waited, _elapsed) = wait_with_slow_pages(job);
+        assert!(matches!(waited.reason, WaitReason::Matched));
+        assert_eq!(
+            waited.matched,
+            Some(("FINAL-MATCH".into(), LAST_PAGE_MATCH, Some("stdout")))
+        );
     }
 
     async fn watch_with_deadline(ctx: Arc<AppContext>, request: RawRequest) -> Response {
