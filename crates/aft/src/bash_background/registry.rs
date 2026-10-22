@@ -3842,6 +3842,7 @@ impl BgTaskRegistry {
                 pending_terminal_override: None,
             }),
         });
+        let mut bootstrap_gate = BootstrapGateGuard::new(&task);
 
         if !shell.is_powershell() {
             let job = Arc::new(crate::bash_db_hints::HintJob::new(
@@ -3898,7 +3899,10 @@ impl BgTaskRegistry {
             let mut state = task
                 .lock_state()
                 .map_err(|_| "background task lock poisoned".to_string())?;
-            if state.metadata.status.is_terminal() || state.kill_in_flight {
+            if self.inner.shutdown.load(Ordering::SeqCst)
+                || state.metadata.status.is_terminal()
+                || state.kill_in_flight
+            {
                 false
             } else if let TaskRuntime::Piped(Some(child)) = &mut state.runtime {
                 if let Some(mut release) = child.stdin.take() {
@@ -3913,6 +3917,9 @@ impl BgTaskRegistry {
                 false
             }
         };
+        if released {
+            bootstrap_gate.disarm();
+        }
         #[cfg(feature = "test-timing-hooks")]
         if released {
             if let Some(gate) = std::env::var_os("AFT_TEST_BASH_AFTER_CREATE_GATE") {
@@ -12883,6 +12890,42 @@ enum LocalIdentityGate {
     CommittedFallback,
 }
 
+#[cfg(unix)]
+struct BootstrapGateGuard<'a> {
+    task: &'a BgTask,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl BootstrapGateGuard<'_> {
+    fn new(task: &BgTask) -> BootstrapGateGuard<'_> {
+        BootstrapGateGuard { task, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BootstrapGateGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Closing the child process's stdin makes it exit before running the user's command.
+        // Recover a poisoned task lock so failed registration can still close stdin.
+        let mut state = self
+            .task
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let TaskRuntime::Piped(Some(child)) = &mut state.runtime {
+            drop(child.stdin.take());
+        }
+    }
+}
+
 /// Spawn a detached background bash child process.
 ///
 /// On Unix this is a single spawn against `/bin/sh`. On Windows it walks
@@ -16084,6 +16127,88 @@ mod tests {
         assert!(
             !marker.exists(),
             "late gate release executed killed command"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn poisoned_watchdog_registration_closes_the_identity_gate() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("must-not-run");
+        let registry = super::BgTaskRegistry::default();
+        let inner = Arc::clone(&registry.inner);
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _watchdog_tasks = inner.watchdog_tasks.lock().unwrap();
+            panic!("poison the watchdog task map before spawn registration");
+        }));
+        assert!(poison.is_err());
+
+        let command = format!("printf ran > '{}'", marker.display());
+        let error = registry
+            .spawn(
+                super::SpawnPlan::Unsandboxed,
+                &command,
+                "session".into(),
+                root.path().to_path_buf(),
+                HashMap::new(),
+                super::super::HardKill::After(Duration::from_secs(30)),
+                root.path().to_path_buf(),
+                1,
+                false,
+                false,
+                Some(root.path().to_path_buf()),
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("background watchdog lock poisoned"),
+            "{error}"
+        );
+
+        let task = registry
+            .task_arcs()
+            .into_iter()
+            .next()
+            .expect("task was inserted before watchdog registration failed");
+        let pgid = {
+            let state = task.lock_state().unwrap();
+            let super::TaskRuntime::Piped(Some(child)) = &state.runtime else {
+                panic!("failed registration must retain its child handle");
+            };
+            child.id() as i32
+        };
+        struct KillGroupOnDrop(i32);
+        impl Drop for KillGroupOnDrop {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(-self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _kill_group_on_drop = KillGroupOnDrop(pgid);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            let mut state = task.lock_state().unwrap();
+            let super::TaskRuntime::Piped(Some(child)) = &mut state.runtime else {
+                panic!("failed registration must retain its child handle");
+            };
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            drop(state);
+            assert!(
+                Instant::now() < deadline,
+                "identity-gated child did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), Some(125));
+        assert!(
+            !marker.exists(),
+            "the command ran without an identity release"
         );
     }
 

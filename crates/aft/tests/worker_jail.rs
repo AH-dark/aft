@@ -10,7 +10,7 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use subc_protocol::session::{ModuleControlRequest, ModuleControlResponse};
 use subc_protocol::{
     BindIdentity, Flags, Frame, FrameType, ModuleHelloAckBody, Principal, Priority, RouteTarget,
@@ -84,10 +84,163 @@ struct Jail {
 
 impl Drop for Jail {
     fn drop(&mut self) {
+        let process_groups = sandbox_task_process_groups(&self.data);
         self.read_router.abort();
         let _ = self.child.kill();
         let _ = self.child.wait();
+
+        // The daemon is killed on fixture teardown, but each detached shell
+        // owns a new process group and can outlive that direct child.
+        let (leaked, remaining) = cleanup_sandbox_task_process_groups(&process_groups);
+        if !std::thread::panicking() {
+            assert!(
+                leaked.is_empty(),
+                "sandbox launcher process groups outlived the worker daemon: {leaked:?}"
+            );
+            assert!(
+                remaining.is_empty(),
+                "sandbox launcher process groups survived fixture cleanup: {remaining:?}"
+            );
+        }
     }
+}
+
+fn cleanup_sandbox_task_process_groups(process_groups: &[i32]) -> (Vec<i32>, Vec<i32>) {
+    let leaked = wait_for_process_groups(process_groups, Duration::from_millis(250));
+    for pgid in process_groups {
+        unsafe {
+            libc::kill(-*pgid, libc::SIGKILL);
+        }
+    }
+    let remaining = wait_for_process_groups(process_groups, Duration::from_secs(2));
+    (leaked, remaining)
+}
+
+fn sandbox_task_process_groups(data: &Path) -> Vec<i32> {
+    let root = data.join("cortexkit/aft/cache/aft/runner/bash-tasks");
+    let mut pending = vec![root];
+    let mut groups = std::collections::BTreeSet::new();
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                let Ok(bytes) = std::fs::read(path) else {
+                    continue;
+                };
+                let Ok(task) = serde_json::from_slice::<
+                    aft::bash_background::persistence::PersistedTask,
+                >(&bytes) else {
+                    continue;
+                };
+                if task.sandbox_native {
+                    if let Some(pgid) = task.pgid.filter(|pgid| *pgid > 1) {
+                        groups.insert(pgid);
+                    }
+                }
+            }
+        }
+    }
+    groups.into_iter().collect()
+}
+
+fn process_group_has_live_members(pgid: i32) -> bool {
+    let Ok(output) = Command::new("ps").args(["-axo", "pgid=,stat="]).output() else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        matches!(
+            (fields.next().and_then(|field| field.parse::<i32>().ok()), fields.next()),
+            (Some(group), Some(state)) if group == pgid && !state.starts_with('Z')
+        )
+    })
+}
+
+fn wait_for_process_groups(groups: &[i32], timeout: Duration) -> Vec<i32> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let alive = groups
+            .iter()
+            .copied()
+            .filter(|pgid| process_group_has_live_members(*pgid))
+            .collect::<Vec<_>>();
+        if alive.is_empty() || Instant::now() >= deadline {
+            return alive;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct KillProcessGroupOnDrop(i32);
+
+impl Drop for KillProcessGroupOnDrop {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(-self.0, libc::SIGKILL);
+        }
+    }
+}
+
+#[test]
+fn worker_jail_teardown_kills_recorded_sandbox_process_groups() {
+    use std::os::unix::process::CommandExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let release = temp.path().join("release");
+    let mut child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            &format!("while ! test -f {}; do sleep .02; done", quote(&release)),
+        ])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pgid = i32::try_from(child.id()).unwrap();
+    let _kill_group_on_drop = KillProcessGroupOnDrop(pgid);
+    assert!(process_group_has_live_members(pgid));
+
+    let session_dir = data.join("cortexkit/aft/cache/aft/runner/bash-tasks/session");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let mut task = aft::bash_background::persistence::PersistedTask::starting(
+        "bash-0000000000000001".into(),
+        "session".into(),
+        "test shell".into(),
+        temp.path().to_path_buf(),
+        Some(temp.path().to_path_buf()),
+        Some(60_000),
+        false,
+        false,
+    );
+    task.sandbox_native = true;
+    task.pgid = Some(pgid);
+    std::fs::write(
+        session_dir.join("bash-0000000000000001.json"),
+        serde_json::to_vec(&task).unwrap(),
+    )
+    .unwrap();
+
+    let groups = sandbox_task_process_groups(&data);
+    assert_eq!(groups, [pgid]);
+    let (leaked, remaining) = cleanup_sandbox_task_process_groups(&groups);
+    assert_eq!(leaked, [pgid], "the live fixture shell must be detected");
+    assert!(
+        remaining.is_empty(),
+        "teardown must kill every recorded group"
+    );
+    assert!(!process_group_has_live_members(pgid));
+    assert!(!child.wait().unwrap().success());
 }
 
 async fn next_frame(stream: &mut TcpStream) -> Frame {
@@ -2928,6 +3081,46 @@ async fn gh_read_jail() -> Jail {
         worker_gh_read::configure,
     )
     .await
+}
+
+#[tokio::test]
+async fn worker_jail_teardown_kills_sandboxed_shell_groups_during_unwind() {
+    if !native_available() {
+        return;
+    }
+    let mut jail = gh_read_jail().await;
+    let ready = jail.worktree.join("teardown-ready");
+    let release = jail.worktree.join("teardown-release");
+    jail.submit_held_bash(json!({
+        "command": format!(
+            "printf '%s\\n' \"$TMPDIR\" > {}; while ! test -f {}; do sleep .02; done",
+            quote(&ready),
+            quote(&release),
+        ),
+        "background": true,
+        "timeout": 60_000,
+    }))
+    .await;
+    let temp = wait_test_file(&ready).await;
+    let (_, metadata_path) = worker_gh_read::observe_task(Path::new(temp.trim()));
+    let task = aft::bash_background::persistence::read_task(&metadata_path).unwrap();
+    assert!(task.sandbox_native, "fixture must start a sandboxed shell");
+    let pgid = task.pgid.expect("running shell process group");
+    assert!(
+        sandbox_task_process_groups(&jail.data).contains(&pgid),
+        "teardown must find this native shell's process group"
+    );
+    assert!(process_group_has_live_members(pgid));
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _jail = jail;
+        panic!("exercise worker fixture teardown while unwinding");
+    }));
+    assert!(panic.is_err());
+    assert!(
+        !process_group_has_live_members(pgid),
+        "sandboxed shell process group {pgid} survived fixture teardown"
+    );
 }
 
 async fn wait_test_file(path: &Path) -> String {

@@ -1,0 +1,1 @@
+- A Unix background shell now closes its identity-gate pipe if task registration fails or the registry begins shutting down before release. The waiting wrapper receives EOF and exits without running the command, rather than remaining blocked with an orphaned task shell.
