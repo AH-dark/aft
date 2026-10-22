@@ -1786,6 +1786,19 @@ fn traversal_batch(
     traversal_batch_filtered(storage, domains, kind, limit, &|_| true)
 }
 
+/// Retention cursors are durable state. With a separate cache root they are
+/// kept per artifact-root identity, so a different cache volume starts its
+/// own laps instead of resuming another volume's position.
+fn cursor_root(storage: &StoragePaths) -> io::Result<PathBuf> {
+    let cursor_root = storage.durable.join("retention/cursors");
+    if storage.durable == storage.artifacts {
+        return Ok(cursor_root);
+    }
+    let identity = crate::config_live::dir_identity(&storage.artifacts)
+        .ok_or_else(|| io::Error::other("artifact-root identity unavailable"))?;
+    Ok(cursor_root.join(format!("{}-{}", identity.0, identity.1)))
+}
+
 fn traversal_batch_filtered(
     storage: &StoragePaths,
     domains: &[(PathBuf, bool)],
@@ -1793,15 +1806,7 @@ fn traversal_batch_filtered(
     limit: usize,
     include: &dyn Fn(&fs::DirEntry) -> bool,
 ) -> io::Result<TraversalBatch> {
-    let cursor_root = storage.durable.join("retention/cursors");
-    let cursor_root = if storage.durable == storage.artifacts {
-        cursor_root
-    } else {
-        let identity = crate::config_live::dir_identity(&storage.artifacts)
-            .ok_or_else(|| io::Error::other("artifact-root identity unavailable"))?;
-        cursor_root.join(format!("{}-{}", identity.0, identity.1))
-    };
-    let cursor_path = cursor_root.join(format!("{kind}.json"));
+    let cursor_path = cursor_root(storage)?.join(format!("{kind}.json"));
     let mut cursor: TraversalCursor = match read_json(&cursor_path) {
         Ok(cursor) => cursor,
         Err(error) if error.kind() == io::ErrorKind::NotFound => TraversalCursor::default(),
@@ -4057,6 +4062,7 @@ fn v3_count_missing_pass(
 /// appeared since the first step keeps the member.
 fn v3_recheck_and_mark_evicting(
     tx: &rusqlite::Transaction<'_>,
+    // The durable root, where retention keeps root bindings.
     storage: &Path,
     scope: &str,
     view_dir: &Path,
@@ -4173,14 +4179,18 @@ struct V3MemberCursor {
     last_scope: Option<String>,
 }
 
-fn v3_member_cursor_path(storage: &Path, family: &str) -> PathBuf {
-    storage
-        .join("retention/cursors/v3-members")
-        .join(format!("{family}.json"))
+fn v3_member_cursor_path(storage: &StoragePaths, family: &str) -> io::Result<PathBuf> {
+    Ok(cursor_root(storage)?
+        .join("v3-members")
+        .join(format!("{family}.json")))
 }
 
+/// v3 family stores live where v2 ones do: under the artifact root (the
+/// `storage.cache_dir` volume when one is set; `blobs` is a cache domain).
+/// Retention bindings, which decide whether a missing root is due, and the
+/// collector's cursors are durable state under the durable root.
 fn collect_one_v3_family(
-    storage: &Path,
+    storage: &StoragePaths,
     cancelled: &dyn Fn() -> bool,
     report: &mut SweepReport,
     bounds: V3Bounds,
@@ -4190,7 +4200,7 @@ fn collect_one_v3_family(
     let next = || {
         traversal_batch_filtered(
             storage,
-            &[(storage.join("blobs/v3"), false)],
+            &[(storage.artifacts.join("blobs/v3"), false)],
             "families-v3",
             1,
             &|entry| {
@@ -4246,7 +4256,7 @@ fn reservation_lock_busy(error: &crate::blob_store::v3::Error) -> bool {
 }
 
 fn collect_v3_family(
-    storage: &Path,
+    paths: &StoragePaths,
     family: &str,
     cancelled: &dyn Fn() -> bool,
     report: &mut SweepReport,
@@ -4254,10 +4264,16 @@ fn collect_v3_family(
 ) -> io::Result<V3Visit> {
     use crate::blob_store::v3::{Measurement, RegistryWriter, ReservationLock};
     let v3 = |error: crate::blob_store::v3::Error| io::Error::other(error.to_string());
+    // Family data: the artifact root. Root bindings: the durable root.
+    let storage = paths.artifacts.as_path();
+    let durable = paths.durable.as_path();
     let registry_path = storage.join("blobs/v3").join(family).join("members.sqlite");
     if !registry_path.try_exists()? {
         return Ok(V3Visit::Done);
     }
+    // View-directory removal refuses a cache whose durable owner is unknown;
+    // declare it, as the v2 collector does when it binds its registry.
+    crate::root_cache::register_durable_owner(paths)?;
     let deadline = Instant::now() + bounds.budget;
     // Lock first, then the registry barrier, the order every v3 writer uses.
     // The wait for the lock comes out of the same budget as the member work:
@@ -4287,7 +4303,7 @@ fn collect_v3_family(
         return Ok(V3Visit::Done);
     }
     let mut owed = false;
-    let cursor_path = v3_member_cursor_path(storage, family);
+    let cursor_path = v3_member_cursor_path(paths, family)?;
     // An unreadable cursor only costs the resume position.
     let resume = read_json::<V3MemberCursor>(&cursor_path)
         .ok()
@@ -4366,7 +4382,7 @@ fn collect_v3_family(
             continue;
         };
         let eligibility = if v3_root_missing(&root) {
-            missing_root_eligibility(storage, &root, member.last_bind_ms)
+            missing_root_eligibility(durable, &root, member.last_bind_ms)
         } else {
             RootEligibility::Live
         };
@@ -4395,7 +4411,7 @@ fn collect_v3_family(
                     .with_barrier(|tx| {
                         Ok(v3_recheck_and_mark_evicting(
                             tx,
-                            storage,
+                            durable,
                             &member.scope,
                             &view_dir,
                             recorded,
@@ -9674,6 +9690,17 @@ mod v3_collector_tests {
     /// process-global free-space override that the `blob_store::v3` tests
     /// change under their own lock; a child keeps these tests out of that.
     fn seed(storage: &Path, members: &[(&str, &str, Option<&Path>)]) {
+        seed_with_durable(storage, None, members);
+    }
+
+    /// Seed a family under `storage`. With `durable`, `storage` is a prepared
+    /// `storage.cache_dir` cache root owned by that durable root, which the
+    /// child prepares too before it writes there.
+    fn seed_with_durable(
+        storage: &Path,
+        durable: Option<&Path>,
+        members: &[(&str, &str, Option<&Path>)],
+    ) {
         let spec = members
             .iter()
             .map(|(scope, kind, root)| {
@@ -9693,6 +9720,10 @@ mod v3_collector_tests {
                 "--test-threads=1",
             ])
             .env("AFT_V3_COLLECTOR_STORAGE", storage)
+            .env(
+                "AFT_V3_COLLECTOR_DURABLE",
+                durable.map(Path::as_os_str).unwrap_or_default(),
+            )
             .env("AFT_V3_COLLECTOR_MEMBERS", spec)
             .env("RUSTC_WRAPPER", "")
             .env("CARGO_BUILD_RUSTC_WRAPPER", "")
@@ -9717,6 +9748,20 @@ mod v3_collector_tests {
         };
         let storage = PathBuf::from(storage);
         let members = std::env::var("AFT_V3_COLLECTOR_MEMBERS").unwrap();
+        // A cache root is admitted for writes only once this process has
+        // prepared it, as the AFT process that publishes v3 data would have.
+        let _prepared = std::env::var_os("AFT_V3_COLLECTOR_DURABLE")
+            .filter(|durable| !durable.is_empty())
+            .map(|durable| {
+                let mut config = crate::config::Config {
+                    storage_dir: Some(PathBuf::from(durable)),
+                    cache_dir: storage.parent().map(Path::to_path_buf),
+                    ..Default::default()
+                };
+                let warning = crate::root_cache::prepare_cache_root_for_test(&mut config);
+                assert!(warning.is_none(), "{warning:?}");
+                config
+            });
         v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
         v3::publish(&storage, FAMILY, 1 << 20, None, |publication| {
             for line in members.lines() {
@@ -9770,7 +9815,7 @@ mod v3_collector_tests {
         fs::create_dir_all(&root).unwrap();
         let root = fs::canonicalize(root).unwrap();
         let scope = crate::path_identity::project_scope_key(&root);
-        record_bind(storage, &root, &scope).unwrap();
+        record_bind(&StoragePaths::same(storage), &root, &scope).unwrap();
         let record = storage.join(format!("retention/roots/{scope}.json"));
         let mut binding: Binding = read_json(&record).unwrap();
         binding.last_bound_ms = 0;
@@ -9780,7 +9825,13 @@ mod v3_collector_tests {
 
     fn pass(storage: &Path) -> SweepReport {
         let mut report = SweepReport::default();
-        collect_one_v3_family(storage, &|| false, &mut report, V3Bounds::PASS).unwrap();
+        collect_one_v3_family(
+            &StoragePaths::same(storage),
+            &|| false,
+            &mut report,
+            V3Bounds::PASS,
+        )
+        .unwrap();
         assert!(report.errors.is_empty(), "{report:?}");
         report
     }
@@ -9981,6 +10032,62 @@ mod v3_collector_tests {
         );
     }
 
+    /// With `storage.cache_dir` set, v3 family stores are under the cache
+    /// root and root bindings under the durable root. The collector must
+    /// read each where it lives, and keep its cursors durable.
+    #[test]
+    fn v3_collector_reads_families_on_the_cache_root_and_bindings_on_the_durable_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let durable = temp.join("storage");
+        let cache_parent = temp.join("cache-volume");
+        fs::create_dir_all(&cache_parent).unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(durable.clone()),
+            cache_dir: Some(cache_parent),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let cache = crate::root_cache::cache_root(&config);
+        let root = bound_root(&temp, &durable, "eligible");
+        seed_with_durable(
+            &cache,
+            Some(&durable),
+            &[("eligible", "view", Some(root.as_path()))],
+        );
+        with_registry(&cache, |tx| {
+            tx.execute("UPDATE members SET last_bind_ms=0", [])?;
+            Ok(())
+        });
+        fill_view_dir(&view_dir(&cache, "eligible"));
+        fs::remove_dir(&root).unwrap();
+        let paths = StoragePaths::new(durable.clone(), cache.clone());
+
+        assert_eq!(crate::views::registry::MISSING_ROOT_SWEEPS, 2);
+        for _ in 0..2 {
+            let mut report = SweepReport::default();
+            collect_one_v3_family(&paths, &|| false, &mut report, V3Bounds::PASS).unwrap();
+            assert!(report.errors.is_empty(), "{report:?}");
+        }
+        assert!(member_scopes(&cache).is_empty(), "the due member was kept");
+        assert!(!view_dir(&cache, "eligible").exists());
+        assert!(
+            !durable.join("blobs").exists(),
+            "the collector created v3 data on the durable root"
+        );
+        assert!(
+            !cache.join("retention").exists(),
+            "the collector wrote its cursors on the cache root"
+        );
+        let cursors = cursor_root(&paths).unwrap();
+        assert!(cursors.starts_with(durable.join("retention/cursors")));
+        assert!(cursors.join("families-v3.json").exists());
+        assert!(cursors
+            .join("v3-members")
+            .join(format!("{FAMILY}.json"))
+            .exists());
+    }
+
     #[test]
     fn v3_eviction_interrupted_after_its_evicting_commit_is_finished_next_pass() {
         let temp = tempfile::tempdir().unwrap();
@@ -10007,7 +10114,12 @@ mod v3_collector_tests {
             );
             let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut report = SweepReport::default();
-                let _ = collect_one_v3_family(&storage, &|| false, &mut report, V3Bounds::PASS);
+                let _ = collect_one_v3_family(
+                    &StoragePaths::same(&storage),
+                    &|| false,
+                    &mut report,
+                    V3Bounds::PASS,
+                );
             }));
             assert!(crashed.is_err());
         }
@@ -10073,7 +10185,13 @@ mod v3_collector_tests {
             passes += 1;
             assert!(passes <= 4, "z-target was never collected");
             let mut report = SweepReport::default();
-            collect_one_v3_family(&storage, &|| false, &mut report, bounds).unwrap();
+            collect_one_v3_family(
+                &StoragePaths::same(&storage),
+                &|| false,
+                &mut report,
+                bounds,
+            )
+            .unwrap();
             assert!(report.errors.is_empty(), "{report:?}");
         }
         assert_eq!(member_scopes(&storage), ["p1", "p2", "p3"]);
@@ -10113,7 +10231,7 @@ mod v3_collector_tests {
         let started = Instant::now();
         let mut report = SweepReport::default();
         let result = collect_one_v3_family(
-            &storage,
+            &StoragePaths::same(&storage),
             &|| false,
             &mut report,
             V3Bounds {
@@ -10173,8 +10291,13 @@ mod v3_collector_tests {
                 budget,
                 ..V3Bounds::PASS
             };
-            let result = collect_one_v3_family(&pass_storage, &|| false, &mut report, bounds)
-                .map_err(|error| error.to_string());
+            let result = collect_one_v3_family(
+                &StoragePaths::same(&pass_storage),
+                &|| false,
+                &mut report,
+                bounds,
+            )
+            .map_err(|error| error.to_string());
             let _ = sender.send((result, report, started.elapsed()));
         });
         let (result, report, elapsed) = receiver
@@ -10424,7 +10547,12 @@ mod v3_collector_tests {
             }
         }
         for _ in 0..2 {
-            let report = run_pass_with_budget(&storage, &|| false, &Instant::now, PASS_BUDGET);
+            let report = run_pass_with_budget(
+                &StoragePaths::same(&storage),
+                &|| false,
+                &Instant::now,
+                PASS_BUDGET,
+            );
             assert!(report.timings_ms.contains_key("blobs_v3"), "{report:?}");
         }
         for yes in [false, true] {
