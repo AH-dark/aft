@@ -66,14 +66,16 @@ export const OMP_TOOL_TIERS: Readonly<Record<string, OmpToolTier>> = {
 
 const TIER_RANK: Readonly<Record<OmpToolTier, number>> = { read: 0, write: 1, exec: 2 };
 
-/** Argument keys whose string values (or arrays of strings) name filesystem paths. */
+/**
+ * Argument keys whose string values (or arrays of strings) name filesystem
+ * paths. A tool's own `prepareArguments`, which `ompCallTier` runs first,
+ * rewrites the older alias spellings it accepts to these keys.
+ */
 const PATH_KEYS = new Set([
   "path",
   "paths",
   "file",
   "files",
-  "file_path",
-  "filePath",
   "target",
   "scope",
   "workdir",
