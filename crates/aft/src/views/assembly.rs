@@ -752,12 +752,24 @@ pub fn prepare_checkout_deferring(
         }
         // The semantic index walks the project with the same rules, so a file
         // the walk does not list is never indexed.
-        let listed = crate::search_index::project_walk_lists(
+        let listing = crate::search_index::project_walk_lists(
             &request.project_root,
             &unexplained.keys().cloned().collect(),
         );
         for (absolute, path) in unexplained {
-            if !listed.contains(&absolute) {
+            if !listing.listed.contains(&absolute) {
+                // The walk could not read a directory or ignore file on the
+                // way, so whether the index lists this file is unknown. That
+                // is a failure to name, not a reason to skip it for good; a
+                // later walk that reads the way settles it.
+                if let Some((gap, error)) = listing.gap_for(&absolute) {
+                    if excludes_semantic(&path) {
+                        fresh_skips.push((path.clone(), None));
+                    }
+                    semantic_failures
+                        .push((path, format!("walk_unreadable: {}: {error}", gap.display())));
+                    continue;
+                }
                 fresh_skips.push((path, Some(SkipReason::ExcludedFromSemanticIndex)));
                 continue;
             }
@@ -2541,6 +2553,92 @@ mod status_settlement_tests {
             callgraph: false,
             ..request(root, storage, head)
         }
+    }
+
+    /// Sets a directory's permissions to 0755 when dropped, so a failing test
+    /// does not leave behind a tree its temporary directory cannot remove.
+    #[cfg(unix)]
+    struct RestoreMode(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// A member the walk cannot reach for a reason it can name (here a
+    /// directory whose listing is denied while its files can still be
+    /// opened) is not one the walk leaves out: it fails with
+    /// `walk_unreadable` instead of being skipped for good, and a later walk
+    /// that can list the directory settles it. The test uses Unix mode bits
+    /// to make a directory traversable but not listable, so it is Unix only.
+    #[cfg(unix)]
+    #[test]
+    fn views_a_walk_gap_fails_unlisted_members_instead_of_skipping_them() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let locked = root.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("inner.py"), "def inner():\n    pass\n").unwrap();
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "locked",
+            ],
+        );
+        let restore = RestoreMode(locked.clone());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o311)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            eprintln!("skipped: this process lists directories without read permission (root)");
+            return;
+        }
+        assert!(fs::read(locked.join("inner.py")).is_ok());
+        let storage = tempfile::tempdir().unwrap();
+
+        let report = publish_checkout(&semantic_request(
+            &root,
+            storage.path(),
+            "head-1",
+            &["file_0.ts"],
+        ))
+        .unwrap();
+        assert!(report.published);
+        let summary = status(storage.path()).summary().unwrap();
+        assert!(
+            summary.skipped_by_reason.is_empty(),
+            "a walk gap became a skip: {:?}",
+            summary.skipped_sample
+        );
+        assert_eq!((summary.pending_count, summary.failed_count), (0, 1));
+        let failed = status(storage.path())
+            .status_for(b"locked/inner.py")
+            .unwrap()
+            .unwrap();
+        assert!(failed.reason.starts_with("walk_unreadable"), "{failed:?}");
+
+        drop(restore);
+        let report = publish_checkout(&semantic_request(
+            &root,
+            storage.path(),
+            "head-2",
+            &["file_0.ts", "locked/inner.py"],
+        ))
+        .unwrap();
+        assert!(report.pending_paths.is_empty());
+        let summary = status(storage.path()).summary().unwrap();
+        assert_eq!((summary.pending_count, summary.failed_count), (0, 0));
+        assert!(summary.skipped_by_reason.is_empty());
     }
 
     /// A member the semantic index never keys must not wait for a key: one

@@ -6228,15 +6228,51 @@ fn project_walk_admits_entry(
     !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
 }
 
+/// What `project_walk_lists` found: the files the walk lists, and the places
+/// it could not look.
+#[derive(Debug, Default)]
+pub(crate) struct ProjectWalkListing {
+    pub listed: BTreeSet<PathBuf>,
+    /// Paths the walk could not read (a directory it could not list, an
+    /// ignore file it could not read), with the error. Whether a file at or
+    /// under one of them is listed is unknown, not "no".
+    pub gaps: Vec<(PathBuf, String)>,
+}
+
+impl ProjectWalkListing {
+    /// The gap that leaves `file`'s listing unknown, if any.
+    pub(crate) fn gap_for(&self, file: &Path) -> Option<&(PathBuf, String)> {
+        self.gaps.iter().find(|(gap, _)| file.starts_with(gap))
+    }
+}
+
+/// The path an `ignore` walk error is about; `None` when it names none.
+fn walk_error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            walk_error_path(err)
+        }
+        ignore::Error::Loop { child, .. } => Some(child),
+        ignore::Error::Partial(errors) => errors.iter().find_map(walk_error_path),
+        _ => None,
+    }
+}
+
 /// Which of `files` (absolute paths under `root`, joined onto `root` as given)
 /// the project walk lists, without walking the rest of the project. It runs
 /// the same walk as `walk_project_files(root, &PathFilters::default())`,
 /// pruned to the directories that lead to `files`, so each answer is the
 /// walk's own decision: built-in skipped directories, content exclusions and
 /// every `.gitignore`/`.aftignore` from the root down to the file.
-pub(crate) fn project_walk_lists(root: &Path, files: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+///
+/// Unlike `walk_project_files`, which drops what it cannot read, this records
+/// walk errors as gaps: when a directory or ignore file on the way could not
+/// be read, the walk cannot tell whether a file beneath it would be listed.
+pub(crate) fn project_walk_lists(root: &Path, files: &BTreeSet<PathBuf>) -> ProjectWalkListing {
+    let mut listing = ProjectWalkListing::default();
     if files.is_empty() {
-        return BTreeSet::new();
+        return listing;
     }
     let leads_to_a_file = files
         .iter()
@@ -6246,17 +6282,33 @@ pub(crate) fn project_walk_lists(root: &Path, files: &BTreeSet<PathBuf>) -> BTre
                 .map(Path::to_path_buf)
         })
         .collect::<HashSet<_>>();
-    project_walk_builder_pruned(
+    let walk = project_walk_builder_pruned(
         root,
         crate::project_content::is_excluded_with_file_type,
         move |path| leads_to_a_file.contains(path),
     )
-    .build()
-    .filter_map(Result::ok)
-    .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-    .map(ignore::DirEntry::into_path)
-    .filter(|path| files.contains(path))
-    .collect()
+    .build();
+    for item in walk {
+        let entry = match item {
+            Ok(entry) => entry,
+            Err(error) => {
+                let path = walk_error_path(&error).unwrap_or(root).to_path_buf();
+                listing.gaps.push((path, error.to_string()));
+                continue;
+            }
+        };
+        // An ignore file below this entry could not be read, so the rules
+        // for everything under it are unknown.
+        if let Some(error) = entry.error() {
+            listing
+                .gaps
+                .push((entry.path().to_path_buf(), error.to_string()));
+        }
+        if entry.file_type().is_some_and(|kind| kind.is_file()) && files.contains(entry.path()) {
+            listing.listed.insert(entry.into_path());
+        }
+    }
+    listing
 }
 
 /// `project_walk_lists` answers per file with the project walk's own rules,
@@ -6277,6 +6329,35 @@ mod project_walk_lists_tests {
                 files.insert(entry.path());
             }
         }
+    }
+
+    /// A directory the walk cannot list is recorded as a gap naming it, so
+    /// files beneath it are unknown rather than classified as excluded.
+    #[cfg(unix)]
+    #[test]
+    fn project_walk_lists_reports_an_unlistable_directory_as_a_gap() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let locked = root.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("inner.py"), "x = 1\n").unwrap();
+        fs::write(root.join("open.py"), "x = 1\n").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o311)).unwrap();
+        let listable = fs::read_dir(&locked).is_ok();
+        let files = BTreeSet::from([locked.join("inner.py"), root.join("open.py")]);
+        let listing = project_walk_lists(&root, &files);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        if listable {
+            eprintln!("skipped: this process lists directories without read permission (root)");
+            return;
+        }
+        assert_eq!(listing.listed, BTreeSet::from([root.join("open.py")]));
+        let (gap, _) = listing
+            .gap_for(&locked.join("inner.py"))
+            .expect("unlistable directory reported as a gap");
+        assert_eq!(gap, &locked);
+        assert!(listing.gap_for(&root.join("open.py")).is_none());
     }
 
     #[test]
@@ -6327,7 +6408,7 @@ mod project_walk_lists_tests {
             assert!(walked.contains(&root.join("pkg/deep/other.py")));
             assert!(!walked.contains(&root.join("pkg/deep/local.py")));
             for file in &all {
-                let listed = project_walk_lists(&root, &BTreeSet::from([file.clone()]));
+                let listed = project_walk_lists(&root, &BTreeSet::from([file.clone()])).listed;
                 assert_eq!(
                     listed.contains(file),
                     walked.contains(file),
@@ -6335,7 +6416,9 @@ mod project_walk_lists_tests {
                     file.display()
                 );
             }
-            assert_eq!(project_walk_lists(&root, &all), walked, "git={git}");
+            let listing = project_walk_lists(&root, &all);
+            assert!(listing.gaps.is_empty(), "git={git} {:?}", listing.gaps);
+            assert_eq!(listing.listed, walked, "git={git}");
         }
     }
 }
