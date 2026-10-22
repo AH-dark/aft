@@ -53,8 +53,8 @@ struct BashStatusParams {
     #[serde(default)]
     output_mode: Option<String>,
     /// Raw transport cursor: pages contain at most 64 KiB. output_next_offset
-    /// advances by bytes actually returned; output_has_more keeps terminal
-    /// pattern watches scanning a captured backlog. PTY byte paging omits
+    /// advances by bytes actually returned; output_has_more reports whether
+    /// more captured bytes remain past that offset. PTY byte paging omits
     /// full-history screen replay; request a screen separately without offsets.
     #[serde(default)]
     output_offset: Option<u64>,
@@ -184,7 +184,8 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             let in_flight = !snapshot.info.status.is_terminal();
             // A byte-paged read returns only its page below. Rendering the PTY
             // screen would replay the whole PTY log on every page, so the
-            // screen is skipped and a note says how to request it.
+            // screen is skipped; unless raw-only output was asked for, a note
+            // in its place says how to request the screen.
             let pty_raw = if output_offset.is_some() {
                 if snapshot.info.mode == BgMode::Pty
                     && !matches!(output_mode.as_deref(), Some("raw"))
