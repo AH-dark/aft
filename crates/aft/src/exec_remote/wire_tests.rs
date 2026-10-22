@@ -163,6 +163,9 @@ pub(crate) enum Script {
     /// at once reports it exited 0: a job that waited long for admission and
     /// then finished.
     GatedAcceptanceThenExit,
+    /// Like `GatedAcceptance`, but once released the runner accepts the inputs
+    /// and then refuses before the command starts.
+    GatedAcceptanceThenRefused,
     /// Drop the connection on the first `exec.run`, before any stream record:
     /// the runner never sends `Accepted`, so the caller cannot know the outcome.
     DropBeforeAccepted,
@@ -322,7 +325,7 @@ pub(crate) async fn daemon_with_capabilities(
                                 // Drop the connection and listener with the run in flight.
                                 return;
                             }
-                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::DrainingGatedAcceptance) {
+                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::DrainingGatedAcceptance) {
                                 let mut accepted = Accepted::new(id(), if let Script::Staged { position, .. } | Script::GatedStages { position } = script { position } else { 1 });
                                 if matches!(script, Script::Windows { acknowledge: true, .. }) {
                                     accepted = accepted.with_platform(Platform::Windows);
@@ -358,7 +361,7 @@ pub(crate) async fn daemon_with_capabilities(
                                     Script::Windows { code: None, .. } => Outcome::OutcomeUnknown,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
-                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
+                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
                             else if attaching && matches!(script, Script::GappedAttach | Script::GappedCancel) { /* output is sent below; completion waits for the test's release */ }
                             else {
                                 if matches!(script, Script::Restart) {
@@ -444,7 +447,9 @@ pub(crate) async fn daemon_with_capabilities(
                 }
                 if (matches!(
                     script,
-                    Script::GatedAcceptance | Script::GatedAcceptanceThenExit
+                    Script::GatedAcceptance
+                        | Script::GatedAcceptanceThenExit
+                        | Script::GatedAcceptanceThenRefused
                 ) || matches!(script, Script::DrainingGatedAcceptance) && runs > 1)
                     && body["method"] == "exec.run"
                 {
@@ -465,7 +470,10 @@ pub(crate) async fn daemon_with_capabilities(
                         .unwrap();
                         let _ =
                             subc_transport::write_frame(&mut *writer.lock().await, &accepted).await;
-                        if matches!(script, Script::GatedAcceptanceThenExit) {
+                        if matches!(
+                            script,
+                            Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused
+                        ) {
                             let record = |ty, body: Vec<u8>| {
                                 Frame::build_with_version(
                                     header.ver,
@@ -478,8 +486,15 @@ pub(crate) async fn daemon_with_capabilities(
                                 )
                                 .unwrap()
                             };
+                            let outcome = if matches!(script, Script::GatedAcceptanceThenRefused) {
+                                Outcome::RefusedBeforeStart {
+                                    reason: RefusalReason::Unreachable,
+                                }
+                            } else {
+                                Outcome::Exit { code: 0 }
+                            };
                             let terminal = serde_json::to_vec(&StreamRecord::Terminal(
-                                TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0),
+                                TerminalRecord::new(id(), outcome, 1, 0, 0),
                             ))
                             .unwrap();
                             for frame in [
