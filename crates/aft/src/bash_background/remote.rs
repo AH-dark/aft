@@ -2862,17 +2862,17 @@ impl BgTaskRegistry {
 }
 
 /// Longest a kill waits, after recording a remote task's cancellation, for
-/// the runner to report the task's terminal state. A runner normally confirms
-/// a cancel within a second or two. A slower one gets the "terminal pending"
-/// reply instead; the cancellation is already recorded, and the terminal still
-/// arrives later and is delivered as the task's completion.
+/// the runner to report the task's terminal state. If no terminal state has
+/// arrived by then, the kill returns "terminal pending"; the cancellation is
+/// already recorded, and the terminal may still arrive later and is delivered
+/// as the task's completion.
 ///
 /// The cap is small because the wait blocks the calling thread. `bash_kill`
 /// runs in the executor's mutating lane: it holds one of the executor's few
 /// general worker threads, and the mutating lane admits one job per project at
 /// a time, so the project's edits and other mutating calls queue behind the
-/// wait too. The scope-end kill also runs on an executor worker, and the
-/// abort, withdrawal and hard-kill paths wait on their own threads.
+/// wait too. The scope-end, abort and withdrawal kills also run as executor
+/// jobs; the hard-kill path waits on the watchdog thread.
 #[cfg(unix)]
 const REMOTE_KILL_SETTLE_CAP: Duration = Duration::from_secs(5);
 
