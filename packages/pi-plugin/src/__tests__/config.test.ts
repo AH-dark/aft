@@ -90,6 +90,16 @@ function runConfigLoader(projectDirectory: string, env: Record<string, string>) 
   };
 }
 
+function runRejectedConfigLoader(projectDirectory: string, env: Record<string, string>) {
+  const result = spawnConfigLoader(
+    projectDirectory,
+    env,
+    `import { loadAftConfig } from "./src/config.ts"; try { loadAftConfig(process.env.PROJECT_DIR!); console.log(JSON.stringify({accepted:true})); } catch (error) { console.log(JSON.stringify({errors:error.errors})); }`,
+  );
+  expect(result.status).toBe(0);
+  return JSON.parse(result.stdout.trim()) as { errors: string[] };
+}
+
 afterEach(() => {
   for (const root of tempRoots) {
     rmSync(root, { recursive: true, force: true });
@@ -98,6 +108,132 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
+  test("rejects malformed JSONC instead of applying defaults", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.projectConfigPath, "{ invalid jsonc");
+    expect(
+      runRejectedConfigLoader(fixture.projectDirectory, {
+        HOME: fixture.home,
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      }).errors,
+    ).toEqual(["invalid_config_document"]);
+  });
+  test("inactive malformed harness settings do not reject valid active hardening", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        auto_update: "opaque",
+        harnesses: {
+          pi: { sandbox: { profile: { worker: "strict" } } },
+          opencode: { sandbox: "opaque" },
+        },
+      }),
+    );
+    const loaded = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(loaded.stdout).sandbox.profile.worker).toBe("strict");
+  });
+  test("non-object configuration documents reject instead of publishing defaults", () => {
+    const fixture = createConfigFixture();
+    for (const document of ["null", "[]", "false", "1", '"text"']) {
+      writeFileSync(fixture.userConfigPath, document);
+      expect(
+        runRejectedConfigLoader(fixture.projectDirectory, {
+          HOME: fixture.home,
+          XDG_CONFIG_HOME: fixture.xdgConfigHome,
+        }).errors,
+      ).toEqual(["invalid_config_document"]);
+    }
+  });
+
+  test("unreadable configuration documents reject instead of publishing defaults", () => {
+    const fixture = createConfigFixture();
+    mkdirSync(fixture.userConfigPath);
+    expect(
+      runRejectedConfigLoader(fixture.projectDirectory, {
+        HOME: fixture.home,
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      }).errors,
+    ).toEqual(["invalid_config_document"]);
+  });
+
+  test("mixed invalid active harness blocks cannot discard valid hardening", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        harnesses: {
+          pi: { sandbox: { profile: { worker: "strict" } }, inspect: false },
+          opencode: { sandbox: "opaque" },
+        },
+      }),
+    );
+    expect(
+      runRejectedConfigLoader(fixture.projectDirectory, {
+        HOME: fixture.home,
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      }).errors,
+    ).toEqual(["invalid_security_config:harnesses.pi"]);
+  });
+
+  test("malformed security sections reject initial loading instead of falling back", () => {
+    const fixture = createConfigFixture();
+    for (const [key, value] of Object.entries({
+      sandbox: { profile: { worker: 5 } },
+      indexes: { semantic: "off" },
+      remote_exec: { enabled: "off" },
+      disabled_tools: "aft_write",
+    })) {
+      writeFileSync(fixture.userConfigPath, JSON.stringify({ [key]: value, format_on_edit: true }));
+      const loaded = spawnConfigLoader(
+        fixture.projectDirectory,
+        { HOME: fixture.home, XDG_CONFIG_HOME: fixture.xdgConfigHome },
+        `import { loadAftConfig } from "./src/config.ts"; try { loadAftConfig(process.env.PROJECT_DIR!); console.log(JSON.stringify({accepted:true})); } catch (error) { console.log(JSON.stringify({errors:error.errors})); }`,
+      );
+      expect(loaded.status).toBe(0);
+      expect(JSON.parse(loaded.stdout.trim())).toEqual({
+        errors: [`invalid_security_config:${key}`],
+      });
+    }
+  });
+
+  test("malformed active harness hardening rejects while inactive blocks remain opaque", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        harnesses: {
+          pi: { sandbox: { profile: { worker: 5 } } },
+          opencode: { sandbox: "unused" },
+        },
+      }),
+    );
+    const loaded = spawnConfigLoader(
+      fixture.projectDirectory,
+      { HOME: fixture.home, XDG_CONFIG_HOME: fixture.xdgConfigHome },
+      `import { loadAftConfig } from "./src/config.ts"; try { loadAftConfig(process.env.PROJECT_DIR!); console.log(JSON.stringify({accepted:true})); } catch (error) { console.log(JSON.stringify({errors:error.errors})); }`,
+    );
+    expect(JSON.parse(loaded.stdout.trim())).toEqual({
+      errors: ["invalid_security_config:harnesses.pi.sandbox"],
+    });
+  });
+
+  test("malformed nonsecurity inspect settings are individually reported and skipped", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ inspect: { categories: { diagnostics: "off" } }, format_on_edit: true }),
+    );
+    const loaded = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(loaded.stdout).format_on_edit).toBe(true);
+    expect(loaded.stderr).toContain("Discarded invalid configuration section: inspect");
+  });
   test("legacy user override cannot relocate a project config file", () => {
     const fixture = createConfigFixture();
     const directory = join(fixture.projectDirectory, ".opencode");
@@ -687,7 +823,7 @@ describe("loadAftConfig", () => {
 
     const script = `
       import { loadAftConfig, getConfigLoadErrors } from "./src/config.ts";
-      const config = loadAftConfig(process.env.PROJECT_DIR!);
+      let config; try { config = loadAftConfig(process.env.PROJECT_DIR!); } catch {}
       console.log(JSON.stringify({ config, errors: getConfigLoadErrors() }));
     `;
     const bad = spawnSync(process.execPath, ["-e", script], {
@@ -765,7 +901,7 @@ describe("loadAftConfig", () => {
     });
   });
 
-  test("rejects malformed lsp servers but keeps other config sections", () => {
+  test("rejects malformed lsp servers without applying neighboring settings", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.projectConfigPath,
@@ -789,15 +925,12 @@ describe("loadAftConfig", () => {
       ),
     );
 
-    const result = runConfigLoader(fixture.projectDirectory, {
+    const result = runRejectedConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    const config = JSON.parse(result.stdout) as Record<string, unknown>;
-    expect(config.format_on_edit).toBe(false);
-    expect(config.lsp).toBeUndefined();
-    expect(result.stderr).toContain("Partial config loaded — invalid sections skipped");
+    expect(result.errors).toEqual(["invalid_security_config:lsp"]);
   });
 
   test("merges safe lsp fields while stripping project lsp servers", () => {
@@ -1060,16 +1193,17 @@ describe("loadAftConfig", () => {
     });
     expect(result.stderr).toContain("bash.env");
 
-    writeFileSync(
-      fixture.userConfigPath,
-      JSON.stringify({ bash: { env: { PYTHONPATH: "/tmp/injected" } } }),
-    );
-    const blocked = runConfigLoader(fixture.projectDirectory, {
+    const candidate = { bash: { env: { PYTHONPATH: "/tmp/injected" } } };
+    writeFileSync(fixture.userConfigPath, JSON.stringify(candidate));
+    const blocked = runRejectedConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
-    expect(JSON.parse(blocked.stdout).bash.env).toBeUndefined();
-    expect(blocked.stderr).toContain("bash.env key PYTHONPATH is blocked");
+    expect(blocked.errors).toEqual(["invalid_security_config:bash"]);
+    const parsed = AftConfigSchema.safeParse(candidate);
+    expect(parsed.success).toBe(false);
+    if (parsed.success) throw new Error("blocked environment key must fail schema validation");
+    expect(parsed.error.message).toContain("bash.env key PYTHONPATH is blocked");
   });
 
   test("project config can override bash.rewrite via legacy experimental block", () => {
@@ -1526,9 +1660,8 @@ describe("loadAftConfig", () => {
     expect(result.stderr).not.toContain("validation error");
   });
 
-  // Below the one-minute minimum is a config error, not a silent clamp: the
-  // invalid bash block is dropped with a message naming the key, and the rest
-  // of the file still loads.
+  // Reject malformed bash candidates instead of losing valid permission/scope
+  // settings in the same section when a resource value is invalid.
   test("bash rejects worker_wait_max_ms below 60000", () => {
     const fixture = createConfigFixture();
     writeFileSync(
@@ -1540,16 +1673,12 @@ describe("loadAftConfig", () => {
       ),
     );
 
-    const result = runConfigLoader(fixture.projectDirectory, {
+    const result = runRejectedConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    const config = JSON.parse(result.stdout) as Record<string, unknown>;
-    expect(config.bash).toBeUndefined();
-    expect(config.format_on_edit).toBe(true);
-    expect(result.stderr).toContain("Partial config loaded");
-    expect(result.stderr).toContain("bash.worker_wait_max_ms must be at least 60000");
+    expect(result.errors).toEqual(["invalid_security_config:bash"]);
   });
 
   test("project config may set worker_wait_max_ms", () => {

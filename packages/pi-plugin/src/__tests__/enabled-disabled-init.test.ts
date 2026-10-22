@@ -114,6 +114,15 @@ async function expectFailingCall(tools: Map<string, RegisteredTool>, fix: string
 }
 
 describe.serial("Pi config error state", () => {
+  test("malformed security config registers error tools without starting a bridge", async () => {
+    const layout = await sandbox();
+    writeFileSync(layout.userConfig, JSON.stringify({ sandbox: { profile: { worker: 5 } } }));
+    const { tools, statuses } = await bootInErrorState();
+    expect([...tools.keys()]).toContain("aft_outline");
+    await expectFailingCall(tools, "invalid_security_config:sandbox");
+    expect(statuses).toHaveLength(1);
+    expect(statuses[0]?.[1]).toContain("invalid_security_config:sandbox");
+  });
   test("a missing subc connection file registers the tools and fails every call", async () => {
     const layout = await sandbox();
     const missing = join(tempDir as string, "no-such-connection.json");
@@ -143,7 +152,7 @@ describe.serial("Pi config error state", () => {
 
     const { tools } = await bootInErrorState();
 
-    await expectFailingCall(tools, "failed to parse");
+    await expectFailingCall(tools, "invalid_config_document");
     await expectFailingCall(tools, "Fix the JSONC syntax in that file");
   });
 });

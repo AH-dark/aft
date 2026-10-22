@@ -90,6 +90,20 @@ function sdkContext(): ToolContext {
 }
 
 describe.serial("OpenCode live config reload", () => {
+  test("malformed hardening reload preserves the whole last-good candidate", async () => {
+    const f = await fixture(
+      '{"sandbox":{"profile":{"worker":"strict"},"read_deny":["private"]},"bash":{"watch_sync_max_ms":120000}}',
+    );
+    writeFileSync(
+      f.userPath,
+      '{"sandbox":{"profile":{"worker":5}},"bash":{"watch_sync_max_ms":1000}}',
+    );
+    f.reload.reload();
+    expect(f.ctx.config.sandbox?.profile?.worker).toBe("strict");
+    expect(f.ctx.config.sandbox?.read_deny).toEqual(["private"]);
+    expect(resolveBashConfig(f.ctx.config).watch_sync_max_ms).toBe(120000);
+    expect(f.notices[0]).toContain("invalid_security_config:sandbox");
+  });
   test("revision_reads refreshes registered V1 and V2 schemas in both directions", async () => {
     const f = await fixture('{"revision_reads":false}');
     const definitions = { read: createReadTool(f.ctx), ...readingTools(f.ctx) };
@@ -165,7 +179,7 @@ describe.serial("OpenCode live config reload", () => {
 
     expect(f.ctx.config.configure_warnings_delivery).toBe("chat");
     expect(f.notices).toHaveLength(1);
-    expect(f.notices[0]).toContain("failed to parse");
+    expect(f.notices[0]).toContain("invalid_config_document");
     expect(f.notices[0]).toContain("keeps using the last valid configuration");
   });
 
@@ -178,7 +192,7 @@ describe.serial("OpenCode live config reload", () => {
     f.reload.reload();
     expect(f.ctx.config.restrict_to_project_root).toBe(true);
     expect(resolveBashConfig(f.ctx.config).watch_sync_max_ms).toBe(120_000);
-    expect(f.notices[0]).toContain("invalid setting");
+    expect(f.notices[0]).toContain("invalid_security_config:restrict_to_project_root");
   });
 
   test("a deleted user file keeps a security setting", async () => {

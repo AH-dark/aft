@@ -962,16 +962,78 @@ export const DEFAULT_INDEXES: ResolvedIndexesConfig = {
 
 /**
  * Whole-load rejection: the candidate config must not be used at all. Raised
- * when a resolved configuration lacks its registration list or an index
- * switch; retired keys are translated and never raise it.
+ * for malformed input documents or security-sensitive sections, or when a
+ * resolved configuration lacks its registration list or index switches.
+ * Retired keys are translated before validation and never raise it.
  */
 export class ConfigRejectedError extends Error {
   readonly errors: string[];
   constructor(errors: string[], source?: string) {
-    super(`AFT configuration${source ? ` at ${source}` : ""} was rejected: ${errors.join(", ")}.`);
+    super(
+      `AFT configuration${source ? ` at ${source}` : ""} was rejected: ${errors.join(", ")}.${errors.includes("invalid_config_document") ? " Fix the JSONC syntax in that file." : ""}`,
+    );
     this.name = "ConfigRejectedError";
     this.errors = errors;
   }
+}
+
+/** Sections whose schema failure must not replace explicit security settings with defaults. */
+const SECURITY_CONFIG_SECTIONS = new Set([
+  "restrict_to_project_root",
+  "url_fetch_allow_private",
+  "sandbox",
+  "indexes",
+  "index",
+  "remote_exec",
+  "disabled_tools",
+  "bash",
+  "lsp",
+  "semantic",
+  "search",
+  "subc",
+  "opencode",
+  "github",
+  "gh_shim",
+  "auto_update",
+]);
+
+/** Use schema issues after harness normalization; inactive blocks never reject a load. */
+export function malformedSecurityConfigErrors(
+  raw: unknown,
+  activeHarness: string,
+  issues: readonly { path: readonly PropertyKey[] }[],
+): string[] {
+  const record = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === "object" && !Array.isArray(value);
+  const errors = new Set<string>();
+  for (const issue of issues) {
+    const key = String(issue.path[0] ?? "");
+    if (key !== "harnesses") {
+      if (SECURITY_CONFIG_SECTIONS.has(key)) errors.add(`invalid_security_config:${key}`);
+      continue;
+    }
+    if (!record(raw) || !record(raw.harnesses)) {
+      errors.add("invalid_security_config:harnesses");
+      continue;
+    }
+    if (issue.path.length > 1 && issue.path[1] !== activeHarness) continue;
+    const block = raw.harnesses[activeHarness];
+    if (!record(block)) {
+      errors.add(`invalid_security_config:harnesses.${activeHarness}`);
+      continue;
+    }
+    const section = String(issue.path[2] ?? "");
+    if (SECURITY_CONFIG_SECTIONS.has(section)) {
+      errors.add(`invalid_security_config:harnesses.${activeHarness}.${section}`);
+    } else if (Object.keys(block).some((name) => SECURITY_CONFIG_SECTIONS.has(name))) {
+      // Partial parsing discards the whole invalid override, including valid hardening.
+      errors.add(`invalid_security_config:harnesses.${activeHarness}`);
+    }
+  }
+  const harnessError = `invalid_security_config:harnesses.${activeHarness}`;
+  if ([...errors].some((error) => error.startsWith(`${harnessError}.`)))
+    errors.delete(harnessError);
+  return [...errors].sort();
 }
 
 /**

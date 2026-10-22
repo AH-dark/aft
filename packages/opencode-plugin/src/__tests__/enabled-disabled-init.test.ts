@@ -103,6 +103,13 @@ async function expectFailingCall(tools: NonNullable<Hooks["tool"]>, fix: string)
 }
 
 describe.serial("OpenCode config error state", () => {
+  test("malformed security config registers error tools without starting a bridge", async () => {
+    const layout = await sandbox();
+    writeFileSync(layout.userConfig, JSON.stringify({ sandbox: { profile: { worker: 5 } } }));
+    const { tools } = await bootInErrorState(layout);
+    expect(Object.keys(tools)).toContain("aft_outline");
+    await expectFailingCall(tools, "invalid_security_config:sandbox");
+  });
   test("a missing subc connection file registers the tools and fails every call", async () => {
     const layout = await sandbox();
     const missing = join(tempDir as string, "no-such-connection.json");
@@ -131,7 +138,7 @@ describe.serial("OpenCode config error state", () => {
     const { tools } = await bootInErrorState(layout);
 
     expect(Object.keys(tools)).toContain("read");
-    await expectFailingCall(tools, "failed to parse");
+    await expectFailingCall(tools, "invalid_config_document");
     await expect(tools.read.execute({ filePath: "a.ts" }, {})).rejects.toThrow(
       "Fix the JSONC syntax in that file",
     );

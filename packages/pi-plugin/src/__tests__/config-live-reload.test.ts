@@ -74,6 +74,20 @@ async function fixture(user: string, project?: string) {
 }
 
 describe.serial("Pi live config reload", () => {
+  test("malformed hardening reload preserves the whole last-good candidate", async () => {
+    const f = await fixture(
+      '{"sandbox":{"profile":{"worker":"strict"},"read_deny":["private"]},"bash":{"watch_sync_max_ms":120000}}',
+    );
+    writeFileSync(
+      f.userPath,
+      '{"sandbox":{"profile":{"worker":5}},"bash":{"watch_sync_max_ms":1000}}',
+    );
+    f.reload.reload();
+    expect(f.ctx.config.sandbox?.profile?.worker).toBe("strict");
+    expect(f.ctx.config.sandbox?.read_deny).toEqual(["private"]);
+    expect(resolveBashConfig(f.ctx.config).watch_sync_max_ms).toBe(120000);
+    expect(f.notices[0]).toContain("invalid_security_config:sandbox");
+  });
   test("refreshed read schemas retain later live path restrictions", async () => {
     const f = await fixture('{"revision_reads":false,"restrict_to_project_root":false}');
     writeFileSync(f.userPath, '{"revision_reads":true,"restrict_to_project_root":false}');
