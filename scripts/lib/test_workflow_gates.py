@@ -123,7 +123,9 @@ class LightPREventGateTests(unittest.TestCase):
         suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
         job = suite["jobs"]["worker-gh-read-landlock"]
         self.assertEqual(job["name"], "Worker GitHub reads (required Landlock)")
-        self.assertNotIn("if", job)
+        # Like every other unit leaf job it skips pull requests and runs in the
+        # merge queue and on main, so every commit that lands has passed it.
+        self.assertEqual(job["if"], "${{ github.event_name != 'pull_request' }}")
         self.assertEqual(str(job["env"]["AFT_REQUIRE_LANDLOCK"]), "1")
 
     def test_pr_exclusion_is_an_event_warning_not_a_dead_train_ref_gate(self) -> None:
@@ -152,9 +154,6 @@ class LightPREventGateTests(unittest.TestCase):
             with self.subTest(context=context):
                 self.assertIn(context, jobs)
                 self.assertNotIn("strategy", jobs[context])
-                if context == "Unit / Worker GitHub reads (required Landlock)":
-                    self.assertNotIn("if", jobs[context])
-                    continue
                 self.assertIn(jobs[context]["if"], (
                     "${{ github.event_name != 'pull_request' }}",
                     "${{ always() && github.event_name != 'pull_request' }}",

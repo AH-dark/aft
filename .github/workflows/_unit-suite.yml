@@ -380,6 +380,7 @@ jobs:
 
   worker-gh-read-landlock:
     name: Worker GitHub reads (required Landlock)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
