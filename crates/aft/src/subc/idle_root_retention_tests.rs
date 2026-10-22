@@ -13,6 +13,9 @@ fn run_in_child(test_name: &str) {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, "1")
+        // Other tests in this process set it while they run; the child must
+        // start the real watchers whatever this process held at spawn time.
+        .env_remove("AFT_TEST_DISABLE_FILE_WATCHER")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
