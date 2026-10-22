@@ -7032,6 +7032,33 @@ fn assert_one_saved_task_paused(reply: &crate::protocol::Response, task: &str) {
     assert_eq!(killed[0]["remote"]["cancel"], "sent", "{reply:?}");
 }
 
+/// The bound project's session hears of the owner's stop exactly once: one
+/// completion for `task`, and one cancelled-call notice naming it, which is
+/// not repeated. The `bash.kill_scope` recovery registry that recorded the
+/// stop has no session of its own and is detached afterwards.
+fn assert_project_told_of_the_stop_once(project: &BgTaskRegistry, task: &str) {
+    let completions = project
+        .drain_completions_for_session(Some("session"))
+        .into_iter()
+        .filter(|completion| completion.task_id == task)
+        .collect::<Vec<_>>();
+    assert_eq!(completions.len(), 1, "{completions:?}");
+    assert_eq!(completions[0].status, BgTaskStatus::Killed);
+    let notices = project.take_cancelled_call_notices("session");
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|notice| notice.contains(task))
+            .count(),
+        1,
+        "{notices:?}"
+    );
+    assert!(
+        project.take_cancelled_call_notices("session").is_empty(),
+        "the cancelled-call notice was repeated"
+    );
+}
+
 /// After a module restart, the owner pauses a scope whose saved draining
 /// retry is due, and the task's project binds while `bash.kill_scope` holds
 /// the copy it recovered, not yet paused. The bind must register that same
@@ -7043,7 +7070,10 @@ async fn bash_kill_scope_recovery_then_a_bind_share_one_saved_task() {
     let scope = owner_scope("saved-recovery-then-bind");
     let (daemon, _clock, task_id, json) =
         saved_due_draining_retry(dir.path(), &scope, u32::MAX).await;
-    let (reached, release) = crate::commands::bash_kill_scope::saved_recovery_gate::arm(dir.path());
+    let (reached, release) = crate::commands::bash_kill_scope::saved_recovery_gate::arm(
+        dir.path(),
+        crate::commands::bash_kill_scope::saved_recovery_gate::Point::AfterRecovery,
+    );
     let operation = start_kill_scope_with_saved_tasks(dir.path(), &scope);
     tokio::time::timeout(Duration::from_secs(30), reached)
         .await
@@ -7072,6 +7102,7 @@ async fn bash_kill_scope_recovery_then_a_bind_share_one_saved_task() {
     assert_paused(&project, &task_id);
     assert_saved_paused(&json);
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_project_told_of_the_stop_once(&project, &task_id);
 }
 
 /// After a module restart, the task's project binds and its worker is about
@@ -7115,6 +7146,55 @@ async fn a_bind_then_bash_kill_scope_recovery_share_one_saved_task() {
     assert_paused(&project, &task_id);
     assert_saved_paused(&json);
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_project_told_of_the_stop_once(&project, &task_id);
+}
+
+/// After a module restart, `bash.kill_scope` recovers and stops a saved
+/// task. The task's project binds just as the stop is saved: its replay read
+/// the task's record from before the stop, so it registers the task the
+/// recovery registry holds, which is already stopped. The stop's notices,
+/// which the recovery registry could not deliver, must reach the project's
+/// session once.
+#[tokio::test]
+async fn a_bind_racing_a_saved_tasks_stop_gets_its_notices() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = owner_scope("saved-stop-then-bind");
+    let (daemon, _clock, task_id, json) =
+        saved_due_draining_retry(dir.path(), &scope, u32::MAX).await;
+    let before_stop = fs::read(&json).unwrap();
+    let (reached, release) = crate::commands::bash_kill_scope::saved_recovery_gate::arm(
+        dir.path(),
+        crate::commands::bash_kill_scope::saved_recovery_gate::Point::BeforeDetach,
+    );
+    let operation = start_kill_scope_with_saved_tasks(dir.path(), &scope);
+    tokio::time::timeout(Duration::from_secs(30), reached)
+        .await
+        .expect("bash.kill_scope must stop the saved task")
+        .unwrap();
+    assert_saved_paused(&json);
+    // Stand in for a replay that read the record just before the stop
+    // saved it.
+    fs::write(&json, &before_stop).unwrap();
+    let project = registry();
+    project.replay_session(dir.path(), "session").unwrap();
+    release.send(()).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(30), operation)
+        .await
+        .expect("bash.kill_scope must reply")
+        .unwrap();
+    assert_one_saved_task_paused(&reply, &task_id);
+    wait_for("the paused task's worker must stop", || {
+        (remote_workers(&task_id) == (2, 2)).then_some(())
+    })
+    .await;
+    assert_eq!(
+        remote_workers(&task_id),
+        (2, 2),
+        "the bind started a worker"
+    );
+    assert_paused(&project, &task_id);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_project_told_of_the_stop_once(&project, &task_id);
 }
 
 /// `bash.kill_scope` recovered a saved task and holds it without a worker.

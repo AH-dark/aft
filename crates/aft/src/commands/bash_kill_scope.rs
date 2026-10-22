@@ -63,7 +63,7 @@ pub(crate) fn handle_bash_kill_scope_with_saved_tasks(
     };
     #[cfg(all(test, unix))]
     if let Some(root) = saved_storage_root {
-        saved_recovery_gate::pass(root);
+        saved_recovery_gate::pass(root, saved_recovery_gate::Point::AfterRecovery);
     }
     let all_registries = registries
         .iter()
@@ -116,6 +116,10 @@ pub(crate) fn handle_bash_kill_scope_with_saved_tasks(
                 Some(registry.wait_owner_pause_cancel(&task.task_id, &task.session_id, deadline));
         }
     }
+    #[cfg(all(test, unix))]
+    if let Some(root) = saved_storage_root {
+        saved_recovery_gate::pass(root, saved_recovery_gate::Point::BeforeDetach);
+    }
     // The recovered tasks are stopped and their records saved; a later
     // replay of their project restores them as finished.
     for registry in &recovered {
@@ -138,9 +142,9 @@ pub(crate) fn handle_bash_kill_scope_with_saved_tasks(
 #[path = "bash_kill_scope_tests.rs"]
 mod tests;
 
-/// Lets a test hold `bash.kill_scope` after it recovered a storage root's
-/// saved tasks and before it pauses them, so another restore of the same
-/// tasks (a project binding) can land in exactly that window.
+/// Lets a test hold `bash.kill_scope` at a `Point` of its handling of a
+/// storage root's saved tasks, so another restore of the same tasks (a
+/// project binding) can land in exactly that window.
 #[cfg(all(test, unix))]
 pub(crate) mod saved_recovery_gate {
     use std::collections::HashMap;
@@ -149,31 +153,45 @@ pub(crate) mod saved_recovery_gate {
 
     type Gate = (tokio::sync::oneshot::Sender<()>, mpsc::Receiver<()>);
 
-    fn gates() -> &'static Mutex<HashMap<PathBuf, Gate>> {
-        static GATES: OnceLock<Mutex<HashMap<PathBuf, Gate>>> = OnceLock::new();
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub(crate) enum Point {
+        /// After the saved tasks were recovered, before they are paused.
+        AfterRecovery,
+        /// After the pause settled, before the recovery registries detach.
+        BeforeDetach,
+    }
+
+    fn gates() -> &'static Mutex<HashMap<(PathBuf, Point), Gate>> {
+        static GATES: OnceLock<Mutex<HashMap<(PathBuf, Point), Gate>>> = OnceLock::new();
         GATES.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    fn key(root: &Path) -> PathBuf {
-        std::fs::canonicalize(root).unwrap_or_else(|_| root.into())
+    fn key(root: &Path, point: Point) -> (PathBuf, Point) {
+        (
+            std::fs::canonicalize(root).unwrap_or_else(|_| root.into()),
+            point,
+        )
     }
 
-    /// Hold the next `bash.kill_scope` for saved tasks under `root` once.
-    /// The receiver fires when it is held; sending on (or dropping) the
-    /// sender lets it go on.
-    pub(crate) fn arm(root: &Path) -> (tokio::sync::oneshot::Receiver<()>, mpsc::Sender<()>) {
+    /// Hold the next `bash.kill_scope` for saved tasks under `root` once at
+    /// `point`. The receiver fires when it is held; sending on (or dropping)
+    /// the sender lets it go on.
+    pub(crate) fn arm(
+        root: &Path,
+        point: Point,
+    ) -> (tokio::sync::oneshot::Receiver<()>, mpsc::Sender<()>) {
         let (reached_tx, reached) = tokio::sync::oneshot::channel();
         let (release, release_rx) = mpsc::channel();
         assert!(gates()
             .lock()
             .unwrap()
-            .insert(key(root), (reached_tx, release_rx))
+            .insert(key(root, point), (reached_tx, release_rx))
             .is_none());
         (reached, release)
     }
 
-    pub(super) fn pass(root: &Path) {
-        let armed = gates().lock().unwrap().remove(&key(root));
+    pub(super) fn pass(root: &Path, point: Point) {
+        let armed = gates().lock().unwrap().remove(&key(root, point));
         if let Some((reached, release)) = armed {
             let _ = reached.send(());
             let _ = release.recv();
