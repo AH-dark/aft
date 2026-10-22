@@ -10839,6 +10839,251 @@ mod tests {
         assert_eq!(outcome.processed, 1);
     }
 
+    /// A views-on checkout whose call graph an operator removes while the
+    /// daemon is stopped: `blobs/<family>/callgraph.sqlite` and its `-wal` and
+    /// `-shm` files are deleted, while `oid-alias.sqlite` and
+    /// `semantic.sqlite` beside them are kept.
+    struct BlobRemovalFixture {
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        storage: PathBuf,
+        family: String,
+        /// `callers` of `target` and `call_tree` of `caller`, Debug-formatted,
+        /// as the daemon answered before the store was removed.
+        callers_before: String,
+        call_tree_before: String,
+        generation_before: String,
+    }
+
+    const BLOB_REMOVAL_EDITED_LIB: &str =
+        "pub fn caller() { target(); }\npub fn second() { target(); }\npub fn target() {}\nfn unused() {}\n";
+
+    fn blob_removal_callgraph_db(storage: &Path, family: &str) -> PathBuf {
+        storage.join("blobs").join(family).join("callgraph.sqlite")
+    }
+
+    fn blob_removal_payload_rows(storage: &Path, family: &str) -> u64 {
+        let connection =
+            rusqlite::Connection::open(blob_removal_callgraph_db(storage, family)).unwrap();
+        connection
+            .query_row("SELECT COUNT(*) FROM blob_payloads", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn blob_removal_answers(ctx: &AppContext) -> (String, String) {
+        let store = lazy_ready(ctx.callgraph_store_for_ops());
+        let lib = Path::new("lib.rs");
+        (
+            format!("{:?}", store.callers_of(lib, "target", 3).unwrap()),
+            format!("{:?}", store.call_tree(lib, "caller", 3).unwrap()),
+        )
+    }
+
+    fn blob_removal_generation(storage: &Path, root: &Path) -> Option<String> {
+        crate::views::ViewStore::open(storage, &crate::path_identity::project_scope_key(root))
+            .unwrap()
+            .current_generation()
+            .unwrap()
+    }
+
+    /// The daemon has stopped once nothing in this process holds the family's
+    /// call-graph database open. Deleting a file that a connection still holds
+    /// would leave that connection reading the unlinked file, which would hide
+    /// the effect being tested.
+    fn blob_removal_stop(ctx: Arc<AppContext>, storage: &Path, family: &str) {
+        drop(ctx);
+        let database = blob_removal_callgraph_db(storage, family);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while crate::db::file_identity::open_connections(&database) > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a connection to {} outlived the stopped context",
+                database.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Removes the family's call-graph blob store and asserts that the alias and
+    /// semantic stores beside it are left in place.
+    fn blob_removal_delete_store(storage: &Path, family: &str) {
+        let database = blob_removal_callgraph_db(storage, family);
+        assert!(database.is_file());
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", database.display()));
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("removing {}: {error}", path.display()),
+            }
+        }
+        let family_dir = storage.join("blobs").join(family);
+        assert!(!database.exists());
+        assert!(family_dir.join("oid-alias.sqlite").is_file());
+        assert!(family_dir.join("semantic.sqlite").is_file());
+    }
+
+    /// Binds a committed checkout with views and the call graph on, records the
+    /// answers the daemon gives, stops it and removes the call-graph blob store.
+    fn blob_removal_fixture() -> BlobRemovalFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("main");
+        init_git_fixture(&root);
+        lazy_commit(&root, LAZY_LIB, "lib");
+        let root = root.canonicalize().unwrap();
+        let storage = temp.path().join("storage");
+        let family = crate::search_index::artifact_cache_key(&root);
+
+        let ctx = lazy_bind(&root, &storage, "before-removal");
+        let (callers_before, call_tree_before) = blob_removal_answers(&ctx);
+        assert!(callers_before.contains("caller"), "{callers_before}");
+        assert!(call_tree_before.contains("target"), "{call_tree_before}");
+        let generation_before = blob_removal_generation(&storage, &root).unwrap();
+        assert!(crate::views::read::derived_built(
+            &lazy_view_dir(&storage, &root),
+            &generation_before
+        ));
+        // lib.rs and tracked.rs each have one extracted payload.
+        assert_eq!(blob_removal_payload_rows(&storage, &family), 2);
+
+        blob_removal_stop(ctx, &storage, &family);
+        blob_removal_delete_store(&storage, &family);
+        BlobRemovalFixture {
+            _temp: temp,
+            root,
+            storage,
+            family,
+            callers_before,
+            call_tree_before,
+            generation_before,
+        }
+    }
+
+    /// Removing only the blob store does not make the daemon rebuild it. The
+    /// published view still names every payload by content key, so after the
+    /// restart the daemon keeps answering from the view's derived database and
+    /// extracts nothing. The first edit then needs a new generation, whose
+    /// closure check finds the unchanged file's payload missing; publication
+    /// fails, the old generation stays current and the edit never reaches the
+    /// call graph.
+    #[test]
+    fn views_removed_callgraph_blob_store_is_not_rebuilt_and_blocks_the_next_publication() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let fixture = blob_removal_fixture();
+        let (root, storage, family) = (&fixture.root, &fixture.storage, &fixture.family);
+
+        let ctx = lazy_bind(root, storage, "after-removal");
+        assert_eq!(
+            blob_removal_answers(&ctx),
+            (
+                fixture.callers_before.clone(),
+                fixture.call_tree_before.clone()
+            ),
+            "the restarted daemon answers from the surviving derived database"
+        );
+        assert_eq!(
+            blob_removal_generation(storage, root).as_deref(),
+            Some(fixture.generation_before.as_str()),
+            "nothing was republished at bind"
+        );
+        assert!(ctx
+            .view_runtime_snapshot()
+            .is_some_and(|view| view.pending_paths.is_empty()));
+        // Opening the store at bind recreated the file, empty: no payload was
+        // extracted again.
+        assert_eq!(blob_removal_payload_rows(storage, family), 0);
+
+        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
+        let error = ctx
+            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
+            .expect_err("publication must fail while the view names missing payloads");
+        eprintln!("publication error after the blob store was removed: {error}");
+        let tracked_key = crate::blob_store::CallgraphKey::from_bytes(
+            &fs::read(root.join("tracked.rs")).unwrap(),
+            "rust",
+            crate::views::callgraph::PRODUCER,
+        )
+        .full_key()
+        .to_hex();
+        assert!(
+            error.contains("missing") && error.contains(&tracked_key),
+            "the unchanged file's payload is the one reported missing: {error}"
+        );
+        // Only the edited file was extracted again.
+        assert_eq!(blob_removal_payload_rows(storage, family), 1);
+        assert_eq!(
+            blob_removal_generation(storage, root).as_deref(),
+            Some(fixture.generation_before.as_str()),
+            "the failed publication left the pre-edit generation current"
+        );
+        let (callers_after_edit, _) = blob_removal_answers(&ctx);
+        assert_eq!(
+            callers_after_edit, fixture.callers_before,
+            "the served graph still lacks the edit's new caller"
+        );
+        assert!(!callers_after_edit.contains("second"));
+
+        // A retry fails the same way: nothing extracts the unchanged file.
+        let retry = ctx
+            .publish_view_paths(BTreeSet::new(), false)
+            .expect_err("a whole-checkout publication fails the same way");
+        assert!(retry.contains(&tracked_key), "{retry}");
+    }
+
+    /// Removing the checkout's view directory together with the blob store
+    /// makes the next bind publish from scratch: every file is extracted
+    /// again, and the rebuilt graph answers as before and takes later edits.
+    #[test]
+    fn views_removed_callgraph_blob_store_and_view_rebuild_on_restart() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let fixture = blob_removal_fixture();
+        let (root, storage, family) = (&fixture.root, &fixture.storage, &fixture.family);
+        let view_dir = lazy_view_dir(storage, root);
+        fs::remove_dir_all(&view_dir).unwrap();
+
+        let ctx = lazy_bind(root, storage, "after-removal");
+        let generation = blob_removal_generation(storage, root).expect("republished at bind");
+        assert!(crate::views::read::derived_built(&view_dir, &generation));
+        assert!(ctx
+            .view_runtime_snapshot()
+            .is_some_and(|view| view.pending_paths.is_empty()));
+        assert_eq!(
+            blob_removal_payload_rows(storage, family),
+            2,
+            "both files were extracted again"
+        );
+        assert_eq!(
+            blob_removal_answers(&ctx),
+            (
+                fixture.callers_before.clone(),
+                fixture.call_tree_before.clone()
+            ),
+        );
+        let (_cold_storage, cold) = lazy_cold_store(root);
+        let store = lazy_ready(ctx.callgraph_store_for_ops());
+        assert_eq!(
+            store.edge_snapshot().unwrap(),
+            cold.edge_snapshot().unwrap()
+        );
+        drop(store);
+
+        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
+        let report = ctx
+            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
+            .unwrap();
+        assert!(report.published, "{report:?}");
+        assert!(report.pending_paths.is_empty(), "{report:?}");
+        let (callers_after_edit, _) = blob_removal_answers(&ctx);
+        assert!(
+            callers_after_edit.contains("second"),
+            "{callers_after_edit}"
+        );
+    }
+
     #[test]
     fn linked_worktree_answers_from_main_graph_without_building_its_own() {
         let _artifact_guard = artifact_owner_test_lock();
