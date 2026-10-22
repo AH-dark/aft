@@ -60,9 +60,22 @@ pub(crate) fn redact_url_cache_paths(
     if !request_has_url(req) {
         return;
     }
-    let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
-    let cache_dir = storage_dir.join("url_cache").to_string_lossy().into_owned();
-    redact_cache_paths_in_value(&mut response.data, &cache_dir);
+    // Downloads are written under the cache root (`AppContext::cache_dir`),
+    // which is the `storage.cache_dir` volume when one is set; downloads from
+    // before that setting stay under the durable storage root. Redact both.
+    let config = ctx.config();
+    let mut roots = vec![ctx.cache_dir()];
+    if let Some(configured) = &config.cache_dir_configured {
+        roots.push(configured.spelling.join("aft"));
+    }
+    roots.push(crate::bash_background::storage_dir(
+        config.storage_dir.as_deref(),
+    ));
+    roots.dedup();
+    for root in roots {
+        let cache_dir = root.join("url_cache").to_string_lossy().into_owned();
+        redact_cache_paths_in_value(&mut response.data, &cache_dir);
+    }
 }
 
 fn redact_cache_paths_in_value(value: &mut serde_json::Value, cache_dir: &str) {
@@ -432,5 +445,51 @@ mod tests {
         assert!(message.contains("the requested URL"), "{message}");
         assert!(!message.contains("url_cache"), "{message}");
         assert!(!message.contains("c7502988ff3e8388.md"), "{message}");
+    }
+
+    /// With `storage.cache_dir` set, downloads live under the cache root on
+    /// another path, and their paths must be redacted too.
+    #[test]
+    fn url_responses_redact_cached_document_paths_under_a_separate_cache_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("private-storage");
+        let cache_parent = temp.path().join("cache-volume");
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.clone()),
+                cache_dir: Some(cache_parent.clone()),
+                ..Default::default()
+            },
+        );
+        assert_ne!(ctx.cache_dir(), storage);
+        let req = serde_json::from_value(serde_json::json!({
+            "id": "url-cache-redaction-split",
+            "command": "outline",
+            "file": "https://example.com/docs.md"
+        }))
+        .unwrap();
+        let cached = ctx
+            .cache_dir()
+            .join("url_cache")
+            .join("c7502988ff3e8388.md");
+        let legacy = storage.join("url_cache").join("0123456789abcdef.md");
+        let mut response = Response::error(
+            "url-cache-redaction-split",
+            "parse_error",
+            format!(
+                "syntax errors in {} and {}",
+                cached.display(),
+                legacy.display()
+            ),
+        );
+
+        redact_url_cache_paths(&req, &ctx, &mut response);
+
+        let message = response.data["message"].as_str().unwrap();
+        assert!(!message.contains("cache-volume"), "{message}");
+        assert!(!message.contains("url_cache"), "{message}");
+        assert!(!message.contains("c7502988ff3e8388.md"), "{message}");
+        assert!(!message.contains("0123456789abcdef.md"), "{message}");
     }
 }
