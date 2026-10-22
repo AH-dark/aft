@@ -1,0 +1,13 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/lib.rs",
+    "crates/aft/src/search_index.rs"
+  ],
+  "note": "File-identity stamps for search_index, reader_floor, gc_memo, context; search_index stamp change is Windows-only identity, no ranking effect. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}
