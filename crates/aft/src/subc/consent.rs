@@ -945,10 +945,12 @@ fn scope_reason(grant: &AccessGrant) -> &'static str {
     }
 }
 
-/// Offer a read-file's immediate directory only when it is not a home ancestor
-/// or a root-level system directory. Unknown home/volume identity stays file-only.
-fn read_directory_scope(grant: &AccessGrant) -> AccessGrant {
-    read_directory_scope_with(grant, directory_is_root_alias)
+/// Offer a file ask's immediate directory, for reads and writes alike, only
+/// when that directory passes `probe_directory_scope_with`: it is not the home
+/// folder, a home ancestor, a root-level or volume-level folder, or a protected
+/// system folder. Unknown home/volume identity stays file-only.
+fn directory_scope(grant: &AccessGrant) -> AccessGrant {
+    directory_scope_with(grant, directory_is_root_alias)
 }
 
 const DIRECTORY_SCOPE_PROBE_BUDGET: Duration = Duration::from_millis(250);
@@ -1054,17 +1056,19 @@ impl DirectoryScopeProbes {
 static DIRECTORY_SCOPE_PROBES: LazyLock<std::sync::Mutex<DirectoryScopeProbes>> =
     LazyLock::new(|| std::sync::Mutex::new(DirectoryScopeProbes::default()));
 
-fn read_directory_scope_with<F>(grant: &AccessGrant, root_alias_check: F) -> AccessGrant
+fn directory_scope_with<F>(grant: &AccessGrant, root_alias_check: F) -> AccessGrant
 where
     F: Fn(&Path, &Path) -> Option<bool> + Send + Sync + 'static,
 {
     let deadline = Instant::now() + directory_scope_probe_budget();
-    if grant.operation != AccessOperation::Read || grant.kind != GrantKind::File {
+    if grant.kind != GrantKind::File {
         return grant.clone();
     }
     let Some(parent) = grant.path.parent() else {
         return grant.clone();
     };
+    // One eligibility answer per directory serves read and write asks alike:
+    // the directory either may be offered as a whole or it may not.
     let (probe, leader) = DIRECTORY_SCOPE_PROBES.lock().unwrap().get(parent);
     let answer = if leader {
         let result = if let Some(permit) = DIRECTORY_SCOPE_PROBE_LIMITER.acquire_until(deadline) {
@@ -1096,7 +1100,7 @@ where
         Ok(true) => AccessGrant {
             path: parent.to_path_buf(),
             kind: GrantKind::Subtree,
-            operation: AccessOperation::Read,
+            operation: grant.operation,
         },
         Ok(false) => grant.clone(),
         Err(reason) => {
@@ -1119,7 +1123,7 @@ async fn scope_before_db(grant: &AccessGrant) -> AccessGrant {
     let probing = grant.clone();
     // A bounded helper still waits for its deadline. Keep that wait off the
     // async executor and outside the database mutex used for head-policy checks.
-    tokio::task::spawn_blocking(move || read_directory_scope(&probing))
+    tokio::task::spawn_blocking(move || directory_scope(&probing))
         .await
         .unwrap_or_else(|_| grant.clone())
 }
@@ -1291,16 +1295,16 @@ fn advertised_scope(prep: &Prepared) -> Option<AccessGrant> {
     if advertised == pattern(&prep.grant) {
         return Some(prep.grant.clone());
     }
-    if prep.grant.kind != GrantKind::File || prep.grant.operation != AccessOperation::Read {
+    if prep.grant.kind != GrantKind::File {
         return None;
     }
     let parent = prep.grant.path.parent()?;
-    // The filesystem root is never offered as a read-file's directory scope.
+    // The filesystem root is never offered as a file's directory scope.
     parent.parent()?;
     let directory = AccessGrant {
         path: parent.to_path_buf(),
         kind: GrantKind::Subtree,
-        operation: AccessOperation::Read,
+        operation: prep.grant.operation,
     };
     (advertised == pattern(&directory)).then_some(directory)
 }

@@ -953,6 +953,100 @@ async fn consent_scope_read_does_not_admit_write() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn consent_scope_write_folder_admits_subfolders_and_refuses_sibling_and_symlink_escape() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    let target = f.head_root.join("shared.txt");
+    let args = json!({"path": target, "content": "first write\n"});
+    let pending = f.tool("write", args.clone(), 301).await;
+    assert_eq!(code(&pending), "access_pending", "{pending}");
+    // The card offers the file (allow once) and its folder (allow scope).
+    let request = f.fake.calls("consent.request")[0].clone();
+    assert_eq!(request["operation"], "write");
+    assert_eq!(request["paths"], json!([target]));
+    assert_eq!(
+        request["pattern"],
+        json!(format!("{}/**", f.head_root.display()))
+    );
+    assert_eq!(request["reason"], "Allow scope: read/write access for all AFT file tools within the displayed directory tree. Protected paths remain denied.");
+    assert_eq!(request["head_policy"], "allow");
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_scope", "answered_by":"user"}),
+    );
+    let allowed = f.tool("write", args, 302).await;
+    assert_ne!(code(&allowed), "access_pending", "{allowed}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "first write\n");
+    assert_eq!(
+        f.worker_grants(),
+        vec![AccessGrant {
+            path: f.head_root.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Write,
+        }]
+    );
+    let asked = f.fake.calls("consent.request").len();
+
+    let nested = f.head_root.join("sub/deeper");
+    std::fs::create_dir_all(&nested).unwrap();
+    let reply = f
+        .tool(
+            "write",
+            json!({"path": nested.join("new.txt"), "content": "nested write\n"}),
+            303,
+        )
+        .await;
+    assert_ne!(code(&reply), "access_pending", "{reply}");
+    assert_eq!(
+        std::fs::read_to_string(nested.join("new.txt")).unwrap(),
+        "nested write\n"
+    );
+    assert_eq!(f.fake.calls("consent.request").len(), asked);
+
+    let sibling = f.dir.path().join("sibling");
+    std::fs::create_dir_all(&sibling).unwrap();
+    let reply = f
+        .tool(
+            "write",
+            json!({"path": sibling.join("new.txt"), "content": "sibling write\n"}),
+            304,
+        )
+        .await;
+    assert_eq!(code(&reply), "access_pending", "{reply}");
+    assert!(!sibling.join("new.txt").exists());
+
+    // A link inside the granted folder resolves to its target, which is
+    // judged on its own: neither a linked directory nor a linked file
+    // outside the folder is covered.
+    std::os::unix::fs::symlink(&sibling, f.head_root.join("escape")).unwrap();
+    let reply = f
+        .tool(
+            "write",
+            json!({"path": f.head_root.join("escape/through.txt"), "content": "escaped\n"}),
+            305,
+        )
+        .await;
+    assert_eq!(code(&reply), "access_pending", "{reply}");
+    assert!(!sibling.join("through.txt").exists());
+    let elsewhere = f.dir.path().join("elsewhere.txt");
+    std::os::unix::fs::symlink(&elsewhere, f.head_root.join("link.txt")).unwrap();
+    let reply = f
+        .tool(
+            "write",
+            json!({"path": f.head_root.join("link.txt"), "content": "escaped\n"}),
+            306,
+        )
+        .await;
+    assert_eq!(code(&reply), "access_pending", "{reply}");
+    assert_eq!(
+        std::fs::read_to_string(&elsewhere).unwrap(),
+        "unheld contents\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn consent_scope_read_does_not_admit_parent() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
@@ -1506,10 +1600,89 @@ fn assert_file_only_read_scope(path: PathBuf) {
         kind: GrantKind::File,
         operation: AccessOperation::Read,
     };
-    let scope = read_directory_scope(&original);
+    let scope = directory_scope(&original);
     assert_eq!(scope, original);
     assert_eq!(scope_reason(&scope), "Allow scope: read-only access for all AFT read tools to the displayed file only. Protected paths remain denied.");
     assert_eq!(pattern(&scope), original.path.to_string_lossy());
+}
+
+/// A write ask for `path` offers the file only. A write in an ordinary nested
+/// directory is checked first and must offer its folder, so the file-only
+/// answer below comes from the directory rules rather than from write asks
+/// never offering a folder.
+#[cfg(unix)]
+fn assert_file_only_write_scope(path: PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = crate::access_policy::policy_path(&dir.path().join("nested/src"));
+    std::fs::create_dir_all(&nested).unwrap();
+    let control = directory_scope(&AccessGrant {
+        path: nested.join("lib.rs"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Write,
+    });
+    assert_eq!(
+        control,
+        AccessGrant {
+            path: nested,
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Write,
+        }
+    );
+    let original = AccessGrant {
+        path,
+        kind: GrantKind::File,
+        operation: AccessOperation::Write,
+    };
+    let scope = directory_scope(&original);
+    assert_eq!(scope, original);
+    assert_eq!(scope_reason(&scope), "Allow scope: read/write access for all AFT file tools to the displayed file only. Protected paths remain denied.");
+    assert_eq!(pattern(&scope), original.path.to_string_lossy());
+}
+
+#[cfg(unix)]
+fn test_home() -> PathBuf {
+    let home = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
+        .map(PathBuf::from)
+        .expect("the test runner supplies a home directory");
+    crate::access_policy::policy_path(&home)
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_write_home_file_stays_file_only() {
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    assert_file_only_write_scope(test_home().join("x"));
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_write_home_ancestor_file_stays_file_only() {
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    let home = test_home();
+    let ancestor = home.parent().expect("the home folder has a parent");
+    assert_file_only_write_scope(ancestor.join("x"));
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_write_root_file_stays_file_only() {
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    assert_file_only_write_scope(PathBuf::from("/x"));
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_write_root_level_folder_stays_file_only() {
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    assert_file_only_write_scope(crate::access_policy::policy_path(Path::new("/usr")).join("x"));
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_write_system_folder_stays_file_only() {
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
+    assert_file_only_write_scope(crate::access_policy::policy_path(Path::new("/etc/hosts")));
 }
 
 #[test]
@@ -1521,7 +1694,7 @@ fn consent_scope_nested_file_still_offers_directory() {
     let parent = dir.path().join("nested/src");
     std::fs::create_dir_all(&parent).unwrap();
     let parent = crate::access_policy::policy_path(&parent);
-    let scope = read_directory_scope(&AccessGrant {
+    let scope = directory_scope(&AccessGrant {
         path: parent.join("lib.rs"),
         kind: GrantKind::File,
         operation: AccessOperation::Read,
@@ -1611,7 +1784,7 @@ fn consent_scope_four_concurrent_cards_share_directory_probe() {
         let probes = Arc::clone(&probes);
         std::thread::spawn(move || {
             barrier.wait();
-            let scope = read_directory_scope_with(&grant, move |directory, root| {
+            let scope = directory_scope_with(&grant, move |directory, root| {
                 if directory.ancestors().last() == Some(root) {
                     probes.fetch_add(1, Ordering::SeqCst);
                     // Keep the first probe open while sibling requests arrive.
@@ -1664,7 +1837,7 @@ fn consent_scope_sibling_card_reuses_memoized_probe() {
     let mut previous_count = 0;
     for name in ["first.txt", "sibling.txt"] {
         let counter = Arc::clone(&probes);
-        let scope = read_directory_scope_with(
+        let scope = directory_scope_with(
             &AccessGrant {
                 path: parent.join(name),
                 kind: GrantKind::File,
@@ -1707,7 +1880,7 @@ fn consent_scope_unknown_alias_answer_is_not_memoized() {
         };
         let counter = Arc::clone(&probes);
         assert_eq!(
-            read_directory_scope_with(&grant, move |_, _| {
+            directory_scope_with(&grant, move |_, _| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 None
             }),
@@ -1744,7 +1917,7 @@ fn consent_scope_memo_expires_and_unsafe_answers_keep_each_file() {
         operation: AccessOperation::Read,
     };
     assert_eq!(
-        read_directory_scope_with(&grant, |_, _| Some(false)).kind,
+        directory_scope_with(&grant, |_, _| Some(false)).kind,
         GrantKind::Subtree
     );
     let probe = Arc::clone(&DIRECTORY_SCOPE_PROBES.lock().unwrap().probes[&parent]);
@@ -1754,7 +1927,7 @@ fn consent_scope_memo_expires_and_unsafe_answers_keep_each_file() {
         ..grant
     };
     assert_eq!(
-        read_directory_scope_with(&sibling, |_, _| Some(true)),
+        directory_scope_with(&sibling, |_, _| Some(true)),
         sibling,
         "an expired safe answer must not hide a newly unsafe alias"
     );
@@ -1763,7 +1936,7 @@ fn consent_scope_memo_expires_and_unsafe_answers_keep_each_file() {
         ..sibling
     };
     assert_eq!(
-        read_directory_scope_with(&other, |_, _| panic!("unsafe answer should be memoized")),
+        directory_scope_with(&other, |_, _| panic!("unsafe answer should be memoized")),
         other,
         "a memoized file-only answer must keep the current caller's file"
     );
@@ -1782,7 +1955,7 @@ fn consent_scope_waits_for_other_directory_probe_permit() {
         std::thread::sleep(Duration::from_millis(75));
         drop(permit);
     });
-    let scope = read_directory_scope_with(
+    let scope = directory_scope_with(
         &AccessGrant {
             path: parent.join("file.txt"),
             kind: GrantKind::File,
@@ -1816,7 +1989,7 @@ async fn consent_scope_timed_out_probe_is_not_memoized() {
     let release_rx = std::sync::Mutex::new(release_rx);
     let first = grant.clone();
     let scope = tokio::task::spawn_blocking(move || {
-        read_directory_scope_with(&first, move |_, _| {
+        directory_scope_with(&first, move |_, _| {
             if counter.fetch_add(1, Ordering::SeqCst) == 0 {
                 release_rx.lock().unwrap().recv().unwrap();
             }
@@ -1835,7 +2008,7 @@ async fn consent_scope_timed_out_probe_is_not_memoized() {
         path: parent.join("sibling.txt"),
         ..grant
     };
-    let scope = read_directory_scope_with(&sibling, move |_, _| {
+    let scope = directory_scope_with(&sibling, move |_, _| {
         counter.fetch_add(1, Ordering::SeqCst);
         Some(false)
     });
@@ -1897,8 +2070,7 @@ fn consent_stalled_root_alias_scan_is_single_flight_and_fails_closed() {
 
     let first_check = Arc::clone(&root_alias_check);
     let started_at = Instant::now();
-    let first =
-        read_directory_scope_with(&grant, move |directory, root| first_check(directory, root));
+    let first = directory_scope_with(&grant, move |directory, root| first_check(directory, root));
     started_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("the dedicated root-alias helper started");
@@ -1911,7 +2083,7 @@ fn consent_stalled_root_alias_scan_is_single_flight_and_fails_closed() {
             let grant = grant.clone();
             let check = Arc::clone(&root_alias_check);
             std::thread::spawn(move || {
-                read_directory_scope_with(&grant, move |directory, root| check(directory, root))
+                directory_scope_with(&grant, move |directory, root| check(directory, root))
             })
         })
         .collect::<Vec<_>>();
@@ -1952,8 +2124,7 @@ fn consent_stalled_root_alias_scan_is_single_flight_and_fails_closed() {
     }
 
     let next_check = Arc::clone(&root_alias_check);
-    let next =
-        read_directory_scope_with(&grant, move |directory, root| next_check(directory, root));
+    let next = directory_scope_with(&grant, move |directory, root| next_check(directory, root));
     assert_eq!(next.kind, GrantKind::Subtree);
     assert!(scan_count.load(Ordering::SeqCst) >= 2);
 }
@@ -2070,17 +2241,25 @@ async fn consent_scope_reconstruction_checks_kind_and_operation() {
     .unwrap() else {
         panic!("expected a directory scope card");
     };
-    assert_eq!(advertised_scope(&prep), Some(directory));
+    assert_eq!(advertised_scope(&prep), Some(directory.clone()));
     let mut mismatched = prep.clone();
     mismatched.request["kind"] = json!("command");
     assert_eq!(advertised_scope(&mismatched), None);
     let mut mismatched = prep.clone();
     mismatched.request["operation"] = json!("write");
     assert_eq!(advertised_scope(&mismatched), None);
-    let mut mismatched = prep.clone();
-    mismatched.grant.operation = AccessOperation::Write;
-    mismatched.request["operation"] = json!("write");
-    assert_eq!(advertised_scope(&mismatched), None);
+    // A write file card may advertise its directory too, and settling it
+    // stores a write directory grant, never a read one.
+    let mut write = prep.clone();
+    write.grant.operation = AccessOperation::Write;
+    write.request["operation"] = json!("write");
+    assert_eq!(
+        advertised_scope(&write),
+        Some(AccessGrant {
+            operation: AccessOperation::Write,
+            ..directory
+        })
+    );
     let mut mismatched = prep;
     mismatched.grant.kind = GrantKind::Subtree;
     assert_eq!(advertised_scope(&mismatched), None);
@@ -2679,6 +2858,94 @@ async fn standalone_untrusted_reverse_asks_then_reads_once_without_cingulate() {
         .unwrap()
         .unwrap();
     assert_eq!(ask.header.ty, FrameType::Request, "a later call asks again");
+    f.connection_cancel.cancel();
+}
+
+fn write_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
+    crate::commands::write::handle_write(&request, ctx)
+}
+
+/// An MCP app's own approval dialog may approve one outside-project write.
+/// The dialog offers no folder choice and the approval covers only this call:
+/// nothing is saved as a standing grant, so a second write in the same folder
+/// asks again.
+#[tokio::test]
+async fn standalone_untrusted_reverse_asks_then_writes_once_without_cingulate() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let target = f.head_root.join("written.txt");
+    let mut route = identity(&f.worker.project_root, None);
+    let inner = Arc::get_mut(&mut route.0).unwrap();
+    inner.trust = BindTrust::Untrusted;
+    inner.consumer_elicitation_capable = true;
+    let (writer, mut replies) = f
+        .send_tool_with_writer(
+            &route,
+            "write",
+            json!({"path": target, "content": "approved outside write\n"}),
+            30,
+            write_dispatch,
+        )
+        .await;
+    let ask = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ask.header.ty, FrameType::Request);
+    let body: Value = serde_json::from_slice(&ask.body).unwrap();
+    assert_eq!(body["method"], BASH_ELICITATION_CREATE_METHOD);
+    assert_eq!(body["params"]["_meta"]["aft"]["tool"], "write");
+    assert_eq!(
+        body["params"]["_meta"]["aft"]["asks"],
+        json!([{"kind": "external_directory", "path": target, "operation": "write"}])
+    );
+    assert!(
+        body["params"]["message"]
+            .as_str()
+            .is_some_and(|message| message.ends_with(" once?")),
+        "{body}"
+    );
+    assert!(!target.exists(), "nothing is written before the answer");
+    assert!(standalone::reply(&writer, &allow_frame(&ask)));
+    let result = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.header.ty, FrameType::Response);
+    let result: Value = serde_json::from_slice(&result.body).unwrap();
+    assert_ne!(result["isError"], json!(true), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "approved outside write\n"
+    );
+    assert!(f.fake.calls("consent.request").is_empty());
+    assert!(f.worker_grants().is_empty());
+
+    let second = f.head_root.join("second.txt");
+    let (_writer, mut again) = f
+        .send_tool_with_writer(
+            &route,
+            "write",
+            json!({"path": second, "content": "unapproved\n"}),
+            31,
+            write_dispatch,
+        )
+        .await;
+    let ask = tokio::time::timeout(Duration::from_secs(10), again.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ask.header.ty,
+        FrameType::Request,
+        "a later write asks again"
+    );
+    let body: Value = serde_json::from_slice(&ask.body).unwrap();
+    assert_eq!(
+        body["params"]["_meta"]["aft"]["asks"][0]["path"],
+        json!(second)
+    );
+    assert!(!second.exists());
     f.connection_cancel.cancel();
 }
 
