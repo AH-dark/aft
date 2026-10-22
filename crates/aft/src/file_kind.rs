@@ -286,7 +286,10 @@ impl FileKindCache {
 /// The kind a file name alone decides (lockfile names, minified and
 /// source-map suffixes, generated path shapes, log and capture names), or
 /// `None` when only content can tell. `relative` is the project-relative path, or
-/// `None` for a file outside the project, whose folders never decide a kind.
+/// `None` for a file outside the project (or one whose spelling could not be
+/// matched to the root), whose folders never decide a kind: its generated
+/// shape is then judged on the file name alone (`api_pb.ts`,
+/// `types.generated.ts`).
 fn classify_by_name(
     relative: Option<&Path>,
     file_name: &str,
@@ -320,7 +323,7 @@ fn classify_by_name(
     {
         return Some((ContentKind::Generated, Some(*suffix)));
     }
-    if relative.is_some_and(path_has_generated_shape) {
+    if path_has_generated_shape(relative.unwrap_or(Path::new(file_name))) {
         return Some((ContentKind::Generated, None));
     }
 
@@ -565,17 +568,29 @@ pub(crate) fn relative_shape_is_generated(project_root: &Path, path: &Path) -> b
     relative_within(project_root, path).is_some_and(|relative| path_has_generated_shape(&relative))
 }
 
-/// The part of `path` below `project_root`; a relative `path` is returned
-/// as is. On Windows the root and the path can arrive in different
+/// The part of `path` below `project_root`, or `None` when `path` is not
+/// under it. A plainly relative `path` (no root, no drive) is taken as
+/// already relative to the root and returned as is.
+///
+/// The prefix match is tried first whatever the spelling, because on Windows
+/// a path such as `/home/gen/project/src/main.rs` has a root but no drive, so
+/// `Path::is_absolute` calls it relative even though it names folders above
+/// the project. On Windows the root and the path can also arrive in different
 /// spellings (`\\?\C:\...` from canonicalization versus `C:\...`), so a
-/// failed prefix match is retried on normalized copies before the path is
-/// treated as outside the root.
+/// failed prefix match is retried on normalized copies. A rooted path that
+/// still does not match (a Windows short-name alias such as `PROJEC~1`, or a
+/// path on another drive) is outside the
+/// root: callers then decide by the file name alone and never by folder
+/// names that may lie above the project.
 fn relative_within(project_root: &Path, path: &Path) -> Option<std::path::PathBuf> {
-    if !path.is_absolute() {
-        return Some(path.to_path_buf());
-    }
     if let Ok(relative) = path.strip_prefix(project_root) {
         return Some(relative.to_path_buf());
+    }
+    let rooted = path
+        .components()
+        .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir));
+    if !rooted {
+        return Some(path.to_path_buf());
     }
     #[cfg(windows)]
     {
@@ -775,6 +790,68 @@ mod tests {
             Some(b"fn main() {}\n".as_slice()),
         );
         assert_eq!(kind.content, ContentKind::Text);
+    }
+
+    #[test]
+    fn file_kind_path_outside_the_root_is_decided_by_its_file_name() {
+        // A file the root does not contain: its folders (`gen/`) never
+        // decide, but a generated file name still does.
+        let root = Path::new("/project");
+        let text = b"fn main() {}\n".as_slice();
+        let kind = classify(root, Path::new("/elsewhere/gen/main.rs"), Some(text));
+        assert_eq!(kind.content, ContentKind::Text);
+        let kind = classify(root, Path::new("/elsewhere/gen/api_pb.ts"), Some(text));
+        assert_eq!(kind.content, ContentKind::Generated);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_kind_windows_folders_above_the_root_never_decide() {
+        let text = b"fn main() {}\n".as_slice();
+        let content =
+            |root: &str, path: &str| classify(Path::new(root), Path::new(path), Some(text)).content;
+        // Drive-letter root and file.
+        let root = r"C:\Users\gen\project";
+        assert_eq!(
+            content(root, r"C:\Users\gen\project\src\main.rs"),
+            ContentKind::Text
+        );
+        assert_eq!(
+            content(root, r"C:\Users\gen\project\src\generated\types.ts"),
+            ContentKind::Generated
+        );
+        // A `\\?\`-prefixed root (the form Windows canonicalization returns)
+        // with a plainly spelled file.
+        let verbatim = r"\\?\C:\Users\gen\project";
+        assert_eq!(
+            content(verbatim, r"C:\Users\gen\project\src\main.rs"),
+            ContentKind::Text
+        );
+        assert_eq!(
+            content(verbatim, r"C:\Users\gen\project\gen\schema.ts"),
+            ContentKind::Generated
+        );
+        // A root with no drive letter, which `Path::is_absolute` calls
+        // relative on Windows.
+        assert_eq!(
+            content(r"\home\gen\project", r"\home\gen\project\src\main.rs"),
+            ContentKind::Text
+        );
+        // A file whose spelling cannot be matched to the root (no drive
+        // letter, or a Windows short-name folder alias such as `PROJEC~1`): only
+        // its file name decides.
+        assert_eq!(
+            content(root, r"\Users\gen\project\src\main.rs"),
+            ContentKind::Text
+        );
+        assert_eq!(
+            content(root, r"C:\Users\gen\PROJEC~1\src\main.rs"),
+            ContentKind::Text
+        );
+        assert_eq!(
+            content(root, r"C:\Users\gen\PROJEC~1\src\api_pb.ts"),
+            ContentKind::Generated
+        );
     }
 
     #[test]

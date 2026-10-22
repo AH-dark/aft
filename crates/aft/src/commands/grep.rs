@@ -1202,7 +1202,10 @@ fn counted_entries(
     // `<folder>/*<shared suffix>`.
     let mut by_folder: Vec<((ContentKind, String, Option<&'static str>), Vec<usize>)> = Vec::new();
     for index in singles {
-        let display = &files[index].display;
+        // The folder goes into an `include` glob, which grep matches against
+        // the `/`-separated relative path; a Windows `\` would be read as a
+        // literal character and select nothing.
+        let display = include_glob_form(&files[index].display);
         let folder = display
             .rsplit_once('/')
             .map(|(folder, _)| folder.to_string())
@@ -1311,6 +1314,18 @@ fn folded_include_candidates(content: ContentKind, marker: Option<&'static str>)
         vec![format!("**/{marker}")]
     } else {
         vec![format!("**/*{marker}*")]
+    }
+}
+
+/// `display` spelled the way `include` globs are matched: grep compares an
+/// `include` against the project-relative path with `/` separators, while
+/// Windows prints paths with `\`. Elsewhere `\` can be part of a file name,
+/// so the path is left as it is.
+fn include_glob_form(display: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) {
+        std::borrow::Cow::Owned(display.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(display)
     }
 }
 

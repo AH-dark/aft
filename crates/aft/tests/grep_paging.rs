@@ -316,6 +316,8 @@ fn numbered_lines(count: usize, text: &str) -> String {
 }
 
 /// Rows printed under a file header: `(header, line)` pairs in text order.
+/// Headers are returned with `/` separators: grep prints paths with the
+/// platform's separator (`\` on Windows), and the tests name files with `/`.
 fn printed_rows(text: &str) -> Vec<(String, u32)> {
     let mut rows = Vec::new();
     let mut header: Option<String> = None;
@@ -331,10 +333,17 @@ fn printed_rows(text: &str) -> Vec<(String, u32)> {
             }
         }
         if header.is_none() {
-            header = Some(line.to_string());
+            header = Some(slashed(line));
         }
     }
     rows
+}
+
+/// `text` with Windows `\` separators written as `/`, so the paths grep
+/// prints compare equal to the `/`-spelled paths the tests expect on every
+/// platform.
+fn slashed(text: &str) -> String {
+    text.replace('\\', "/")
 }
 
 /// `(file, line)` of every row in the JSON page, in page order.
@@ -368,6 +377,7 @@ fn grep_counts_lockfile_lines_and_names_the_path() {
     let ctx = grep_ctx(project.path());
 
     let (data, text) = run_grep(&ctx, serde_json::json!({"pattern": "sha512"}));
+    let text = slashed(&text);
     let rows = printed_rows(&text);
     assert_eq!(
         rows,
@@ -541,7 +551,7 @@ fn grep_include_marker_targets_logs() {
         serde_json::json!({"pattern": "needle", "include": "**/*"}),
     );
     assert!(
-        text.contains("runs/run.log: 20 lines (log or command output)"),
+        slashed(&text).contains("runs/run.log: 20 lines (log or command output)"),
         "text:\n{text}"
     );
 }
@@ -561,6 +571,7 @@ fn grep_folder_path_does_not_target_captures() {
         &ctx,
         serde_json::json!({"pattern": "needle", "path": project.path().join("research").to_string_lossy()}),
     );
+    let text = slashed(&text);
     assert_eq!(
         printed_rows(&text),
         vec![("research/README.md".to_string(), 1)],
@@ -650,6 +661,10 @@ fn grep_small_result_prints_whole() {
     let ctx = grep_ctx(project.path());
 
     let (_, text) = run_grep(&ctx, serde_json::json!({"pattern": "needle"}));
+    // grep prints paths with the platform's separator.
+    #[cfg(windows)]
+    assert!(text.starts_with("src\\a.rs\n"), "text:\n{text}");
+    let text = slashed(&text);
     let rows_and_footer = text
         .split_once("\n\nFound ")
         .map(|(rows, _)| rows)
@@ -688,6 +703,42 @@ fn counted_hints(text: &str) -> Vec<String> {
     hints
 }
 
+/// Files whose lines grep prints when each counted-only hint in `text` is
+/// passed back the way the block says: a path as `path`, a pattern as
+/// `include`. The hints are passed exactly as printed, so a hint spelled in a
+/// form grep cannot take back (for example a `\` path in an include glob on
+/// Windows) shows nothing and fails here. Returned paths use `/`.
+fn files_shown_by_hints(
+    ctx: &aft::context::AppContext,
+    text: &str,
+) -> std::collections::BTreeSet<String> {
+    let mut reached = std::collections::BTreeSet::new();
+    for hint in counted_hints(text) {
+        let params = if let Some(value) = hint
+            .strip_prefix("label:")
+            .or_else(|| hint.strip_prefix("path:"))
+        {
+            if value.contains(['*', '?', '[', '{']) {
+                serde_json::json!({"pattern": "needle", "include": value})
+            } else {
+                serde_json::json!({"pattern": "needle", "path": value})
+            }
+        } else if let Some(include) = hint.strip_prefix("include:") {
+            serde_json::json!({"pattern": "needle", "include": include})
+        } else {
+            panic!("folded row without a way to show it: {hint}\n{text}");
+        };
+        let (_, shown) = run_grep(ctx, params);
+        let files: std::collections::BTreeSet<String> = printed_rows(&shown)
+            .into_iter()
+            .map(|(file, _)| file)
+            .collect();
+        assert!(!files.is_empty(), "{hint} shows nothing:\n{shown}");
+        reached.extend(files);
+    }
+    reached
+}
+
 #[test]
 fn grep_folded_counted_rows_name_every_file() {
     // Nine generated files (decided by their folder, so no include pattern
@@ -710,7 +761,7 @@ fn grep_folded_counted_rows_name_every_file() {
     );
     for index in 0..9 {
         assert!(
-            text.contains(&format!("pkg{index}/generated/api_{index}.ts")),
+            slashed(&text).contains(&format!("pkg{index}/generated/api_{index}.ts")),
             "generated file {index} has no path to show it:\n{text}"
         );
     }
@@ -720,6 +771,11 @@ fn grep_folded_counted_rows_name_every_file() {
             .all(|hint| !hint.starts_with("bare:")),
         "a folded row has no path or include:\n{text}"
     );
+    let reached = files_shown_by_hints(&ctx, &text);
+    for index in 0..9 {
+        let file = format!("pkg{index}/generated/api_{index}.ts");
+        assert!(reached.contains(&file), "{file} is not reachable:\n{text}");
+    }
 }
 
 #[test]
@@ -738,33 +794,43 @@ fn grep_folded_counted_include_selects_the_folded_files() {
     let ctx = grep_ctx(project.path());
 
     let (_, text) = run_grep(&ctx, serde_json::json!({"pattern": "needle"}));
-    let mut reached = std::collections::BTreeSet::new();
-    for hint in counted_hints(&text) {
-        if let Some(label) = hint
-            .strip_prefix("label:")
-            .or_else(|| hint.strip_prefix("path:"))
-        {
-            reached.insert(label.to_string());
-        } else if let Some(include) = hint.strip_prefix("include:") {
-            let (_, shown) = run_grep(
-                &ctx,
-                serde_json::json!({"pattern": "needle", "include": include}),
-            );
-            let files: std::collections::BTreeSet<String> = printed_rows(&shown)
-                .into_iter()
-                .map(|(file, _)| file)
-                .collect();
-            assert!(
-                !files.is_empty(),
-                "include {include} selects nothing:\n{shown}"
-            );
-            reached.extend(files);
-        } else {
-            panic!("folded row without a way to show it: {hint}\n{text}");
-        }
-    }
+    assert!(
+        counted_hints(&text)
+            .iter()
+            .any(|hint| hint.starts_with("include:")),
+        "no folded include row:\n{text}"
+    );
+    let reached = files_shown_by_hints(&ctx, &text);
     for index in 0..9 {
         let log = format!("logs/r{index}/app{index}.log.1");
         assert!(reached.contains(&log), "{log} is not reachable:\n{text}");
+    }
+}
+
+#[test]
+fn grep_counted_folder_include_selects_its_files() {
+    // Two JSON-lines captures in one nested folder fold to one
+    // `<folder>/*<suffix>` include row; it must select them when passed back,
+    // whatever separator the platform prints paths with.
+    let project = tempfile::tempdir().expect("tempdir");
+    for name in ["a", "b"] {
+        write_file(
+            project.path(),
+            &format!("runs/day1/{name}.jsonl"),
+            &numbered_lines(20, "needle record"),
+        );
+    }
+    write_file(project.path(), "src/main.ts", "needle main\n");
+    let ctx = grep_ctx(project.path());
+
+    let (_, text) = run_grep(&ctx, serde_json::json!({"pattern": "needle"}));
+    assert!(
+        text.contains("runs/day1/*.jsonl: 40 lines in 2 files (log or command output)"),
+        "text:\n{text}"
+    );
+    let reached = files_shown_by_hints(&ctx, &text);
+    for name in ["a", "b"] {
+        let file = format!("runs/day1/{name}.jsonl");
+        assert!(reached.contains(&file), "{file} is not reachable:\n{text}");
     }
 }
