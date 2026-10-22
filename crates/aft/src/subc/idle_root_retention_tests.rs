@@ -490,3 +490,135 @@ fn evicted_worked_roots_keep_only_bookkeeping() {
         );
     }
 }
+
+/// Make output that the builtin `make` filter rewrites: its directory lines
+/// are stripped.
+const MAKE_OUTPUT: &str =
+    "make: Entering directory '/work'\ncc -o app main.c\nmake: Leaving directory '/work'\n";
+
+/// A root's background task output must compress the same before and after
+/// the root is evicted for idleness. A running task keeps the root from
+/// being evicted at all; once it has finished, the root can be evicted, and
+/// a later render of the finished task's output still goes through the
+/// root's filters.
+#[cfg(unix)]
+#[test]
+fn background_task_output_compresses_the_same_after_idle_eviction() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let root = ProjectRootId::from_path(project.path()).unwrap();
+    let mut config = Config {
+        project_root: Some(root.as_path().to_path_buf()),
+        storage_dir: Some(storage.path().to_path_buf()),
+        experimental_bash_background: true,
+        experimental_bash_compress: true,
+        ..Config::default()
+    };
+    config.sandbox.profile.head = crate::config::SandboxMode::Off;
+    let ctx = Arc::new(AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        config,
+    ));
+    install_bash_compressor(&ctx);
+    // Configure compiles the filters eagerly.
+    ctx.reset_filter_registry();
+    let compress = |ctx: &AppContext| {
+        ctx.bash_background()
+            .compress_output("make", MAKE_OUTPUT.to_string(), Some(0))
+            .text
+    };
+    let before = compress(&ctx);
+    assert_ne!(
+        before, MAKE_OUTPUT,
+        "the make filter must change this output"
+    );
+
+    let executor = Arc::new(Executor::new());
+    assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+    let launched = crate::bash_background::spawn(
+        "req-idle-eviction",
+        SESSION,
+        "sleep 1",
+        crate::bash_background::BashShell::Bash,
+        PathBuf::from("/bin/sh"),
+        None,
+        None,
+        crate::bash_background::HardKill::After(Duration::from_secs(60)),
+        &ctx,
+        true,
+        false,
+        false,
+        false,
+        24,
+        80,
+        Vec::new(),
+        false,
+        None,
+        None,
+    );
+    assert!(launched.success, "launch failed: {:?}", launched.data);
+    let task_id = launched.data["task_id"].as_str().unwrap().to_string();
+
+    let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+    quiesce_unbound_root(&root, &mut live_roots, &executor);
+    live_roots.get_mut(&root).unwrap().last_touched =
+        Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
+    let metrics = DispatchPathMetrics::new();
+    let reap = |live_roots: &mut HashMap<ProjectRootId, RootMeta>| {
+        reap_idle_roots(
+            Instant::now(),
+            live_roots,
+            &HashMap::new(),
+            &HashMap::new(),
+            &executor,
+            &metrics,
+        )
+        .evicted
+    };
+    assert_eq!(reap(&mut live_roots), 0, "a running task holds the root");
+    assert!(ctx.filter_registry_loaded());
+
+    // Let the task finish, then evict.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let snapshot = ctx
+            .bash_background()
+            .observed_status(&task_id, SESSION, 4096)
+            .expect("task is registered");
+        if snapshot.info.status.is_terminal()
+            && ctx.bash_background().try_has_running_tasks() == Some(false)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the task never finished");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The background release takes the embedding model in the same step
+    // that decides about the filters, so its absence marks the release done.
+    let mut semantic = ctx.config().semantic.clone();
+    semantic.backend = crate::config::SemanticBackend::OpenAiCompatible;
+    semantic.base_url = Some("http://127.0.0.1:9".to_string());
+    *ctx.semantic_embedding_model().lock() = Some(
+        crate::semantic_index::EmbeddingModel::from_config(&semantic).expect("embedding model"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !live_roots[&root].idle_artifacts_evicted {
+        assert!(
+            Instant::now() < deadline,
+            "the finished root was not evicted"
+        );
+        reap(&mut live_roots);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ctx.semantic_embedding_model().lock().is_some() {
+        assert!(Instant::now() < deadline, "the idle release never ran");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(
+        compress(&ctx),
+        before,
+        "the finished task's output must compress as it did before eviction"
+    );
+}

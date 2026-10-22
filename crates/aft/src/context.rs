@@ -13278,7 +13278,14 @@ impl AppContext {
                     .semantic_embedding_model
                     .try_lock()
                     .and_then(|mut model| model.take());
-                (watches, model, ctx.take_filter_registry())
+                // Background task output is compressed through the shared
+                // filter handle, which cannot load a released registry. A
+                // root that still holds task records keeps its filters, so a
+                // later render of that output compresses exactly as it would
+                // have without the eviction.
+                let filters =
+                    (!ctx.bash_background.has_task_records()).then(|| ctx.take_filter_registry());
+                (watches, model, filters)
             });
             // Dropped after the lifecycle check releases, so their shutdown
             // never holds up a rebind.

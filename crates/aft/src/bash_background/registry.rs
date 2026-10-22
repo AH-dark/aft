@@ -9359,6 +9359,18 @@ impl BgTaskRegistry {
 
     /// Whether any task is still under watch, without waiting: `None` when
     /// the watch map is locked by another thread right now.
+    /// Whether the registry still holds any task record, running or
+    /// finished. A finished task's output can be compressed again later (a
+    /// render that has to be redone, or a completion re-masked for changed
+    /// secrets), so its root keeps what that compression needs.
+    pub(crate) fn has_task_records(&self) -> bool {
+        self.inner
+            .tasks
+            .lock()
+            .map(|tasks| !tasks.is_empty())
+            .unwrap_or(true)
+    }
+
     pub(crate) fn try_has_running_tasks(&self) -> Option<bool> {
         match self.inner.watchdog_tasks.try_lock() {
             Ok(tasks) => Some(!tasks.is_empty()),
