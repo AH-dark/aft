@@ -1014,23 +1014,6 @@ jobs:
         env:
           CARGO_TERM_COLOR: never
 
-      - name: Bash reply timeout contract (test-timing-hooks)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo --version
-          test_name="bash_reply_timing_contract_test::subc_promoted_foreground_is_killed_at_its_timeout"
-          if ! listing="$(cargo test --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --list 2>&1)"; then
-            printf '%s\n' "$listing" >&2
-            exit 1
-          fi
-          printf '%s\n' "$listing"
-          if [[ "$listing" != *"$test_name: test"* ]]; then
-            printf 'expected test missing from integration inventory: %s\n' "$test_name" >&2
-            exit 1
-          fi
-          cargo test --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --exact
-
       - name: Rust watcher gate (macOS)
         # Keep FSEvents tests serial because they share fixtures and exercise
         # the platform watcher backend that the other shards exclude.
@@ -1128,6 +1111,23 @@ jobs:
           AFT_TEST_DIAG: "1"
           AFT_GATE_PHASES: conformance
           AFT_GATE_SKIP_RELEASE_STORM: "1"
+
+      - name: Bash reply timeout contract (test-timing-hooks)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --version
+          test_name="bash_reply_timing_contract_test::subc_promoted_foreground_is_killed_at_its_timeout"
+          if ! listing="$(cargo test --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --list 2>&1)"; then
+            printf '%s\n' "$listing" >&2
+            exit 1
+          fi
+          printf '%s\n' "$listing"
+          if [[ "$listing" != *"$test_name: test"* ]]; then
+            printf 'expected test missing from integration inventory: %s\n' "$test_name" >&2
+            exit 1
+          fi
+          cargo test --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --exact
 
       - name: Fetch pinned subc-core
         id: subc_core
