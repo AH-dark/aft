@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "recorded_on": "b7cf5a957a80538beccc210a0b1f25c4d7f392ef",
+  "platform": "linux-x86_64",
+  "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "command": "python3 scripts/views-performance-gate.py --rowid-layout --output .cortexkit/internal-docs/investigations/slice-3b-baseline-corrected",
+  "note": "Recorded before production layout changes. The first acquisition used the logical WITHOUT ROWID autoindex name for dbstat (not its physical btree); this corrected acquisition measures blob_payloads itself.",
+  "composition": "Authorized composition of ffbbea3e0 digest SELECT and 256 probes with its shared-31-byte-prefix fixture: [7;32], final byte 0..63 repeated four times, 128 hits and 128 misses. Payloads repeat pinned Cargo.lock to 1 MiB; 32 rows inserted in final-byte order. This is not the external real-snapshot materialization experiment mentioned in that commit.",
+  "corpus": {
+    "repository": "https://github.com/cortexkit/aft.git",
+    "commit": "05d40ac417db6137a4204521bd3c59853325e968",
+    "path": "Cargo.lock",
+    "payload_bytes": 139480,
+    "payload_sha256": "244d8a4473686e84ad152013782711197ab09c7ecc09e82fe94c73d2ac5464be",
+    "row_bytes": 1048576,
+    "rows": 32
+  },
+  "layout_tag": 1,
+  "sqlite_version": "3.46.0",
+  "sqlite_source_id": "2024-05-23 13:25:27 96c92aba00c8375bc32fafcdf12429c58bd8aabfcadab6683e35bbb9cdebf19e",
+  "statement": "SELECT payload_digest FROM blob_payloads WHERE full_key = ?1",
+  "probes_per_batch": 256,
+  "present_probes": 128,
+  "absent_probes": 128,
+  "discarded_warmup_batches": 1,
+  "batches": [
+    {"cpu_ns":105063059,"full_scan_steps":0,"vm_steps":2176,"wall_ns":105059233},
+    {"cpu_ns":111046149,"full_scan_steps":0,"vm_steps":2176,"wall_ns":111042805},
+    {"cpu_ns":104272828,"full_scan_steps":0,"vm_steps":2176,"wall_ns":104270009},
+    {"cpu_ns":101756273,"full_scan_steps":0,"vm_steps":2176,"wall_ns":101759900},
+    {"cpu_ns":103098318,"full_scan_steps":0,"vm_steps":2176,"wall_ns":103106216},
+    {"cpu_ns":103798980,"full_scan_steps":0,"vm_steps":2176,"wall_ns":103795613},
+    {"cpu_ns":102814517,"full_scan_steps":0,"vm_steps":2176,"wall_ns":102822275},
+    {"cpu_ns":101007159,"full_scan_steps":0,"vm_steps":2176,"wall_ns":101004309},
+    {"cpu_ns":99723384,"full_scan_steps":0,"vm_steps":2176,"wall_ns":99844351},
+    {"cpu_ns":99905255,"full_scan_steps":0,"vm_steps":2176,"wall_ns":99914622},
+    {"cpu_ns":103473712,"full_scan_steps":0,"vm_steps":2176,"wall_ns":103514760}
+  ],
+  "median_wall_ns": 103106216,
+  "locator_index": "blob_payloads",
+  "locator_overflow_pages": 8224
+}
