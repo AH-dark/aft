@@ -6176,35 +6176,251 @@ fn project_walk_builder_with_admission(
     crate::views::io::WORK
         .full_walks
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    project_walk_builder_pruned(search_root, excludes, |_| true)
+}
+
+/// The project walk with one more condition, `descend`, on every entry below
+/// the root. Every decision the walk makes about an entry it does visit is
+/// unchanged: the ignore rules, the excluded directories and the content
+/// exclusions are the same builder settings and the same entry predicate.
+/// Only the set of entries visited shrinks.
+fn project_walk_builder_pruned(
+    search_root: &Path,
+    excludes: fn(&Path, Option<&std::fs::FileType>) -> bool,
+    descend: impl Fn(&Path) -> bool + Send + Sync + 'static,
+) -> WalkBuilder {
     let mut builder = WalkBuilder::new(search_root);
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
     builder.same_file_system(true).hidden(false);
     crate::context::apply_project_ignore_rules(&mut builder, search_root).filter_entry(
-        move |entry| {
-            let file_type = entry.file_type();
-            if excludes(entry.path(), file_type.as_ref()) {
-                return false;
-            }
-            let name = entry.file_name().to_string_lossy();
-            if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
-                return !matches!(
-                    name.as_ref(),
-                    "node_modules"
-                        | "target"
-                        | "venv"
-                        | ".venv"
-                        | ".git"
-                        | "__pycache__"
-                        | ".tox"
-                        | "dist"
-                        | "build"
-                );
-            }
-            !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
-        },
+        move |entry| project_walk_admits_entry(entry, excludes) && descend(entry.path()),
     );
     builder
+}
+
+/// The membership rule the project walk applies to each entry on top of the
+/// ignore rules: content exclusions, skipped directory names and OS metadata
+/// files.
+fn project_walk_admits_entry(
+    entry: &ignore::DirEntry,
+    excludes: fn(&Path, Option<&std::fs::FileType>) -> bool,
+) -> bool {
+    let file_type = entry.file_type();
+    if excludes(entry.path(), file_type.as_ref()) {
+        return false;
+    }
+    let name = entry.file_name().to_string_lossy();
+    if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
+        return !matches!(
+            name.as_ref(),
+            "node_modules"
+                | "target"
+                | "venv"
+                | ".venv"
+                | ".git"
+                | "__pycache__"
+                | ".tox"
+                | "dist"
+                | "build"
+        );
+    }
+    !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
+}
+
+/// What `project_walk_lists` found: the files the walk lists, and the places
+/// it could not look.
+#[derive(Debug, Default)]
+pub(crate) struct ProjectWalkListing {
+    pub listed: BTreeSet<PathBuf>,
+    /// Paths the walk could not read (a directory it could not list, an
+    /// ignore file it could not read), with the error. Whether a file at or
+    /// under one of them is listed is unknown, not "no".
+    pub gaps: Vec<(PathBuf, String)>,
+}
+
+impl ProjectWalkListing {
+    /// The gap that leaves `file`'s listing unknown, if any.
+    pub(crate) fn gap_for(&self, file: &Path) -> Option<&(PathBuf, String)> {
+        self.gaps.iter().find(|(gap, _)| file.starts_with(gap))
+    }
+}
+
+/// The path an `ignore` walk error is about; `None` when it names none.
+fn walk_error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            walk_error_path(err)
+        }
+        ignore::Error::Loop { child, .. } => Some(child),
+        ignore::Error::Partial(errors) => errors.iter().find_map(walk_error_path),
+        _ => None,
+    }
+}
+
+/// Which of `files` (absolute paths under `root`, joined onto `root` as given)
+/// the project walk lists, without walking the rest of the project. It runs
+/// the same walk as `walk_project_files(root, &PathFilters::default())`,
+/// pruned to the directories that lead to `files`, so each answer is the
+/// walk's own decision: built-in skipped directories, content exclusions and
+/// every `.gitignore`/`.aftignore` from the root down to the file.
+///
+/// Unlike `walk_project_files`, which drops what it cannot read, this records
+/// walk errors as gaps: when a directory or ignore file on the way could not
+/// be read, the walk cannot tell whether a file beneath it would be listed.
+pub(crate) fn project_walk_lists(root: &Path, files: &BTreeSet<PathBuf>) -> ProjectWalkListing {
+    let mut listing = ProjectWalkListing::default();
+    if files.is_empty() {
+        return listing;
+    }
+    let leads_to_a_file = files
+        .iter()
+        .flat_map(|file| {
+            file.ancestors()
+                .take_while(|ancestor| ancestor.starts_with(root))
+                .map(Path::to_path_buf)
+        })
+        .collect::<HashSet<_>>();
+    let walk = project_walk_builder_pruned(
+        root,
+        crate::project_content::is_excluded_with_file_type,
+        move |path| leads_to_a_file.contains(path),
+    )
+    .build();
+    for item in walk {
+        let entry = match item {
+            Ok(entry) => entry,
+            Err(error) => {
+                let path = walk_error_path(&error).unwrap_or(root).to_path_buf();
+                listing.gaps.push((path, error.to_string()));
+                continue;
+            }
+        };
+        // An ignore file below this entry could not be read, so the rules
+        // for everything under it are unknown.
+        if let Some(error) = entry.error() {
+            listing
+                .gaps
+                .push((entry.path().to_path_buf(), error.to_string()));
+        }
+        if entry.file_type().is_some_and(|kind| kind.is_file()) && files.contains(entry.path()) {
+            listing.listed.insert(entry.into_path());
+        }
+    }
+    listing
+}
+
+/// `project_walk_lists` answers per file with the project walk's own rules,
+/// so it must agree with `walk_project_files` on every file of a tree.
+#[cfg(test)]
+mod project_walk_lists_tests {
+    use super::*;
+
+    fn every_file(dir: &Path, files: &mut BTreeSet<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                if entry.file_name() != ".git" {
+                    every_file(&entry.path(), files);
+                }
+            } else if kind.is_file() {
+                files.insert(entry.path());
+            }
+        }
+    }
+
+    /// A directory the walk cannot list is recorded as a gap naming it, so
+    /// files beneath it are unknown rather than classified as excluded.
+    #[cfg(unix)]
+    #[test]
+    fn project_walk_lists_reports_an_unlistable_directory_as_a_gap() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let locked = root.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("inner.py"), "x = 1\n").unwrap();
+        fs::write(root.join("open.py"), "x = 1\n").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o311)).unwrap();
+        let listable = fs::read_dir(&locked).is_ok();
+        let files = BTreeSet::from([locked.join("inner.py"), root.join("open.py")]);
+        let listing = project_walk_lists(&root, &files);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        if listable {
+            eprintln!("skipped: this process lists directories without read permission (root)");
+            return;
+        }
+        assert_eq!(listing.listed, BTreeSet::from([root.join("open.py")]));
+        let (gap, _) = listing
+            .gap_for(&locked.join("inner.py"))
+            .expect("unlistable directory reported as a gap");
+        assert_eq!(gap, &locked);
+        assert!(listing.gap_for(&root.join("open.py")).is_none());
+    }
+
+    #[test]
+    fn project_walk_lists_agrees_with_the_walk_on_every_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for git in [false, true] {
+            let root = root.join(if git { "git" } else { "plain" });
+            let files = [
+                (".gitignore", "ignored.py\n*.log\n/self-ignored/\n"),
+                (".aftignore", "aftignored.py\n/.aftignore\n"),
+                ("src/kept.py", "x = 1\n"),
+                ("src/trace.log", "log\n"),
+                ("ignored.py", "x = 1\n"),
+                ("aftignored.py", "x = 1\n"),
+                ("self-ignored/inner.py", "x = 1\n"),
+                ("dist/bundle.js", "var x;\n"),
+                ("build/out.js", "var x;\n"),
+                ("node_modules/pkg/index.js", "var x;\n"),
+                ("target/debug/gen.rs", "fn f() {}\n"),
+                ("pkg/__pycache__/m.py", "x = 1\n"),
+                ("pkg/.gitignore", "generated.py\n!keep.log\n"),
+                ("pkg/generated.py", "x = 1\n"),
+                ("pkg/keep.log", "log\n"),
+                ("pkg/kept.py", "x = 1\n"),
+                ("pkg/deep/generated.py", "x = 1\n"),
+                ("pkg/deep/.aftignore", "local.py\n"),
+                ("pkg/deep/local.py", "x = 1\n"),
+                ("pkg/deep/other.py", "x = 1\n"),
+                ("fixtures/data.db", "SQLite format 3\0"),
+                (".DS_Store", ""),
+            ];
+            for (relative, content) in files {
+                let path = root.join(relative);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, content).unwrap();
+            }
+            if git {
+                fs::create_dir_all(root.join(".git")).unwrap();
+            }
+            let walked = walk_project_files(&root, &PathFilters::default())
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let mut all = BTreeSet::new();
+            every_file(&root, &mut all);
+            assert_eq!(all.len(), files.len(), "fixture files: {all:?}");
+            // The fixture exercises both answers.
+            assert!(walked.contains(&root.join("pkg/deep/other.py")));
+            assert!(!walked.contains(&root.join("pkg/deep/local.py")));
+            for file in &all {
+                let listed = project_walk_lists(&root, &BTreeSet::from([file.clone()])).listed;
+                assert_eq!(
+                    listed.contains(file),
+                    walked.contains(file),
+                    "git={git} {}",
+                    file.display()
+                );
+            }
+            let listing = project_walk_lists(&root, &all);
+            assert!(listing.gaps.is_empty(), "git={git} {:?}", listing.gaps);
+            assert_eq!(listing.listed, walked, "git={git}");
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

@@ -884,13 +884,14 @@ pub struct ViewHealthSnapshot {
     pub pinned: bool,
     pub pending_paths: usize,
     pub failed_paths: usize,
-    /// Members published without one of their derived planes, by reason (for
-    /// example a source the call graph cannot decode). They count as neither
-    /// pending nor failed: the view is complete, and status names them so the
-    /// omission is visible.
+    /// Paths that ended without one of their derived planes, or outside the
+    /// generation, for a reason no retry changes, by reason (for example a
+    /// source the call graph cannot decode, or a HEAD entry with an
+    /// unsupported Git mode). They count as neither pending nor failed: the
+    /// view is complete, and status names them so the omission is visible.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub skipped_paths: BTreeMap<String, usize>,
-    /// Up to `path_status::SKIPPED_PATH_SAMPLE_CAP` skipped members, bytewise
+    /// Up to `path_status::SKIPPED_PATH_SAMPLE_CAP` skipped paths, bytewise
     /// ordered.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped_path_sample: Vec<ViewSkippedPath>,

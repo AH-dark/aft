@@ -48,7 +48,7 @@ pub struct AssemblyReport {
     pub published: bool,
 }
 
-/// A missing blob or unsupported tracked-file mode found while assembling a
+/// A missing blob or outstanding semantic work found while assembling a
 /// checkout generation. Retain this evidence so queries can explain what must
 /// arrive or change without reading the blob stores or checkout files again.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -70,6 +70,28 @@ struct Candidate {
 #[cfg(test)]
 thread_local! {
     static RETAINED_CANDIDATE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HEAD_REWRITE: std::cell::RefCell<Option<HeadRewrite>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+type HeadRewrite = Box<dyn FnOnce(&mut Vec<crate::alias::TrackedPath>)>;
+
+/// Applies `rewrite` to the HEAD listing the next assembly on this thread
+/// reads, so a test can add entries a real `git ls-tree` does not print, such
+/// as a non-canonical mode.
+#[cfg(test)]
+fn rewrite_next_head_for_test(rewrite: impl FnOnce(&mut Vec<crate::alias::TrackedPath>) + 'static) {
+    HEAD_REWRITE.with(|slot| *slot.borrow_mut() = Some(Box::new(rewrite)));
+}
+
+#[cfg(test)]
+fn rewrite_head_for_test(
+    mut head: Vec<crate::alias::TrackedPath>,
+) -> Vec<crate::alias::TrackedPath> {
+    if let Some(rewrite) = HEAD_REWRITE.with(|slot| slot.borrow_mut().take()) {
+        rewrite(&mut head);
+    }
+    head
 }
 
 pub fn head_tree_fingerprint(entries: &[crate::alias::TrackedPath]) -> String {
@@ -490,8 +512,17 @@ pub fn prepare_checkout_deferring(
     let mut semantic_pending_paths = BTreeSet::new();
     let mut pending_inputs = BTreeMap::new();
     let mut fresh_skips = Vec::new();
+    let mut unsupported_mode_paths = Vec::new();
+    // Members whose bytes this publication reads, as opposed to reusing the
+    // previous generation's entry for unchanged content.
+    let mut fresh_reads = std::collections::HashSet::new();
+    // What the semantic index would make of each member read here, worked out
+    // from the bytes in hand so classifying it later needs no second read.
+    let mut fresh_semantic_classes = std::collections::HashMap::new();
     let mut candidates = Vec::with_capacity(head.len());
 
+    #[cfg(test)]
+    let head = rewrite_head_for_test(head);
     for tracked in head {
         let rel_path = RelPath::new(tracked.rel_path.clone())?;
         let absolute = request
@@ -563,6 +594,13 @@ pub fn prepare_checkout_deferring(
                 let Some(source) = read_working_tree_file(&absolute)? else {
                     continue;
                 };
+                fresh_reads.insert(tracked.rel_path.clone());
+                if request.require_semantic
+                    && crate::semantic_index::is_semantic_indexed_extension(&absolute)
+                {
+                    fresh_semantic_classes
+                        .insert(tracked.rel_path.clone(), semantic_class_of_bytes(&source));
+                }
                 let resolution_input = is_resolution_input(&tracked.rel_path);
                 let language = if resolution_input {
                     Some("config".to_string())
@@ -632,16 +670,23 @@ pub fn prepare_checkout_deferring(
                     source: needs_source.then_some(source),
                 });
             }
-            GitMode::Other(_) => {
-                pending_inputs.insert(
-                    tracked.rel_path.clone(),
-                    PendingInput {
-                        plane: "membership",
-                        reason: "unsupported Git mode",
-                        blob_key: None,
-                    },
+            GitMode::Other(mode) => {
+                // Git's tree reader canonicalizes every entry mode before
+                // `git ls-tree` prints it (canon_mode in Git's tree-walk.c):
+                // to a regular file, symlink, directory (recursed into with
+                // -r, never printed) or submodule (160000, the Gitlink arm
+                // above). So no Git release is known to reach this arm. If one
+                // does, this assembler has no way to publish the entry: leave
+                // the path out with a recorded skip instead of holding back
+                // the whole generation for a mode no retry will change.
+                crate::slog_warn!(
+                    "content-addressed view publication skipped {} with unsupported Git mode {} root={}",
+                    String::from_utf8_lossy(&tracked.rel_path),
+                    String::from_utf8_lossy(&mode),
+                    request.project_root.display()
                 );
-                blocking_paths.insert(tracked.rel_path);
+                unsupported_mode_paths.push(tracked.rel_path.clone());
+                fresh_skips.push((tracked.rel_path, Some(SkipReason::UnsupportedGitMode)));
             }
         }
     }
@@ -650,29 +695,113 @@ pub fn prepare_checkout_deferring(
     profile.candidates = candidates.len();
     profile.assembly_ms = assembly_started.elapsed().as_millis();
 
+    let mut semantic_failures = Vec::new();
     if request.require_semantic {
+        // A member with no semantic key waits for the semantic index only if
+        // that index will ever key it. One it never reads (too large, not
+        // UTF-8, left out by the walk the index uses) is skipped instead, and
+        // one that cannot be read is failed; left pending, any of them would
+        // stay pending for as long as its content and the ignore rules hold.
+        let recorded_skips = status
+            .skip_reasons()
+            .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+        let excludes_semantic = |path: &[u8]| {
+            recorded_skips
+                .get(path)
+                .and_then(|reason| SkipReason::parse(reason))
+                .is_some_and(SkipReason::excludes_semantic)
+        };
+        let mut unexplained = BTreeMap::new();
         for candidate in &candidates {
-            let missing = matches!(
-                &candidate.entry,
-                ManifestEntry::Regular { planes, .. }
-                    if planes.semantic.is_none()
-                        && crate::semantic_index::is_semantic_indexed_extension(
-                            &request
-                                .project_root
-                                .join(path_from_bytes(candidate.path.as_bytes()))
-                        )
-            );
-            if missing {
-                pending_inputs.insert(
-                    candidate.path.as_bytes().to_vec(),
-                    PendingInput {
-                        plane: "semantic",
-                        reason: "shared semantic blob unavailable",
-                        blob_key: None,
-                    },
-                );
-                semantic_pending_paths.insert(candidate.path.as_bytes().to_vec());
+            let ManifestEntry::Regular { planes, .. } = &candidate.entry else {
+                continue;
+            };
+            let path = candidate.path.as_bytes();
+            let absolute = request.project_root.join(path_from_bytes(path));
+            if !crate::semantic_index::is_semantic_indexed_extension(&absolute) {
+                continue;
             }
+            if planes.semantic.is_some() {
+                // A semantic key is present: clear any earlier skip that said
+                // the index never reads this member.
+                if excludes_semantic(path) {
+                    fresh_skips.push((path.to_vec(), None));
+                }
+                continue;
+            }
+            // Content this publication did not read is unchanged, and so is
+            // the outcome recorded for it.
+            if excludes_semantic(path) && !fresh_reads.contains(path) {
+                continue;
+            }
+            // Only a member this publication reused unread touches the disk.
+            let class = match fresh_semantic_classes.get(path) {
+                Some(class) => Ok(*class),
+                None => semantic_source_class(&absolute),
+            };
+            match class {
+                Ok(SemanticSourceClass::Skipped(reason)) => {
+                    fresh_skips.push((path.to_vec(), Some(reason)));
+                }
+                Ok(SemanticSourceClass::Readable) => {
+                    unexplained.insert(absolute, path.to_vec());
+                }
+                // Deleted since HEAD was read: the next publication drops it.
+                Ok(SemanticSourceClass::Gone) => {
+                    pending_inputs.insert(
+                        path.to_vec(),
+                        PendingInput {
+                            plane: "semantic",
+                            reason: "shared semantic blob unavailable",
+                            blob_key: None,
+                        },
+                    );
+                    semantic_pending_paths.insert(path.to_vec());
+                }
+                Err(error) => semantic_failures.push((
+                    path.to_vec(),
+                    format!("semantic source unreadable: {error}"),
+                )),
+            }
+        }
+        // The semantic index walks the project with the same rules, so a file
+        // the walk does not list is never indexed.
+        let listing = crate::search_index::project_walk_lists(
+            &request.project_root,
+            &unexplained.keys().cloned().collect(),
+        );
+        for (absolute, path) in unexplained {
+            if !listing.listed.contains(&absolute) {
+                // The walk could not read a directory or ignore file on the
+                // way, so whether the index lists this file is unknown. That
+                // is a failure to name, not a reason to skip it for good; a
+                // later walk that reads the way settles it.
+                if let Some((gap, error)) = listing.gap_for(&absolute) {
+                    if excludes_semantic(&path) {
+                        fresh_skips.push((path.clone(), None));
+                    }
+                    semantic_failures
+                        .push((path, format!("walk_unreadable: {}: {error}", gap.display())));
+                    continue;
+                }
+                fresh_skips.push((path, Some(SkipReason::ExcludedFromSemanticIndex)));
+                continue;
+            }
+            // Readable, listed and unkeyed: no semantic key is available yet
+            // (for example the file changed since the index read it), so the
+            // member stays pending until one arrives.
+            if excludes_semantic(&path) {
+                fresh_skips.push((path.clone(), None));
+            }
+            pending_inputs.insert(
+                path.clone(),
+                PendingInput {
+                    plane: "semantic",
+                    reason: "shared semantic blob unavailable",
+                    blob_key: None,
+                },
+            );
+            semantic_pending_paths.insert(path);
         }
     }
 
@@ -790,13 +919,26 @@ pub fn prepare_checkout_deferring(
     // `StatusSettlement`.
     let intent = crate::path_status::StatusIntent {
         generation: generation_number(&next_generation),
+        // HEAD paths left out for their Git mode keep their skips.
         members: candidates
             .iter()
             .map(|candidate| candidate.path.as_bytes().to_vec())
+            .chain(unsupported_mode_paths)
             .collect(),
         keep_pending: semantic_pending_paths.clone(),
         marked_through,
-        fresh_skips: fresh_skips.into_iter().collect(),
+        failed: semantic_failures.into_iter().collect(),
+        // The call graph and the semantic plane can both report a path; a
+        // skip from either one wins over the other's all-clear.
+        fresh_skips: fresh_skips
+            .into_iter()
+            .fold(BTreeMap::new(), |mut merged, (path, reason)| {
+                let slot = merged.entry(path).or_insert(None);
+                if reason.is_some() {
+                    *slot = reason;
+                }
+                merged
+            }),
     };
     // Read the ledger now, off the commit barrier: when it already says what
     // this publication would say, there is nothing to settle, and the commit
@@ -1653,6 +1795,55 @@ fn lacks_callgraph_key(entry: &ManifestEntry, rel_path: &[u8]) -> bool {
             || super::callgraph::source_language(&path_from_bytes(rel_path)).is_some())
 }
 
+/// What the semantic index makes of a member file's bytes on disk.
+#[derive(Clone, Copy, Debug)]
+enum SemanticSourceClass {
+    /// The index reads files like this one; whether the walk it uses lists
+    /// the file is decided separately.
+    Readable,
+    /// The index never reads this content.
+    Skipped(SkipReason),
+    /// The file is no longer in the checkout.
+    Gone,
+}
+
+/// The semantic index's own read rules applied to bytes already read: it
+/// skips files over `MAX_SEMANTIC_FILE_BYTES` without reading them, and cannot
+/// read one that is not UTF-8 (`semantic_index::collect_semantic_file`).
+fn semantic_class_of_bytes(bytes: &[u8]) -> SemanticSourceClass {
+    if bytes.len() as u64 > crate::semantic_index::MAX_SEMANTIC_FILE_BYTES {
+        SemanticSourceClass::Skipped(SkipReason::SemanticFileTooLarge)
+    } else if std::str::from_utf8(bytes).is_err() {
+        SemanticSourceClass::Skipped(SkipReason::NonUtf8Source)
+    } else {
+        SemanticSourceClass::Readable
+    }
+}
+
+/// Applies the same rules to `absolute` on disk, for a member this
+/// publication did not read: the size from metadata, so an oversized file is
+/// never read, then the bytes. Any other read error is returned: it is not a
+/// property of the content, and nothing says the index would fare better.
+fn semantic_source_class(absolute: &Path) -> std::io::Result<SemanticSourceClass> {
+    let metadata = match fs::metadata(absolute) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SemanticSourceClass::Gone)
+        }
+        Err(error) => return Err(error),
+    };
+    if metadata.len() > crate::semantic_index::MAX_SEMANTIC_FILE_BYTES {
+        return Ok(SemanticSourceClass::Skipped(
+            SkipReason::SemanticFileTooLarge,
+        ));
+    }
+    match crate::project_content::read(absolute) {
+        Ok(bytes) => Ok(semantic_class_of_bytes(&bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SemanticSourceClass::Gone),
+        Err(error) => Err(error),
+    }
+}
+
 fn missing_callgraph_payload(
     store: &BlobStore,
     key: &FullKey,
@@ -1678,12 +1869,26 @@ fn missing_callgraph_payload(
         // empty file instead: no symbols, as the call graph built without
         // views leaves unreadable files out. Assembly records the path as
         // skipped.
+        //
+        // Every other error `extract` returns is independent of the file's
+        // content, so it fails the publication rather than skipping the file:
+        // an unknown language name, a grammar the parser refuses, no parse
+        // tree (only possible with a timeout or cancellation, neither of
+        // which is set), or a symbol query that does not compile or does not
+        // exist for the language. Each of these would recur for every file in
+        // that language. A syntax error is not among them: tree-sitter returns
+        // a tree with error nodes, and the file is published with what it
+        // yields. Neither call graph limits file size.
         CallgraphBlob::extract(
             std::str::from_utf8(source).unwrap_or(""),
             language,
             crate::views::callgraph::PRODUCER,
         )
-        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
+        .map_err(|error| {
+            ViewError::InvalidManifest(format!(
+                "call graph extraction for {language} source failed: {error}"
+            ))
+        })?
     };
     Ok(Some(blob.to_bytes().map_err(|error| {
         ViewError::InvalidManifest(error.to_string())
@@ -2162,6 +2367,454 @@ mod status_settlement_tests {
         assert_eq!(pending(storage.path()), 0);
     }
 
+    fn manifest_paths(storage: &Path, report: &AssemblyReport) -> Vec<String> {
+        ViewStore::open(storage, SCOPE)
+            .unwrap()
+            .load_manifest(report.generation.as_deref().unwrap())
+            .unwrap()
+            .entries()
+            .map(|(path, _)| String::from_utf8_lossy(path.as_bytes()).into_owned())
+            .collect()
+    }
+
+    /// A HEAD path whose Git mode is not a regular file, a symlink or a
+    /// submodule is one view assembly cannot publish. It must not hold back
+    /// the generation: the rest publishes, the path is left out with a
+    /// recorded skip, and a pending row scheduled for it settles. Once HEAD no
+    /// longer lists it, the skip is dropped.
+    #[test]
+    fn views_unsupported_git_mode_is_skipped_without_blocking_publication() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        assert!(
+            publish_checkout(&request(&root, storage.path(), "head-1"))
+                .unwrap()
+                .published
+        );
+        status(storage.path())
+            .mark_pending(b"odd/entry", "view publication scheduled", 1)
+            .unwrap();
+
+        // Real repositories cannot produce this entry through `git ls-tree`,
+        // which prints canonical modes, so inject it into the HEAD listing.
+        // 100664 is a legacy group-writable file mode.
+        rewrite_next_head_for_test(|head| {
+            let oid = head[0].git_oid;
+            head.push(
+                crate::alias::TrackedPath::new(
+                    b"odd/entry".to_vec(),
+                    GitMode::Other(b"100664".to_vec()),
+                    oid,
+                )
+                .unwrap(),
+            );
+        });
+        let report = publish_checkout(&request(&root, storage.path(), "head-2")).unwrap();
+        assert!(
+            report.published,
+            "an unsupported mode held back publication"
+        );
+        assert!(
+            report.pending_paths.is_empty(),
+            "{:?}",
+            report.pending_paths
+        );
+        assert_eq!(manifest_paths(storage.path(), &report), vec!["file_0.ts"]);
+        let summary = status(storage.path()).summary().unwrap();
+        assert_eq!((summary.pending_count, summary.failed_count), (0, 0));
+        assert_eq!(
+            summary.skipped_by_reason,
+            BTreeMap::from([("unsupported_git_mode".to_string(), 1)])
+        );
+        assert_eq!(summary.skipped_sample[0].rel_path, b"odd/entry");
+
+        let report = publish_checkout(&request(&root, storage.path(), "head-3")).unwrap();
+        assert!(report.pending_paths.is_empty());
+        assert!(skips(storage.path()).is_empty());
+    }
+
+    /// A submodule is HEAD mode 160000. It is published as a gitlink entry
+    /// (its commit, no content), never pending and never skipped.
+    #[test]
+    fn views_submodule_entry_publishes_as_a_gitlink() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let commit = std::process::Command::new("git")
+            .current_dir(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let commit = String::from_utf8(commit.stdout).unwrap();
+        git(
+            &root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{},vendor/sub", commit.trim()),
+            ],
+        );
+        // Commit the index as is: `git add .` would stage the submodule's
+        // absent checkout directory as a deletion.
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "submodule",
+            ],
+        );
+        let storage = tempfile::tempdir().unwrap();
+        let report = publish_checkout(&request(&root, storage.path(), "head-1")).unwrap();
+        assert!(report.published);
+        assert!(
+            report.pending_paths.is_empty(),
+            "{:?}",
+            report.pending_paths
+        );
+        let manifest = ViewStore::open(storage.path(), SCOPE)
+            .unwrap()
+            .load_manifest(report.generation.as_deref().unwrap())
+            .unwrap();
+        assert!(manifest.entries().any(|(path, entry)| {
+            path.as_bytes() == b"vendor/sub" && matches!(entry, ManifestEntry::Gitlink { .. })
+        }));
+        let summary = status(storage.path()).summary().unwrap();
+        assert_eq!((summary.pending_count, summary.failed_count), (0, 0));
+        assert!(summary.skipped_by_reason.is_empty());
+    }
+
+    /// Source that does not parse still has a call graph: tree-sitter answers
+    /// a syntax error with a tree holding error nodes, not with an error. So
+    /// broken source neither fails the publication nor is skipped; it is
+    /// published with what the extractor finds in it.
+    #[test]
+    fn views_unparseable_callgraph_sources_publish_with_their_call_graph() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let broken = [
+            ("broken.py", "def (:\n    )))\nclass\n"),
+            ("broken.ts", "export function {{{ ((( => ;;\n"),
+            ("broken.rs", "fn ( { impl for <\n"),
+        ];
+        for (name, source) in broken {
+            fs::write(root.join(name), source).unwrap();
+        }
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "broken",
+            ],
+        );
+        let storage = tempfile::tempdir().unwrap();
+        let report = publish_checkout(&request(&root, storage.path(), "head-1")).unwrap();
+        assert!(report.published);
+        assert!(
+            report.pending_paths.is_empty(),
+            "{:?}",
+            report.pending_paths
+        );
+        let manifest = ViewStore::open(storage.path(), SCOPE)
+            .unwrap()
+            .load_manifest(report.generation.as_deref().unwrap())
+            .unwrap();
+        for (name, _) in broken {
+            assert!(
+                manifest.entries().any(|(path, entry)| {
+                    path.as_bytes() == name.as_bytes()
+                        && matches!(
+                            entry,
+                            ManifestEntry::Regular { planes, .. } if planes.callgraph.is_some()
+                        )
+                }),
+                "{name} has no call graph"
+            );
+        }
+        let summary = status(storage.path()).summary().unwrap();
+        assert_eq!((summary.pending_count, summary.failed_count), (0, 0));
+        assert!(summary.skipped_by_reason.is_empty());
+    }
+
+    /// Stores a placeholder semantic blob keyed from `path`'s current bytes
+    /// and returns that key, standing in for the semantic index's handoff.
+    fn semantic_key(storage: &Path, root: &Path, path: &str) -> String {
+        let source = fs::read(root.join(path)).unwrap();
+        let key = crate::blob_store::SemanticKey::for_current(&source, path.as_bytes(), "model")
+            .full_key();
+        BlobStore::open(storage, FAMILY, BlobPlane::Semantic)
+            .unwrap()
+            .put(&key, b"vector")
+            .unwrap();
+        key.to_hex()
+    }
+
+    fn semantic_request(
+        root: &Path,
+        storage: &Path,
+        head: &str,
+        keyed: &[&str],
+    ) -> AssemblyRequest {
+        AssemblyRequest {
+            semantic_keys: keyed
+                .iter()
+                .map(|path| (path.as_bytes().to_vec(), semantic_key(storage, root, path)))
+                .collect(),
+            require_semantic: true,
+            callgraph: false,
+            ..request(root, storage, head)
+        }
+    }
+
+    /// Sets a directory's permissions to 0755 when dropped, so a failing test
+    /// does not leave behind a tree its temporary directory cannot remove.
+    #[cfg(unix)]
+    struct RestoreMode(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// A member the walk cannot reach for a reason it can name (here a
+    /// directory whose listing is denied while its files can still be
+    /// opened) is not one the walk leaves out: it fails with
+    /// `walk_unreadable` instead of being skipped for good, and a later walk
+    /// that can list the directory settles it. The test uses Unix mode bits
+    /// to make a directory traversable but not listable, so it is Unix only.
+    #[cfg(unix)]
+    #[test]
+    fn views_a_walk_gap_fails_unlisted_members_instead_of_skipping_them() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let locked = root.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("inner.py"), "def inner():\n    pass\n").unwrap();
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "locked",
+            ],
+        );
+        let restore = RestoreMode(locked.clone());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o311)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            eprintln!("skipped: this process lists directories without read permission (root)");
+            return;
+        }
+        assert!(fs::read(locked.join("inner.py")).is_ok());
+        let storage = tempfile::tempdir().unwrap();
+
+        let report = publish_checkout(&semantic_request(
+            &root,
+            storage.path(),
+            "head-1",
+            &["file_0.ts"],
+        ))
+        .unwrap();
+        assert!(report.published);
+        let summary = status(storage.path()).summary().unwrap();
+        assert!(
+            summary.skipped_by_reason.is_empty(),
+            "a walk gap became a skip: {:?}",
+            summary.skipped_sample
+        );
+        assert_eq!((summary.pending_count, summary.failed_count), (0, 1));
+        let failed = status(storage.path())
+            .status_for(b"locked/inner.py")
+            .unwrap()
+            .unwrap();
+        assert!(failed.reason.starts_with("walk_unreadable"), "{failed:?}");
+
+        drop(restore);
+        let report = publish_checkout(&semantic_request(
+            &root,
+            storage.path(),
+            "head-2",
+            &["file_0.ts", "locked/inner.py"],
+        ))
+        .unwrap();
+        assert!(report.pending_paths.is_empty());
+        let summary = status(storage.path()).summary().unwrap();
+        assert_eq!((summary.pending_count, summary.failed_count), (0, 0));
+        assert!(summary.skipped_by_reason.is_empty());
+    }
+
+    /// A member the semantic index never keys must not wait for a key: one
+    /// over the index's size limit, one that is not UTF-8, and one the walk
+    /// the index uses leaves out (built-in skipped directories, `.gitignore`
+    /// and `.aftignore` rules, nested ones included) are skipped with a
+    /// reason, and one that cannot be read is failed. A readable, walked file
+    /// the index has not keyed yet, such as one changed since the index read
+    /// it, stays pending until its key arrives.
+    #[test]
+    fn views_semantic_members_the_index_never_keys_are_skipped_not_pending() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let files: &[(&str, &[u8])] = &[
+            (".gitignore", b"ignored.py\n"),
+            (".aftignore", b"aftignored.py\n"),
+            ("latin1.py", b"def caf\xe9():\n    pass\n"),
+            ("stale.py", b"def stale():\n    pass\n"),
+            ("secret.py", b"def secret():\n    pass\n"),
+            ("ignored.py", b"x = 1\n"),
+            ("aftignored.py", b"x = 1\n"),
+            ("dist/bundle.js", b"var x;\n"),
+            ("node_modules/pkg/index.js", b"var x;\n"),
+            ("target/gen.rs", b"fn f() {}\n"),
+            ("pkg/.gitignore", b"generated.py\n"),
+            ("pkg/generated.py", b"x = 1\n"),
+        ];
+        for (path, bytes) in files {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        let size = crate::semantic_index::MAX_SEMANTIC_FILE_BYTES as usize + 1;
+        fs::write(root.join("big.py"), "#".repeat(size)).unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["add", "-f", "ignored.py", "pkg/generated.py"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "semantic",
+            ],
+        );
+        let storage = tempfile::tempdir().unwrap();
+        let excluded = BTreeMap::from([
+            ("excluded_from_semantic_index".to_string(), 6),
+            ("non_utf8_source".to_string(), 1),
+            ("semantic_file_too_large".to_string(), 1),
+        ]);
+
+        let report = publish_checkout(&semantic_request(
+            &root,
+            storage.path(),
+            "head-1",
+            &["file_0.ts"],
+        ))
+        .unwrap();
+        assert!(report.published);
+        assert_eq!(
+            report.pending_paths,
+            BTreeSet::from([b"secret.py".to_vec(), b"stale.py".to_vec()]),
+            "{:?}",
+            report
+                .pending_paths
+                .iter()
+                .map(|path| String::from_utf8_lossy(path).into_owned())
+                .collect::<Vec<_>>()
+        );
+        let summary = status(storage.path()).summary().unwrap();
+        assert_eq!(summary.skipped_by_reason, excluded);
+        assert_eq!((summary.pending_count, summary.failed_count), (2, 0));
+
+        // The stale file's key arrives; the skips stand.
+        let keyed = ["file_0.ts", "stale.py"];
+        let report =
+            publish_checkout(&semantic_request(&root, storage.path(), "head-2", &keyed)).unwrap();
+        assert_eq!(
+            report.pending_paths,
+            BTreeSet::from([b"secret.py".to_vec()])
+        );
+        let summary = status(storage.path()).summary().unwrap();
+        assert_eq!(summary.skipped_by_reason, excluded);
+        assert_eq!(summary.pending_count, 1);
+
+        // A publication that reuses the unchanged members keeps their skips.
+        // A reused member that can no longer be read fails rather than waits
+        // (unless this process bypasses permissions, as root does).
+        #[cfg(unix)]
+        let unreadable = {
+            use std::os::unix::fs::PermissionsExt as _;
+            let secret = root.join("secret.py");
+            fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+            fs::read(&secret).is_err()
+        };
+        #[cfg(not(unix))]
+        let unreadable = false;
+        let mut incremental = semantic_request(&root, storage.path(), "head-3", &keyed);
+        incremental.changed_paths = BTreeSet::from([b"stale.py".to_vec()]);
+        fs::write(root.join("stale.py"), "def stale():\n    return 1\n").unwrap();
+        incremental.semantic_keys.insert(
+            b"stale.py".to_vec(),
+            semantic_key(storage.path(), &root, "stale.py"),
+        );
+        let report = publish_checkout(&incremental).unwrap();
+        assert_eq!(report.pending_paths.is_empty(), unreadable);
+        assert_eq!(skips(storage.path()), excluded);
+        let summary = status(storage.path()).summary().unwrap();
+        assert_eq!(
+            (summary.pending_count, summary.failed_count),
+            if unreadable { (0, 1) } else { (1, 0) }
+        );
+        if unreadable {
+            let failed = status(storage.path())
+                .status_for(b"secret.py")
+                .unwrap()
+                .unwrap();
+            assert!(
+                failed.reason.starts_with("semantic source unreadable"),
+                "{failed:?}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(root.join("secret.py"), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        // Once the rules let the index read a file and it is keyed, its skip
+        // clears.
+        fs::write(root.join(".gitignore"), "").unwrap();
+        let report = publish_checkout(&semantic_request(
+            &root,
+            storage.path(),
+            "head-4",
+            &["file_0.ts", "stale.py", "secret.py", "ignored.py"],
+        ))
+        .unwrap();
+        assert!(report.pending_paths.is_empty());
+        assert_eq!(
+            skips(storage.path())["excluded_from_semantic_index"],
+            5,
+            "{:?}",
+            status(storage.path()).summary().unwrap().skipped_sample
+        );
+    }
+
     /// A committed repository with one Python file that is not UTF-8, so
     /// its first publication records a call-graph skip.
     fn latin1_repository() -> (tempfile::TempDir, PathBuf) {
@@ -2258,8 +2911,10 @@ mod status_settlement_tests {
     /// barrier must not clear what a newer preparation marked meanwhile: that
     /// work is not covered by the older generation, and its data is still
     /// missing. Here the older settlement waits while a newer preparation marks
-    /// two members pending (it needs semantic vectors nobody has stored); the
-    /// older settlement still clears the row scheduled before it started.
+    /// a member pending (it needs semantic vectors nobody has stored; the
+    /// other semantic member, `latin1.py`, is not UTF-8 and is skipped
+    /// instead); the older settlement still clears the row scheduled before
+    /// it started.
     #[test]
     fn views_a_held_older_settlement_keeps_pending_rows_a_newer_preparation_marked() {
         let (_project, root) = latin1_repository();
@@ -2281,9 +2936,9 @@ mod status_settlement_tests {
             &mut |_| Ok(()),
         )
         .unwrap();
-        let marked = BTreeSet::from([b"file_0.ts".to_vec(), b"latin1.py".to_vec()]);
+        let marked = BTreeSet::from([b"file_0.ts".to_vec()]);
         assert_eq!(newer.report().pending_paths, marked);
-        assert_eq!(pending(storage.path()), 3);
+        assert_eq!(pending(storage.path()), 2);
 
         assert!(matches!(older.settle_status(), SettleOutcome::Applied(_)));
         let ledger = status(storage.path());
@@ -2297,5 +2952,56 @@ mod status_settlement_tests {
             );
         }
         drop(newer);
+    }
+
+    /// A member this publication read is classified for the semantic index
+    /// from the bytes already in hand; only a member it reuses unread is read
+    /// again for that.
+    #[test]
+    fn views_semantic_classification_reads_a_fresh_member_once() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        fs::write(root.join("stale.py"), "def stale():\n    pass\n").unwrap();
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "stale",
+            ],
+        );
+        let storage = tempfile::tempdir().unwrap();
+        let stale = root.join("stale.py");
+        let reads = |probe: &crate::project_content::Probe| {
+            probe.paths().iter().filter(|path| **path == stale).count()
+        };
+
+        // Every member is read: stale.py, unkeyed, is classified from that read.
+        let probe = crate::project_content::Probe::new(&root);
+        let report = publish_checkout(&semantic_request(
+            &root,
+            storage.path(),
+            "head-1",
+            &["file_0.ts"],
+        ))
+        .unwrap();
+        assert_eq!(report.pending_paths, BTreeSet::from([b"stale.py".to_vec()]));
+        assert_eq!(reads(&probe), 1, "a freshly read member was read again");
+        drop(probe);
+
+        // Assembly reads file_0.ts and reuses stale.py unread, so semantic
+        // classification reads stale.py, once.
+        let probe = crate::project_content::Probe::new(&root);
+        let mut incremental = semantic_request(&root, storage.path(), "head-2", &["file_0.ts"]);
+        incremental.changed_paths = BTreeSet::from([b"file_0.ts".to_vec()]);
+        let report = publish_checkout(&incremental).unwrap();
+        assert_eq!(report.pending_paths, BTreeSet::from([b"stale.py".to_vec()]));
+        assert_eq!(reads(&probe), 1);
     }
 }

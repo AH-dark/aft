@@ -32,6 +32,33 @@ pub fn entry(bytes: &[u8], policy: &TrigramPolicy, seq: u64) -> LiveEntry {
     entry
 }
 
+/// File names whose content decides walker membership.
+pub const IGNORE_FILE_NAMES: [&str; 3] = [".gitignore", ".aftignore", ".ignore"];
+
+/// The disk state of the root ignore file `name`: its bytes, or absent when
+/// it cannot be read as a file.
+pub fn root_ignore_file_state(root: &Path, name: &str) -> DiskState {
+    match std::fs::read(root.join(name)) {
+        Ok(bytes) => DiskState::of_bytes(&bytes),
+        Err(_) => DiskState::Absent,
+    }
+}
+
+/// The disk state of every root ignore file, present or absent. A walk
+/// records it so a later query can tell whether the rules it ran under still
+/// hold, including for an ignore file that ignores itself and so is never a
+/// walked member.
+pub fn root_ignore_files(root: &Path) -> super::snapshot::RootIgnoreFiles {
+    IGNORE_FILE_NAMES
+        .iter()
+        .filter_map(|name| {
+            RelPath::new(name.as_bytes().to_vec())
+                .ok()
+                .map(|path| (path, root_ignore_file_state(root, name)))
+        })
+        .collect()
+}
+
 /// A partial walk retains its named gaps. It is never promoted to healthy.
 #[derive(Debug, Default)]
 pub struct Walk {
@@ -80,10 +107,15 @@ pub fn strict_walk(root: &Path, policy: &TrigramPolicy, seq: u64) -> Walk {
 pub fn reconcile(delta: &mut LiveDelta, root: &Path, policy: &TrigramPolicy) -> Walk {
     delta.set_watcher(WatcherState::Reconciling);
     let seq = delta.bump_epoch();
+    // Read before the walk: an edit landing between the two then shows up as
+    // a difference from this record, never as a record of rules the walk did
+    // not apply.
+    let ignore_files = root_ignore_files(root);
     let walk = strict_walk(root, policy, seq);
     if !walk.gaps.is_empty() || super::intent::active(root) {
         return walk;
     }
+    delta.record_root_ignore_files(Some(ignore_files));
     let snapshot = delta.snapshot();
     let paths = snapshot
         .membership()
