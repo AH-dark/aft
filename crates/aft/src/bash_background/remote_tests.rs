@@ -1488,6 +1488,20 @@ fn workspace_owner_holders_reads_ck_motor_queue_report() {
     // Another blocker is not a workspace owner, even with running holders.
     let other_phase = detail.replacen("waiting_on=workspace owner", "waiting_on=permits", 1);
     assert!(workspace_owner_holders(&other_phase).is_empty());
+    // A checkout held because another workspace's job mounts it as a sibling,
+    // or a sibling user held back behind an earlier queued job of the same
+    // repository, is never this session's own earlier job, even when the
+    // report lists the same job ids. These are ck-motor's phase names.
+    for phase in ["sibling user of this checkout", "queued workspace job"] {
+        let sibling = detail.replacen(
+            "waiting_on=workspace owner;",
+            &format!(
+                "waiting_on={phase}; sibling_users=[job={holder} workspace=/work/other permits=4];"
+            ),
+            1,
+        );
+        assert!(workspace_owner_holders(&sibling).is_empty(), "{phase}");
+    }
     assert!(workspace_owner_holders("maintenance").is_empty());
 }
 
