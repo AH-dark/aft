@@ -10514,13 +10514,17 @@ impl AppContext {
             // observable while the cold build runs in the background.
             let work = if let Some(force_token) = force_token {
                 crate::slog_info!(
-                    "callgraph cold-build decision: reason={}; action=force rebuild",
+                    "callgraph cold-build decision: reason=force token; token={}; trigger={}; action=force rebuild",
+                    force_token,
                     self.callgraph_force_demand.reason()
                 );
                 CallgraphBackgroundWork::ForceRebuild(force_token)
             } else {
+                let reason = CallGraphStore::cold_build_reason(&callgraph_dir, &project_root)
+                    .unwrap_or_else(|error| format!("generation unreadable; detail={error}"));
                 crate::slog_info!(
-                    "callgraph cold-build decision: reason=no current generation; action=ensure build"
+                    "callgraph cold-build decision: reason={}; action=ensure build",
+                    reason
                 );
                 CallgraphBackgroundWork::Ensure
             };
@@ -17189,6 +17193,132 @@ mod callgraph_store_for_ops_tests {
             },
         ));
         ([project, storage], ctx)
+    }
+
+    fn published_callgraph_for_log_test(ctx: &AppContext) -> PathBuf {
+        let root = ctx.callgraph_project_root().unwrap();
+        let dir = ctx.callgraph_store_dir();
+        let key = dir.file_name().unwrap().to_str().unwrap();
+        crate::root_cache::configure_artifact_access(&root, key, false);
+        let (store, _) = CallGraphStore::cold_build_with_lease(
+            ctx.callgraph_store_dir(),
+            root.clone(),
+            &[root.join("src/lib.rs")],
+        )
+        .unwrap();
+        store.sqlite_path().to_path_buf()
+    }
+
+    fn capture_cold_build_decision(ctx: &AppContext) -> String {
+        let _wait = force_async_callgraph_builds(ctx);
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            let _ = ctx.callgraph_store_for_ops();
+        });
+        let rx = ctx
+            .callgraph_store_rx
+            .lock()
+            .take()
+            .expect("cold build receiver");
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("background build");
+        lines
+            .into_iter()
+            .find(|line| line.contains("callgraph cold-build decision:"))
+            .expect("decision log")
+    }
+
+    #[test]
+    fn callgraph_cold_build_logs_pointer_missing() {
+        let (_dirs, ctx) = cold_build_context();
+        let log = capture_cold_build_decision(&ctx);
+        assert!(log.contains("reason=pointer missing;"), "{log}");
+    }
+
+    #[test]
+    fn callgraph_cold_build_logs_schema_stale() {
+        let (_dirs, ctx) = cold_build_context();
+        let path = published_callgraph_for_log_test(&ctx);
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute("UPDATE meta SET v = '0' WHERE k = 'schema_version'", [])
+            .unwrap();
+        drop(conn);
+        let log = capture_cold_build_decision(&ctx);
+        for expected in [
+            "reason=fingerprint or schema stale;",
+            "stored_schema=0;",
+            "current_schema=1;",
+        ] {
+            assert!(log.contains(expected), "missing {expected}: {log}");
+        }
+    }
+
+    #[test]
+    fn callgraph_cold_build_logs_fingerprint_stale() {
+        let (_dirs, ctx) = cold_build_context();
+        let path = published_callgraph_for_log_test(&ctx);
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let current: String = conn
+            .query_row("SELECT v FROM meta WHERE k = 'fingerprint'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "UPDATE meta SET v = 'previous-build' WHERE k = 'fingerprint'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let log = capture_cold_build_decision(&ctx);
+        for expected in [
+            "reason=fingerprint or schema stale;".to_string(),
+            "stored_fingerprint=previous-build;".into(),
+            format!("current_fingerprint={current};"),
+        ] {
+            assert!(log.contains(&expected), "missing {expected}: {log}");
+        }
+    }
+
+    #[test]
+    fn callgraph_cold_build_logs_force_token() {
+        let (_dirs, ctx) = cold_build_context();
+        let token = ctx.mark_callgraph_store_force_rebuild("corpus drift");
+        let log = capture_cold_build_decision(&ctx);
+        assert!(
+            log.contains(&format!(
+                "reason=force token; token={token}; trigger=corpus drift;"
+            )),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn callgraph_cold_build_logs_root_mismatch() {
+        let (_dirs, ctx) = cold_build_context();
+        let other = TempDir::new().unwrap();
+        let path = published_callgraph_for_log_test(&ctx);
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute(
+            "UPDATE backend_file_state SET workspace_root = ?1",
+            [other.path().to_str().unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            CallGraphStore::open_ready_repairing(
+                ctx.callgraph_store_dir(),
+                ctx.callgraph_project_root().unwrap(),
+            )
+            .unwrap();
+        });
+        let log = lines
+            .iter()
+            .find(|line| line.contains("callgraph cold-build decision:"))
+            .expect("root decision log");
+        assert!(log.contains("reason=root mismatch;"), "{log}");
+        assert!(
+            log.contains(&format!("from={};", other.path().display())),
+            "{log}"
+        );
     }
 
     /// Build a successful call-graph answer and attach its pending-changes

@@ -5822,6 +5822,50 @@ impl CallGraphStore {
         }
     }
 
+    /// Explain a cold-build decision without filtering away stale metadata or
+    /// changing the published store. Only the cold path pays for this probe.
+    pub(crate) fn cold_build_reason(callgraph_dir: &Path, project_root: &Path) -> Result<String> {
+        let key = project_key_for_store(callgraph_dir, project_root)?;
+        let target = if let Some(generation) = read_pointer(callgraph_dir, &key) {
+            let path = callgraph_dir.join(&generation);
+            if !path.is_file() {
+                return Ok(format!(
+                    "published generation missing; generation={generation}"
+                ));
+            }
+            path
+        } else {
+            let path = legacy_sqlite_path(callgraph_dir, &key);
+            if !path.is_file() {
+                return Ok("pointer missing".into());
+            }
+            path
+        };
+        let conn = open_readonly_connection(&target)?;
+        let (schema, fingerprint, ready): (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+            "SELECT (SELECT v FROM meta WHERE k = 'schema_version'),
+                    (SELECT v FROM meta WHERE k = 'fingerprint'),
+                    (SELECT v FROM meta WHERE k = 'ready')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let current_schema = SCHEMA_VERSION.to_string();
+        let current_fingerprint = schema_fingerprint();
+        if schema.as_deref() != Some(current_schema.as_str())
+            || fingerprint.as_deref() != Some(current_fingerprint.as_str())
+        {
+            return Ok(format!(
+                "fingerprint or schema stale; stored_schema={}; current_schema={current_schema}; stored_fingerprint={}; current_fingerprint={current_fingerprint}; current_build_output={BUILD_OUTPUT_VERSION}",
+                schema.as_deref().unwrap_or("missing"), fingerprint.as_deref().unwrap_or("missing"),
+            ));
+        }
+        Ok(format!(
+            "generation not ready; ready={}",
+            ready.as_deref().unwrap_or("missing")
+        ))
+    }
+
     pub fn open_readonly(
         callgraph_dir: PathBuf,
         project_root: PathBuf,
@@ -12454,7 +12498,7 @@ fn log_root_repair_rebuild(repair: &OpenRootRepair) {
     } = repair
     {
         crate::slog_info!(
-            "callgraph cold-build decision: reason=re-rooting refused; from={}; to={}; detail={}",
+            "callgraph cold-build decision: reason=root mismatch; from={}; to={}; detail={}",
             previous_roots.join(", "),
             current_root,
             reason

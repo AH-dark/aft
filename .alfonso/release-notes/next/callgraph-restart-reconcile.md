@@ -1,0 +1,1 @@
+- Restarts pick up offline call-graph edits without rebuilding; competing health checks retry less often, and cold-build logs explain why (#746, thanks @moynzzz).
