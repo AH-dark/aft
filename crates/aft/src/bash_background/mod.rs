@@ -1114,29 +1114,31 @@ pub(crate) fn spawn(
             (plan, Some(task))
         } else {
             let root = project_root.as_deref().unwrap_or(&workdir);
+            if crate::sandbox_spawn::worker_jail_active() && remote.is_some() {
+                // A host-local socket is not delegated to remote execution or
+                // its later local fallback. Neither path requires broker setup.
+                for key in [
+                    crate::gh_shim_worker_broker::SOCKET_ENV,
+                    crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV,
+                    crate::gh_shim_worker_broker::STATE_ENV,
+                ] {
+                    env.remove(key);
+                }
+                crate::slog_info!("gh_shim worker_read unavailable: task={} reason=remote launch or local fallback has no host broker; command continues without broker authority",task.paths.task_id.escape_debug());
+            }
             if crate::sandbox_spawn::worker_jail_active()
-                && config.github.shim
                 && remote.is_none()
                 && plan.enforces_shell_containment()
             {
-                let result = plan
-                    .temp_dir()
-                    .ok_or_else(|| "worker read broker requires private task temp".to_string())
-                    .and_then(|temp| {
-                        crate::gh_shim_worker_broker::start(
-                            &gh_shim_ticket,
-                            &task.paths.task_id,
-                            temp,
-                            std::time::Instant::now() + hard_kill.limit(),
-                            ctx.bash_background().clone(),
-                            &mut env,
-                        )
-                    });
-                if let Err(error) = result {
-                    plan.cleanup_unspawned();
-                    let _ = persistence::delete_resolved_task(&task);
-                    return Response::error(request_id, "worker_read_broker_unavailable", error);
-                }
+                crate::gh_shim_worker_broker::provision_optional(
+                    &gh_shim_ticket,
+                    &task.paths.task_id,
+                    plan.temp_dir(),
+                    std::time::Instant::now() + hard_kill.limit(),
+                    ctx.bash_background().clone(),
+                    &mut env,
+                    config.github.shim,
+                );
             }
             enter_bash_startup_step(BashStartupStep::Environment);
             let environment = crate::sandbox_spawn::approved_environment_for_plan(&plan, &env);

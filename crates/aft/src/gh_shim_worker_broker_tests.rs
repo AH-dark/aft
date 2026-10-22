@@ -1022,3 +1022,122 @@ async fn gh_shim_broker_raw_request_uses_real_signed_manifest_binding() {
     }
     assert_eq!(transport.0.load(Ordering::SeqCst), 1);
 }
+
+fn optional_service(root: &Path) -> (Service, mpsc::Receiver<ScopeQuery>) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (scopes, receiver) = mpsc::channel(4);
+    (
+        Service {
+            relay: GhRelay::new(root.join("unused-connection.json")),
+            scopes,
+            runtime: tokio::runtime::Handle::current(),
+            endpoints: Ok(crate::gh_shim_worker_endpoints::Generation::new(root).unwrap()),
+            connection_slots: Arc::new(Semaphore::new(64)),
+        },
+        receiver,
+    )
+}
+
+#[tokio::test]
+async fn optional_worker_broker_live_service_is_still_provided() {
+    let _state = crate::test_env::gh_shim_state_guard();
+    let root = tempfile::tempdir().unwrap();
+    let (service, _receiver) = optional_service(root.path());
+    let temp = root.path().join("000000000001");
+    std::fs::create_dir(&temp).unwrap();
+    let ticket = PendingTicket::issue("optional-positive-session", "/server/project");
+    let mut environment = std::collections::HashMap::new();
+    let provided = with_service_for_test(Some(service), || {
+        crate::bash_background::registry::with_scope_spawn(Some(stamp()), || {
+            provision_optional(
+                &ticket,
+                "optional-positive-task",
+                Some(&temp),
+                Instant::now() + Duration::from_secs(60),
+                Default::default(),
+                &mut environment,
+                true,
+            )
+        })
+    });
+    assert!(
+        provided,
+        "a usable scope service must still provision the read broker"
+    );
+    let socket = PathBuf::from(environment.get(SOCKET_ENV).unwrap());
+    let file = PathBuf::from(environment.get(CAPABILITY_FILE_ENV).unwrap());
+    let capability = std::fs::read_to_string(file).unwrap();
+    assert_eq!(capability.len(), 32);
+    assert!(socket.exists());
+    assert!(crate::gh_shim_ticket::redeem_worker_read(&capability, &socket).is_some());
+    assert!(!environment.contains_key(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV));
+    assert!(Path::new(environment.get(STATE_ENV).unwrap()).starts_with(&temp));
+    drop(ticket);
+    assert!(!socket.exists());
+}
+
+#[tokio::test]
+async fn optional_worker_broker_failed_seed_rolls_back_without_spawn_authority() {
+    let _state = crate::test_env::gh_shim_state_guard();
+    let source = PathBuf::from(std::env::var_os(STATE_ENV).unwrap());
+    std::fs::write(
+        source.join("gh-routing-manifest.json"),
+        vec![b'x'; 1_048_577],
+    )
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let (service, _receiver) = optional_service(root.path());
+    let temp = root.path().join("000000000001");
+    std::fs::create_dir(&temp).unwrap();
+    let ticket = PendingTicket::issue("optional-rollback-session", "/server/project");
+    let mut environment = std::collections::HashMap::from([
+        (SOCKET_ENV.into(), "inherited-socket".into()),
+        (CAPABILITY_FILE_ENV.into(), "inherited-file".into()),
+        (STATE_ENV.into(), "inherited-state".into()),
+    ]);
+    let (provided, logs) = crate::logging::capture_log_lines(|| {
+        with_service_for_test(Some(service), || {
+            crate::bash_background::registry::with_scope_spawn(Some(stamp()), || {
+                provision_optional(
+                    &ticket,
+                    "optional-rollback-task",
+                    Some(&temp),
+                    Instant::now() + Duration::from_secs(60),
+                    Default::default(),
+                    &mut environment,
+                    true,
+                )
+            })
+        })
+    });
+    assert!(!provided);
+    for key in [SOCKET_ENV, CAPABILITY_FILE_ENV, STATE_ENV] {
+        assert!(!environment.contains_key(key));
+    }
+    assert!(
+        !temp.join(".gh-read-capability").exists(),
+        "an aborted setup must not leave a bearer file"
+    );
+    assert!(
+        !temp.join(".gh-shim").exists(),
+        "failed seeding must remove only its new state directory"
+    );
+    assert!(!temp.with_file_name("000000000001.gh-read.sock").exists());
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("snapshot limit") && line.contains("command continues")),
+        "{logs:?}"
+    );
+    assert!(
+        ticket
+            .worker_read_capability(
+                temp.with_file_name("000000000001.gh-read.sock"),
+                Instant::now() + Duration::from_secs(60),
+                &stamp()
+            )
+            .is_some(),
+        "the failed read grant must be removed, not merely hidden from the environment"
+    );
+    ticket.abandon_worker_read();
+}

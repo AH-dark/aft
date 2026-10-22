@@ -88,6 +88,68 @@ struct Service {
 #[cfg(unix)]
 static SERVICE: Mutex<Option<Service>> = Mutex::new(None);
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static TEST_SERVICE: std::cell::RefCell<Option<Option<Service>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(unix)]
+fn command_service() -> Option<Service> {
+    #[cfg(test)]
+    if let Some(service) = TEST_SERVICE.with(|slot| slot.borrow().clone()) {
+        return service;
+    }
+    SERVICE.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+#[cfg(all(test, unix))]
+fn with_service_for_test<R>(service: Option<Service>, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Option<Service>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_SERVICE.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+    let _restore = Restore(TEST_SERVICE.with(|slot| slot.replace(Some(service))));
+    run()
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn without_service_for_test<R>(run: impl FnOnce() -> R) -> R {
+    with_service_for_test(None, run)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn with_available_service_for_test<R>(root: &Path, run: impl FnOnce() -> R) -> R {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (scopes, _receiver) = mpsc::channel(4);
+    let service = Service {
+        relay: GhRelay::new(root.join("unused-connection.json")),
+        scopes,
+        runtime: tokio::runtime::Handle::current(),
+        endpoints: Ok(crate::gh_shim_worker_endpoints::Generation::new(root).unwrap()),
+        connection_slots: Arc::new(Semaphore::new(64)),
+    };
+    let scope = ScopeStamp::new(
+        subc_protocol::Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        },
+        "optional-spawn-scope",
+        1,
+        subc_protocol::scope::ScopeKind::Worker,
+    )
+    .with_owner_authorized(true)
+    .with_attributes(
+        subc_protocol::scope::ScopeAttributes::new()
+            .with_agent_id(Some("test-worker".into()))
+            .with_delegates(true),
+    );
+    with_service_for_test(Some(service), || {
+        crate::bash_background::registry::with_scope_spawn(Some(scope), run)
+    })
+}
+
 /// Installed for one module connection. Losing that connection invalidates all
 /// brokers that captured its channel, including commands surviving a reconnect.
 pub(crate) struct ServiceGuard {
@@ -208,11 +270,10 @@ pub(crate) fn start(
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let service = SERVICE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
-        .ok_or("worker read broker has no daemon scope service")?;
+    let service = command_service().ok_or("worker read broker has no daemon scope service")?;
+    if service.scopes.is_closed() {
+        return Err("worker read broker daemon scope service is closed".into());
+    }
     let name = temp
         .file_name()
         .ok_or("worker temp has no name")?
@@ -222,6 +283,13 @@ pub(crate) fn start(
         .bind(&name)
         .map_err(|e| format!("worker read broker bind failed: {e}"))?;
     let socket = endpoint.path();
+    let mut rollback = ProvisionRollback {
+        ticket,
+        capability_file: None,
+        state: None,
+        endpoint: Some(endpoint.clone()),
+        committed: false,
+    };
     ticket.reserve_task(task_id);
     let stamp = crate::bash_background::registry::scope_for_spawn()
         .ok_or("worker read broker requires authenticated spawn scope")?;
@@ -239,10 +307,16 @@ pub(crate) fn start(
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&cap_file)
         .map_err(|e| e.to_string())?;
+    rollback.capability_file = Some(cap_file.clone());
     file.write_all(capability.as_bytes())
         .map_err(|e| e.to_string())?;
     let state = temp.join(".gh-shim");
     crate::gh_shim::seed_worker_state(&state)?;
+    rollback.state = Some(state.clone());
+    let listener = {
+        let _entered = service.runtime.enter();
+        tokio::net::UnixListener::from_std(listener).map_err(|error| error.to_string())?
+    };
     env.remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
     env.insert(SOCKET_ENV.into(), socket.to_string_lossy().into_owned());
     env.insert(
@@ -252,18 +326,82 @@ pub(crate) fn start(
     env.insert(STATE_ENV.into(), state.to_string_lossy().into_owned());
     let runtime = service.runtime.clone();
     runtime.spawn(async move {
-        let listener = match tokio::net::UnixListener::from_std(listener) {
-            Ok(listener) => listener,
-            Err(_) => {
-                cancel.send_replace(true);
-                endpoint.remove();
-                return;
-            }
-        };
         serve(listener, socket.clone(), service, tasks, cancel.subscribe()).await;
         endpoint.remove();
     });
+    rollback.committed = true;
     Ok(())
+}
+
+#[cfg(unix)]
+struct ProvisionRollback<'a> {
+    ticket: &'a crate::gh_shim_ticket::PendingTicket,
+    capability_file: Option<PathBuf>,
+    state: Option<PathBuf>,
+    endpoint: Option<Arc<crate::gh_shim_worker_endpoints::Endpoint>>,
+    committed: bool,
+}
+#[cfg(unix)]
+impl Drop for ProvisionRollback<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        self.ticket.abandon_worker_read();
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.remove();
+        }
+        if let Some(path) = &self.capability_file {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(path) = &self.state {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+/// Broker availability never decides whether a confined shell may start. A
+/// failed setup grants nothing and publishes no endpoint paths to that child.
+#[cfg(unix)]
+pub(crate) fn provision_optional(
+    ticket: &crate::gh_shim_ticket::PendingTicket,
+    task_id: &str,
+    temp: Option<&Path>,
+    deadline: Instant,
+    tasks: crate::bash_background::BgTaskRegistry,
+    env: &mut std::collections::HashMap<String, String>,
+    enabled: bool,
+) -> bool {
+    for key in [
+        SOCKET_ENV,
+        CAPABILITY_FILE_ENV,
+        STATE_ENV,
+        crate::gh_shim_ticket::GH_SHIM_TICKET_ENV,
+    ] {
+        env.remove(key);
+    }
+    let result = if !enabled {
+        Err("worker GitHub shim is disabled".to_string())
+    } else {
+        temp.ok_or_else(|| "worker read broker has no private task temp".to_string())
+            .and_then(|temp| start(ticket, task_id, temp, deadline, tasks, env))
+    };
+    match result {
+        Ok(()) => true,
+        Err(reason) => {
+            ticket.abandon_worker_read();
+            for key in [
+                SOCKET_ENV,
+                CAPABILITY_FILE_ENV,
+                STATE_ENV,
+                crate::gh_shim_ticket::GH_SHIM_TICKET_ENV,
+            ] {
+                env.remove(key);
+            }
+            crate::slog_warn!("gh_shim worker_read unavailable: task={} reason={}; command continues without broker authority",task_id.escape_debug(),reason.escape_debug());
+            false
+        }
+    }
 }
 
 #[cfg(unix)]

@@ -293,6 +293,22 @@ impl PendingTicket {
         true
     }
 
+    /// Abandon only optional read authority after a failed setup. The pending
+    /// command ticket still follows its normal bind/drop/terminal lifecycle.
+    #[cfg(unix)]
+    pub(crate) fn abandon_worker_read(&self) {
+        let Some(candidate) = self.ticket.as_deref().and_then(decode) else {
+            return;
+        };
+        let mut entries = registry();
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| constant_time_eq(&entry.ticket, &candidate))
+        {
+            entry.worker_read.take();
+        }
+    }
+
     /// Attach the spawned task's id so the task's terminal transition revokes
     /// the ticket. The caller must then check whether the task already ended
     /// (see `revoke_task`), because a very short command can reach its

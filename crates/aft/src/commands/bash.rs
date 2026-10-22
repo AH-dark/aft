@@ -2038,6 +2038,11 @@ mod tests {
     }
 
     #[cfg(unix)]
+    mod optional_broker_tests {
+        include!("bash_optional_broker_tests.rs");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn host_request_returns_exact_escalation_ask_and_untrusted_request_is_denied() {
         let project = tempfile::tempdir().unwrap();
