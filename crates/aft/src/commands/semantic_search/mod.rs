@@ -1840,7 +1840,7 @@ impl SearchLaneStatus {
                     if !backend.available && backend.paused_until_ms.is_some() {
                         // A scheduled pause is not an ordinary unavailable-index
                         // state, even when no lane is ready to run this request.
-                        return PAUSED_EMBEDDING_DETAIL.to_string();
+                        return paused_backend_detail(&backend);
                     }
                 }
                 let state = match lane.effective {
@@ -7013,8 +7013,56 @@ struct ClassifiedEmbedQueryError {
 const PAUSED_EMBEDDING_DETAIL: &str =
     "Semantic search unavailable: the embedding model is paused; using keyword search only.";
 
+/// Footer reason shown when Synapse refuses the embedding request for a
+/// query because it is compiling a new input shape or loading the model
+/// (`shape_compiling`, `model_loading`).
+const WARMING_UP_FOOTER_REASON: &str = "warming up";
+
+/// The query detail for a model that is still warming up. `ready_in_ms` is
+/// how long Synapse said the warm-up still needs, when it said so.
+fn warming_up_embedding_detail(ready_in_ms: Option<u64>) -> String {
+    match ready_in_ms {
+        Some(ms) => {
+            let seconds = ms.div_ceil(1_000).max(1);
+            let eta = if seconds < 60 {
+                format!("{seconds}s")
+            } else {
+                format!("{} min", seconds.div_ceil(60))
+            };
+            format!(
+                "Semantic search unavailable: the embedding model is warming up (expected ready in about {eta}); using keyword search only."
+            )
+        }
+        None => "Semantic search unavailable: the embedding model is warming up; using keyword search only."
+            .to_string(),
+    }
+}
+
+/// The detail for a backend health snapshot that records a pause: a warm-up
+/// names itself and when it should end, every other pause keeps the paused
+/// sentence.
+fn paused_backend_detail(backend: &crate::context::EmbeddingBackendHealthSnapshot) -> String {
+    if backend.pause_cause == Some(crate::synapse_embed::PauseCause::WarmingUp) {
+        let now = crate::semantic_index::unix_millis_now();
+        warming_up_embedding_detail(
+            backend
+                .paused_until_ms
+                .filter(|until| *until > now)
+                .map(|until| until - now),
+        )
+    } else {
+        PAUSED_EMBEDDING_DETAIL.to_string()
+    }
+}
+
 fn classify_embed_query_error(error: &str) -> ClassifiedEmbedQueryError {
-    if crate::synapse_embed::LanePause::from_error(error).is_some() {
+    if let Some(pause) = crate::synapse_embed::LanePause::from_error(error) {
+        if pause.cause == crate::synapse_embed::PauseCause::WarmingUp {
+            return ClassifiedEmbedQueryError {
+                detail: warming_up_embedding_detail(pause.retry_after_ms),
+                footer_reason: WARMING_UP_FOOTER_REASON,
+            };
+        }
         ClassifiedEmbedQueryError {
             detail: PAUSED_EMBEDDING_DETAIL.to_string(),
             footer_reason: "unavailable",
@@ -7444,12 +7492,13 @@ fn semantic_lane_state(
     // embedding refused by the same pause, and no backend probe is started.
     let backend = ctx.semantic_backend_health_snapshot();
     if !backend.available && backend.paused_until_ms.is_some() {
+        let detail = paused_backend_detail(&backend);
         return SemanticLaneState {
             semantic_status: "unavailable",
             backend_unavailable: None,
             disclosure: Some(SemanticLaneDisclosure {
-                text: PAUSED_EMBEDDING_DETAIL.to_string(),
-                note: PAUSED_EMBEDDING_DETAIL.to_string(),
+                text: detail.clone(),
+                note: detail,
             }),
         };
     }
@@ -8920,6 +8969,82 @@ mod tests {
                     START + PAUSE_MS
                 );
             });
+        });
+    }
+
+    #[test]
+    fn shape_compiling_query_falls_back_at_once_and_names_the_warm_up() {
+        use crate::synapse_embed::pause_test_support::*;
+        crate::semantic_index::with_lane_pause_clock(START, |clock| {
+            with_compiling_synapse(clock.clone(), 90_000, |mut semantic, requests| {
+                let project = tempfile::tempdir().unwrap();
+                std::fs::write(project.path().join("remix-panel.ts"),
+                    "// where remix panel mounted option switching handled\nexport const panel = true;\n").unwrap();
+                let ctx = test_context(project.path());
+                semantic.route_project_root = Some(project.path().to_path_buf());
+                ctx.update_config(|config| config.semantic = semantic.clone());
+                ctx.set_canonical_cache_root(project.path().to_path_buf());
+                *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+                *ctx.semantic_index().write().unwrap() =
+                    Some(SemanticIndex::new(project.path().to_path_buf(), 2));
+                let response = response_value(handle_semantic_search(
+                    &semantic_request("where remix panel mounted option switching handled", 5),
+                    &ctx,
+                ));
+                assert_eq!(response["success"], true, "{response}");
+                assert_eq!(response["lexical_only_fallback"], true);
+                assert!(
+                    !response["results"].as_array().unwrap().is_empty(),
+                    "{response}"
+                );
+                let text = response["text"].as_str().unwrap();
+                assert!(text.contains("Semantic search unavailable: the embedding model is warming up (expected ready in about 2 min); using keyword search only."), "{text}");
+                assert!(text.contains("[semantic: warming up]"), "{text}");
+                assert!(!text.contains("[semantic: unavailable]"), "{text}");
+                assert!(!text.contains("shape_compiling"), "{text}");
+                // The query never waits for the compile.
+                assert_eq!(clock.load(Ordering::SeqCst), START);
+                assert_eq!(requests.lock().unwrap().len(), 2);
+                let status = ctx.build_status_snapshot();
+                assert_eq!(status["semantic_index"]["state"], "paused", "{status}");
+                assert_eq!(status["semantic_index"]["paused_until_ms"], START + 90_000);
+            });
+        });
+    }
+
+    #[test]
+    fn warm_up_during_initial_build_search_names_the_warm_up() {
+        use crate::synapse_embed::pause_test_support::*;
+        crate::semantic_index::with_lane_pause_clock(START, |_clock| {
+            let project = tempfile::tempdir().unwrap();
+            let source_file = project.path().join("remix-panel.ts");
+            let source =
+                "// where remix panel mounted option switching handled\nexport const panel = true;\n";
+            std::fs::write(&source_file, source).unwrap();
+            let ctx = test_context(project.path());
+            ctx.set_canonical_cache_root(project.path().to_path_buf());
+            // A ready keyword lane, as in the paused-build test above.
+            let mut index = SearchIndex::new();
+            index.index_file(&source_file, source.as_bytes());
+            index.ready = true;
+            *ctx.search_index().write().unwrap() = Some(index);
+            *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Building {
+                stage: "embedding".to_string(),
+                files: None,
+                entries_done: None,
+                entries_total: None,
+            };
+            record_warm_up_for_root(project.path(), START + 30_000);
+            let response = response_value(handle_semantic_search(
+                &semantic_request("where remix panel mounted option switching handled", 5),
+                &ctx,
+            ));
+            assert_eq!(response["success"], true, "{response}");
+            assert_eq!(response["lexical_only_fallback"], true, "{response}");
+            assert_eq!(
+                response["note"],
+                "Semantic search unavailable: the embedding model is warming up (expected ready in about 30s); using keyword search only."
+            );
         });
     }
 

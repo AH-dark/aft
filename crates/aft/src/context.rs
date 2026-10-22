@@ -2463,6 +2463,8 @@ pub(crate) struct EmbeddingBackendHealthSnapshot {
     pub(crate) since_ms: Option<u64>,
     pub(crate) next_retry_ms: Option<u64>,
     pub(crate) paused_until_ms: Option<u64>,
+    /// Why the backend refused requests for now, when `paused_until_ms` is set.
+    pub(crate) pause_cause: Option<crate::synapse_embed::PauseCause>,
 }
 
 /// The refresh circuit only trips once an index exists and later refreshes
@@ -2479,6 +2481,7 @@ fn with_cold_build_backend_health(
         snapshot.available = false;
         snapshot.last_error = Some(pause.reason);
         snapshot.paused_until_ms = Some(pause.paused_until_ms);
+        snapshot.pause_cause = Some(pause.cause);
         snapshot.next_retry_ms = Some(pause.paused_until_ms);
         return snapshot;
     }
@@ -12286,6 +12289,7 @@ impl AppContext {
                 since_ms: Some(outage.since_ms),
                 next_retry_ms: Some(outage.next_retry_ms),
                 paused_until_ms: None,
+                pause_cause: None,
             },
             None => EmbeddingBackendHealthSnapshot {
                 available: true,
@@ -12312,6 +12316,7 @@ impl AppContext {
                 since_ms: Some(outage.since_ms),
                 next_retry_ms: Some(outage.next_retry_ms),
                 paused_until_ms: None,
+                pause_cause: None,
             },
             None => EmbeddingBackendHealthSnapshot {
                 available: true,
