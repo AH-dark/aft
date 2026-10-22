@@ -6649,6 +6649,9 @@ pub(super) enum DrainingGate {
     /// After a signer-refusal retry finished waiting out the runner's hint,
     /// before it rechecks for cancellation and records the resubmission.
     BeforeHintedResubmit,
+    /// After the runner refused a submission that AFT will not retry, before
+    /// the worker reports the refusal.
+    BeforeRefusalReport,
 }
 
 type DrainingGateKey = (PathBuf, DrainingGate);
@@ -8013,6 +8016,14 @@ fn signer_retry_script(refusals: u32) -> Script {
 /// whole cancellation), and the runner's refusal kept as the proof that the
 /// command never started.
 fn assert_signer_retry_pause_saved(json: &Path) {
+    assert_refused_pause_saved(json, "runner_sign_unavailable");
+}
+
+/// The saved record of a task the owner paused after the runner refused it
+/// with `detail`: paused, the cancellation recorded as sent, no sign that the
+/// command started, and the runner's refusal (`ran: none`) kept as the proof
+/// that it never did.
+fn assert_refused_pause_saved(json: &Path, detail: &str) {
     assert_saved_paused(json);
     let remote = read_task(json).unwrap().remote.unwrap();
     assert!(
@@ -8024,7 +8035,7 @@ fn assert_signer_retry_pause_saved(json: &Path) {
         .as_ref()
         .unwrap_or_else(|| panic!("{remote:?}"));
     assert_eq!(refusal.ran, Some(Ran::None), "{remote:?}");
-    assert_eq!(refusal.refusal_detail(), Some("runner_sign_unavailable"));
+    assert_eq!(refusal.refusal_detail(), Some(detail));
 }
 
 /// The owner pauses a worker whose `runon` task waits out a signer refusal's
@@ -8136,6 +8147,42 @@ async fn bash_kill_scope_never_resubmits_a_saved_signer_refusal() {
     assert_saved_pause_reply(&reply, &task_id, &local_task, local_pid).await;
     assert_signer_retry_pause_saved(&json);
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
+/// The runner refuses a job in a way AFT does not retry, and the owner's pause
+/// lands after the refusal arrived but before the worker reports it. The
+/// worker's report cannot replace the pause's terminal state, and it must
+/// still settle the pause: the runner refused the job, so nothing runs.
+#[tokio::test]
+async fn bash_kill_scope_settles_when_paused_as_a_refusal_is_reported() {
+    let daemon = daemon(
+        Script::SignerRefused {
+            refusals: u32::MAX,
+            detail: "runner_sign_missing",
+            retry_after_ms: None,
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("refusal-report");
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeRefusalReport);
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    gate.reached().await;
+    let operation = start_kill_scope(&registry, &scope);
+    pause_recorded(&registry, &task).await;
+    gate.release();
+    assert_pause_settles_promptly(&registry, operation, &task).await;
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_refused_pause_saved(
+        &registry.task(&task).unwrap().paths.json,
+        "runner_sign_missing",
+    );
+    assert_no_retry_sleep(&mut clock);
 }
 
 #[tokio::test]

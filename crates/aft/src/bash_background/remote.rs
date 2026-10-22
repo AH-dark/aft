@@ -2280,27 +2280,37 @@ impl BgTaskRegistry {
                             HintedRetryStep::Surface => {}
                         }
                     }
+                    #[cfg(test)]
+                    tests::draining_gate(&root, tests::DrainingGate::BeforeRefusalReport).await;
                     let reason = serde_json::to_value(reason)
                         .unwrap()
                         .as_str()
                         .unwrap_or("unknown")
                         .to_owned();
-                    if let Some(fallback) = fallback.take() {
+                    let result = if let Some(fallback) = fallback.take() {
                         // A live refusal uses the launch plan captured before
                         // dispatch. The private disk snapshot is for restarts.
-                        return self.remote_fallback(
+                        self.remote_fallback(&task, fallback, &reason, refusal_detail.as_deref())
+                    } else {
+                        self.restored_remote_fallback(
                             &task,
-                            fallback,
+                            &remote,
                             &reason,
                             refusal_detail.as_deref(),
-                        );
+                        )
+                    };
+                    // If the owner's pause landed after this refusal arrived
+                    // but before the lines above reported it, the pause had
+                    // already ended the task (so the report changed nothing)
+                    // and the fallback declined to run the command locally.
+                    // The runner refused the job, so nothing is left running:
+                    // record the pause's outcome, which `bash.kill_scope`
+                    // waits for. (A failed fallback is recorded as failed
+                    // when this worker exits.)
+                    if result.is_ok() {
+                        self.settle_owner_pause_without_resubmit(&task);
                     }
-                    return self.restored_remote_fallback(
-                        &task,
-                        &remote,
-                        &reason,
-                        refusal_detail.as_deref(),
-                    );
+                    return result;
                 }
                 Ok(StreamProgress::Complete(verdict)) => {
                     if !platform_ok {
