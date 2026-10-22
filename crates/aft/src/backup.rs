@@ -124,6 +124,35 @@ fn run_before_namespace_wait_hook_for_tests(storage_dir: &Path) {
     }
 }
 
+/// Test seam run while the default-session snapshot check holds the namespace
+/// shared, after it has looked in the harness backup directory and before it
+/// looks in the root one. Keyed by storage directory.
+#[cfg(test)]
+static BETWEEN_LEGACY_CHECKS_HOOKS: LazyLock<Mutex<HashMap<PathBuf, NamespaceWaitHook>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn set_between_legacy_checks_hook_for_tests(
+    storage_dir: &Path,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    BETWEEN_LEGACY_CHECKS_HOOKS
+        .lock()
+        .unwrap()
+        .insert(storage_dir.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_between_legacy_checks_hook_for_tests(storage_dir: &Path) {
+    let hook = BETWEEN_LEGACY_CHECKS_HOOKS
+        .lock()
+        .unwrap()
+        .remove(storage_dir);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 static BACKUP_MAINTENANCE_KEYS: LazyLock<Mutex<HashSet<(PathBuf, Option<String>)>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static BACKUP_MIGRATION_KEYS: LazyLock<Mutex<HashSet<(PathBuf, Option<String>)>>> =
@@ -1123,11 +1152,28 @@ impl BackupStore {
     /// migration cannot run; other root-repair failures are logged and do not
     /// stop the snapshot.
     ///
-    /// Running the migration first is simpler than merging the legacy entries
-    /// into an existing stack afterwards, which would mean renumbering backup
-    /// files, reordering entries and their database rows across two stacks.
+    /// The check for legacy history holds the namespace shared. Root repair
+    /// and the flat migration move entries only while holding it exclusively,
+    /// so an unlocked check could look in the harness directory, then in the
+    /// root one, and miss an entry another process moved between the two. A
+    /// check that finds nothing needs no lock afterwards: repair and migration
+    /// only relocate entries that already exist, so none can appear for the
+    /// file later. After the migration the check runs again. If the entry is
+    /// still in the old layout (a failed move, a repair conflict or a protected
+    /// session) and the file has no default-session stack yet, the snapshot
+    /// refuses rather than create that stack in front of the entry, where the
+    /// migration would later skip it because the target exists.
     fn run_snapshot_maintenance(&mut self, session: &str, key: &Path) -> Result<(), AftError> {
-        if session != crate::protocol::DEFAULT_SESSION_ID || !self.has_unmigrated_history(key) {
+        const BEFORE: &str = "recording a backup";
+        if session != crate::protocol::DEFAULT_SESSION_ID {
+            self.run_process_maintenance_once();
+            return Ok(());
+        }
+        let deadline = namespace_wait_deadline();
+        let pending = self
+            .has_unmigrated_history(key, deadline)
+            .map_err(|message| self.layout_error(BEFORE, message))?;
+        if !pending {
             self.run_process_maintenance_once();
             return Ok(());
         }
@@ -1139,40 +1185,75 @@ impl BackupStore {
                 .unwrap()
                 .remove(&(storage_dir, self.effective_storage_harness()));
         }
-        self.run_waiting_maintenance("recording a backup")
+        self.run_process_maintenance(Some(deadline))
+            .map_err(|message| self.layout_error(BEFORE, message))?;
+        let still_pending = self
+            .has_unmigrated_history(key, deadline)
+            .map_err(|message| self.layout_error(BEFORE, message))?;
+        if still_pending && !self.default_session_stack_exists(key) {
+            return Err(self.layout_error(
+                BEFORE,
+                "the file's older history is still in the old layout, and recording now would hide it from undo"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Whether `key` still has a legacy flat entry, either in the harness
     /// backup directory awaiting the flat migration or in the root backup
-    /// directory awaiting root repair.
-    fn has_unmigrated_history(&self, key: &Path) -> bool {
+    /// directory awaiting root repair. Holds the namespace shared, waiting for
+    /// an exclusive holder until `deadline`, so no entry is in flight between
+    /// the two directories while they are read.
+    fn has_unmigrated_history(&self, key: &Path, deadline: Instant) -> Result<bool, String> {
+        let Some(storage_dir) = self.storage_dir.clone() else {
+            return Ok(false);
+        };
+        if !storage_dir.is_dir() {
+            // No storage directory yet means no legacy history at all.
+            return Ok(false);
+        }
+        let _shared = match backup_namespace_shared(&storage_dir, deadline) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return Err("the backup namespace is busy".to_string()),
+            Err(error) => return Err(format!("cannot lock the backup namespace: {error}")),
+        };
         let hash = Self::path_hash(key);
-        let harness_entry = self.backups_dir().map(|dir| dir.join(&hash));
-        let root_entry = self
-            .storage_dir
-            .as_ref()
-            .filter(|_| self.effective_storage_harness().is_some())
-            .map(|dir| dir.join("backups").join(&hash));
-        [harness_entry, root_entry]
-            .into_iter()
-            .flatten()
-            .any(|dir| is_legacy_flat_backup_entry(&dir))
+        if self
+            .backups_dir()
+            .is_some_and(|dir| is_legacy_flat_backup_entry(&dir.join(&hash)))
+        {
+            return Ok(true);
+        }
+        #[cfg(test)]
+        run_between_legacy_checks_hook_for_tests(&storage_dir);
+        Ok(self.effective_storage_harness().is_some()
+            && is_legacy_flat_backup_entry(&storage_dir.join("backups").join(&hash)))
+    }
+
+    fn default_session_stack_exists(&self, key: &Path) -> bool {
+        self.session_dir(crate::protocol::DEFAULT_SESSION_ID)
+            .is_some_and(|dir| dir.join(Self::path_hash(key)).exists())
+    }
+
+    fn layout_error(&self, before: &str, message: String) -> AftError {
+        AftError::IoError {
+            path: self
+                .storage_dir
+                .as_deref()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default(),
+            message: format!(
+                "legacy backup history could not be moved into the current layout before {before}: {message}"
+            ),
+        }
     }
 
     /// [`Self::run_restore_maintenance`] with the operation it runs before
     /// named in the error.
     fn run_waiting_maintenance(&mut self, before: &str) -> Result<(), AftError> {
         self.run_process_maintenance(Some(namespace_wait_deadline()))
-            .map_err(|message| AftError::IoError {
-                path: self
-                    .storage_dir
-                    .as_deref()
-                    .map(|dir| dir.display().to_string())
-                    .unwrap_or_default(),
-                message: format!(
-                    "legacy backup history could not be moved into the current layout before {before}: {message}"
-                ),
-            })
+            .map_err(|message| self.layout_error(before, message))
     }
 
     /// Shared body of [`Self::run_process_maintenance_once`] and
@@ -6142,11 +6223,35 @@ fn backup_namespace_gate(
     storage: &Path,
     wait_until: Option<Instant>,
 ) -> std::io::Result<Option<std::fs::File>> {
+    lock_backup_namespace(storage, wait_until, false)
+}
+
+/// Take the backup namespace shared, waiting for an exclusive holder until
+/// `deadline`. Root repair and the flat migration move legacy entries only
+/// while holding the namespace exclusively, so a shared holder sees every
+/// legacy entry at rest, never one in flight between directories.
+fn backup_namespace_shared(
+    storage: &Path,
+    deadline: Instant,
+) -> std::io::Result<Option<std::fs::File>> {
+    lock_backup_namespace(storage, Some(deadline), true)
+}
+
+fn lock_backup_namespace(
+    storage: &Path,
+    wait_until: Option<Instant>,
+    shared: bool,
+) -> std::io::Result<Option<std::fs::File>> {
     let file = backup_namespace_file(storage)?;
     let mut pause = Duration::from_millis(2);
     let mut announced = false;
     loop {
-        match file.try_lock() {
+        let attempt = if shared {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        };
+        match attempt {
             Ok(()) => return Ok(Some(file)),
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(error)) => return Err(error),
@@ -6165,7 +6270,7 @@ fn backup_namespace_gate(
         if !announced {
             announced = true;
             crate::slog_warn!(
-                "backup namespace {} is busy; waiting for it before moving legacy backup history",
+                "backup namespace {} is busy; waiting for it to look for or move legacy backup history",
                 storage.display()
             );
             #[cfg(test)]
@@ -8604,6 +8709,100 @@ mod tests {
             .join(BackupStore::path_hash(&key))
             .exists());
         assert!(store.history(DEFAULT_SESSION_ID, &path).is_empty());
+    }
+
+    #[test]
+    fn default_session_snapshot_sees_legacy_entry_moved_between_its_directory_checks() {
+        let storage = tempfile::tempdir().unwrap();
+        let (mut store, path, key, root_entry) = legacy_root_history_fixture(storage.path());
+        // The test marks this process's maintenance and flat migration as
+        // complete, so only the snapshot's own check can notice the file's
+        // legacy entry.
+        let layout_key = (
+            storage.path().to_path_buf(),
+            store.effective_storage_harness(),
+        );
+        BACKUP_MAINTENANCE_KEYS
+            .lock()
+            .unwrap()
+            .insert(layout_key.clone());
+        BACKUP_MIGRATION_KEYS.lock().unwrap().insert(layout_key);
+
+        // Between the check of the harness directory and the check of the
+        // root one, another process's root repair moves the entry from root
+        // to harness. Like the real repair, it moves only while it can hold
+        // the namespace exclusively.
+        let harness_entry = storage
+            .path()
+            .join("opencode/backups")
+            .join(BackupStore::path_hash(&key));
+        let mover_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mover_moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (ran, moved) = (Arc::clone(&mover_ran), Arc::clone(&mover_moved));
+        let (storage_path, from, to) = (
+            storage.path().to_path_buf(),
+            root_entry.clone(),
+            harness_entry.clone(),
+        );
+        set_between_legacy_checks_hook_for_tests(storage.path(), move || {
+            ran.store(true, Ordering::SeqCst);
+            let namespace = backup_namespace_file(&storage_path).unwrap();
+            if namespace.try_lock().is_ok() {
+                fs::create_dir_all(to.parent().unwrap()).unwrap();
+                fs::rename(&from, &to).unwrap();
+                moved.store(true, Ordering::SeqCst);
+            }
+        });
+
+        store
+            .snapshot(DEFAULT_SESSION_ID, &path, "edit after upgrade")
+            .unwrap();
+        assert!(
+            mover_ran.load(Ordering::SeqCst),
+            "the check reached the seam between its two directory reads"
+        );
+        assert_eq!(
+            store.history(DEFAULT_SESSION_ID, &path).len(),
+            2,
+            "the legacy entry must sit below the new snapshot in one stack"
+        );
+        assert!(!root_entry.exists() && !harness_entry.exists());
+        assert!(
+            !mover_moved.load(Ordering::SeqCst),
+            "no entry may move while the snapshot's check holds the namespace"
+        );
+        store.restore_latest(DEFAULT_SESSION_ID, &path).unwrap();
+        store.restore_latest(DEFAULT_SESSION_ID, &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original content");
+    }
+
+    #[test]
+    fn default_session_snapshot_refuses_while_legacy_entry_cannot_be_moved() {
+        let storage = tempfile::tempdir().unwrap();
+        let (mut store, path, key, root_entry) = legacy_root_history_fixture(storage.path());
+        // Something unrelated already occupies the entry's harness location,
+        // so root repair reports a conflict and leaves the legacy entry in
+        // the root directory.
+        let occupied = storage
+            .path()
+            .join("opencode/backups")
+            .join(BackupStore::path_hash(&key));
+        fs::create_dir_all(&occupied).unwrap();
+        fs::write(occupied.join("keep"), "existing destination").unwrap();
+
+        let recorded = store.snapshot(DEFAULT_SESSION_ID, &path, "edit after upgrade");
+        match &recorded {
+            Err(AftError::IoError { message, .. }) => assert!(
+                message.contains("older history is still in the old layout"),
+                "unexpected snapshot error: {message}"
+            ),
+            other => panic!("the snapshot must refuse, got {other:?}"),
+        }
+        assert!(root_entry.join("meta.json").exists());
+        assert!(
+            !store.default_session_stack_exists(&key),
+            "no default-session stack may be created in front of the legacy entry"
+        );
     }
 
     #[test]
