@@ -289,7 +289,13 @@ Each value is set and read back; a mismatch refuses as `pragma:<name>`.
   `open_existing_until`) checks it before each directory entry of the walk.
   If the deadline passes, the walk stops, its transaction is rolled back, and
   nothing is recorded or released: the result is `Measurement::Owed`. A
-  partial sum is never recorded as a total. The registry keeps its last
+  partial sum is never recorded as a total. A walk that completes is
+  confirmed only by a complete recheck finding the same total, because the
+  measurement's own commit and checkpoint can allocate registry pages. If the
+  deadline stops that recheck, the result is also `Owed`, and the saved total
+  is raised by the growth of the registry's own files since the walk counted
+  them (found by stat, not a walk), so it is never below what the family
+  uses. The registry keeps its last
   complete measurement, which can only overstate usage after deletions, and
   every writer open measures again, so the next writer or the collector's
   next visit repays it. The retention collector uses its pass deadline for
@@ -379,7 +385,8 @@ Tests (`storage_retention::v3_collector_tests`):
 `v3_collector_never_creates_a_registry`,
 `v3_collector_skips_a_family_whose_reservation_lock_is_busy`,
 `v3_collector_resumes_after_the_last_examined_member`,
-`v3_measurement_past_the_deadline_records_nothing_and_is_owed` and
+`v3_measurement_past_the_deadline_records_nothing_and_is_owed`,
+`blob_store::v3::tests::a_recheck_stopped_by_the_deadline_never_saves_a_total_below_usage` and
 `no_production_path_writes_v3_over_a_v0_60_0_floor`.
 
 ## Replay prototype

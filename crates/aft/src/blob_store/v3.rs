@@ -187,18 +187,38 @@ pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<O
             };
             total = total.saturating_add(bytes);
         } else {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                total = total.saturating_add(meta.blocks().saturating_mul(512));
-            }
-            #[cfg(not(unix))]
-            {
-                total = total.saturating_add(meta.len());
-            }
+            total = total.saturating_add(file_allocated(&meta));
         }
     }
     Ok(Some(total))
+}
+
+/// The bytes one non-directory entry is charged in the namespace inventory.
+fn file_allocated(meta: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
+/// The inventory charge of the registry's own files (`members.sqlite` and
+/// its `-wal` and `-shm`), the only files a measurement's commit and
+/// checkpoint change. A few stats, never a walk.
+fn registry_allocated(dir: &Path) -> Result<u64> {
+    let mut total = 0u64;
+    for name in ["members.sqlite", "members.sqlite-wal", "members.sqlite-shm"] {
+        match fs::symlink_metadata(dir.join(name)) {
+            Ok(meta) => total = total.saturating_add(file_allocated(&meta)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -218,11 +238,14 @@ pub(crate) fn set_walk_delay_for_test(delay: Duration) {
 pub enum Measurement {
     /// A complete walk was recorded, with this many allocated bytes.
     Recorded(u64),
-    /// The deadline passed during the walk. Nothing was recorded and no
-    /// reservation was released; the registry keeps its last complete
-    /// measurement, which can only overstate usage after deletions. Every
-    /// writer open measures again, so the next writer (or the collector's
-    /// next visit) repays it.
+    /// The deadline passed before a measurement was confirmed. Either the
+    /// first walk was cut short, and nothing was recorded or released (the
+    /// registry keeps its last complete measurement, which can only overstate
+    /// usage after deletions), or the walk was recorded but the deadline
+    /// stopped the recheck, and the saved total was raised by the registry's
+    /// own growth so it is never below what the family uses. Every writer
+    /// open measures again, so the next writer (or the collector's next
+    /// visit) repays it.
     Owed,
 }
 
@@ -708,13 +731,38 @@ impl<'a> RegistryWriter<'a> {
         // WAL charge. Repeat if the accounting update allocated registry pages.
         let mut connection = self.connection()?;
         checkpoint(&connection)?;
+        // The last total this call committed, with the registry-file bytes the
+        // walk behind it counted.
+        let mut committed: Option<(u64, u64)> = None;
         for _ in 0..8 {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Nothing writes the registry files between this stat and the
+            // walk: this transaction holds the registry's write lock and its
+            // own writes come later.
+            let counted = registry_allocated(&self.dir)?;
             // Dropping the transaction rolls it back: a walk cut short by the
             // deadline records nothing and releases nothing.
             let Some(bytes) = allocated_bytes_until(&self.dir, deadline)? else {
-                return Ok(Measurement::Owed);
+                drop(tx);
+                return match committed {
+                    None => Ok(Measurement::Owed),
+                    Some((bytes, counted)) => {
+                        settle_registry_growth(&mut connection, &self.dir, bytes, counted)
+                    }
+                };
             };
+            #[cfg(test)]
+            let expire_recheck = GROW_AND_EXPIRE_RECHECK.with(|seam| seam.replace(false));
+            #[cfg(test)]
+            if expire_recheck {
+                // Make this commit allocate registry pages the walk did not see.
+                for index in 0..256 {
+                    tx.execute(
+                        "INSERT INTO view_sessions VALUES(?1,'seam',1,1,0)",
+                        [format!("{index:04}{}", "x".repeat(1024))],
+                    )?;
+                }
+            }
             if let Some(id) = release {
                 tx.execute(
                     "UPDATE reservations SET state='released',reserved_bytes=0 WHERE id=?1",
@@ -754,11 +802,21 @@ impl<'a> RegistryWriter<'a> {
             )?;
             tx.commit()?;
             checkpoint(&connection)?;
-            // The recorded total came from a complete walk. If the deadline
-            // stops the stability recheck, keep it rather than repeat.
+            committed = Some((bytes, counted));
+            #[cfg(test)]
+            let deadline = if expire_recheck {
+                Some(Instant::now())
+            } else {
+                deadline
+            };
+            // The commit and checkpoint above can allocate registry pages the
+            // walk did not count, so only a complete recheck that finds the
+            // same total confirms it. A recheck the deadline stops is not a
+            // confirmation.
             match allocated_bytes_until(&self.dir, deadline)? {
-                Some(again) if again != bytes => {}
-                _ => return Ok(Measurement::Recorded(bytes)),
+                Some(again) if again == bytes => return Ok(Measurement::Recorded(bytes)),
+                Some(_) => {}
+                None => return settle_registry_growth(&mut connection, &self.dir, bytes, counted),
             }
         }
         Err(Error::Refused("reservation_ledger_unreadable"))
@@ -843,6 +901,54 @@ pub struct Reservation {
     before: u64,
     registry: RegistryIdentity,
 }
+/// After a committed measurement whose recheck the deadline stopped: raises
+/// the saved total by the registry files' growth since the walk counted them,
+/// so it is never below what the family uses, and returns
+/// [`Measurement::Owed`]. Only the registry's own commits and checkpoints change
+/// files while the reservation lock is held, so stats of those files replace
+/// the walk; each correction is itself committed and checkpointed, and the
+/// files are re-stated until that leaves them unchanged.
+fn settle_registry_growth(
+    connection: &mut Connection,
+    dir: &Path,
+    bytes: u64,
+    counted: u64,
+) -> Result<Measurement> {
+    let mut recorded = bytes;
+    for _ in 0..8 {
+        let safe = bytes
+            .saturating_sub(counted)
+            .saturating_add(registry_allocated(dir)?)
+            .max(recorded);
+        if safe == recorded {
+            // No growth since the total last saved: it stands.
+            return Ok(Measurement::Owed);
+        }
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE accounting SET measured_bytes=?1 WHERE singleton=1",
+            [safe],
+        )?;
+        tx.commit()?;
+        checkpoint(connection)?;
+        recorded = safe;
+    }
+    Err(Error::Refused("reservation_ledger_unreadable"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static GROW_AND_EXPIRE_RECHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Test seam: the next deadline-bounded measurement on this thread commits
+/// extra registry pages after its walk, and its recheck finds the deadline
+/// already passed. Its only caller is a unix-only test.
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn grow_and_expire_recheck_for_test() {
+    GROW_AND_EXPIRE_RECHECK.with(|seam| seam.set(true));
+}
+
 fn checkpoint(c: &Connection) -> Result<()> {
     let (busy, _, _): (i64, i64, i64) =
         c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
