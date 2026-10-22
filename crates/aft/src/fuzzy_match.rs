@@ -281,6 +281,12 @@ fn compute_line_offsets(source: &str) -> Vec<usize> {
 }
 
 /// Find all positions where `needle_lines` matches a contiguous sequence in `haystack_lines`.
+///
+/// `compare` must be an equivalence relation on lines (equality of a key such
+/// as the trimmed line). The search is a Knuth-Morris-Pratt scan over lines
+/// that reports every occurrence, overlapping ones included, in ascending
+/// order, so it is linear in haystack plus needle lines. Trying every start
+/// cost haystack lines × needle lines when long runs of lines repeat.
 fn find_line_matches<F>(
     haystack_lines: &[&str],
     needle_lines: &[&str],
@@ -293,18 +299,52 @@ fn find_line_matches<F>(
 where
     F: Fn(&str, &str) -> bool,
 {
+    let compare = |line: &str, expected: &str| {
+        #[cfg(test)]
+        crate::patch::matcher::count_line_comparison(line, expected);
+        compare(line, expected)
+    };
     let mut matches = Vec::new();
-    if needle_lines.len() > haystack_lines.len() {
+    if needle_lines.is_empty() || needle_lines.len() > haystack_lines.len() {
         return matches;
     }
 
-    'outer: for i in 0..=(haystack_lines.len() - needle_lines.len()) {
-        for j in 0..needle_lines.len() {
-            if !compare(haystack_lines[i + j], needle_lines[j]) {
-                continue 'outer;
+    // prefix[i]: length of the longest proper prefix of needle_lines[..=i]
+    // that is also its suffix, under `compare`.
+    let mut prefix = vec![0; needle_lines.len()];
+    for i in 1..needle_lines.len() {
+        let mut matched = prefix[i - 1];
+        loop {
+            if compare(needle_lines[i], needle_lines[matched]) {
+                matched += 1;
+                break;
             }
+            if matched == 0 {
+                break;
+            }
+            matched = prefix[matched - 1];
         }
+        prefix[i] = matched;
+    }
+
+    let mut matched = 0;
+    for (index, line) in haystack_lines.iter().enumerate() {
+        loop {
+            if compare(line, needle_lines[matched]) {
+                matched += 1;
+                break;
+            }
+            if matched == 0 {
+                break;
+            }
+            matched = prefix[matched - 1];
+        }
+        if matched < needle_lines.len() {
+            continue;
+        }
+        matched = prefix[matched - 1];
         // Found a match at line `i` spanning `needle_lines.len()` lines
+        let i = index + 1 - needle_lines.len();
         let byte_start = line_offsets[i];
         let end_line = i + needle_lines.len();
         let byte_end = if end_line < line_offsets.len() {
@@ -743,6 +783,154 @@ mod tests {
             .map(|m| (m.byte_start, m.byte_len, m.pass))
             .collect()
     }
+
+    /// `find_line_matches` as it was before the Knuth-Morris-Pratt scan:
+    /// every start tried in turn. Kept unchanged as the reference result.
+    fn find_line_matches_scan_oracle<F>(
+        haystack_lines: &[&str],
+        needle_lines: &[&str],
+        line_offsets: &[usize],
+        haystack: &str,
+        needle: &str,
+        compare: F,
+        pass: u8,
+    ) -> Vec<FuzzyMatch>
+    where
+        F: Fn(&str, &str) -> bool,
+    {
+        let mut matches = Vec::new();
+        if needle_lines.len() > haystack_lines.len() {
+            return matches;
+        }
+        'outer: for i in 0..=(haystack_lines.len() - needle_lines.len()) {
+            for j in 0..needle_lines.len() {
+                if !compare(haystack_lines[i + j], needle_lines[j]) {
+                    continue 'outer;
+                }
+            }
+            let byte_start = line_offsets[i];
+            let end_line = i + needle_lines.len();
+            let byte_end = if end_line < line_offsets.len() {
+                line_offsets[end_line]
+            } else {
+                haystack.len()
+            };
+            matches.push(boundary_match(haystack, needle, byte_start, byte_end, pass));
+        }
+        matches
+    }
+
+    /// One line pass (2, 3 or 4) returns the same matches, byte ranges
+    /// included, as the old start-by-start scan on generated inputs with
+    /// duplicate, empty and whitespace-only lines, CRLF, and repeated blocks.
+    fn assert_line_pass_matches_scan(seed: u64, pass: u8) {
+        use crate::patch::matcher::line_test_support::{file_lines, pattern_lines};
+        use crate::patch::matcher::reflow_test_support::Rng;
+        let mut rng = Rng::new(seed);
+        let (mut cases_with_matches, mut matches_total) = (0, 0);
+        for case in 0..10_000 {
+            let lines = file_lines(&mut rng);
+            let separator = if rng.below(3) == 0 { "\r\n" } else { "\n" };
+            let mut haystack = lines.join(separator);
+            if rng.below(2) == 0 {
+                haystack.push_str(separator);
+            }
+            let needle = pattern_lines(&mut rng, &lines).join(separator);
+            let haystack_lines: Vec<&str> = haystack.lines().collect();
+            let needle_lines: Vec<&str> = needle.lines().collect();
+            if needle_lines.is_empty() {
+                continue;
+            }
+            let offsets = compute_line_offsets(&haystack);
+            let normalized = |lines: &[&str]| {
+                lines
+                    .iter()
+                    .map(|line| normalize_unicode(line.trim()))
+                    .collect::<Vec<_>>()
+            };
+            let (haystack_normalized, needle_normalized) =
+                (normalized(&haystack_lines), normalized(&needle_lines));
+            let (keys, needle_keys): (Vec<&str>, Vec<&str>) = if pass == 4 {
+                (
+                    haystack_normalized.iter().map(String::as_str).collect(),
+                    needle_normalized.iter().map(String::as_str).collect(),
+                )
+            } else {
+                (haystack_lines.clone(), needle_lines.clone())
+            };
+            let compare: fn(&str, &str) -> bool = match pass {
+                2 => |a, b| a.trim_end() == b.trim_end(),
+                3 => |a, b| a.trim() == b.trim(),
+                _ => |a, b| a == b,
+            };
+            let expected = find_line_matches_scan_oracle(
+                &keys,
+                &needle_keys,
+                &offsets,
+                &haystack,
+                &needle,
+                compare,
+                pass,
+            );
+            let actual = find_line_matches(
+                &keys,
+                &needle_keys,
+                &offsets,
+                &haystack,
+                &needle,
+                compare,
+                pass,
+            );
+            assert_eq!(
+                spans(&actual),
+                spans(&expected),
+                "case {case}: haystack {haystack:?} needle {needle:?}"
+            );
+            cases_with_matches += usize::from(!actual.is_empty());
+            matches_total += actual.len();
+        }
+        assert!(
+            cases_with_matches > 1_000,
+            "only {cases_with_matches} cases matched"
+        );
+        assert!(
+            matches_total > cases_with_matches,
+            "no case had several matches"
+        );
+    }
+
+    #[test]
+    fn rstrip_pass_matches_the_start_by_start_scan() {
+        assert_line_pass_matches_scan(0x11ae_1002, 2);
+    }
+
+    #[test]
+    fn trim_pass_matches_the_start_by_start_scan() {
+        assert_line_pass_matches_scan(0x11ae_1003, 3);
+    }
+
+    #[test]
+    fn unicode_pass_matches_the_start_by_start_scan() {
+        assert_line_pass_matches_scan(0x11ae_1004, 4);
+    }
+
+    // BEGIN line-tier work-bound test
+    /// Every line of a repetitive file matches the needle's lines except its
+    /// last, which differs only in spacing ("ab" for "a b"). Trying every
+    /// start compared 7,000 lines (6,999 equal, then the differing last one)
+    /// at each of 18,001 starts in each line pass. The three line passes together now stay within a small
+    /// multiple of the file plus needle size.
+    #[test]
+    fn line_pass_work_is_linear_on_repetitive_near_misses() {
+        let haystack = "a b\n".repeat(25_000);
+        let needle = "a b\n".repeat(6_999) + "ab";
+        crate::patch::matcher::LINE_MATCH_WORK.with(|work| work.set(0));
+        assert!(find_all_fuzzy(&haystack, &needle).is_empty());
+        let work = crate::patch::matcher::LINE_MATCH_WORK.with(std::cell::Cell::get);
+        let size = haystack.len() + needle.len();
+        assert!(work <= 32 * size, "{work} units of work for {size} bytes");
+    }
+    // END line-tier work-bound test
 
     // BEGIN reflow-work-bound test
     /// A repetitive file whose lines all match the needle's text, but the
