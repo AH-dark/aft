@@ -7,7 +7,8 @@
   ],
   "fenced_files": [
     "crates/aft/src/commands/semantic_search/mod.rs",
-    "crates/aft/src/lib.rs"
+    "crates/aft/src/lib.rs",
+    "crates/aft/src/search_index.rs"
   ],
-  "note": "grep output by file kind (approved design): shared file-kind classifier plus grep's counted kinds, files-first summary, round-robin first page and match-centred windows. Fenced files: lib.rs module registration and semantic_search/mod.rs visibility of snippet_bounds only; aft_search ranked rows must be byte-identical (engine_unwired). Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+  "note": "grep output by file kind (approved design): shared file-kind classifier plus grep's counted kinds, files-first summary, round-robin first page and match-centred windows. Fenced files: lib.rs module registration, semantic_search/mod.rs visibility of snippet_bounds, and search_index.rs's opt-in path-ordered grep scan (aft_search keeps arrival order); aft_search ranked rows must be byte-identical (engine_unwired). Ranking and routing are unchanged; benchmark rows must remain byte-identical."
 }
