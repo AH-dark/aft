@@ -172,6 +172,31 @@ describe("bash wait detach helper", () => {
     }
   });
 
+  test("no active wait result is debug output rather than routine info", async () => {
+    const info = spyOn(logger, "log");
+    const debug = spyOn(logger, "debug");
+    const bridge = {
+      send: async () => ({ success: true, detached: false }),
+    };
+    const pool = {
+      getActiveBridgeForRoot: () => bridge,
+      activeBridges: () => [bridge],
+    };
+    try {
+      await signalBashWaitDetachForProject(
+        pool as unknown as Parameters<typeof signalBashWaitDetachForProject>[0],
+        projectRoot,
+        "session-no-active-wait",
+      );
+      expect(info).not.toHaveBeenCalled();
+      expect(debug).toHaveBeenCalledTimes(1);
+      expect(String(debug.mock.calls[0]?.[0])).toContain("no active wait found");
+    } finally {
+      info.mockRestore();
+      debug.mockRestore();
+    }
+  });
+
   test("root-key miss fans out to every live bridge instead of dropping", async () => {
     const sends: string[] = [];
     const bridgeFor = (label: string) => ({

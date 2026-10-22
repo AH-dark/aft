@@ -13,14 +13,60 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         registry.signal_wait_mode_detach(req.session())
     };
-    // The signal is fire-and-forget from the plugin's user-message hook, so a
-    // silent session mismatch is invisible without this trace: log which
-    // session the signal resolved against and whether a wait was active.
-    crate::slog_info!(
-        "bash_wait_detach: session={} detached={} active_wait_sessions={}",
+    // A message can arrive when no wait is active; keep that routine miss at
+    // debug so INFO remains useful for an actual detached wait.
+    log_detach_outcome(
         req.session(),
         detached,
-        ctx.bash_background().active_wait_session_count()
+        ctx.bash_background().active_wait_session_count(),
     );
     Response::success(&req.id, json!({ "detached": detached }))
+}
+
+fn log_detach_outcome(session: &str, detached: bool, active_wait_sessions: usize) {
+    if detached {
+        crate::slog_info!(
+            "bash_wait_detach: session={} detached={} active_wait_sessions={}",
+            session,
+            detached,
+            active_wait_sessions
+        );
+    } else {
+        crate::slog_debug!(
+            "bash_wait_detach: session={} detached={} active_wait_sessions={}",
+            session,
+            detached,
+            active_wait_sessions
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn no_op_detach_is_debug_logged_while_success_stays_info() {
+        let (_, no_op) = crate::logging::capture_log_lines(|| {
+            super::log_detach_outcome("session", false, 0);
+        });
+        assert!(
+            no_op.iter().any(|line| {
+                line.starts_with("DEBUG ") && line.contains("detached=false")
+            }),
+            "no-op detach was not debug-logged: {no_op:?}"
+        );
+        assert!(
+            !no_op.iter().any(|line| line.starts_with("INFO ")),
+            "no-op detach was info-logged: {no_op:?}"
+        );
+
+        let (_, success) = crate::logging::capture_log_lines(|| {
+            super::log_detach_outcome("session", true, 1);
+        });
+        assert!(
+            success.iter().any(|line| {
+                line.starts_with("INFO ") && line.contains("detached=true")
+            }),
+            "successful detach was not info-logged: {success:?}"
+        );
+    }
 }
