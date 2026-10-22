@@ -1011,6 +1011,12 @@ pub(crate) struct RegistryInner {
     /// pause before any restored command can reach the runner again, and
     /// then starts the workers with `start_held_remote_workers`.
     held_remote_workers: Mutex<Option<Vec<String>>>,
+    /// Set on a registry built by `recover_saved_scope_tasks` only to stop a
+    /// scope's saved tasks. It has no session to deliver to and is detached
+    /// afterwards, so it never queues a completion or cancelled-call notice:
+    /// those go to a project registry that registered the task, or are left
+    /// in the task's record for its project's later replay.
+    saved_task_recovery: AtomicBool,
     pub(crate) completions: Mutex<VecDeque<BgCompletion>>,
     pub(crate) progress_sender: SharedProgressSender,
     watchdog_started: AtomicBool,
@@ -1151,6 +1157,12 @@ pub(crate) struct BgTask {
     /// Serialize terminal notification routing, including watch safety nets.
     /// Delivery acknowledgement remains separate so pending results can replay.
     terminal_notification_routed: Mutex<bool>,
+    /// The project registry whose sessions receive this task's completion
+    /// and cancelled-call notices, when the task is shared between registries
+    /// (see `SavedRemoteTaskClaim`): the first registry that is not a
+    /// `bash.kill_scope` recovery registry to restore or register it. `None`
+    /// for a task only one registry holds; that registry publishes its notices.
+    notice_registry: Mutex<Option<std::sync::Weak<RegistryInner>>>,
     #[cfg(unix)]
     adopted_exit: Mutex<super::exit_observer::AdoptedExit>,
     pub(crate) state: Mutex<BgTaskState>,
@@ -1499,6 +1511,7 @@ impl BgTaskRegistry {
                 retained_scratch: Mutex::new(HashMap::new()),
                 revoked_scopes: Mutex::new(HashSet::new()),
                 held_remote_workers: Mutex::new(None),
+                saved_task_recovery: AtomicBool::new(false),
                 completions: Mutex::new(VecDeque::new()),
                 progress_sender,
                 watchdog_started: AtomicBool::new(false),
@@ -3931,6 +3944,7 @@ impl BgTaskRegistry {
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
             terminal_notification_routed: Mutex::new(false),
+            notice_registry: Mutex::new(None),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             terminal_persist_dirty: AtomicBool::new(false),
@@ -4286,6 +4300,7 @@ impl BgTaskRegistry {
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
             terminal_notification_routed: Mutex::new(false),
+            notice_registry: Mutex::new(None),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             terminal_persist_dirty: AtomicBool::new(false),
@@ -4542,6 +4557,7 @@ impl BgTaskRegistry {
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
             terminal_notification_routed: Mutex::new(false),
+            notice_registry: Mutex::new(None),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             terminal_persist_dirty: AtomicBool::new(false),
@@ -7800,11 +7816,43 @@ impl BgTaskRegistry {
     }
 
     fn index_cancelled_call(&self, session_id: &str, task_id: &str) {
+        match self.notice_target(task_id) {
+            NoticeTarget::Here => self.index_cancelled_call_here(session_id, task_id),
+            NoticeTarget::Elsewhere(registry) => {
+                registry.index_cancelled_call_here(session_id, task_id)
+            }
+            // The notice stays in the task's record, which a later replay of
+            // its project indexes.
+            NoticeTarget::Nowhere => {}
+        }
+    }
+
+    fn index_cancelled_call_here(&self, session_id: &str, task_id: &str) {
         if let Ok(mut tasks) = self.inner.cancelled_call_tasks.lock() {
             tasks
                 .entry(session_id.to_string())
                 .or_default()
                 .insert(task_id.to_string());
+        }
+    }
+
+    /// Which registry publishes `task_id`'s completion and cancelled-call
+    /// notices when this registry records them (see `BgTask::notice_registry`).
+    fn notice_target(&self, task_id: &str) -> NoticeTarget {
+        let publisher = self.task(task_id).and_then(|task| {
+            task.notice_registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+        });
+        match publisher {
+            Some(inner) if !Arc::ptr_eq(&inner, &self.inner) => {
+                NoticeTarget::Elsewhere(BgTaskRegistry { inner })
+            }
+            Some(_) => NoticeTarget::Here,
+            None if self.inner.saved_task_recovery.load(Ordering::Acquire) => NoticeTarget::Nowhere,
+            None => NoticeTarget::Here,
         }
     }
 
@@ -9229,6 +9277,10 @@ impl BgTaskRegistry {
         let mut errors = Vec::new();
         for storage_dir in storage_dirs {
             let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+            registry
+                .inner
+                .saved_task_recovery
+                .store(true, Ordering::Release);
             *registry
                 .inner
                 .held_remote_workers
@@ -9419,6 +9471,13 @@ impl BgTaskRegistry {
             .task(&task_id)
             .ok_or_else(|| format!("{task_id}: restored remote task missing"))?;
         let held = self.hold_remote_worker(&task_id);
+        if !self.inner.saved_task_recovery.load(Ordering::Acquire) {
+            *task
+                .notice_registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Arc::downgrade(&self.inner));
+        }
         claims.insert(
             task_id.clone(),
             SavedRemoteTaskClaim {
@@ -9461,6 +9520,40 @@ impl BgTaskRegistry {
                 .lock()
                 .map_err(|_| "background watchdog lock poisoned")?
                 .insert(task.task_id.clone(), Arc::clone(task));
+        }
+        if self.inner.saved_task_recovery.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // A project registry publishes the task's notices from now on, unless
+        // another project registry already does.
+        let publishes = {
+            let mut publisher = task
+                .notice_registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let taken = publisher
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .is_some();
+            if !taken {
+                *publisher = Some(Arc::downgrade(&self.inner));
+            }
+            !taken
+        };
+        if publishes {
+            // A `bash.kill_scope` recovery registry may have stopped the task
+            // before this registry registered it, and kept no notice of it.
+            // Publish those notices here; the task's routed flag keeps the
+            // completion from being queued twice.
+            let metadata = task
+                .lock_state()
+                .map_err(|_| "background task lock poisoned")?
+                .metadata
+                .clone();
+            if metadata.cancelled_call_unannounced {
+                self.index_cancelled_call_here(&task.session_id, &task.task_id);
+            }
+            self.enqueue_completion_if_needed(&metadata, Some(&task.paths), false);
         }
         Ok(())
     }
@@ -9686,6 +9779,7 @@ impl BgTaskRegistry {
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.finished_at.map(started_instant_from_unix_millis)),
             terminal_notification_routed: Mutex::new(false),
+            notice_registry: Mutex::new(None),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             terminal_persist_dirty: AtomicBool::new(false),
@@ -10664,6 +10758,23 @@ impl BgTaskRegistry {
         // safe; the dedupe-by-queue check stays for the push frame side.
         if !metadata.status.is_terminal() {
             return;
+        }
+        // A task shared with a project registry publishes through it, and a
+        // `bash.kill_scope` recovery registry publishes nothing: it has no
+        // session and is detached afterwards, so a notice queued there (and
+        // the routed flag below, which it would set) would be lost.
+        match self.notice_target(&metadata.task_id) {
+            NoticeTarget::Here => {}
+            NoticeTarget::Elsewhere(registry) => {
+                return registry.enqueue_completion_from_parts(
+                    metadata,
+                    buffer,
+                    paths,
+                    emit_frame,
+                    terminal_render,
+                );
+            }
+            NoticeTarget::Nowhere => return,
         }
 
         let owned_buffer = if buffer.is_none() && metadata.mode != BgMode::Pty {
@@ -12581,6 +12692,17 @@ type PersistedGcSlots = HashMap<PathBuf, PersistedGcSlot>;
 fn persisted_gc_slots() -> &'static Mutex<PersistedGcSlots> {
     static SLOTS: std::sync::OnceLock<Mutex<PersistedGcSlots>> = std::sync::OnceLock::new();
     SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Where a registry sends a task's completion and cancelled-call notices.
+enum NoticeTarget {
+    /// This registry's own queue and index.
+    Here,
+    /// The project registry that shares the task.
+    Elsewhere(BgTaskRegistry),
+    /// Nowhere now: a `bash.kill_scope` recovery registry that shares the
+    /// task with no project registry. The notice stays in the task's record.
+    Nowhere,
 }
 
 /// The one in-memory task for an unfinished saved remote task, shared by
