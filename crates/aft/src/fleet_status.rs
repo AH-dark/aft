@@ -1014,7 +1014,8 @@ mod tests {
     use std::collections::HashSet;
     use subc_protocol::manifest::{ManagementOperation, ManagementOperationKind};
 
-    const FIXTURES: &str = include_str!("../../../.cortexkit/status-line-fixtures-2026-08-14.json");
+    const FIXTURES: &str =
+        include_str!("../tests/fixtures/status_line/status-line-fixtures-2026-08-14.json");
     const PUBLISH_ACK_FIXTURES: [&str; 9] = [
         "publish_aft",
         "supersede_r3",

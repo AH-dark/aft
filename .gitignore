@@ -97,9 +97,6 @@ benchmarks/aft-search/.bench/
 !/.cortexkit/aft.jsonc
 !/.cortexkit/magic-context.jsonc
 !/.cortexkit/prefrontal.jsonc
-# Status-line test fixture that crates/aft compiles in with include_str!
-# (fleet_status.rs and tests/integration/subc_bridge_test.rs).
-!/.cortexkit/status-line-fixtures-2026-08-14.json
 
 # Local investigations can contain private corpus questions, reports and paths.
 /.cortexkit/internal-docs/
