@@ -5478,6 +5478,140 @@ mod grant_path_tests {
         );
     }
 
+    /// Start a background runon whose runner holds admission, and return its
+    /// launch reply (the task id, before Accepted) with the caller's transport
+    /// deadline.
+    #[cfg(unix)]
+    async fn background_admission_reply(
+        daemon: &crate::exec_remote::wire_tests::Daemon,
+        executor: &Arc<Executor>,
+        root: &ProjectRootId,
+    ) -> (BashDeferredCompletion, Instant) {
+        let received = Instant::now();
+        let transport_deadline = received + Duration::from_secs(5);
+        let budget =
+            crate::commands::blocking_wait::ReplyBudget::new(received, Some(transport_deadline));
+        let mut replies = with_bash_timing_for_test(Some(BashTimingForTest::new(received)), || {
+            deadline_test_call_owned(
+                executor,
+                root,
+                remote_runon_stub,
+                json!({"command":"uname -s", "runon":"linux,4c", "background":true}),
+                budget,
+                false,
+            )
+        });
+        wait_for_capture_submission(daemon, &mut replies).await;
+        let reply = tokio::time::timeout(Duration::from_secs(1), replies.recv())
+            .await
+            .expect("background runon must return its task id without waiting for remote admission")
+            .unwrap();
+        assert!(
+            reply.response_for_test().success,
+            "{:?}",
+            reply.response_for_test()
+        );
+        assert!(reply.response_for_test().data["task_id"].is_string());
+        assert!(
+            Instant::now() < transport_deadline,
+            "task id must arrive inside the transport budget"
+        );
+        (reply, transport_deadline)
+    }
+
+    #[cfg(unix)]
+    fn admission_status(ctx: &AppContext, task_id: &str) -> Response {
+        crate::commands::bash_status::handle(
+            &RawRequest {
+                id: "admission-status".into(),
+                command: "bash_status".into(),
+                lsp_hints: None,
+                session_id: Some("deadline-session".into()),
+                params: json!({"task_id":task_id}),
+            },
+            ctx,
+        )
+    }
+
+    /// A kill recorded after the runner received `exec.run` but before it
+    /// accepted the job has no job id to cancel. The worker cancels the call
+    /// itself: a call-key Cancel on the same channel, epoch and correlation as
+    /// the `exec.run`, kept alive by a status round trip so the worker's
+    /// runtime shutting down cannot drop it. Without terminal proof the task
+    /// ends as fate unknown, never as having run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_runon_kill_before_admission_cancels_submission() {
+        use crate::exec_remote::wire_tests::Script;
+        let (daemon, _dir, root, executor, ctx) =
+            capture_fixture(Script::GatedAdmission { refuse: false }).await;
+        let (reply, _) = background_admission_reply(&daemon, &executor, &root).await;
+        let task_id = reply.response_for_test().data["task_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let killed_id = task_id.clone();
+        let kill_ctx = ctx.clone();
+        let killed = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                crate::commands::bash_kill::handle(
+                    &RawRequest {
+                        id: "kill-admission".into(),
+                        command: "bash_kill".into(),
+                        lsp_hints: None,
+                        session_id: Some("deadline-session".into()),
+                        params: json!({"task_id":killed_id}),
+                    },
+                    &kill_ctx,
+                )
+            }),
+        )
+        .await
+        .expect("queued cancellation must not wait for admission")
+        .unwrap();
+        assert!(killed.success, "{killed:?}");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if daemon
+                    .log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(header, _)| header.ty == FrameType::Cancel)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the real client must send a call-key Cancel before receiving a job id");
+        let log = daemon.log.lock().unwrap();
+        let run = log
+            .iter()
+            .find(|(_, body)| body["method"] == "exec.run")
+            .unwrap()
+            .0;
+        let cancel = log
+            .iter()
+            .find(|(header, _)| header.ty == FrameType::Cancel)
+            .unwrap()
+            .0;
+        assert_eq!(
+            (cancel.channel, cancel.epoch, cancel.corr),
+            (run.channel, run.epoch, run.corr)
+        );
+        drop(log);
+        daemon.acceptance_gate.notify_one();
+        let status = admission_status(&ctx, &task_id);
+        assert_eq!(
+            status.data["status"], "fate_unknown",
+            "unsubscribe is not terminal proof: {status:?}"
+        );
+        assert!(!status.data.to_string().contains("admitted"), "{status:?}");
+    }
+
     /// A runner that is slow to accept a job must not hold a foreground call
     /// past its foreground window. The call's `timeout` is ten minutes, so the
     /// wait for the runner's acceptance alone would last a full minute; only

@@ -166,6 +166,10 @@ pub(crate) enum Script {
     /// Like `GatedAcceptance`, but once released the runner accepts the inputs
     /// and then refuses before the command starts.
     GatedAcceptanceThenRefused,
+    /// Hold admission until released, then complete or refuse without running.
+    GatedAdmission {
+        refuse: bool,
+    },
     /// Delay route opening before the client can submit exec.run.
     GatedRoute,
     /// Drop the connection on the first `exec.run`, before any stream record:
@@ -336,7 +340,7 @@ pub(crate) async fn daemon_with_capabilities(
                                 // Drop the connection and listener with the run in flight.
                                 return;
                             }
-                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::DrainingGatedAcceptance) {
+                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) {
                                 let mut accepted = Accepted::new(id(), if let Script::Staged { position, .. } | Script::GatedStages { position } = script { position } else { 1 });
                                 if matches!(script, Script::Windows { acknowledge: true, .. }) {
                                     accepted = accepted.with_platform(Platform::Windows);
@@ -372,7 +376,7 @@ pub(crate) async fn daemon_with_capabilities(
                                     Script::Windows { code: None, .. } => Outcome::OutcomeUnknown,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
-                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
+                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
                             else if attaching && matches!(script, Script::GappedAttach | Script::GappedCancel) { /* output is sent below; completion waits for the test's release */ }
                             else {
                                 if matches!(script, Script::Restart) {
@@ -455,6 +459,76 @@ pub(crate) async fn daemon_with_capabilities(
                     subc_transport::write_frame(&mut *writer.lock().await, &response)
                         .await
                         .unwrap();
+                }
+                if let Script::GatedAdmission { refuse } = script {
+                    if body["method"] == "exec.run" {
+                        let writer = writer.clone();
+                        let gate = server_acceptance_gate.clone();
+                        let stop = stop.clone();
+                        producers.push(tokio::spawn(async move {
+                            gate.notified().await;
+                            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                                return;
+                            }
+                            let records = if refuse {
+                                vec![StreamRecord::Terminal(TerminalRecord::new(
+                                    id(),
+                                    Outcome::RefusedBeforeStart {
+                                        reason: RefusalReason::QueueWaitExceeded,
+                                    },
+                                    0,
+                                    0,
+                                    0,
+                                ))]
+                            } else {
+                                vec![
+                                    StreamRecord::Accepted(Accepted::new(id(), 7)),
+                                    StreamRecord::Output(Output::new(
+                                        0,
+                                        OutputStream::Stdout,
+                                        BytePayload(b"admitted\n".to_vec()),
+                                    )),
+                                    StreamRecord::Terminal(TerminalRecord::new(
+                                        id(),
+                                        Outcome::Exit { code: 0 },
+                                        1,
+                                        0,
+                                        0,
+                                    )),
+                                ]
+                            };
+                            let mut writer = writer.lock().await;
+                            for record in records {
+                                let frame = Frame::build_with_version(
+                                    header.ver,
+                                    FrameType::StreamData,
+                                    header.flags,
+                                    header.channel,
+                                    header.epoch,
+                                    header.corr,
+                                    serde_json::to_vec(&record).unwrap(),
+                                )
+                                .unwrap();
+                                if subc_transport::write_frame(&mut *writer, &frame)
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            let end = Frame::build_with_version(
+                                header.ver,
+                                FrameType::StreamEnd,
+                                header.flags,
+                                header.channel,
+                                header.epoch,
+                                header.corr,
+                                vec![],
+                            )
+                            .unwrap();
+                            let _ = subc_transport::write_frame(&mut *writer, &end).await;
+                        }));
+                    }
                 }
                 if (matches!(
                     script,
