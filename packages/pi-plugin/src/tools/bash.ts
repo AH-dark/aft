@@ -17,6 +17,7 @@ import {
   maxWatchTimeoutMs,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
+  REGEX_WINDOW_SCAN_INCOMPLETE_TEXT,
   refuseAftModuleOptionWithoutFallback,
   resolveWatchTimeoutMs,
   runBashHostFallback,
@@ -466,6 +467,9 @@ interface BashStatusWaited {
   match?: string;
   match_offset?: number;
   match_stream?: "stdout" | "stderr";
+  /** The task exited without a match, but a regex scan dropped older output
+   * from its window, so the non-match is not a complete answer. */
+  scan_incomplete?: boolean;
 }
 
 /**
@@ -1467,6 +1471,9 @@ async function waitForBashStatus(
   };
   // A regex match held back at a page edge, per stream (see the scan below).
   const deferredMatch: Record<OutputStream, boolean> = { output: false, stderr: false };
+  // Set once a regex scan trims older output out of its window; a later
+  // no-match exit then cannot rule out a match longer than the window.
+  let regexWindowDropped = false;
   const bridgeOptions = {
     keepBridgeOnTimeout: true,
     transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
@@ -1546,6 +1553,7 @@ async function waitForBashStatus(
             state.text += chunk.text;
             if (waitFor.kind === "regex") {
               const trimmed = trimWaitScanBuffer(state.text, state.baseOffset, waitFor);
+              if (trimmed.baseOffset !== state.baseOffset) regexWindowDropped = true;
               state.text = trimmed.text;
               state.baseOffset = trimmed.baseOffset;
             }
@@ -1597,7 +1605,10 @@ async function waitForBashStatus(
             taskId,
           );
         }
-        return withWaited(data, waited("exited"));
+        return withWaited(
+          data,
+          waited("exited", regexWindowDropped ? { scan_incomplete: true } : {}),
+        );
       }
 
       // User-message abort: if the user sent a message while we were
@@ -1873,7 +1884,8 @@ function formatWaitSummary(
     return `${waitedText}; the watch was cancelled. The task keeps running.`;
   }
   const exit = typeof details.exit_code === "number" ? `, exit ${details.exit_code}` : "";
-  return `${waitedText}; task exited (${details.status}${exit}).`;
+  const incomplete = waited.scan_incomplete ? ` ${REGEX_WINDOW_SCAN_INCOMPLETE_TEXT}` : "";
+  return `${waitedText}; task exited (${details.status}${exit}).${incomplete}`;
 }
 
 /** Role and resolved sync cap used to word a bash_watch timeout reply. */

@@ -7,6 +7,7 @@ import {
   isBridgeTransportTimeout,
   isTerminalStatus,
   maxWatchTimeoutMs,
+  REGEX_WINDOW_SCAN_INCOMPLETE_TEXT,
   resolveWatchTimeoutMs,
   TERMINAL_SCAN_INCOMPLETE_TEXT,
   taskKillDeadlineText,
@@ -60,6 +61,9 @@ export type BashStatusWaited = {
   match?: string;
   match_offset?: number;
   match_stream?: "stdout" | "stderr";
+  /** The task exited without a match, but a regex scan dropped older output
+   * from its window, so the non-match is not a complete answer. */
+  scan_incomplete?: boolean;
 };
 
 /**
@@ -380,6 +384,7 @@ function formatWatchResultText(
       const stat = String(data.status ?? "unknown");
       const e = typeof data.exit_code === "number" ? `, exit ${data.exit_code}` : "";
       text += `\n${waitedText}; task exited (${stat}${e}).`;
+      if (waited.scan_incomplete) text += ` ${REGEX_WINDOW_SCAN_INCOMPLETE_TEXT}`;
     }
   }
   const preview = data.output_preview as string | undefined;
@@ -459,6 +464,9 @@ export async function waitForBashStatus(
   };
   // A regex match held back at a page edge, per stream (see the scan below).
   const deferredMatch: Record<OutputStream, boolean> = { output: false, stderr: false };
+  // Set once a regex scan trims older output out of its window; a later
+  // no-match exit then cannot rule out a match longer than the window.
+  let regexWindowDropped = false;
   const bridgeOptions: BridgeRequestOptions = {};
   if (waitFor?.kind === "regex") {
     await validateWaitRegex(ctx, runtime, waitFor);
@@ -534,6 +542,7 @@ export async function waitForBashStatus(
             state.text += chunk.text;
             if (waitFor.kind === "regex") {
               const trimmed = trimWaitScanBuffer(state.text, state.baseOffset, waitFor);
+              if (trimmed.baseOffset !== state.baseOffset) regexWindowDropped = true;
               state.text = trimmed.text;
               state.baseOffset = trimmed.baseOffset;
             }
@@ -582,7 +591,10 @@ export async function waitForBashStatus(
           { ctx, directory: projectRootFor(runtime), sessionID: runtime.sessionID },
           taskId,
         );
-        return withWaited(data, waited("exited"));
+        return withWaited(
+          data,
+          waited("exited", regexWindowDropped ? { scan_incomplete: true } : {}),
+        );
       }
       // User-message abort: if the user sent a message while we were
       // blocking, convert this sync wait to an async watch so the agent's

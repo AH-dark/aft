@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { BashOutputPageDecoder } from "../bash-output-page.js";
+import { readFileSync } from "node:fs";
+import {
+  BashOutputPageDecoder,
+  REGEX_WINDOW_SCAN_INCOMPLETE_TEXT,
+  TERMINAL_SCAN_INCOMPLETE_TEXT,
+} from "../bash-output-page.js";
 
 describe("raw output page decoding", () => {
   test("approved decoder retains a split UTF-8 prefix with its byte offset", () => {
@@ -35,5 +40,23 @@ describe("raw output page decoding", () => {
     const decoder = new BashOutputPageDecoder();
     decoder.decode(Buffer.from([0xe2]), 0, false);
     expect(decoder.decode(Buffer.from("new"), 10, true)).toEqual({ text: "new", baseOffset: 10 });
+  });
+});
+
+describe("watch sentences shared with the engine", () => {
+  // The engine's own bash_watch renders these sentences too. Reading the Rust
+  // source keeps the hosts and the engine from drifting apart.
+  const engineWatch = readFileSync(
+    new URL("../../../../crates/aft/src/commands/bash_watch.rs", import.meta.url),
+    "utf8",
+  );
+
+  test("the window-drop sentence is the engine's REGEX_WINDOW_SCAN_INCOMPLETE", () => {
+    const found = /const REGEX_WINDOW_SCAN_INCOMPLETE: &str = "([^"]*)";/.exec(engineWatch);
+    expect(found?.[1]).toBe(REGEX_WINDOW_SCAN_INCOMPLETE_TEXT);
+  });
+
+  test("the mid-drain timeout sentence is the engine's", () => {
+    expect(engineWatch).toContain(`{waited_text}; ${TERMINAL_SCAN_INCOMPLETE_TEXT}`);
   });
 });

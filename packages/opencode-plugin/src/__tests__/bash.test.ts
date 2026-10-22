@@ -11,6 +11,7 @@ import {
   type BridgeRequestOptions,
   BridgeTransportTimeoutError,
   BridgeTransportUnavailableError,
+  REGEX_WINDOW_SCAN_INCOMPLETE_TEXT,
   watchClock,
   watchTimeoutSteer,
 } from "@cortexkit/aft-bridge";
@@ -2004,6 +2005,35 @@ describe("bash_status tool", () => {
     expect(result).not.toContain("matched");
     const real = await watchExitedRegex(acrossFirstPage(" READY", " now\n"), "\\bREADY\\b");
     expect(real).toContain('matched "READY" in stdout at offset 65531');
+  });
+
+  test("a regex match longer than the scan window reports an incomplete scan", async () => {
+    const stdout = Buffer.concat([
+      Buffer.from("BEGIN\n"),
+      Buffer.alloc(200 * 1024, "x"),
+      Buffer.from("\nEND\n"),
+    ]);
+    const result = await watchExitedRegex(stdout, "BEGIN[\\s\\S]*END");
+    expect(result).not.toContain("matched");
+    expect(result).toContain(
+      `task exited (completed, exit 0). ${REGEX_WINDOW_SCAN_INCOMPLETE_TEXT}`,
+    );
+  });
+
+  test("an absent regex is incomplete only when the scan window dropped output", async () => {
+    const large = Buffer.alloc(200 * 1024, "x");
+    expect(await watchExitedRegex(large, "NEVER")).toContain(REGEX_WINDOW_SCAN_INCOMPLETE_TEXT);
+    const small = await watchExitedRegex(Buffer.alloc(1024, "x"), "NEVER");
+    expect(small).toContain("task exited (completed, exit 0).");
+    expect(small).not.toContain("incomplete");
+    // A literal keeps an exact tail, so trimming loses nothing.
+    const { watchTool } = makeCtx(pagedExitedTask(large));
+    const literal = await watchTool.execute(
+      { taskId: "bash-paged-literal", pattern: "NEVER" },
+      createMockSdkContext(),
+    );
+    expect(literal).toContain("task exited (completed, exit 0).");
+    expect(literal).not.toContain("incomplete");
   });
 
   test("a regex match straddling two pages is found once at its offset", async () => {

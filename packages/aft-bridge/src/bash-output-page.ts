@@ -13,6 +13,16 @@ export const TERMINAL_SCAN_INCOMPLETE_TEXT =
   "watch limit reached while scanning captured output. The task already exited; the pattern scan is incomplete. Use a longer watch or paged raw output to inspect the remaining bytes.";
 
 /**
+ * Added to an exited task's no-match watch result when a regex scan had to
+ * drop older output from its 64 KiB window, so the non-match is not a
+ * complete answer. Literal patterns never get it: the tail they keep is
+ * exact. The text is the engine's `REGEX_WINDOW_SCAN_INCOMPLETE` in
+ * `commands/bash_watch.rs`; a bridge test keeps the two identical.
+ */
+export const REGEX_WINDOW_SCAN_INCOMPLETE_TEXT =
+  "The pattern scan is incomplete: no match was found, but output older than the 64 KiB regex scan window was dropped while scanning, so a regex match longer than the window cannot be ruled out. A literal (string) pattern is scanned exactly at any length.";
+
+/**
  * Decodes one stream's raw pages without turning a UTF-8 character split
  * across a page edge into replacement characters. The incomplete tail of a
  * page (at most three bytes) is held back and decoded with the next page;
