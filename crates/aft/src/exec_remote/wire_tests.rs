@@ -166,6 +166,8 @@ pub(crate) enum Script {
     /// Like `GatedAcceptance`, but once released the runner accepts the inputs
     /// and then refuses before the command starts.
     GatedAcceptanceThenRefused,
+    /// Delay route opening before the client can submit exec.run.
+    GatedRoute,
     /// Drop the connection on the first `exec.run`, before any stream record:
     /// the runner never sends `Accepted`, so the caller cannot know the outcome.
     DropBeforeAccepted,
@@ -306,6 +308,15 @@ pub(crate) async fn daemon_with_capabilities(
                 FrameType::Request if header.channel == 0 => match body["op"].as_str() {
                     Some("catalog.list") => replies.push(reply(FrameType::Response, json!({"op":"catalog.list", "generation":1, "subc_ops":["catalog.list"],
                         "modules":[{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":claims, "requires":[]}}]}))),
+                    Some("route.open") if matches!(script, Script::GatedRoute) => {
+                        let frame = reply(FrameType::Response, json!({"op":"route.open", "route_channel":40, "route_epoch":1}));
+                        let writer = writer.clone();
+                        let gate = server_acceptance_gate.clone();
+                        producers.push(tokio::spawn(async move {
+                            gate.notified().await;
+                            let _ = subc_transport::write_frame(&mut *writer.lock().await, &frame).await;
+                        }));
+                    },
                     Some("route.open") => replies.push(reply(FrameType::Response, json!({"op":"route.open", "route_channel":40, "route_epoch":1}))),
                     _ => panic!("unexpected control request {body}"),
                 },

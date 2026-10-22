@@ -5551,6 +5551,73 @@ mod grant_path_tests {
             .is_some_and(|reason| reason.to_ascii_lowercase().contains("unreachable")));
     }
 
+    /// A kill recorded while the background task's worker is still opening
+    /// its runner route (before `exec.run` is sent) ends the task there: the
+    /// worker checks for the cancellation before dispatch and never submits
+    /// the command.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_runon_kill_before_submission_never_dispatches() {
+        use crate::exec_remote::wire_tests::Script;
+        let (daemon, _dir, root, executor, ctx) = capture_fixture(Script::GatedRoute).await;
+        let mut replies = capture_call(
+            &executor,
+            &root,
+            json!({"command":"uname -s", "runon":"linux", "background":true}),
+        );
+        let reply = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+            .await
+            .expect("background launch must not wait for route opening")
+            .unwrap();
+        let task_id = reply.response_for_test().data["task_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let killed_id = task_id.clone();
+        let kill_ctx = ctx.clone();
+        let kill = tokio::task::spawn_blocking(move || {
+            crate::commands::bash_kill::handle(
+                &RawRequest {
+                    id: "kill-before-submit".into(),
+                    command: "bash_kill".into(),
+                    lsp_hints: None,
+                    session_id: Some("deadline-session".into()),
+                    params: json!({"task_id":killed_id}),
+                },
+                &kill_ctx,
+            )
+        });
+        wait_for_task_state(&ctx, "cancel intent before dispatch", |registry| {
+            registry
+                .task_for_test(&task_id)
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .metadata
+                .remote
+                .as_ref()
+                .unwrap()
+                .cancel_requested
+        })
+        .await;
+        daemon.acceptance_gate.notify_one();
+        let killed = tokio::time::timeout(Duration::from_secs(5), kill)
+            .await
+            .expect("cancelled startup must settle once its connection resolves")
+            .unwrap();
+        assert_eq!(killed.data["status"], "killed", "{killed:?}");
+        assert!(
+            !daemon
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, body)| body["method"] == "exec.run"),
+            "a cancellation recorded before submission must prevent exec.run"
+        );
+    }
+
     /// A runner that is slow to accept a job must not hold a foreground call
     /// past its foreground window. The call's `timeout` is ten minutes, so the
     /// wait for the runner's acceptance alone would last a full minute; only
