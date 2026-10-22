@@ -6612,6 +6612,9 @@ pub(super) enum DrainingGate {
     BeforeBudgetCheck,
     /// After the worker decided to resubmit, before it records the dispatch.
     BeforeResubmit,
+    /// After a signer-refusal retry finished waiting out the runner's hint,
+    /// before it rechecks for cancellation and records the resubmission.
+    BeforeHintedResubmit,
 }
 
 type DrainingGateKey = (PathBuf, DrainingGate);
@@ -7820,6 +7823,145 @@ fn precommit_remote_handle_failure_removes_layout() {
         "uncommitted remote layout leaked"
     );
     assert!(registry.list(0).is_empty());
+}
+
+fn signer_retry_script(refusals: u32) -> Script {
+    Script::SignerRefused {
+        refusals,
+        detail: "runner_sign_unavailable",
+        retry_after_ms: Some(2000),
+    }
+}
+
+/// The saved record of a task the owner paused while AFT held back a signer
+/// refusal's resubmission: paused, the pause's cancellation recorded as sent
+/// (the runner had refused the job, so withholding the resubmission was the
+/// whole cancellation), and the runner's refusal kept as the proof that the
+/// command never started.
+fn assert_signer_retry_pause_saved(json: &Path) {
+    assert_saved_paused(json);
+    let remote = read_task(json).unwrap().remote.unwrap();
+    assert!(
+        remote.started.is_none() && !remote.output_received,
+        "{remote:?}"
+    );
+    let refusal = remote
+        .terminal
+        .as_ref()
+        .unwrap_or_else(|| panic!("{remote:?}"));
+    assert_eq!(refusal.ran, Some(Ran::None), "{remote:?}");
+    assert_eq!(refusal.refusal_detail(), Some("runner_sign_unavailable"));
+}
+
+/// The owner pauses a worker whose `runon` task waits out a signer refusal's
+/// retry hint. The worker wakes, sees the cancellation, and must settle the
+/// pause itself without resubmitting, as a draining retry does.
+#[tokio::test]
+async fn bash_kill_scope_settles_while_signer_retry_waits() {
+    let daemon = daemon(signer_retry_script(u32::MAX), "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("signer-wait");
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let first = clock.now();
+    clock.expect_sleep(first, first + 2000).await;
+    assert_pause_settles_promptly(&registry, start_kill_scope(&registry, &scope), &task).await;
+    // The retry clock never moved: cancellation, not the hint, woke the worker.
+    assert_eq!(clock.now(), first);
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    // Give a worker that wrongly kept waiting its chance to resubmit.
+    clock.advance(2000);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_signer_retry_pause_saved(&registry.task(&task).unwrap().paths.json);
+}
+
+/// The pause lands after the signer-retry wait ended but before the worker
+/// records the resubmission. Its recheck there must settle the pause.
+#[tokio::test]
+async fn bash_kill_scope_settles_when_paused_just_before_signer_resubmit() {
+    let daemon = daemon(signer_retry_script(1), "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("signer-resubmit");
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let first = clock.now();
+    clock.expect_sleep(first, first + 2000).await;
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeHintedResubmit);
+    clock.advance(2000);
+    gate.reached().await;
+    let operation = start_kill_scope(&registry, &scope);
+    pause_recorded(&registry, &task).await;
+    gate.release();
+    assert_pause_settles_promptly(&registry, operation, &task).await;
+    assert_eq!(clock.now(), first + 2000);
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_signer_retry_pause_saved(&registry.task(&task).unwrap().paths.json);
+}
+
+/// A signer-refusal retry is not resumable: its wait lives only in the worker,
+/// so a daemon that stops during the wait saves just the runner's refusal.
+/// After a module restart, the owner pauses that saved task. Recovering it
+/// for the pause must neither resubmit it nor leave the pause unsettled. The
+/// scope's saved local command keeps the pause busy long enough for a worker
+/// started during recovery to reach the runner.
+#[tokio::test]
+async fn bash_kill_scope_never_resubmits_a_saved_signer_refusal() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+        signer_retry_script(1),
+        "exec-remote/v1",
+        2,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    let scope = owner_scope("saved-signer-refusal");
+    let original = registry();
+    let task_id =
+        start_scoped_runon_retry(&original, dir.path(), daemon.connection.clone(), &scope);
+    clock.expect_event(DrainingClockEvent::Stopped).await;
+    remote_worker_exited(&task_id).await;
+    let json = original.task(&task_id).unwrap().paths.json.clone();
+    // What survives the stop: the refusal, and no saved retry wait to resume.
+    let saved = read_task(&json).unwrap();
+    assert!(!saved.status.is_terminal(), "{saved:?}");
+    let remote = saved.remote.as_ref().unwrap();
+    assert_eq!(
+        remote
+            .terminal
+            .as_ref()
+            .and_then(|refusal| refusal.ran.clone()),
+        Some(Ran::None),
+        "{saved:?}"
+    );
+    let retry = remote.retry.as_ref().unwrap();
+    assert_eq!(
+        (retry.first_refusal_at_ms, retry.next_retry_at_ms),
+        (None, None),
+        "{saved:?}"
+    );
+    original.detach();
+    let (local_task, local_pid) = start_saved_term_ignoring_task(dir.path(), &scope).await;
+    // The hint has passed by the time the owner pauses the restarted module.
+    clock.advance(2000);
+    let reply = kill_scope_with_saved_tasks(dir.path(), &scope).await;
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        1,
+        "the paused signer refusal was resubmitted: {reply:?}"
+    );
+    assert_saved_pause_reply(&reply, &task_id, &local_task, local_pid).await;
+    assert_signer_retry_pause_saved(&json);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
 }
 
 #[tokio::test]
