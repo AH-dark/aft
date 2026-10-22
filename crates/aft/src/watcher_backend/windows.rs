@@ -120,7 +120,30 @@ impl ProjectWatcher {
         let observed_generation = matcher_generation.load(Ordering::Acquire);
         let counters = crate::context::watcher_counters_for_root(&root);
         counters.set_backend_exclusions(observed_generation, Vec::new(), Vec::new());
+        let targets = project_watch_targets(&root, extra_watch_paths);
+        Self::start(
+            root,
+            targets,
+            WINDOWS_BUFFER_SIZE,
+            tx,
+            matcher_generation,
+            observed_generation,
+            counters,
+        )
+    }
 
+    /// Spawns the completion thread for `targets` and waits until every
+    /// directory read is submitted. `root` names the watch in logs and in the
+    /// rescan event sent after a buffer overflow.
+    fn start(
+        root: PathBuf,
+        targets: Vec<WatchTarget>,
+        buffer_size: usize,
+        tx: mpsc::Sender<notify::Result<Event>>,
+        matcher_generation: Arc<AtomicU64>,
+        observed_generation: u64,
+        counters: Arc<crate::context::WatcherCounters>,
+    ) -> notify::Result<Self> {
         let completion_port = CompletionPort::create()?;
         let thread_port = Arc::clone(&completion_port);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -137,7 +160,8 @@ impl ProjectWatcher {
                 let result = run_completion_loop(
                     thread_port.raw(),
                     root,
-                    extra_watch_paths,
+                    targets,
+                    buffer_size,
                     tx,
                     thread_shutdown,
                     matcher_generation,
@@ -198,6 +222,70 @@ impl Drop for ProjectWatcher {
     }
 }
 
+/// Change notifications for one directory and its immediate children, for
+/// watches that follow a single directory around (the config-file watch).
+/// `watch` replaces the watched directory; `unwatch` stops it whatever path it
+/// names, as on the macOS backend.
+///
+/// It runs on the same completion-port loop as [`ProjectWatcher`] rather than
+/// on notify's Windows watcher. notify 8 stops a read by cancelling it and
+/// closing the directory handle, then waits in an alertable state for the
+/// read's completion routine. A read that had already completed with changes
+/// runs that routine anyway, and it re-arms `ReadDirectoryChangesW` on the
+/// closed handle value. When another thread has just been handed that same
+/// value for a synchronous handle, the re-armed read blocks in the kernel on
+/// that handle, and every later call on it by its owner waits behind it. Here
+/// a read that completes during shutdown may still be re-armed, but on the
+/// watch's own open handle: the loop cancels and drains every pending read
+/// before any handle is closed.
+pub(crate) struct DirectoryWatcher {
+    sender: mpsc::Sender<notify::Result<Event>>,
+    watcher: Option<ProjectWatcher>,
+}
+
+impl DirectoryWatcher {
+    pub(crate) fn new(
+        sender: mpsc::Sender<notify::Result<Event>>,
+        _counters: Arc<crate::context::WatcherCounters>,
+    ) -> Self {
+        Self {
+            sender,
+            watcher: None,
+        }
+    }
+
+    pub(crate) fn watch(&mut self, path: &Path, mode: notify::RecursiveMode) -> notify::Result<()> {
+        debug_assert_eq!(mode, notify::RecursiveMode::NonRecursive);
+        // Stop the previous directory first: its thread and handle end here.
+        self.watcher = None;
+        // Event paths are built from this spelling, as notify built them from
+        // the path it was given.
+        let directory = path.to_path_buf();
+        // These watches see only one directory's entries, so a much smaller
+        // buffer than the project watch's suffices; the network limit is
+        // the largest size every filesystem accepts.
+        let buffer_size = WINDOWS_BUFFER_SIZE.min(WINDOWS_NETWORK_BUFFER_SIZE);
+        self.watcher = Some(ProjectWatcher::start(
+            directory.clone(),
+            vec![(directory, None, false)],
+            buffer_size,
+            self.sender.clone(),
+            // No ignore rules apply here, so the generation never moves, and
+            // the counters stay private: they must not overwrite the project
+            // watcher's backend state for the same root.
+            Arc::new(AtomicU64::new(0)),
+            0,
+            Arc::new(crate::context::WatcherCounters::default()),
+        )?);
+        Ok(())
+    }
+
+    pub(crate) fn unwatch(&mut self, _path: &Path) -> notify::Result<()> {
+        self.watcher = None;
+        Ok(())
+    }
+}
+
 struct DirectoryWatch {
     directory: PathBuf,
     exact_file: Option<PathBuf>,
@@ -217,6 +305,7 @@ impl DirectoryWatch {
         directory: PathBuf,
         exact_file: Option<PathBuf>,
         recursive: bool,
+        buffer_size: usize,
         completion_port: HANDLE,
         completion_key: usize,
     ) -> notify::Result<Self> {
@@ -255,10 +344,8 @@ impl DirectoryWatch {
             exact_file,
             recursive,
             handle,
-            buffer: super::notification_buffer::NotificationBuffer::new(WINDOWS_BUFFER_SIZE),
-            completed_buffer: super::notification_buffer::NotificationBuffer::new(
-                WINDOWS_BUFFER_SIZE,
-            ),
+            buffer: super::notification_buffer::NotificationBuffer::new(buffer_size),
+            completed_buffer: super::notification_buffer::NotificationBuffer::new(buffer_size),
             overlapped: Box::new(OVERLAPPED::default()),
             pending: false,
         })
@@ -321,7 +408,8 @@ impl Drop for DirectoryWatch {
 fn run_completion_loop(
     completion_port: HANDLE,
     root: PathBuf,
-    extra_watch_paths: Vec<PathBuf>,
+    targets: Vec<WatchTarget>,
+    buffer_size: usize,
     tx: mpsc::Sender<notify::Result<Event>>,
     shutdown: Arc<AtomicBool>,
     matcher_generation: Arc<AtomicU64>,
@@ -330,7 +418,7 @@ fn run_completion_loop(
     counters: Arc<crate::context::WatcherCounters>,
     start_tx: mpsc::SyncSender<notify::Result<()>>,
 ) -> notify::Result<()> {
-    let mut watches = match open_watches(completion_port, &root, extra_watch_paths) {
+    let mut watches = match open_watches(completion_port, targets, buffer_size) {
         Ok(watches) => watches,
         Err(error) => {
             let _ = start_tx.send(Err(error));
@@ -460,11 +548,13 @@ fn run_completion_loop(
     loop_result
 }
 
-fn open_watches(
-    completion_port: HANDLE,
-    root: &Path,
-    extra_watch_paths: Vec<PathBuf>,
-) -> notify::Result<Vec<DirectoryWatch>> {
+/// A directory to read changes from: the directory, the one file in it that
+/// matters (`None` for all of them), and whether its subtree is included.
+type WatchTarget = (PathBuf, Option<PathBuf>, bool);
+
+/// The project root recursively, plus each extra path non-recursively: a
+/// directory itself, or a file through its parent directory.
+fn project_watch_targets(root: &Path, extra_watch_paths: Vec<PathBuf>) -> Vec<WatchTarget> {
     let mut targets = vec![(root.to_path_buf(), None, true)];
     let mut seen = BTreeSet::new();
     seen.insert((root.to_path_buf(), None));
@@ -486,12 +576,26 @@ fn open_watches(
             targets.push((directory, exact_file, recursive));
         }
     }
+    targets
+}
 
+fn open_watches(
+    completion_port: HANDLE,
+    targets: Vec<WatchTarget>,
+    buffer_size: usize,
+) -> notify::Result<Vec<DirectoryWatch>> {
     targets
         .into_iter()
         .enumerate()
         .map(|(index, (directory, exact_file, recursive))| {
-            DirectoryWatch::open(directory, exact_file, recursive, completion_port, index + 1)
+            DirectoryWatch::open(
+                directory,
+                exact_file,
+                recursive,
+                buffer_size,
+                completion_port,
+                index + 1,
+            )
         })
         .collect()
 }

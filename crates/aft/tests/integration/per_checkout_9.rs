@@ -1432,8 +1432,14 @@ fn over_cap_parent_names_skipped_and_unindexed_children() {
 }
 
 /// Discovery runs on the session worker, never on the configure path: with
-/// a walk held until the test releases it, the bind still answers promptly.
-/// Queries name discovery as a gap meanwhile; the children appear once it ends.
+/// a walk held until the test releases it, the bind still returns. Queries
+/// name discovery as a gap meanwhile; the children appear once it ends.
+///
+/// The bind runs on its own thread and must return while discovery is still
+/// held. A bind that waited for discovery could never return before the
+/// release, so the deadline only bounds how long the test waits to say so; it
+/// is not a speed bound, which a loaded runner can exceed for reasons that
+/// have nothing to do with discovery.
 #[test]
 fn slow_discovery_never_delays_the_bind() {
     fast_refresh();
@@ -1452,20 +1458,33 @@ fn slow_discovery_never_delays_the_bind() {
         )
         .with_test_checkpoint_store(),
     );
+    let configure = request(json!({
+        "id": "configure-slow-parent",
+        "command": "configure",
+        "harness": "opencode",
+        "project_root": root,
+        "storage_dir": storage,
+        "config": crate::helpers::user_config(config_doc(true, TRIGRAM_ONLY, None)),
+    }));
+    let (bound_tx, bound_rx) = std::sync::mpsc::channel();
     let started = Instant::now();
-    let configured = aft::commands::configure::handle_configure(
-        &request(json!({
-            "id": "configure-slow-parent",
-            "command": "configure",
-            "harness": "opencode",
-            "project_root": root,
-            "storage_dir": storage,
-            "config": crate::helpers::user_config(config_doc(true, TRIGRAM_ONLY, None)),
-        })),
-        &ctx,
-    );
+    let binder = {
+        let ctx = Arc::clone(&ctx);
+        thread::spawn(move || {
+            let _ = bound_tx.send(aft::commands::configure::handle_configure(&configure, &ctx));
+        })
+    };
+    let configured = bound_rx.recv_timeout(DEADLINE).unwrap_or_else(|_| {
+        panic!("the bind did not return within {DEADLINE:?} while discovery was held")
+    });
     let bind = started.elapsed();
+    // The result has arrived, so the binder thread is only returning.
+    binder.join().unwrap();
     assert!(configured.success, "{configured:?}");
+    eprintln!(
+        "parent folder bind with discovery held answered in {} ms",
+        bind.as_millis()
+    );
     aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
     assert!(
         discovery.wait_until_started(DEADLINE),
@@ -1478,15 +1497,6 @@ fn slow_discovery_never_delays_the_bind() {
     assert!(
         gap_kinds(&first).contains(&"parent_discovering".to_string()),
         "{first:#}"
-    );
-    eprintln!(
-        "parent folder bind with discovery held answered in {} ms",
-        bind.as_millis()
-    );
-    assert!(
-        bind < Duration::from_millis(2_000),
-        "the bind waited for discovery: {} ms",
-        bind.as_millis()
     );
     drop(discovery);
     while session.discovery().is_none() {

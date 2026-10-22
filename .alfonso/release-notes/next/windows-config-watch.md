@@ -1,0 +1,1 @@
+- On Windows, stopping or moving a config-file watch no longer occasionally freezes unrelated file operations in the AFT process. AFT now uses its own watcher for config files there.
