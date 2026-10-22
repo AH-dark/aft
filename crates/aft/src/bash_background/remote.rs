@@ -180,6 +180,87 @@ fn retries_draining(remote: &RemoteTask, verdict: &Verdict) -> bool {
         )
 }
 
+/// Refusals AFT resubmits by itself when the runner attaches a retry hint, as
+/// (reason, refusal details). ck-motor hints `runner_authentication_failed`
+/// only while its signer is briefly unavailable or answers badly; the details
+/// that need an operator (a missing signer, a refused grant, bad credentials,
+/// a stopped agent, a broken SSH config) come without a hint and are not
+/// listed. Add a reason or detail here only when the runner guarantees that
+/// such a refusal never ran the command and clears up by itself.
+#[cfg(unix)]
+const HINTED_RETRY_REFUSALS: &[(&str, &[&str])] = &[(
+    "runner_authentication_failed",
+    &["runner_sign_unavailable", "runner_sign_invalid_response"],
+)];
+
+/// The most times AFT resubmits one job after hinted refusals, however long
+/// the runner keeps asking it to retry.
+#[cfg(unix)]
+const HINTED_RETRY_MAX_RESUBMITS: u32 = 5;
+
+/// The runner's retry hint for a refusal AFT may resubmit by itself, or
+/// `None` when the refusal must reach the caller as it is.
+///
+/// The record must say `ran: "none"`: that, with `refused_before_start`, is
+/// the runner's proof that the command never started, so sending it again
+/// cannot run it twice. A missing or unrecognised `ran` could hide a run.
+#[cfg(unix)]
+fn hinted_retry_after_ms(terminal: &TerminalRecord) -> Option<u64> {
+    if terminal.ran != Some(Ran::None) {
+        return None;
+    }
+    let Outcome::RefusedBeforeStart { reason } = &terminal.outcome else {
+        return None;
+    };
+    let reason = String::from(reason.clone());
+    let detail = terminal.refusal_detail()?;
+    let listed = HINTED_RETRY_REFUSALS
+        .iter()
+        .any(|(listed, details)| *listed == reason && details.contains(&detail));
+    if listed {
+        terminal.retry_after_ms
+    } else {
+        None
+    }
+}
+
+/// How long the runner gives a job to be admitted, counted from its first
+/// submission: the request's own queue wait limit, or ck-motor's default when
+/// it names none. Hinted resubmissions must fit inside it.
+#[cfg(unix)]
+fn hinted_retry_budget_ms(_root: &Path, request: &RunRequest) -> u64 {
+    #[cfg(test)]
+    if let Some(ms) = tests::hinted_retry_budget_ms(_root) {
+        return ms;
+    }
+    request.queue_wait_limit_s.map_or_else(
+        || duration_ms(RUNNER_QUEUE_WAIT_LIMIT),
+        |seconds| seconds.saturating_mul(1000),
+    )
+}
+
+/// What the worker that submitted a job keeps for resubmitting it after a
+/// hinted refusal. It lives only in that worker: after a restart a saved
+/// refusal reaches the caller unchanged.
+#[cfg(unix)]
+struct HintedRetry {
+    request: RunRequest,
+    /// When the runner's admission limit for the first submission passes, on
+    /// the retry clock (Unix milliseconds outside tests).
+    deadline_ms: u64,
+    resubmits: u32,
+}
+
+#[cfg(unix)]
+enum HintedRetryStep {
+    /// Report the refusal as it is.
+    Surface,
+    /// The task already reached its terminal state (cancelled, or the
+    /// resubmission could not be sent).
+    Ended,
+    Resubmitted(exec::RemoteStream),
+}
+
 #[cfg(unix)]
 fn draining_delay_ms(attempt: u32, retry_after_ms: Option<u64>) -> u64 {
     retry_after_ms.unwrap_or_else(|| {
@@ -1855,6 +1936,7 @@ impl BgTaskRegistry {
             }
         };
         let mut fallback = None;
+        let mut hinted: Option<HintedRetry> = None;
         if remote.accepted && !platform_acknowledged(&remote) {
             if let Some(job_id) = remote.job_id {
                 let _ = client.cancel_job(job_id).await;
@@ -1898,6 +1980,12 @@ impl BgTaskRegistry {
                     })
                 })
                 .map_err(|e| e.to_string())?;
+                hinted = Some(HintedRetry {
+                    deadline_ms: draining_now_ms(&root)
+                        .saturating_add(hinted_retry_budget_ms(&root, &request)),
+                    request: request.clone(),
+                    resubmits: 0,
+                });
             }
             match client.run(&request).await {
                 Ok(stream) => stream,
@@ -2000,6 +2088,24 @@ impl BgTaskRegistry {
                             continue;
                         }
                         return Ok(());
+                    }
+                    if let Some(retry) = hinted.as_mut() {
+                        match self.hinted_retry(&client, &task, &root, retry).await? {
+                            HintedRetryStep::Resubmitted(next) => {
+                                stream = next;
+                                recovery.resubmitted(
+                                    &task
+                                        .state
+                                        .lock()
+                                        .map_err(|_| "task lock poisoned")?
+                                        .metadata,
+                                );
+                                recovery.reset();
+                                continue;
+                            }
+                            HintedRetryStep::Ended => return Ok(()),
+                            HintedRetryStep::Surface => {}
+                        }
                     }
                     let reason = serde_json::to_value(reason)
                         .unwrap()
@@ -2171,6 +2277,120 @@ impl BgTaskRegistry {
             Err(error) if proves_no_start(&error) => {
                 self.refuse_remote_before_dispatch(task, &error.to_string())?;
                 Ok(None)
+            }
+            Err(error) => Err(format!("remote outcome unknown; not resubmitted: {error}")),
+        }
+    }
+
+    /// Act on a refusal the runner marked transient with a retry hint: wait
+    /// for the hint, then send the same request again. The refusal is reported
+    /// unchanged when it carries no usable hint, the hint is longer than the
+    /// job's admission time left, or the job was already resubmitted
+    /// [`HINTED_RETRY_MAX_RESUBMITS`] times. A kill during the wait ends the
+    /// task at once.
+    async fn hinted_retry(
+        &self,
+        client: &ExecRemoteClient,
+        task: &Arc<BgTask>,
+        root: &Path,
+        retry: &mut HintedRetry,
+    ) -> Result<HintedRetryStep, String> {
+        let (terminal, started) = {
+            let state = task.state.lock().map_err(|_| "task lock poisoned")?;
+            let remote = state
+                .metadata
+                .remote
+                .as_ref()
+                .ok_or("remote record absent")?;
+            (
+                remote.terminal.clone(),
+                remote.started.is_some() || remote.output_received,
+            )
+        };
+        // A `Started` record or any output would show the command did run,
+        // whatever the terminal record says.
+        let Some(terminal) = terminal.filter(|_| !started) else {
+            return Ok(HintedRetryStep::Surface);
+        };
+        let Some(hint) = hinted_retry_after_ms(&terminal) else {
+            return Ok(HintedRetryStep::Surface);
+        };
+        if retry.resubmits >= HINTED_RETRY_MAX_RESUBMITS {
+            return Ok(HintedRetryStep::Surface);
+        }
+        let now = draining_now_ms(root);
+        if hint > retry.deadline_ms.saturating_sub(now) {
+            return Ok(HintedRetryStep::Surface);
+        }
+        let reason = match &terminal.outcome {
+            Outcome::RefusedBeforeStart { reason } => String::from(reason.clone()),
+            _ => String::new(),
+        };
+        crate::slog_info!(
+            "runon: resubmitting job {} after its refusal before start (reason={reason} detail={} retry_after_ms={hint}); resubmission {} of at most {HINTED_RETRY_MAX_RESUBMITS}",
+            terminal.job_id,
+            terminal.refusal_detail().unwrap_or_default(),
+            retry.resubmits + 1,
+        );
+        let until = now.saturating_add(hint);
+        loop {
+            let cancel = task
+                .state
+                .lock()
+                .map_err(|_| "task lock poisoned")?
+                .metadata
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.cancel_requested);
+            if cancel {
+                self.remote_terminal(task, Verdict::Cancelled, None);
+                return Ok(HintedRetryStep::Ended);
+            }
+            let now = draining_now_ms(root);
+            if now >= until {
+                break;
+            }
+            // A kill records its intent before it notifies, and a notification
+            // sent before this wait began is kept, so the check above and this
+            // wait together never miss one.
+            tokio::select! {
+                _ = task.remote_cancel_notify.notified() => {},
+                _ = draining_retry_sleep(root, now, until - now) => {},
+            }
+        }
+        {
+            let mut db = DeferredDbWrites::new(self, task);
+            let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
+            let remote = state
+                .metadata
+                .remote
+                .as_mut()
+                .ok_or("remote record absent")?;
+            if remote.cancel_requested {
+                drop(state);
+                drop(db);
+                self.remote_terminal(task, Verdict::Cancelled, None);
+                return Ok(HintedRetryStep::Ended);
+            }
+            // Clear the refusal before dispatch, as a draining resubmission
+            // does: a crash after this write is ambiguous and must recover by
+            // attach, never by another exec.run.
+            remote.terminal = None;
+            remote.job_id = None;
+            remote.last_seq = None;
+            if let Some(saved) = remote.retry.as_mut() {
+                // Re-attach limits after a restart count from this submission.
+                saved.resubmitted_at_ms = Some(unix_millis());
+            }
+            self.persist_task_locked(task, &state.metadata, &mut db)
+                .map_err(|e| e.to_string())?;
+        }
+        retry.resubmits += 1;
+        match client.run(&retry.request).await {
+            Ok(stream) => Ok(HintedRetryStep::Resubmitted(stream)),
+            Err(error) if proves_no_start(&error) => {
+                self.refuse_remote_before_dispatch(task, &error.to_string())?;
+                Ok(HintedRetryStep::Ended)
             }
             Err(error) => Err(format!("remote outcome unknown; not resubmitted: {error}")),
         }
