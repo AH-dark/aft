@@ -1277,8 +1277,20 @@ pub fn resolve_uninitialized_task_layout(
     }
     if has_directory {
         let task = directory.expect("directory result checked");
-        let control = task.open_dir_at(OsStr::new(CONTROL_DIR))?;
-        let io_dir = task.open_dir_at(OsStr::new(IO_DIR))?;
+        let control = match task.open_dir_at(OsStr::new(CONTROL_DIR)) {
+            Ok(control) => control,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(task_layout_not_found())
+            }
+            Err(error) => return Err(error),
+        };
+        let io_dir = match task.open_dir_at(OsStr::new(IO_DIR)) {
+            Ok(io_dir) => io_dir,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(task_layout_not_found())
+            }
+            Err(error) => return Err(error),
+        };
         let paths = TaskPaths::directory(session_dir.to_path_buf(), task_id);
         return Ok(ResolvedTask {
             paths,
@@ -1966,7 +1978,7 @@ pub fn delete_task_bundle_with_legacy_harness_root(
         return Err(task_layout_not_found());
     };
     if task_layout_entry_exists(&legacy_session_dir, &paths.task_id)? {
-        let resolved = resolve_task_layout(&legacy_session_dir, &paths.task_id)?;
+        let resolved = resolve_task_for_bundle_delete(&legacy_session_dir, paths)?;
         if resolved.paths.layout != paths.layout {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1991,7 +2003,7 @@ fn delete_task_bundle_at_root(paths: &TaskPaths) -> io::Result<()> {
     if paths.layout == TaskLayout::Directory {
         return delete_windows_directory_bundle(paths);
     }
-    let resolved = resolve_task_layout(&paths.session_dir, &paths.task_id)?;
+    let resolved = resolve_task_for_bundle_delete(&paths.session_dir, paths)?;
     if resolved.paths.layout != paths.layout {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1999,6 +2011,42 @@ fn delete_task_bundle_at_root(paths: &TaskPaths) -> io::Result<()> {
         ));
     }
     delete_resolved_task(&resolved)
+}
+
+fn resolve_task_for_bundle_delete(
+    session_dir: &Path,
+    paths: &TaskPaths,
+) -> io::Result<ResolvedTask> {
+    match resolve_task_layout(session_dir, &paths.task_id) {
+        Ok(resolved) => Ok(resolved),
+        Err(error) if is_task_layout_not_found(&error) => {
+            if paths.layout == TaskLayout::Directory {
+                let incomplete = TaskPaths::directory(session_dir.to_path_buf(), &paths.task_id);
+                remove_empty_task_directory(&incomplete)?;
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_empty_task_directory(paths: &TaskPaths) -> io::Result<bool> {
+    if paths.layout != TaskLayout::Directory {
+        return Ok(false);
+    }
+    let _session_lock = lock_session_directory(&paths.session_dir)?;
+    match fs::remove_dir(&paths.dir) {
+        Ok(()) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn task_layout_entry_exists(session_dir: &Path, task_id: &str) -> io::Result<bool> {
@@ -3519,6 +3567,35 @@ extern "system" {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn empty_task_directory_is_classified_and_removed_on_delete() {
+        let storage = tempfile::tempdir().unwrap();
+        let task = super::create_task_layout(
+            storage.path(),
+            "empty-layout",
+            "bash-0000000000000010",
+        )
+        .unwrap();
+        let paths = task.paths.clone();
+        drop(task);
+        std::fs::remove_dir(&paths.control_dir).unwrap();
+        std::fs::remove_dir(&paths.io_dir).unwrap();
+
+        let error = super::resolve_uninitialized_task_layout(
+            &paths.session_dir,
+            &paths.task_id,
+        )
+        .unwrap_err();
+        assert!(
+            super::is_task_layout_not_found(&error),
+            "missing required layout directories were not classified: {error}"
+        );
+        let error = super::delete_task_bundle(&paths).unwrap_err();
+        assert!(super::is_task_layout_not_found(&error));
+        assert!(!paths.dir.exists(), "empty task directory was left behind");
+    }
+
     #[test]
     fn task_session_rmdir_waits_for_creator_with_an_open_session_directory() {
         let storage = tempfile::tempdir().unwrap();

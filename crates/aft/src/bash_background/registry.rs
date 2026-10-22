@@ -18541,6 +18541,54 @@ mod tests {
         assert_eq!(registry.finished_delete_attempt_count(&task_id), 0);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_finished_removes_an_empty_task_directory_without_retrying() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let task_id = "bash-0000000000000020".to_string();
+        let layout = super::super::persistence::create_task_layout(
+            storage.path(),
+            "session",
+            &task_id,
+        )
+        .unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.clone(),
+            "session".into(),
+            "true".into(),
+            storage.path().to_path_buf(),
+            Some(storage.path().to_path_buf()),
+            None,
+            true,
+            false,
+        );
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        metadata.completion_delivered = true;
+        write_task(&layout.paths.json, &metadata).unwrap();
+        registry
+            .insert_rehydrated_task(metadata, layout.paths.clone(), true)
+            .unwrap();
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        std::fs::remove_dir_all(&task.paths.dir).unwrap();
+        std::fs::create_dir(&task.paths.dir).unwrap();
+        let clock_origin = Instant::now();
+        *task.terminal_at.lock().unwrap() = Some(clock_origin);
+
+        registry.cleanup_finished_at(
+            crate::bash_background::watchdog::FINISHED_RETENTION,
+            clock_origin + Duration::from_secs(24 * 60 * 60 + 1),
+        );
+
+        assert!(registry.task_for_session(&task_id, "session").is_none());
+        assert_eq!(registry.finished_delete_attempt_count(&task_id), 0);
+        assert!(!task.paths.dir.exists(), "empty task directory was left behind");
+        assert!(
+            !task.paths.session_dir.exists(),
+            "empty session directory was left behind"
+        );
+    }
+
     #[test]
     fn cleanup_finished_retries_a_transient_bundle_delete_failure() {
         let registry = BgTaskRegistry::default();
