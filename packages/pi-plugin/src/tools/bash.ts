@@ -78,6 +78,14 @@ export function appendBashStreamTail(previous: string, chunk: string): string {
 }
 
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
+/**
+ * Most bytes a held regex match may keep in the scan buffer: the window plus
+ * one 64 KiB bash_status page. The engine's own watch never holds more than
+ * that either (it cuts to its window after every page). A held match that
+ * would need more is let go, the buffer is trimmed as usual, and the trimmed
+ * bytes mark the scan incomplete.
+ */
+const REGEX_WAIT_HELD_MATCH_CAP_BYTES = 2 * REGEX_WAIT_SCAN_WINDOW_BYTES;
 
 /**
  * Decide whether a bash_watch caller should be treated as a delegated worker.
@@ -1815,7 +1823,10 @@ function coerceMatchOffset(value: unknown): number {
 /**
  * Trims the scan buffer to what a later match still needs. `heldAt`, the
  * stream byte offset of a regex match held back at a page edge, keeps that
- * match whole until the next page settles it.
+ * match whole until the next page settles it, as long as the kept text stays
+ * within REGEX_WAIT_HELD_MATCH_CAP_BYTES. An open-ended match (for example
+ * `BEGIN[\s\S]*`) would otherwise pin the buffer start and grow it by a page
+ * on every poll.
  */
 function trimWaitScanBuffer(
   text: string,
@@ -1828,7 +1839,11 @@ function trimWaitScanBuffer(
     pattern.kind === "substring"
       ? substringKeepStart(text, pattern.value)
       : regexKeepStart(text, REGEX_WAIT_SCAN_WINDOW_BYTES);
-  if (heldAt !== undefined && heldAt >= baseOffset) {
+  if (
+    heldAt !== undefined &&
+    heldAt >= baseOffset &&
+    Buffer.byteLength(text, "utf8") - (heldAt - baseOffset) <= REGEX_WAIT_HELD_MATCH_CAP_BYTES
+  ) {
     keepFrom = Math.min(keepFrom, charIndexAtByteOffset(text, heldAt - baseOffset));
   }
   if (keepFrom <= 0) return { text, baseOffset, context };

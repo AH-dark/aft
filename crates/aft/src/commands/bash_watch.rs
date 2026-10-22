@@ -1147,6 +1147,41 @@ mod tests {
     }
 
     #[test]
+    fn approved_open_ended_held_match_does_not_pin_the_engine_scan_buffer() {
+        // BEGIN[\s\S]* reaches the end of every page, so it is held on each
+        // one. The cut after each page depends only on the buffer length,
+        // never on the held match, so the buffer stays bounded.
+        let mut output = b"BEGIN".to_vec();
+        output.extend(std::iter::repeat_n(b'x', 8 * PAGE));
+        let (_dir, mut job) = terminal_watch_with_stdout(&output);
+        job.pattern = Some(regex_pattern(r"BEGIN[\s\S]*"));
+        let snapshot = job
+            .registry
+            .observed_status(&job.task_id, &job.session, 0)
+            .unwrap();
+        let mut stdout = StreamScan::default();
+        let mut stderr = StreamScan::default();
+        for _ in 0..9 {
+            let found = job.scan(
+                job.pattern.as_ref().unwrap(),
+                &snapshot,
+                &mut stdout,
+                &mut stderr,
+            );
+            assert!(found.is_none(), "{found:?}");
+            assert!(
+                stdout.buffer.len() <= PAGE + REGEX_SCAN_CONTEXT_BYTES,
+                "scan buffer grew to {} bytes",
+                stdout.buffer.len()
+            );
+        }
+        let (waited, text) = exited_watch_text(&output, regex_pattern(r"BEGIN[\s\S]*"));
+        assert!(waited.matched.is_none());
+        assert!(waited.scan_incomplete, "{text}");
+        assert!(text.contains(REGEX_WINDOW_SCAN_INCOMPLETE), "{text}");
+    }
+
+    #[test]
     fn approved_regex_match_straddling_two_pages_is_found_once_at_its_offset() {
         let output = across_first_page(b"BOUND", b"ARY-7\nmore\nBOUNDARY-8\n");
         let waited = watch_exited_output(&output, r"BOUNDARY-\d");

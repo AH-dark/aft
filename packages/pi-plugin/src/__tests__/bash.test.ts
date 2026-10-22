@@ -2198,6 +2198,21 @@ describe("bash tool adapter", () => {
     expect(result).not.toContain("incomplete");
   });
 
+  test("an open-ended held match cannot grow the scan buffer past its cap", async () => {
+    // BEGIN[\s\S]* matches up to the end of every page, so each page would
+    // hold it again at the same offset if the hold had no limit.
+    const stdout = Buffer.concat([Buffer.from("BEGIN"), Buffer.alloc(8 * 64 * 1024, "x")]);
+    let largestScan = 0;
+    const result = await watchExitedRegex(stdout, "BEGIN[\\s\\S]*", (params) => {
+      largestScan = Math.max(largestScan, Buffer.byteLength(String(params.text ?? "")));
+      return regexMatchLikeEngine(params);
+    });
+    // The window plus one page, plus at most one context character.
+    expect(largestScan).toBeLessThanOrEqual(2 * 64 * 1024 + 4);
+    expect(result).not.toContain("matched");
+    expect(result).toContain(REGEX_WINDOW_SCAN_INCOMPLETE_TEXT);
+  });
+
   test("a word boundary at a page edge is not a match when the word continues", async () => {
     const result = await watchExitedRegex(acrossFirstPage(" READY", "NESS\n"), "\\bREADY\\b");
     expect(result).not.toContain("matched");
