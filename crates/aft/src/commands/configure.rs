@@ -3230,6 +3230,9 @@ fn handle_configure_prepared(
     ctx: &AppContext,
     prepared: Option<&Config>,
 ) -> Response {
+    // The configuration active before a connect, kept only to recognise a
+    // refused connect that left it in place.
+    let active_before = prepared.is_none().then(|| ctx.config_unpinned());
     if prepared.is_none() {
         ctx.note_connect_started();
     }
@@ -3246,6 +3249,12 @@ fn handle_configure_prepared(
     crate::config_live::finish_configure(ctx, response.success);
     if response.success {
         ctx.retain_cache_recovery_request(req);
+    } else if active_before.is_some_and(|before| Arc::ptr_eq(&before, &ctx.config_unpinned())) {
+        // The refused connect published nothing, so the earlier connect's
+        // request still describes the active configuration. Without a new
+        // stamp every later cache recovery would be dropped as stale and
+        // caches would not restart when their volume returns.
+        ctx.restamp_cache_recovery_request();
     }
     response
 }

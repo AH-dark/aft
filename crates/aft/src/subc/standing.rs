@@ -1520,6 +1520,45 @@ mod tests {
         );
     }
 
+    /// A refused reconnect leaves the earlier configuration active; its cache
+    /// recovery must keep working, so caches stop when the volume goes away and
+    /// restart when it returns.
+    #[cfg(unix)]
+    #[test]
+    fn cache_recovery_still_runs_after_a_refused_reconnect() {
+        let session = BoundCacheSession::start();
+        let active = session.ctx.config();
+        let refused: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "refused-reconnect", "command": "configure", "harness": "opencode",
+            "project_root": session.project, "storage_dir": 7,
+            "cortexkit_user_config_path": session.user_file,
+        }))
+        .unwrap();
+        let response = crate::commands::configure::handle_configure(&refused, &session.ctx);
+        assert!(!response.success, "{response:?}");
+        assert!(
+            Arc::ptr_eq(&active, &session.ctx.config()),
+            "the refused reconnect changed the active configuration"
+        );
+        drop(active);
+
+        let away = session.temp.path().join("cache-volume-unmounted");
+        let now = std::time::Instant::now();
+        std::fs::rename(&session.cache, &away).unwrap();
+        session.refresh(now);
+        assert!(
+            session.ctx.cache_unavailable_reason().is_some(),
+            "the probe did not notice the volume went away"
+        );
+        std::fs::rename(&away, &session.cache).unwrap();
+        session.refresh(now + std::time::Duration::from_secs(61));
+        assert!(
+            session.caches_on(),
+            "the returning volume did not restore the caches (a recovery dropped as stale?): {:?}",
+            session.ctx.cache_unavailable_reason()
+        );
+    }
+
     /// A cache recovery and a reconnect are both route-bind configures on the
     /// actor's Mutating lane. A bind admitted beside a reader runs with only a
     /// shared hold on the epoch gate, but it still marks the actor's writer in

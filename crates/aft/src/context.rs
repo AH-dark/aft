@@ -8756,6 +8756,18 @@ impl AppContext {
         self.connect_generation.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// A connect was refused and the configuration it would have replaced
+    /// stays active: give that configuration's retained request the current
+    /// connect generation, so later cache recoveries re-run it again. Work
+    /// queued before the refused connect keeps the older generation and is
+    /// still dropped.
+    pub(crate) fn restamp_cache_recovery_request(&self) {
+        let generation = self.connect_generation();
+        if let Some((_, _, stamped)) = self.cache_recovery.lock().as_mut() {
+            *stamped = generation;
+        }
+    }
+
     pub(crate) fn connect_generation(&self) -> u64 {
         self.connect_generation.load(Ordering::SeqCst)
     }
