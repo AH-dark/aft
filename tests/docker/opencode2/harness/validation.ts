@@ -667,7 +667,7 @@ export async function deriveListSurfaces(repoRoot: string): Promise<ListSurface[
     }
     const unit = body.match(/unit:\s*Unit::([A-Za-z]+)/)?.[1]?.toLowerCase();
     const narrowBody = body.match(/narrow:\s*&\[(?<narrow>[^\]]*)\]/)?.groups?.narrow;
-    const reasons = [...body.matchAll(/reason:\s*Reason::(Cap|Depth|Budget|Walk)/g)].map((match) =>
+    const reasons = [...body.matchAll(/reason:\s*Reason::(Cap|Depth|Budget|Walk|Kind)/g)].map((match) =>
       match[1].toLowerCase(),
     );
     if (unit === undefined || narrowBody === undefined) {

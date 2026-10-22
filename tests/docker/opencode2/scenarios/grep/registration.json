@@ -245,7 +245,7 @@
           "call_id": "grep-t6-grep-payload-matches-incomplete",
           "fixture": "incomplete",
           "triggered_reason": "cap",
-          "expected_trailer": "shown 100 of ≥101 rows (cap) · narrow: offset, path, include, exclude"
+          "expected_trailer": "shown 40 of 140 rows (cap) · narrow: offset, path, include"
         }
       }
     }
