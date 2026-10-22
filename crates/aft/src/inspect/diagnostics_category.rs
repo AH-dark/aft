@@ -165,6 +165,7 @@ struct DiagnosticsCollection {
     /// change the warm working set's diagnostics authority rules.
     producer_failure_files: HashMap<ServerKey, Vec<PathBuf>>,
     producer_notes: BTreeSet<String>,
+    producer_authority: Vec<(String, PathBuf, String)>,
     /// Servers with a root marker but no file to analyze, keyed by server id.
     /// Informational only: an inapplicable server is neither a failure nor a
     /// gap, so it never makes the payload incomplete.
@@ -203,10 +204,14 @@ struct DiagnosticsCollection {
 ///
 /// The authority halves differ by design. An unscoped request makes a
 /// full-root claim. Rust needs current reports or a completed current compiler
-/// check; an idle pre-begin Current state is not check authority. Non-Rust
-/// producers retain the settlement contract: an authoritative report or a
+/// check; an idle pre-begin Current state is not check authority. Pyright and
+/// basedpyright require an END after publications from an announced/begun run.
+/// A short analysis with no run can settle a post-input publication after that
+/// publication's two-second grace. Clients that never report progress disclose
+/// the separate first_publish_no_analysis_progress rule.
+/// Other producers retain the settlement contract: an authoritative report or a
 /// non-warming successful client certifies the warm working set, not unopened
-/// files. This applies to TypeScript, Biome, oxlint, pyright, YAML and bash.
+/// files. This applies to TypeScript, Biome, oxlint, YAML and bash.
 /// A scoped request
 /// makes per-file claims: every scoped file must either carry an
 /// authoritative producer report or appear as a named gap, because a
@@ -321,6 +326,25 @@ pub(crate) fn run_diagnostics_category(
         .iter()
         .map(|(server, reason)| ((server_id(server), server.root.clone()), reason.clone()))
         .collect();
+    for key in expected_producers {
+        if let Some(authority) = ctx.lsp().analysis_progress_authority(key) {
+            collection.producer_authority.push((
+                server_id(key),
+                key.root.clone(),
+                authority.to_string(),
+            ));
+            let explanation = if authority == "document_pull" {
+                "file authority comes from its document diagnostic response; no timing grace"
+            } else {
+                "post-input publications can settle after a 2s no-run grace; announced or begun runs require END after publication"
+            };
+            collection.producer_notes.insert(format!(
+                "{} @ {}: diagnostics authority={authority} ({explanation})",
+                server_id(key),
+                display_root(snapshot, &key.root)
+            ));
+        }
+    }
     // A producer whose `cargo check` was still running is not indexing. Its
     // gap moves from `indexing_gaps` to `checking_producers`, so it is not
     // treated as a warming server, whose provisional rows would be shown.
@@ -460,6 +484,35 @@ pub(crate) fn run_diagnostics_category(
     collection.sort_and_dedup();
 
     if let Some((candidates, _)) = &scoped {
+        // A registered document pull certifies only its own scoped file. Other
+        // open files may still have workspace progress; that cannot downgrade
+        // successful file pulls or certify any unrequested file.
+        {
+            let lsp = ctx.lsp();
+            for key in expected_producers {
+                if lsp.analysis_progress_authority(key) != Some("document_pull") {
+                    continue;
+                }
+                let files = candidates
+                    .files
+                    .iter()
+                    .filter(|file| {
+                        producer_keys_for_file(file, &snapshot.config, &snapshot.project_root)
+                            .contains(key)
+                    })
+                    .collect::<Vec<_>>();
+                if !files.is_empty()
+                    && files
+                        .iter()
+                        .all(|file| lsp.analysis_progress_certifies_file(key, file))
+                {
+                    let producer = (server_id(key), key.root.clone());
+                    collection.indexing_gaps.remove(&producer);
+                    collection.servers_pending.remove(&producer);
+                }
+            }
+            collection.producers_settled = collection.servers_pending.is_empty();
+        }
         collection.apply_scope(scope);
         collection.scope_walk_truncated = !candidates.walk_complete;
         collection.record_scope_coverage_gaps(ctx, snapshot, &candidates.files, sweep.as_ref());
@@ -471,6 +524,16 @@ pub(crate) fn run_diagnostics_category(
             .iter()
             .map(|gap| gap.file.clone())
             .collect::<HashSet<_>>();
+        // Warm storage can retain a prior certificate for feedback, but a fresh
+        // scoped reply must not label a cached, unanswered file as complete.
+        for row in &mut collection.diagnostics {
+            row.provisional |= uncovered.contains(&row.diagnostic.file);
+        }
+        for (_, _, rows) in &mut collection.producer_reports {
+            for row in rows {
+                row.provisional |= uncovered.contains(&row.diagnostic.file);
+            }
+        }
         let saved_file_count = collection.saved_files.len();
         let saved_files = collection.saved_files.clone();
         let mut payload = collection.into_payload(snapshot);
@@ -534,10 +597,12 @@ fn collect_warm_working_set(
                 .as_ref()
                 .is_some_and(|files| files.contains(&file))
     };
-    let replaced_by_typescript_request = |server: &ServerKey, file: &Path| {
-        sweep
-            .and_then(|sweep| sweep.typescript_reports.get(file))
-            .is_some_and(|(key, _)| key == server)
+    let replaced_by_scoped_request = |server: &ServerKey, file: &Path| {
+        sweep.is_some_and(|sweep| {
+            sweep
+                .requested_reports
+                .contains_key(&(file.to_path_buf(), server.clone()))
+        })
     };
     {
         let mut lsp = ctx.lsp();
@@ -549,7 +614,7 @@ fn collect_warm_working_set(
         collection.producer_reports = lsp
             .authoritative_diagnostic_reports()
             .filter(|(server, file, _)| {
-                !replaced_by_typescript_request(server, file)
+                !replaced_by_scoped_request(server, file)
                     && accepts_file(file)
                     && !tsconfig_membership.should_skip_diagnostics(file)
             })
@@ -648,7 +713,7 @@ fn collect_warm_working_set(
             !producers.is_empty() && collection.servers_pending.is_empty();
         collection.diagnostics = lsp
             .current_diagnostic_reports()
-            .filter(|(server, file, _)| !replaced_by_typescript_request(server, file))
+            .filter(|(server, file, _)| !replaced_by_scoped_request(server, file))
             .flat_map(|(_, _, entry)| {
                 entry
                     .diagnostics
@@ -662,7 +727,7 @@ fn collect_warm_working_set(
     }
 
     if let Some(sweep) = sweep {
-        for (file, (server, result)) in &sweep.typescript_reports {
+        for ((file, server), result) in &sweep.requested_reports {
             if !accepts_file(file) || tsconfig_membership.should_skip_diagnostics(file) {
                 continue;
             }
@@ -984,21 +1049,31 @@ impl DiagnosticsCollection {
             } else {
                 scoped_file_coverage(ctx, &snapshot.config, file)
             };
-            if let Some((key, result)) = sweep
+            let requested = sweep
                 .filter(|_| !matches!(coverage, ScopedFileCoverage::ExcludedByTsconfig))
-                .and_then(|sweep| sweep.typescript_reports.get(file))
-            {
-                if let Err(failure) = result {
-                    self.scope_coverage_gaps.push(ScopedCoverageGap {
-                        file: file.clone(),
-                        reason: "the reporting LSP server has not answered the diagnostics request for this file",
-                        cause: CoverageCause {
-                            producer: Some(server_id(key)), root: Some(key.root.clone()), reason: failure.to_string(),
-                        },
-                    });
+                .map(|sweep| {
+                    sweep
+                        .requested_reports
+                        .iter()
+                        .filter(|((requested, _), _)| requested == file)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !requested.is_empty() {
+                for ((_, key), result) in requested {
+                    if let Err(reason) = result {
+                        self.scope_coverage_gaps.push(ScopedCoverageGap {
+                            file: file.clone(),
+                            reason: "the reporting LSP server has not answered the diagnostics request for this file",
+                            cause: CoverageCause {
+                                producer: Some(server_id(key)), root: Some(key.root.clone()), reason: reason.clone(),
+                            },
+                        });
+                    }
                 }
-                // A successful synchronous answer certifies this file even if
-                // its last push was empty, partial, or has not arrived yet.
+                // A successful explicit answer certifies this file even if its
+                // last push was empty, partial, or has not arrived yet. Every
+                // failed producer still leaves a coverage gap for this file.
                 continue;
             }
             // A report published while `cargo check` was still running lacks
@@ -1029,10 +1104,16 @@ impl DiagnosticsCollection {
             }
             // Rust pushes in pull mode carry only compiler results, and
             // TypeScript pushes can carry only syntax results. Neither answers
-            // an explicit diagnostics request that failed during this sweep.
-            if let Some((key, reason)) = sweep
-                .and_then(|sweep| sweep.unanswered.get(file))
-                .filter(|(key, _)| matches!(key.kind, ServerKind::Rust | ServerKind::TypeScript))
+            // a failed explicit request. Python likewise cannot substitute a
+            // cached pre-open certificate for an unanswered new open.
+            if let Some((key, reason)) =
+                sweep
+                    .and_then(|sweep| sweep.unanswered.get(file))
+                    .filter(|(key, reason)| {
+                        matches!(key.kind, ServerKind::Rust | ServerKind::TypeScript)
+                            || reason.starts_with("analysis_progress_pending:")
+                            || ctx.lsp().analysis_progress_authority(key).is_some()
+                    })
             {
                 self.scope_coverage_gaps.push(ScopedCoverageGap {
                     file: file.clone(),
@@ -1342,6 +1423,15 @@ impl DiagnosticsCollection {
                     })
                     .collect(),
             );
+        }
+        for (producer, root, rule) in self.producer_authority {
+            let authority = &mut payload["by_producer"][&producer]["authority"];
+            if !authority.is_array() {
+                *authority = serde_json::json!([]);
+            }
+            authority.as_array_mut().unwrap().push(serde_json::json!({
+                "root": display_root(snapshot, &root), "rule": rule, "no_progress_grace_ms": if rule == "document_pull" { 0 } else { 2000 },
+            }));
         }
         payload
     }
@@ -1722,15 +1812,15 @@ mod payload_count_tests {
             std::fs::write(file, "export const broken: number = \"wrong\";\n").unwrap();
             let mut diagnostic = collection().diagnostics.remove(0).diagnostic;
             diagnostic.file = file.clone();
-            sweep.typescript_reports.insert(
-                file.clone(),
+            sweep.requested_reports.insert(
                 (
+                    file.clone(),
                     ServerKey {
                         kind: ServerKind::TypeScript,
                         root: external.clone(),
                     },
-                    Ok(vec![diagnostic]),
                 ),
+                Ok(vec![diagnostic]),
             );
         }
         let ctx = crate::context::AppContext::new(
@@ -1750,7 +1840,9 @@ mod payload_count_tests {
     fn typescript_sync_excluded_external_report_keeps_exclusion_gap() {
         let (_temp, ctx, snapshot, included, excluded, mut sweep) =
             typescript_sync_exclusion_fixture();
-        sweep.typescript_reports.remove(&included);
+        sweep
+            .requested_reports
+            .retain(|(file, _), _| file != &included);
         let files = [excluded.clone()];
         let mut collected =
             super::collect_warm_working_set(&ctx, &snapshot, &[], None, Some(&files), Some(&sweep));
@@ -1787,6 +1879,59 @@ mod payload_count_tests {
             "{payload:#}"
         );
         assert_eq!(payload["items"].as_array().unwrap().len(), 1, "{payload:#}");
+    }
+
+    #[test]
+    fn scoped_request_reports_share_authority_for_typescript_and_python() {
+        let (_temp, ctx, snapshot, included, excluded, mut sweep) =
+            typescript_sync_exclusion_fixture();
+        let python = snapshot.project_root.join("broken.py");
+        std::fs::write(&python, "value: int = 'wrong'\n").unwrap();
+        let key = ServerKey {
+            kind: ServerKind::Python,
+            root: snapshot.project_root.clone(),
+        };
+        let mut diagnostic = collection().diagnostics.remove(0).diagnostic;
+        diagnostic.file = python.clone();
+        ctx.lsp()
+            .diagnostics_store_mut_for_test()
+            .publish(key.clone(), python.clone(), Vec::new());
+        sweep
+            .requested_reports
+            .insert((python.clone(), key.clone()), Ok(vec![diagnostic]));
+        let files = [included.clone(), excluded.clone(), python.clone()];
+        let mut collected =
+            super::collect_warm_working_set(&ctx, &snapshot, &[], None, Some(&files), Some(&sweep));
+        collected.record_scope_coverage_gaps(&ctx, &snapshot, &files, Some(&sweep));
+        assert_eq!(collected.diagnostics.len(), 2);
+        assert_eq!(collected.producer_reports.len(), 2);
+        assert!(collected
+            .producer_reports
+            .iter()
+            .all(|(_, file, _)| file != &excluded));
+        assert_eq!(collected.scope_coverage_gaps.len(), 1);
+        assert_eq!(collected.scope_coverage_gaps[0].file, excluded);
+
+        // A failed new pull cannot borrow the old clean push, even while the
+        // TypeScript answer for another file is successful.
+        sweep
+            .requested_reports
+            .insert((python.clone(), key), Err("python pull timed out".into()));
+        let files = [included, python.clone()];
+        let mut collected =
+            super::collect_warm_working_set(&ctx, &snapshot, &[], None, Some(&files), Some(&sweep));
+        collected.record_scope_coverage_gaps(&ctx, &snapshot, &files, Some(&sweep));
+        assert_eq!(collected.producer_reports.len(), 1);
+        assert_eq!(collected.scope_coverage_gaps.len(), 1);
+        assert_eq!(collected.scope_coverage_gaps[0].file, python);
+        assert_eq!(
+            collected.scope_coverage_gaps[0].cause.producer.as_deref(),
+            Some("python")
+        );
+        assert_eq!(
+            collected.scope_coverage_gaps[0].cause.reason,
+            "python pull timed out"
+        );
     }
 
     #[test]

@@ -37,6 +37,14 @@ fn write_request(writer: &mut impl Write, id: i64, method: &str, params: Value) 
     )
 }
 
+fn record_pull_event(event: &str) -> io::Result<()> {
+    if let Some(path) = std::env::var_os("AFT_FAKE_LSP_DYNAMIC_PULL_LOG") {
+        let mut log = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(log, "{event}")?;
+    }
+    Ok(())
+}
+
 fn request_position(params: &Option<Value>) -> (u64, u64) {
     let line = params
         .as_ref()
@@ -591,6 +599,11 @@ pub(crate) fn main() -> io::Result<()> {
     let mut check_completed = false;
     // Open documents with their latest version and the diagnostics the fake
     // last published for them from its own analysis, for the emulated check.
+    let mut analysis_opens = 0usize;
+    let dynamic_pull = std::env::var_os("AFT_FAKE_LSP_DYNAMIC_PULL").is_some();
+    let mut client_dynamic_pull = false;
+    let mut client_disables_pull = false;
+    let mut diagnostic_registered = false;
     let mut open_documents: std::collections::BTreeMap<String, (Value, Value)> =
         std::collections::BTreeMap::new();
     // Files the last emulated check found a compiler error in. Like
@@ -796,6 +809,9 @@ pub(crate) fn main() -> io::Result<()> {
                     //   (no env)                           → push-only with watched-files support
                     let pull_enabled =
                         std::env::var("AFT_FAKE_LSP_PULL").ok().as_deref() == Some("1");
+                    client_disables_pull = params.as_ref().and_then(|p| p.pointer("/initializationOptions/disablePullDiagnostics")).and_then(Value::as_bool) == Some(true);
+                    client_dynamic_pull = !client_disables_pull && params.as_ref().and_then(|p| p.pointer("/capabilities/textDocument/diagnostic/dynamicRegistration")).and_then(Value::as_bool) == Some(true);
+                    if dynamic_pull { record_pull_event(&format!("initialize dynamic={client_dynamic_pull} disabled={client_disables_pull}"))?; }
                     workspace_root = params
                         .as_ref()
                         .and_then(|value| value.get("rootUri"))
@@ -1084,6 +1100,17 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                 }
                 "textDocument/diagnostic" => {
+                    if dynamic_pull {
+                        record_pull_event(&format!("pull registered={diagnostic_registered} {}", request_document_uri_string(&params)))?;
+                        if !diagnostic_registered {
+                            write_json_message(&mut writer, &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"document diagnostics were not registered"}}))?;
+                            continue;
+                        }
+                        if open_documents.get(&request_document_uri_string(&params)).is_some_and(|(items, _)| items.as_array().is_some_and(|items| items.is_empty())) {
+                            write_response(&mut writer, id, json!({"kind":"full","resultId":"fake-clean-result","items":[]}))?;
+                            continue;
+                        }
+                    }
                     // LSP 3.17 pull diagnostics. Honor previousResultId for
                     // unchanged-state replies. Fail-mode is controlled by
                     // env var so tests can drive each branch.
@@ -1327,6 +1354,16 @@ pub(crate) fn main() -> io::Result<()> {
             },
             ServerMessage::Notification { method, params } => match method.as_str() {
                 "initialized" => {
+                    if dynamic_pull && client_dynamic_pull {
+                        if let Some(delay) = std::env::var("AFT_FAKE_LSP_REGISTER_DIAGNOSTICS_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+                            std::thread::sleep(std::time::Duration::from_millis(delay));
+                        }
+                        write_request(&mut writer, 22_000, "client/registerCapability", json!({"registrations":[{"id":"fake-python-diagnostics","method":"textDocument/diagnostic","registerOptions":{"documentSelector":null,"identifier":"fake-lsp","interFileDependencies":true,"workspaceDiagnostics":false}}]}))?;
+                    }
+                    if std::env::var("AFT_FAKE_LSP_ANALYSIS_PROGRESS").ok().as_deref() == Some("already_running") {
+                        write_request(&mut writer, 20_000, "window/workDoneProgress/create", json!({"token": 17}))?;
+                        write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": 17, "value": {"kind": "begin", "title": "Analysis"}}))))?;
+                    }
                     let server_status_mode = std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok();
                     if cargo_lock_status_mode() {
                         last_load_stale = cargo_lock_is_stale(workspace_root.as_deref());
@@ -1398,6 +1435,15 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                 }
                 "workspace/didChangeWatchedFiles" => {
+                    if dynamic_pull && diagnostic_registered {
+                        if std::env::var_os("AFT_FAKE_LSP_UNREGISTER_DIAGNOSTICS").is_some() {
+                            write_request(&mut writer, 22_002, "client/unregisterCapability", json!({"unregisterations":[{"id":"fake-python-diagnostics","method":"textDocument/diagnostic"}]}))?;
+                        } else {
+                            for (items, _) in open_documents.values_mut() { *items = json!([]); }
+                            record_pull_event("refresh-requested")?;
+                            write_request(&mut writer, 22_001, "workspace/diagnostic/refresh", json!(null))?;
+                        }
+                    }
                     write_notification(
                         &mut writer,
                         &Notification::new("custom/watchedFilesChanged", params),
@@ -1406,6 +1452,60 @@ pub(crate) fn main() -> io::Result<()> {
                 "textDocument/didOpen" => {
                     let uri = document_uri(&params);
                     let version = document_version(&params);
+                    if dynamic_pull {
+                        if let Some(uri) = uri.as_str() { open_documents.insert(uri.to_string(), (opened_diagnostics(), version.clone())); }
+                        record_pull_event(&format!("open {uri}"))?;
+                        write_publish_diagnostics_versioned(&mut writer, uri.clone(), if client_disables_pull { opened_diagnostics() } else { json!([]) }, version)?;
+                        if client_dynamic_pull && diagnostic_registered { write_request(&mut writer, 22_001, "workspace/diagnostic/refresh", json!(null))?; }
+                        continue;
+                    }
+                    if let Ok(mode) = std::env::var("AFT_FAKE_LSP_ANALYSIS_PROGRESS") {
+                        analysis_opens += 1;
+                        if let Some(release) = std::env::var_os("AFT_FAKE_LSP_BEFORE_ANALYSIS_PUBLISH") {
+                            write_custom_notification(&mut writer, "custom/beforeAnalysisPublish", uri.clone(), version.clone())?;
+                            while !std::path::Path::new(&release).exists() { std::thread::sleep(std::time::Duration::from_millis(10)); }
+                        }
+                        if mode == "short_no_publish" && analysis_opens > 1 { continue; }
+                        if mode == "short_runs" && analysis_opens > 1 {
+                            write_publish_diagnostics_versioned(&mut writer, uri, opened_diagnostics(), version)?;
+                            continue;
+                        }
+                        // Model an empty startup report arriving before the
+                        // server's background analysis has even started.
+                        if mode != "end_before_publication" {
+                            write_publish_diagnostics_versioned(&mut writer, uri.clone(), json!([]), version.clone())?;
+                        }
+                        if mode != "already_running" {
+                            write_request(&mut writer, 20_000, "window/workDoneProgress/create", json!({"token": 17}))?;
+                            if mode == "announce_delay" { std::thread::sleep(std::time::Duration::from_millis(2500)); }
+                            write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": 17, "value": {"kind": "begin", "title": "Analysis"}}))))?;
+                        }
+                        if mode == "end_before_publication" {
+                            write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": 17, "value": {"kind": "end"}}))))?;
+                            write_publish_diagnostics_versioned(&mut writer, uri, opened_diagnostics(), version)?;
+                            continue;
+                        }
+                        if mode == "new_begin" {
+                            write_publish_diagnostics_versioned(&mut writer, uri.clone(), opened_diagnostics(), version.clone())?;
+                            write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": "next", "value": {"kind": "begin", "title": "Analysis"}}))))?;
+                            write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": 17, "value": {"kind": "end"}}))))?;
+                            std::thread::sleep(std::time::Duration::from_millis(600));
+                            write_publish_diagnostics_versioned(&mut writer, uri, changed_diagnostics(), version)?;
+                            write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": "next", "value": {"kind": "end"}}))))?;
+                            continue;
+                        }
+                        if mode != "never" {
+                            if let Some(release) = std::env::var_os("AFT_FAKE_LSP_ANALYSIS_RELEASE_FILE") {
+                                while !std::path::Path::new(&release).exists() {
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                                }
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(600));
+                            write_publish_diagnostics_versioned(&mut writer, uri, opened_diagnostics(), version)?;
+                            write_notification(&mut writer, &Notification::new("$/progress", Some(json!({"token": 17, "value": {"kind": "end"}}))))?;
+                        }
+                        continue;
+                    }
                     if let Some(uri) = uri.as_str() {
                         open_documents
                             .insert(uri.to_string(), (opened_diagnostics(), version.clone()));
@@ -1517,6 +1617,12 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                 }
                 "textDocument/didChange" => {
+                    if dynamic_pull && client_dynamic_pull {
+                        let uri = document_uri(&params);
+                        if let Some(uri) = uri.as_str() { open_documents.insert(uri.into(), (changed_diagnostics(), document_version(&params))); }
+                        write_request(&mut writer, 22_001, "workspace/diagnostic/refresh", json!(null))?;
+                        continue;
+                    }
                     if let Some(path) = std::env::var_os("AFT_FAKE_LSP_DID_CHANGE_LOG") {
                         let mut log = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
                         writeln!(log, "{}", serde_json::to_string(&params)?)?;
@@ -1613,7 +1719,17 @@ pub(crate) fn main() -> io::Result<()> {
                 "exit" => break,
                 _ => {}
             },
-            ServerMessage::Response(_) => {}
+            ServerMessage::Response(response) => {
+                if dynamic_pull && response.id == RequestId::Int(22_000) && response.error.is_none() {
+                    diagnostic_registered = true;
+                    record_pull_event("register-accepted")?;
+                }
+                if dynamic_pull && response.id == RequestId::Int(22_002) && response.error.is_none() {
+                    diagnostic_registered = false;
+                    record_pull_event("unregister-accepted")?;
+                    write_notification(&mut writer, &Notification::new("custom/diagnosticsUnregistered", None))?;
+                }
+            }
         }
     }
 

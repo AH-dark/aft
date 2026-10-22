@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use aft::commands::configure::handle_configure;
 use aft::commands::delete_file::handle_delete_file;
 use aft::commands::lsp_diagnostics::handle_lsp_diagnostics;
 use aft::commands::move_file::handle_move_file;
@@ -232,28 +233,40 @@ fn pyright_extra_paths_workspace() -> (tempfile::TempDir, PathBuf, PathBuf, Stri
     (temp_dir, root, source, source_text)
 }
 
+/// An `AppContext` whose language servers use `config`, with private storage.
+fn pyright_context(config: &Config) -> AppContext {
+    AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(config.clone()),
+    )
+    .with_test_checkpoint_store()
+}
+
+/// Diagnostics for `file` as an edit that asks for them receives them.
+///
+/// Pyright registers `textDocument/diagnostic` dynamically once AFT offers
+/// dynamic registration, and from then on it sends no `publishDiagnostics`
+/// for open documents: the client has to ask. So this goes through
+/// `AppContext::lsp_notify_and_collect_diagnostics`, the path an edit with
+/// `diagnostics: true` uses, which pulls before it waits. A bare
+/// `LspManager` wait only watches for pushed reports and times out.
 fn pyright_diagnostics_for(
     file: &std::path::Path,
     source_text: &str,
     config: &Config,
 ) -> Vec<StoredDiagnostic> {
-    let mut manager = LspManager::new();
-    let pre_snapshot = manager.snapshot_pre_edit_state(file);
-    let versions = manager
-        .notify_file_changed_versioned(file, source_text, config)
-        .expect("notify pyright file changed");
+    let ctx = pyright_context(config);
+    // Start the server first so its startup does not use up the edit's
+    // diagnostics budget, which production caps at 10 seconds.
     assert!(
-        !versions.is_empty(),
+        !ctx.lsp()
+            .ensure_server_for_file(file, &ctx.config())
+            .is_empty(),
         "pyright should start for the fixture before diagnostics can be checked"
     );
 
-    let outcome = manager.wait_for_post_edit_diagnostics(
-        file,
-        config,
-        &versions,
-        &pre_snapshot,
-        Duration::from_secs(20),
-    );
+    let outcome =
+        ctx.lsp_notify_and_collect_diagnostics(file, source_text, Duration::from_secs(10));
     assert!(
         outcome.pending_servers.is_empty(),
         "timed out waiting for pyright diagnostics: {:?}",
@@ -419,6 +432,115 @@ fn pyright_uses_nested_workspace_virtualenv_for_imports() {
     assert!(
         !has_fakepkg_missing_import(&diagnostics),
         "Pyright should resolve packages from the nested workspace virtualenv: {diagnostics:?}"
+    );
+}
+
+/// Pyright stops pushing diagnostics for open documents once it has
+/// registered for pull requests. An edit that does not ask for diagnostics
+/// (the ordinary write path) must still reach the status bar counts and the
+/// accepted snapshots that feed alerts: AFT pulls in the background after the
+/// change. An edit that asks for diagnostics must receive the new error inline.
+#[test]
+fn pyright_edit_error_reaches_status_bar_alert_source_and_inline_diagnostics() {
+    if !pyright_langserver_available() {
+        eprintln!("skipping pyright edit diagnostics test: pyright-langserver not on PATH");
+        return;
+    }
+
+    let temp_dir = tempdir().expect("tempdir");
+    let root = temp_dir.path().join("python-app");
+    fs::create_dir_all(&root).expect("create workspace");
+    fs::write(root.join("pyproject.toml"), "[project]\nname = 'demo'\n").expect("write pyproject");
+    let file = root.join("app.py");
+    let clean = "VALUE: int = 1\n";
+    fs::write(&file, clean).expect("write clean source");
+    let file = fs::canonicalize(&file).expect("canonical source path");
+    let root = fs::canonicalize(&root).expect("canonical root");
+    // The status bar reports error counts only for a configured project whose
+    // language-server applicability is known, so configure it as a session
+    // does instead of only setting `project_root`.
+    crate::helpers::disable_in_process_file_watcher();
+    let storage_dir = root.join(".aft-test-storage");
+    let ctx = pyright_context(&Config {
+        storage_dir: Some(storage_dir.clone()),
+        ..Config::default()
+    });
+    let configure: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "configure",
+        "command": "configure",
+        "harness": "opencode",
+        "project_root": root.to_string_lossy(),
+        "storage_dir": storage_dir.to_string_lossy(),
+        "config": crate::helpers::user_config(serde_json::json!({
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false }
+        })),
+    }))
+    .expect("configure request parses");
+    let configured = serde_json::to_value(handle_configure(&configure, &ctx))
+        .expect("configure response serializes");
+    assert_eq!(
+        configured["success"], true,
+        "configure failed: {configured:#}"
+    );
+    assert!(
+        !ctx.lsp()
+            .ensure_server_for_file(&file, &ctx.config())
+            .is_empty(),
+        "pyright should start for the fixture"
+    );
+
+    // Open the clean file and wait until pyright has reported it clean.
+    let opened = ctx.lsp_notify_and_collect_diagnostics(&file, clean, Duration::from_secs(10));
+    assert!(
+        opened.complete() && opened.diagnostics.is_empty(),
+        "clean file should be reported clean: {opened:?}"
+    );
+
+    // Ordinary edit: notify only, as a write without `diagnostics: true` does.
+    let broken = "VALUE: int = \"wrong\"\n";
+    fs::write(&file, broken).expect("write broken source");
+    ctx.lsp_notify_file_changed(&file, broken);
+    let is_error_in_file = |diag: &StoredDiagnostic| {
+        diag.file.ends_with("app.py") && diag.severity == DiagnosticSeverity::Error
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut alert_source_saw_error = false;
+    loop {
+        let drained = ctx.lsp().drain_events();
+        alert_source_saw_error |= drained
+            .accepted_snapshots
+            .iter()
+            .any(|snapshot| snapshot.diagnostics.iter().any(is_error_in_file));
+        let counts = ctx.status_bar_count_values();
+        if counts.errors == Some(1) && alert_source_saw_error {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the edit's error never reached the status bar ({counts:?}) and alert source \
+             (saw error: {alert_source_saw_error}); stored: {:?}",
+            ctx.lsp().get_diagnostics_for_file(&file)
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    // Edit that asks for diagnostics: the new error comes back with the edit.
+    let broken_again = "VALUE: int = \"wrong\"\nOTHER: str = 2\n";
+    fs::write(&file, broken_again).expect("write second broken source");
+    let edited =
+        ctx.lsp_notify_and_collect_diagnostics(&file, broken_again, Duration::from_secs(10));
+    assert!(
+        edited.complete(),
+        "inline diagnostics incomplete: {edited:?}"
+    );
+    assert_eq!(
+        edited
+            .diagnostics
+            .iter()
+            .filter(|diag| is_error_in_file(diag))
+            .count(),
+        2,
+        "both errors should be reported inline: {edited:?}"
     );
 }
 
@@ -2380,6 +2502,7 @@ fn post_edit_wait_rejects_stale_pre_edit_publish() {
         version: Some(4),
         stale: false,
         provisional: false,
+        from_document_pull: false,
     };
 
     let pre_edit = PreEditSnapshot {
@@ -2416,6 +2539,7 @@ fn post_edit_wait_rejects_unversioned_epoch_only_publish() {
         version: None,
         stale: false,
         provisional: false,
+        from_document_pull: false,
     };
 
     let pre_edit = PreEditSnapshot {
@@ -2731,6 +2855,7 @@ fn edit_diagnostics_reports_warming_publish_as_pending_until_quiescent() {
         version: Some(1),
         stale: false,
         provisional: true,
+        from_document_pull: false,
     };
 
     let outcome = LspManager::post_edit_outcome_for_entry_for_test(

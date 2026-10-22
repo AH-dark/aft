@@ -420,6 +420,14 @@ pub enum ServerState {
 /// Events sent from background reader threads into the main loop.
 #[derive(Debug, Clone)]
 pub enum LspEvent {
+    /// A manager-owned document pull completed; the epoch prevents a later
+    /// replacement from being accepted as this pull's observation.
+    DocumentDiagnosticsPulled {
+        server_kind: ServerKind,
+        root: PathBuf,
+        file: PathBuf,
+        epoch: u64,
+    },
     /// Server sent a notification (e.g. publishDiagnostics).
     Notification {
         server_kind: ServerKind,
@@ -710,8 +718,187 @@ pub(crate) struct RustWorkspaceState {
     check_begins_at_load: u64,
 }
 
+/// Per-server work-done runs used to certify background analysis.
+#[derive(Default)]
+struct WorkDoneAnalysis {
+    active: std::collections::HashSet<String>,
+    announced: std::collections::HashSet<String>,
+    observed: bool,
+    opens: HashMap<PathBuf, OpenAnalysis>,
+    latest_input: Option<AnalysisInput>,
+    last_published_epoch: u64,
+    certified_report_seen: bool,
+    short_publication_seen: bool,
+    // The manager records the last diagnostics-store epoch when END arrives.
+    // A later publication cannot borrow authority from that earlier END.
+    completed_through_epoch: Option<u64>,
+}
+
+struct OpenAnalysis {
+    opened_at: Instant,
+    published_epoch: Option<u64>,
+    published_at: Option<Instant>,
+    requires_end: bool,
+}
+
+struct AnalysisInput {
+    at: Instant,
+    after_epoch: u64,
+    requires_end: bool,
+}
+
+impl WorkDoneAnalysis {
+    // Pyright need not start progress when a whole analysis fits one batch.
+    // Allow a post-input publication to settle after this no-run grace; any
+    // progress announcement or BEGIN instead requires an ordered END.
+    const GRACE: Duration = Duration::from_secs(2);
+
+    fn opened(&mut self, file: PathBuf) {
+        self.input();
+        let requires_end = self.running();
+        self.opens.insert(
+            file,
+            OpenAnalysis {
+                opened_at: Instant::now(),
+                published_epoch: None,
+                published_at: None,
+                requires_end,
+            },
+        );
+    }
+
+    fn input(&mut self) {
+        self.latest_input = Some(AnalysisInput {
+            at: Instant::now(),
+            after_epoch: self.last_published_epoch,
+            requires_end: self.running(),
+        });
+    }
+
+    fn certified(&mut self, no_run: bool) {
+        self.certified_report_seen = true;
+        self.short_publication_seen |= no_run;
+    }
+
+    fn published(&mut self, file: &Path, epoch: u64, published_at: Option<Instant>) {
+        self.last_published_epoch = self.last_published_epoch.max(epoch);
+        if let Some(open) = self.opens.get_mut(file) {
+            open.published_epoch = Some(epoch);
+            open.published_at = published_at;
+        }
+    }
+
+    fn announced(&mut self, token: String) {
+        self.observed = true;
+        self.announced.insert(token);
+        for open in self.opens.values_mut() {
+            open.requires_end = true;
+        }
+        if let Some(input) = &mut self.latest_input {
+            input.requires_end = true;
+        }
+    }
+
+    fn running(&self) -> bool {
+        !self.active.is_empty() || !self.announced.is_empty()
+    }
+
+    fn covered_by_end(&self, epoch: u64) -> bool {
+        self.completed_through_epoch.is_some_and(|end| epoch <= end)
+    }
+
+    fn record(&mut self, token: String, kind: &str, diagnostics_epoch: u64) {
+        match kind {
+            "begin" => {
+                self.observed = true;
+                self.announced.remove(&token);
+                self.active.insert(token);
+                for open in self.opens.values_mut() {
+                    open.requires_end = true;
+                }
+                if let Some(input) = &mut self.latest_input {
+                    input.requires_end = true;
+                }
+            }
+            "end" => {
+                if self.active.remove(&token) {
+                    if !self.running() {
+                        self.completed_through_epoch = Some(diagnostics_epoch);
+                        self.last_published_epoch =
+                            self.last_published_epoch.max(diagnostics_epoch);
+                        self.short_publication_seen = false;
+                        self.latest_input = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn pending(&self) -> bool {
+        self.running()
+            || self.opens.iter().any(|(file, open)| {
+                if open
+                    .published_epoch
+                    .is_some_and(|epoch| self.certifies(file, epoch, open.published_at))
+                {
+                    return false;
+                }
+                open.opened_at.elapsed() < Self::GRACE
+                    || (open.requires_end && open.published_epoch.is_some())
+            })
+    }
+
+    fn authority(&self) -> &'static str {
+        if self.pending() {
+            "analysis_progress_pending"
+        } else if self.observed {
+            if self.short_publication_seen {
+                "post_input_publish_no_analysis_run"
+            } else {
+                "work_done_progress"
+            }
+        } else {
+            "first_publish_no_analysis_progress"
+        }
+    }
+
+    fn certifies(&self, file: &Path, epoch: u64, published_at: Option<Instant>) -> bool {
+        if self.running() {
+            return false;
+        }
+        if self.covered_by_end(epoch) {
+            return true;
+        }
+        if self.latest_input.as_ref().is_some_and(|input| {
+            !input.requires_end
+                && epoch > input.after_epoch
+                && published_at.is_some_and(|at| at >= input.at && at.elapsed() >= Self::GRACE)
+        }) && self
+            .opens
+            .get(file)
+            .is_none_or(|open| open.published_epoch == Some(epoch))
+        {
+            return true;
+        }
+        match self.opens.get(file) {
+            // Pyright can finish a small analysis batch without starting a
+            // progress reporter. Only this open's own publication may settle it;
+            // any announced or begun run instead requires its ordered END.
+            Some(open) => {
+                !open.requires_end
+                    && open.published_epoch == Some(epoch)
+                    && published_at
+                        .is_some_and(|at| at >= open.opened_at && at.elapsed() >= Self::GRACE)
+            }
+            None => !self.observed,
+        }
+    }
+}
+
 /// A client connected to one language server process.
 pub struct LspClient {
+    analysis_progress: WorkDoneAnalysis,
     pub(crate) runtime_note: Option<String>,
     pub(crate) rust_cargo_disabled_for_worker: bool,
     kind: ServerKind,
@@ -734,6 +921,9 @@ pub struct LspClient {
     /// `None` until `initialize()` succeeds; conservative defaults thereafter
     /// when the server doesn't advertise diagnosticProvider.
     diagnostic_caps: Option<ServerDiagnosticCapabilities>,
+    diagnostic_registrations: Arc<Mutex<super::diagnostic_registration::DiagnosticRegistrations>>,
+    allow_diagnostic_registration: Arc<AtomicBool>,
+    pull_diagnostics_disabled: bool,
     /// Rust-analyzer's workspace analysis has reached quiescence. Other server
     /// kinds do not use the experimental server-status signal and start
     /// authoritative by default.
@@ -1017,6 +1207,12 @@ impl LspClient {
         };
         let pending = Arc::new(Mutex::new(PendingMap::new()));
         let watched_file_registrations = Arc::new(Mutex::new(HashMap::new()));
+        let diagnostic_registrations = Arc::new(Mutex::new(
+            super::diagnostic_registration::DiagnosticRegistrations::default(),
+        ));
+        let allow_diagnostic_registration = Arc::new(AtomicBool::new(false));
+        let reader_diagnostic_registrations = Arc::clone(&diagnostic_registrations);
+        let reader_allow_diagnostic_registration = Arc::clone(&allow_diagnostic_registration);
         let reader_pending = Arc::clone(&pending);
         let reader_writer = writer.clone();
         let reader_watched_file_registrations = Arc::clone(&watched_file_registrations);
@@ -1071,6 +1267,12 @@ impl LspClient {
                             &method,
                             params.as_ref(),
                         );
+                        if method == "client/unregisterCapability" {
+                            reader_diagnostic_registrations
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .record(&method, params.as_ref());
+                        }
                         // Auto-respond to server requests to prevent deadlocks.
                         // Server requests (like client/registerCapability,
                         // window/workDoneProgress/create) block the server until
@@ -1092,7 +1294,17 @@ impl LspClient {
                         let response =
                             super::jsonrpc::OutgoingResponse::success(id.clone(), response_value);
                         if let Ok(payload) = serde_json::to_string(&response) {
-                            reader_writer.send_response(payload);
+                            // The FIFO writer must queue registration acknowledgement
+                            // before any caller can queue a diagnostic pull.
+                            if reader_writer.send_response(payload)
+                                && reader_allow_diagnostic_registration.load(Ordering::SeqCst)
+                                && method == "client/registerCapability"
+                            {
+                                reader_diagnostic_registrations
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .record(&method, params.as_ref());
+                            }
                         }
                         // Also forward as event for any interested handlers
                         let _ = event_tx.send(LspEvent::ServerRequest {
@@ -1134,8 +1346,12 @@ impl LspClient {
             pending,
             next_id: AtomicI64::new(1),
             diagnostic_caps: None,
+            diagnostic_registrations,
+            allow_diagnostic_registration,
+            pull_diagnostics_disabled: false,
             rust_analyzer_quiescent,
             rust_analyzer_failure: None,
+            analysis_progress: WorkDoneAnalysis::default(),
             rust_analyzer_warning: None,
             rust_workspace_check_owed_since: None,
             rust_flycheck_running: HashMap::new(),
@@ -1241,10 +1457,10 @@ impl LspClient {
                         "codeDescriptionSupport": true,
                         "dataSupport": true
                     },
-                    // LSP 3.17 textDocument diagnostic pull. dynamicRegistration=false
-                    // because we use static capability discovery from the InitializeResult.
-                    // relatedDocumentSupport=true to receive cascading diagnostics for
-                    // files that became known while analyzing the requested one.
+                    // Static discovery is the default for document diagnostics.
+                    // Python dynamic registration is enabled below unless opted out.
+                    // Related-document support permits cascading diagnostics for
+                    // files discovered while analyzing the requested one.
                     "diagnostic": {
                         "dynamicRegistration": false,
                         "relatedDocumentSupport": true
@@ -1266,13 +1482,27 @@ impl LspClient {
             ]
         });
         let (checks_on_save, checks_on_load) = rust_check_triggers(initialization_options.as_ref());
+        self.pull_diagnostics_disabled = self.uses_analysis_progress()
+            && initialization_options
+                .as_ref()
+                .and_then(|options| options.get("disablePullDiagnostics"))
+                .and_then(Value::as_bool)
+                == Some(true);
+        let dynamic_diagnostics = self.uses_analysis_progress() && !self.pull_diagnostics_disabled;
+        self.allow_diagnostic_registration
+            .store(dynamic_diagnostics, Ordering::SeqCst);
+        params_value["capabilities"]["textDocument"]["diagnostic"]["dynamicRegistration"] =
+            json!(dynamic_diagnostics);
+        params_value["capabilities"]["workspace"]["diagnostic"]["refreshSupport"] =
+            json!(dynamic_diagnostics);
         if let Some(initialization_options) = initialization_options {
             params_value["initializationOptions"] = initialization_options;
         }
-        if matches!(&self.kind, ServerKind::Rust) {
-            // rust-analyzer reports its `cargo check` runs only to clients that
-            // accept server-initiated progress. Inspect needs those begin/end
-            // events to know when compiler errors have been published.
+        if matches!(&self.kind, ServerKind::Rust | ServerKind::Python)
+            || matches!(&self.kind, ServerKind::Custom(id) if id.as_ref() == "basedpyright")
+        {
+            // rust-analyzer's compiler checks and Pyright's background analysis
+            // need server-initiated progress so inspect can wait for completion.
             params_value["capabilities"]["window"] = json!({ "workDoneProgress": true });
         }
 
@@ -1326,16 +1556,191 @@ impl LspClient {
     /// Diagnostic capabilities advertised by the server. Returns `None` until
     /// `initialize()` has succeeded; returns `Some` with conservative defaults
     /// (all `false`) when the server didn't advertise diagnosticProvider.
-    pub fn diagnostic_capabilities(&self) -> Option<&ServerDiagnosticCapabilities> {
-        self.diagnostic_caps.as_ref()
+    pub fn diagnostic_capabilities(&self) -> Option<ServerDiagnosticCapabilities> {
+        self.diagnostic_capabilities_inner(None)
     }
 
-    /// Whether diagnostics from this server instance should be treated as
-    /// provisional because rust-analyzer is warming or reported failed analysis.
+    pub(crate) fn diagnostic_capabilities_for_file(
+        &self,
+        file: &Path,
+    ) -> Option<ServerDiagnosticCapabilities> {
+        self.diagnostic_capabilities_inner(Some(file))
+    }
+
+    fn diagnostic_capabilities_inner(
+        &self,
+        file: Option<&Path>,
+    ) -> Option<ServerDiagnosticCapabilities> {
+        let static_caps = self.diagnostic_caps.clone()?;
+        if self.pull_diagnostics_disabled {
+            return Some(ServerDiagnosticCapabilities::default());
+        }
+        if static_caps.pull_diagnostics {
+            return Some(static_caps);
+        }
+        self.diagnostic_registrations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .capabilities(&self.root, file)
+            .or(Some(static_caps))
+    }
+
+    pub(crate) fn uses_document_pull(&self, file: Option<&Path>) -> bool {
+        self.diagnostic_capabilities_inner(file)
+            .is_some_and(|caps| caps.pull_diagnostics)
+    }
+
+    pub(crate) fn start_document_diagnostic_request(
+        &mut self,
+        file: &Path,
+        mut params: super::pull_params::AftDocumentDiagnosticParams,
+    ) -> Result<(PendingLspRequest, bool), LspError> {
+        let registrations = Arc::clone(&self.diagnostic_registrations);
+        let registrations = registrations.lock().unwrap_or_else(|p| p.into_inner());
+        let caps = if self.pull_diagnostics_disabled {
+            None
+        } else {
+            self.diagnostic_caps
+                .clone()
+                .filter(|caps| caps.pull_diagnostics)
+                .or_else(|| registrations.capabilities(&self.root, Some(file)))
+        }
+        .ok_or_else(|| {
+            LspError::ServerNotReady("document diagnostics are not registered for this file".into())
+        })?;
+        if params.identifier != caps.identifier {
+            params.previous_result_id = None;
+        }
+        params.identifier = caps.identifier;
+        let used_previous = params.previous_result_id.is_some();
+        // Keep registration stable through FIFO enqueue: unregistration cannot
+        // be acknowledged ahead of a request authorized by the old registration.
+        let request =
+            self.start_request::<super::pull_params::AftDocumentDiagnosticRequest>(params)?;
+        drop(registrations);
+        Ok((request, used_previous))
+    }
+
+    /// Whether this server is still analyzing: Rust uses workspace/check state;
+    /// enabled background-analysis producers use their work-done progress.
     pub fn diagnostics_are_provisional(&self) -> bool {
         self.is_unresponsive()
+            || (self.uses_analysis_progress()
+                && if self.uses_document_pull(None) {
+                    self.analysis_progress.running()
+                } else {
+                    self.analysis_progress.pending()
+                })
             || (matches!(&self.kind, ServerKind::Rust)
                 && (!self.rust_analyzer_quiescent || self.rust_analyzer_failure.is_some()))
+    }
+
+    pub(crate) fn uses_analysis_progress(&self) -> bool {
+        matches!(self.kind, ServerKind::Python)
+            || matches!(&self.kind, ServerKind::Custom(id) if id.as_ref() == "basedpyright")
+    }
+
+    pub(crate) fn analysis_progress_authority(&self) -> Option<&'static str> {
+        self.uses_analysis_progress().then(|| {
+            if self.uses_document_pull(None) {
+                "document_pull"
+            } else {
+                self.analysis_progress.authority()
+            }
+        })
+    }
+
+    pub(crate) fn record_analysis_progress(&mut self, params: &Value, diagnostics_epoch: u64) {
+        if let (Some(token), Some(kind)) = (
+            params.get("token"),
+            params.pointer("/value/kind").and_then(Value::as_str),
+        ) {
+            self.analysis_progress
+                .record(token.to_string(), kind, diagnostics_epoch);
+        }
+    }
+
+    pub(crate) fn analysis_progress_certifies(
+        &self,
+        file: &Path,
+        epoch: u64,
+        published_at: Option<Instant>,
+    ) -> bool {
+        !self.uses_analysis_progress()
+            || (!self.uses_document_pull(Some(file))
+                && self.analysis_progress.certifies(
+                    &crate::inspect::job::normalize_path(file),
+                    epoch,
+                    published_at,
+                ))
+    }
+
+    pub(crate) fn has_analysis_progress(&self) -> bool {
+        self.uses_analysis_progress() && self.analysis_progress.observed
+    }
+
+    pub(crate) fn note_analysis_progress_support(&mut self, params: &Value) {
+        if let Some(token) = params.get("token") {
+            self.analysis_progress.announced(token.to_string());
+        }
+    }
+
+    pub(crate) fn note_analysis_publication(
+        &mut self,
+        file: &Path,
+        epoch: u64,
+        published_at: Option<Instant>,
+    ) {
+        self.analysis_progress.published(
+            &crate::inspect::job::normalize_path(file),
+            epoch,
+            published_at,
+        );
+    }
+
+    pub(crate) fn analysis_progress_running(&self) -> bool {
+        self.uses_analysis_progress() && self.analysis_progress.running()
+    }
+
+    pub(crate) fn note_certified_diagnostics(&mut self, no_run: bool) {
+        self.analysis_progress.certified(no_run);
+    }
+
+    pub(crate) fn analysis_progress_covered_by_end(&self, epoch: u64) -> bool {
+        self.analysis_progress.covered_by_end(epoch)
+    }
+
+    pub(crate) fn has_certified_analysis_report(&self) -> bool {
+        self.uses_analysis_progress() && self.analysis_progress.certified_report_seen
+    }
+
+    fn note_analysis_document(&mut self, method: &str, params: &Value) {
+        if !self.uses_analysis_progress() {
+            return;
+        }
+        let Some(file) = params
+            .pointer("/textDocument/uri")
+            .and_then(Value::as_str)
+            .and_then(|uri| uri.parse::<lsp_types::Uri>().ok())
+            .and_then(|uri| crate::lsp::position::uri_to_path(&uri))
+        else {
+            return;
+        };
+        let file = crate::inspect::job::normalize_path(&file);
+        if self.uses_document_pull(Some(&file)) {
+            self.analysis_progress.opens.remove(&file);
+            return;
+        }
+        match method {
+            "textDocument/didOpen" | "textDocument/didChange" => {
+                self.analysis_progress.opened(file)
+            }
+            "textDocument/didClose" => {
+                self.analysis_progress.input();
+                self.analysis_progress.opens.remove(&file);
+            }
+            _ => {}
+        }
     }
 
     pub(crate) fn diagnostic_failure(&self) -> Option<&str> {
@@ -1843,8 +2248,11 @@ impl LspClient {
         N::Params: serde::Serialize,
     {
         self.ensure_can_send()?;
-        let notification = Notification::new(N::METHOD, Some(serde_json::to_value(params)?));
-        self.writer.send(serde_json::to_string(&notification)?)
+        let params = serde_json::to_value(params)?;
+        let notification = Notification::new(N::METHOD, Some(params));
+        self.writer.send(serde_json::to_string(&notification)?)?;
+        self.note_analysis_document(N::METHOD, notification.params.as_ref().unwrap());
+        Ok(())
     }
 
     /// Write an already serialized notification.
@@ -1863,7 +2271,12 @@ impl LspClient {
     ) -> Result<(), LspError> {
         self.ensure_can_send()?;
         let json = full_did_change_message(uri, version, text)?;
-        self.send_serialized_notification(&json)
+        self.send_serialized_notification(&json)?;
+        self.note_analysis_document(
+            "textDocument/didChange",
+            &json!({"textDocument": {"uri": uri.as_str()}}),
+        );
+        Ok(())
     }
 
     /// Send `textDocument/didSave`, with the borrowed text when given (see
@@ -2521,6 +2934,105 @@ fn parse_diagnostic_capabilities(value: &Value) -> ServerDiagnosticCapabilities 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn analysis_progress_end_before_publication_cannot_certify_the_report() {
+        let file = PathBuf::from("checked.py");
+        let mut progress = WorkDoneAnalysis::default();
+        progress.record("old".into(), "begin", 0);
+        progress.opened(file.clone());
+        progress.record("old".into(), "end", 1);
+        progress.published(&file, 2, Some(Instant::now()));
+        assert!(!progress.certifies(&file, 2, Some(Instant::now())));
+        progress.record("new".into(), "begin", 2);
+        progress.record("new".into(), "end", 2);
+        assert!(progress.certifies(&file, 2, Some(Instant::now())));
+        assert_eq!(progress.authority(), "work_done_progress");
+    }
+
+    #[test]
+    fn analysis_progress_nested_tokens_and_no_progress_fallback_are_distinct() {
+        let file = PathBuf::from("checked.py");
+        let mut progress = WorkDoneAnalysis::default();
+        progress.opened(file.clone());
+        progress.published(&file, 1, Some(Instant::now()));
+        progress.opens.get_mut(&file).unwrap().opened_at = Instant::now() - WorkDoneAnalysis::GRACE;
+        assert_eq!(progress.authority(), "first_publish_no_analysis_progress");
+        progress.record("outer".into(), "begin", 0);
+        progress.record("inner".into(), "begin", 0);
+        progress.record("inner".into(), "end", 1);
+        assert!(progress.pending());
+        progress.record("outer".into(), "end", 1);
+        assert!(!progress.pending());
+        progress.opened(file.clone());
+        progress.opens.get_mut(&file).unwrap().opened_at = Instant::now() - WorkDoneAnalysis::GRACE;
+        progress.announced("next".into());
+        assert_eq!(progress.authority(), "analysis_progress_pending");
+    }
+
+    #[test]
+    fn analysis_progress_short_run_requires_its_own_post_open_publication() {
+        let file = PathBuf::from("small.py");
+        let mut progress = WorkDoneAnalysis::default();
+        progress.record("warmup".into(), "begin", 0);
+        progress.record("warmup".into(), "end", 1);
+        progress.opened(file.clone());
+        progress.opens.get_mut(&file).unwrap().opened_at = Instant::now() - WorkDoneAnalysis::GRACE;
+        assert!(
+            !progress.pending(),
+            "an unanswered open must not poison the producer forever"
+        );
+        let published_at = Some(Instant::now() - WorkDoneAnalysis::GRACE);
+        assert!(
+            !progress.certifies(&file, 2, published_at),
+            "no report exists for this open"
+        );
+        progress.published(&PathBuf::from("other.py"), 2, published_at);
+        assert!(
+            !progress.certifies(&file, 2, published_at),
+            "another file cannot settle the open"
+        );
+        progress.published(&file, 3, published_at);
+        assert!(progress.certifies(&file, 3, published_at));
+        progress.certified(true);
+        assert_eq!(progress.authority(), "post_input_publish_no_analysis_run");
+        progress.record("recheck".into(), "begin", 3);
+        assert!(!progress.certifies(&file, 3, published_at));
+        progress.record("recheck".into(), "end", 3);
+        assert!(progress.certifies(&file, 3, published_at));
+    }
+
+    #[test]
+    fn analysis_progress_short_batch_can_update_a_dependent_file() {
+        let first = PathBuf::from("consumer.py");
+        let second = PathBuf::from("dependency.py");
+        let mut progress = WorkDoneAnalysis::default();
+        progress.opened(first.clone());
+        progress.published(&first, 1, Some(Instant::now()));
+        progress.record("warmup".into(), "begin", 1);
+        progress.record("warmup".into(), "end", 1);
+        progress.opened(second.clone());
+        let old = Instant::now() - WorkDoneAnalysis::GRACE - Duration::from_secs(1);
+        progress.latest_input.as_mut().unwrap().at = old;
+        progress.opens.get_mut(&second).unwrap().opened_at = old;
+        let at = Some(old + Duration::from_millis(1));
+        progress.published(&first, 2, at);
+        progress.published(&second, 3, at);
+        assert!(progress.certifies(&first, 2, at));
+        assert!(progress.certifies(&second, 3, at));
+        assert!(
+            !progress.certifies(&first, 3, at),
+            "another file's epoch cannot settle the consumer"
+        );
+        progress.announced("next".into());
+        assert!(
+            !progress.certifies(&first, 2, at),
+            "a promised run cannot fall back after the grace"
+        );
+        progress.record("next".into(), "begin", 3);
+        progress.record("next".into(), "end", 3);
+        assert!(progress.certifies(&first, 2, at));
+    }
     // Only the Unix-gated reap tests below spawn real children and name paths.
     #[cfg(unix)]
     use std::collections::HashMap;

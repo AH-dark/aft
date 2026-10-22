@@ -4116,6 +4116,10 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
     let mut status_changed = drained.diagnostics_changed;
     for event in drained.events {
         match event {
+            LspEvent::DocumentDiagnosticsPulled { .. } => {
+                // The manager already stored and version-checked this reply.
+                // Its diagnostics_changed flag drives the ordinary status signal.
+            }
             LspEvent::Notification {
                 server_kind,
                 root,
@@ -4137,6 +4141,10 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
                 method,
                 params,
             } => {
+                status_changed |= matches!(
+                    method.as_str(),
+                    "client/registerCapability" | "client/unregisterCapability"
+                );
                 log::debug!(
                     "[aft-lsp] request {:?} {} {:?} {} {}",
                     server_kind,

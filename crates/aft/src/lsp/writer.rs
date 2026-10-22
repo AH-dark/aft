@@ -115,7 +115,7 @@ impl LspWriter {
 
     /// Give a healthy writer time to drain a burst of server requests, but
     /// never park the stdout reader indefinitely behind a blocked stdin pipe.
-    pub(crate) fn send_response(&self, payload: String) {
+    pub(crate) fn send_response(&self, payload: String) -> bool {
         let (done, _) = bounded(1);
         if self
             .tx
@@ -123,6 +123,9 @@ impl LspWriter {
             .is_err()
         {
             self.mark_unresponsive_if_silent(self.received_count());
+            false
+        } else {
+            true
         }
     }
 

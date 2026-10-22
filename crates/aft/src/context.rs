@@ -760,6 +760,7 @@ struct StatusBarTier2 {
 #[derive(Debug, Clone, Default)]
 struct StatusBarCache {
     valid: bool,
+    diagnostics_authoritative: bool,
     diagnostics_generation: u64,
     tier2_generation: u64,
     tsconfig_generation: u64,
@@ -5009,6 +5010,10 @@ impl AppContext {
         };
         #[cfg(test)]
         let context = context.with_test_checkpoint_store();
+        context
+            .lsp_manager
+            .lock()
+            .enable_background_document_pulls(Arc::downgrade(&context.lsp_manager));
         crate::logging::sync_storage_root(context.storage_dir());
         context
     }
@@ -5076,7 +5081,7 @@ impl AppContext {
                 (None, None)
             };
             counts.diagnostics_gaps = producer_gaps.clone();
-            counts.mask_disabled(&self.config().inspect)
+            counts
         };
 
         {
@@ -5085,16 +5090,20 @@ impl AppContext {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if cached.valid
+                && cached.diagnostics_authoritative == authoritative
                 && cached.diagnostics_generation == diagnostics_generation
                 && cached.tier2_generation == tier2.generation
                 && cached.tsconfig_generation == tsconfig_generation
             {
-                return Some(mask_failed(
-                    cached
-                        .counts
-                        .clone()
-                        .expect("a valid status-count cache carries truthful values"),
-                ));
+                return Some(
+                    mask_failed(
+                        cached
+                            .counts
+                            .clone()
+                            .expect("a valid status-count cache carries truthful values"),
+                    )
+                    .mask_disabled(&self.config().inspect),
+                );
             }
         }
 
@@ -5119,8 +5128,9 @@ impl AppContext {
                 }
                 None => lsp.warm_error_warning_counts_with_provisional(),
             };
+        let provisional = provisional || lsp.project_analysis_progress_pending();
         let (errors, warnings) = if provisional {
-            // A warming report cannot prove current E/W values. Preserve a prior
+            // A warming producer or report cannot prove current E/W values. Preserve a prior
             // authoritative pair when available; otherwise omit both categories.
             previous_authoritative.unwrap_or((None, None))
         } else if lsp.has_any_diagnostic_reports() {
@@ -5128,7 +5138,9 @@ impl AppContext {
         } else {
             (None, None)
         };
-        let counts = StatusBarCountValues {
+        // Cache availability-masked values: a hidden zero is not a prior
+        // certificate that a later provisional report may reuse.
+        let counts = mask_failed(StatusBarCountValues {
             errors,
             warnings,
             dead_code: tier2.dead_code,
@@ -5140,19 +5152,20 @@ impl AppContext {
             diagnostics: None,
             diagnostics_reason: None,
             diagnostics_gaps: Vec::new(),
-        };
+        });
 
         *self
             .status_bar_cached
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = StatusBarCache {
             valid: true,
+            diagnostics_authoritative: authoritative,
             diagnostics_generation,
             tier2_generation: tier2.generation,
             tsconfig_generation,
             counts: Some(counts.clone()),
         };
-        Some(mask_failed(counts))
+        Some(counts.mask_disabled(&self.config().inspect))
     }
 
     /// Provides legacy numeric status-bar fields to callers that still require
@@ -20118,6 +20131,50 @@ mod status_bar_tests {
                 ctx.status_bar_count_values().warnings
             ),
             (Some(0), Some(0))
+        );
+    }
+
+    #[test]
+    fn status_bar_never_promotes_a_masked_zero_into_a_warm_certificate() {
+        use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
+        use crate::lsp::registry::ServerKind;
+        use crate::lsp::roots::ServerKey;
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let file = PathBuf::from("/fixture/main.py");
+        let key = ServerKey {
+            kind: ServerKind::Python,
+            root: PathBuf::from("/fixture"),
+        };
+        ctx.lsp()
+            .diagnostics_store_mut_for_test()
+            .publish(key.clone(), file.clone(), Vec::new());
+        assert_eq!(ctx.status_bar_count_values().errors, None);
+        ctx.lsp()
+            .diagnostics_store_mut_for_test()
+            .publish_full_with_provisional(
+                key,
+                file.clone(),
+                vec![StoredDiagnostic {
+                    file,
+                    line: 1,
+                    column: 1,
+                    end_line: 1,
+                    end_column: 2,
+                    severity: DiagnosticSeverity::Error,
+                    message: "not certified yet".into(),
+                    code: None,
+                    source: None,
+                }],
+                None,
+                None,
+                true,
+            );
+        ctx.lsp().store_project_applicability(Default::default());
+        let counts = ctx.status_bar_count_values();
+        assert_eq!(
+            (counts.errors, counts.warnings),
+            (None, None),
+            "a zero hidden behind unknown applicability was never a certified warm pair"
         );
     }
 

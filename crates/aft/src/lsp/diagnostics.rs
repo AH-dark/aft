@@ -64,10 +64,12 @@ pub struct DiagnosticEntry {
     /// in the store so resultIds and server coverage are not lost, but warm
     /// readers must not count or display them as current diagnostics.
     pub stale: bool,
-    /// True while rust-analyzer has not reported that its workspace analysis is
-    /// quiescent. These diagnostics are useful leads, but are not authoritative
-    /// enough to contribute to counts until the server has settled.
+    /// True until the server has certified its background analysis, through
+    /// Rust workspace/check state or an enabled work-done completion barrier.
+    /// Provisional diagnostics are leads, not authoritative counts.
     pub provisional: bool,
+    /// A document pull, rather than an asynchronous push, certified this entry.
+    pub from_document_pull: bool,
 }
 
 /// Stores diagnostics from all LSP servers, keyed per `(ServerKey, file)`.
@@ -315,6 +317,7 @@ impl DiagnosticsStore {
         let key = (server, file);
         self.next_epoch = self.next_epoch.saturating_add(1);
         self.generation = self.generation.wrapping_add(1);
+        let from_document_pull = result_id.is_some();
         let entry = DiagnosticEntry {
             diagnostics,
             epoch: self.next_epoch,
@@ -322,6 +325,7 @@ impl DiagnosticsStore {
             version,
             stale: false,
             provisional,
+            from_document_pull,
         };
 
         self.last_publish_at_for_file
@@ -516,6 +520,12 @@ impl DiagnosticsStore {
             .is_some_and(|published_at| {
                 *published_at >= since && self.has_fresh_report_for_server_file(server, file)
             })
+    }
+
+    pub(crate) fn publication_time(&self, server: &ServerKey, file: &Path) -> Option<Instant> {
+        self.last_publish_at_for_file
+            .get(&(server.clone(), file.to_path_buf()))
+            .copied()
     }
 
     /// Get current diagnostics for files under a directory.
@@ -829,23 +839,78 @@ impl DiagnosticsStore {
         true
     }
 
-    /// Promote the latest provisional report for each file when its server reaches
-    /// quiescence. Each store entry is already the server's latest replacement
-    /// publish, so the settle boundary makes it authoritative without requiring a
-    /// later publish. Independent watcher staleness is preserved.
     pub fn promote_provisional_for_server(&mut self, key: &ServerKey) -> bool {
+        self.promote_provisional_through_epoch(key, u64::MAX)
+    }
+
+    pub(crate) fn current_epoch(&self) -> u64 {
+        self.next_epoch
+    }
+
+    pub(crate) fn mark_document_pull(&mut self, key: &ServerKey, file: &Path) {
+        if let Some(entry) = self.entries.get_mut(&(key.clone(), file.to_path_buf())) {
+            entry.from_document_pull = true;
+        }
+    }
+
+    pub(crate) fn invalidate_document_pulls(&mut self, key: &ServerKey) {
         let mut changed = false;
-        for ((stored_key, _), entry) in &mut self.entries {
-            if stored_key == key && entry.provisional {
-                entry.provisional = false;
+        for ((server, _), entry) in &mut self.entries {
+            if server == key && entry.from_document_pull {
+                entry.stale = true;
+                entry.result_id = None;
                 changed = true;
             }
         }
         if changed {
             self.generation = self.generation.wrapping_add(1);
         }
+    }
+
+    pub(crate) fn has_provisional_report_for_server(&self, key: &ServerKey) -> bool {
+        self.entries
+            .iter()
+            .any(|((server, _), entry)| server == key && entry.provisional)
+    }
+
+    /// Only publications preceding the server's analysis end are certified by
+    /// that end. A later publication needs a later completed analysis run.
+    pub(crate) fn promote_provisional_through_epoch(
+        &mut self,
+        key: &ServerKey,
+        end_epoch: u64,
+    ) -> bool {
+        !self
+            .promote_provisional_reports(key, |_, epoch, _| epoch <= end_epoch)
+            .is_empty()
+    }
+
+    pub(crate) fn promote_provisional_reports(
+        &mut self,
+        key: &ServerKey,
+        mut certifies: impl FnMut(&Path, u64, Option<Instant>) -> bool,
+    ) -> Vec<PathBuf> {
+        let mut promoted = Vec::new();
+        for ((stored_key, file), entry) in &mut self.entries {
+            if stored_key == key
+                && entry.provisional
+                && certifies(
+                    file,
+                    entry.epoch,
+                    self.last_publish_at_for_file
+                        .get(&(stored_key.clone(), file.clone()))
+                        .copied(),
+                )
+            {
+                entry.provisional = false;
+                promoted.push(file.clone());
+            }
+        }
+        if !promoted.is_empty() {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.debug_assert_index_consistent();
-        changed
+        promoted
     }
 
     /// Clear the readiness marker after a pull response is received from a

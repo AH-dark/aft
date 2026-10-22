@@ -1,5 +1,583 @@
 # aft_inspect truth at scale: campaign report
 
+## Negotiated Python document pulls: implemented and measured
+
+The scoped Python authority path now uses the document diagnostic protocol
+established in the source investigation below. A successful response certifies
+**that file**, not a whole workspace. An empty startup push, a hover response or
+the passage of two seconds cannot substitute for a negotiated document pull.
+Non-negotiated servers retain the separately disclosed progress/push fallback.
+
+### Registration, coverage and warm feedback
+
+- Pyright/basedpyright clients advertise dynamic document diagnostics unless
+  `disablePullDiagnostics` is true. Registrations are server-instance scoped,
+  match the document selector, carry the negotiated identifier and are removed
+  on unregistration. Static providers remain independent.
+- Scoped inspection opens all selected document bodies before sending analysis
+  requests. It also notices registration arriving after didOpen. Background
+  pulls pause while the scoped sweep owns that transport, preventing a large
+  later didOpen from blocking behind an earlier expensive analysis request.
+- Full and valid unchanged responses supply file authority. The unchanged cache
+  is the exact previous **pull** report sent with the request, not an intervening
+  unsolicited push. Replies for changed documents or replaced server instances
+  are rejected. Failed/cancelled/rejected requests and missing unchanged caches
+  leave coverage unknown; they do not certify startup E0.
+- Normal opens/changes, registration and `workspace/diagnostic/refresh` queue
+  background pulls of open files. Accepted pull snapshots enter the same
+  version-checked alert path as pushes, so users need not invoke inspect to keep
+  warm counts and alert episodes current. No workspace diagnostic request or
+  unopened-neighbor analysis was introduced.
+- Producer details report `authority=document_pull` and
+  `no_progress_grace_ms=0`; the prose now describes a file response rather than
+  the fallback timing rule. The fallback still requires the server's
+  analysis-progress end event (`$/progress`, `kind: end`) after publication
+  for an announced/begun run.
+
+### Real protocol evidence
+
+Both the direct protocol driver and AFT were exercised against Pyright **1.1.414**
+and basedpyright **1.40.2**, with isolated installations (basedpyright also ships
+`pyright` command names). Both initialize results omit diagnosticProvider and
+then dynamically register `textDocument/diagnostic` with the correct identifier.
+A direct open and unchanged reopen each returned one assignment error. Pyright
+sent no pushes in that interval; basedpyright sent an empty close-time push,
+which was not used as diagnostic authority.
+
+AFT's real-server captures each returned **E1, coverage 1/1, document_pull, zero
+grace**, both normally and with an explicitly marked startup empty push injected
+by the tracing proxy. Selected wire events from the injected runs:
+
+```text
+Pyright:
+1792591025.2862737 didOpen broken.py
+1792591025.2868865 injected publishDiagnostics []
+1792591025.7459648 textDocument/diagnostic id=3
+1792591025.9207008 response id=3 kind=full items=1
+basedpyright:
+1792591033.9986312 didOpen broken.py
+1792591033.9987884 injected publishDiagnostics []
+1792591034.5320425 textDocument/diagnostic id=3
+1792591034.5607530 response id=3 kind=full items=1
+```
+
+Raw frames, including registration acknowledgements and request identifiers, are
+retained under `.cortexkit/internal-docs/investigations/inspect-document-pull/raw/`.
+The traced binary hash is
+`06779918d6ce61c5820d7ee39336906939e76eb7804616a08e22b5fa383a4aa1`;
+the final binary below additionally corrects the authority explanation, without
+changing negotiation or certificate behavior.
+
+### Final FastAPI diagnostics: three fresh processes
+
+Same source pin, dependency freeze and seeded **52-file** domain as the
+[progress-liveness captures](#progress-liveness-and-warm-feedback-follow-up)
+(retained as `inspect-progress-liveness/raw/fastapi-{1,2,3}/results.json` in the
+investigation directory): FastAPI `26dbe0b00e1211b99446500fc6e402cfec6a3b99`, Python
+**3.14.4**, Pyright **1.1.414**, Pydantic **2.14.1**, Starlette **1.9.0**.
+
+| Fresh process | AFT E/W | Reference E/W | Agreements | AFT-only / reference-only | Authoritative files | Authority |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 62 | 62 | 62 | 0 / 0 | 52/52 | document_pull |
+| 2 | 62 | 62 | 62 | 0 / 0 | 52/52 | document_pull |
+| 3 | 62 | 62 | 62 | 0 / 0 | 52/52 | document_pull |
+
+The collector issues three scoped diagnostic requests for batches of 20, 20 and
+12 files. Each reply has full file coverage (20/20, 20/20, 12/12 authoritative
+files/examined files), no Python gaps, and zero timing grace. Diagnostic totals
+by reply remain **14, 11, 37** (61 errors and one
+warning overall). The collector still exits **1** for named project-wide
+Bash/TypeScript/YAML producer gaps; these are not Python-sample incompleteness.
+The historical reference of 50 is not silently replaced: its complete dependency
+freeze was unavailable, as documented in the original follow-up below. These
+new same-environment triples establish stable observed counts, not equivalence
+to that older environment.
+
+Canonical records are `raw/certified-fastapi-{1,2,3}/results.json`; executable
+SHA-256 is `917049cf6a486305421b7e888bfdb8d699ff72e487a566ebf2d9ce7abdffa1d7`.
+The executable was built from the reviewed working source before the delivery
+commit, not claimed to embed that later SHA. The original twelve-row Rust
+judgment/ablation table below remains the same-source D12-to-D0 measurement;
+this protocol follow-up does not change liveness scoring or exclusions.
+
+### Regression and mutation evidence
+
+- Without pull negotiation,
+  `scoped_python_dynamic_pull_replaces_startup_empty_push_with_real_error`
+  fails with **FRESH/complete E0, expected E1**. The disabled-pull compatibility
+  test and Rust push-only control both remain green.
+- Ignoring server diagnostic refresh makes only
+  `python_dynamic_pull_refresh_updates_warm_counts_and_alerts_without_inspect`
+  fail: **server refresh did not drive a clean open-file pull**. Initial warm
+  status/alert population and scoped-pull controls remain green.
+- Allowing unchanged responses to borrow an unsolicited startup push makes only
+  `unchanged_pull_cannot_certify_a_startup_push_cache` fail: expected
+  **RequestFailed(no_cache_for_unchanged)**. The intervening-push/request-cache
+  sibling passes.
+- Each deliberate production-code mutation tested that removing a repair makes
+  its regression fail. The mutation carried the `NON-VACUITY BREAK` marker, was
+  applied after staging the live state, recorded with a non-empty diff, and
+  restored with checkout/touch
+  to an empty unstaged diff. No break remains. Logs and exact diff pairs are in
+  the investigation's `verification/` directory.
+- Eight dynamic-pull integration cases cover registration, delayed registration,
+  large document transport ordering, opt-out, unregistration, warm feedback,
+  dependency refresh and failure honesty. Error, method-not-found, cancellation
+  and missing-cache unchanged replies all remain incomplete/unknown.
+- Final Linux gates (serialized, eight allocated CPUs): LSP units **310 passed,
+  3 existing ignored**; diagnostics-category units **24**; Rust dead-code scanner
+  units **70**; own published-view fixture **1**; Python progress/pull
+  integrations **21**. `cargo check -p agent-file-tools --tests` finished and
+  `cargo fmt --all -- --check` exited 0. Cargo/rustc **1.99.0**, rustfmt
+  **1.10.0-stable**. Existing scoped blocking integrations **13**, status-cache
+  units **11**, and alert target **18** also passed during this follow-up.
+- Benchmark helper regressions: `test_diagnostics.py` **7 passed**,
+  `test_score.py` **39 passed**; Python **3.14.4**. Bridge build (`tsc`, TypeScript
+  **5.9.3**) passed; `bun run lint` checked **751 files** with Biome **2.4.7**.
+- Tool diagnostics were PARTIAL because worker rust-analyzer capacity was
+  exhausted and compiler checks are disabled there; the compiler gates above
+  are the authoritative checks. No Windows/macOS runtime claim is made.
+
+## Python document-pull protocol: pre-build source findings
+
+Both checked releases implement **per-document pull diagnostics**: Pyright
+**1.1.414**, commit `a28cce4077d87b80bead12de809f79845e39c8ba`, and the published
+latest basedpyright **1.40.2**, commit
+`344759687c2fff3bd0a7d6a83a9d1847f806b795`. No build or test was needed to
+establish these protocol facts; this section records the source decision before
+the implementation build.
+
+### Registration is dynamic, not an initialize-result diagnosticProvider
+
+- Pyright [`languageServerBase.ts:628-630`](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/languageServerBase.ts#L628-L630)
+  and basedpyright [lines 715-717](https://github.com/DetachHead/basedpyright/blob/344759687c2fff3bd0a7d6a83a9d1847f806b795/packages/pyright-internal/src/languageServerBase.ts#L715-L717)
+  enable pull only if the client declares
+  `textDocument.diagnostic.dynamicRegistration` and initialization option
+  `disablePullDiagnostics` is not true.
+- Their static initialize results do not contain `diagnosticProvider`. Instead,
+  Pyright `languageServerBase.ts:693-703` and basedpyright `:801-811` install and
+  register `PullDiagnosticsDynamicFeature`.
+- Pyright [`pullDiagnosticsDynamicFeature.ts:41-49`](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/languageService/pullDiagnosticsDynamicFeature.ts#L41-L49)
+  and basedpyright [lines 38-48](https://github.com/DetachHead/basedpyright/blob/344759687c2fff3bd0a7d6a83a9d1847f806b795/packages/pyright-internal/src/languageService/pullDiagnosticsDynamicFeature.ts#L38-L48)
+  register `textDocument/diagnostic` through `client/registerCapability`, with
+  `interFileDependencies: true`. `workspaceDiagnostics` is conditional on
+  workspace diagnostic mode; it is not a prerequisite for a document pull.
+- At the source decision, AFT advertised `dynamicRegistration: false`, opting the
+  client out of dynamic registration, and discovered only static diagnosticProvider.
+  The missing static initialize field therefore did not establish that either
+  server lacks pull support.
+
+The document handlers are bound at Pyright `languageServerBase.ts:561` and
+basedpyright `:654`. Pyright [lines 1156-1230](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/languageServerBase.ts#L1156-L1230)
+and basedpyright [lines 1559-1639](https://github.com/DetachHead/basedpyright/blob/344759687c2fff3bd0a7d6a83a9d1847f806b795/packages/pyright-internal/src/languageServerBase.ts#L1559-L1639)
+await `analyzeFileAndGetDiagnostics` for the requested URI and repeat if its
+diagnostic version changes during analysis. The underlying Program explicitly
+analyzes the file and retrieves its full-range diagnostics (Pyright
+`analyzer/program.ts:827-835`; basedpyright `:873-881`). This is a file certificate,
+not a claim that unrelated files or the whole workspace have been checked.
+The scoped client must open the file first: in open-files-only mode the handler
+intentionally returns an empty full report for a closed document. The handlers
+also have early-return guards for cancellation and files inside ZIP archives
+(`canNavigateToFile`), and Pyright
+additionally guards disabled language services. Client timeout, cancellation,
+missing-cache and rejected-request outcomes must remain failure/unknown rather
+than being converted to successful reports containing zero diagnostics.
+
+### Negotiating pull stops ordinary open-file push analysis
+
+Pushes **cannot remain the assumed source for warm counts or alerts** after this
+negotiation. Pyright [`createAnalyzerService():313-330`](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/languageServerBase.ts#L313-L330)
+and basedpyright [lines 353-370](https://github.com/DetachHead/basedpyright/blob/344759687c2fff3bd0a7d6a83a9d1847f806b795/packages/pyright-internal/src/languageServerBase.ts#L353-L370)
+request `workspace/diagnostic/refresh` on invalidation in open-files-only pull
+mode, and their `shouldRunAnalysis` callback disables ordinary background
+analysis when pull is supported unless a workspace diagnostic request is active.
+
+This does not mean the publishDiagnostics protocol handler is removed. Their send routines still
+call `connection.sendDiagnostics` when not streaming a workspace result
+(Pyright `:1506-1522`; basedpyright `:2075-2098`). Those notifications cannot
+replace the missing normal open-file analysis stream.
+
+The selected implementation path is therefore negotiated document pulls for
+exactly the scoped files, and pull-driven refresh of open files for warm counts
+and alert observations. AFT will honor `disablePullDiagnostics`, issue no
+unregistered document request, retain push/status compatibility and the progress
+fence for non-negotiated servers, and remove the two-second certificate only
+where document pull is actually in effect. Specifically, scoped file authority
+will no longer wait two seconds hoping that no further analysis is announced.
+It will await the file analysis requested by `textDocument/diagnostic`, rather
+than treating a hover/documentSymbol round trip as a proxy for diagnostic completion.
+
+## Progress liveness and warm-feedback follow-up
+
+The END-after-publication barrier is retained for an **announced or begun**
+analysis run. It is not a requirement that Pyright start a run on every open.
+The earlier implementation incorrectly treated historical progress support as
+such a requirement; a later small analysis could leave the whole producer pending.
+
+### Real Pyright 1.1.414: all three idle-open cases can send no progress
+
+The pinned source is still `a28cce4077d87b80bead12de809f79845e39c8ba`.
+The real-server driver first opens three actual FastAPI source files to establish
+observed BEGIN/END support, waits for completion, then exercises each case in a
+small fixture workspace. Every event below is from that same process. URI paths
+are reduced to their fixture basename; the full frames and version-0 document
+contents are retained in the investigation artifacts.
+
+```text
+1792568426.0213230  window/workDoneProgress/create
+1792568428.5428643  $/progress begin
+1792568428.5430865  $/progress end
+
+1792568439.6000087  didOpen excluded.py version=0
+1792568439.6088226  publishDiagnostics excluded.py version=0 diagnostics=1
+
+1792568446.6165123  didOpen notes.txt version=0 languageId=plaintext
+1792568446.6254098  publishDiagnostics notes.txt version=0 diagnostics=6
+
+1792568460.6700075  didOpen reopen.py version=0
+1792568460.6772976  publishDiagnostics reopen.py version=0 diagnostics=1
+1792568464.6821284  didClose reopen.py
+1792568467.6866434  didOpen reopen.py version=0 (unchanged bytes)
+1792568467.6930757  publishDiagnostics reopen.py version=0 diagnostics=1
+
+1792568474.6985430  didOpen first.py version=0
+1792568474.7059670  publishDiagnostics first.py version=0 diagnostics=1
+1792568478.7083395  didOpen second.py version=0 (first file remains open)
+1792568478.7155580  publishDiagnostics second.py version=0 diagnostics=1
+```
+
+**No BEGIN, END, or progress-create request occurs in any of those small-file
+stages**, including the unchanged reopen and second-after-idle stages. The driver
+captures at least four seconds per stage and waits for protocol quiet; the source
+explains why no END is owed, rather than interpreting a short wait as completion.
+The `.txt` case was repeated with `languageId=python` with the same six diagnostics
+and no progress. The excluded file is explicitly listed in `pyrightconfig.json`.
+
+Both `reopen.py` opens have text SHA-256
+`285363e2d3f909e9683d1c83781a42bad62ee60aa5894cd731d4a4309e2766c6`.
+The warmup also demonstrates why an announcement matters: CREATE precedes BEGIN
+by about 2.52 seconds, longer than the no-run grace.
+
+This is workload-dependent, not a rule that excluded files never cause progress:
+
+- [`languageServerBase.ts:1096-1118`](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/languageServerBase.ts#L1096-L1118)
+  forwards an explicit open to the containing workspaces and constructs a Python
+  document even if the client supplied another language ID.
+- [`program.ts:458-505`](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/analyzer/program.ts#L458-L505)
+  opens untracked/excluded files as `isOpenByClient`; [lines 1380-1388](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/analyzer/program.ts#L1380-L1388)
+  keep explicitly opened files needed for analysis. Reopening resets the
+  diagnostic version to force a report, even if content did not change.
+- [`sourceFile.ts:585-614`](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/analyzer/sourceFile.ts#L585-L614)
+  avoids marking unchanged content dirty; `service.ts:360-372` still schedules
+  reanalysis for the open.
+- `languageServerBase.ts:1352-1373` sends each batch's computed diagnostics before
+  reporting its remaining-file count. At [lines 1396-1413](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/languageServerBase.ts#L1396-L1413),
+  a zero count calls `end()` without first calling `begin()`.
+  [`ProgressReportTracker.end():53-60`](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/common/progressReporter.ts#L53-L60)
+  is a no-op if progress was never displaying. A batch that finishes all its work
+  can therefore publish diagnostics with **no progress messages at all**.
+
+### Liveness rule and negative controls
+
+AFT now distinguishes an open/sync grace from an actual run. A post-input
+publication may settle after the two-second **publication** grace when no run
+was announced or begun. This works even after an earlier run completed. The
+producer details disclose `post_input_publish_no_analysis_run`; unsupported
+progress retains its separately named first-publication rule. There is no
+production sleep or request-budget increase.
+
+The proof remains per file: its current epoch and publication time come from
+that exact `(server, file)` entry. A local input epoch excludes older cached
+reports; dependent-file publications from the same short batch can also settle.
+Opens are removed from arming state on close. After two seconds, a file with no
+publication no longer keeps the producer pending, but that file stays uncovered; it
+cannot reuse its cached pre-open report or poison the producer forever.
+
+`window/workDoneProgress/create` is an analysis announcement for this Pyright
+implementation (`server.ts:277-322` creates it inside `begin()`). It blocks the
+no-run route even before BEGIN arrives. Every announced/begun run still needs an
+END **after** the publication it certifies. Tests still reject an END before the
+publication, a new BEGIN without its own END, a run without END, and a startup-empty
+report treated as final. The early-END
+fake now places END before the file's **first** publication, so an earlier empty
+publication cannot accidentally satisfy the ordering being tested.
+
+Before this follow-up, all four new fake-server scenarios failed with
+`errors: null`, `complete: false`, `analysis_progress_pending` despite a valid
+post-open report: excluded file, routed non-source file, unchanged reopen, and
+second file after idle. The six original progress tests passed in that red run.
+All scenarios now settle, and the explicit silent-open control remains an honest
+file gap while `server_is_warming` and producer settlement recover.
+
+### Status bar and alerts: keep history separate from fresh authority
+
+The status bar did churn: the before-fix integrated test obtained E1/W1, then
+`(errors, warnings) = (None, None)` during reanalysis. The count cache attempted to
+retain prior values, but the still-provisional producer prevented the bar from
+displaying them, replacing the numbers with unknown E?/W? until completion.
+The alert engines did **not** legitimately close episodes from
+that demotion: `live_publish_drop_reason` excludes provisional publications,
+`alert_state.rs` mutates only accepted observations, and `alert_render.rs` removes
+a rendered identity only on an authoritative snapshot that omits it. Absence from
+an observation batch is not an authoritative empty snapshot.
+
+The repair no longer demotes every certified store entry on an open/run. Old
+certificates remain warm snapshots; **replacement publications** are provisional.
+Fresh inspect separately gates producer state (and the open document's version),
+so old snapshots cannot claim fresh scoped authority while a run can affect them.
+Warm status can retain an actually certified E/W pair through that interval;
+first startup, missing/failed producers and unproven values remain unknown.
+The status cache now stores absent values for unavailable diagnostic counts and
+includes producer authority in its cache identity, so discovering the producer
+set cannot reuse a zero that was previously hidden as unknown. That additional
+regression was red with `(Some(0), Some(0))`
+where `(None, None)` was required.
+
+Cross-file effects are real, so fresh authority cannot be inferred from just the
+file being opened/changed. The same real-server trace also records:
+
+```text
+1792568482.7264745  publishDiagnostics consumer.py version=0 diagnostics=0
+1792568486.7368786  publishDiagnostics dependency.py version=0 diagnostics=0
+1792568490.7392557  didChange dependency.py version=1
+1792568490.9966006  publishDiagnostics consumer.py version=0 diagnostics=1
+1792568490.9969873  publishDiagnostics dependency.py version=1 diagnostics=0
+```
+
+Only the dependency changed from an `int` return to `str`; the still-open consumer
+gained an error. This small batch also emitted no progress. Pyright's
+`backgroundAnalysisProgram.ts:128-131` marks changed files dirty and
+`program.ts:2546-2562` recursively reanalyzes their `importedBy` dependents.
+
+Certification now delivers the deferred, document-version-checked replacement to
+alert ingestion exactly once, rather than dropping the publication while warming
+and never forwarding it later. The integrated regression drives actual LSP drain
+snapshots through `AcceptedObservationBatch`, `AlertDeltaState` and `AlertEngine`:
+E1/W1 survives pre-publication, watcher-stale and startup-empty phases; no pending
+empty snapshot is accepted; after END, the unchanged error has the same episode
+ID and produces no repeated reminder. Failure and unversioned-report exclusions
+are unchanged. This is not a new project-wide or unopened-file diagnostic claim.
+
+### Follow-up gates and repeat capture
+
+On `linux,8c`, the affected gates pass: **307 LSP unit tests** (three existing
+manual/performance tests ignored), **24 diagnostics-category tests**, **11 status
+cache tests**, **9 renderer tests** (one existing performance probe ignored),
+**3 alert-state tests**, **13 Python fake-server integrations**, **13 existing
+blocking-scope integrations**, and **18 alert integration tests**. Package test
+compilation and format checking also pass. The delayed-announcement fixture uses
+a 30-second test budget: inspect reserves five seconds and allocates half the
+remaining work time to a phase, so an 8-second value (clamped to 10) cannot fit
+the injected 2.5-second announcement delay plus the fake's 0.6-second run. No
+production budget was changed to make that test pass.
+
+Three new fresh FastAPI processes after these repairs remain **62 AFT / 62
+reference / 62 agreements / zero differences**, all 52 sampled files complete,
+with 14/11/37 E/W diagnostics per batch. All pages use `work_done_progress` for
+this larger workload. The executable SHA-256 is
+`10734aa7ea2f8ef51f43379e700afcbf0bba1c70951a5a1faa6776d38f35f3a8`.
+The collector still exits 1 for the unchanged missing project Bash/YAML producers,
+not for Python sample incompleteness. Source pins and primary tool/dependency
+versions are unchanged from the preceding capture.
+
+The full traces, fixture/config bytes, failing-before outputs and final gates
+are retained outside `target/` under
+`.cortexkit/internal-docs/investigations/inspect-progress-liveness/`; the real-server
+driver is retained under `.cortexkit/scripts/inspect-progress-liveness/`.
+
+## Accuracy follow-up: the twelve Rust rows and Python startup authority
+
+This follow-up judges **all twelve** rows in the earlier capture's
+`items.dead_code` Rust bucket. All twelve are false positives; none was removed
+with an exclusion, public-API blanket root, oracle adjustment or scoring change.
+The nine previously unjudged rows are now recorded individually in
+`judgments/diagnostics-follow-up.json`. Older sections below retain their
+original numbers and acceptance boundaries.
+
+### Individual Rust decisions
+
+Line numbers below identify the original rows. The symbols and production
+callers still exist in this checkout; no row was explained away as source drift.
+
+| Original path under `crates/aft/src/` | Symbol / original line | Judgment and production evidence |
+|---|---|---|
+| `db/file_identity.rs` | `is_live_sqlite_handle` / 627 | **False positive.** `commands/file_read_exact.rs:75,144` calls the guard. The production chain reaches it through the private `read_as_parent` call inside the `flow_read.rs:363` macro body, then `flow_read.rs:496`. Losing that private macro hop disconnected the guard; this was not a missing blanket `Drop` root. |
+| `edit.rs` | `link_count` / 452 | **False positive.** The Windows `source_replacement::may_keep_access` branch calls `windows::link_count` at :339; existing-file writes use `may_keep_access` at :97-99. |
+| `edit.rs` | `copy_platform_security` / 660 | **False positive.** `copy_access` calls `xattrs::copy_platform_security` at :384. Linux and macOS definitions are alternative live implementations, not unused duplicate declarations. |
+| `edit.rs` | `platform_acls_match` / 678 | **False positive.** The shared Linux/macOS `copy_access` branch verifies ACLs through this helper at :396; the macOS definition compares both ACLs at :684. |
+| `edit.rs` | `extended_acl_text` / 705 | **False positive.** Production ACL comparison calls it twice at :684; ACL removal also calls it at :747,766. Its additional test callers do not make it test-only. |
+| `edit.rs` | `clear_extended_acl` / 743 | **False positive.** The macOS `source_recovery::make_private` branch calls it at :1014 before a recovery copy is written. Other platform definitions of `make_private` must not replace that source body. |
+| `edit.rs` | `copy_protected` / 857 | **False positive.** Windows replacement and recovery paths call it at :410 and :1028 to protect their DACLs. A Linux compiler cannot judge those Windows paths dead. |
+| `subc/scope_describe.rs` | `describe_answer_ends_scope` / 28 | **False positive.** The running scope worker passes it to `is_ok_and` inside `tokio::select!` at :187, before revoking an ended scope. This is a function-item argument inside opaque macro tokens. |
+| `subc/tool_provider.rs` | `broca_text` / 377 | **False positive.** `render_catalog` calls it for `CatalogPreset::Head` at :598-611; the production catalog route reaches that renderer. |
+| `subc/tool_provider.rs` | `worker_text` / 394 | **False positive.** `render_catalog` calls it for the accepted Worker preset at :598-611. |
+| `subc/tool_provider.rs` | `reader_text` / 412 | **False positive.** `render_catalog` calls it for the accepted Reader preset at :598-611. |
+| `subc/tool_provider.rs` | `catalog_for_confined_request` / 525 | **False positive.** `subc/remote_policy.rs:195-199` selects this function in an `if` branch, then invokes the selected `render` value at :200-207. Dropping that value edge also orphaned the three text helpers above. |
+
+The three extra names in an initial extraction were **not** D12 rows:
+`temp_cleanup.rs::{ready,failed}` and `callgraph_maintenance.rs::pending` were in
+`project_summary.dead_code.test_only_top` / `side_lists.dead_code_test_only`.
+They also have production callers (`bash_background/registry.rs:8887,8893` and
+`context.rs:8581-8582`). That separate test-only attribution concern is recorded
+separately; these three names are not part of the twelve false-positive rows above.
+
+### Four causes, each isolated rather than inferred from the count
+
+The scanner now retains local private declaration identities for macro hops;
+joins inline source identities to the existing short-name liveness nodes;
+retains calls from **every source cfg variant** when a callgraph node has only
+one body; and follows function-valued branch tails and unshadowed macro callback
+arguments. The facts version advances from 7 to 8 so cached old facts cannot
+preserve the false positives. Function-value edges are liveness facts, not
+fabricated direct calls in callgraph navigation. Ordinary unreachable functions,
+unreachable macro callers, shadowed callback names and private library APIs keep
+their existing tests and verdicts.
+
+A same-source, full Rust-domain store-backed capture covers **961 Rust files**,
+including the normal test/fixture classification. Substituting the original
+scanner from the imported prerequisite's HEAD reproduces **the exact D12 row
+identities above**. Restoring the candidate gives **D0**. The unchanged all-target
+Rust compiler reference reports **dead_code 0** (585 compiler artifacts).
+The final comparison runs prebuilt driver binaries after moving the temporary
+driver source out of the product tree. Earlier ablation side captures include
+that one driver (962 files); its presence changes none of the D12 identities.
+Individually neutralizing the four repairs, with the other repairs left live,
+restores exactly these own rows:
+
+| Neutralized cause | Own Rust rows restored | Minimal regression / red |
+|---|---:|---|
+| Private macro intermediate declarations | 1: SQLite handle guard | `own_accuracy_private_macro_hop_keeps_handle_guard_live`: `is_live, unused` instead of `unused` |
+| Alternate cfg bodies and their lexical paths | 6: the six `edit.rs` helpers | `own_accuracy_cfg_variants_preserve_nested_and_parent_module_calls`: `verify, leaf, links, unused` instead of `unused` |
+| Function-valued conditional branch tails | 4: catalog renderer and its three text helpers | `own_accuracy_selected_function_item_keeps_catalog_renderers_live`: `normal, confined, unused` instead of `unused` |
+| Macro callback arguments | 1: scope-ended predicate | `own_accuracy_macro_callback_is_live_but_unused_sibling_is_dead`: `ends_scope, unused` instead of `unused` |
+
+Every deliberately broken control used as proof is marked `NON-VACUITY BREAK`
+only while applied, runs against a
+staged live-state backup, and is restored with an empty unstaged diff. The named
+regression is the only failing test in each selected run; ordinary private-call,
+single-variant, unused-function or bound-name sibling controls remain green.
+The real source shapes are also checked through a published checkout-view
+fixture, not only a hand-built callgraph snapshot.
+
+This Rust-domain capture is not a claim of a completed project-wide live-view
+benchmark: the standalone own-checkout collector stayed `callgraph_building` and
+its log records a 600-second Tier-2 timeout. The direct production scanner and
+store projection establish the Rust liveness numbers; the published-view fixture
+checks that projection boundary. No scoped-timing or all-language acceptance
+claim is added.
+
+### Why FastAPI changed from 38 to 22
+
+The problem is **not** that scoped inspect forgot to wait for a publication from
+each file. It already does that. Pyright can publish version-0 **empty startup
+reports before background analysis completes**; AFT accepted those as final and
+closed the sampled files immediately. A real trace reproduced twenty `didOpen`
+messages at 1792547289.425-.475, twenty empty reports at 1792547290.498-.499, then the first
+`didClose` at 1792547290.523. That first batch was marked authoritative for
+20/20 files with E0. An unmodified same-environment collector observed 34/62;
+another traced process observed 0/11/37 E/W diagnostics in its three batches. These are reproductions of the
+observation defect, not claims to recreate the old environment's exact 38/22.
+
+AFT now advertises `window.workDoneProgress` for Python and basedpyright (Rust
+already did), answers `window/workDoneProgress/create` through the existing
+reader response path, and tracks overlapping server-owned progress tokens.
+Authority requires both a post-open publication **and an analysis END after that
+publication**. An END merely read after our `didOpen` is insufficient. The
+diagnostics-store epoch at END preserves the server stream's publication order;
+a later publication cannot borrow an earlier END. A run already active while
+additional documents open can certify them only after their publications. A new
+BEGIN keeps reports provisional until its own END. Budget exhaustion yields
+`complete: false` with `analysis_progress_pending`, not a complete-and-clean
+partial set. No production sleep or larger inspect budget was added.
+
+This completion interpretation is restricted to Pyright/basedpyright, whose
+analysis progress has the necessary meaning. In pinned Pyright **1.1.414**, commit
+[`a28cce4077d87b80bead12de809f79845e39c8ba`](https://github.com/microsoft/pyright/commit/a28cce4077d87b80bead12de809f79845e39c8ba),
+[`languageServerBase.ts:1352-1373`](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/languageServerBase.ts#L1352-L1373)
+sends computed diagnostics before updating progress from
+`results.requiringAnalysisCount.files`; [lines 1396-1413](https://github.com/microsoft/pyright/blob/a28cce4077d87b80bead12de809f79845e39c8ba/packages/pyright-internal/src/languageServerBase.ts#L1396-L1413)
+end progress when that remaining-files count is zero. Settings are unchanged
+during these captures; the separate configuration-disable path is not used as
+analysis completion evidence here.
+
+For versions/servers that **never** report analysis progress, the documented
+two-second negotiation grace retains first-publication authority. Once progress
+support is observed, an unfinished run cannot fall back. The actual response
+discloses each root's rule under
+`by_producer.python.authority[]` (`work_done_progress`,
+`analysis_progress_pending` or `first_publish_no_analysis_progress`), as well as
+producer-labelled notes. This fallback is explicitly weaker, not a claim to
+prove that an unsupported server finished background analysis.
+
+The slow fake server first publishes empty version-0 diagnostics, then real
+diagnostics at analysis completion. Before the fix,
+`scoped_python_progress_waits_past_startup_empty_publication` returned **FRESH,
+complete, E0, authoritative 1/1**, failing expected E1. The never-ending variant
+also returned complete and failed
+`scoped_python_progress_without_end_is_pending_not_clean`. Regressions additionally
+cover a pre-existing run, END-before-publication, a second BEGIN, overlapping
+tokens, and a server without progress support.
+
+The additional ordering regressions were independently reddened and restored:
+
+| Neutralized guarantee | Only failing integration test | Captured failure / surviving controls |
+|---|---|---|
+| END must follow the file's publication | `scoped_python_progress_end_before_post_open_publication_is_pending` | Returned FRESH/complete instead of pending; the other five progress tests passed. |
+| Preserve a run already active at open | `scoped_python_progress_existing_run_certifies_later_opened_files` | Returned unknown E/W instead of E1; the other five passed. |
+| Every new BEGIN needs its own END | `scoped_python_progress_new_begin_waits_for_its_own_end` | Returned the old error/warning pair instead of `test diagnostic after change`; the other five passed. |
+| Do not settle at the startup publication | `scoped_python_progress_waits_past_startup_empty_publication` | Returned E0 instead of E1; the unsupported-server control passed. |
+| A run with no END stays pending | `scoped_python_progress_without_end_is_pending_not_clean` | Returned FRESH/complete E0 instead of pending. The same applied control retained the unsupported-server case. |
+
+An initial overly broad trial disabled the entire progress opt-in, also removing
+the fallback-rule disclosure and reddening its control. It was discarded as
+confounded, restored, and replaced by the startup-fence control above, which
+preserves disclosure. That discarded trial is retained in the evidence, not
+counted as a successful single-red mutation.
+
+### Three fresh captures and reproducibility
+
+All runs use `runon: linux,8c` (network only for provisioning), serialized Cargo,
+FastAPI pin `26dbe0b00e1211b99446500fc6e402cfec6a3b99`, and the unchanged
+diagnostics collector's seeded **52-file** sample in batches 20/20/12. The runner
+cannot write `/srv/build/review`; the approved copy location is
+`target/inspect-accuracy/`. Python **3.14.4**, Pyright **1.1.414**, Pydantic
+**2.14.1**, Starlette **1.9.0**, Cargo/rustc **1.99.0**, Bun **1.4.2** and Node
+**24.21.0** match the available earlier primary-version provenance. The full new
+Python dependency freeze is retained. The earlier full transitive freeze is not
+available: the reference is now **62**, not the historical **50**, so no accuracy
+gain is claimed across those environments.
+
+| Independent fresh process | AFT E/W | Reference E/W | Agreed | AFT-only / reference-only | Scoped coverage |
+|---|---:|---:|---:|---:|---|
+| 1 | 62 | 62 | 62 | 0 / 0 | 52/52, all three pages complete |
+| 2 | 62 | 62 | 62 | 0 / 0 | 52/52, all three pages complete |
+| 3 | 62 | 62 | 62 | 0 / 0 | 52/52, all three pages complete |
+
+Each process reports **14/11/37 E/W diagnostics** in its three batches, using `work_done_progress` authority.
+The tested debug executable SHA-256 is
+`03fc2e9e1b567b9668de01c570d7af31885a59394daba5c3da6b13aff44ef5ed`.
+The project footer still correctly shows unknown E/W for missing Bash/YAML
+producers; each collector command exits 1 for that incomplete **project**
+coverage, not for its complete Python sample. The seven-repository all-producer
+gate remains unpassed.
+
+Other registered producer IDs are not silently upgraded to this contract:
+
+| Producer(s) | Analysis-progress evidence / behavior in this slice |
+|---|---|
+| `python` (Pyright), custom `basedpyright` | Pyright source and real traces establish the contract; enabled for the Pyright-derived protocol. Basedpyright uses the same mechanism, but has no separate installed-version corpus or custom-ID integration run here. |
+| `rust` | Existing rust-analyzer server-status / compiler-check progress contract and fake-server regressions retained. |
+| `typescript`, `typescript-native`, `go`, `bash`, `yaml`, `ty`, `oxlint`, `biome`, `dockerfile`, `vue`, `astro`, `svelte`, `prisma`, `terraform` | Whether their installed versions report **analysis** progress is unmeasured here; authority unchanged. Generic work-done support alone is not treated as an analysis guarantee. |
+| `clojure-lsp`, `dart`, `elixir-ls`, `fsharp`, `gleam`, `haskell-language-server`, `jdtls`, `julials`, `nixd`, `ocaml-lsp`, `php-intelephense`, `ruby-lsp`, `sourcekit-lsp`, `csharp`, `razor`, `clangd`, `lua-ls`, `zls`, `tinymist`, `kotlin-ls`, `texlab`, other custom IDs | Analysis-progress semantics unmeasured; no behavior change. |
+
+Verification includes the 70 scanner tests, published-view source fixture,
+18 client and 27 diagnostics-store tests, six Python progress integrations and
+13 existing blocking-scope integrations, plus all-target compiler checking and
+format checking. Raw captures, source pins, dependency freeze, initial reds,
+mutation outputs and restore evidence live outside regenerable build directories
+under `.cortexkit/internal-docs/investigations/inspect-accuracy/`. No ranking
+fence, tool arguments, dependency manifest or lockfile changed.
+
 ## Current follow-up: own checkout and seven-repository diagnostics
 
 The latest measurement uses a Linux **release** build of

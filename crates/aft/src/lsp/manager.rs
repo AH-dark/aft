@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
@@ -22,11 +22,10 @@ use crate::lsp::client::{
 use crate::lsp::diagnostics::{
     from_lsp_diagnostics, DiagnosticEntry, DiagnosticsStore, StoredDiagnostic,
 };
-use crate::lsp::document::{DiskSnapshot, DocumentStore};
+use crate::lsp::document::{DiskSnapshot, DocumentEntry, DocumentStore};
 use crate::lsp::position::{uri_for_path, uri_to_path};
 use crate::lsp::pull_params::{
-    AftDocumentDiagnosticParams, AftDocumentDiagnosticRequest, AftWorkspaceDiagnosticParams,
-    AftWorkspaceDiagnosticRequest,
+    AftDocumentDiagnosticParams, AftWorkspaceDiagnosticParams, AftWorkspaceDiagnosticRequest,
 };
 use crate::lsp::registry::{
     is_config_file_path_with_custom, resolve_server_binary, servers_for_file,
@@ -47,6 +46,115 @@ use crate::{slog_error, slog_warn};
 mod applicability_walk_tests;
 
 const STDERR_REASON_BYTES: usize = 2 * 1024;
+
+struct DocumentPullWorker(Weak<parking_lot::Mutex<LspManager>>);
+
+pub(crate) struct BackgroundDocumentPullPause {
+    owner: Weak<parking_lot::Mutex<LspManager>>,
+    active: bool,
+    idle: Option<Receiver<()>>,
+}
+
+impl std::fmt::Debug for BackgroundDocumentPullPause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackgroundDocumentPullPause")
+            .finish_non_exhaustive()
+    }
+}
+
+impl BackgroundDocumentPullPause {
+    pub(crate) fn wait_until_idle(&mut self, deadline: Instant) -> bool {
+        self.idle
+            .take()
+            .is_none_or(|idle| idle.recv_deadline(deadline).is_ok())
+    }
+}
+
+impl Drop for BackgroundDocumentPullPause {
+    fn drop(&mut self) {
+        if self.active {
+            if let Some(owner) = self.owner.upgrade() {
+                let mut manager = owner.lock();
+                manager.background_pull_pauses -= 1;
+                manager.start_background_document_pull_worker();
+            }
+        }
+    }
+}
+
+impl Drop for DocumentPullWorker {
+    fn drop(&mut self) {
+        if let Some(owner) = self.0.upgrade() {
+            let mut manager = owner.lock();
+            manager.background_pull_running = false;
+            manager.background_pull_inflight = false;
+            for waiter in std::mem::take(&mut manager.background_pull_idle_waiters) {
+                let _ = waiter.send(());
+            }
+            manager.start_background_document_pull_worker();
+        }
+    }
+}
+
+fn run_background_document_pulls(owner: Weak<parking_lot::Mutex<LspManager>>) {
+    let Some(manager) = owner.upgrade() else {
+        return;
+    };
+    let _worker = DocumentPullWorker(owner);
+    loop {
+        let batch = {
+            let mut manager = manager.lock();
+            if manager.background_pull_pending.is_empty() {
+                return;
+            }
+            std::mem::take(&mut manager.background_pull_pending)
+        };
+        // Finish a batch before taking newly coalesced input, so a continuously
+        // edited file cannot starve other open files in the same manager.
+        let mut batch = batch.into_iter();
+        while let Some((key, file)) = batch.next() {
+            let pull = {
+                let mut manager = manager.lock();
+                if manager.background_pull_pauses > 0 {
+                    manager.background_pull_pending.insert((key, file));
+                    manager.background_pull_pending.extend(batch);
+                    return;
+                }
+                let eligible = manager
+                    .clients
+                    .get(&key)
+                    .is_some_and(|client| client.uses_document_pull(Some(&file)))
+                    && manager
+                        .documents
+                        .get(&key)
+                        .is_some_and(|store| store.is_open(&file));
+                if !eligible {
+                    continue;
+                }
+                match manager.begin_document_pull(
+                    &key,
+                    &file,
+                    Instant::now() + LspManager::PULL_FILE_TIMEOUT,
+                ) {
+                    Ok(pull) => {
+                        manager.background_pull_inflight = true;
+                        pull
+                    }
+                    Err(_) => continue,
+                }
+            };
+            // Reuse scoped/post-edit pulls without holding the manager lock
+            // while a language server analyzes the file.
+            let pull = pull.wait();
+            let mut manager = manager.lock();
+            manager.finish_document_pull(pull);
+            manager.background_pull_inflight = false;
+            for waiter in std::mem::take(&mut manager.background_pull_idle_waiters) {
+                let _ = waiter.send(());
+            }
+        }
+    }
+}
 
 /// Leads the failure reason for TypeScript files that neither an installed
 /// typescript nor a declared typescript dependency covers.
@@ -373,6 +481,9 @@ pub(crate) struct DocumentPull {
     key: ServerKey,
     canonical_path: PathBuf,
     document_version: Option<i32>,
+    document_snapshot: Option<DocumentEntry>,
+    server_pid: Option<u32>,
+    previous_report: Option<DiagnosticEntry>,
     /// The pull itself opened the document in this server (it was not open
     /// for an edit or an earlier query).
     opened_for_pull: bool,
@@ -776,6 +887,12 @@ pub struct LspShutdownAllOutcome {
 }
 
 pub struct LspManager {
+    background_pull_owner: Weak<parking_lot::Mutex<LspManager>>,
+    background_pull_pending: HashSet<(ServerKey, PathBuf)>,
+    background_pull_running: bool,
+    background_pull_inflight: bool,
+    background_pull_pauses: usize,
+    background_pull_idle_waiters: Vec<Sender<()>>,
     rust_cargo_disabled_for_worker: Arc<std::sync::atomic::AtomicBool>,
     quiesced: std::sync::atomic::AtomicBool,
     /// Active server instances, keyed by (ServerKind, workspace_root).
@@ -792,6 +909,9 @@ pub struct LspManager {
     documents: HashMap<ServerKey, DocumentStore>,
     /// Stored publishDiagnostics payloads across all servers.
     diagnostics: DiagnosticsStore,
+    /// Already accepted observations consumed while ordering a pull response.
+    /// The normal event drain delivers them once to status/alert consumers.
+    pending_diagnostic_observations: Vec<AcceptedDiagnosticSnapshot>,
     /// Unified event channel — all server reader threads send here.
     event_tx: Sender<LspEvent>,
     event_rx: Receiver<LspEvent>,
@@ -1080,10 +1200,17 @@ impl LspManager {
             rust_cargo_disabled_for_worker: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             quiesced: std::sync::atomic::AtomicBool::new(false),
             clients: HashMap::new(),
+            background_pull_owner: Weak::new(),
+            background_pull_pending: HashSet::new(),
+            background_pull_running: false,
+            background_pull_inflight: false,
+            background_pull_pauses: 0,
+            background_pull_idle_waiters: Vec::new(),
             inspect_rust_checks: HashMap::new(),
             server_binaries: HashMap::new(),
             documents: HashMap::new(),
             diagnostics: DiagnosticsStore::new(),
+            pending_diagnostic_observations: Vec::new(),
             event_tx,
             event_rx,
             post_edit_waiters: HashMap::new(),
@@ -1120,6 +1247,101 @@ impl LspManager {
     #[doc(hidden)]
     pub fn set_retry_clock(&mut self, clock: RetryClock) {
         self.retry_clock = clock;
+    }
+
+    pub(crate) fn enable_background_document_pulls(
+        &mut self,
+        owner: Weak<parking_lot::Mutex<LspManager>>,
+    ) {
+        self.background_pull_owner = owner;
+    }
+
+    fn queue_background_document_pull(&mut self, key: &ServerKey, file: &Path) {
+        let eligible = self.clients.get(key).is_some_and(|client| {
+            client.uses_analysis_progress()
+                && client.state() == ServerState::Ready
+                && client.uses_document_pull(Some(file))
+        }) && self
+            .documents
+            .get(key)
+            .is_some_and(|store| store.is_open(file));
+        if !eligible || self.background_pull_owner.strong_count() == 0 {
+            return;
+        }
+        self.background_pull_pending
+            .insert((key.clone(), file.to_path_buf()));
+        self.start_background_document_pull_worker();
+    }
+
+    fn queue_open_document_pulls(&mut self, key: &ServerKey) {
+        let files = self
+            .documents
+            .get(key)
+            .map(|store| {
+                store
+                    .open_documents()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for file in files {
+            self.queue_background_document_pull(key, &file);
+        }
+    }
+
+    fn start_background_document_pull_worker(&mut self) {
+        if self.background_pull_running
+            || self.background_pull_pending.is_empty()
+            || self.background_pull_pauses > 0
+        {
+            return;
+        }
+        self.background_pull_running = true;
+        let owner = self.background_pull_owner.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("aft-lsp-document-pulls".into())
+            .spawn(move || run_background_document_pulls(owner))
+        {
+            self.background_pull_running = false;
+            slog_warn!("could not start document diagnostics helper: {error}");
+        }
+    }
+
+    pub(crate) fn pause_background_document_pulls(&mut self) -> BackgroundDocumentPullPause {
+        let active = self.background_pull_owner.strong_count() > 0;
+        if active {
+            self.background_pull_pauses += 1;
+        }
+        let idle = if active && self.background_pull_inflight {
+            let (tx, rx) = bounded(1);
+            self.background_pull_idle_waiters.push(tx);
+            Some(rx)
+        } else {
+            None
+        };
+        BackgroundDocumentPullPause {
+            owner: self.background_pull_owner.clone(),
+            active,
+            idle,
+        }
+    }
+
+    fn note_document_pull_completed(&mut self, key: &ServerKey, file: &Path) {
+        if !self.clients.get(key).is_some_and(|client| {
+            client.uses_analysis_progress() && client.uses_document_pull(Some(file))
+        }) {
+            return;
+        }
+        if let Some(client) = self.clients.get_mut(key) {
+            client.note_certified_diagnostics(false);
+        }
+        let _ = self.event_tx.send(LspEvent::DocumentDiagnosticsPulled {
+            server_kind: key.kind.clone(),
+            root: key.root.clone(),
+            file: file.to_path_buf(),
+            epoch: self.diagnostics.current_epoch(),
+        });
     }
 
     /// A root's analyzer is shared by sessions. Once a worker uses the root,
@@ -1438,8 +1660,9 @@ impl LspManager {
         self.project_applicability.is_some()
     }
 
-    /// A failed diagnostics producer differs from one still starting. Either
-    /// prevents project totals, but only actual failures report producer_missing.
+    /// Warm counts may retain a previously certified pair during reanalysis.
+    /// This is not inspect's fresh per-file authority; failures and clients
+    /// without a certified baseline still prevent numeric project counts.
     pub(crate) fn project_diagnostics_authority(&self) -> (bool, Vec<serde_json::Value>) {
         let Some(snapshot) = &self.project_applicability else {
             return (false, Vec::new());
@@ -1482,10 +1705,26 @@ impl LspManager {
         let authoritative = gaps.is_empty()
             && snapshot.server_keys.iter().all(|key| {
                 self.has_client(key)
-                    && !self.server_is_warming(key)
-                    && self.has_authoritative_report_for_server(key)
+                    && (self.clients.get(key).is_some_and(|client| {
+                        client.has_certified_analysis_report()
+                            && (client.diagnostics_are_provisional()
+                                || self.diagnostics.has_provisional_report_for_server(key))
+                    }) || (!self.server_is_warming(key)
+                        && self.has_authoritative_report_for_server(key)))
             });
         (authoritative, gaps)
+    }
+
+    pub(crate) fn project_analysis_progress_pending(&self) -> bool {
+        self.project_applicability.as_ref().is_some_and(|snapshot| {
+            snapshot.server_keys.iter().any(|key| {
+                self.clients.get(key).is_some_and(|client| {
+                    client.uses_analysis_progress()
+                        && !client.uses_document_pull(None)
+                        && client.diagnostics_are_provisional()
+                })
+            })
+        })
     }
 
     /// Start exactly the servers selected by a prior applicability snapshot.
@@ -2147,6 +2386,9 @@ impl LspManager {
             }
         }
 
+        for key in &server_keys {
+            self.queue_background_document_pull(key, &canonical_path);
+        }
         Ok(EnsureFileOpenResult {
             server_keys,
             newly_opened,
@@ -2274,6 +2516,7 @@ impl LspManager {
                 if let Some(store) = self.documents.get_mut(&key) {
                     store.bump_version_with(&canonical_path, &disk);
                 }
+                self.queue_background_document_pull(&key, &canonical_path);
                 versions.push((key, next_version));
                 continue;
             }
@@ -2314,6 +2557,7 @@ impl LspManager {
                 .open_with(canonical_path.clone(), &disk);
             // didOpen carries version 0 — that's the version the server
             // will echo on its first publishDiagnostics for this document.
+            self.queue_background_document_pull(&key, &canonical_path);
             versions.push((key, 0));
         }
 
@@ -2941,6 +3185,16 @@ impl LspManager {
             .is_some_and(|caps| caps.pull_diagnostics)
     }
 
+    pub(crate) fn server_supports_pull_for_file(
+        &self,
+        server_key: &ServerKey,
+        file: &Path,
+    ) -> bool {
+        self.clients
+            .get(server_key)
+            .is_some_and(|client| client.uses_document_pull(Some(file)))
+    }
+
     /// This server's current stored diagnostics for a file, if it has a report.
     pub(crate) fn server_file_diagnostics(
         &self,
@@ -3215,17 +3469,36 @@ impl LspManager {
     /// Whether LSP events are waiting to be drained. Cheap channel peek for
     /// the maintenance scheduler's skip probe.
     pub fn has_pending_events(&self) -> bool {
-        !self.event_rx.is_empty()
+        !self.event_rx.is_empty() || !self.pending_diagnostic_observations.is_empty()
     }
 
     pub fn drain_events_bounded(&mut self, max_events: usize) -> DrainedLspEvents {
+        self.drain_events_inner(max_events, false)
+    }
+
+    fn drain_events_inner(
+        &mut self,
+        max_events: usize,
+        preserve_pull_observations: bool,
+    ) -> DrainedLspEvents {
         let mut events = Vec::new();
-        let mut diagnostics_changed = false;
-        let mut accepted_snapshots = Vec::new();
+        let mut deferred_pull_events = Vec::new();
+        let mut accepted_snapshots = if preserve_pull_observations {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.pending_diagnostic_observations)
+        };
+        let mut diagnostics_changed = !accepted_snapshots.is_empty();
         while events.len() < max_events {
             let Ok(event) = self.event_rx.try_recv() else {
                 break;
             };
+            if preserve_pull_observations
+                && matches!(event, LspEvent::DocumentDiagnosticsPulled { .. })
+            {
+                deferred_pull_events.push(event);
+                continue;
+            }
             // `handle_event` returns the file of a stored publish; the
             // snapshot reuses it instead of parsing the payload again.
             if let Some(file) = self.handle_event(&event) {
@@ -3236,8 +3509,43 @@ impl LspManager {
             }
             events.push(event);
         }
+        for event in deferred_pull_events {
+            let _ = self.event_tx.send(event);
+        }
         let has_more = events.len() >= max_events && !self.event_rx.is_empty();
         self.send_due_rust_saves();
+        let mut promoted_reports = Vec::new();
+        for (key, client) in &mut self.clients {
+            if client.uses_analysis_progress() {
+                // Keep old certified entries as warm snapshots. Only replacement
+                // publications are provisional; fresh inspect separately gates
+                // the producer because analysis can change dependent files too.
+                let mut no_run = false;
+                let promoted = self.diagnostics.promote_provisional_reports(
+                    key,
+                    |file, epoch, published_at| {
+                        let certified =
+                            client.analysis_progress_certifies(file, epoch, published_at);
+                        no_run |= certified && !client.analysis_progress_covered_by_end(epoch);
+                        certified
+                    },
+                );
+                if !promoted.is_empty() {
+                    diagnostics_changed = true;
+                    if self.diagnostics.has_authoritative_report_for_server(key) {
+                        client.note_certified_diagnostics(no_run);
+                    }
+                }
+                promoted_reports.extend(promoted.into_iter().map(|file| (key.clone(), file)));
+            }
+        }
+        // A provisional publication was deliberately absent from live alert
+        // ingestion. Deliver its version-checked snapshot once it is certified.
+        for (key, file) in promoted_reports {
+            if let Some(snapshot) = self.accepted_snapshot_for_file(&key, &file) {
+                accepted_snapshots.push(snapshot);
+            }
+        }
         for client in self.clients.values_mut() {
             if client.rust_check_completed_current(Instant::now(), FLYCHECK_PUBLISH_SETTLE)
                 && !client.diagnostics_are_provisional()
@@ -3729,8 +4037,13 @@ impl LspManager {
     /// pending; a server exit is reported separately.
     ///
     /// `AppContext` uses the prepare/poll/finish methods directly so channel
-    /// waiting happens without its manager mutex. This convenience method keeps
-    /// the same behavior for standalone manager callers.
+    /// waiting happens without its manager mutex. This convenience method only
+    /// waits: unlike `AppContext::lsp_notify_and_collect_diagnostics`, it sends
+    /// no `textDocument/diagnostic` request, and a manager built outside
+    /// `AppContext` runs no background pulls. A server that has registered for
+    /// pull requests (Pyright does) stops pushing reports for open documents,
+    /// so here it stays pending unless the caller pulls first, for example with
+    /// [`Self::pull_file_diagnostics_with_timeout`].
     pub fn wait_for_post_edit_diagnostics(
         &mut self,
         file_path: &Path,
@@ -3964,37 +4277,51 @@ impl LspManager {
         deadline: Option<Instant>,
     ) -> DocumentPull {
         let canonical_path = canonical_path.to_path_buf();
+        self.background_pull_pending
+            .remove(&(key.clone(), canonical_path.clone()));
         let document_version = self
             .documents
             .get(&key)
             .and_then(|store| store.version(&canonical_path));
         let mut pull = DocumentPull {
+            document_version,
+            document_snapshot: self
+                .documents
+                .get(&key)
+                .and_then(|store| store.entry(&canonical_path))
+                .cloned(),
+            server_pid: self.clients.get(&key).map(LspClient::child_pid),
+            previous_report: self
+                .diagnostics
+                .entries_for_file(&canonical_path)
+                .into_iter()
+                .find(|(stored, entry)| {
+                    **stored == key && entry.from_document_pull && entry.result_id.is_some()
+                })
+                .map(|(_, entry)| entry.clone()),
             key,
             canonical_path,
-            document_version,
             opened_for_pull: false,
             state: DocumentPullState::Done(PullFileOutcome::PullNotSupported),
         };
         let supports_pull = self
             .clients
             .get(&pull.key)
-            .and_then(|c| c.diagnostic_capabilities())
+            .and_then(|c| c.diagnostic_capabilities_for_file(&pull.canonical_path))
             .is_some_and(|caps| caps.pull_diagnostics);
         if !supports_pull {
             return pull;
         }
 
         // Look up previous resultId for incremental requests.
-        let previous_result_id = self
-            .diagnostics
-            .entries_for_file(&pull.canonical_path)
-            .into_iter()
-            .find(|(k, _)| **k == pull.key)
-            .and_then(|(_, entry)| entry.result_id.clone());
+        let previous_result_id = pull
+            .previous_report
+            .as_ref()
+            .and_then(|entry| entry.result_id.clone());
         let identifier = self
             .clients
             .get(&pull.key)
-            .and_then(|c| c.diagnostic_capabilities())
+            .and_then(|c| c.diagnostic_capabilities_for_file(&pull.canonical_path))
             .and_then(|caps| caps.identifier.clone());
         let params = AftDocumentDiagnosticParams {
             text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
@@ -4022,14 +4349,19 @@ impl LspManager {
                 .unwrap_or_else(|| "none".to_string())
         );
         let started = match self.clients.get_mut(&pull.key) {
-            Some(client) => client.start_request::<AftDocumentDiagnosticRequest>(params),
+            Some(client) => client.start_document_diagnostic_request(&pull.canonical_path, params),
             None => Err(LspError::ServerNotReady("server not found".into())),
         };
         pull.state = match started {
-            Ok(request) => DocumentPullState::InFlight {
-                request,
-                wait_until: Instant::now() + timeout,
-            },
+            Ok((request, used_previous)) => {
+                if !used_previous {
+                    pull.previous_report = None;
+                }
+                DocumentPullState::InFlight {
+                    request,
+                    wait_until: Instant::now() + timeout,
+                }
+            }
             Err(err) => DocumentPullState::Replied(Err(err)),
         };
         pull
@@ -4087,6 +4419,9 @@ impl LspManager {
             key,
             canonical_path,
             document_version,
+            document_snapshot,
+            server_pid,
+            previous_report,
             state,
             ..
         } = pull;
@@ -4095,6 +4430,24 @@ impl LspManager {
             DocumentPullState::Replied(reply) => reply,
             DocumentPullState::InFlight { .. } => unreachable!("DocumentPull::wait replies"),
         };
+        if self.clients.get(&key).map(LspClient::child_pid) != server_pid
+            || self
+                .documents
+                .get(&key)
+                .and_then(|store| store.entry(&canonical_path))
+                != document_snapshot.as_ref()
+        {
+            return PullFileOutcome::RequestFailed {
+                reason: "document_changed_while_pulling".into(),
+            };
+        }
+        if self.clients.get(&key).is_some_and(|client| {
+            client.uses_analysis_progress() && !client.uses_document_pull(Some(&canonical_path))
+        }) {
+            return PullFileOutcome::RequestFailed {
+                reason: "document_diagnostics_not_registered".into(),
+            };
+        }
         let report = reply.and_then(|value| {
             serde_json::from_value::<lsp_types::DocumentDiagnosticReportResult>(value)
                 .map_err(Into::into)
@@ -4127,9 +4480,17 @@ impl LspManager {
                     // returning a full pull response. Apply those older events
                     // first so the full report remains authoritative. An
                     // unchanged response must inspect only a previous pull cache.
-                    self.drain_events();
+                    let drained = self.drain_events_inner(usize::MAX, true);
+                    self.pending_diagnostic_observations
+                        .extend(drained.accepted_snapshots);
                 }
-                self.ingest_document_report(&key, &canonical_path, document_version, report)
+                self.ingest_document_report(
+                    &key,
+                    &canonical_path,
+                    document_version,
+                    previous_report,
+                    report,
+                )
             }
             Err(err) => {
                 slog_info!(
@@ -4339,6 +4700,7 @@ impl LspManager {
         key: &ServerKey,
         canonical_path: &Path,
         document_version: Option<i32>,
+        previous_report: Option<DiagnosticEntry>,
         result: lsp_types::DocumentDiagnosticReportResult,
     ) -> PullFileOutcome {
         let report = match result {
@@ -4360,10 +4722,9 @@ impl LspManager {
                     &key.kind,
                 );
                 let count = stored.len();
-                let provisional = self
-                    .clients
-                    .get(key)
-                    .is_some_and(|client| client.diagnostics_are_provisional());
+                let provisional = self.clients.get(key).is_some_and(|client| {
+                    client.diagnostics_are_provisional() && !client.uses_analysis_progress()
+                });
                 self.diagnostics.publish_full_with_provisional(
                     key.clone(),
                     canonical_path.to_path_buf(),
@@ -4372,39 +4733,33 @@ impl LspManager {
                     document_version,
                     provisional,
                 );
+                self.diagnostics.mark_document_pull(key, canonical_path);
+                self.note_document_pull_completed(key, canonical_path);
                 PullFileOutcome::Full {
                     diagnostic_count: count,
                 }
             }
-            lsp_types::DocumentDiagnosticReport::Unchanged(_unchanged) => {
+            lsp_types::DocumentDiagnosticReport::Unchanged(unchanged) => {
                 // The server says the previous resultId is still valid for the
                 // current document. That is only usable if we already have a
                 // report for this exact server/file; an initial `unchanged`
                 // response cannot prove freshness. A stale watcher entry is
                 // acceptable here because the pull response itself proves the
                 // cached diagnostics still describe the now-synced file.
-                if self
-                    .diagnostics
-                    .has_report_for_server_file(key, canonical_path)
-                {
-                    if let Some(version) = document_version {
-                        self.diagnostics.confirm_for_server_file_version(
-                            key,
-                            canonical_path,
-                            version,
-                        );
-                    } else {
-                        self.diagnostics
-                            .mark_fresh_for_server_file(key, canonical_path);
-                    }
-                    let authoritative = self
-                        .clients
-                        .get(key)
-                        .map_or(true, |client| !client.diagnostics_are_provisional());
-                    if authoritative {
-                        self.diagnostics
-                            .clear_provisional_for_server_file(key, canonical_path);
-                    }
+                if let Some(previous) = previous_report {
+                    let authoritative = self.clients.get(key).map_or(true, |client| {
+                        !client.diagnostics_are_provisional() || client.uses_analysis_progress()
+                    });
+                    self.diagnostics.publish_full_with_provisional(
+                        key.clone(),
+                        canonical_path.to_path_buf(),
+                        previous.diagnostics,
+                        Some(unchanged.unchanged_document_diagnostic_report.result_id),
+                        document_version,
+                        !authoritative,
+                    );
+                    self.diagnostics.mark_document_pull(key, canonical_path);
+                    self.note_document_pull_completed(key, canonical_path);
                     PullFileOutcome::Unchanged
                 } else {
                     PullFileOutcome::RequestFailed {
@@ -4824,7 +5179,26 @@ impl LspManager {
     pub fn has_authoritative_report_for_file(&self, file: &Path) -> bool {
         let normalized = normalize_lookup_path(file);
         self.diagnostics
-            .has_authoritative_report_for_file(&normalized)
+            .entries_for_file(&normalized)
+            .into_iter()
+            .any(|(key, entry)| {
+                !entry.stale
+                    && !entry.provisional
+                    && self.clients.get(key).is_none_or(|client| {
+                        !client.uses_analysis_progress()
+                            || ((if client.uses_document_pull(Some(&normalized)) {
+                                entry.from_document_pull
+                            } else {
+                                !self.server_is_warming(key)
+                            }) && self
+                                .documents
+                                .get(key)
+                                .and_then(|documents| documents.version(&normalized))
+                                .is_none_or(|version| {
+                                    entry.version.is_none_or(|reported| reported == version)
+                                }))
+                    })
+            })
     }
 
     /// True if this server instance holds any authoritative report: an entry
@@ -4840,9 +5214,50 @@ impl LspManager {
     /// know (never started, or exited since) is not warming and cannot block a
     /// quiescence wait.
     pub fn server_is_warming(&self, server: &ServerKey) -> bool {
+        self.clients.get(server).is_some_and(|client| {
+            client.diagnostics_are_provisional()
+                || (client.has_analysis_progress()
+                    && self.diagnostics.has_provisional_report_for_server(server))
+        })
+    }
+
+    pub(crate) fn analysis_progress_authority(&self, server: &ServerKey) -> Option<&'static str> {
         self.clients
             .get(server)
-            .is_some_and(|client| client.diagnostics_are_provisional())
+            .and_then(|client| client.analysis_progress_authority())
+    }
+
+    pub(crate) fn analysis_progress_certifies_file(&self, server: &ServerKey, file: &Path) -> bool {
+        if self.clients.get(server).is_some_and(|client| {
+            client.uses_analysis_progress() && client.uses_document_pull(Some(file))
+        }) {
+            return self
+                .diagnostics
+                .entries_for_file(&normalize_lookup_path(file))
+                .into_iter()
+                .any(|(key, entry)| {
+                    key == server
+                        && entry.from_document_pull
+                        && !entry.provisional
+                        && !entry.stale
+                        && self
+                            .documents
+                            .get(server)
+                            .and_then(|store| store.version(file))
+                            .is_some_and(|version| entry.version == Some(version))
+                });
+        }
+        self.clients.get(server).is_none_or(|client| {
+            !client.uses_analysis_progress()
+                || self.diagnostic_epoch(server, file).is_some_and(|epoch| {
+                    client.analysis_progress_certifies(
+                        file,
+                        epoch,
+                        self.diagnostics
+                            .publication_time(server, &normalize_lookup_path(file)),
+                    )
+                })
+        })
     }
 
     /// A producer has settled when it holds a current authoritative report or
@@ -4850,6 +5265,14 @@ impl LspManager {
     /// diagnostics freshness gate both use this predicate so a complete
     /// producer set cannot be judged incomplete by a second, stricter check.
     pub fn producer_has_settled(&self, server: &ServerKey) -> bool {
+        if self
+            .clients
+            .get(server)
+            .is_some_and(|client| client.uses_analysis_progress())
+            && self.server_is_warming(server)
+        {
+            return self.producer_failure(server).is_some();
+        }
         self.producer_failure(server).is_some()
             || self.has_authoritative_report_for_server(server)
             || !self.server_is_warming(server)
@@ -4898,6 +5321,18 @@ impl LspManager {
         event: &LspEvent,
         file: &Path,
     ) -> Option<AcceptedDiagnosticSnapshot> {
+        if let LspEvent::DocumentDiagnosticsPulled {
+            server_kind, root, ..
+        } = event
+        {
+            return self.accepted_snapshot_for_file(
+                &ServerKey {
+                    kind: server_kind.clone(),
+                    root: root.clone(),
+                },
+                file,
+            );
+        }
         let LspEvent::Notification {
             server_kind,
             root,
@@ -4914,18 +5349,26 @@ impl LspManager {
             kind: server_kind.clone(),
             root: root.clone(),
         };
-        if self.live_publish_drop_reason(&server_key, file).is_some() {
+        self.accepted_snapshot_for_file(&server_key, file)
+    }
+
+    fn accepted_snapshot_for_file(
+        &self,
+        server_key: &ServerKey,
+        file: &Path,
+    ) -> Option<AcceptedDiagnosticSnapshot> {
+        if self.live_publish_drop_reason(server_key, file).is_some() {
             return None;
         }
-        let document_version = self.documents.get(&server_key)?.version(file)?;
+        let document_version = self.documents.get(server_key)?.version(file)?;
         let entry = self
             .diagnostics
             .entries_for_file(file)
             .into_iter()
-            .find_map(|(stored_key, entry)| (stored_key == &server_key).then_some(entry))?;
+            .find_map(|(stored_key, entry)| (stored_key == server_key).then_some(entry))?;
 
         Some(AcceptedDiagnosticSnapshot::new(
-            server_key,
+            server_key.clone(),
             document_version,
             entry.diagnostics.clone(),
         ))
@@ -4938,7 +5381,16 @@ impl LspManager {
         if client.state() != ServerState::Ready {
             return Some("server-not-ready");
         }
-        if client.diagnostics_are_provisional() {
+        let pulled = self
+            .diagnostics
+            .entries_for_file(file)
+            .into_iter()
+            .any(|(stored, entry)| stored == key && entry.from_document_pull && !entry.provisional);
+        if (client.uses_analysis_progress()
+            && client.analysis_progress_running()
+            && !(client.uses_document_pull(Some(file)) && pulled))
+            || (!client.uses_analysis_progress() && client.diagnostics_are_provisional())
+        {
             return Some("producer-warming");
         }
         let Some(document_version) = self
@@ -4978,6 +5430,9 @@ impl LspManager {
         }
         | LspEvent::ServerExited {
             server_kind, root, ..
+        }
+        | LspEvent::DocumentDiagnosticsPulled {
+            server_kind, root, ..
         }) = event;
         let event_key = ServerKey {
             kind: server_kind.clone(),
@@ -4990,6 +5445,54 @@ impl LspManager {
             }
         }
         let published_file = match event {
+            LspEvent::DocumentDiagnosticsPulled {
+                server_kind,
+                root,
+                file,
+                epoch,
+            } => {
+                let key = ServerKey {
+                    kind: server_kind.clone(),
+                    root: root.clone(),
+                };
+                self.diagnostics
+                    .entries_for_file(file)
+                    .into_iter()
+                    .any(|(stored, entry)| {
+                        stored == &key
+                            && entry.from_document_pull
+                            && entry.epoch == *epoch
+                            && !entry.provisional
+                            && !entry.stale
+                    })
+                    .then(|| file.clone())
+            }
+            LspEvent::ServerRequest {
+                server_kind,
+                root,
+                method,
+                ..
+            } if matches!(
+                method.as_str(),
+                "client/registerCapability"
+                    | "client/unregisterCapability"
+                    | "workspace/diagnostic/refresh"
+            ) =>
+            {
+                let key = ServerKey {
+                    kind: server_kind.clone(),
+                    root: root.clone(),
+                };
+                if method == "client/unregisterCapability"
+                    && self.clients.get(&key).is_some_and(|client| {
+                        client.uses_analysis_progress() && !client.uses_document_pull(None)
+                    })
+                {
+                    self.diagnostics.invalidate_document_pulls(&key);
+                }
+                self.queue_open_document_pulls(&key);
+                None
+            }
             LspEvent::Notification {
                 server_kind,
                 root,
@@ -5008,12 +5511,38 @@ impl LspManager {
                 None
             }
             LspEvent::Notification {
-                server_kind: ServerKind::Rust,
+                server_kind,
                 root,
                 method,
                 params: Some(params),
             } if method == "$/progress" => {
-                self.handle_rust_progress(root.clone(), params);
+                if *server_kind == ServerKind::Rust {
+                    self.handle_rust_progress(root.clone(), params);
+                } else if let Some(client) = self.clients.get_mut(&ServerKey {
+                    kind: server_kind.clone(),
+                    root: root.clone(),
+                }) {
+                    if client.uses_analysis_progress() {
+                        client.record_analysis_progress(params, self.diagnostics.current_epoch());
+                    }
+                }
+                None
+            }
+            LspEvent::ServerRequest {
+                server_kind,
+                root,
+                method,
+                params: Some(params),
+                ..
+            } if method == "window/workDoneProgress/create" => {
+                if let Some(client) = self.clients.get_mut(&ServerKey {
+                    kind: server_kind.clone(),
+                    root: root.clone(),
+                }) {
+                    if client.uses_analysis_progress() {
+                        client.note_analysis_progress_support(params);
+                    }
+                }
                 None
             }
             LspEvent::ServerExited {
@@ -5188,10 +5717,11 @@ impl LspManager {
         // so observation sources can accept only reports that prove which
         // in-memory document state they describe. The earlier
         // `publish_with_kind` path silently dropped both facts.
-        let provisional = self
-            .clients
-            .get(&key)
-            .is_some_and(|client| client.diagnostics_are_provisional());
+        let provisional = self.clients.get(&key).is_some_and(|client| {
+            client.diagnostics_are_provisional()
+                || client.has_analysis_progress()
+                || (client.uses_analysis_progress() && client.uses_document_pull(Some(&file)))
+        });
         self.diagnostics.publish_full_with_provisional(
             key.clone(),
             file.clone(),
@@ -5200,6 +5730,19 @@ impl LspManager {
             version,
             provisional,
         );
+        let epoch = self.diagnostics.current_epoch();
+        let published_at = self.diagnostics.publication_time(&key, &file);
+        if let Some(client) = self.clients.get_mut(&key) {
+            if client.uses_analysis_progress() {
+                client.note_analysis_publication(&file, epoch, published_at);
+                if !provisional {
+                    client.note_certified_diagnostics(
+                        !client.analysis_progress_covered_by_end(epoch),
+                    );
+                }
+            }
+        }
+        self.queue_background_document_pull(&key, &file);
         if let Some(reason) = self.live_publish_drop_reason(&key, &file) {
             slog_info!(
                 "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=dropped-because-{} file={} version={}",
@@ -6302,7 +6845,7 @@ fn resolve_for_lsp_uri(file_path: &Path) -> PathBuf {
     resolved
 }
 
-fn language_id_for_extension(ext: &str) -> &'static str {
+pub(crate) fn language_id_for_extension(ext: &str) -> &'static str {
     match ext {
         "ts" => "typescript",
         "tsx" => "typescriptreact",
@@ -9548,5 +10091,76 @@ while True:
             "{}",
             lines[1]
         );
+    }
+}
+
+#[cfg(test)]
+mod document_pull_certificate_tests {
+    use super::*;
+    use crate::lsp::diagnostics::DiagnosticSeverity;
+    use serde_json::json;
+
+    fn key() -> ServerKey {
+        ServerKey {
+            kind: ServerKind::Python,
+            root: PathBuf::from("/pull-fixture"),
+        }
+    }
+    fn unchanged() -> lsp_types::DocumentDiagnosticReportResult {
+        serde_json::from_value(json!({"kind":"unchanged","resultId":"checked"})).unwrap()
+    }
+
+    #[test]
+    fn unchanged_pull_cannot_certify_a_startup_push_cache() {
+        let mut manager = LspManager::new();
+        let key = key();
+        let file = key.root.join("broken.py");
+        manager
+            .diagnostics
+            .publish_full(key.clone(), file.clone(), Vec::new(), None, Some(0));
+        let outcome = manager.ingest_document_report(&key, &file, Some(0), None, unchanged());
+        assert!(
+            matches!(outcome, PullFileOutcome::RequestFailed { reason } if reason == "no_cache_for_unchanged")
+        );
+        assert!(
+            !manager.diagnostics.entries_for_file(&file)[0]
+                .1
+                .from_document_pull
+        );
+    }
+
+    #[test]
+    fn unchanged_pull_restores_the_request_cache_not_an_intervening_push() {
+        let mut manager = LspManager::new();
+        let key = key();
+        let file = key.root.join("broken.py");
+        manager.diagnostics.publish_full(
+            key.clone(),
+            file.clone(),
+            vec![StoredDiagnostic {
+                file: file.clone(),
+                line: 1,
+                column: 1,
+                end_line: 1,
+                end_column: 2,
+                severity: DiagnosticSeverity::Error,
+                message: "checked error".into(),
+                code: None,
+                source: None,
+            }],
+            Some("checked".into()),
+            Some(0),
+        );
+        let previous = manager.diagnostics.entries_for_file(&file)[0].1.clone();
+        manager
+            .diagnostics
+            .publish_full(key.clone(), file.clone(), Vec::new(), None, Some(0));
+        assert!(matches!(
+            manager.ingest_document_report(&key, &file, Some(0), Some(previous), unchanged()),
+            PullFileOutcome::Unchanged
+        ));
+        let entry = manager.diagnostics.entries_for_file(&file)[0].1;
+        assert!(entry.from_document_pull);
+        assert_eq!(entry.diagnostics[0].message, "checked error");
     }
 }
