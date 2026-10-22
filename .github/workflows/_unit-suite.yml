@@ -69,18 +69,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$(uname -s)" in
-            Linux) plat="linux" ;;
-            Darwin) plat="mac" ;;
-            *) plat="windows-tar" ;;
-          esac
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
+      - uses: ./.github/actions/setup-nextest
 
       - name: Build nextest archive (Linux integration suite)
         run: cargo nextest archive --workspace -E 'kind(test) - binary(=watcher_integration)' --archive-file "$LINUX_NEXTEST_ARCHIVE"
@@ -133,18 +122,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$(uname -s)" in
-            Linux) plat="linux" ;;
-            Darwin) plat="mac" ;;
-            *) plat="windows-tar" ;;
-          esac
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
+      - uses: ./.github/actions/setup-nextest
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -525,18 +503,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$(uname -s)" in
-            Linux) plat="linux" ;;
-            Darwin) plat="mac" ;;
-            *) plat="windows-tar" ;;
-          esac
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
+      - uses: ./.github/actions/setup-nextest
 
       - name: Release storm tests (production-calibrated latency bounds)
         run: cargo nextest run --no-fail-fast --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
@@ -607,18 +574,7 @@ jobs:
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$(uname -s)" in
-            Linux) plat="linux" ;;
-            Darwin) plat="mac" ;;
-            *) plat="windows-tar" ;;
-          esac
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
+      - uses: ./.github/actions/setup-nextest
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -676,13 +632,7 @@ jobs:
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/mac" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
+      - uses: ./.github/actions/setup-nextest
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -737,13 +687,7 @@ jobs:
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/mac" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
+      - uses: ./.github/actions/setup-nextest
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -793,13 +737,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/mac" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
+      - uses: ./.github/actions/setup-nextest
 
       - uses: ./.github/actions/download-artifact-retry
         with:
@@ -945,13 +883,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/mac" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
+      - uses: ./.github/actions/setup-nextest
 
       - uses: ./.github/actions/download-artifact-retry
         with:
@@ -1009,13 +941,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/mac" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
+      - uses: ./.github/actions/setup-nextest
 
       - name: Capture watcher inventory for the split proof
         run: cargo test -p agent-file-tools --features test-timing-hooks --test watcher_integration -- --list > "$RUNNER_TEMP/macos-watcher-inventory.txt" 2>&1
@@ -1079,13 +1005,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/mac" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
+      - uses: ./.github/actions/setup-nextest
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1189,18 +1109,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$(uname -s)" in
-            Linux) plat="linux" ;;
-            Darwin) plat="mac" ;;
-            *) plat="windows-tar" ;;
-          esac
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
+      - uses: ./.github/actions/setup-nextest
 
       - name: Build nextest archive (Windows Rust suite)
         run: cargo nextest archive --workspace -E "(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)" --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE"
@@ -1301,18 +1210,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$(uname -s)" in
-            Linux) plat="linux" ;;
-            Darwin) plat="mac" ;;
-            *) plat="windows-tar" ;;
-          esac
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
+      - uses: ./.github/actions/setup-nextest
 
       - uses: ./.github/actions/download-artifact-retry
         with:
@@ -1363,13 +1261,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # The gate script checks for cargo-nextest before running any phase.
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/windows-tar" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
+      - uses: ./.github/actions/setup-nextest
 
       - name: Rust watcher + conformance gate (Windows)
         # Keep watcher tests serial because they share fixtures. The conformance

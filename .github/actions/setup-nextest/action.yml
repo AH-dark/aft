@@ -1,0 +1,96 @@
+name: Setup cargo-nextest
+
+description: Install a pinned cargo-nextest release from a cached, checksum-verified archive
+
+inputs:
+  version:
+    description: cargo-nextest release to install
+    required: false
+    default: "0.9.138"
+
+runs:
+  using: composite
+  steps:
+    - name: Cache cargo-nextest
+      id: nextest-cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-nextest*
+        key: cargo-nextest-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Download and install cargo-nextest
+      if: steps.nextest-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        NEXTEST_VERSION: ${{ inputs.version }}
+        NEXTEST_RUNNER_OS: ${{ runner.os }}
+      run: |
+        set -euo pipefail
+
+        case "$NEXTEST_RUNNER_OS" in
+          Linux)
+            platform="linux"
+            release_target="x86_64-unknown-linux-gnu"
+            expected_sha256="3793bf0c27607b196f502c39b2108f571de89fcda7586ae6beefa11ee177b216"
+            ;;
+          macOS)
+            platform="mac"
+            release_target="universal-apple-darwin"
+            expected_sha256="124baa34d160355fa8a8bed053856270cfcf132659e76a0bc8bbcdfc093266b7"
+            ;;
+          Windows)
+            platform="windows-tar"
+            release_target="x86_64-pc-windows-msvc"
+            expected_sha256="e4606198dd067299f16863dcf5b9be007b9cae041e468c417884fc224760c0f4"
+            ;;
+          *)
+            echo "Unsupported runner OS: $NEXTEST_RUNNER_OS" >&2
+            exit 1
+            ;;
+        esac
+
+        if [[ "$NEXTEST_VERSION" != "0.9.138" ]]; then
+          echo "No pinned cargo-nextest checksum is available for $NEXTEST_VERSION" >&2
+          exit 1
+        fi
+
+        mkdir -p "$HOME/.cargo/bin"
+        archive_name="cargo-nextest-${NEXTEST_VERSION}-${platform}.tar.gz"
+        archive="$RUNNER_TEMP/$archive_name"
+        checksum_file="$RUNNER_TEMP/cargo-nextest-${NEXTEST_VERSION}-${release_target}.sha256"
+        curl --fail --location --silent --show-error \
+          --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 180 \
+          --output "$archive" "https://get.nexte.st/${NEXTEST_VERSION}/${platform}"
+        test -s "$archive"
+        printf '%s  %s\n' "$expected_sha256" "$archive" > "$checksum_file"
+        if command -v sha256sum >/dev/null 2>&1; then
+          sha256sum --check --status "$checksum_file"
+        else
+          shasum -a 256 --check --status "$checksum_file"
+        fi
+        (
+          cd "$RUNNER_TEMP"
+          tar -tzf "$archive_name" | grep -Eq '(^|/)cargo-nextest(\.exe)?$'
+          tar -xzf "$archive_name" -C "$HOME/.cargo/bin"
+        )
+
+    - name: Verify cargo-nextest version
+      shell: bash
+      env:
+        NEXTEST_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        binary="$HOME/.cargo/bin/cargo-nextest"
+        if [[ -f "${binary}.exe" ]]; then
+          binary="${binary}.exe"
+        fi
+        test -f "$binary"
+        actual_version=$("$binary" --version)
+        printf '%s\n' "$actual_version"
+        case "$actual_version" in
+          "cargo-nextest ${NEXTEST_VERSION}"*) ;;
+          *)
+            echo "Expected cargo-nextest ${NEXTEST_VERSION}, got: $actual_version" >&2
+            exit 1
+            ;;
+        esac
