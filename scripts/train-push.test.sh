@@ -1383,10 +1383,11 @@ test_required_check_failure_is_red() {
     > "$dir/ci-state/required_check_runs.final"
   run_train "$dir" required-check-failure
   if [ "$LAST_RC" -eq 4 ] && [[ "$LAST_OUT" == *'failed: linux'* ]] &&
+    [[ "$LAST_OUT" == *'green run: https://github.com/example/repo/actions/runs/42424242424'* ]] &&
     [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ]; then
-    ok 'a cancelled required context is reported red by name without landing'
+    ok 'a cancelled required context is red by name and preserves the green run URL'
   else
-    fail "a cancelled required context is reported red by name without landing (rc=$LAST_RC)"
+    fail "a cancelled required context is red by name and preserves the green run URL (rc=$LAST_RC)"
   fi
 }
 

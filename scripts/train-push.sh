@@ -1045,6 +1045,7 @@ required_check_state_details() {
 
 wait_for_required_status_checks() {
   local sha="$1"
+  local run_url="$2"
   local attempts="${TRAIN_PUSH_REQUIRED_CHECK_ATTEMPTS:-360}"
   local wait_seconds="${TRAIN_PUSH_REQUIRED_CHECK_SLEEP:-10}"
   local result_rc attempt details contexts
@@ -1068,11 +1069,11 @@ wait_for_required_status_checks() {
       :
     else
       result_rc=$?
-      landing_failed "could not read required check results for $sha (gh query exit $result_rc)" "$sha" "(required checks)"
+      landing_failed "could not read required check results for $sha (gh query exit $result_rc)" "$sha" "$run_url"
     fi
     classify_required_check_results
     if [ "${#REQUIRED_FAILED[@]}" -gt 0 ]; then
-      landing_failed "required checks not all green on $sha ($(required_check_state_details))" "$sha" "(required checks)"
+      landing_failed "required checks not all green on $sha ($(required_check_state_details))" "$sha" "$run_url"
     fi
     if [ "${#REQUIRED_PENDING[@]}" -eq 0 ] && [ "${#REQUIRED_MISSING[@]}" -eq 0 ]; then
       say "required status checks green on $sha: $contexts"
@@ -1084,7 +1085,7 @@ wait_for_required_status_checks() {
     [ "$attempt" -lt "$attempts" ] && sleep "$wait_seconds"
   done
   details="$(required_check_state_details)"
-  landing_failed "required checks did not all complete successfully on $sha before the wait limit ($details)" "$sha" "(required checks)"
+  landing_failed "required checks did not all complete successfully on $sha before the wait limit ($details)" "$sha" "$run_url"
 }
 
 required_check_failure_reason() {
@@ -1218,7 +1219,7 @@ land_verified_sha() {
     refuse_non_fast_forward "$sha"
   fi
 
-  wait_for_required_status_checks "$sha"
+  wait_for_required_status_checks "$sha" "$run_url"
   say "landing CI-verified $sha on $remote/$default_branch"
   set +e
   git -C "$REPO" push "$remote" "$sha:refs/heads/$default_branch" 2>&1 | tee "$push_log"
@@ -1956,7 +1957,7 @@ fi
 if [ -n "$parent_name" ]; then
   wait_for_parent "$verified_sha" "$run_url"
 fi
-wait_for_required_status_checks "$head_sha"
+wait_for_required_status_checks "$head_sha" "$run_url"
 say "landing $head_sha on $remote/$default_branch"
 set +e
 git -C "$REPO" push "$remote" "$head_sha:refs/heads/$default_branch" 2>&1 | tee "$push_log"
