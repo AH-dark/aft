@@ -130,17 +130,16 @@ pub fn has_reflow_content(input: &str) -> bool {
     input.chars().any(|ch| !ch.is_whitespace())
 }
 
-fn matches_at<F>(lines: &[&str], pattern: &[&str], start: usize, compare: &F) -> bool
-where
-    F: Fn(&str, &str) -> bool,
-{
-    pattern
-        .iter()
-        .enumerate()
-        .all(|(offset, expected)| compare(lines[start + offset], expected))
-}
-
 /// Search for a full pattern with a caller-supplied comparator, optionally anchored at EOF; mirrors `patch-parser.ts:247-281`.
+///
+/// Returns the first line at or after `start_index` where every pattern line
+/// compares equal (with `eof`, only the position ending at the last line).
+/// `compare` must be an equivalence relation, such as equality of a key
+/// derived from each line (the line itself, its trimmed form, ...). With
+/// `eof` only the window ending at the last line is checked; otherwise the
+/// search is [`normalized_sequence_match`]'s Knuth-Morris-Pratt scan over
+/// lines, so it stays linear in file plus pattern lines where trying every
+/// start cost file lines × pattern lines on repetitive files.
 pub fn try_match<F>(
     lines: &[&str],
     pattern: &[&str],
@@ -151,26 +150,20 @@ pub fn try_match<F>(
 where
     F: Fn(&str, &str) -> bool,
 {
-    if pattern.is_empty() || pattern.len() > lines.len() {
-        return None;
-    }
-
-    if eof {
-        let from_end = lines.len() - pattern.len();
-        if from_end >= start_index && matches_at(lines, pattern, from_end, &compare) {
-            return Some(from_end);
-        }
-        return None;
-    }
-
-    let last_start = lines.len() - pattern.len();
-    if start_index > last_start {
-        return None;
-    }
-
-    (start_index..=last_start).find(|&start| matches_at(lines, pattern, start, &compare))
+    normalized_sequence_match(lines, pattern, start_index, eof, compare)
 }
 
+/// Add one line-tier comparison to the work counter: one unit plus the
+/// shorter line's byte length.
+#[cfg(test)]
+pub(crate) fn count_line_comparison(a: &str, b: &str) {
+    LINE_MATCH_WORK.with(|work| work.set(work.get() + 1 + a.len().min(b.len())));
+}
+
+/// First match of `pattern` at or after `start_index` under `compare`, an
+/// equivalence relation on lines. Without `eof` this is a Knuth-Morris-Pratt
+/// scan over lines; with `eof` only the window ending at the last line is
+/// checked.
 fn normalized_sequence_match(
     lines: &[&str],
     pattern: &[&str],
@@ -178,6 +171,11 @@ fn normalized_sequence_match(
     eof: bool,
     compare: impl Fn(&str, &str) -> bool,
 ) -> Option<usize> {
+    let compare = |line: &str, expected: &str| {
+        #[cfg(test)]
+        count_line_comparison(line, expected);
+        compare(line, expected)
+    };
     if pattern.is_empty() || pattern.len() > lines.len() {
         return None;
     }
@@ -282,6 +280,10 @@ thread_local! {
     /// stream, and each byte normalized. Tests bound this by the file and
     /// needle sizes for the whole pass.
     pub(crate) static REFLOW_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Work done by the line-by-line tiers: one unit per line comparison
+    /// plus the shorter line's byte length. Tests bound this counter by file
+    /// plus needle size.
+    pub(crate) static LINE_MATCH_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -883,20 +885,15 @@ mod tests {
         });
         assert_eq!(found, None);
         assert!(calls.get() <= 2 * (lines.len() + pattern.len()));
+        // Baseline: try every start in turn, as `try_match` once did.
         let baseline_calls = Cell::new(0);
-        assert_eq!(
-            found,
-            super::try_match(
-                &lines,
-                &pattern,
-                0,
-                |a, b| {
-                    baseline_calls.set(baseline_calls.get() + 1);
-                    a == b
-                },
-                false
-            )
-        );
+        let baseline = (0..=lines.len() - pattern.len()).find(|&start| {
+            pattern.iter().enumerate().all(|(offset, expected)| {
+                baseline_calls.set(baseline_calls.get() + 1);
+                lines[start + offset] == *expected
+            })
+        });
+        assert_eq!(found, baseline);
         assert!(baseline_calls.get() > calls.get() * 20);
         eprintln!(
             "repeated-prefix comparisons: baseline {}, indexed {}",
@@ -1627,6 +1624,200 @@ mod reflow_linear {
         assert_eq!(patched.lines().count(), 6_000 - 2_000 + 1);
         assert!(patched.contains("    call_999(argument_999);\nreplaced();\n    call_3000("));
     }
+}
+
+/// Generated inputs for the line-tier differential tests here and in
+/// `fuzzy_match`: lines with duplicates, empty and whitespace-only lines,
+/// leading and trailing spaces and tabs, smart quotes and dashes.
+#[cfg(test)]
+pub(crate) mod line_test_support {
+    use super::reflow_test_support::Rng;
+
+    const LINES: &[&str] = &[
+        "a",
+        "a ",
+        " a",
+        "\ta",
+        "a\t",
+        "  a  ",
+        "b",
+        "b ",
+        "",
+        " ",
+        "\t",
+        "x y",
+        "x  y",
+        "\u{2018}q\u{2019}",
+        "'q'",
+        "\u{2014}",
+        "-",
+        "a b",
+    ];
+
+    /// File lines: random lines, often with a repeated block, so that
+    /// matches repeat and overlap.
+    pub(crate) fn file_lines(rng: &mut Rng) -> Vec<String> {
+        let count = 1 + rng.below(16);
+        let mut lines = Vec::new();
+        while lines.len() < count {
+            if rng.below(3) == 0 {
+                let block = (0..1 + rng.below(3))
+                    .map(|_| LINES[rng.below(LINES.len())].to_string())
+                    .collect::<Vec<_>>();
+                for _ in 0..2 + rng.below(4) {
+                    lines.extend(block.iter().cloned());
+                }
+            } else {
+                lines.push(LINES[rng.below(LINES.len())].to_string());
+            }
+        }
+        lines.truncate(count);
+        lines
+    }
+
+    /// Pattern lines: a window of the file with each line kept, given extra
+    /// leading or trailing whitespace, or replaced; or random lines.
+    pub(crate) fn pattern_lines(rng: &mut Rng, lines: &[String]) -> Vec<String> {
+        if rng.below(5) == 0 {
+            return (0..1 + rng.below(4))
+                .map(|_| LINES[rng.below(LINES.len())].to_string())
+                .collect();
+        }
+        let start = if rng.below(4) == 0 {
+            0
+        } else {
+            rng.below(lines.len())
+        };
+        let end = if rng.below(4) == 0 {
+            lines.len()
+        } else {
+            start + 1 + rng.below(lines.len() - start)
+        };
+        lines[start..end]
+            .iter()
+            .map(|line| match rng.below(8) {
+                0 => format!("{line} "),
+                1 => format!(" {line}"),
+                2 => format!("{line}\t"),
+                3 => LINES[rng.below(LINES.len())].to_string(),
+                _ => line.clone(),
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod line_tiers {
+    use super::line_test_support::{file_lines, pattern_lines};
+    use super::reflow_test_support::Rng;
+    use super::*;
+
+    /// `try_match` as it was before the Knuth-Morris-Pratt scan: every start
+    /// tried in turn. Kept unchanged as the reference result.
+    fn try_match_scan_oracle<F>(
+        lines: &[&str],
+        pattern: &[&str],
+        start_index: usize,
+        compare: F,
+        eof: bool,
+    ) -> Option<usize>
+    where
+        F: Fn(&str, &str) -> bool,
+    {
+        let matches_at = |start: usize| {
+            pattern
+                .iter()
+                .enumerate()
+                .all(|(offset, expected)| compare(lines[start + offset], expected))
+        };
+        if pattern.is_empty() || pattern.len() > lines.len() {
+            return None;
+        }
+        if eof {
+            let from_end = lines.len() - pattern.len();
+            if from_end >= start_index && matches_at(from_end) {
+                return Some(from_end);
+            }
+            return None;
+        }
+        let last_start = lines.len() - pattern.len();
+        if start_index > last_start {
+            return None;
+        }
+        (start_index..=last_start).find(|&start| matches_at(start))
+    }
+
+    /// The first match and the next one after it (the uniqueness check the
+    /// non-exact tiers make) agree with the old scan on generated inputs.
+    fn assert_tier_matches_scan(seed: u64, compare: fn(&str, &str) -> bool) {
+        let mut rng = Rng::new(seed);
+        let mut found = 0;
+        for case in 0..10_000 {
+            let mut lines = file_lines(&mut rng);
+            let mut pattern = pattern_lines(&mut rng, &lines);
+            if rng.below(4) == 0 {
+                // apply_patch strips a CR before matching; an unstripped one
+                // must still compare the same way in both scans.
+                lines.iter_mut().for_each(|line| line.push('\r'));
+                if rng.below(2) == 0 {
+                    pattern.iter_mut().for_each(|line| line.push('\r'));
+                }
+            }
+            let lines = lines.iter().map(String::as_str).collect::<Vec<_>>();
+            let pattern = pattern.iter().map(String::as_str).collect::<Vec<_>>();
+            let start = rng.below(lines.len() + 1);
+            let eof = rng.below(4) == 0;
+            let expected = try_match_scan_oracle(&lines, &pattern, start, compare, eof);
+            let actual = try_match(&lines, &pattern, start, compare, eof);
+            assert_eq!(
+                actual, expected,
+                "case {case}: lines {lines:?} pattern {pattern:?} start {start} eof {eof}"
+            );
+            if let Some(first) = actual {
+                found += 1;
+                assert_eq!(
+                    try_match(&lines, &pattern, first + 1, compare, eof),
+                    try_match_scan_oracle(&lines, &pattern, first + 1, compare, eof),
+                    "case {case}: next match after {first}"
+                );
+            }
+        }
+        assert!(found > 500, "only {found} matches");
+    }
+
+    #[test]
+    fn exact_tier_matches_the_start_by_start_scan() {
+        assert_tier_matches_scan(0x11ae_0001, |a, b| a == b);
+    }
+
+    #[test]
+    fn rstrip_tier_matches_the_start_by_start_scan() {
+        assert_tier_matches_scan(0x11ae_0002, |a, b| a.trim_end() == b.trim_end());
+    }
+
+    #[test]
+    fn trim_tier_matches_the_start_by_start_scan() {
+        assert_tier_matches_scan(0x11ae_0003, |a, b| a.trim() == b.trim());
+    }
+
+    // BEGIN line-tier work-bound test
+    /// Every line of a repetitive file matches the hunk's lines except its
+    /// last, which differs only in spacing ("ab" for "a b"). Trying every
+    /// start compared 7,000 lines (6,999 equal, then the differing last one)
+    /// at each of 18,001 starts in the exact, rstrip and trim tiers. All line tiers together now stay within
+    /// a small multiple of the file plus hunk size.
+    #[test]
+    fn line_tier_work_is_linear_on_repetitive_near_misses() {
+        let lines = vec!["a b"; 25_000];
+        let mut pattern = vec!["a b"; 6_999];
+        pattern.push("ab");
+        LINE_MATCH_WORK.with(|work| work.set(0));
+        assert_eq!(seek_sequence_tiered(&lines, &pattern, 0, false), None);
+        let work = LINE_MATCH_WORK.with(|work| work.get());
+        let size = lines.len() * "a b\n".len() + pattern.join("\n").len();
+        assert!(work <= 32 * size, "{work} units of work for {size} bytes");
+    }
+    // END line-tier work-bound test
 }
 
 #[cfg(test)]
