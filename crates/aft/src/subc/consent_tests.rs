@@ -2861,6 +2861,94 @@ async fn standalone_untrusted_reverse_asks_then_reads_once_without_cingulate() {
     f.connection_cancel.cancel();
 }
 
+fn write_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
+    crate::commands::write::handle_write(&request, ctx)
+}
+
+/// An MCP app's own approval dialog may approve one outside-project write.
+/// The dialog offers no folder choice and the approval covers only this call:
+/// nothing is saved as a standing grant, so a second write in the same folder
+/// asks again.
+#[tokio::test]
+async fn standalone_untrusted_reverse_asks_then_writes_once_without_cingulate() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let target = f.head_root.join("written.txt");
+    let mut route = identity(&f.worker.project_root, None);
+    let inner = Arc::get_mut(&mut route.0).unwrap();
+    inner.trust = BindTrust::Untrusted;
+    inner.consumer_elicitation_capable = true;
+    let (writer, mut replies) = f
+        .send_tool_with_writer(
+            &route,
+            "write",
+            json!({"filePath": target, "content": "approved outside write\n"}),
+            30,
+            write_dispatch,
+        )
+        .await;
+    let ask = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ask.header.ty, FrameType::Request);
+    let body: Value = serde_json::from_slice(&ask.body).unwrap();
+    assert_eq!(body["method"], BASH_ELICITATION_CREATE_METHOD);
+    assert_eq!(body["params"]["_meta"]["aft"]["tool"], "write");
+    assert_eq!(
+        body["params"]["_meta"]["aft"]["asks"],
+        json!([{"kind": "external_directory", "path": target, "operation": "write"}])
+    );
+    assert!(
+        body["params"]["message"]
+            .as_str()
+            .is_some_and(|message| message.ends_with(" once?")),
+        "{body}"
+    );
+    assert!(!target.exists(), "nothing is written before the answer");
+    assert!(standalone::reply(&writer, &allow_frame(&ask)));
+    let result = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.header.ty, FrameType::Response);
+    let result: Value = serde_json::from_slice(&result.body).unwrap();
+    assert_ne!(result["isError"], json!(true), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "approved outside write\n"
+    );
+    assert!(f.fake.calls("consent.request").is_empty());
+    assert!(f.worker_grants().is_empty());
+
+    let second = f.head_root.join("second.txt");
+    let (_writer, mut again) = f
+        .send_tool_with_writer(
+            &route,
+            "write",
+            json!({"filePath": second, "content": "unapproved\n"}),
+            31,
+            write_dispatch,
+        )
+        .await;
+    let ask = tokio::time::timeout(Duration::from_secs(10), again.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ask.header.ty,
+        FrameType::Request,
+        "a later write asks again"
+    );
+    let body: Value = serde_json::from_slice(&ask.body).unwrap();
+    assert_eq!(
+        body["params"]["_meta"]["aft"]["asks"][0]["path"],
+        json!(second)
+    );
+    assert!(!second.exists());
+    f.connection_cancel.cancel();
+}
+
 #[tokio::test]
 async fn standalone_untrusted_reverse_denial_keeps_path_error() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
