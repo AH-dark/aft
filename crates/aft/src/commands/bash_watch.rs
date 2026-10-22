@@ -125,6 +125,10 @@ struct StreamScan {
     base: u64,
     next: u64,
     has_more: bool,
+    /// A regex match ended exactly at the end of the buffer while more
+    /// captured bytes were still to be read. It is checked again once the
+    /// next page arrives or the stream is known to end there.
+    deferred: bool,
 }
 
 fn parse_params(req: &RawRequest) -> Result<BashWatchParams, String> {
@@ -549,19 +553,36 @@ impl WatchJob {
             let bytes = page.bytes;
             let next = page.next_offset;
             if bytes.is_empty() {
-                continue;
+                // A deferred match whose stream turned out to end there is a
+                // real match of the whole output; nothing new needs reading.
+                if !(scan.deferred && !scan.has_more) {
+                    continue;
+                }
+            } else {
+                if scan.buffer.is_empty() {
+                    scan.base = scan.next;
+                }
+                scan.next = next.max(scan.next + bytes.len() as u64);
+                scan.buffer.extend_from_slice(&bytes);
             }
-            if scan.buffer.is_empty() {
-                scan.base = scan.next;
-            }
-            scan.next = next.max(scan.next + bytes.len() as u64);
-            scan.buffer.extend_from_slice(&bytes);
+            scan.deferred = false;
             if let Some(found) = pattern.regex().find(&scan.buffer) {
-                return Some((
-                    String::from_utf8_lossy(found.as_bytes()).into_owned(),
-                    scan.base + found.start() as u64,
-                    label,
-                ));
+                // A page ends where the read stopped, not where the output
+                // ends. A regex match that reaches the end of the buffer may
+                // depend on what follows ($, \z, \b, a greedy repeat), so while
+                // more captured bytes follow it is not yet a match of the
+                // whole output. A literal is complete once all its bytes are in.
+                let end_dependent = matches!(pattern, WaitPattern::Regex(_))
+                    && scan.has_more
+                    && found.end() == scan.buffer.len();
+                if !end_dependent {
+                    return Some((
+                        String::from_utf8_lossy(found.as_bytes()).into_owned(),
+                        scan.base + found.start() as u64,
+                        label,
+                    ));
+                }
+                scan.deferred = true;
             }
             let cut = pattern.keep_from(scan.buffer.len());
             if cut > 0 {
@@ -948,17 +969,10 @@ mod tests {
     /// call with a long `limit_ms` and a reply budget parsed from `deadline_ms`
     /// the way the transport parses it.
     fn budgeted_terminal_watch(client_window: Duration) -> (tempfile::TempDir, WatchJob) {
-        let (dir, mut job, _snapshot) = approved_terminal_watch_fixture();
-        let ctx = context(dir.path(), dir.path());
-        let layout = with_authenticated_principal(principal(dir.path()), || {
-            let storage = crate::bash_background::task_storage_dir(&ctx);
-            let session = crate::bash_background::persistence::session_tasks_dir(&storage, SESSION);
-            crate::bash_background::persistence::resolve_task_layout(&session, TASK).unwrap()
-        });
         let mut output = vec![b'x'; BUDGET_PAGES * PAGE];
         let at = LAST_PAGE_MATCH as usize;
         output[at..at + 11].copy_from_slice(b"FINAL-MATCH");
-        std::fs::write(&layout.paths.stdout, output).unwrap();
+        let (dir, mut job) = terminal_watch_with_stdout(&output);
         let wall_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -969,6 +983,90 @@ mod tests {
         );
         job.limit_ms = 30_000;
         (dir, job)
+    }
+
+    /// The exited-task fixture with its stdout replaced by `output`.
+    fn terminal_watch_with_stdout(output: &[u8]) -> (tempfile::TempDir, WatchJob) {
+        let (dir, job, _snapshot) = approved_terminal_watch_fixture();
+        let ctx = context(dir.path(), dir.path());
+        let layout = with_authenticated_principal(principal(dir.path()), || {
+            let storage = crate::bash_background::task_storage_dir(&ctx);
+            let session = crate::bash_background::persistence::session_tasks_dir(&storage, SESSION);
+            crate::bash_background::persistence::resolve_task_layout(&session, TASK).unwrap()
+        });
+        std::fs::write(&layout.paths.stdout, output).unwrap();
+        (dir, job)
+    }
+
+    fn regex_pattern(source: &str) -> WaitPattern {
+        match parse_pattern(Some(&json!({ "regex": source }))) {
+            Ok(Some(pattern)) => pattern,
+            _ => panic!("test regex {source:?} must parse"),
+        }
+    }
+
+    /// Runs a full terminal watch of `output` for a regex pattern.
+    fn watch_exited_output(output: &[u8], source: &str) -> Waited {
+        let (_dir, mut job) = terminal_watch_with_stdout(output);
+        job.pattern = Some(regex_pattern(source));
+        job.wait(&crate::executor::JobCancellation::new()).unwrap()
+    }
+
+    /// `head` ends exactly at the first page boundary and `tail` follows it.
+    fn across_first_page(head: &[u8], tail: &[u8]) -> Vec<u8> {
+        let mut output = vec![b'.'; PAGE - head.len()];
+        output.extend_from_slice(head);
+        output.extend_from_slice(tail);
+        output
+    }
+
+    #[test]
+    fn approved_end_anchor_at_page_boundary_is_not_a_match_when_output_continues() {
+        let output = across_first_page(b"READY", b"-NOT\n");
+        let waited = watch_exited_output(&output, "READY$");
+        assert!(
+            matches!(waited.reason, WaitReason::Exited),
+            "READY$ falsely matched at a page edge: {:?}",
+            waited.matched
+        );
+        assert!(waited.matched.is_none());
+    }
+
+    #[test]
+    fn approved_text_end_anchor_at_page_boundary_is_not_a_match_when_output_continues() {
+        let output = across_first_page(b"READY", b"-NOT\n");
+        let waited = watch_exited_output(&output, r"READY\z");
+        assert!(waited.matched.is_none(), "{:?}", waited.matched);
+        // The same anchor still matches at the true end of the output.
+        let waited = watch_exited_output(&across_first_page(b"READY", b""), r"READY\z");
+        assert_eq!(
+            waited.matched,
+            Some(("READY".into(), (PAGE - 5) as u64, Some("stdout")))
+        );
+    }
+
+    #[test]
+    fn approved_word_boundary_at_page_boundary_is_not_a_match_when_the_word_continues() {
+        let output = across_first_page(b" READY", b"NESS\n");
+        let waited = watch_exited_output(&output, r"\bREADY\b");
+        assert!(waited.matched.is_none(), "{:?}", waited.matched);
+        // A real word boundary just past the page edge is still found.
+        let output = across_first_page(b" READY", b" now\n");
+        let waited = watch_exited_output(&output, r"\bREADY\b");
+        assert_eq!(
+            waited.matched,
+            Some(("READY".into(), (PAGE - 5) as u64, Some("stdout")))
+        );
+    }
+
+    #[test]
+    fn approved_regex_match_straddling_two_pages_is_found_once_at_its_offset() {
+        let output = across_first_page(b"BOUND", b"ARY-7\nmore\nBOUNDARY-8\n");
+        let waited = watch_exited_output(&output, r"BOUNDARY-\d");
+        assert_eq!(
+            waited.matched,
+            Some(("BOUNDARY-7".into(), (PAGE - 5) as u64, Some("stdout")))
+        );
     }
 
     /// Runs the wait on its own thread with slowed page reads. The hard
