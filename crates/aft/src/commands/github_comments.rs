@@ -627,7 +627,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn worker_comment_cannot_use_operator_gh_when_the_shim_is_disabled() {
-        use std::os::unix::fs::PermissionsExt;
         struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
         impl Drop for Restore {
             fn drop(&mut self) {
@@ -656,8 +655,7 @@ mod tests {
         std::env::set_var("PATH", std::env::join_paths(search_path).unwrap());
         std::env::set_var("AFT_STORAGE_DIR", root.path().join("storage"));
         let gh = root.path().join("gh");
-        std::fs::write(&gh,b"#!/bin/sh\nwhile IFS= read -r line; do :; done\nprintf invoked > \"$0.ran\"\nprintf 'https://github.com/cortexkit/aft/issues/7#issuecomment-1\\n'\n").unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(&gh,b"#!/bin/sh\nwhile IFS= read -r line; do :; done\nprintf invoked > \"$0.ran\"\nprintf 'https://github.com/cortexkit/aft/issues/7#issuecomment-1\\n'\n").unwrap();
         let mut config = Config::default();
         config.github.shim = false;
         config.git.co_author = "off".into();

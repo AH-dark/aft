@@ -92,6 +92,9 @@ pub mod engram_catalog;
 pub mod environment;
 pub mod error;
 pub mod exec_remote;
+#[cfg(test)]
+#[path = "../tests/helpers/executable_cache.rs"]
+mod executable_cache;
 pub mod executor;
 pub mod extract;
 pub mod feature_config;

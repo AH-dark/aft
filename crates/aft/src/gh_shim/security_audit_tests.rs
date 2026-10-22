@@ -464,7 +464,6 @@ fn audit_unattributed_jailed_worker_never_gets_operator_gh() {
 /// no canary or a readable one.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_probe_child(mode: &str, clear_all: bool) -> (std::process::Output, tempfile::TempDir) {
-    use std::os::unix::fs::PermissionsExt;
     let bin = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let home = home.keep().canonicalize().unwrap();
@@ -478,12 +477,11 @@ fn run_probe_child(mode: &str, clear_all: bool) -> (std::process::Output, tempfi
     )
     .unwrap();
     let fake = bin.path().join("gh");
-    fs::write(
+    crate::executable_cache::write_executable(
         &fake,
         b"#!/bin/sh\nprintf invoked > \"$0.ran\"\nprintf '123\\n'\nexit 0\n",
     )
     .unwrap();
-    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command.current_dir(bin.path());
     command.args([

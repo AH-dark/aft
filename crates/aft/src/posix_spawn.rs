@@ -774,11 +774,10 @@ mod tests {
         if !native_backend_for_tests() {
             return;
         }
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let shadow = dir.path().join("env");
-        std::fs::write(&shadow, b"#!/bin/sh\nprintf cwd-shadow").unwrap();
-        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(&shadow, b"#!/bin/sh\nprintf cwd-shadow")
+            .unwrap();
         for (path, expected) in [
             (None, "NATIVE_TOKEN=default-search\n"),
             (Some(""), "cwd-shadow"),

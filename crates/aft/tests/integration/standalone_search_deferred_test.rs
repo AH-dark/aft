@@ -1483,8 +1483,6 @@ fn standalone_inspect_completed_cargo_check_is_fresh_while_analyzer_is_warming()
 #[cfg(unix)]
 #[test]
 fn standalone_inspect_runs_cargo_check_while_the_analyzer_warms() {
-    use std::os::unix::fs::PermissionsExt;
-
     // Inspect's own cargo check must run while inspect waits for the analyzer
     // to settle, not after. With a 36 s budget (31 s of work time) that wait
     // lasts about 15 s for an analyzer that never settles; a check started
@@ -1493,15 +1491,15 @@ fn standalone_inspect_runs_cargo_check_while_the_analyzer_warms() {
     let temp = tempfile::tempdir().unwrap();
     let real_cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let slow_cargo = temp.path().join("slow-cargo");
-    fs::write(
+    crate::test_helpers::executable_cache::write_executable(
         &slow_cargo,
         format!(
             "#!/bin/sh\nif [ \"$1\" = check ]; then sleep 9; fi\nunset CARGO\nexec '{}' \"$@\"\n",
             Path::new(&real_cargo).display()
-        ),
+        )
+        .as_bytes(),
     )
     .unwrap();
-    fs::set_permissions(&slow_cargo, fs::Permissions::from_mode(0o755)).unwrap();
 
     let (response, _) = warming_rust_inspect_response(true, 36_000, json!({ "CARGO": slow_cargo }));
     assert_eq!(response["complete"], true, "{response:#}");

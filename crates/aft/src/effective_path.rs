@@ -1191,8 +1191,7 @@ mod tests {
     fn distinct_effective_path_spawns_bare_names_without_fork() {
         let tools = tempfile::tempdir().unwrap();
         let tool = tools.path().join("aft-path-probe-tool");
-        fs::write(&tool, "#!/bin/sh\nprintf '%s' \"$PATH\"\n").unwrap();
-        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable_shim(&tool, "#!/bin/sh\nprintf '%s' \"$PATH\"\n");
         let path =
             std::env::join_paths([tools.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
         assert_ne!(std::env::var_os("PATH").as_deref(), Some(path.as_os_str()));
@@ -1229,8 +1228,7 @@ mod tests {
     fn path_resolution_defers_relative_entries_and_paths_to_the_child() {
         let tools = tempfile::tempdir().unwrap();
         let tool = tools.path().join("aft-path-probe-tool");
-        fs::write(&tool, "#!/bin/sh\n").unwrap();
-        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable_shim(&tool, "#!/bin/sh\n");
         let absolute = std::env::join_paths([tools.path()]).unwrap();
         assert_eq!(
             resolve_in_path(OsStr::new("aft-path-probe-tool"), &absolute),
@@ -1337,10 +1335,7 @@ mod tests {
     }
 
     fn write_executable_shim(path: &Path, body: &str) {
-        fs::write(path, body).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
+        crate::executable_cache::write_executable(path, body.as_bytes()).unwrap();
     }
 
     #[test]
@@ -1620,16 +1615,10 @@ eval "$2"
     fn login_shell_probe_times_out() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let shell = dir.path().join("slow-login-shell");
-        fs::write(
+        write_executable_shim(
             &shell,
             "#!/bin/sh\nsleep 10\nprintf '%s' '/fake/login/bin:/usr/bin:/bin'\n",
-        )
-        .expect("write fake shell");
-        let mut permissions = fs::metadata(&shell)
-            .expect("fake shell metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&shell, permissions).expect("chmod fake shell");
+        );
 
         let started = Instant::now();
         let probed = probe_login_shell_path_once(&shell, LOGIN_SHELL_PATH_PROBE_TIMEOUT);

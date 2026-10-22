@@ -73,13 +73,12 @@ fn write_jq_fixture(directory: &std::path::Path) {
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
         let jq = directory.join("jq");
-        std::fs::write(&jq, "#!/bin/sh\ncat >/dev/null\nprintf 'A\\r\\nB\\n'\n").unwrap();
-        let mut permissions = std::fs::metadata(&jq).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(jq, permissions).unwrap();
+        crate::executable_cache::write_executable(
+            &jq,
+            b"#!/bin/sh\ncat >/dev/null\nprintf 'A\\r\\nB\\n'\n",
+        )
+        .unwrap();
     }
 }
 fn reply(value: Value) -> ReadReply {

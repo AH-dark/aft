@@ -2237,7 +2237,6 @@ mod tests {
     #[test]
     fn launcher_test_plan_wraps_the_spawned_command_line() {
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
 
         use crate::sandbox_profile::SandboxProfile;
@@ -2248,9 +2247,9 @@ mod tests {
         let args_log = project.path().join("launcher-args.txt");
         let launcher_script = project.path().join("sandbox-launch");
         let launcher = PathBuf::from("/bin/sh");
-        fs::write(
+        crate::executable_cache::write_executable_with_mode(
             &launcher_script,
-            r#"printf '%s\n' "$0" "$@" > "$AFT_TEST_LAUNCH_ARGS.tmp"
+            br#"printf '%s\n' "$0" "$@" > "$AFT_TEST_LAUNCH_ARGS.tmp"
 mv -f "$AFT_TEST_LAUNCH_ARGS.tmp" "$AFT_TEST_LAUNCH_ARGS"
 [ "$1" = "--profile-json" ] || exit 92
 [ -n "$2" ] || exit 93
@@ -2259,11 +2258,9 @@ mv -f "$AFT_TEST_LAUNCH_ARGS.tmp" "$AFT_TEST_LAUNCH_ARGS"
 shift 5
 exec "$@"
 "#,
+            0o700,
         )
         .unwrap();
-        let mut permissions = fs::metadata(&launcher_script).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&launcher_script, permissions).unwrap();
 
         let profile = SandboxProfile::build(
             vec![project.path().to_path_buf()],
@@ -2325,7 +2322,6 @@ exec "$@"
     #[test]
     fn launcher_init_failure_is_terminal_without_unsandboxed_retry() {
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
 
         use crate::response_finalize::DispatchOutcome;
@@ -2338,17 +2334,16 @@ exec "$@"
         let launcher = PathBuf::from("/bin/sh");
         let launcher_spawns = project.path().join("launcher-spawns");
         let command_marker = project.path().join("command-must-not-run");
-        fs::write(
+        crate::executable_cache::write_executable_with_mode(
             &launcher_script,
             format!(
                 "printf 'spawn\\n' >> '{}'\necho 'sandbox_unavailable: test backend failed' >&2\nprintf %s sandbox_unavailable >&\"$4\"\nexit 78\n",
                 launcher_spawns.display()
-            ),
+            )
+            .as_bytes(),
+            0o700,
         )
         .unwrap();
-        let mut permissions = fs::metadata(&launcher_script).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&launcher_script, permissions).unwrap();
 
         let profile = SandboxProfile::build(
             vec![project.path().to_path_buf()],

@@ -2896,13 +2896,11 @@ mod tests {
         let bin_dir = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let fake = bin_dir.join("ruff");
-        fs::write(
+        crate::executable_cache::write_executable(
             &fake,
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exec sleep 10; fi\nexit 0\n",
+            b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exec sleep 10; fi\nexit 0\n",
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
 
         let path = dir.path().join("main.py");
         fs::write(&path, "print('hello')\n").unwrap();
@@ -2975,14 +2973,12 @@ mod tests {
 
     #[cfg(unix)]
     fn counting_checker(root: &Path, tool: &str, output: &str, code: i32) {
-        use std::os::unix::fs::PermissionsExt;
         let bin = root.join("node_modules/.bin");
         fs::create_dir_all(&bin).unwrap();
         let path = bin.join(tool);
-        fs::write(&path, format!(
+        crate::executable_cache::write_executable(&path, format!(
             "#!/bin/sh\nprintf 'run\\n' >> '{0}/{tool}-count'\nprintf '%s\\n' \"$@\" >> '{0}/{tool}-args'\nprintf '%s\\n' '{output}'\nexit {code}\n", root.display()
-        )).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        ).as_bytes()).unwrap();
     }
 
     #[cfg(unix)]
@@ -3584,9 +3580,7 @@ mod tests {
         let bin_dir = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let fake = bin_dir.join("oxfmt");
-        fs::write(&fake, "#!/bin/sh\necho 1.0.0").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(&fake, b"#!/bin/sh\necho 1.0.0").unwrap();
 
         let path = dir.path().join("src/app.ts");
         let config = Config {
@@ -3612,10 +3606,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin_dir = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        use std::os::unix::fs::PermissionsExt;
         let fake = bin_dir.join("biome");
-        fs::write(&fake, "#!/bin/sh\necho 1.0.0").unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(&fake, b"#!/bin/sh\necho 1.0.0").unwrap();
 
         let path = Path::new("test.ts");
         let mut config = Config {
@@ -3640,10 +3632,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin_dir = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        use std::os::unix::fs::PermissionsExt;
         let fake = bin_dir.join("oxfmt");
-        fs::write(&fake, "#!/bin/sh\necho 1.0.0").unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(&fake, b"#!/bin/sh\necho 1.0.0").unwrap();
 
         let path = Path::new("test.ts");
         let mut config = Config {
@@ -3951,13 +3941,10 @@ mod tests {
         fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
         let bin_dir = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        use std::os::unix::fs::PermissionsExt;
         let fake_tsc = bin_dir.join("tsc");
-        fs::write(&fake_tsc, "#!/bin/sh\nexit 0").unwrap();
-        fs::set_permissions(&fake_tsc, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(&fake_tsc, b"#!/bin/sh\nexit 0").unwrap();
         let fake_tsgo = bin_dir.join("tsgo");
-        fs::write(&fake_tsgo, "#!/bin/sh\nexit 0").unwrap();
-        fs::set_permissions(&fake_tsgo, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(&fake_tsgo, b"#!/bin/sh\nexit 0").unwrap();
 
         let path = dir.path().join("src/app.ts");
         let config = Config {
@@ -3979,10 +3966,8 @@ mod tests {
         fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
         let bin_dir = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        use std::os::unix::fs::PermissionsExt;
         let fake_tsgo = bin_dir.join("tsgo");
-        fs::write(&fake_tsgo, "#!/bin/sh\nexit 0").unwrap();
-        fs::set_permissions(&fake_tsgo, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(&fake_tsgo, b"#!/bin/sh\nexit 0").unwrap();
 
         let path = dir.path().join("src/app.ts");
         let mut config = Config {
@@ -4012,14 +3997,12 @@ mod tests {
 
         let bin_dir = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        use std::os::unix::fs::PermissionsExt;
         let fake_tsgo = bin_dir.join("tsgo");
-        fs::write(
+        crate::executable_cache::write_executable(
             &fake_tsgo,
-            "#!/bin/sh\nif [ \"$1 $2 $3\" != \"--noEmit --pretty false\" ]; then echo \"bad args: $*\" >&2; exit 3; fi\nprintf '%s\n' \"src/app.ts(1,23): error TS2322: Type 'string' is not assignable to type 'number'.\"\nexit 2\n",
+            b"#!/bin/sh\nif [ \"$1 $2 $3\" != \"--noEmit --pretty false\" ]; then echo \"bad args: $*\" >&2; exit 3; fi\nprintf '%s\n' \"src/app.ts(1,23): error TS2322: Type 'string' is not assignable to type 'number'.\"\nexit 2\n",
         )
         .unwrap();
-        fs::set_permissions(&fake_tsgo, fs::Permissions::from_mode(0o755)).unwrap();
         // Pay the macOS first-exec assessment for the fresh shim in setup:
         // under a busy syspolicyd it can exceed the checker timeout inside
         // validate_full and fail this test as a spurious "timeout" skip.
@@ -4107,15 +4090,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn try_well_known_path_lookup_in_finds_executable_file() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let bin_dir = dir.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let tool_path = bin_dir.join("toolx");
-        fs::write(&tool_path, "#!/bin/sh\necho test").unwrap();
-        let mut perms = fs::metadata(&tool_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&tool_path, perms).unwrap();
+        crate::executable_cache::write_executable(&tool_path, b"#!/bin/sh\necho test").unwrap();
 
         let candidates = vec![
             dir.path().join("missing/toolx"),
@@ -4306,9 +4285,7 @@ C:\repo\other.go:1:1: other file
         let bin_dir = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let fake = bin_dir.join("biome");
-        fs::write(&fake, "#!/bin/sh\necho 1.0.0\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(&fake, b"#!/bin/sh\necho 1.0.0\n").unwrap();
 
         let path = dir.path().join("src/app.ts");
         let config = Config {
@@ -4332,9 +4309,8 @@ C:\repo\other.go:1:1: other file
         let bin_dir = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let fake = bin_dir.join("ruff");
-        fs::write(&fake, "#!/bin/sh\necho 'ruff 0.0.1'\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(&fake, b"#!/bin/sh\necho 'ruff 0.0.1'\n")
+            .unwrap();
 
         let path = dir.path().join("main.py");
         let config = Config {
@@ -4362,9 +4338,7 @@ C:\repo\other.go:1:1: other file
         let bin_dir = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let fake = bin_dir.join("staticcheck");
-        fs::write(&fake, "#!/bin/sh\necho staticcheck\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(&fake, b"#!/bin/sh\necho staticcheck\n").unwrap();
 
         let path = dir.path().join("main.go");
         let config = Config {
@@ -4389,11 +4363,9 @@ C:\repo\other.go:1:1: other file
         let dir = tempfile::tempdir().unwrap();
         let bin_dir = dir.path().join("node_modules").join(".bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        use std::os::unix::fs::PermissionsExt;
         for name in ["cargo", "go"] {
             let fake = bin_dir.join(name);
-            fs::write(&fake, "#!/bin/sh\necho fake\n").unwrap();
-            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::executable_cache::write_executable(&fake, b"#!/bin/sh\necho fake\n").unwrap();
         }
 
         fs::write(

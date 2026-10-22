@@ -2201,15 +2201,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn toolchain_version_change_invalidates_completed_check() {
-        use std::os::unix::fs::PermissionsExt;
         let (temp, mut cache) = fixture();
         let binary = temp.path().join("compiler");
-        fs::write(&binary, "#!/bin/sh\nprintf 'compiler 1\\n'\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(&binary, b"#!/bin/sh\nprintf 'compiler 1\\n'\n")
+            .unwrap();
         cache.runtime.binary = binary.clone();
         let analyzer = temp.path().join("analyzer");
-        fs::write(&analyzer, "#!/bin/sh\nprintf 'analyzer 1\\n'\n").unwrap();
-        fs::set_permissions(&analyzer, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(
+            &analyzer,
+            b"#!/bin/sh\nprintf 'analyzer 1\\n'\n",
+        )
+        .unwrap();
         cache.runtime.binary = analyzer;
         cache
             .runtime
@@ -2223,7 +2225,8 @@ mod tests {
         cache.saved_mut().fingerprint =
             fingerprint(&cache.root, runtime, None, Instant::now() + BUDGET, None).unwrap();
         assert!(cache.validated(Instant::now() + BUDGET).is_some());
-        fs::write(binary, "#!/bin/sh\nprintf 'compiler 2\\n'\n").unwrap();
+        crate::executable_cache::write_executable(&binary, b"#!/bin/sh\nprintf 'compiler 2\\n'\n")
+            .unwrap();
         assert!(cache.validated(Instant::now() + BUDGET).is_none());
     }
     #[test]
@@ -2533,11 +2536,13 @@ mod tests {
 
     #[cfg(unix)]
     fn live_fixture() -> (tempfile::TempDir, CompletedRustCheck) {
-        use std::os::unix::fs::PermissionsExt;
         let (temp, mut cache) = fixture();
         let compiler = temp.path().join("compiler");
-        fs::write(&compiler, "#!/bin/sh\nprintf 'compiler 1\\n'\n").unwrap();
-        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(
+            &compiler,
+            b"#!/bin/sh\nprintf 'compiler 1\\n'\n",
+        )
+        .unwrap();
         cache.runtime.binary = compiler.clone();
         cache
             .runtime
@@ -2586,16 +2591,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn inspect_uses_new_certificate_while_an_older_validation_is_still_pending() {
-        use std::os::unix::fs::PermissionsExt;
         let _env = crate::test_env::process_env_lock();
         let (temp, mut check) = live_fixture();
         let cargo = temp.path().join("cargo");
-        fs::write(
+        crate::executable_cache::write_executable(
             &cargo,
-            "#!/bin/sh\nprintf 'checked\\n' > check-ran\nprintf '%s\\n' '{\"reason\":\"build-finished\",\"success\":true}'\n",
+            b"#!/bin/sh\nprintf 'checked\\n' > check-ran\nprintf '%s\\n' '{\"reason\":\"build-finished\",\"success\":true}'\n",
         )
         .unwrap();
-        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
         check
             .runtime
             .env
@@ -2623,17 +2626,23 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn analyzer_version_change_invalidates_completed_check() {
-        use std::os::unix::fs::PermissionsExt;
         let (temp, mut cache) = live_fixture();
         let analyzer = temp.path().join("analyzer");
-        fs::write(&analyzer, "#!/bin/sh\nprintf 'analyzer 1\\n'\n").unwrap();
-        fs::set_permissions(&analyzer, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(
+            &analyzer,
+            b"#!/bin/sh\nprintf 'analyzer 1\\n'\n",
+        )
+        .unwrap();
         cache.runtime.binary = analyzer.clone();
         cache.begin(begin_after_fixture_inputs());
         cache.finished = true;
         cache.complete();
         assert!(cache.validated(Instant::now() + BUDGET).is_some());
-        fs::write(analyzer, "#!/bin/sh\nprintf 'analyzer 2\\n'\n").unwrap();
+        crate::executable_cache::write_executable(
+            &analyzer,
+            b"#!/bin/sh\nprintf 'analyzer 2\\n'\n",
+        )
+        .unwrap();
         assert!(cache.validated(Instant::now() + BUDGET).is_none());
     }
 

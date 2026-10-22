@@ -25,6 +25,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 #[path = "helpers/aft_binary.rs"]
 mod aft_binary;
+#[path = "helpers/executable_cache.rs"]
+mod executable_cache;
 #[path = "helpers/worker_gh_read.rs"]
 mod worker_gh_read;
 
@@ -2446,9 +2448,7 @@ fn native_available() -> bool {
 }
 
 fn executable(path: &Path, contents: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, contents).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    executable_cache::write_executable(path, contents.as_bytes()).unwrap();
 }
 
 #[tokio::test]

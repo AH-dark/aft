@@ -41,7 +41,7 @@ impl RenameFixture {
         .unwrap();
         fs::write(data.join("workflow.yml"), workflow).unwrap();
         let gh = base.upstream_bin.join("gh");
-        fs::write(&gh, r##"#!/bin/sh
+        test_helpers::executable_cache::write_executable(&gh, r##"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$GH_SHIM_TEST_RECORD"
 # Reject unexpected shapes instead of blessing flags the real gh rejects.
@@ -66,8 +66,7 @@ case "$*" in
   *) echo "unexpected gh arguments: $*" >&2; exit 2 ;;
 esac
 printf '{"nameWithOwner":"%s","defaultBranchRef":{"name":"main"},"url":"https://github.com/%s"}\n' "$repo" "$repo"
-"##).unwrap();
-        fs::set_permissions(gh, fs::Permissions::from_mode(0o755)).unwrap();
+"##.as_bytes()).unwrap();
         Self { base, data }
     }
 

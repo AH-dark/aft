@@ -618,19 +618,18 @@ mod startup_storage_tests {
     fn standing_empty_steady_ticks_do_no_database_or_git_work() {
         #[cfg(unix)]
         if std::env::var_os("AFT_TEST_STANDING_GIT_LOG").is_none() {
-            use std::os::unix::fs::PermissionsExt;
             let recorder = tempfile::tempdir().unwrap();
             let git = which::which("git").unwrap();
             let wrapper = recorder.path().join("git");
-            std::fs::write(
+            crate::executable_cache::write_executable(
                 &wrapper,
                 format!(
                     "#!/bin/sh\nprintf x >> \"$AFT_TEST_STANDING_GIT_LOG\"\nexec '{}' \"$@\"\n",
                     git.to_string_lossy().replace('\'', "'\\''")
-                ),
+                )
+                .as_bytes(),
             )
             .unwrap();
-            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
             let path = std::env::join_paths(
                 std::iter::once(recorder.path().to_path_buf())
                     .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),

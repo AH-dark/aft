@@ -4396,18 +4396,16 @@ fn single_crate_fixture(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
 #[test]
 fn rust_worker_inspect_is_partial_and_never_invokes_cargo_on_path() {
     let _guard = super::lsp_manager_test::rust_worker_policy_test_guard();
-    use std::os::unix::fs::PermissionsExt;
     let (temp, root, _) = single_crate_fixture("worker-inspect");
     let bin = temp.path().join("bin");
     fs::create_dir(&bin).unwrap();
     let log = temp.path().join("cargo-invocations");
     let cargo = bin.join("cargo");
     let real_cargo = which::which("cargo").unwrap();
-    fs::write(&cargo, format!(
+    crate::test_helpers::executable_cache::write_executable(&cargo, format!(
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = check ]; then exit 1; fi\nexec '{}' \"$@\"\n",
         log.display(), real_cargo.display()
-    )).unwrap();
-    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    ).as_bytes()).unwrap();
     let path = std::env::join_paths(
         std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
