@@ -583,6 +583,20 @@ const BASH_OUTCOMES = [
 
 const FORMAT_CASES: FormatCase[] = [
   {
+    name: "bash_running_remote_job_status",
+    tool_name: "bash_status",
+    agent_args: { taskId: "bash-remote" },
+    native_response_json: {
+      id: "1",
+      success: true,
+      task_id: "bash-remote",
+      status: "running",
+      mode: "pipes",
+      remote_job_id: "0192a64a-1234-7000-8000-000000000001",
+      remote_phase_note: "queued on the runner (1 s)",
+    },
+  },
+  {
     name: "safety_purge",
     tool_name: "safety",
     agent_args: { op: "purge", path: "secret.env" },

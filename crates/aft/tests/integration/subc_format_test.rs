@@ -192,6 +192,12 @@ fn bash_unknown_outcome_format_matches_typescript_golden_fixtures() {
 }
 
 #[test]
+fn bash_running_remote_job_status_matches_typescript_golden_fixture() {
+    let failure = assert_case(&fixtures_root().join("bash_running_remote_job_status"));
+    assert!(failure.is_none(), "{}", failure.unwrap_or_default());
+}
+
+#[test]
 fn bash_error_renders_as_text_not_raw_json() {
     // The MCP e2e probe caught a denied bash call returning the raw response
     // JSON as its text content because "bash" was missing from the formatted

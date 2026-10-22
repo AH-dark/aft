@@ -1197,6 +1197,11 @@ fn format_bash_status(
     if let Some(summary) = data.get("live_descendants_summary").and_then(Value::as_str) {
         text.push_str(&format!(" · {summary}"));
     }
+    if status == "running" {
+        if let Some(job_id) = data.get("remote_job_id").and_then(Value::as_str) {
+            text.push_str(&format!(" · remote job {job_id}"));
+        }
+    }
     // A remote task's phase note distinguishes input capture from queueing
     // and reports the runner's stop deadline once execution starts.
     if let Some(note) = data.get("remote_phase_note").and_then(Value::as_str) {
@@ -4885,6 +4890,39 @@ mod bash_companion_format_tests {
             with_watch.contains("To wait for it, call bash_watch; don't poll."),
             "{with_watch}"
         );
+    }
+
+    #[test]
+    fn running_bash_status_includes_an_assigned_remote_job_id() {
+        let text = status_text(
+            json!({
+                "task_id": "bash-1",
+                "status": "running",
+                "mode": "pipes",
+                "remote_job_id": "0192a64a-1234-7000-8000-000000000001",
+                "remote_phase_note": "queued on the runner (1 s)",
+            }),
+            None,
+        );
+        assert!(
+            text.contains("Task bash-1: running · remote job 0192a64a-1234-7000-8000-000000000001")
+        );
+        assert!(text.contains("queued on the runner (1 s)"));
+    }
+
+    #[test]
+    fn running_bash_status_without_an_assigned_remote_job_keeps_its_header() {
+        let text = status_text(
+            json!({
+                "task_id": "bash-1",
+                "status": "running",
+                "mode": "pipes",
+                "remote_phase_note": "submitting to the runner (capturing inputs; not accepted yet)",
+            }),
+            None,
+        );
+        assert!(text.starts_with("Task bash-1: running · submitting to the runner"));
+        assert!(!text.contains("remote job"));
     }
 
     #[test]

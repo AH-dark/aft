@@ -1527,6 +1527,34 @@ describe("bash_status tool", () => {
     expect(text).toContain(reason);
   });
 
+  test("running bash_status shows the full assigned remote job ID", async () => {
+    const jobId = "0192a64a-1234-7000-8000-000000000001";
+    const { statusTool } = makeCtx(() => ({
+      success: true,
+      status: "running",
+      remote_job_id: jobId,
+      remote_phase_note: "queued on the runner (1 s)",
+    }));
+
+    const text = await statusTool.execute({ taskId: "bash-remote" }, createMockSdkContext());
+
+    expect(text).toContain(`remote job ${jobId}`);
+    expect(text).toContain("queued on the runner (1 s)");
+  });
+
+  test("running bash_status does not add a job label before runner acceptance", async () => {
+    const { statusTool } = makeCtx(() => ({
+      success: true,
+      status: "running",
+      remote_phase_note: "submitting to the runner (capturing inputs; not accepted yet)",
+    }));
+
+    const text = await statusTool.execute({ taskId: "bash-remote" }, createMockSdkContext());
+
+    expect(text).toContain("Task bash-remote: running");
+    expect(text).not.toContain("remote job");
+  });
+
   test("default sync cap rejects 120001 with the config knob in the error", async () => {
     const { watchTool } = makeCtx(() => ({ success: true, status: "completed", exit_code: 0 }));
 

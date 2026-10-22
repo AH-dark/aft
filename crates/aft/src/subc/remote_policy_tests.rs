@@ -1686,14 +1686,16 @@ async fn exercise_catalog_remote_bash(
         assert!(!response.success, "{response:?}");
         assert_eq!(response.data["code"], "remote_unavailable", "{response:?}");
         assert_eq!(response.data["message"], format!(
-            "runon refused: remote refused: {reason}; command was not run; retry, or omit runon to run locally"
+            "runon refused: remote refused: {reason}; command was not run; retry, or omit runon to run locally; remote job 0192a64a-1234-7000-8000-000000000001"
         ));
     } else {
         assert!(response.success, "{response:?}");
         assert!(
             response.data["output"]
                 .as_str()
-                .is_some_and(|s| s.starts_with("ran remotely on ck-motor\n")),
+                .is_some_and(|s| s.starts_with(
+                    "ran remotely on ck-motor (job 0192a64a-1234-7000-8000-000000000001)\n"
+                )),
             "{response:?}"
         );
     }
