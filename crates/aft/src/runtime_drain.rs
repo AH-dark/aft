@@ -6925,6 +6925,9 @@ mod tests {
                 retry_after_ms: Some(2_700_000),
                 paused_until_ms: 2_800_000,
                 reason: "maintenance".into(),
+                cause: Default::default(),
+                safe_to_retry_same_request: true,
+                record_id: 0,
             },
         )
         .to_string();

@@ -168,7 +168,7 @@ fn lane_paused_six_cold_roots_leave_slots_and_maintenance_available() {
                         if clock.load(Ordering::SeqCst) < START + PAUSE_MS {
                             Err(SynapseEmbeddingError::LanePaused(LanePause {
                                 lane_id: MODEL.into(), fingerprint: Some("pinned".into()), retry_after_ms: Some(PAUSE_MS),
-                                paused_until_ms: START + PAUSE_MS, reason: "maintenance".into(),
+                                paused_until_ms: START + PAUSE_MS, reason: "maintenance".into(), cause: Default::default(), safe_to_retry_same_request: true, record_id: 0,
                             }).to_string())
                         } else { Ok(vec![vec![1.0, 0.0]; texts.len()]) }
                     }, 100)
@@ -253,7 +253,7 @@ fn lane_paused_executor_jobs_return_without_pinning_a_worker() {
             with_lane_pause_wait_hook(|_| panic!("executor worker attempted an announced-pause wait"), || {
                 let result: Result<(), String> = retry_lane_pause(|| Err(SynapseEmbeddingError::LanePaused(LanePause {
                     lane_id: MODEL.into(), fingerprint: Some("pinned".into()), retry_after_ms: Some(PAUSE_MS),
-                    paused_until_ms: START + PAUSE_MS, reason: "maintenance".into(),
+                    paused_until_ms: START + PAUSE_MS, reason: "maintenance".into(), cause: Default::default(), safe_to_retry_same_request: true, record_id: 0,
                 }).to_string()));
                 Response::success(format!("paused-{number}"), serde_json::json!({"pause": LanePause::from_error(&result.unwrap_err()).is_some()}))
             })

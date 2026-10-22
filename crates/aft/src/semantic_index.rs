@@ -820,7 +820,12 @@ pub(crate) fn retry_lane_pause_while<T>(
                 if !may_wait {
                     return Err(error);
                 }
-                wait_lane_pause(pause.retry_delay(backoff), current)?;
+                let delay = pause.retry_delay(backoff);
+                crate::synapse_embed::note_pause_retry_at(
+                    &pause,
+                    unix_millis_now().saturating_add(delay.as_millis() as u64),
+                );
+                wait_lane_pause(delay, current)?;
                 backoff = (backoff * 2).min(max);
             }
             success => return success,
@@ -11120,6 +11125,9 @@ mod tests {
                                 retry_after_ms: Some(PAUSE_MS),
                                 paused_until_ms: START + PAUSE_MS,
                                 reason: "maintenance".into(),
+                                cause: Default::default(),
+                                safe_to_retry_same_request: true,
+                                record_id: 0,
                             },
                         )
                         .to_string())
@@ -11299,6 +11307,9 @@ mod tests {
                         .as_u64()
                         .unwrap(),
                     reason: "maintenance".into(),
+                    cause: Default::default(),
+                    safe_to_retry_same_request: true,
+                    record_id: 0,
                 };
                 Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(pause).to_string())
             });
@@ -11347,6 +11358,265 @@ mod tests {
                 assert_eq!(requests.lock().unwrap().len(), 3);
             });
         });
+    }
+
+    /// Builds a one-file index the way the legacy cold build does: a retry
+    /// loop around the corpus walk and the build, embedding through `model`.
+    /// Returns the index, each embedding attempt's test-clock time, and how
+    /// often the corpus was walked.
+    fn build_one_file_index_through_pause_retry(
+        directory: &Path,
+        model: &mut SemanticEmbeddingModel,
+    ) -> (Result<SemanticIndex, String>, Vec<u64>, usize) {
+        let file = directory.join("compile.ts");
+        fs::write(&file, "export function keyword() { return 1; }\n").unwrap();
+        let mut attempts = Vec::new();
+        let mut embed = |texts: Vec<String>| {
+            attempts.push(unix_millis_now());
+            model.embed(texts)
+        };
+        let walks = std::cell::Cell::new(0);
+        let index = retry_lane_pause(|| {
+            let files = pause_job_files(directory, || {
+                walks.set(walks.get() + 1);
+                Ok(vec![file.clone()])
+            })
+            .map_err(|_| "corpus walk failed".to_string())?;
+            SemanticIndex::build_with_progress_and_cancellation_caps(
+                directory,
+                &files,
+                &mut embed,
+                100,
+                EmbedTextCaps::default(),
+                &mut |_, _| {},
+                &mut || true,
+            )
+        });
+        (index, attempts, walks.get())
+    }
+
+    /// Synapse answers `shape_compiling` (the pinned fixture carries
+    /// `retry_after_ms: 1000`; this fake compiles for one second) whenever
+    /// a request blocks on a cold compile past its deadline (after a restart,
+    /// an OS update, or a long input reaching an unused width). The legacy
+    /// cold build must treat that as a wait, not as the failure that clears
+    /// the semantic index and its status.
+    #[test]
+    fn shape_compiling_cold_build_waits_out_the_compile_and_resumes() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |clock| {
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
+            with_compiling_synapse(clock.clone(), 1_000, |config, requests| {
+                let directory = tempfile::tempdir().unwrap();
+                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+                let before = lane_pause_chunk_calls();
+                let (index, attempts, walks) =
+                    build_one_file_index_through_pause_retry(directory.path(), &mut model);
+                let index = index.expect("a compiling model must not fail the build");
+                assert!(index.len() > 0);
+                // The one-second hint is shorter than the worker's backoff.
+                assert_eq!(attempts, vec![START, START + 15_000]);
+                assert_eq!(lane_pause_chunk_calls() - before, 1, "the retry re-chunked");
+                assert_eq!(walks, 1, "the retry walked the corpus again");
+                let batches = requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, request)| request["method"] == "embed.batch")
+                    .count();
+                assert_eq!(batches, 2);
+                assert!(embedding_backend_build_health(directory.path()).is_none());
+            });
+        });
+    }
+
+    /// Where no worker may wait (an executor job), the refusal comes back as
+    /// an error the legacy build loop retries instead of publishing `Failed`.
+    #[test]
+    fn shape_compiling_error_is_a_pause_the_legacy_build_retries() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |clock| {
+            with_compiling_synapse(clock.clone(), 1_000, |config, _requests| {
+                let directory = tempfile::tempdir().unwrap();
+                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+                let (index, attempts, _) =
+                    build_one_file_index_through_pause_retry(directory.path(), &mut model);
+                let error = index.err().expect("no policy, so no wait and no retry");
+                assert_eq!(attempts, vec![START]);
+                let pause = crate::synapse_embed::LanePause::from_error(&error)
+                    .unwrap_or_else(|| panic!("not a pause: {error}"));
+                assert_eq!(pause.retry_after_ms, Some(1_000));
+                assert!(embedding_failure_is_transient(&error), "{error}");
+                assert_eq!(
+                    crate::synapse_embed::lane_pause_for_root(
+                        config.route_project_root.as_deref().unwrap()
+                    )
+                    .map(|pause| pause.paused_until_ms),
+                    Some(START + 1_000)
+                );
+            });
+        });
+    }
+
+    /// A compile longer than the worker's backoff is waited out for the
+    /// hinted time, and status shows the warm-up and when it ends meanwhile.
+    #[test]
+    fn shape_compiling_wait_honours_a_hint_longer_than_the_backoff() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |clock| {
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
+            with_compiling_synapse(clock.clone(), 90_000, |config, _requests| {
+                let root = config.route_project_root.clone().unwrap();
+                let waits = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                let seen = std::rc::Rc::clone(&waits);
+                let hook_clock = clock.clone();
+                let directory = tempfile::tempdir().unwrap();
+                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+                let (index, attempts, _) = with_lane_pause_wait_hook(
+                    move |delay| {
+                        let pause = crate::synapse_embed::lane_pause_for_root(&root).unwrap();
+                        seen.borrow_mut()
+                            .push((delay, pause.paused_until_ms, pause.reason));
+                        hook_clock.fetch_add(
+                            delay.as_millis() as u64,
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                    },
+                    || build_one_file_index_through_pause_retry(directory.path(), &mut model),
+                );
+                assert!(index.unwrap().len() > 0);
+                assert_eq!(attempts, vec![START, START + 90_000]);
+                assert_eq!(
+                    *waits.borrow(),
+                    vec![(
+                        Duration::from_secs(90),
+                        START + 90_000,
+                        "shape_compiling: …".to_string()
+                    )]
+                );
+            });
+        });
+    }
+
+    /// An unhinted warm-up waits the worker's backoff, and status shows that
+    /// wait's end rather than a pause that already ended.
+    #[test]
+    fn unhinted_warm_up_status_shows_when_the_backoff_retry_runs() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |clock| {
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
+            let reply = serde_json::json!({"result": {"error": {
+                "class": "transient", "code": "model_loading", "message": "loading",
+            }}});
+            with_fake_synapse_refusing(
+                clock.clone(),
+                START + 1,
+                move |_| reply.clone(),
+                |config, _requests| {
+                    let root = config.route_project_root.clone().unwrap();
+                    let ends = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                    let seen = std::rc::Rc::clone(&ends);
+                    let hook_clock = clock.clone();
+                    let directory = tempfile::tempdir().unwrap();
+                    let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+                    let (index, attempts, _) = with_lane_pause_wait_hook(
+                        move |delay| {
+                            seen.borrow_mut().push(
+                                crate::synapse_embed::lane_pause_for_root(&root)
+                                    .map(|pause| pause.paused_until_ms),
+                            );
+                            hook_clock.fetch_add(
+                                delay.as_millis() as u64,
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
+                        },
+                        || build_one_file_index_through_pause_retry(directory.path(), &mut model),
+                    );
+                    assert!(index.unwrap().len() > 0);
+                    assert_eq!(attempts, vec![START, START + 15_000]);
+                    assert_eq!(*ends.borrow(), vec![Some(START + 15_000)]);
+                },
+            );
+        });
+    }
+
+    /// A live refresh refused while the model compiles keeps the served
+    /// index and resumes the same chunks after the hint.
+    #[test]
+    fn shape_compiling_live_refresh_keeps_its_index_and_resumes() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |clock| {
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
+            with_compiling_synapse(clock, 90_000, |config, requests| {
+                let directory = tempfile::tempdir().unwrap();
+                let file = directory.path().join("live.ts");
+                fs::write(&file, "export function keyword() { return 2; }\n").unwrap();
+                let mut index = SemanticIndex::new(directory.path().to_path_buf(), 2);
+                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+                let before = lane_pause_chunk_calls();
+                let mut attempts = Vec::new();
+                let refresh = retry_lane_pause(|| {
+                    index.refresh_invalidated_files(
+                        directory.path(),
+                        std::slice::from_ref(&file),
+                        &mut |texts| {
+                            attempts.push((unix_millis_now(), lane_pause_chunk_calls() - before));
+                            model.embed(texts)
+                        },
+                        100,
+                        100,
+                        &mut |_, _| {},
+                    )
+                })
+                .unwrap();
+                assert!(!refresh.added_entries.is_empty());
+                assert_eq!(attempts, vec![(START, 1), (START + 90_000, 1)]);
+                assert_eq!(requests.lock().unwrap().len(), 3);
+            });
+        });
+    }
+
+    /// An unbind while a background thread waits out a compile ends the
+    /// wait without another embedding request.
+    #[test]
+    fn shape_compiling_wait_on_a_background_thread_is_interrupted_by_unbind() {
+        use crate::synapse_embed::pause_test_support::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let handle = std::thread::spawn(|| {
+            with_lane_pause_clock(START, |clock| {
+                with_compiling_synapse(clock, 90_000, |config, requests| {
+                    let bound = Arc::new(AtomicBool::new(true));
+                    let strict = Arc::clone(&bound);
+                    let _policy = PauseRetryScope::new(
+                        Duration::from_secs(15),
+                        Duration::from_secs(60),
+                        || true,
+                    )
+                    .with_pause_current(move || strict.load(Ordering::SeqCst));
+                    let directory = tempfile::tempdir().unwrap();
+                    let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+                    let (index, attempts, _) = with_lane_pause_wait_hook(
+                        move |_| bound.store(false, Ordering::SeqCst),
+                        || build_one_file_index_through_pause_retry(directory.path(), &mut model),
+                    );
+                    let batches = requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, request)| request["method"] == "embed.batch")
+                        .count();
+                    (index.err(), attempts, batches)
+                })
+            })
+        });
+        let (error, attempts, batches) = handle.join().unwrap();
+        assert_eq!(error.as_deref(), Some("semantic lane superseded"));
+        assert_eq!(attempts, vec![START]);
+        assert_eq!(batches, 1);
     }
 
     #[test]
@@ -11405,6 +11675,9 @@ mod tests {
                                             retry_after_ms: Some(PAUSE_MS),
                                             paused_until_ms: START + PAUSE_MS,
                                             reason: "maintenance".into(),
+                                            cause: Default::default(),
+                                            safe_to_retry_same_request: true,
+                                            record_id: 0,
                                         },
                                     )
                                     .to_string(),
@@ -11477,6 +11750,9 @@ mod tests {
                         retry_after_ms: Some(PAUSE_MS),
                         paused_until_ms: START + PAUSE_MS,
                         reason: "maintenance".into(),
+                        cause: Default::default(),
+                        safe_to_retry_same_request: true,
+                        record_id: 0,
                     },
                 )
                 .to_string())
@@ -11538,7 +11814,7 @@ mod tests {
                                         );
                                         Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(crate::synapse_embed::LanePause {
                                 lane_id: MODEL.into(), fingerprint: Some("pinned".into()), retry_after_ms: Some(PAUSE_MS),
-                                paused_until_ms: START + PAUSE_MS, reason: "maintenance".into(),
+                                paused_until_ms: START + PAUSE_MS, reason: "maintenance".into(), cause: Default::default(), safe_to_retry_same_request: true, record_id: 0,
                             }).to_string())
                                     },
                                     100,

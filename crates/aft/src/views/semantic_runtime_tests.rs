@@ -61,6 +61,55 @@ fn lane_paused_view_fill_waits_without_rechunking_and_resumes() {
 }
 
 #[test]
+fn shape_compiling_view_fill_waits_out_the_compile_and_resumes() {
+    use crate::semantic_index::{lane_pause_chunk_calls, with_lane_pause_clock, PauseRetryScope};
+    use crate::synapse_embed::pause_test_support::*;
+    with_lane_pause_clock(START, |clock| {
+        with_compiling_synapse(clock.clone(), 90_000, |config, requests| {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("checkout");
+            let storage = directory.path().join("storage");
+            write_tree(
+                &root,
+                &[("compile.ts", "export function keyword() { return 3; }\n")],
+            );
+            let runtime = open(&storage, "compiling", &root);
+            let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(5), Duration::from_secs(300), || true);
+            let before = lane_pause_chunk_calls();
+            let mut attempts = Vec::new();
+            let slot = Arc::new(CheckoutSemanticSlot::default());
+            let (epoch, _wake) = slot.begin();
+            let outcome = catch_up(
+                &Arc::downgrade(&slot),
+                epoch,
+                &runtime,
+                &fast_schedule(&root),
+                FillBudget::default(),
+                &mut |texts| {
+                    attempts.push((
+                        clock.load(Ordering::SeqCst),
+                        lane_pause_chunk_calls() - before,
+                    ));
+                    model.embed(texts)
+                },
+            );
+            assert!(matches!(outcome, FillOutcome::Settled));
+            // The 90 s hint outlasts the fill's 5 s backoff, so it sets the wait.
+            assert_eq!(attempts, vec![(START, 1), (START + 90_000, 1)]);
+            assert_eq!(lane_pause_chunk_calls() - before, 1);
+            assert_eq!(requests.lock().unwrap().len(), 3);
+            assert!(!runtime
+                .search(&[1.0, 0.0], 10, &|_| true)
+                .unwrap()
+                .results
+                .is_empty());
+        });
+    });
+}
+
+#[test]
 fn lane_paused_view_fingerprint_waits_before_checkout_preparation() {
     use crate::semantic_index::{lane_pause_chunk_calls, with_lane_pause_clock, PauseRetryScope};
     use crate::synapse_embed::pause_test_support::*;
@@ -259,6 +308,9 @@ fn lane_paused_view_cursor_retains_completed_and_unattempted_chunks() {
                         retry_after_ms: Some(PAUSE_MS),
                         paused_until_ms: START + PAUSE_MS,
                         reason: "maintenance".into(),
+                        cause: Default::default(),
+                        safe_to_retry_same_request: true,
+                        record_id: 0,
                     })
                     .to_string())
                 } else {
@@ -295,6 +347,9 @@ fn lane_pause_error() -> String {
         retry_after_ms: Some(PAUSE_MS),
         paused_until_ms: START + PAUSE_MS,
         reason: "maintenance".into(),
+        cause: Default::default(),
+        safe_to_retry_same_request: true,
+        record_id: 0,
     })
     .to_string()
 }

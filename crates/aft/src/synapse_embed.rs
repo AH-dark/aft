@@ -33,6 +33,28 @@ pub(crate) mod route_tests;
 
 const LANE_PAUSE_MARKER: &str = "[lane_paused] ";
 pub(crate) const MAX_LANE_PAUSE_MS: u64 = 120 * 60 * 1_000;
+/// Shortest retry hint honoured from a reply of class `transient`. Synapse
+/// answers a loading model with 250 ms, so the `lane_paused` floor of one
+/// second would discard real hints; anything shorter uses the normal backoff.
+pub(crate) const MIN_TRANSIENT_RETRY_MS: u64 = 100;
+
+/// Why Synapse refused an embedding request for now. Every cause travels the
+/// same pause path: background indexing waits and retries while keeping its
+/// index, queries fall back to keyword search at once, and none of them counts
+/// as a model failure or a circuit-breaker timeout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseCause {
+    /// `lane_paused`: an announced, scheduled pause of the model lane.
+    #[default]
+    LanePaused,
+    /// `shape_compiling` or `model_loading`: the model is still warming up and
+    /// will serve the same request once it is ready.
+    WarmingUp,
+    /// Any other reply of class `transient` (a full queue, an expired
+    /// deadline, a restarting engine, a quarantined lane).
+    Transient,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LanePause {
@@ -41,6 +63,22 @@ pub struct LanePause {
     pub retry_after_ms: Option<u64>,
     pub paused_until_ms: u64,
     pub reason: String,
+    #[serde(default)]
+    pub cause: PauseCause,
+    /// Synapse's `safe_to_retry_same_request`. When false, a retry must not
+    /// resend the refused request unchanged; see
+    /// [`LanePause::retry_same_request`].
+    #[serde(default = "same_request_is_safe")]
+    pub safe_to_retry_same_request: bool,
+    /// Which recorded pause this is: set when the client records the
+    /// refusal for its route root, and unique within the process, so a
+    /// worker's retry time reaches only the pause it waits on. 0 until then.
+    #[serde(default)]
+    pub record_id: u64,
+}
+
+fn same_request_is_safe() -> bool {
+    true
 }
 
 impl LanePause {
@@ -55,11 +93,218 @@ impl LanePause {
     pub fn retry_delay(&self, backoff: Duration) -> Duration {
         backoff.max(Duration::from_millis(self.retry_after_ms.unwrap_or(0)))
     }
+
+    /// Whether a retry may resend the refused request unchanged. Synapse
+    /// clears this when the request itself must change first.
+    pub fn retry_same_request(&self) -> bool {
+        self.safe_to_retry_same_request
+    }
+}
+
+/// Record that a background retry for `pause` will not run before
+/// `retry_at_ms`, so status shows when the wait really ends. A warm-up or
+/// other transient refusal may carry no hint (or a hint shorter than the
+/// worker's backoff); the daemon's own end time of an announced lane pause is
+/// left as it is. Only the recorded pause the worker waits on is extended:
+/// another root's identical pause, or a newer refusal that replaced this one,
+/// keeps its own end time.
+pub(crate) fn note_pause_retry_at(pause: &LanePause, retry_at_ms: u64) {
+    if pause.cause == PauseCause::LanePaused || pause.record_id == 0 {
+        return;
+    }
+    let mut pauses = lane_pauses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(recorded) = pauses
+        .values_mut()
+        .find(|recorded| recorded.record_id == pause.record_id)
+    {
+        recorded.paused_until_ms = recorded.paused_until_ms.max(retry_at_ms);
+    }
+}
+
+fn next_pause_record_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 fn lane_pauses() -> &'static Mutex<HashMap<PathBuf, LanePause>> {
     static PAUSES: OnceLock<Mutex<HashMap<PathBuf, LanePause>>> = OnceLock::new();
     PAUSES.get_or_init(Mutex::default)
+}
+
+/// Per project root and model, the most rows an `embed.batch` page may carry
+/// after Synapse refused a page with `safe_to_retry_same_request: false`
+/// (it does so for `deadline_exceeded`). Such a page must not be resent
+/// unchanged, so the retry splits the same texts into pages half as large,
+/// which also gives each page its own `request_key`. A one-row page cannot be
+/// split further; it is sent again under a fresh `request_key` instead (see
+/// [`refused_request_keys`]). Each fully embedded batch doubles
+/// the limit back toward the model's recommended rows. It lives outside the
+/// client because a background build opens a new client for every retry.
+fn page_row_caps() -> &'static Mutex<HashMap<(PathBuf, String), usize>> {
+    static CAPS: OnceLock<Mutex<HashMap<(PathBuf, String), usize>>> = OnceLock::new();
+    CAPS.get_or_init(Mutex::default)
+}
+
+fn page_row_limit(root: &Path, model: &str, recommended: usize) -> usize {
+    page_row_caps()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(root.to_path_buf(), model.to_owned()))
+        .map_or(recommended, |cap| recommended.min(*cap))
+}
+
+fn shrink_page_rows(root: &Path, model: &str, refused_rows: usize) {
+    page_row_caps()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            (root.to_path_buf(), model.to_owned()),
+            (refused_rows / 2).max(1),
+        );
+}
+
+fn grow_page_rows(root: &Path, model: &str, recommended: usize) {
+    let mut caps = page_row_caps()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = (root.to_path_buf(), model.to_owned());
+    let Some(cap) = caps.get_mut(&key) else {
+        return;
+    };
+    *cap = cap.saturating_mul(2);
+    if *cap >= recommended {
+        caps.remove(&key);
+    }
+}
+
+/// One-row `embed.batch` pages Synapse refused with
+/// `safe_to_retry_same_request: false`, by their stable request key, with how
+/// often each was refused. Synapse's wire contract makes a request the "same"
+/// one by its `request_key` and the digest bound to that key (operation,
+/// model, constraints, ordered item ids and content hashes); a new key with
+/// the same items is admitted as a new job. A row cannot be split the way a
+/// larger refused page is, so its next send uses a fresh key derived from the
+/// stable one and the refusal count instead: the same row, never the same
+/// request. A successful send forgets the entry, so later sends of that row
+/// use its normal key again: the stable key, or after any drop the key derived
+/// from it and the drop count. [`RefusedRequestKeys`] bounds how many rows are
+/// remembered and for how long; a row it drops before it succeeds is never
+/// resent under a key that was refused.
+fn refused_request_keys() -> &'static Mutex<RefusedRequestKeys> {
+    static KEYS: OnceLock<Mutex<RefusedRequestKeys>> = OnceLock::new();
+    KEYS.get_or_init(Mutex::default)
+}
+
+/// Most refused rows remembered at once. Only a successful send clears an
+/// entry, so a refused row that is abandoned (its build is cancelled, its
+/// root closes, its source changes) would otherwise stay for the whole
+/// session; past this many, the entry refused longest ago is dropped first.
+const MAX_REFUSED_REQUEST_KEYS: usize = 1_024;
+
+/// How long a refused row is remembered after its last refusal.
+const REFUSED_REQUEST_KEY_TTL_MS: u64 = 60 * 60 * 1_000;
+
+#[derive(Default)]
+struct RefusedRequestKeys {
+    entries: HashMap<String, RefusedRequestKey>,
+    /// How many entries the cap evicted, plus one for each expiry pass that
+    /// removed any: drops other than a row succeeding. A dropped row's next
+    /// send must not fall back to a key Synapse already refused, so every key
+    /// sent after a drop is derived from this count too: each drop moves all
+    /// rows onto keys never sent before it. Drops are rare, and a new key for
+    /// the same items costs only a new Synapse job.
+    drops: u64,
+}
+
+struct RefusedRequestKey {
+    refusals: u64,
+    last_refused_ms: u64,
+}
+
+impl RefusedRequestKeys {
+    fn key_to_send(&mut self, stable_key: &str, now_ms: u64) -> String {
+        self.expire(now_ms);
+        let base = if self.drops == 0 {
+            stable_key.to_owned()
+        } else {
+            hex_sha256(format!("{stable_key}:drops:{}", self.drops).as_bytes())
+        };
+        match self.entries.get(stable_key) {
+            Some(entry) => hex_sha256(format!("{base}:resend:{}", entry.refusals).as_bytes()),
+            None => base,
+        }
+    }
+
+    fn note_refused(&mut self, stable_key: &str, now_ms: u64) {
+        self.expire(now_ms);
+        if !self.entries.contains_key(stable_key) && self.entries.len() >= MAX_REFUSED_REQUEST_KEYS
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_refused_ms)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+                self.drops += 1;
+            }
+        }
+        let entry = self
+            .entries
+            .entry(stable_key.to_owned())
+            .or_insert(RefusedRequestKey {
+                refusals: 0,
+                last_refused_ms: now_ms,
+            });
+        entry.refusals += 1;
+        entry.last_refused_ms = now_ms;
+    }
+
+    fn forget(&mut self, stable_key: &str) {
+        self.entries.remove(stable_key);
+    }
+
+    fn expire(&mut self, now_ms: u64) {
+        let before = self.entries.len();
+        self.entries.retain(|_, entry| {
+            now_ms.saturating_sub(entry.last_refused_ms) < REFUSED_REQUEST_KEY_TTL_MS
+        });
+        if self.entries.len() < before {
+            self.drops += 1;
+        }
+    }
+}
+
+/// Milliseconds since the first refused-row lookup in this process. The
+/// refused-row ages use their own monotonic clock rather than the lane-pause
+/// test clock, which is per test thread, so tests on other threads cannot age
+/// out each other's entries.
+fn refused_request_key_clock_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+fn request_key_to_send(stable_key: &str) -> String {
+    refused_request_keys()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .key_to_send(stable_key, refused_request_key_clock_ms())
+}
+
+fn note_refused_request_key(stable_key: &str) {
+    refused_request_keys()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .note_refused(stable_key, refused_request_key_clock_ms());
+}
+
+fn forget_refused_request_key(stable_key: &str) {
+    refused_request_keys()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .forget(stable_key);
 }
 
 pub(crate) fn lane_pause_for_root(root: &Path) -> Option<LanePause> {
@@ -211,6 +456,31 @@ pub(crate) mod pause_test_support {
                     retry_after_ms: Some(PAUSE_MS),
                     paused_until_ms: START + PAUSE_MS,
                     reason: "scheduled maintenance".into(),
+                    cause: Default::default(),
+                    safe_to_retry_same_request: true,
+                    record_id: 0,
+                },
+            );
+    }
+
+    /// Records, as a refused embedding request would, that the model of
+    /// `root` is compiling a new input shape until `ready_at` on the test
+    /// clock.
+    pub(crate) fn record_warm_up_for_root(root: &Path, ready_at: u64) {
+        lane_pauses()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                root.to_path_buf(),
+                LanePause {
+                    lane_id: MODEL.into(),
+                    fingerprint: Some("pinned".into()),
+                    retry_after_ms: Some(ready_at - START),
+                    paused_until_ms: ready_at,
+                    reason: "shape_compiling: compiling".into(),
+                    cause: PauseCause::WarmingUp,
+                    safe_to_retry_same_request: true,
+                    record_id: 0,
                 },
             );
     }
@@ -225,6 +495,64 @@ pub(crate) mod pause_test_support {
     pub(crate) fn with_fake_synapse<T>(
         clock: Arc<AtomicU64>,
         retry_after_ms: Option<Value>,
+        run: impl FnOnce(SemanticBackendConfig, Requests) -> T,
+    ) -> T {
+        with_fake_synapse_refusing(
+            clock,
+            START + PAUSE_MS,
+            move |now| {
+                pause_reply(
+                    retry_after_ms
+                        .clone()
+                        .unwrap_or_else(|| json!(START + PAUSE_MS - now)),
+                )
+            },
+            run,
+        )
+    }
+
+    /// Synapse's reply while a request blocks on a cold shape compile, as
+    /// the wire contract in the SYNAPSE repository
+    /// (docs/wire-contract-v1.md, section 2) shows it: a transient refusal
+    /// with a 1,000 ms retry hint.
+    pub(crate) const SHAPE_COMPILING_REPLY: &str =
+        include_str!("../tests/fixtures/synapse/error-shape-compiling-transient.json");
+
+    /// Synapse's error object while a model lane is still loading.
+    pub(crate) const MODEL_LOADING_ERROR: &str =
+        include_str!("../tests/fixtures/synapse/error-model-loading-transient.json");
+
+    /// A fake Synapse whose model lane needs `compile_ms` on the test clock
+    /// to compile a cold input shape. Until then it answers every embedding
+    /// request with the pinned `shape_compiling` fixture, its hint set to the
+    /// time still left, and afterwards serves the same requests, as the real
+    /// daemon does once its compile finishes. A one-second compile reproduces
+    /// the fixture byte for byte on its first refusal.
+    pub(crate) fn with_compiling_synapse<T>(
+        clock: Arc<AtomicU64>,
+        compile_ms: u64,
+        run: impl FnOnce(SemanticBackendConfig, Requests) -> T,
+    ) -> T {
+        let reply: Value = serde_json::from_str(SHAPE_COMPILING_REPLY).unwrap();
+        let ready_at = START + compile_ms;
+        with_fake_synapse_refusing(
+            clock,
+            ready_at,
+            move |now| {
+                let mut reply = reply.clone();
+                reply["result"]["error"]["retry_after_ms"] = json!(ready_at - now);
+                reply
+            },
+            run,
+        )
+    }
+
+    /// A fake Synapse that lists [`MODEL`] and refuses every embedding
+    /// request with `refusal(now)` until the test clock reaches `ready_at`.
+    pub(crate) fn with_fake_synapse_refusing<T>(
+        clock: Arc<AtomicU64>,
+        ready_at: u64,
+        refusal: impl Fn(u64) -> Value + Send + 'static,
         run: impl FnOnce(SemanticBackendConfig, Requests) -> T,
     ) -> T {
         use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
@@ -276,8 +604,8 @@ pub(crate) mod pause_test_support {
                         let reply = if value["method"] == MODELS_LIST_OPERATION {
                             json!({"models":[{"model":MODEL,"fingerprint":"pinned","table_epoch":1,"dims":2,
                                 "recommended_batch":{"rows":100,"token_budget":8192}}]})
-                        } else if now < START + PAUSE_MS {
-                            pause_reply(retry_after_ms.clone().unwrap_or_else(|| json!(START + PAUSE_MS - now)))
+                        } else if now < ready_at {
+                            refusal(now)
                         } else {
                             let items = params.get("items").and_then(Value::as_array).cloned().unwrap_or_else(|| vec![params.clone()]);
                             json!({"fingerprint":"pinned","table_epoch":1,"vectors":items.into_iter().map(|item|
@@ -632,13 +960,33 @@ impl SynapseEmbeddingClient {
             .collect::<Vec<_>>();
         let pages = split_batch_pages(
             &items,
-            self.metadata.recommended_rows,
+            page_row_limit(
+                &self.state.route_project_root,
+                &self.state.model,
+                self.metadata.recommended_rows,
+            ),
             self.metadata.recommended_token_budget,
         );
         let mut vectors = HashMap::with_capacity(items.len());
         for page in pages {
-            vectors.extend(self.embed_batch_page(&page)?);
+            match self.embed_batch_page(&page) {
+                Ok(page_vectors) => vectors.extend(page_vectors),
+                Err(SynapseEmbeddingError::LanePaused(pause)) if !pause.retry_same_request() => {
+                    shrink_page_rows(
+                        &self.state.route_project_root,
+                        &self.state.model,
+                        page.len(),
+                    );
+                    return Err(SynapseEmbeddingError::LanePaused(pause));
+                }
+                Err(error) => return Err(error),
+            }
         }
+        grow_page_rows(
+            &self.state.route_project_root,
+            &self.state.model,
+            self.metadata.recommended_rows,
+        );
         items
             .iter()
             .map(|item| {
@@ -656,7 +1004,25 @@ impl SynapseEmbeddingClient {
         &mut self,
         items: &[BatchItem],
     ) -> Result<HashMap<String, Vec<f32>>, SynapseEmbeddingError> {
-        let request_key = batch_request_key(&self.state.model, &self.metadata.identity, items);
+        let stable_key = batch_request_key(&self.state.model, &self.metadata.identity, items);
+        let result = self.embed_batch_page_as(items, request_key_to_send(&stable_key));
+        match &result {
+            Ok(_) => forget_refused_request_key(&stable_key),
+            Err(SynapseEmbeddingError::LanePaused(pause))
+                if !pause.retry_same_request() && items.len() == 1 =>
+            {
+                note_refused_request_key(&stable_key);
+            }
+            Err(_) => {}
+        }
+        result
+    }
+
+    fn embed_batch_page_as(
+        &mut self,
+        items: &[BatchItem],
+        request_key: String,
+    ) -> Result<HashMap<String, Vec<f32>>, SynapseEmbeddingError> {
         let wire_items = items
             .iter()
             .map(|item| {
@@ -858,10 +1224,11 @@ impl SynapseState {
                                     "{operation} response exceeded 512KiB page bound"
                                 )));
                             }
-                            let result =
+                            let mut result =
                                 decode_result_envelope_for_request(response, Some(&params));
-                            match &result {
+                            match &mut result {
                                 Err(SynapseEmbeddingError::LanePaused(pause)) => {
+                                    pause.record_id = next_pause_record_id();
                                     lane_pauses()
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1078,6 +1445,11 @@ fn decode_result_envelope_for_request(
                         .filter(|ms| (1_000..=MAX_LANE_PAUSE_MS).contains(ms)),
                     paused_until_ms,
                     reason: reason.to_owned(),
+                    cause: PauseCause::LanePaused,
+                    safe_to_retry_same_request: error["safe_to_retry_same_request"]
+                        .as_bool()
+                        .unwrap_or(true),
+                    record_id: 0,
                 }))
             }
             "not_certified" => Err(SynapseEmbeddingError::ModelNotCertified(
@@ -1087,6 +1459,15 @@ fn decode_result_envelope_for_request(
                 expected: "required fingerprint".to_string(),
                 served: message.to_string(),
             }),
+            // Transience is the reply's class, not its code: Synapse sends
+            // `shape_compiling`, `model_loading`, `deadline_exceeded`,
+            // `queue_full`, `engine_crashed` and quarantined lanes this way,
+            // and may add codes. The two warm-up codes are named only so a
+            // query can say the model is warming up.
+            _ if error.get("class").and_then(Value::as_str) == Some("transient") => {
+                Err(transient_refusal(code, message, error, request)
+                    .map_or_else(|mismatch| mismatch, SynapseEmbeddingError::LanePaused))
+            }
             _ => Err(SynapseEmbeddingError::DaemonUnavailable(format!(
                 "{code}: {message}"
             ))),
@@ -1094,6 +1475,70 @@ fn decode_result_envelope_for_request(
     }
     serde_json::to_vec(&result)
         .map_err(|error| SynapseEmbeddingError::InvalidEnvelope(error.to_string()))
+}
+
+/// Decode a reply of class `transient` into a pause that ends after its retry
+/// hint. A missing, malformed or out-of-range hint (outside
+/// [`MIN_TRANSIENT_RETRY_MS`]..=[`MAX_LANE_PAUSE_MS`]) is dropped, so the
+/// waiting worker uses its normal backoff instead; it never makes the refusal
+/// permanent. Both `details` fields are optional, but when the reply names
+/// its lane (or that lane's fingerprint) it must be the requested model's, as
+/// for `lane_paused`: another lane's refusal is a fingerprint mismatch, never
+/// a pause of this lane.
+fn transient_refusal(
+    code: &str,
+    message: &str,
+    error: &Value,
+    request: Option<&Value>,
+) -> Result<LanePause, SynapseEmbeddingError> {
+    let details = &error["details"];
+    // Only embedding requests name a model and pinned fingerprint; a
+    // `models.list` refusal has nothing to compare.
+    if let Some(model) = request.and_then(|request| request["model"].as_str()) {
+        let pinned = request
+            .and_then(|request| request["required_fingerprint"].as_str())
+            .unwrap_or_default();
+        let lane_id = details.get("lane_id");
+        let fingerprint = details.get("fingerprint");
+        if lane_id.is_some_and(|value| value.as_str() != Some(model))
+            || fingerprint.is_some_and(|value| value.as_str() != Some(pinned))
+        {
+            return Err(SynapseEmbeddingError::FingerprintMismatch {
+                expected: format!("{model}:{pinned}"),
+                served: format!(
+                    "{}:{}",
+                    lane_id.unwrap_or(&Value::Null),
+                    fingerprint.unwrap_or(&Value::Null)
+                ),
+            });
+        }
+    }
+    let retry_after_ms = error["retry_after_ms"]
+        .as_u64()
+        .filter(|ms| (MIN_TRANSIENT_RETRY_MS..=MAX_LANE_PAUSE_MS).contains(ms));
+    let lane_id = details["lane_id"]
+        .as_str()
+        .or_else(|| request.and_then(|request| request["model"].as_str()))
+        .unwrap_or_default();
+    Ok(LanePause {
+        lane_id: lane_id.to_owned(),
+        fingerprint: request
+            .and_then(|request| request["required_fingerprint"].as_str())
+            .map(str::to_owned),
+        retry_after_ms,
+        paused_until_ms: crate::semantic_index::unix_millis_now()
+            .saturating_add(retry_after_ms.unwrap_or(0)),
+        reason: format!("{code}: {message}"),
+        cause: if matches!(code, "shape_compiling" | "model_loading") {
+            PauseCause::WarmingUp
+        } else {
+            PauseCause::Transient
+        },
+        safe_to_retry_same_request: error["safe_to_retry_same_request"]
+            .as_bool()
+            .unwrap_or(true),
+        record_id: 0,
+    })
 }
 
 fn parse_models_list(raw: &[u8]) -> Result<Vec<SynapseModelMetadata>, SynapseEmbeddingError> {
@@ -1528,6 +1973,351 @@ mod tests {
         .unwrap();
         let error = decode_result_envelope(response).unwrap_err();
         assert!(error.to_string().starts_with("[transient] "), "{error}");
+    }
+
+    fn decode_refusal(reply: &Value) -> SynapseEmbeddingError {
+        use super::pause_test_support::MODEL;
+        let request = json!({"model": MODEL, "required_fingerprint": "pinned"});
+        decode_result_envelope_for_request(serde_json::to_vec(reply).unwrap(), Some(&request))
+            .unwrap_err()
+    }
+
+    fn decoded_pause(reply: &Value) -> LanePause {
+        let error = decode_refusal(reply);
+        let rendered = error.to_string();
+        assert!(rendered.starts_with("[transient] "), "{rendered}");
+        let SynapseEmbeddingError::LanePaused(pause) = error else {
+            panic!("{rendered}");
+        };
+        assert_eq!(LanePause::from_error(&rendered).as_ref(), Some(&pause));
+        pause
+    }
+
+    #[test]
+    fn shape_compiling_fixture_decodes_as_a_warm_up_with_its_hint() {
+        use super::pause_test_support::*;
+        crate::semantic_index::with_lane_pause_clock(START, |_| {
+            let pause = decoded_pause(&serde_json::from_str(SHAPE_COMPILING_REPLY).unwrap());
+            assert_eq!(pause.cause, PauseCause::WarmingUp);
+            assert_eq!(pause.retry_after_ms, Some(1_000));
+            assert_eq!(pause.paused_until_ms, START + 1_000);
+            assert_eq!(pause.lane_id, MODEL);
+            assert!(pause.retry_same_request());
+            assert_eq!(pause.reason, "shape_compiling: …");
+            assert_eq!(
+                pause.retry_delay(Duration::from_millis(100)),
+                Duration::from_secs(1)
+            );
+        });
+    }
+
+    #[test]
+    fn model_loading_fixture_decodes_as_a_warm_up_with_its_250ms_hint() {
+        use super::pause_test_support::*;
+        crate::semantic_index::with_lane_pause_clock(START, |_| {
+            let error: Value = serde_json::from_str(MODEL_LOADING_ERROR).unwrap();
+            // The fixture has no `details`; the lane comes from the request.
+            let pause = decoded_pause(&json!({"result": {"error": error}}));
+            assert_eq!(pause.cause, PauseCause::WarmingUp);
+            assert_eq!(pause.retry_after_ms, Some(250));
+            assert_eq!(pause.paused_until_ms, START + 250);
+            assert_eq!(pause.lane_id, MODEL);
+        });
+    }
+
+    #[test]
+    fn any_transient_class_reply_is_a_pause_carrying_its_hint() {
+        for (code, hint, safe, details) in [
+            ("queue_full", 2_000, true, Value::Null),
+            ("deadline_exceeded", 100, false, Value::Null),
+            ("engine_crashed", 5_000, true, Value::Null),
+            (
+                "lane_quarantined",
+                600_000,
+                true,
+                json!({"lane_id": "qwen3-embedding-0.6b-ane", "quarantined": true}),
+            ),
+            ("some_future_code", 30_000, true, Value::Null),
+        ] {
+            let pause = decoded_pause(&json!({"result": {"error": {
+                "class": "transient", "code": code, "message": "try later",
+                "retry_after_ms": hint, "safe_to_retry_same_request": safe,
+                "details": details,
+            }}}));
+            assert_eq!(pause.cause, PauseCause::Transient, "{code}");
+            assert_eq!(pause.retry_after_ms, Some(hint), "{code}");
+            assert_eq!(pause.retry_same_request(), safe, "{code}");
+            assert_eq!(pause.reason, format!("{code}: try later"));
+        }
+    }
+
+    #[test]
+    fn transient_hint_out_of_range_or_malformed_uses_the_normal_backoff() {
+        for hint in [
+            json!(MIN_TRANSIENT_RETRY_MS - 1),
+            json!(MAX_LANE_PAUSE_MS + 1),
+            json!(-1),
+            json!(1.5),
+            json!("1000"),
+            Value::Null,
+        ] {
+            let pause = decoded_pause(&json!({"result": {"error": {
+                "class": "transient", "code": "shape_compiling", "message": "compiling",
+                "retry_after_ms": hint, "safe_to_retry_same_request": true,
+            }}}));
+            assert_eq!(pause.cause, PauseCause::WarmingUp, "{hint}");
+            assert_eq!(pause.retry_after_ms, None, "{hint}");
+            assert_eq!(
+                pause.retry_delay(Duration::from_secs(15)),
+                Duration::from_secs(15),
+                "{hint}"
+            );
+        }
+        for hint in [MIN_TRANSIENT_RETRY_MS, MAX_LANE_PAUSE_MS] {
+            let pause = decoded_pause(&json!({"result": {"error": {
+                "class": "transient", "code": "queue_full", "retry_after_ms": hint,
+            }}}));
+            assert_eq!(pause.retry_after_ms, Some(hint));
+        }
+    }
+
+    #[test]
+    fn transient_reply_for_another_lane_does_not_pause_this_one() {
+        use super::pause_test_support::*;
+        let mut reply: Value = serde_json::from_str(SHAPE_COMPILING_REPLY).unwrap();
+        reply["result"]["error"]["details"]["lane_id"] = json!("another-lane");
+        assert!(matches!(
+            decode_refusal(&reply),
+            SynapseEmbeddingError::FingerprintMismatch { .. }
+        ));
+        let mut pinned_elsewhere = reply.clone();
+        pinned_elsewhere["result"]["error"]["details"] = json!({
+            "lane_id": MODEL,
+            "fingerprint": "another-fingerprint",
+        });
+        assert!(matches!(
+            decode_refusal(&pinned_elsewhere),
+            SynapseEmbeddingError::FingerprintMismatch { .. }
+        ));
+        // Through the client, the other lane's refusal records no pause.
+        crate::semantic_index::with_lane_pause_clock(START, |clock| {
+            with_fake_synapse_refusing(
+                clock,
+                START + 1,
+                move |_| reply.clone(),
+                |config, _| {
+                    let mut client = SynapseEmbeddingClient::from_config(&config).unwrap();
+                    assert!(matches!(
+                        client.embed_query("query", Duration::from_secs(1)),
+                        Err(SynapseEmbeddingError::FingerprintMismatch { .. })
+                    ));
+                    assert!(
+                        lane_pause_for_root(config.route_project_root.as_deref().unwrap())
+                            .is_none()
+                    );
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn transient_reply_without_a_hint_is_still_a_pause() {
+        let pause = decoded_pause(&json!({"result": {"error": {
+            "class": "transient", "code": "shape_compiling", "message": "compiling",
+        }}}));
+        assert_eq!(pause.cause, PauseCause::WarmingUp);
+        assert_eq!(pause.retry_after_ms, None);
+        assert!(pause.retry_same_request());
+    }
+
+    #[test]
+    fn permanent_or_unclassed_reply_is_not_a_pause() {
+        for error in [
+            json!({"class": "permanent", "code": "invalid_request", "message": "bad",
+                "retry_after_ms": 1_000, "safe_to_retry_same_request": false}),
+            json!({"code": "shape_compiling", "message": "no class"}),
+        ] {
+            assert!(matches!(
+                decode_refusal(&json!({"result": {"error": error}})),
+                SynapseEmbeddingError::DaemonUnavailable(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn shape_compiling_query_fails_at_once_without_tripping_the_breaker() {
+        use super::pause_test_support::*;
+        crate::semantic_index::with_lane_pause_clock(START, |clock| {
+            with_compiling_synapse(clock.clone(), 90_000, |config, requests| {
+                let mut client = SynapseEmbeddingClient::from_config(&config).unwrap();
+                client.state.consecutive_timeouts = 2;
+                let error = client
+                    .embed_query("query", Duration::from_secs(1))
+                    .unwrap_err();
+                let SynapseEmbeddingError::LanePaused(pause) = &error else {
+                    panic!("{error}");
+                };
+                assert_eq!(pause.cause, PauseCause::WarmingUp);
+                assert_eq!(pause.retry_after_ms, Some(90_000));
+                assert_eq!(client.state.consecutive_timeouts, 2);
+                assert!(client.state.circuit_open_until.is_none());
+                assert_eq!(clock.load(Ordering::SeqCst), START);
+                let root = config.route_project_root.as_deref().unwrap();
+                let recorded = lane_pause_for_root(root).unwrap();
+                assert_eq!(recorded.paused_until_ms, START + 90_000);
+                assert_eq!(recorded.cause, PauseCause::WarmingUp);
+                clock.store(START + 90_000, Ordering::SeqCst);
+                assert_eq!(
+                    client.embed_query("query", Duration::from_secs(1)).unwrap(),
+                    vec![1.0, 0.0]
+                );
+                assert!(lane_pause_for_root(root).is_none());
+                assert_eq!(requests.lock().unwrap().len(), 3);
+            });
+        });
+    }
+
+    /// Models one send of `row` at `now_ms` that Synapse refuses as unsafe,
+    /// and returns the key that send used.
+    fn refuse_row(keys: &mut RefusedRequestKeys, row: &str, now_ms: u64) -> String {
+        let sent = keys.key_to_send(row, now_ms);
+        keys.note_refused(row, now_ms);
+        sent
+    }
+
+    #[test]
+    fn refused_rows_past_the_cap_drop_oldest_first_and_never_reuse_a_refused_key() {
+        let mut keys = RefusedRequestKeys::default();
+        let mut refused = vec![refuse_row(&mut keys, "row-0", 0)];
+        // Refused a second time, so both its stable and its first resend key
+        // were refused.
+        refused.push(refuse_row(&mut keys, "row-0", 1));
+        for row in 1..=MAX_REFUSED_REQUEST_KEYS {
+            refused.push(refuse_row(&mut keys, &format!("row-{row}"), 1 + row as u64));
+        }
+        assert_eq!(keys.entries.len(), MAX_REFUSED_REQUEST_KEYS);
+        assert!(
+            !keys.entries.contains_key("row-0"),
+            "the oldest entry stayed"
+        );
+        assert!(keys.entries.contains_key("row-1"));
+        let now = 2 + MAX_REFUSED_REQUEST_KEYS as u64;
+        let dropped = keys.key_to_send("row-0", now);
+        assert!(
+            !refused.contains(&dropped),
+            "a row dropped by the cap was resent under a key Synapse refused"
+        );
+        assert!(!refused.contains(&keys.key_to_send("row-1", now)));
+    }
+
+    #[test]
+    fn refused_rows_expire_after_their_age_limit_and_never_reuse_a_refused_key() {
+        let mut keys = RefusedRequestKeys::default();
+        let refused = refuse_row(&mut keys, "row", 0);
+        let resend = keys.key_to_send("row", REFUSED_REQUEST_KEY_TTL_MS - 1);
+        assert_ne!(resend, refused);
+        assert!(
+            keys.entries.contains_key("row"),
+            "expired before its age limit"
+        );
+        let late = keys.key_to_send("row", REFUSED_REQUEST_KEY_TTL_MS);
+        assert!(keys.entries.is_empty(), "kept past its age limit");
+        assert_ne!(
+            late, refused,
+            "an expired row was resent under the key Synapse refused"
+        );
+        // Without any drop the stable key is used as before.
+        assert_eq!(RefusedRequestKeys::default().key_to_send("row", 0), "row");
+    }
+
+    #[test]
+    fn unsafe_refusal_of_one_row_resends_it_as_a_new_request() {
+        use super::pause_test_support::*;
+        crate::semantic_index::with_lane_pause_clock(START, |clock| {
+            let refusal = json!({"result": {"error": {
+                "class": "transient", "code": "deadline_exceeded", "message": "deadline",
+                "retry_after_ms": 100, "safe_to_retry_same_request": false,
+            }}});
+            with_fake_synapse_refusing(
+                clock.clone(),
+                START + 100,
+                move |_| refusal.clone(),
+                |config, requests| {
+                    // A text no other test embeds, so its stable key is ours.
+                    let texts = vec!["one row refused with an unsafe deadline".to_string()];
+                    let mut client = SynapseEmbeddingClient::from_config(&config).unwrap();
+                    assert!(matches!(
+                        client.embed_batch(&texts),
+                        Err(SynapseEmbeddingError::LanePaused(_))
+                    ));
+                    clock.store(START + 100, Ordering::SeqCst);
+                    let mut client = SynapseEmbeddingClient::from_config(&config).unwrap();
+                    assert_eq!(client.embed_batch(&texts).unwrap().len(), 1);
+                    assert_eq!(client.embed_batch(&texts).unwrap().len(), 1);
+                    let sent = requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, request)| request["method"] == BATCH_OPERATION)
+                        .map(|(_, request)| {
+                            (
+                                request["params"]["request_key"]
+                                    .as_str()
+                                    .unwrap()
+                                    .to_owned(),
+                                request["params"]["items"].clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(sent.len(), 3);
+                    assert!(sent.iter().all(|(_, items)| *items == sent[0].1));
+                    assert_ne!(
+                        sent[1].0, sent[0].0,
+                        "the refused row was resent as the same request"
+                    );
+                    assert_eq!(
+                        sent[2].0, sent[0].0,
+                        "after it succeeded the row did not return to its stable key"
+                    );
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn unsafe_transient_refusal_splits_the_page_before_it_is_sent_again() {
+        use super::pause_test_support::*;
+        crate::semantic_index::with_lane_pause_clock(START, |clock| {
+            let refusal = json!({"result": {"error": {
+                "class": "transient", "code": "deadline_exceeded", "message": "deadline",
+                "retry_after_ms": 100, "safe_to_retry_same_request": false,
+            }}});
+            with_fake_synapse_refusing(
+                clock.clone(),
+                START + 100,
+                move |_| refusal.clone(),
+                |config, requests| {
+                    let texts = ["a", "b", "c", "d"].map(String::from).to_vec();
+                    let mut client = SynapseEmbeddingClient::from_config(&config).unwrap();
+                    assert!(matches!(
+                        client.embed_batch(&texts),
+                        Err(SynapseEmbeddingError::LanePaused(_))
+                    ));
+                    clock.store(START + 100, Ordering::SeqCst);
+                    // A background build opens a new client for its retry.
+                    let mut client = SynapseEmbeddingClient::from_config(&config).unwrap();
+                    assert_eq!(client.embed_batch(&texts).unwrap().len(), 4);
+                    let pages = requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, request)| request["method"] == BATCH_OPERATION)
+                        .map(|(_, request)| request["params"]["items"].as_array().unwrap().len())
+                        .collect::<Vec<_>>();
+                    assert_eq!(pages, vec![4, 2, 2]);
+                },
+            );
+        });
     }
 
     use super::*;

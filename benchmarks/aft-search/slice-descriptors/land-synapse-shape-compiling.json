@@ -1,0 +1,13 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/semantic_index.rs"
+  ],
+  "note": "Synapse transient replies (shape_compiling, model_loading) pause indexing and keep the index; aft_search says the model is warming up (approved wording). Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}
