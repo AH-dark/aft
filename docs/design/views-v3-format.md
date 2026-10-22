@@ -340,16 +340,29 @@ starts the next lap in the same pass so a lone family is visited every pass.
   commits `state = 'evicting'`. The collector then removes the view directory
   (refusing while a SQLite connection in the process is open under it),
   deletes the member row, and takes a covering measurement. A crash leaves an
-  `evicting` member, which the next pass finishes.
+  `evicting` member, which the next pass finishes. Once `evicting` is
+  committed the eviction is always finished, even if the root has come back.
+- **The `evicting` contract for binders.** A binder that finds its member in
+  `evicting` must never use that view directory. It treats the member as
+  absent and publishes a fresh one, or waits for the eviction to finish.
+  Finishing an eviction after the root returns is safe only under this rule.
 - **Bounds** match `collect_one_v2_family`: a `PASS_BUDGET` (5 s) deadline and
   at most `HISTORY_ENTRIES` (8192) members per pass. Plane rows are left for
   slice 4's v3 plane sweep.
+- **The lock wait shares that budget.** The collector takes the reservation
+  lock with `ReservationLock::acquire_until(storage, deadline)`, using the
+  family's pass deadline, never the 120 s wait of `acquire`. When another
+  process holds the lock past that deadline, the family is skipped for this
+  pass and listed in the pass report's `skipped_families` as
+  `blobs/v3/<family>: reservation_busy`. The cursor is not advanced, so the
+  next pass tries that family first.
 
 Tests (`storage_retention::v3_collector_tests`):
 `v3_collector_applies_the_missing_root_rule_to_view_members_only`,
 `v3_eviction_interrupted_after_its_evicting_commit_is_finished_next_pass`,
 `collecting_a_view_member_lowers_committed_usage_by_its_allocated_bytes`,
-`v3_collector_never_creates_a_registry` and
+`v3_collector_never_creates_a_registry`,
+`v3_collector_skips_a_family_whose_reservation_lock_is_busy` and
 `no_production_path_writes_v3_over_a_v0_60_0_floor`.
 
 ## Replay prototype
@@ -395,3 +408,7 @@ The manifest base header with PublishedFrontier, tombstones and
 readiness_overrides, donor seal records, the symbol plane, the v3 import
 ledger, persisted stat evidence, staging names and token rows. The rowid
 layout and its layout-tag section belong to 3b.
+
+Slice 4's binder must honour the `evicting` contract above: when it finds its
+member in `evicting`, it never uses that view directory, and either treats the
+member as absent and publishes a fresh one or waits for the eviction to finish.

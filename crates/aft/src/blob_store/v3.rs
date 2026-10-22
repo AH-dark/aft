@@ -201,6 +201,19 @@ impl ReservationLock {
             storage: storage.to_path_buf(),
         })
     }
+    /// Like [`Self::acquire`], but waits no later than `deadline`; a deadline already past makes exactly one attempt.
+    pub fn acquire_until(storage: &Path, deadline: std::time::Instant) -> Result<Self> {
+        fs::create_dir_all(storage.join("blobs/v3"))?;
+        let guard = crate::fs_lock::try_acquire_until(
+            &storage.join("blobs/v3/reservations.lock"),
+            deadline,
+        )
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        Ok(Self {
+            guard,
+            storage: storage.to_path_buf(),
+        })
+    }
     fn verify(&self, storage: &Path) -> Result<()> {
         if self.storage != storage || !self.guard.verify_writer_epoch()? {
             return Err(Error::InvalidIdentity);

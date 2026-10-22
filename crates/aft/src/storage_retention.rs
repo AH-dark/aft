@@ -100,6 +100,9 @@ pub(crate) struct SweepReport {
     pub stopped_early: bool,
     pub cancelled: bool,
     pub errors: Vec<String>,
+    /// Blob families this pass left for a later pass, each with the reason,
+    /// such as `blobs/v3/<family>: reservation_busy`.
+    pub skipped_families: Vec<String>,
     pub domains: BTreeMap<String, DomainReport>,
     /// Wall time by stage, including setup and blob work outside the root budget.
     pub timings_ms: BTreeMap<String, u64>,
@@ -3050,7 +3053,7 @@ fn run_pass_with_budget(
             .timings_ms
             .insert("blobs_v2".into(), phase.elapsed().as_millis() as u64);
         let phase = Instant::now();
-        if let Err(error) = collect_one_v3_family(storage, cancelled, &mut report) {
+        if let Err(error) = collect_one_v3_family(storage, cancelled, &mut report, PASS_BUDGET) {
             report.errors.push(error.to_string());
         }
         report
@@ -3401,6 +3404,12 @@ fn v3_recheck_and_mark_evicting(
 /// committed, deletes its row, then takes a covering measurement so committed
 /// usage falls by the bytes actually freed. A crash anywhere in here leaves
 /// the `evicting` row, and the next pass calls this again to finish.
+///
+/// Once `evicting` is committed the eviction is always finished, even if the
+/// member's root has come back since. That is safe only because of the
+/// contract every v3 binder must follow: a binder that finds its member in
+/// `evicting` never uses that view directory. It treats the member as absent
+/// and publishes a fresh one, or waits for the eviction to finish.
 fn v3_finish_eviction(
     storage: &Path,
     registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
@@ -3444,6 +3453,7 @@ fn collect_one_v3_family(
     storage: &Path,
     cancelled: &dyn Fn() -> bool,
     report: &mut SweepReport,
+    budget: Duration,
 ) -> io::Result<()> {
     // Only family directories take the pass's one visit, so the lock file
     // beside them never uses up a pass.
@@ -3475,12 +3485,34 @@ fn collect_one_v3_family(
         return Ok(());
     };
     let family = item.entry.file_name().to_string_lossy().into_owned();
-    let result = collect_v3_family(storage, &family, cancelled, report);
-    if !cancelled() {
+    let result = collect_v3_family(storage, &family, cancelled, report, budget);
+    // A family skipped because its reservation lock was busy keeps the lap
+    // position, so the next pass tries it first.
+    if !cancelled() && !matches!(result, Ok(V3Visit::LockBusy)) {
         // Advance even when family work fails, so later families can still run.
         atomic_json(&batch.cursor_path, &item.after)?;
     }
-    result
+    result.map(|_| ())
+}
+
+/// How one family visit of the v3 collector ended.
+enum V3Visit {
+    /// The family was examined, or had no registry to examine.
+    Done,
+    /// Another process held the storage-root reservation lock past the
+    /// pass's budget, so the family was not examined.
+    LockBusy,
+}
+
+fn reservation_lock_busy(error: &crate::blob_store::v3::Error) -> bool {
+    matches!(
+        error,
+        crate::blob_store::v3::Error::Io(error)
+            if error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<crate::fs_lock::AcquireError>())
+                .is_some_and(|source| matches!(source, crate::fs_lock::AcquireError::Timeout))
+    )
 }
 
 fn collect_v3_family(
@@ -3488,18 +3520,32 @@ fn collect_v3_family(
     family: &str,
     cancelled: &dyn Fn() -> bool,
     report: &mut SweepReport,
-) -> io::Result<()> {
+    budget: Duration,
+) -> io::Result<V3Visit> {
     use crate::blob_store::v3::{RegistryWriter, ReservationLock};
     let v3 = |error: crate::blob_store::v3::Error| io::Error::other(error.to_string());
     let registry_path = storage.join("blobs/v3").join(family).join("members.sqlite");
     if !registry_path.try_exists()? {
-        return Ok(());
+        return Ok(V3Visit::Done);
     }
-    let deadline = Instant::now() + PASS_BUDGET;
+    let deadline = Instant::now() + budget;
     // Lock first, then the registry barrier, the order every v3 writer uses.
+    // The wait for the lock comes out of the same budget as the member work:
+    // a publisher holding it must not stall the retention lane, which also
+    // gates binds. The lock is taken only once a registry is known to exist,
+    // because taking it creates `blobs/v3/` and the lock file.
+    let lock = match ReservationLock::acquire_until(storage, deadline) {
+        Ok(lock) => lock,
+        Err(error) if reservation_lock_busy(&error) => {
+            report
+                .skipped_families
+                .push(format!("blobs/v3/{family}: reservation_busy"));
+            return Ok(V3Visit::LockBusy);
+        }
+        Err(error) => return Err(v3(error)),
+    };
     // Opening the registry takes a covering measurement and releases the
     // reservations of dead owners.
-    let lock = ReservationLock::acquire(storage).map_err(v3)?;
     let mut registry = RegistryWriter::open_existing(storage, family, &lock).map_err(v3)?;
     let members: Vec<V3Member> = registry
         .with_barrier(|tx| {
@@ -3615,7 +3661,7 @@ fn collect_v3_family(
         .entry("views/v3".to_owned())
         .or_default()
         .add(&domain);
-    Ok(())
+    Ok(V3Visit::Done)
 }
 
 fn record_v3_removal(domain: &mut DomainReport, bytes: Option<u64>) {
@@ -7517,7 +7563,7 @@ mod v3_collector_tests {
 
     fn pass(storage: &Path) -> SweepReport {
         let mut report = SweepReport::default();
-        collect_one_v3_family(storage, &|| false, &mut report).unwrap();
+        collect_one_v3_family(storage, &|| false, &mut report, PASS_BUDGET).unwrap();
         assert!(report.errors.is_empty(), "{report:?}");
         report
     }
@@ -7744,7 +7790,7 @@ mod v3_collector_tests {
             );
             let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut report = SweepReport::default();
-                let _ = collect_one_v3_family(&storage, &|| false, &mut report);
+                let _ = collect_one_v3_family(&storage, &|| false, &mut report, PASS_BUDGET);
             }));
             assert!(crashed.is_err());
         }
@@ -7764,6 +7810,60 @@ mod v3_collector_tests {
         assert_eq!(finished.removed_roots, 1, "{finished:?}");
         assert!(member_scopes(&storage).is_empty());
         assert!(!view_dir(&storage, "crash").exists());
+    }
+
+    /// Another process's hold on the reservation lock costs the pass at most
+    /// its budget: the family is reported as skipped, the lap position stays,
+    /// and the next pass examines that same family first once the lock is free.
+    #[test]
+    fn v3_collector_skips_a_family_whose_reservation_lock_is_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        fs::create_dir_all(&storage).unwrap();
+        let root = bound_root(&temp, &storage, "busy");
+        seed(&storage, &[("busy", "view", Some(&root))]);
+        with_registry(&storage, |tx| {
+            tx.execute("UPDATE members SET last_bind_ms=0", [])?;
+            Ok(())
+        });
+        fs::remove_dir(&root).unwrap();
+        // A second family sorts after the seeded one, so a skip that wrongly
+        // advanced the lap would make the next pass visit this one instead.
+        const LATER: &str = "fedcba9876543210";
+        fs::create_dir_all(storage.join("blobs/v3").join(LATER)).unwrap();
+
+        // The lock is not reentrant, so holding it here makes the
+        // collector's own acquisition wait exactly as another process's would.
+        let held = ReservationLock::acquire(&storage).unwrap();
+        let budget = Duration::from_millis(300);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let pass_storage = storage.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut report = SweepReport::default();
+            let result = collect_one_v3_family(&pass_storage, &|| false, &mut report, budget)
+                .map_err(|error| error.to_string());
+            let _ = sender.send((result, report, started.elapsed()));
+        });
+        let (result, report, elapsed) = receiver
+            .recv_timeout(budget + Duration::from_secs(10))
+            .expect("the pass waited for the reservation lock past its budget");
+        result.unwrap();
+        assert!(elapsed < budget + Duration::from_secs(5), "{elapsed:?}");
+        assert_eq!(
+            report.skipped_families,
+            [format!("blobs/v3/{FAMILY}: reservation_busy")]
+        );
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(!report.domains.contains_key("views/v3"), "{report:?}");
+        drop(held);
+        assert_eq!(missing_sweeps(&storage, "busy"), 0);
+
+        let next = pass(&storage);
+        assert!(next.skipped_families.is_empty(), "{next:?}");
+        assert_eq!(next.domains["views/v3"].examined, 1, "{next:?}");
+        assert_eq!(missing_sweeps(&storage, "busy"), 1);
     }
 
     /// The st_blocks size of every file below `path`, computed here rather
