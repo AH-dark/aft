@@ -11823,6 +11823,199 @@ mod tests {
         assert_eq!(digest["views"]["ticket"]["generation"], json!(2));
     }
 
+    /// Every HEAD path a first views-on configure schedules must leave the
+    /// pending ledger once the publication finishes, including paths the
+    /// publication does not make view members: tracked files deleted from the
+    /// checkout (binary assets here, as a copy of a tree can leave them out),
+    /// tracked files the project content rules exclude, and tracked symlinks
+    /// deleted from the checkout. A path left pending here is never revisited,
+    /// so status would report it pending for the life of the view.
+    #[test]
+    fn views_first_publication_leaves_no_path_pending_for_non_member_head_paths() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = project.path();
+        // Binary content present in the checkout: an ordinary member.
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::write(root.join("assets/present.png"), [0x89, b'P', 0xff, 0xfe, 0]).unwrap();
+        // Binary content committed and then removed from the checkout.
+        std::fs::write(root.join("assets/banner.jpeg"), [0xff, 0xd8, 0xff, 0xe0, 0]).unwrap();
+        std::fs::create_dir_all(root.join("fixtures")).unwrap();
+        std::fs::write(root.join("fixtures/binary.bin"), [0, 0xff, 0xfe, 1]).unwrap();
+        // A tracked database file, which project content rules always exclude.
+        std::fs::write(root.join("fixtures/model.db"), b"SQLite format 3\0").unwrap();
+        #[cfg(unix)]
+        {
+            // A dangling symlink present in the checkout is still a member;
+            // one deleted from the checkout is not.
+            std::os::unix::fs::symlink("missing.rs", root.join("dangling.rs")).unwrap();
+            std::os::unix::fs::symlink("tracked.rs", root.join("removed_link.rs")).unwrap();
+        }
+        init_git_fixture(root);
+        std::fs::remove_file(root.join("assets/banner.jpeg")).unwrap();
+        std::fs::remove_file(root.join("fixtures/binary.bin")).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(root.join("removed_link.rs")).unwrap();
+        let canonical_root = std::fs::canonicalize(root).unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let response = handle_configure_for_test(
+            &configure_request_with_params(json!({
+                "project_root": canonical_root,
+                "storage_dir": storage.path(),
+                "harness": "opencode",
+                "config": [user_tier(json!({
+                    "views": { "enabled": true },
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": true }
+                }))]
+            })),
+            &ctx,
+        );
+        assert!(response.success, "{}", response.data);
+
+        super::drain_deferred_configure_maintenance(&ctx);
+
+        let view = ctx.view_runtime_snapshot().expect("view runtime");
+        let manifest = view.manifest.as_ref().expect("published manifest");
+        let members = manifest
+            .entries()
+            .map(|(path, _)| String::from_utf8_lossy(path.as_bytes()).into_owned())
+            .collect::<BTreeSet<_>>();
+        assert!(members.contains("assets/present.png"), "{members:?}");
+        assert!(!members.contains("assets/banner.jpeg"), "{members:?}");
+        assert!(!members.contains("fixtures/binary.bin"), "{members:?}");
+        assert!(!members.contains("fixtures/model.db"), "{members:?}");
+        #[cfg(unix)]
+        {
+            assert!(members.contains("dangling.rs"), "{members:?}");
+            assert!(!members.contains("removed_link.rs"), "{members:?}");
+        }
+
+        let ledger = crate::path_status::PathStatusStore::open(&view.view_dir)
+            .unwrap()
+            .summary()
+            .unwrap();
+        let annotated = ledger
+            .paths
+            .iter()
+            .map(|status| {
+                format!(
+                    "{} {} ({})",
+                    String::from_utf8_lossy(&status.rel_path),
+                    status.state.as_str(),
+                    status.reason
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (ledger.pending_count, ledger.failed_count),
+            (0, 0),
+            "paths left annotated after a complete publication: {annotated:?}"
+        );
+        let health = ctx.view_health_snapshot().expect("view health");
+        assert_eq!(health.generation, 1);
+        assert!(health.pinned);
+        assert_eq!((health.pending_paths, health.failed_paths), (0, 0));
+    }
+
+    /// A tracked source in a call-graph language that is not valid UTF-8 can
+    /// never be parsed. It must not fail the publication (which would leave
+    /// every HEAD path pending forever): it joins the generation with an
+    /// empty call graph and is reported as skipped, apart from pending and
+    /// failed, while every other file keeps its call graph.
+    #[test]
+    fn views_publication_skips_a_non_utf8_callgraph_source_and_completes() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = project.path();
+        // 0xe9 is "é" in Latin-1 and an invalid byte in UTF-8.
+        std::fs::write(root.join("latin1.py"), b"def caf\xe9():\n    pass\n").unwrap();
+        std::fs::write(root.join("util.py"), "def helper():\n    pass\n").unwrap();
+        init_git_fixture(root);
+        let canonical_root = std::fs::canonicalize(root).unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let response = handle_configure_for_test(
+            &configure_request_with_params(json!({
+                "project_root": canonical_root,
+                "storage_dir": storage.path(),
+                "harness": "opencode",
+                "config": [user_tier(json!({
+                    "views": { "enabled": true },
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": true }
+                }))]
+            })),
+            &ctx,
+        );
+        assert!(response.success, "{}", response.data);
+
+        super::drain_deferred_configure_maintenance(&ctx);
+
+        let health = ctx.view_health_snapshot().expect("view health");
+        assert_eq!(health.generation, 1, "{health:?}");
+        assert!(health.pinned, "{health:?}");
+        assert_eq!((health.pending_paths, health.failed_paths), (0, 0));
+        assert_eq!(
+            health.skipped_paths,
+            std::collections::BTreeMap::from([("non_utf8_source".to_string(), 1)])
+        );
+        let status = serde_json::to_value(&health).unwrap();
+        assert_eq!(status["skipped_paths"]["non_utf8_source"], json!(1));
+        assert_eq!(
+            status["skipped_path_sample"],
+            json!([{ "path": "latin1.py", "reason": "non_utf8_source" }])
+        );
+        let view = ctx.view_runtime_snapshot().expect("view runtime");
+        let manifest = view.manifest.as_ref().expect("published manifest");
+        assert!(manifest
+            .entries()
+            .any(|(path, _)| path.as_bytes() == b"latin1.py"));
+        match ctx.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(store) => {
+                assert_eq!(store.reader_kind(), "view");
+                for (file, symbol) in [("tracked.rs", "tracked"), ("util.py", "helper")] {
+                    assert!(
+                        crate::callgraph_store::CallGraphRead::node_for(
+                            &store,
+                            Path::new(file),
+                            symbol,
+                        )
+                        .is_ok(),
+                        "{file}:{symbol} left the call graph"
+                    );
+                }
+            }
+            _ => panic!("expected view callgraph reader"),
+        }
+
+        // Once the file decodes, its skip is cleared by the next publication.
+        std::fs::write(root.join("latin1.py"), "def cafe():\n    pass\n").unwrap();
+        ctx.publish_view_paths(BTreeSet::from([b"latin1.py".to_vec()]), true)
+            .unwrap();
+        // Read the ledger directly: status caches its summary between reads.
+        let ledger = crate::path_status::PathStatusStore::open(&view.view_dir)
+            .unwrap()
+            .summary()
+            .unwrap();
+        assert!(ledger.skipped_by_reason.is_empty(), "{ledger:?}");
+        assert!(ledger.skipped_sample.is_empty(), "{ledger:?}");
+        assert_eq!((ledger.pending_count, ledger.failed_count), (0, 0));
+    }
+
     /// While a views-on root is unbound past the grace window its semantic
     /// lane embeds nothing; after the rebind it resumes on its own and embeds
     /// only what changed, reusing every stored vector.

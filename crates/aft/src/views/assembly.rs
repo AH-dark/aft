@@ -10,7 +10,7 @@ use rusqlite::OptionalExtension;
 use crate::alias::{head_tree_entries, AliasStore, GitMode};
 use crate::blob_store::{BlobPlane, BlobStore, CallgraphKey, FullKey, PutOutcome};
 use crate::callgraph_store::join::CallgraphBlob;
-use crate::path_status::PathStatusStore;
+use crate::path_status::{PathStatusStore, SkipReason};
 use crate::pins::AssemblyPin;
 
 use super::{
@@ -85,7 +85,9 @@ pub fn head_tree_fingerprint(entries: &[crate::alias::TrackedPath]) -> String {
 
 pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
     let mut prepared = prepare_checkout(request, &mut |_| Ok(()))?;
-    prepared.commit()
+    let report = prepared.commit()?;
+    prepared.settle_status();
+    Ok(report)
 }
 
 /// Owns the unpublished files and assembly pin until CAS succeeds or the build
@@ -98,6 +100,119 @@ pub struct PreparedAssembly {
     pin: Option<AssemblyPin>,
     _base_pin: Option<crate::pins::QueryPin>,
     profile: PublicationProfile,
+    /// Status changes of a complete assembly, until the commit decides them.
+    settlement: Option<StatusSettlement>,
+    /// Status changes the commit accepted, waiting for `settle_status`.
+    committed_settlement: Option<StatusSettlement>,
+}
+
+/// The path-status changes a complete assembly computed: pending rows to
+/// clear and call-graph skips to record or drop. They describe the generation
+/// being prepared, so they are applied only once that generation is the one
+/// served: after its publication succeeds, or when the publication is a no-op
+/// because the current generation already has the same manifest. A build that
+/// fails, is cancelled, is dropped uncommitted or loses the publication race
+/// drops them, so status keeps describing the generation still served.
+///
+/// They are applied after the publisher leaves its commit barrier (the root
+/// actor's write gate and the publication job table), so reads and other
+/// projects' publications never wait for status writes.
+struct StatusSettlement {
+    view: ViewStore,
+    /// The generation the changes describe: the one the publication swaps
+    /// in, or for a no-op the one already served.
+    generation: String,
+    root: PathBuf,
+    intent: crate::path_status::StatusIntent,
+}
+
+/// What became of a committed settlement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettleOutcome {
+    /// No committed settlement was waiting, or applying it failed (the
+    /// failure is logged).
+    Nothing,
+    /// The ledger was brought in line, writing this many rows.
+    Applied(usize),
+    /// A newer generation is served now; its own settlement describes it, so
+    /// this older one is dropped rather than overwrite it.
+    Superseded,
+}
+
+/// Per-view bookkeeping that orders settlements applied off the barrier.
+#[derive(Default)]
+struct SettleGate {
+    /// Held while a settlement checks the served generation and writes, so a
+    /// newer settlement cannot be overtaken between the check and the write.
+    serial: std::sync::Mutex<()>,
+    /// Settlements committed and not yet applied. While any is outstanding,
+    /// the ledger is about to change, so a preparation cannot conclude from
+    /// what it reads that its own settlement would write nothing.
+    outstanding: std::sync::atomic::AtomicUsize,
+}
+
+fn settle_gate(view_dir: &Path) -> std::sync::Arc<SettleGate> {
+    static GATES: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<SettleGate>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    GATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(view_dir.to_path_buf())
+        .or_default()
+        .clone()
+}
+
+impl StatusSettlement {
+    fn apply(self) -> std::result::Result<SettleOutcome, String> {
+        let gate = settle_gate(self.view.view_dir());
+        let _serial = gate
+            .serial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let served = self
+            .view
+            .current_generation()
+            .map_err(|error| error.to_string())?;
+        if served.as_deref() != Some(self.generation.as_str()) {
+            return Ok(SettleOutcome::Superseded);
+        }
+        #[cfg(test)]
+        run_before_settle_write(self.view.view_dir());
+        let written = PathStatusStore::open(self.view.view_dir())
+            .and_then(|mut status| status.settle(&self.intent))
+            .map_err(|error| error.to_string())?;
+        Ok(SettleOutcome::Applied(written))
+    }
+}
+
+#[cfg(test)]
+type SettleHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+static BEFORE_SETTLE_WRITE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, SettleHook>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Runs `hook` each time a settlement for `view_dir` is about to open the
+/// status ledger to write.
+#[cfg(test)]
+pub(crate) fn before_settle_write_for_test(
+    view_dir: &Path,
+    hook: impl Fn() + Send + Sync + 'static,
+) {
+    BEFORE_SETTLE_WRITE
+        .lock()
+        .unwrap()
+        .insert(view_dir.to_path_buf(), std::sync::Arc::new(hook));
+}
+
+#[cfg(test)]
+fn run_before_settle_write(view_dir: &Path) {
+    let hook = BEFORE_SETTLE_WRITE.lock().unwrap().get(view_dir).cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 impl PreparedAssembly {
@@ -134,14 +249,23 @@ impl PreparedAssembly {
                         );
                     }
                     self.profile.outcome = "published";
+                    self.accept_settlement();
                 }
                 PublishOutcome::Conflict { current_generation } => {
                     self.profile.outcome = "conflict";
+                    // Another generation won; this one's status changes do
+                    // not describe it.
+                    self.settlement = None;
                     return Err(ViewError::InvalidManifest(format!(
                         "publication base changed to {current_generation:?}"
                     )));
                 }
             }
+        } else {
+            // Nothing to publish. A settlement here belongs to a no-op whose
+            // manifest equals the current generation's, so it describes the
+            // generation being served and applies as is.
+            self.accept_settlement();
         }
         self.profile.finish();
         Ok(AssemblyReport {
@@ -153,10 +277,61 @@ impl PreparedAssembly {
             published: self.report.published,
         })
     }
+
+    /// Marks the prepared status changes as describing the served generation.
+    /// Runs inside the publisher's commit barrier, so it only moves them
+    /// aside; `settle_status` writes them once the barrier is released.
+    fn accept_settlement(&mut self) {
+        if let Some(settlement) = self.settlement.take() {
+            settle_gate(settlement.view.view_dir())
+                .outstanding
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.committed_settlement = Some(settlement);
+        }
+    }
+
+    /// Applies the status changes a successful commit accepted. Call it after
+    /// releasing any lock the commit ran under: it opens the view's status
+    /// ledger and writes in one transaction. Only the rows that differ are
+    /// written, and a settlement whose generation is no longer served is
+    /// dropped, so a slow settlement never overwrites a newer one. The
+    /// generation is already current, so a write that fails does not fail
+    /// the publication: it is logged, the transaction rolls back, and the next
+    /// publication of the view (a no-op included) computes the changes again.
+    pub fn settle_status(&mut self) -> SettleOutcome {
+        let Some(settlement) = self.committed_settlement.take() else {
+            return SettleOutcome::Nothing;
+        };
+        let gate = settle_gate(settlement.view.view_dir());
+        let root = settlement.root.clone();
+        let outcome = settlement.apply().unwrap_or_else(|error| {
+            log::warn!(
+                "views: root={} path status not updated after publication: {error}",
+                root.display()
+            );
+            SettleOutcome::Nothing
+        });
+        gate.outstanding
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        if let SettleOutcome::Applied(written) = outcome {
+            if written > 0 {
+                crate::slog_info!(
+                    "content-addressed view publication settled {} path status row(s) root={}",
+                    written,
+                    root.display()
+                );
+            }
+        }
+        outcome
+    }
 }
 
 impl Drop for PreparedAssembly {
     fn drop(&mut self) {
+        // A committed settlement describes the served generation. Callers
+        // settle it after leaving their commit barrier; one that did not still
+        // gets its status here rather than losing it.
+        self.settle_status();
         // An abandoned build still owns the checkpoint keeper. Close it before
         // cleanup, otherwise the file-identity guard correctly refuses unlink
         // and leaves an entire unpublished database behind on every retry.
@@ -270,6 +445,16 @@ pub fn prepare_checkout_deferring(
     super::io::WORK
         .full_walks
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The mark epoch read here, before the checkout is read, is the cutoff
+    // for this publication's settlement: an annotation marked with a higher
+    // epoch (by a newer preparation, or a configure scheduling more paths)
+    // belongs to a later publication and keeps its annotation; see
+    // `StatusIntent::marked_through`.
+    let mut status = PathStatusStore::open(view.view_dir())
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    let marked_through = status
+        .mark_epoch()
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     let head = head_tree_entries(&request.project_root)
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     profile.head_ms = head_started.elapsed().as_millis();
@@ -304,6 +489,7 @@ pub fn prepare_checkout_deferring(
     let mut blocking_paths = BTreeSet::new();
     let mut semantic_pending_paths = BTreeSet::new();
     let mut pending_inputs = BTreeMap::new();
+    let mut fresh_skips = Vec::new();
     let mut candidates = Vec::with_capacity(head.len());
 
     for tracked in head {
@@ -416,6 +602,17 @@ pub fn prepare_checkout_deferring(
                     .transpose()?
                     .map_or((None, None), |(key, payload)| (Some(key), payload));
                 let callgraph_key = key.as_ref().map(FullKey::to_hex);
+                if language.is_some() {
+                    // Freshly read content decides whether the call graph
+                    // skips this member; reused members keep their record.
+                    let non_utf8 = request.callgraph
+                        && !resolution_input
+                        && std::str::from_utf8(&source).is_err();
+                    fresh_skips.push((
+                        tracked.rel_path.clone(),
+                        non_utf8.then_some(SkipReason::NonUtf8Source),
+                    ));
+                }
                 // Only a new payload can seed an alias. Cached or read-only
                 // candidates need neither their source bytes nor tracked row.
                 let needs_source = payload.is_some() && request.allow_blob_put;
@@ -508,6 +705,8 @@ pub fn prepare_checkout_deferring(
         pin: Some(pin),
         _base_pin: base_pin,
         profile,
+        settlement: None,
+        committed_settlement: None,
     };
     prepared.profile.enter(1, phase)?;
     timing.phase("assembly_pin");
@@ -567,8 +766,6 @@ pub fn prepare_checkout_deferring(
     timing.phase("blob_and_alias_puts");
     prepared.profile.blob_puts = blob_puts;
     prepared.profile.pending_paths = blocking_paths.len() + semantic_pending_paths.len();
-    let mut status = PathStatusStore::open(view.view_dir())
-        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     status
         .mark_pending_many(
             blocking_paths
@@ -588,14 +785,41 @@ pub fn prepare_checkout_deferring(
             .collect();
         return Ok(prepared);
     }
-    status
-        .clear_many(
-            candidates
-                .iter()
-                .map(|candidate| candidate.path.as_bytes())
-                .filter(|path| !semantic_pending_paths.contains(*path)),
-        )
-        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    // A complete generation is assembled. Its status changes wait in the
+    // prepared assembly until the generation is the one served; see
+    // `StatusSettlement`.
+    let intent = crate::path_status::StatusIntent {
+        generation: generation_number(&next_generation),
+        members: candidates
+            .iter()
+            .map(|candidate| candidate.path.as_bytes().to_vec())
+            .collect(),
+        keep_pending: semantic_pending_paths.clone(),
+        marked_through,
+        fresh_skips: fresh_skips.into_iter().collect(),
+    };
+    // Read the ledger now, off the commit barrier: when it already says what
+    // this publication would say, there is nothing to settle, and the commit
+    // will not open the ledger at all. A settlement committed earlier and not
+    // yet applied is about to change the ledger, so then the reading is not
+    // conclusive and the changes are worked out again when they are applied.
+    let settled_already = settle_gate(view.view_dir())
+        .outstanding
+        .load(std::sync::atomic::Ordering::Acquire)
+        == 0
+        && status
+            .plan_settlement(&intent)
+            .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
+            .is_empty();
+    drop(status);
+    if !settled_already {
+        prepared.settlement = Some(StatusSettlement {
+            view: view.clone(),
+            generation: next_generation.clone(),
+            root: request.project_root.clone(),
+            intent,
+        });
+    }
     timing.phase("path_status");
     prepared.report.pending_paths = semantic_pending_paths;
 
@@ -632,6 +856,12 @@ pub fn prepare_checkout_deferring(
         prepared.profile.cold_build_reason = "none";
         prepared.report.manifest = None;
         prepared.report.blob_puts = blob_puts;
+        // A no-op's status changes describe the generation already served.
+        if let (Some(settlement), Some(current)) =
+            (prepared.settlement.as_mut(), current_generation.as_ref())
+        {
+            settlement.generation = current.clone();
+        }
         return Ok(prepared);
     }
     prepared.profile.enter(2, phase)?;
@@ -1443,9 +1673,13 @@ fn missing_callgraph_payload(
     let blob = if resolution_input {
         CallgraphBlob::config(source.to_vec(), crate::views::callgraph::PRODUCER)
     } else {
+        // A source that is not valid UTF-8 cannot be parsed. Failing here
+        // would fail the whole publication, so it gets the call graph of an
+        // empty file instead: no symbols, as the call graph built without
+        // views leaves unreadable files out. Assembly records the path as
+        // skipped.
         CallgraphBlob::extract(
-            std::str::from_utf8(source)
-                .map_err(|error| ViewError::InvalidManifest(error.to_string()))?,
+            std::str::from_utf8(source).unwrap_or(""),
             language,
             crate::views::callgraph::PRODUCER,
         )
@@ -1787,3 +2021,281 @@ pub(super) mod worker_seed;
 #[cfg(test)]
 #[path = "worker_seed_tests.rs"]
 mod worker_seed_tests;
+
+/// Path status describes the generation being served, so a publication's
+/// status changes land only with the generation they describe.
+#[cfg(test)]
+mod status_settlement_tests {
+    use super::*;
+
+    const FAMILY: &str = "settle-family";
+    const SCOPE: &str = "settle-scope";
+
+    fn git(project: &Path, args: &[&str]) {
+        assert!(std::process::Command::new("git")
+            .current_dir(project)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn request(project: &Path, storage: &Path, head: &str) -> AssemblyRequest {
+        AssemblyRequest {
+            storage: storage.to_path_buf(),
+            project_root: project.to_path_buf(),
+            family: FAMILY.into(),
+            scope: SCOPE.into(),
+            desired_head: head.into(),
+            changed_paths: Default::default(),
+            semantic_keys: Default::default(),
+            require_semantic: false,
+            allow_blob_put: true,
+            callgraph: true,
+        }
+    }
+
+    fn status(storage: &Path) -> PathStatusStore {
+        let view = ViewStore::open(storage, SCOPE).unwrap();
+        PathStatusStore::open(view.view_dir()).unwrap()
+    }
+
+    fn skips(storage: &Path) -> BTreeMap<String, usize> {
+        status(storage).summary().unwrap().skipped_by_reason
+    }
+
+    fn pending(storage: &Path) -> usize {
+        status(storage).summary().unwrap().pending_count
+    }
+
+    /// A skip recorded for the served generation stays while a publication
+    /// that would clear it is cancelled or dropped before it publishes, and
+    /// so does a pending row it would settle. The first publication that
+    /// succeeds applies both; a later no-op publication settles too, because
+    /// its manifest is the served one.
+    #[test]
+    fn views_status_changes_wait_for_their_generation_to_publish() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        // 0xe9 is "é" in Latin-1 and an invalid byte in UTF-8.
+        fs::write(root.join("latin1.py"), b"def caf\xe9():\n    pass\n").unwrap();
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "latin1",
+            ],
+        );
+        let storage = tempfile::tempdir().unwrap();
+        assert!(
+            publish_checkout(&request(&root, storage.path(), "head-1"))
+                .unwrap()
+                .published
+        );
+        let skipped = BTreeMap::from([("non_utf8_source".to_string(), 1)]);
+        assert_eq!(skips(storage.path()), skipped);
+
+        // The file becomes readable, and a scheduled path that is not a
+        // member waits for a complete publication to settle it.
+        fs::write(root.join("latin1.py"), "def cafe():\n    pass\n").unwrap();
+        status(storage.path())
+            .mark_pending(b"gone.ts", "view publication scheduled", 1)
+            .unwrap();
+
+        // Cancelled at the last phase before the pointer swap.
+        let cancelled = prepare_checkout(&request(&root, storage.path(), "head-2"), &mut |phase| {
+            if phase == "cas" {
+                Err(ViewError::InvalidManifest("cancelled".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(cancelled.is_err());
+        assert_eq!(
+            skips(storage.path()),
+            skipped,
+            "cancelled build changed status"
+        );
+        assert_eq!(
+            pending(storage.path()),
+            1,
+            "cancelled build settled a pending row"
+        );
+
+        // Fully prepared, then dropped without publishing (for example when
+        // the configuration changes before the prepared build is committed).
+        let prepared =
+            prepare_checkout(&request(&root, storage.path(), "head-2"), &mut |_| Ok(())).unwrap();
+        drop(prepared);
+        assert_eq!(
+            skips(storage.path()),
+            skipped,
+            "unpublished build changed status"
+        );
+        assert_eq!(
+            pending(storage.path()),
+            1,
+            "unpublished build settled a pending row"
+        );
+
+        assert!(
+            publish_checkout(&request(&root, storage.path(), "head-2"))
+                .unwrap()
+                .published
+        );
+        assert!(skips(storage.path()).is_empty());
+        assert_eq!(pending(storage.path()), 0);
+
+        // A no-op publication describes the served generation: it settles.
+        status(storage.path())
+            .mark_pending(b"also_gone.ts", "view publication scheduled", 2)
+            .unwrap();
+        let report = publish_checkout(&request(&root, storage.path(), "head-2")).unwrap();
+        assert!(!report.published, "expected a no-op publication");
+        assert_eq!(pending(storage.path()), 0);
+    }
+
+    /// A committed repository with one Python file that is not UTF-8, so
+    /// its first publication records a call-graph skip.
+    fn latin1_repository() -> (tempfile::TempDir, PathBuf) {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        fs::write(root.join("latin1.py"), LATIN1).unwrap();
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "latin1",
+            ],
+        );
+        (project, root)
+    }
+
+    // 0xe9 is "é" in Latin-1 and an invalid byte in UTF-8.
+    const LATIN1: &[u8] = b"def caf\xe9():\n    pass\n";
+
+    /// Settlements are written after the commit barrier, so an older one can
+    /// finish after a newer one. It must not overwrite the newer status: here
+    /// the older generation would clear a skip the newer one records again.
+    #[test]
+    fn views_an_older_settlement_finishing_last_never_overwrites_a_newer_one() {
+        let (_project, root) = latin1_repository();
+        let storage = tempfile::tempdir().unwrap();
+        publish_checkout(&request(&root, storage.path(), "head-1")).unwrap();
+        let skipped = BTreeMap::from([("non_utf8_source".to_string(), 1)]);
+        assert_eq!(skips(storage.path()), skipped);
+
+        // The older publication sees the file decode, and commits; its
+        // settlement is held back.
+        fs::write(root.join("latin1.py"), "def cafe():\n    pass\n").unwrap();
+        let mut older =
+            prepare_checkout(&request(&root, storage.path(), "head-2"), &mut |_| Ok(())).unwrap();
+        assert!(older.commit().unwrap().published);
+        assert_eq!(skips(storage.path()), skipped, "settled inside commit");
+
+        // The newer publication sees it undecodable again and settles first.
+        fs::write(root.join("latin1.py"), LATIN1).unwrap();
+        let mut newer =
+            prepare_checkout(&request(&root, storage.path(), "head-3"), &mut |_| Ok(())).unwrap();
+        assert!(newer.commit().unwrap().published);
+        assert!(matches!(newer.settle_status(), SettleOutcome::Applied(_)));
+        assert_eq!(skips(storage.path()), skipped);
+
+        assert_eq!(older.settle_status(), SettleOutcome::Superseded);
+        assert_eq!(skips(storage.path()), skipped, "the older settlement won");
+    }
+
+    /// A no-op publication whose status is already settled has nothing to
+    /// write, and its commit does not open the status ledger.
+    #[test]
+    fn views_settled_no_op_publication_writes_no_status() {
+        let (_project, root) = latin1_repository();
+        let storage = tempfile::tempdir().unwrap();
+        publish_checkout(&request(&root, storage.path(), "head-1")).unwrap();
+        let view_dir = ViewStore::open(storage.path(), SCOPE)
+            .unwrap()
+            .view_dir()
+            .to_path_buf();
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&writes);
+        before_settle_write_for_test(&view_dir, move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let mut prepared =
+            prepare_checkout(&request(&root, storage.path(), "head-1"), &mut |_| Ok(())).unwrap();
+        assert!(!prepared.commit().unwrap().published, "expected a no-op");
+        assert_eq!(prepared.settle_status(), SettleOutcome::Nothing);
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // With a row to settle, the same no-op writes exactly that row.
+        status(storage.path())
+            .mark_pending(b"gone.ts", "view publication scheduled", 1)
+            .unwrap();
+        let mut prepared =
+            prepare_checkout(&request(&root, storage.path(), "head-1"), &mut |_| Ok(())).unwrap();
+        assert!(!prepared.commit().unwrap().published);
+        assert_eq!(prepared.settle_status(), SettleOutcome::Applied(1));
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(pending(storage.path()), 0);
+    }
+
+    /// A settlement applied after its publication released the commit
+    /// barrier must not clear what a newer preparation marked meanwhile: that
+    /// work is not covered by the older generation, and its data is still
+    /// missing. Here the older settlement waits while a newer preparation marks
+    /// two members pending (it needs semantic vectors nobody has stored); the
+    /// older settlement still clears the row scheduled before it started.
+    #[test]
+    fn views_a_held_older_settlement_keeps_pending_rows_a_newer_preparation_marked() {
+        let (_project, root) = latin1_repository();
+        let storage = tempfile::tempdir().unwrap();
+        publish_checkout(&request(&root, storage.path(), "head-1")).unwrap();
+        status(storage.path())
+            .mark_pending(b"gone.ts", "view publication scheduled", 1)
+            .unwrap();
+
+        let mut older =
+            prepare_checkout(&request(&root, storage.path(), "head-2"), &mut |_| Ok(())).unwrap();
+        assert!(older.commit().unwrap().published);
+
+        let newer = prepare_checkout(
+            &AssemblyRequest {
+                require_semantic: true,
+                ..request(&root, storage.path(), "head-3")
+            },
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        let marked = BTreeSet::from([b"file_0.ts".to_vec(), b"latin1.py".to_vec()]);
+        assert_eq!(newer.report().pending_paths, marked);
+        assert_eq!(pending(storage.path()), 3);
+
+        assert!(matches!(older.settle_status(), SettleOutcome::Applied(_)));
+        let ledger = status(storage.path());
+        assert!(ledger.status_for(b"gone.ts").unwrap().is_none());
+        for path in &marked {
+            assert_eq!(
+                ledger.status_for(path).unwrap().map(|row| row.state),
+                Some(crate::path_status::PathState::Pending),
+                "{} lost the pending row a newer preparation marked",
+                String::from_utf8_lossy(path)
+            );
+        }
+        drop(newer);
+    }
+}

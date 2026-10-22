@@ -13,6 +13,136 @@ use rusqlite::{params, OptionalExtension, TransactionBehavior};
 /// Maximum paths included in a refresh-status response; counts include paths beyond this limit.
 pub const VISIBLE_PATH_CAP: usize = 20;
 
+/// Maximum skipped paths named in a status summary; the per-reason counts
+/// include paths beyond this limit.
+pub const SKIPPED_PATH_SAMPLE_CAP: usize = 5;
+
+/// Why a view member was published without one of its derived planes.
+///
+/// A skip is a terminal state, not a problem state: the path is in the
+/// generation, the view is complete, and no later work will change the
+/// outcome until the file's content changes. It is recorded so status can say
+/// which members a plane left out instead of hiding them. Skips live in their
+/// own table and never count as pending or failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum SkipReason {
+    /// The file is in a call-graph language but is not valid UTF-8, so the
+    /// parser cannot read it. It is published with an empty call graph; the
+    /// call graph built without views also leaves such files out.
+    NonUtf8Source,
+}
+
+impl SkipReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NonUtf8Source => "non_utf8_source",
+        }
+    }
+}
+
+/// One skipped member named in a status summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathSkip {
+    pub rel_path: Vec<u8>,
+    pub reason: String,
+}
+
+/// What a complete view publication says the status ledger should hold once
+/// its generation is the one served.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StatusIntent {
+    /// The generation the intent describes; new skip rows start at it.
+    pub generation: u64,
+    /// Every member of the generation.
+    pub members: std::collections::HashSet<Vec<u8>>,
+    /// Paths whose semantic work is still outstanding; they stay pending.
+    pub keep_pending: std::collections::BTreeSet<Vec<u8>>,
+    /// The ledger's mark epoch (`PathStatusStore::mark_epoch`) when the
+    /// publication's preparation started reading the checkout. An annotation
+    /// marked later belongs to work this publication does not cover, such as
+    /// a newer preparation that marked pending while this settlement waited
+    /// to be applied, so the settlement leaves it alone.
+    pub marked_through: u64,
+    /// Skip outcomes for members read afresh: `Some` records a skip, `None`
+    /// removes one. Members reused unread keep their rows, since their
+    /// content, and so their outcome, did not change.
+    pub fresh_skips: std::collections::BTreeMap<Vec<u8>, Option<SkipReason>>,
+}
+
+/// The ledger rows a settlement writes: annotations to delete (with the state
+/// they were read in) and skips to record (`Some`) or delete (`None`).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct StatusChanges {
+    pub clear: Vec<(Vec<u8>, PathState)>,
+    pub skips: Vec<(Vec<u8>, Option<SkipReason>)>,
+}
+
+impl StatusChanges {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.clear.is_empty() && self.skips.is_empty()
+    }
+}
+
+/// Compares the ledger with `intent`. It reads every annotation and skip
+/// row, which a settled view keeps few of, rather than probing each member.
+fn plan_settlement(
+    connection: &rusqlite::Connection,
+    intent: &StatusIntent,
+) -> Result<StatusChanges, PathStatusError> {
+    let mut changes = StatusChanges::default();
+    // An annotation written before marks were stamped has no mark; it is
+    // older than any settlement that reads it.
+    let mut annotations =
+        connection.prepare_cached("SELECT rel_path, state, COALESCE(mark, 0) FROM path_status")?;
+    for row in annotations.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })? {
+        let (path, state, mark) = row?;
+        let state = PathState::parse(&state).ok_or(PathStatusError::InvalidState(state))?;
+        if u64::try_from(mark).unwrap_or(0) > intent.marked_through {
+            continue;
+        }
+        let joined = !intent.keep_pending.contains(&path);
+        let settled = match state {
+            PathState::Pending => joined,
+            PathState::Failed => joined && intent.members.contains(&path),
+        };
+        if settled {
+            changes.clear.push((path, state));
+        }
+    }
+    let mut recorded = std::collections::BTreeMap::new();
+    let mut skips = connection.prepare_cached("SELECT rel_path, reason FROM path_skips")?;
+    for row in skips.query_map([], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (path, reason) = row?;
+        recorded.insert(path, reason);
+    }
+    for (path, reason) in &recorded {
+        let outcome = intent.fresh_skips.get(path);
+        if !intent.members.contains(path) || outcome == Some(&None) {
+            changes.skips.push((path.clone(), None));
+        } else if let Some(Some(fresh)) = outcome {
+            if fresh.as_str() != reason {
+                changes.skips.push((path.clone(), Some(*fresh)));
+            }
+        }
+    }
+    for (path, outcome) in &intent.fresh_skips {
+        if let Some(reason) = outcome {
+            if !recorded.contains_key(path) && intent.members.contains(path) {
+                changes.skips.push((path.clone(), Some(*reason)));
+            }
+        }
+    }
+    Ok(changes)
+}
+
 const PATH_STATUS_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS path_status (
     rel_path BLOB NOT NULL PRIMARY KEY,
@@ -20,6 +150,15 @@ CREATE TABLE IF NOT EXISTS path_status (
     reason TEXT NOT NULL,
     since_generation INTEGER NOT NULL CHECK(since_generation >= 0)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS path_skips (
+    rel_path BLOB NOT NULL PRIMARY KEY,
+    reason TEXT NOT NULL,
+    since_generation INTEGER NOT NULL CHECK(since_generation >= 0)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS path_status_marks (
+    id INTEGER NOT NULL PRIMARY KEY CHECK(id = 0),
+    epoch INTEGER NOT NULL CHECK(epoch >= 0)
+);
 CREATE TABLE IF NOT EXISTS maintenance_outcomes (
     operation TEXT NOT NULL PRIMARY KEY,
     outcome TEXT NOT NULL,
@@ -27,16 +166,59 @@ CREATE TABLE IF NOT EXISTS maintenance_outcomes (
 ) WITHOUT ROWID;
 "#;
 
+/// Stamps each annotation with the mark epoch of the write that last marked
+/// it (`?5`), so a settlement can tell its own work from later marks.
 const UPSERT_PATH_STATUS: &str =
-    "INSERT INTO path_status (rel_path, state, reason, since_generation)
-    VALUES (?1, ?2, ?3, ?4)
+    "INSERT INTO path_status (rel_path, state, reason, since_generation, mark)
+    VALUES (?1, ?2, ?3, ?4, ?5)
     ON CONFLICT(rel_path) DO UPDATE SET
         state = excluded.state,
         reason = excluded.reason,
         since_generation = CASE
             WHEN path_status.state = excluded.state THEN path_status.since_generation
             ELSE excluded.since_generation
-        END";
+        END,
+        mark = excluded.mark";
+
+/// Advances the ledger's mark epoch inside `transaction` and returns the new
+/// value. Every write that marks annotations takes one, so marks only grow.
+fn next_mark(transaction: &rusqlite::Transaction<'_>) -> Result<i64, PathStatusError> {
+    transaction.execute(
+        "INSERT INTO path_status_marks (id, epoch) VALUES (0, 1)
+         ON CONFLICT(id) DO UPDATE SET epoch = epoch + 1",
+        [],
+    )?;
+    Ok(transaction.query_row(
+        "SELECT epoch FROM path_status_marks WHERE id = 0",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// Adds the `mark` column to a ledger created before annotations were
+/// stamped. Its existing rows keep no mark, which reads as older than any
+/// settlement.
+fn add_mark_column(connection: &mut rusqlite::Connection) -> Result<(), PathStatusError> {
+    // Check without a write lock first: every open runs this, including the
+    // status reader, and an up-to-date ledger must not wait behind a large
+    // marking or settlement write. Only a ledger that still needs the column
+    // takes the write lock, and it checks again under it.
+    if mark_column_exists(connection)? {
+        return Ok(());
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !mark_column_exists(&transaction)? {
+        transaction.execute_batch("ALTER TABLE path_status ADD COLUMN mark INTEGER")?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn mark_column_exists(connection: &rusqlite::Connection) -> Result<bool, PathStatusError> {
+    Ok(connection
+        .prepare("SELECT 1 FROM pragma_table_info('path_status') WHERE name = 'mark'")?
+        .exists([])?)
+}
 
 /// The two path problem states exposed by view status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +260,10 @@ pub struct PathStatusSummary {
     pub pending_count: usize,
     pub failed_count: usize,
     pub paths: Vec<PathStatus>,
+    /// Skipped members by reason. Skips are not counted as pending or failed.
+    pub skipped_by_reason: std::collections::BTreeMap<String, usize>,
+    /// At most `SKIPPED_PATH_SAMPLE_CAP` skipped members, bytewise ordered.
+    pub skipped_sample: Vec<PathSkip>,
 }
 
 #[derive(Debug)]
@@ -163,10 +349,12 @@ impl PathStatusStore {
             connection.pragma_update(None, "journal_mode", "WAL")
         })?;
         connection.execute_batch(PATH_STATUS_SCHEMA)?;
-        Ok(Self {
+        let mut store = Self {
             path: path.to_path_buf(),
             connection,
-        })
+        };
+        add_mark_column(&mut store.connection)?;
+        Ok(store)
     }
 
     pub fn path(&self) -> &Path {
@@ -207,6 +395,7 @@ impl PathStatusStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mark = next_mark(&transaction)?;
         {
             let mut upsert = transaction.prepare_cached(UPSERT_PATH_STATUS)?;
             for (path, reason) in rows {
@@ -214,7 +403,8 @@ impl PathStatusStore {
                     path,
                     PathState::Pending.as_str(),
                     reason,
-                    generation
+                    generation,
+                    mark
                 ])?;
             }
         }
@@ -241,8 +431,9 @@ impl PathStatusStore {
         Ok(())
     }
 
-    /// Clears completed paths together, preserving annotations for paths that
-    /// still have outstanding work.
+    /// Deletes the given paths' annotations in one transaction. Publications
+    /// use `settle`; tests use this to clear rows directly.
+    #[cfg(test)]
     pub(crate) fn clear_many<'a>(
         &mut self,
         paths: impl IntoIterator<Item = &'a [u8]>,
@@ -343,11 +534,91 @@ impl PathStatusStore {
             .map(Self::decode_row)
             .collect::<Result<Vec<_>, _>>()?;
 
+        let mut by_reason = self
+            .connection
+            .prepare("SELECT reason, COUNT(*) FROM path_skips GROUP BY reason ORDER BY reason")?;
+        let skipped_by_reason = by_reason
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .map(|row| {
+                let (reason, count) = row?;
+                let count = usize::try_from(count)
+                    .map_err(|_| PathStatusError::InvalidGeneration(count))?;
+                Ok((reason, count))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, PathStatusError>>()?;
+        let mut sample = self
+            .connection
+            .prepare("SELECT rel_path, reason FROM path_skips ORDER BY rel_path LIMIT ?1")?;
+        let skipped_sample = sample
+            .query_map(params![SKIPPED_PATH_SAMPLE_CAP as i64], |row| {
+                Ok(PathSkip {
+                    rel_path: row.get(0)?,
+                    reason: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(PathStatusSummary {
             pending_count,
             failed_count,
             paths,
+            skipped_by_reason,
+            skipped_sample,
         })
+    }
+
+    /// The rows `intent` would change, read without writing. Empty when the
+    /// ledger already says what `intent` says.
+    pub(crate) fn plan_settlement(
+        &self,
+        intent: &StatusIntent,
+    ) -> Result<StatusChanges, PathStatusError> {
+        plan_settlement(&self.connection, intent)
+    }
+
+    /// Brings the ledger in line with `intent` in one IMMEDIATE transaction,
+    /// writing only the rows that differ, and returns how many it wrote.
+    ///
+    /// Pending rows clear unless their path still has outstanding semantic
+    /// work: a member has joined the generation, and a path that is not a
+    /// member (deleted from the checkout, excluded by the project content
+    /// rules, no longer in HEAD) is never revisited by a later publication,
+    /// so a row left behind for it would stay pending for the life of the
+    /// view. Failed rows clear only for members that joined. Skips follow the
+    /// fresh outcomes, and skips of paths that are no longer members go.
+    pub(crate) fn settle(&mut self, intent: &StatusIntent) -> Result<usize, PathStatusError> {
+        let generation = i64::try_from(intent.generation)
+            .map_err(|_| PathStatusError::GenerationOutOfRange(intent.generation))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changes = plan_settlement(&transaction, intent)?;
+        {
+            let mut clear = transaction
+                .prepare_cached("DELETE FROM path_status WHERE rel_path = ?1 AND state = ?2")?;
+            for (path, state) in &changes.clear {
+                clear.execute(params![path, state.as_str()])?;
+            }
+            let mut upsert = transaction.prepare_cached(
+                "INSERT INTO path_skips (rel_path, reason, since_generation)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(rel_path) DO UPDATE SET
+                     reason = excluded.reason,
+                     since_generation = excluded.since_generation",
+            )?;
+            let mut unskip =
+                transaction.prepare_cached("DELETE FROM path_skips WHERE rel_path = ?1")?;
+            for (path, reason) in &changes.skips {
+                match reason {
+                    Some(reason) => upsert.execute(params![path, reason.as_str(), generation])?,
+                    None => unskip.execute(params![path])?,
+                };
+            }
+        }
+        transaction.commit()?;
+        Ok(changes.clear.len() + changes.skips.len())
     }
 
     fn upsert(
@@ -359,11 +630,32 @@ impl PathStatusStore {
     ) -> Result<(), PathStatusError> {
         let generation = i64::try_from(since_generation)
             .map_err(|_| PathStatusError::GenerationOutOfRange(since_generation))?;
-        self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mark = next_mark(&transaction)?;
+        transaction.execute(
             UPSERT_PATH_STATUS,
-            params![rel_path, state.as_str(), reason, generation],
+            params![rel_path, state.as_str(), reason, generation, mark],
         )?;
+        transaction.commit()?;
         Ok(())
+    }
+
+    /// The ledger's current mark epoch. Annotations written since marks were
+    /// introduced are stamped at or below it; older rows have no mark and
+    /// count as epoch 0. A publication reads it before its preparation reads
+    /// the checkout, and its settlement clears nothing marked later.
+    pub(crate) fn mark_epoch(&self) -> Result<u64, PathStatusError> {
+        let epoch: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT epoch FROM path_status_marks WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(epoch.map_or(0, |epoch| u64::try_from(epoch).unwrap_or(0)))
     }
 
     fn decode_row(
@@ -624,6 +916,8 @@ mod tests {
                 pending_count: 0,
                 failed_count: 0,
                 paths: Vec::new(),
+                skipped_by_reason: Default::default(),
+                skipped_sample: Vec::new(),
             }
         );
         for index in 0..25 {
@@ -711,5 +1005,205 @@ mod tests {
         assert!(store.status_for(b"a").unwrap().is_none());
         assert!(store.status_for(b"b").unwrap().is_none());
         assert!(store.status_for(b"pending").unwrap().is_some());
+    }
+
+    fn intent(
+        generation: u64,
+        members: &[&[u8]],
+        keep_pending: &[&[u8]],
+        fresh_skips: &[(&[u8], Option<SkipReason>)],
+    ) -> StatusIntent {
+        StatusIntent {
+            generation,
+            members: members.iter().map(|path| path.to_vec()).collect(),
+            keep_pending: keep_pending.iter().map(|path| path.to_vec()).collect(),
+            marked_through: u64::MAX,
+            fresh_skips: fresh_skips
+                .iter()
+                .map(|(path, reason)| (path.to_vec(), *reason))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn settle_clears_other_pending_rows_and_keeps_waiting_paths_and_non_member_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = super::PathStatusStore::open(directory.path()).unwrap();
+        for path in [
+            b"deleted.png".as_slice(),
+            b"excluded.db",
+            b"waiting.rs",
+            b"joined.rs",
+        ] {
+            store.mark_pending(path, "scheduled", 1).unwrap();
+        }
+        store.mark_failed(b"broken.rs", "quarantined", 1).unwrap();
+        store.mark_failed(b"fixed.rs", "quarantined", 1).unwrap();
+        let intent = intent(
+            2,
+            &[b"waiting.rs", b"joined.rs", b"fixed.rs"],
+            &[b"waiting.rs"],
+            &[],
+        );
+
+        assert_eq!(store.settle(&intent).unwrap(), 4);
+
+        let summary = store.summary().unwrap();
+        assert_eq!((summary.pending_count, summary.failed_count), (1, 1));
+        assert_eq!(
+            store.status_for(b"waiting.rs").unwrap().unwrap().state,
+            PathState::Pending
+        );
+        assert_eq!(
+            store.status_for(b"broken.rs").unwrap().unwrap().state,
+            PathState::Failed
+        );
+        // Settled once, the same intent writes nothing.
+        assert!(store.plan_settlement(&intent).unwrap().is_empty());
+        assert_eq!(store.settle(&intent).unwrap(), 0);
+    }
+
+    #[test]
+    fn skips_are_counted_by_reason_apart_from_pending_and_failed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = super::PathStatusStore::open(directory.path()).unwrap();
+        let names = (0..7)
+            .map(|index| format!("latin1_{index}.py").into_bytes())
+            .collect::<Vec<_>>();
+        let mut members = names.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        members.push(b"waiting.rs");
+        let skipped = names
+            .iter()
+            .map(|name| (name.as_slice(), Some(SkipReason::NonUtf8Source)))
+            .collect::<Vec<_>>();
+        store
+            .settle(&intent(2, &members, &[b"waiting.rs"], &skipped))
+            .unwrap();
+        store.mark_pending(b"waiting.rs", "scheduled", 2).unwrap();
+
+        let summary = store.summary().unwrap();
+        assert_eq!((summary.pending_count, summary.failed_count), (1, 0));
+        assert_eq!(
+            summary.skipped_by_reason,
+            std::collections::BTreeMap::from([("non_utf8_source".to_string(), 7)])
+        );
+        assert_eq!(summary.skipped_sample.len(), SKIPPED_PATH_SAMPLE_CAP);
+        assert_eq!(summary.skipped_sample[0].rel_path, b"latin1_0.py");
+        assert_eq!(summary.skipped_sample[0].reason, "non_utf8_source");
+        assert_eq!(
+            store
+                .status_for(b"waiting.rs")
+                .unwrap()
+                .unwrap()
+                .since_generation,
+            2
+        );
+
+        // A fresh read that decodes clears its skip; a path that left the
+        // generation loses its skip; reused members keep theirs. Exactly
+        // those two rows are written.
+        members.retain(|path| *path != b"latin1_1.py".as_slice());
+        let next = intent(3, &members, &[b"waiting.rs"], &[(b"latin1_0.py", None)]);
+        assert_eq!(
+            store.plan_settlement(&next).unwrap(),
+            StatusChanges {
+                clear: Vec::new(),
+                skips: vec![
+                    (b"latin1_0.py".to_vec(), None),
+                    (b"latin1_1.py".to_vec(), None)
+                ],
+            }
+        );
+        assert_eq!(store.settle(&next).unwrap(), 2);
+        let summary = store.summary().unwrap();
+        assert_eq!(summary.skipped_by_reason["non_utf8_source"], 5);
+        assert_eq!(summary.skipped_sample[0].rel_path, b"latin1_2.py");
+        assert_eq!(summary.pending_count, 1);
+    }
+
+    /// A settlement clears only annotations marked up to the epoch it read
+    /// when its preparation started; a later mark of the same or another path
+    /// survives it.
+    #[test]
+    fn settle_leaves_annotations_marked_after_its_epoch() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = super::PathStatusStore::open(directory.path()).unwrap();
+        store.mark_pending(b"covered.rs", "scheduled", 1).unwrap();
+        store.mark_pending(b"remarked.rs", "scheduled", 1).unwrap();
+        let mut covering = intent(2, &[b"covered.rs", b"remarked.rs"], &[], &[]);
+        covering.marked_through = store.mark_epoch().unwrap();
+        store
+            .mark_pending_many(
+                [(b"remarked.rs".as_slice(), "newer"), (b"newer.rs", "newer")],
+                3,
+            )
+            .unwrap();
+        assert!(store.mark_epoch().unwrap() > covering.marked_through);
+
+        assert_eq!(store.settle(&covering).unwrap(), 1);
+        assert!(store.status_for(b"covered.rs").unwrap().is_none());
+        assert!(store.status_for(b"remarked.rs").unwrap().is_some());
+        assert!(store.status_for(b"newer.rs").unwrap().is_some());
+    }
+
+    /// Opening an up-to-date ledger takes no write lock, so the status reader
+    /// is never queued behind a large marking or settlement write.
+    #[test]
+    fn opening_an_upgraded_ledger_does_not_wait_for_a_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(super::PathStatusStore::open(directory.path()).unwrap());
+        let writer = rusqlite::Connection::open(directory.path().join("derived.sqlite")).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        let store = super::PathStatusStore::open(directory.path()).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "open waited {:?} behind a writer",
+            started.elapsed()
+        );
+        assert_eq!(store.summary().unwrap().pending_count, 0);
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// A ledger written before annotations carried a mark still reads, its
+    /// rows count as marked before any settlement, and new marks are stamped.
+    #[test]
+    fn ledger_without_marks_reads_and_settles() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("derived.sqlite");
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE path_status (
+                 rel_path BLOB NOT NULL PRIMARY KEY,
+                 state TEXT NOT NULL CHECK(state IN ('pending', 'failed')),
+                 reason TEXT NOT NULL,
+                 since_generation INTEGER NOT NULL CHECK(since_generation >= 0)
+             ) WITHOUT ROWID;
+             INSERT INTO path_status VALUES (x'6f6c642e7273', 'pending', 'scheduled', 1);",
+        )
+        .unwrap();
+        drop(old);
+
+        let mut store = super::PathStatusStore::open(directory.path()).unwrap();
+        assert_eq!(store.summary().unwrap().pending_count, 1);
+        assert_eq!(store.mark_epoch().unwrap(), 0);
+        store.mark_pending(b"new.rs", "scheduled", 2).unwrap();
+        assert_eq!(store.mark_epoch().unwrap(), 1);
+
+        let mut covering = intent(2, &[b"old.rs", b"new.rs"], &[], &[]);
+        covering.marked_through = 0;
+        assert_eq!(store.settle(&covering).unwrap(), 1);
+        assert!(store.status_for(b"old.rs").unwrap().is_none());
+        assert!(store.status_for(b"new.rs").unwrap().is_some());
+        drop(store);
+        // Reopening an upgraded ledger leaves it as it is.
+        assert_eq!(
+            super::PathStatusStore::open(directory.path())
+                .unwrap()
+                .summary()
+                .unwrap()
+                .pending_count,
+            1
+        );
     }
 }

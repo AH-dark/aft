@@ -181,6 +181,8 @@ mod tests {
             pinned: true,
             pending_paths: 0,
             failed_paths: 0,
+            skipped_paths: Default::default(),
+            skipped_path_sample: Vec::new(),
             cold_builds: Default::default(),
         };
         assert_eq!(ticket_current_view(Some(snapshot.clone()), None), None);

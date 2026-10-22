@@ -558,6 +558,8 @@ pub(crate) fn schedule(
                         // Sealing and cancellation are atomic with respect to superseding
                         // submissions, which hold JOBS while signaling this token.
                         let _jobs = JOBS.lock();
+                        #[cfg(test)]
+                        let _barrier = CommitBarrierMark::enter();
                         if token.cancel_requested_before_commit() {
                             return Err("view publication superseded".to_owned());
                         }
@@ -569,6 +571,10 @@ pub(crate) fn schedule(
                         let _ = token.try_seal_committed();
                         report
                     };
+                    // Path status is written only now, after the write gate and
+                    // the job table are released, so neither is held while it
+                    // opens SQLite and writes.
+                    prepared.settle_status();
                     log::info!(
                     "content-addressed view publication published={} blob_puts={} pending_paths={} root={}",
                     report.published,
@@ -623,6 +629,37 @@ pub(crate) fn schedule(
 #[cfg(test)]
 #[path = "view_publication_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+thread_local! {
+    static IN_COMMIT_BARRIER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks this thread as holding the publication commit barrier (the root
+/// actor's write gate and the job table) for as long as it lives.
+#[cfg(test)]
+struct CommitBarrierMark;
+
+#[cfg(test)]
+impl CommitBarrierMark {
+    fn enter() -> Self {
+        IN_COMMIT_BARRIER.set(true);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for CommitBarrierMark {
+    fn drop(&mut self) {
+        IN_COMMIT_BARRIER.set(false);
+    }
+}
+
+/// Whether this thread is inside a publication's commit barrier.
+#[cfg(test)]
+pub(crate) fn in_commit_barrier_for_test() -> bool {
+    IN_COMMIT_BARRIER.get()
+}
 
 #[cfg(test)]
 fn test_gate(id: u64, root: &std::path::Path, phase: &str) {
