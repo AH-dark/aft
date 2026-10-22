@@ -370,7 +370,7 @@ fn status_server() -> (SocketAddr, Arc<std::sync::Mutex<HashMap<String, usize>>>
 }
 
 #[test]
-fn a_timed_out_url_fails_from_memory_without_a_new_fetch() {
+fn a_server_that_hit_the_headers_limit_fails_from_memory_without_a_new_fetch() {
     let storage = tempfile::tempdir().unwrap();
     let connections = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&connections);
@@ -379,10 +379,13 @@ fn a_timed_out_url_fails_from_memory_without_a_new_fetch() {
         thread::sleep(SERVER_STALL);
     });
     let target = url(address, "/silent.md");
-    let (first, _) = fetch_within(CALL_BUDGET, &target, storage.path(), local());
+    // A budget large enough that the 15 s headers limit, not the caller's
+    // budget, ends the wait: the server is to blame.
+    let roomy = Duration::from_secs(30);
+    let (first, _) = fetch_within(roomy, &target, storage.path(), local());
     assert_eq!(first.unwrap_err().code(), "url_fetch_timeout");
 
-    let (second, elapsed) = fetch_within(CALL_BUDGET, &target, storage.path(), local());
+    let (second, elapsed) = fetch_within(roomy, &target, storage.path(), local());
     let error = second.expect_err("the remembered failure is repeated");
     assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
     assert_eq!(error.code(), "url_fetch_timeout", "{error}");
@@ -392,6 +395,85 @@ fn a_timed_out_url_fails_from_memory_without_a_new_fetch() {
     let retry_after = error.retry_after().expect("a remembered failure says when");
     assert!(retry_after <= FAILURE_MEMORY && !retry_after.is_zero());
     assert_eq!(connections.load(Ordering::SeqCst), 1, "no second fetch");
+}
+
+/// Answers every request with a small Markdown document, after stalling
+/// the first one; counts requests.
+fn answers_after_a_first_stall(stall_first: bool) -> (SocketAddr, Arc<AtomicUsize>) {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&requests);
+    let address = serve(move |_, mut stream| {
+        if counter.fetch_add(1, Ordering::SeqCst) == 0 && stall_first {
+            thread::sleep(SERVER_STALL);
+            return;
+        }
+        let body = b"# Doc\n\n## Section\n\ntext\n";
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/markdown\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(body);
+    });
+    (address, requests)
+}
+
+#[test]
+fn a_fetch_never_started_for_lack_of_budget_is_not_remembered() {
+    let storage = tempfile::tempdir().unwrap();
+    let (address, requests) = answers_after_a_first_stall(false);
+    let target = url(address, "/late-in-a-batch.md");
+    // Less budget than the read-back reserve and reply margin: no time is
+    // left to fetch at all, as for a late URL in a long zoom batch.
+    let (starved, _) = fetch_within(
+        Duration::from_millis(2_900),
+        &target,
+        storage.path(),
+        local(),
+    );
+    assert_eq!(starved.unwrap_err().code(), "url_fetch_timeout");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "the fetch never started"
+    );
+
+    let (fresh, _) = fetch_within(CALL_BUDGET, &target, storage.path(), local());
+    fresh.expect("a call with a fresh budget fetches normally");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_fetch_cut_short_by_the_call_budget_is_not_remembered() {
+    let storage = tempfile::tempdir().unwrap();
+    let (address, requests) = answers_after_a_first_stall(true);
+    let target = url(address, "/slow-once.md");
+    // The 2 s fetch deadline this budget leaves ends the first request
+    // before any limit of the fetcher's own would.
+    let (cut, _) = fetch_within(CALL_BUDGET, &target, storage.path(), local());
+    let error = cut.expect_err("the stalled first request is cut off");
+    assert_eq!(error.phase(), Some(FetchPhase::Headers), "{error}");
+
+    let (fresh, _) = fetch_within(CALL_BUDGET, &target, storage.path(), local());
+    fresh.expect("a call with a fresh budget fetches normally");
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_cached_document_is_served_while_a_failure_is_remembered() {
+    let storage = tempfile::tempdir().unwrap();
+    let (address, requests) = answers_after_a_first_stall(false);
+    let target = url(address, "/cached.md");
+    let (first, _) = fetch_within(CALL_BUDGET, &target, storage.path(), local());
+    let cached = first.expect("first fetch");
+    remember_failure(
+        FailureKey::new(storage.path(), &target, true),
+        &UrlFetchError::http_status(503, "HTTP 503 Service Unavailable"),
+    );
+
+    let (second, _) = fetch_within(CALL_BUDGET, &target, storage.path(), local());
+    assert_eq!(second.expect("the cached document is served"), cached);
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "no new fetch");
 }
 
 #[test]

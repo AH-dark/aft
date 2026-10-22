@@ -126,6 +126,10 @@ pub struct UrlFetchError {
     status: Option<u16>,
     /// Set on a remembered failure: how long until a call fetches again.
     retry_after: Option<Duration>,
+    /// Set when the fetch stopped (or never started) only because the
+    /// calling tool call had too little budget left. Such a failure says
+    /// nothing about the server, so it is never remembered.
+    cut_by_call_budget: bool,
 }
 
 impl UrlFetchError {
@@ -136,6 +140,7 @@ impl UrlFetchError {
             phase: None,
             status: None,
             retry_after: None,
+            cut_by_call_budget: false,
         }
     }
 
@@ -176,7 +181,14 @@ impl UrlFetchError {
     /// client errors (4xx) other than 408 Request Timeout and 429 Too Many
     /// Requests. Refusals by the SSRF check and other local errors are cheap
     /// to reproduce and are not remembered.
+    ///
+    /// Only failures the server or network caused are remembered: a timeout
+    /// cut short by the caller's budget is not, and neither is a failure
+    /// that is itself being repeated from memory.
     fn worth_remembering(&self) -> bool {
+        if self.cut_by_call_budget || self.retry_after.is_some() {
+            return false;
+        }
         self.code == "url_fetch_timeout"
             || self
                 .status
@@ -191,6 +203,9 @@ impl UrlFetchError {
 struct FetchDeadline {
     at: Instant,
     allowed: Duration,
+    /// The call's budget, not the URL ceiling, set this deadline: a fetch it
+    /// stops was stopped by the caller, not by a slow server.
+    set_by_call: bool,
 }
 
 impl FetchDeadline {
@@ -208,6 +223,7 @@ impl FetchDeadline {
         Self {
             at,
             allowed: at.saturating_duration_since(now),
+            set_by_call: at < ceiling,
         }
     }
 
@@ -220,14 +236,17 @@ impl FetchDeadline {
     }
 
     fn timeout_error(&self, phase: FetchPhase, url: &str) -> UrlFetchError {
-        UrlFetchError::timeout(
-            phase,
-            format!(
-                "URL fetch timed out in the {} phase: the {}ms fetch deadline elapsed fetching {url}",
-                phase.as_str(),
-                self.allowed.as_millis()
-            ),
-        )
+        UrlFetchError {
+            cut_by_call_budget: self.set_by_call,
+            ..UrlFetchError::timeout(
+                phase,
+                format!(
+                    "URL fetch timed out in the {} phase: the {}ms fetch deadline elapsed fetching {url}",
+                    phase.as_str(),
+                    self.allowed.as_millis()
+                ),
+            )
+        }
     }
 }
 
@@ -262,18 +281,16 @@ pub fn is_http_url(value: &str) -> bool {
 /// Fetch `url` into the URL cache under `storage_dir` and return the cached
 /// document's path. A failure worth remembering (see
 /// [`UrlFetchError::worth_remembering`]) is repeated for
-/// [`FAILURE_MEMORY`] without a new fetch, so an agent that retries a
-/// timed-out page gets its answer at once instead of waiting again.
+/// [`FAILURE_MEMORY`] instead of a new fetch, so an agent that retries a
+/// page the server failed gets its answer at once instead of waiting again.
+/// A document already in the cache is served regardless.
 pub fn fetch_url_to_cache(
     url: &str,
     storage_dir: &Path,
     options: UrlFetchOptions,
 ) -> Result<PathBuf, UrlFetchError> {
     let key = FailureKey::new(storage_dir, url, options.allow_private);
-    if let Some(remembered) = remembered_failure(&key) {
-        return Err(remembered);
-    }
-    let result = download_to_cache(url, storage_dir, options);
+    let result = download_to_cache(url, storage_dir, options, &key);
     match &result {
         Ok(_) => forget_failure(&key),
         Err(error) if error.worth_remembering() => remember_failure(key, error),
@@ -373,16 +390,19 @@ fn age_remembered_failure(key: &FailureKey, by: Duration) {
     }
 }
 
+/// The document cache is consulted first: a document that is cached is
+/// served (after the SSRF check) even while a failure of the same URL is
+/// remembered. Only a cache miss can be answered by a remembered failure.
 fn download_to_cache(
     url: &str,
     storage_dir: &Path,
     options: UrlFetchOptions,
+    failure_key: &FailureKey,
 ) -> Result<PathBuf, UrlFetchError> {
     let parsed = Url::parse(url).map_err(|_| UrlFetchError::new(format!("Invalid URL: {url}")))?;
     let deadline = FetchDeadline::for_current_call();
     let fetch_url = rewrite_url_for_fetch(&parsed);
     let approved = Arc::new(ApprovedHosts::default());
-    validate_public_url(&fetch_url, &options, &deadline, &approved)?;
 
     let dir = cache_dir(storage_dir);
     crate::private_storage::open_dir(storage_dir, &dir).map_err(|error| {
@@ -394,7 +414,16 @@ fn download_to_cache(
 
     let hash = hash_url(url);
     let meta_file = meta_path(storage_dir, &hash);
-    if let Some(cached) = fresh_cached_path(storage_dir, &hash, &meta_file, &fetch_url)? {
+    let cached = fresh_cached_path(storage_dir, &hash, &meta_file, &fetch_url)?;
+    if cached.is_none() {
+        if let Some(remembered) = remembered_failure(failure_key) {
+            return Err(remembered);
+        }
+    }
+    // A cache hit is checked too: the request may refuse private addresses
+    // that the call which filled the cache allowed.
+    validate_public_url(&fetch_url, &options, &deadline, &approved)?;
+    if let Some(cached) = cached {
         return Ok(cached);
     }
 
