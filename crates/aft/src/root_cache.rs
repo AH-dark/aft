@@ -57,7 +57,7 @@ pub use location::{
     CleanupReport, ProcessStorageLease, StoragePaths, CACHE_DIR_UNAVAILABLE,
 };
 pub(crate) use location::{
-    cache_deletion_protections, check_cache_access, ensure_config_storage_lease,
+    cache_deletion_protections, check_cache_access, durable_route, ensure_config_storage_lease,
     identity_storage_root, pin_cache_path, pin_owned_cache_path, prepare_process_cache_root,
     prepare_third_party_cache_dir, refuse_durable_cache_write, refuse_new_durable_cache_entry,
     register_durable_owner, retention_protections, unavailable_code, unavailable_warning,

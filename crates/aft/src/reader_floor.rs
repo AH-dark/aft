@@ -468,15 +468,13 @@ pub fn prepare(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
     prepare_uncached(storage_root)
 }
 
-/// A floor lives in durable storage, but its refusal must also cover artifacts
-/// on a separate volume. Register that explicit scope before any cache opens.
-pub(crate) fn prepare_artifact_root(storage: &Path, artifacts: &Path) {
+/// A floor lives in durable storage, and its refusals also cover artifacts on
+/// a separate `storage.cache_dir` volume: refusal routing spells paths inside
+/// a prepared cache root under the durable root that owns it (see
+/// [`crate::root_cache::durable_route`]), so nothing is recorded for the
+/// cache root itself, which never becomes a storage owner of its own.
+pub(crate) fn prepare_artifact_root(storage: &Path, _artifacts: &Path) {
     prepare(storage);
-    for refusal in persisted_format::refusals_under(storage) {
-        if refusal.source != crate::persisted_format::RefusalSource::Artifact {
-            persisted_format::record(&refusal, artifacts);
-        }
-    }
 }
 
 fn prepare_uncached(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {

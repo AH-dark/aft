@@ -364,6 +364,34 @@ pub(crate) fn identity_storage_root(storage: &Path) -> std::borrow::Cow<'_, Path
         _ => std::borrow::Cow::Borrowed(storage),
     }
 }
+
+/// The same location as `path`, spelled under the durable storage root that
+/// owns the prepared `storage.cache_dir` cache root containing it, or `None`
+/// when `path` is not inside such a cache root (always the case while no
+/// `cache_dir` is configured).
+///
+/// Version-floor refusals belong to the storage root an artifact is reached
+/// through. A cache root on another volume is never reached through its
+/// storage root, so this gives its artifacts the route they would have if
+/// the cache were linked under that storage root: `<cache>/aft/index/k` reads
+/// as `<storage>/index/k`. That route is only a name for ownership; nothing
+/// opens it.
+pub(crate) fn durable_route(path: &Path) -> Option<PathBuf> {
+    let registry = STATUS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    registry
+        .locations
+        .iter()
+        .filter_map(|(root, (_, _, identity))| {
+            let durable = registry.owners.get(identity.as_ref()?)?;
+            let relative = path.strip_prefix(root).ok()?;
+            (durable != root).then(|| (root.components().count(), durable.join(relative)))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, route)| route)
+}
 fn status(root: &Path) -> (Option<String>, u64, Option<Identity>) {
     STATUS
         .get_or_init(Default::default)

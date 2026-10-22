@@ -14537,6 +14537,67 @@ mod tests {
         assert!(error.detail().contains("Too many open files"));
     }
 
+    /// With `storage.cache_dir` set to a cache root outside the storage root,
+    /// a search index written in a newer format on the cache root is refused,
+    /// and its refusal belongs to the durable storage root that owns the cache
+    /// root: health and status list it there, under the project's key, and a
+    /// replacement with a current-format header clears it. Paths under the
+    /// durable root itself are never re-spelled.
+    #[test]
+    fn cache_root_index_refusal_is_listed_and_cleared_under_its_storage_root() {
+        let storage = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            cache_dir: Some(cache.path().to_path_buf()),
+            ..crate::config::Config::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let durable = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        let artifacts = crate::root_cache::cache_root(&config);
+        assert!(!artifacts.starts_with(&durable));
+        let key = "cache-dir-refusal-key";
+        assert!(crate::root_cache::durable_route(&durable.join("index").join(key)).is_none());
+
+        let cache_dir = artifacts.join("index").join(key);
+        fs::create_dir_all(&cache_dir).unwrap();
+        let cache_bin = cache_dir.join("cache.bin");
+        let write_header = |version: u32| {
+            let mut bytes = CACHE_MAGIC.to_le_bytes().to_vec();
+            bytes.extend(version.to_le_bytes());
+            fs::write(&cache_bin, bytes).unwrap();
+        };
+        let listed_under_storage = || {
+            crate::persisted_format::refusals_under(&durable)
+                .into_iter()
+                .filter(|refusal| {
+                    refusal.store == crate::persisted_format::PersistedStore::SearchIndex
+                        && refusal.path == cache_bin
+                })
+                .count()
+        };
+
+        write_header(INDEX_FORMAT_VERSION + 1);
+        crate::persisted_format::preflight_project_artifacts(&durable, &artifacts, key);
+        let refused = SearchIndex::check_disk_cache_format(&cache_dir)
+            .expect_err("a newer-format index on the cache root is refused");
+        assert_eq!(refused.path, cache_bin);
+        assert_eq!(listed_under_storage(), 1);
+        let (owned, _) = crate::persisted_format::refusals_for_push(&durable, Some(key));
+        assert!(
+            owned.iter().any(|refusal| refusal.path == cache_bin),
+            "status attributes the refusal to this project on its storage root: {owned:?}"
+        );
+
+        write_header(INDEX_FORMAT_VERSION);
+        assert!(SearchIndex::check_disk_cache_format(&cache_dir).is_ok());
+        assert_eq!(listed_under_storage(), 0);
+        assert!(crate::persisted_format::refusal_covering(
+            crate::persisted_format::PersistedStore::SearchIndex,
+            &cache_bin
+        )
+        .is_none());
+    }
     #[test]
     fn artifact_cache_key_concurrent_memo_writes_keep_valid_json() {
         let _probe_lock = git_root_commit_probe_override_lock_for_test();
