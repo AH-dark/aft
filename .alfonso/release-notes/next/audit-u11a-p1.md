@@ -1,0 +1,1 @@
+- Background bash keeps signal deaths as 128+signal exit codes and returns raw output in bounded 64 KiB pages; bash_watch finishes scanning an exited task's output before reporting no match, and says the scan is incomplete if its time runs out first.
