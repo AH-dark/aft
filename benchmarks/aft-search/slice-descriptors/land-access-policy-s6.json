@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "note": "aft_search's root refusal check now reads the outside-roots rule; ranking unchanged, results byte-identical to the old engine in the recorded table. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}
