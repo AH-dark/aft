@@ -58,6 +58,13 @@ fn bench_health_rollup_steps() {
     //                             does) and reads one new file into its
     //                             symbol cache; one root in ten also edits a
     //                             file in its trigram index
+    //   AFT_ROLLUP_BENCH_ARENA_CHUNKS  resident chunks held by views-on
+    //                             semantic arenas, spread over four families
+    //                             in runs of 100 chunks (views-on daemons
+    //                             hold hundreds of thousands)
+    //   AFT_ROLLUP_BENCH_CENSUS_READS=1  read the memory census after every
+    //                             tick, as a client polling `memory.census`
+    //                             does
     let env_count = |name: &str, default: usize| -> usize {
         std::env::var(name)
             .ok()
@@ -68,6 +75,9 @@ fn bench_health_rollup_steps() {
     let thread_count = env_count("AFT_ROLLUP_BENCH_THREADS", 0);
     let files_per_root = env_count("AFT_ROLLUP_BENCH_FILES", 0);
     let churn = std::env::var("AFT_ROLLUP_BENCH_CHURN").is_ok_and(|value| value == "1");
+    let arena_chunks = env_count("AFT_ROLLUP_BENCH_ARENA_CHUNKS", 0);
+    let census_reads =
+        std::env::var("AFT_ROLLUP_BENCH_CENSUS_READS").is_ok_and(|value| value == "1");
     const TICKS: usize = 20;
     let (park_tx, park_rx) = std::sync::mpsc::channel::<()>();
     let park_rx = Arc::new(std::sync::Mutex::new(park_rx));
@@ -93,6 +103,28 @@ fn bench_health_rollup_steps() {
         SELECT 'opencode', 'session', printf('task-%d',x), 'project', hex(zeroblob(1000)), '.', 'completed', 0, 1, 1 FROM n;").unwrap();
     tx.commit().unwrap();
     let bytes: u64 = std::fs::metadata(&db_path).unwrap().len();
+    // Arenas live while this function holds them; the census finds them
+    // through the process registry, as it finds the daemon's.
+    let arenas = (0..4)
+        .map(|family| {
+            crate::views::semantic_arena::arena_for(&storage, &format!("bench-arena-{family}"))
+        })
+        .collect::<Vec<_>>();
+    for run in 0..arena_chunks.div_ceil(100) {
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&(run as u64).to_le_bytes());
+        arenas[run % arenas.len()].install(
+            crate::blob_store::v2::FamilyKey::new(
+                crate::blob_store::v2::FamilyPlane::Semantic,
+                key,
+            ),
+            crate::semantic_index::SemanticVectors::synthetic_for_test(
+                Path::new(&format!("src/arena_{run}.rs")),
+                100,
+                4,
+            ),
+        );
+    }
     let app = App::default_shared();
     app.set_db(Arc::new(std::sync::Mutex::new(db)));
     app.set_open_route_count(300);
@@ -176,6 +208,7 @@ fn bench_health_rollup_steps() {
             .is_some_and(|view| view.pending_paths == 1 && view.failed_paths == 1)
     }));
     STEPS.with(|steps| *steps.borrow_mut() = Some(BTreeMap::new()));
+    let census_builds_before = cache.census_builds_for_test();
     let mut total = 0u64;
     let mut elapsed_steps = BTreeMap::<String, f64>::new();
     let mut elapsed_total = 0.0;
@@ -215,7 +248,7 @@ fn bench_health_rollup_steps() {
             &app,
             executor.actor_entries(),
         );
-        let tick = &built.memory_census["health_rollup_tick"];
+        let tick = &built.tick;
         elapsed_total += tick["elapsed_ms"].as_f64().unwrap();
         for (step, value) in tick["steps"].as_object().unwrap() {
             *elapsed_steps.entry(step.clone()).or_default() +=
@@ -225,10 +258,13 @@ fn bench_health_rollup_steps() {
         cache.publish(Some(built));
         publish_timer.mark("publish holder / old JSON drop");
         total += cpu_ns() - started;
+        if census_reads {
+            std::hint::black_box(cache.memory_census());
+        }
     }
     let steps = STEPS.with(|steps| steps.borrow_mut().take().unwrap());
     println!(
-        "roots={roots_count} routes=300 persisted_views={} installed_views={roots_count} extra_threads={thread_count} files_per_root={files_per_root} churn={churn} aft_db_bytes={bytes} ticks={TICKS} interval_s=3 CPU (not wall)",
+        "roots={roots_count} routes=300 persisted_views={} installed_views={roots_count} extra_threads={thread_count} files_per_root={files_per_root} churn={churn} arena_chunks={arena_chunks} census_reads={census_reads} aft_db_bytes={bytes} ticks={TICKS} interval_s=3 CPU (not wall)",
         roots_count * 10
     );
     for (step, ns) in steps {
@@ -250,6 +286,10 @@ fn bench_health_rollup_steps() {
         total as f64 / TICKS as f64 / 1000.,
         total as f64 / TICKS as f64 / 3000.
     );
+    println!(
+        "memory census measured on {} of {TICKS} ticks",
+        cache.census_builds_for_test() - census_builds_before
+    );
     let metrics = DispatchPathMetrics::new();
     let pending = HashMap::new();
     let before = cpu_ns();
@@ -262,6 +302,7 @@ fn bench_health_rollup_steps() {
         (cpu_ns() - before) as f64 / TICKS as f64 / 1000.
     );
     drop(park_tx);
+    drop(arenas);
     for thread in parked {
         thread.join().unwrap();
     }

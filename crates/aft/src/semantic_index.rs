@@ -4612,6 +4612,35 @@ pub struct SemanticVectors {
 }
 
 impl SemanticVectors {
+    /// A run of `chunks` distinct chunks of `file`, each with its own
+    /// `dimension`-float vector, for tests that need resident vectors without
+    /// running an embedding model.
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_test(file: &Path, chunks: usize, dimension: usize) -> Self {
+        Self {
+            entries: (0..chunks)
+                .map(|ordinal| {
+                    EmbeddingEntry::new(
+                        SemanticChunk {
+                            file: file.to_path_buf(),
+                            name: format!("symbol_{ordinal}"),
+                            qualified_name: None,
+                            kind: SymbolKind::Function,
+                            start_line: ordinal as u32,
+                            end_line: ordinal as u32 + 1,
+                            exported: false,
+                            embed_text: String::new(),
+                            snippet: String::new(),
+                        },
+                        (0..dimension)
+                            .map(|position| (ordinal * dimension + position) as f32 + 1.0)
+                            .collect::<Vec<f32>>(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
     /// Number of embedded chunks in this run.
     pub fn chunk_count(&self) -> usize {
         self.entries.len()

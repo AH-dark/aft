@@ -37,7 +37,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct SemanticArena {
     storage: PathBuf,
     family: String,
-    runs: Mutex<HashMap<FamilyKey, Arc<SemanticVectors>>>,
+    runs: Mutex<resident_runs::ResidentRuns>,
     /// Every distinct vector held by a resident run, by content digest.
     vectors: Mutex<VectorPool>,
     inflight: Mutex<HashSet<FamilyKey>>,
@@ -187,6 +187,102 @@ fn same_bits(left: &[f32], right: &[f32]) -> bool {
 
 type Registry = HashMap<(PathBuf, String), Weak<SemanticArena>>;
 
+/// The resident runs of one arena. The map is private to this module and is
+/// changed only through [`ResidentRuns::insert`] and
+/// [`ResidentRuns::retain_referenced`], which both advance `epoch`, so no
+/// change to the runs can leave the cached totals in place.
+mod resident_runs {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    use super::ArenaMemory;
+    use crate::blob_store::v2::FamilyKey;
+    use crate::semantic_index::SemanticVectors;
+
+    #[derive(Debug, Default)]
+    pub(super) struct ResidentRuns {
+        runs: HashMap<FamilyKey, Arc<SemanticVectors>>,
+        /// Advanced by every change to `runs`. A resident run never changes
+        /// after it is installed, so while this stays the same so do the run
+        /// totals.
+        epoch: u64,
+        /// The run totals of the last walk and the `epoch` they were taken
+        /// at. Walking visits every vector of every run, which for a large
+        /// family is millions of hash-set inserts; the health rollup asks for
+        /// the totals every few seconds while the runs rarely change.
+        totals: Option<(u64, ArenaMemory)>,
+        /// Full walks of the runs made by [`Self::totals`].
+        #[cfg(test)]
+        walks: u64,
+    }
+
+    impl ResidentRuns {
+        pub(super) fn get(&self, key: &FamilyKey) -> Option<Arc<SemanticVectors>> {
+            self.runs.get(key).cloned()
+        }
+
+        pub(super) fn insert(&mut self, key: FamilyKey, run: Arc<SemanticVectors>) {
+            self.runs.insert(key, run);
+            self.epoch += 1;
+        }
+
+        /// Drops the runs nothing outside the arena holds. Returns how many
+        /// were dropped.
+        pub(super) fn retain_referenced(&mut self) -> usize {
+            let before = self.runs.len();
+            self.runs.retain(|_, run| Arc::strong_count(run) > 1);
+            let released = before - self.runs.len();
+            if released > 0 {
+                self.epoch += 1;
+            }
+            released
+        }
+
+        /// Totals of the runs as [`super::SemanticArena::memory`] reports
+        /// them, without the chunk index table: every run once, and every
+        /// vector allocation once however many runs share it. Walks the runs
+        /// only when they changed since the last walk.
+        pub(super) fn totals(&mut self) -> ArenaMemory {
+            if let Some((epoch, totals)) = self.totals {
+                if epoch == self.epoch {
+                    return totals;
+                }
+            }
+            #[cfg(test)]
+            {
+                self.walks += 1;
+            }
+            let mut seen = HashSet::new();
+            let mut memory = ArenaMemory {
+                runs: self.runs.len(),
+                ..ArenaMemory::default()
+            };
+            for run in self.runs.values() {
+                memory.chunks += run.chunk_count();
+                memory.bytes = memory
+                    .bytes
+                    .saturating_add(run.resident_bytes_without_vectors());
+                for vector in run.vectors() {
+                    if seen.insert(Arc::as_ptr(vector).cast::<f32>()) {
+                        memory.vectors += 1;
+                        memory.vector_bytes = memory
+                            .vector_bytes
+                            .saturating_add(crate::semantic_index::vector_bytes(vector));
+                    }
+                }
+            }
+            memory.bytes = memory.bytes.saturating_add(memory.vector_bytes);
+            self.totals = Some((self.epoch, memory));
+            memory
+        }
+
+        #[cfg(test)]
+        pub(super) fn walks(&self) -> u64 {
+            self.walks
+        }
+    }
+}
+
 fn arenas() -> &'static Mutex<Registry> {
     static ARENAS: OnceLock<Mutex<Registry>> = OnceLock::new();
     ARENAS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -210,7 +306,7 @@ pub fn arena_for(storage: &Path, family: &str) -> Arc<SemanticArena> {
     let arena = Arc::new(SemanticArena {
         storage: key.0.clone(),
         family: key.1.clone(),
-        runs: Mutex::new(HashMap::new()),
+        runs: Mutex::new(resident_runs::ResidentRuns::default()),
         vectors: Mutex::new(VectorPool::default()),
         inflight: Mutex::new(HashSet::new()),
         released: Condvar::new(),
@@ -314,7 +410,7 @@ impl SemanticArena {
 
     /// The resident run for `key`, if one was admitted.
     pub fn get(&self, key: &FamilyKey) -> Option<Arc<SemanticVectors>> {
-        lock(&self.runs).get(key).cloned()
+        lock(&self.runs).get(key)
     }
 
     /// Admits `key` from the family store, decoding it once. Returns `None`
@@ -395,7 +491,7 @@ impl SemanticArena {
         lock(&self.vectors).share(&mut run);
         let mut runs = lock(&self.runs);
         if let Some(resident) = runs.get(&key) {
-            return (Arc::clone(resident), false);
+            return (resident, false);
         }
         let run = Arc::new(run);
         runs.insert(key, Arc::clone(&run));
@@ -534,45 +630,34 @@ impl SemanticArena {
     /// Drops runs no view references any more, after a view unbinds or moves
     /// to another generation. Returns how many runs were released.
     pub fn trim(&self) -> usize {
-        let released = {
-            let mut runs = lock(&self.runs);
-            let before = runs.len();
-            runs.retain(|_, run| Arc::strong_count(run) > 1);
-            before - runs.len()
-        };
+        let released = lock(&self.runs).retain_referenced();
         if released > 0 {
             lock(&self.vectors).prune();
         }
         released
     }
 
+    /// Resident bytes of the arena: its runs, each vector allocation once, and
+    /// the chunk index table. The run totals are reused while no run was added
+    /// or dropped (see `ResidentRuns`), so an unchanged arena is not walked
+    /// again.
     pub fn memory(&self) -> ArenaMemory {
-        let runs = lock(&self.runs);
-        let mut seen = HashSet::new();
-        let mut memory = ArenaMemory {
-            runs: runs.len(),
-            ..ArenaMemory::default()
-        };
-        for run in runs.values() {
-            memory.chunks += run.chunk_count();
-            memory.bytes = memory
-                .bytes
-                .saturating_add(run.resident_bytes_without_vectors());
-            for vector in run.vectors() {
-                if seen.insert(Arc::as_ptr(vector).cast::<f32>()) {
-                    memory.vectors += 1;
-                    memory.vector_bytes = memory
-                        .vector_bytes
-                        .saturating_add(crate::semantic_index::vector_bytes(vector));
-                }
-            }
-        }
-        memory.bytes = memory.bytes.saturating_add(memory.vector_bytes);
+        let mut runs = lock(&self.runs);
+        let mut memory = runs.totals();
+        // The chunk index grows and shrinks without any run changing, so its
+        // table size is read on every call; reading it is one lock. The runs
+        // stay locked meanwhile, as they always were here.
         memory.bytes = memory.bytes.saturating_add(
             (lock(&self.vectors).by_chunk.capacity()
                 * std::mem::size_of::<(FamilyKey, ChunkEntry)>()) as u64,
         );
+        drop(runs);
         memory
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_memory_walks_for_test(&self) -> u64 {
+        lock(&self.runs).walks()
     }
 
     /// Payloads decoded from the store since the arena was created. Queries
