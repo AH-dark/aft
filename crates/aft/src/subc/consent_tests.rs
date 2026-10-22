@@ -958,7 +958,7 @@ async fn consent_scope_write_folder_admits_subfolders_and_refuses_sibling_and_sy
     let f = fixture(FakeCingulate::up());
     set_hold_budget_for_test(Some(Duration::from_millis(100)));
     let target = f.head_root.join("shared.txt");
-    let args = json!({"filePath": target, "content": "first write\n"});
+    let args = json!({"path": target, "content": "first write\n"});
     let pending = f.tool("write", args.clone(), 301).await;
     assert_eq!(code(&pending), "access_pending", "{pending}");
     // The card offers the file (allow once) and its folder (allow scope).
@@ -993,7 +993,7 @@ async fn consent_scope_write_folder_admits_subfolders_and_refuses_sibling_and_sy
     let reply = f
         .tool(
             "write",
-            json!({"filePath": nested.join("new.txt"), "content": "nested write\n"}),
+            json!({"path": nested.join("new.txt"), "content": "nested write\n"}),
             303,
         )
         .await;
@@ -1009,7 +1009,7 @@ async fn consent_scope_write_folder_admits_subfolders_and_refuses_sibling_and_sy
     let reply = f
         .tool(
             "write",
-            json!({"filePath": sibling.join("new.txt"), "content": "sibling write\n"}),
+            json!({"path": sibling.join("new.txt"), "content": "sibling write\n"}),
             304,
         )
         .await;
@@ -1023,7 +1023,7 @@ async fn consent_scope_write_folder_admits_subfolders_and_refuses_sibling_and_sy
     let reply = f
         .tool(
             "write",
-            json!({"filePath": f.head_root.join("escape/through.txt"), "content": "escaped\n"}),
+            json!({"path": f.head_root.join("escape/through.txt"), "content": "escaped\n"}),
             305,
         )
         .await;
@@ -1034,7 +1034,7 @@ async fn consent_scope_write_folder_admits_subfolders_and_refuses_sibling_and_sy
     let reply = f
         .tool(
             "write",
-            json!({"filePath": f.head_root.join("link.txt"), "content": "escaped\n"}),
+            json!({"path": f.head_root.join("link.txt"), "content": "escaped\n"}),
             306,
         )
         .await;
@@ -2882,7 +2882,7 @@ async fn standalone_untrusted_reverse_asks_then_writes_once_without_cingulate() 
         .send_tool_with_writer(
             &route,
             "write",
-            json!({"filePath": target, "content": "approved outside write\n"}),
+            json!({"path": target, "content": "approved outside write\n"}),
             30,
             write_dispatch,
         )
@@ -2926,7 +2926,7 @@ async fn standalone_untrusted_reverse_asks_then_writes_once_without_cingulate() 
         .send_tool_with_writer(
             &route,
             "write",
-            json!({"filePath": second, "content": "unapproved\n"}),
+            json!({"path": second, "content": "unapproved\n"}),
             31,
             write_dispatch,
         )
