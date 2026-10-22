@@ -1141,3 +1141,46 @@ async fn optional_worker_broker_failed_seed_rolls_back_without_spawn_authority()
     );
     ticket.abandon_worker_read();
 }
+
+// A refusal carries the daemon's explanation (for an unknown query key it
+// names the key and the allowed ones). The worker-facing error must keep it,
+// or a refused command can't be corrected without reading broker traffic.
+#[cfg(unix)]
+#[test]
+fn broker_refusal_error_keeps_the_daemon_message() {
+    use std::io::{Read, Write};
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("broker.sock");
+    let capability_file = root.path().join("capability");
+    std::fs::write(&capability_file, "0123456789abcdef0123456789abcdef").unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut size = [0u8; 4];
+        stream.read_exact(&mut size).unwrap();
+        let mut request = vec![0u8; u32::from_be_bytes(size) as usize];
+        stream.read_exact(&mut request).unwrap();
+        let reply = serde_json::to_vec(&serde_json::json!({
+            "status": "error",
+            "data": {
+                "refusal_code": "worker_query_key_not_allowed",
+                "message": "query key `sort` is not allowed; allowed keys: page, per_page"
+            }
+        }))
+        .unwrap();
+        stream
+            .write_all(&(reply.len() as u32).to_be_bytes())
+            .unwrap();
+        stream.write_all(&reply).unwrap();
+    });
+    let client = Client {
+        socket,
+        capability_file,
+    };
+    let error = request(&client, Operation::SessionContext, Duration::from_secs(5)).unwrap_err();
+    server.join().unwrap();
+    assert_eq!(
+        error,
+        "worker read broker refused: worker_query_key_not_allowed: query key `sort` is not allowed; allowed keys: page, per_page"
+    );
+}

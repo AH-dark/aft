@@ -675,10 +675,18 @@ pub(crate) fn request(
                         .get("data")
                         .cloned()
                         .ok_or_else(|| "worker read broker omitted data".into()),
-                    Some("error") => Err(format!(
-                        "worker read broker refused: {}",
-                        reply["data"]["refusal_code"].as_str().unwrap_or("refused")
-                    )),
+                    Some("error") => {
+                        // Keep the daemon's explanation (for example, which
+                        // query keys are allowed) so a refused command can be
+                        // corrected without inspecting broker traffic.
+                        let code = reply["data"]["refusal_code"].as_str().unwrap_or("refused");
+                        Err(match reply["data"]["message"].as_str() {
+                            Some(message) if !message.is_empty() => {
+                                format!("worker read broker refused: {code}: {message}")
+                            }
+                            _ => format!("worker read broker refused: {code}"),
+                        })
+                    }
                     _ => Err("worker read broker reply has unknown status".into()),
                 }
             })
