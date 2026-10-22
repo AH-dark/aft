@@ -71,6 +71,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/landing-policy.py --event "$GITHUB_EVENT_NAME" --event-path "$GITHUB_EVENT_PATH"
+      - name: No ignored files tracked under .cortexkit
+        # .cortexkit/ is private working space; .gitignore names the few paths
+        # there that may be tracked, and any other tracked file fails here.
+        run: scripts/check-cortexkit-tracking.sh
       - name: Capture exact queue context for removal diagnostics
         if: ${{ always() && github.event_name == 'merge_group' }}
         run: |
@@ -243,7 +247,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Resolve pinned benchmark imports
-        run: scripts/telemetry/imports-resolve.sh --spec .cortexkit/alfonso/drafts/2026-09-09-aft-search-quality-b1-real-query-benchmark-manifest-gate-baseline-and-remeasure.md --snapshot 30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17
+        run: scripts/telemetry/imports-resolve.sh --spec benchmarks/aft-search/B1.md --snapshot 30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17
       - name: Run harness and mode-selection goldens
         run: |
           scripts/telemetry/cost-gate.sh --search-quality --self-test
