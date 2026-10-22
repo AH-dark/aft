@@ -92,12 +92,15 @@ pub(super) fn measure<T>(
 }
 
 const GRAPH_TABLES: &[&str] = &[
+    "files",
     "nodes",
     "refs",
     "edges",
     "file_dependencies",
     "dispatch_hints",
     "type_ref_names",
+    "backend_file_state",
+    "resolution_config_fields",
 ];
 
 /// Every graph row, sorted, with the fixture root replaced so two copies of
@@ -107,8 +110,15 @@ fn dump_graph_rows(store: &CallGraphStore) -> String {
     let conn = store.conn.lock().expect("callgraph store mutex poisoned");
     let mut out = String::new();
     for table in GRAPH_TABLES {
+        // Filesystem/build timestamps vary between identical copies of a tree;
+        // graph evidence and freshness content identities must not vary.
+        let columns = match *table {
+            "files" => "path, content_hash, size, lang, is_dead_code_root, is_public_api, surface_fingerprint",
+            "backend_file_state" => "backend, workspace_root, file_path, content_hash, status",
+            _ => "*",
+        };
         let mut statement = conn
-            .prepare(&format!("SELECT * FROM {table}"))
+            .prepare(&format!("SELECT {columns} FROM {table}"))
             .expect("prepare dump");
         let columns = statement.column_count();
         let mut rows = statement
@@ -139,6 +149,330 @@ fn dump_graph_rows(store: &CallGraphStore) -> String {
         }
     }
     out
+}
+
+/// Save a deterministic corpus before an I/O change, then compare the logical
+/// rows and public graph walks against that saved baseline after the change.
+#[test]
+#[ignore = "measurement: AFT_CALLGRAPH_IO_PARITY names the baseline dump"]
+fn callgraph_io_fixture_equivalence() {
+    let dump = PathBuf::from(std::env::var("AFT_CALLGRAPH_IO_PARITY").expect("baseline dump"));
+    fs::create_dir_all(dump.parent().unwrap()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = write_scaling_fixture(&root, 512);
+    let (store, _) =
+        CallGraphStore::cold_build_with_lease_chunked(dir.path().join("store"), root, &files, 100)
+            .unwrap();
+    let rows = dump_graph_rows(&store);
+    let queries = dump_query_outputs(&store, usize::MAX);
+    for (name, value) in [("rows", rows), ("queries", queries)] {
+        let path = dump.with_extension(name);
+        if std::env::var_os("AFT_CALLGRAPH_IO_PARITY_RECORD").is_some() {
+            fs::write(&path, &value).unwrap();
+        } else {
+            assert_eq!(fs::read_to_string(&path).unwrap(), value, "{name} changed");
+        }
+        eprintln!(
+            "parity {name}: lines={} blake3={}",
+            value.lines().count(),
+            blake3::hash(value.as_bytes())
+        );
+    }
+}
+
+fn vm_steps(conn: &Connection, run: impl FnOnce()) -> usize {
+    struct Reset<'a>(&'a Connection);
+    impl Drop for Reset<'_> {
+        fn drop(&mut self) {
+            // Remove the callback before its stack-owned counter disappears,
+            // including when an assertion in the measured closure panics.
+            unsafe {
+                ffi::sqlite3_progress_handler(self.0.handle(), 0, None, std::ptr::null_mut());
+            }
+        }
+    }
+    unsafe extern "C" fn count(context: *mut c_void) -> c_int {
+        // SQLite invokes the callback synchronously while the counter is alive.
+        unsafe { &*(context.cast::<AtomicUsize>()) }.fetch_add(1, AtomicOrdering::Relaxed);
+        0
+    }
+    let steps = AtomicUsize::new(0);
+    unsafe {
+        ffi::sqlite3_progress_handler(
+            conn.handle(),
+            1,
+            Some(count),
+            (&steps as *const AtomicUsize).cast_mut().cast(),
+        );
+    }
+    let reset = Reset(conn);
+    run();
+    drop(reset);
+    steps.load(AtomicOrdering::Relaxed)
+}
+
+#[test]
+fn callgraph_io_status_scans_visit_only_nonfresh_rows() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<60000)
+        INSERT INTO backend_file_state(backend,workspace_root,file_path,content_hash,status,updated_at)
+        SELECT 'treesitter','/project',printf('file%d.ts',x),'hash','fresh',0 FROM n;").unwrap();
+    conn.execute_batch(
+        "INSERT INTO backend_file_state VALUES
+        ('treesitter','/project','stale.ts','hash','stale',0),
+        ('treesitter','/project','binary.ts','hash','undecodable',0)",
+    )
+    .unwrap();
+    let root = Path::new("/project");
+    let steps = vm_steps(&conn, || {
+        assert_eq!(
+            stale_backend_file_paths(&conn, root, true).unwrap(),
+            vec!["stale.ts"]
+        );
+        assert_eq!(
+            backend_file_paths_with_status(&conn, root, BACKEND_STATUS_UNDECODABLE).unwrap(),
+            vec!["binary.ts"]
+        );
+    });
+    assert!(
+        steps < 200,
+        "status scans executed {steps} VM steps for fresh rows"
+    );
+}
+
+#[test]
+fn callgraph_io_root_lookup_uses_meta() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = write_scaling_fixture(&root, 8);
+    let store = CallGraphStore::open(dir.path().join("store"), root.clone()).unwrap();
+    store.cold_build(&files).unwrap();
+    let conn = store.conn.lock().unwrap();
+    let steps = vm_steps(&conn, || {
+        assert_eq!(
+            stored_workspace_roots(&conn).unwrap(),
+            vec![root.display().to_string()]
+        );
+    });
+    assert!(
+        steps < 30,
+        "root lookup executed {steps} VM steps instead of reading meta"
+    );
+}
+
+#[test]
+fn callgraph_io_legacy_root_scan_is_cached_once_and_repair_updates_meta() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let old_root = dir.path().join("moved-away").display().to_string();
+    let mut conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO backend_file_state VALUES('treesitter',?1,'file.ts','hash','fresh',0)",
+        [&old_root],
+    )
+    .unwrap();
+    assert_eq!(stored_workspace_roots(&conn).unwrap(), vec![old_root]);
+    assert!(
+        vm_steps(&conn, || {
+            stored_workspace_roots(&conn).unwrap();
+        }) < 30
+    );
+    assert!(matches!(
+        reconcile_workspace_roots(&mut conn, &root, true).unwrap(),
+        OpenRootRepair::ReRooted
+    ));
+    assert_eq!(
+        stored_workspace_roots(&conn).unwrap(),
+        vec![root.display().to_string()]
+    );
+}
+
+#[test]
+fn callgraph_io_extraction_commits_by_bytes_not_chunk_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = write_scaling_fixture(&root, 300);
+    let store = CallGraphStore::open(dir.path().join("store"), root).unwrap();
+    let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&batches);
+    set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+        observed.lock().unwrap().push(paths.len())
+    })));
+    let result = store.cold_build_chunked(&files, 100);
+    set_cold_build_extract_observer(None);
+    result.unwrap();
+    assert_eq!(*batches.lock().unwrap(), vec![300]);
+}
+
+#[test]
+fn callgraph_io_large_cache_is_build_only() {
+    let conn = TrackedConnection::open_in_memory(SqliteStore::CallgraphColdGeneration).unwrap();
+    configure_build_connection(&conn).unwrap();
+    let cache: i64 = conn
+        .pragma_query_value(None, "cache_size", |row| row.get(0))
+        .unwrap();
+    assert_eq!(cache, -262144);
+    configure_connection(&conn).unwrap();
+    let cache: i64 = conn
+        .pragma_query_value(None, "cache_size", |row| row.get(0))
+        .unwrap();
+    assert_eq!(cache, CALLGRAPH_SQLITE_CACHE_KIB);
+}
+
+#[test]
+fn callgraph_io_refresh_reuses_connection_and_releases_it_on_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = write_scaling_fixture(&root, 3);
+    let store_dir = dir.path().join("store");
+    let (store, _) =
+        CallGraphStore::cold_build_with_lease(store_dir.clone(), root.clone(), &files).unwrap();
+    let path = store.sqlite_path().to_path_buf();
+    drop(store);
+    let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+    let pending = PendingCallGraphStorePaths::default();
+    let key = RefreshRoot {
+        callgraph_dir: store_dir.clone(),
+        project_root: root.clone(),
+    };
+    for attempt in 0..2 {
+        fs::write(
+            &files[0],
+            format!("export function edited{attempt}() {{}}\n"),
+        )
+        .unwrap();
+        assert!(enqueue_callgraph_store_refresh(
+            store_dir.clone(),
+            root.clone(),
+            vec![files[0].clone()],
+            pending.clone()
+        ));
+        assert!(worker
+            .worker
+            .wait_for_root_with_budget(&root, Duration::from_secs(15)));
+        let stores = worker.worker.shared.stores.lock().unwrap();
+        let store = &stores
+            .get(&key)
+            .expect("idle refresh connection retained")
+            .store;
+        assert!(
+            store.writer_lease.is_none(),
+            "idle connection must not retain the writer lease"
+        );
+        let conn = store.conn.lock().unwrap();
+        if attempt == 0 {
+            conn.execute_batch(
+                "CREATE TEMP TABLE reuse_sentinel(value); INSERT INTO reuse_sentinel VALUES(746)",
+            )
+            .unwrap();
+        } else {
+            assert_eq!(
+                conn.query_row("SELECT value FROM reuse_sentinel", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                746
+            );
+        }
+    }
+    close_refresh_connections(&root);
+    assert_eq!(
+        crate::db::file_identity::open_connections(&path),
+        0,
+        "eviction must close the connection and WAL mapping"
+    );
+    assert!(enqueue_callgraph_store_refresh(
+        store_dir.clone(),
+        root.clone(),
+        vec![files[0].clone()],
+        pending
+    ));
+    assert!(worker
+        .worker
+        .wait_for_root_with_budget(&root, Duration::from_secs(15)));
+    let (next, _) = CallGraphStore::force_cold_build_with_lease_chunked(
+        store_dir.clone(),
+        root.clone(),
+        &files,
+        100,
+    )
+    .unwrap();
+    let next_path = next.sqlite_path().to_path_buf();
+    assert_ne!(path, next_path);
+    drop(next);
+    assert!(enqueue_callgraph_store_refresh(
+        store_dir,
+        root.clone(),
+        vec![files[0].clone()],
+        PendingCallGraphStorePaths::default()
+    ));
+    assert!(worker
+        .worker
+        .wait_for_root_with_budget(&root, Duration::from_secs(15)));
+    assert_eq!(
+        crate::db::file_identity::open_connections(&path),
+        0,
+        "superseded generation must be closed before reusing a writer"
+    );
+    assert_eq!(
+        worker.worker.shared.stores.lock().unwrap()[&key]
+            .store
+            .sqlite_path(),
+        next_path
+    );
+    drop(worker);
+    assert_eq!(
+        crate::db::file_identity::open_connections(&next_path),
+        0,
+        "worker shutdown must close cached connections"
+    );
+}
+
+#[test]
+fn callgraph_io_rebind_retires_the_previous_roots_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "previous-root");
+    let files = write_scaling_fixture(&root, 3);
+    let store_dir = dir.path().join("store");
+    let (store, _) =
+        CallGraphStore::cold_build_with_lease(store_dir.clone(), root.clone(), &files).unwrap();
+    let path = store.sqlite_path().to_path_buf();
+    drop(store);
+    let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+    let generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+    for publication in [false, true] {
+        let lifecycle = SubcLifecycleAdmission::default();
+        let ticket = CallgraphRefreshTicket::new(
+            lifecycle.clone(),
+            Arc::clone(&generation),
+            generation.load(AtomicOrdering::SeqCst),
+            epoch.clone(),
+            epoch.current(),
+        );
+        assert!(enqueue_callgraph_store_refresh_fenced(
+            store_dir.clone(),
+            root.clone(),
+            vec![files[0].clone()],
+            PendingCallGraphStorePaths::default(),
+            ticket
+        ));
+        assert!(worker
+            .worker
+            .wait_for_root_with_budget(&root, Duration::from_secs(15)));
+        assert_eq!(crate::db::file_identity::open_connections(&path), 1);
+        if publication {
+            epoch.next();
+        } else {
+            generation.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        // No path from the replacement configure is needed to retire the old
+        // root's connection, even when configure switches canonical roots.
+        retire_obsolete_callgraph_refresh_waiters();
+        assert_eq!(crate::db::file_identity::open_connections(&path), 0);
+    }
 }
 
 /// `callers`, `call_tree` and `trace_to` output for an evenly spaced sample
@@ -1630,8 +1964,8 @@ fn sqlite_file_bytes(path: &Path) -> (u64, u64) {
 
 /// Cold build and one-file refreshes of generated stores of growing size,
 /// through the same entry points the engine uses: a leased, staged cold
-/// build that publishes a generation, then for each refresh a fresh refresh
-/// connection (the refresh worker opens one per batch) and one changed file.
+/// build that publishes a generation, then three one-file edits sharing a
+/// refresh connection, as the refresh worker does between lifecycle changes.
 ///
 /// Prints `/proc/self/io` deltas for each step and, for the refresh body,
 /// statement profile totals and the 12 statements with the most full-scan
@@ -1735,6 +2069,7 @@ fn measure_cold_build_and_one_file_refresh_io_by_store_size() {
         );
         drop(store);
 
+        let mut cached_refresh = None;
         for (attempt, index) in [0usize, files_count / 2, files_count - 1]
             .into_iter()
             .enumerate()
@@ -1747,9 +2082,11 @@ fn measure_cold_build_and_one_file_refresh_io_by_store_size() {
             fs::write(&path, text).unwrap();
 
             let before_open = ProcIo::sample();
-            let store = CallGraphStore::open_ready_for_refresh(callgraph_dir.clone(), root.clone())
-                .expect("open for refresh")
-                .expect("ready store");
+            let store = cached_refresh.take().unwrap_or_else(|| {
+                CallGraphStore::open_ready_for_refresh(callgraph_dir.clone(), root.clone())
+                    .expect("open for refresh")
+                    .expect("ready store")
+            });
             let open = ProcIo::sample().since(before_open);
             trace_statements(&store.conn.lock().unwrap());
             let before_refresh = ProcIo::sample();
@@ -1788,7 +2125,7 @@ fn measure_cold_build_and_one_file_refresh_io_by_store_size() {
             report_statement_profiles(&format!(
                 "scaling files={files_count} refresh#{attempt} open-time"
             ));
-            drop(store);
+            cached_refresh = Some(store);
         }
     }
 }

@@ -6053,6 +6053,9 @@ impl AppContext {
             .subc_lifecycle
             .advance_generation(self.configure_generation.as_ref());
         crate::callgraph_store::retire_obsolete_callgraph_refresh_waiters();
+        if let Some(root) = self.canonical_cache_root_opt() {
+            crate::callgraph_store::close_refresh_connections(&root);
+        }
         generation
     }
 
@@ -6069,6 +6072,9 @@ impl AppContext {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
         crate::callgraph_store::retire_obsolete_callgraph_refresh_waiters();
+        if let Some(root) = self.canonical_cache_root_opt() {
+            crate::callgraph_store::close_refresh_connections(&root);
+        }
         self.repeat_breaker.clear();
     }
 
@@ -12882,6 +12888,9 @@ impl AppContext {
             return false;
         }
 
+        if let Some(root) = self.canonical_cache_root_opt() {
+            crate::callgraph_store::close_refresh_connections(&root);
+        }
         self.callgraph_store
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
