@@ -1752,16 +1752,25 @@ fn materialize_dead_code_contributions(
             }
             for call in &mut internal_calls {
                 if let Some(items) = rust_items_by_file.get(&contribution.file) {
-                    call.caller_symbol =
-                        rust_function_identity(items, &call.caller_symbol, Some(call.line), None);
+                    call.caller_symbol = rust_method_node(items, &call.caller_symbol)
+                        .unwrap_or_else(|| {
+                            rust_function_identity(
+                                items,
+                                &call.caller_symbol,
+                                Some(call.line),
+                                None,
+                            )
+                        });
                 }
                 if let Some(items) = rust_items_by_file.get(&call.file) {
-                    call.symbol = rust_function_identity(
-                        items,
-                        &call.symbol,
-                        None,
-                        (call.file == contribution.file).then_some(call.caller_symbol.as_str()),
-                    );
+                    call.symbol = rust_method_node(items, &call.symbol).unwrap_or_else(|| {
+                        rust_function_identity(
+                            items,
+                            &call.symbol,
+                            None,
+                            (call.file == contribution.file).then_some(call.caller_symbol.as_str()),
+                        )
+                    });
                 }
                 // An edge to a struct, enum or other type declaration carries no
                 // test status: production code uses types through type
@@ -1862,6 +1871,17 @@ fn materialize_dead_code_contributions(
                 language_for_file(&contribution.file) != "rust"
                     && public_api_files.contains(&contribution.file),
             );
+            // Roots name methods with their impl (`Owner::name`) as well; use
+            // the same method node as the edges above.
+            if let Some(items) = rust_items_by_file.get(&contribution.file) {
+                for root in &mut liveness_roots {
+                    if let Some(node) = rust_method_node(items, root) {
+                        *root = node;
+                    }
+                }
+                liveness_roots.sort();
+                liveness_roots.dedup();
+            }
             contribution.go_initializers =
                 initializers_by_file.get(&contribution.file).map(|group| {
                     GoInitializerContribution {
@@ -4815,6 +4835,54 @@ fn rust_export_identity(export: &ExportContribution, facts: Option<&RustApiFacts
         }
     }
     export.symbol.clone()
+}
+
+/// The graph node of a method named with its impl, such as `Config::production`
+/// or `Display for Config::fmt` (how source scans name a method, optionally
+/// behind its module path). The stored callgraph and the export rows name a
+/// method by its own name only. When exactly one impl in this file defines a
+/// method with that name, both spellings denote the same declaration, so it
+/// maps to the short name and the method has one node. Same-named methods of
+/// several types keep their separate impl-qualified nodes. Anything else
+/// returns `None`.
+fn rust_method_node(items: &[RustApiItem], symbol: &str) -> Option<String> {
+    let (prefix, name) = symbol.rsplit_once("::")?;
+    let type_name = |path: &str| {
+        let path = path.split('<').next().unwrap_or(path).trim();
+        path.rsplit("::").next().unwrap_or(path).to_string()
+    };
+    let (trait_name, owner) = match prefix.rsplit_once(" for ") {
+        Some((trait_path, owner)) => (Some(type_name(trait_path)), type_name(owner)),
+        None => (None, type_name(prefix)),
+    };
+    let owners = items
+        .iter()
+        .filter(|item| item.name == name && item.owner.is_some())
+        .map(|item| (&item.owner, &item.trait_name))
+        .collect::<BTreeSet<_>>();
+    // A free function with the method's name already owns the short node.
+    if owners.len() != 1
+        || items
+            .iter()
+            .any(|item| item.owner.is_none() && item.scope.is_empty() && item.name == name)
+    {
+        return None;
+    }
+    items
+        .iter()
+        .any(|item| {
+            item.name == name
+                && item
+                    .owner
+                    .as_deref()
+                    .is_some_and(|item_owner| type_name(item_owner) == owner)
+                && trait_name.as_ref().is_none_or(|trait_name| {
+                    item.trait_name
+                        .as_deref()
+                        .is_some_and(|item_trait| &type_name(item_trait) == trait_name)
+                })
+        })
+        .then(|| name.to_string())
 }
 
 fn rust_function_identity(
@@ -8133,6 +8201,39 @@ mod tests {
         assert!(headline_symbols(&aggregate).is_empty(), "{aggregate:#}");
         assert!(test_only_symbols(&aggregate).is_empty(), "{aggregate:#}");
         assert_eq!(aggregate["excluded_test_count"], 2, "{aggregate:#}");
+    }
+
+    /// A method called from a production closure and from a test is one
+    /// declaration: the test call must not make what the method's body uses
+    /// look test-only.
+    #[test]
+    fn review_method_called_from_production_closure_and_test_keeps_body_production() {
+        let aggregate = stored_rust_fixture_scan(&[
+            ("src/main.rs", "mod subc;\nfn main() { subc::start(None); }\n"),
+            (
+                "src/subc/mod.rs",
+                "mod stall_watchdog;\npub(crate) fn start(o: Option<stall_watchdog::Config>) {\n    let _ = o.unwrap_or_else(|| stall_watchdog::Config::production());\n}\n",
+            ),
+            (
+                "src/subc/stall_watchdog.rs",
+                r#"
+pub(super) struct PlatformCapture;
+pub(crate) struct Config { capture: std::sync::Arc<PlatformCapture> }
+impl Config {
+    pub(super) fn production() -> Self {
+        Self { capture: std::sync::Arc::new(PlatformCapture) }
+    }
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn production_config() { let _ = super::Config::production(); }
+}
+"#,
+            ),
+        ]);
+        assert!(headline_symbols(&aggregate).is_empty(), "{aggregate:#}");
+        assert!(test_only_symbols(&aggregate).is_empty(), "{aggregate:#}");
     }
 
     #[test]
