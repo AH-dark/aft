@@ -938,7 +938,24 @@ fn a_stopped_but_live_pin_owner_keeps_its_keys() {
 #[cfg(unix)]
 #[test]
 fn a_publisher_killed_at_any_durability_boundary_leaves_protected_bytes_readable() {
-    for step in DurabilityStep::ALL {
+    let v2_steps = [
+        DurabilityStep::BlobCommitted,
+        DurabilityStep::SegmentRowRecorded,
+        DurabilityStep::SegmentFileSynced,
+        DurabilityStep::SegmentDurable,
+        DurabilityStep::ManifestWritten,
+        DurabilityStep::ManifestParentSynced,
+        DurabilityStep::PointerCas,
+        DurabilityStep::PointerSynced,
+    ];
+    assert_eq!(
+        v2_steps.to_vec(),
+        DurabilityStep::ALL
+            .into_iter()
+            .filter(|step| !DurabilityStep::V3_ONLY.contains(step))
+            .collect::<Vec<_>>()
+    );
+    for step in v2_steps {
         let storage = tempdir().unwrap();
         let root = storage.path().join("root-a");
         fs::create_dir_all(&root).unwrap();

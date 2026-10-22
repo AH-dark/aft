@@ -41,6 +41,74 @@ fn fixture(
     (metadata, resolved.paths)
 }
 
+#[test]
+fn persisted_task_gc_preserves_readable_tasks_when_the_storage_floor_refuses_them() {
+    let storage = tempfile::tempdir().unwrap();
+    let task_storage = storage.path().join("opencode");
+    let registry = BgTaskRegistry::default();
+    let tasks = [
+        fixture(&task_storage, "session", true, 30),
+        fixture(&task_storage, "session", false, 30),
+    ];
+    let files: Vec<_> = tasks
+        .iter()
+        .flat_map(|(_, paths)| [&paths.json, &paths.stdout, &paths.stderr, &paths.exit])
+        .map(|path| {
+            (
+                path.clone(),
+                fs::read(path).unwrap(),
+                fs::metadata(path).unwrap().modified().unwrap(),
+            )
+        })
+        .collect();
+    let store = crate::persisted_format::PersistedStore::BashTask;
+    crate::reader_floor::raise(storage.path(), &[(store, store.supported() + 1)]).unwrap();
+    let refusals = crate::reader_floor::prepare(storage.path());
+    let floor = refusals
+        .into_iter()
+        .find(|refusal| refusal.store == store)
+        .expect("the real storage floor must refuse this build");
+    assert_eq!(
+        registry.maybe_gc_persisted(&task_storage).unwrap(),
+        0,
+        "GC must neither retire nor collect readable tasks under a newer floor"
+    );
+    for (path, bytes, modified) in files {
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "task artifact changed: {}",
+            path.display()
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            modified,
+            "task artifact was rewritten: {}",
+            path.display()
+        );
+    }
+    for (metadata, paths) in tasks {
+        assert_eq!(
+            crate::persisted_format::gate(
+                store,
+                &paths.json,
+                &paths.json,
+                Some(u64::from(metadata.schema_version))
+            ),
+            Err(floor.clone())
+        );
+        assert_eq!(
+            crate::persisted_format::refusal_covering(store, &paths.json),
+            Some(floor.clone())
+        );
+        let read = super::super::persistence::read_task(&paths.json).unwrap_err();
+        assert_eq!(
+            crate::persisted_format::UnsupportedPersistedFormat::from_io_error(&read),
+            Some(&floor)
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn watchdog_cost_live_children_open_no_artifacts() {

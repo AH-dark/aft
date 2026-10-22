@@ -18,6 +18,9 @@ use crate::db::lifecycle::{SqliteStore, TrackedConnection};
 
 pub mod reclaim;
 pub mod v2;
+pub mod v3;
+#[doc(hidden)]
+pub use v3::set_free_space_for_test;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

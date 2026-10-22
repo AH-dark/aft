@@ -203,6 +203,7 @@ pub fn raise(
     storage_root: &Path,
     requirements: &[(PersistedStore, u32)],
 ) -> Result<ReaderFloor, FloorError> {
+    crate::persisted_format::register_storage_root(storage_root);
     crate::production_storage::refuse_write(storage_root).map_err(|error| FloorError::Io {
         path: storage_root.to_path_buf(),
         error,
@@ -440,6 +441,7 @@ pub(crate) fn refresh_refused(storage_root: &Path) -> Result<(), FloorError> {
 /// floor as its baseline, so the next format change has a floor to raise.
 /// Returns the refusals it recorded.
 pub fn prepare(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
+    crate::persisted_format::register_storage_root(storage_root);
     if !prepare_allowed(storage_root) {
         return Vec::new();
     }

@@ -133,6 +133,15 @@ pub fn run_with_options(args: Args, options: Options) -> ExitStatus {
     let target_marker = target_marker_path(&args);
     let source_marker = source_marker_path(&args);
 
+    let skipped = args.from.join(REBUILDABLE_SUBTREE);
+    if skipped.exists() {
+        log.write(serde_json::json!({
+            "level":"info", "step":"copy", "subtree":REBUILDABLE_SUBTREE,
+            "path":skipped, "action":"skipped",
+            "reason":"rebuildable; will be rebuilt at the new location",
+            "source_disposition":"retained; old blobs/v3 can be deleted",
+        }));
+    }
     if source_marker.exists() && target_marker.exists() {
         log.write(serde_json::json!({
             "level": "info",
@@ -142,7 +151,7 @@ pub fn run_with_options(args: Args, options: Options) -> ExitStatus {
         return ExitStatus::Success;
     }
 
-    let source_bytes = match source_size(&args.from) {
+    let source_bytes = match source_size(&args.from, &args.from) {
         Ok(bytes) => bytes,
         Err(error) => {
             log.write(serde_json::json!({
@@ -540,6 +549,9 @@ fn migration_items() -> &'static [MigrationItem] {
 
 fn migrate_item(args: &MigrationArgs, item: MigrationItem, log: &mut JsonLogger) -> io::Result<()> {
     let source = args.from.join(item.source_name);
+    if !migration_source_included(&args.from, &source) {
+        return Ok(());
+    }
     if !source.exists() {
         log.write(serde_json::json!({
             "level": "info",
@@ -582,7 +594,7 @@ fn migrate_whole(
     }
 
     let bytes = match item.entry {
-        EntryKind::Directory => copy_dir_recursive(source, &staging),
+        EntryKind::Directory => copy_dir_recursive(&args.from, source, &staging),
         EntryKind::File => copy_file(source, &staging),
     }?;
 
@@ -627,7 +639,7 @@ fn migrate_child_union(
         }
         let child_staging = staging_path(&child_final, item.name);
         let result = if child_source.is_dir() {
-            copy_dir_recursive(&child_source, &child_staging)
+            copy_dir_recursive(&args.from, &child_source, &child_staging)
         } else {
             copy_file(&child_source, &child_staging)
         };
@@ -722,14 +734,27 @@ fn staging_path(final_path: &Path, subtree: &str) -> PathBuf {
     ))
 }
 
-fn copy_dir_recursive(source: &Path, target: &Path) -> io::Result<u64> {
+const REBUILDABLE_SUBTREE: &str = "blobs/v3";
+
+// Sizing and copying share this root-relative exclusion. Other paths,
+// including nested directories named v3, keep their existing rules.
+fn migration_source_included(root: &Path, path: &Path) -> bool {
+    !path
+        .strip_prefix(root)
+        .is_ok_and(|relative| relative.starts_with(REBUILDABLE_SUBTREE))
+}
+
+fn copy_dir_recursive(root: &Path, source: &Path, target: &Path) -> io::Result<u64> {
+    if !migration_source_included(root, source) {
+        return Ok(0);
+    }
     crate::private_storage::create_dir_all(target)?;
     let mut bytes = 0_u64;
     for entry in sorted_read_dir(source)? {
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
         let copied = if source_path.is_dir() {
-            copy_dir_recursive(&source_path, &target_path)?
+            copy_dir_recursive(root, &source_path, &target_path)?
         } else {
             copy_file(&source_path, &target_path)?
         };
@@ -754,7 +779,10 @@ fn sorted_read_dir(path: &Path) -> io::Result<Vec<fs::DirEntry>> {
     Ok(entries)
 }
 
-fn source_size(path: &Path) -> io::Result<u64> {
+fn source_size(root: &Path, path: &Path) -> io::Result<u64> {
+    if !migration_source_included(root, path) {
+        return Ok(0);
+    }
     if !path.exists() {
         return Ok(0);
     }
@@ -765,7 +793,7 @@ fn source_size(path: &Path) -> io::Result<u64> {
     let mut total = 0_u64;
     for entry in fs::read_dir(path)? {
         let entry = entry?;
-        total = total.saturating_add(source_size(&entry.path())?);
+        total = total.saturating_add(source_size(root, &entry.path())?);
     }
     Ok(total)
 }
@@ -802,7 +830,7 @@ fn item_bytes(args: &MigrationArgs, item: MigrationItem) -> io::Result<ItemBytes
             };
             for entry in fs::read_dir(&source)? {
                 let entry = entry?;
-                let child = source_size(&entry.path())?;
+                let child = source_size(&args.from, &entry.path())?;
                 bytes.total = bytes.total.saturating_add(child);
                 if !already_published(&final_path.join(entry.file_name())) {
                     bytes.pending = bytes.pending.saturating_add(child);
@@ -811,7 +839,7 @@ fn item_bytes(args: &MigrationArgs, item: MigrationItem) -> io::Result<ItemBytes
             Ok(bytes)
         }
         MergeKind::Whole if already_published(&final_path) => Ok(ItemBytes {
-            total: source_size(&source)?,
+            total: source_size(&args.from, &source)?,
             pending: 0,
         }),
         // The remaining cases count the whole source: a `Whole` item whose
@@ -820,7 +848,7 @@ fn item_bytes(args: &MigrationArgs, item: MigrationItem) -> io::Result<ItemBytes
         // plain file rather than a folder (the copy step reports that as an
         // error; the preflight only sizes it).
         MergeKind::Whole | MergeKind::ChildUnion | MergeKind::TrustJson => {
-            let total = source_size(&source)?;
+            let total = source_size(&args.from, &source)?;
             Ok(ItemBytes {
                 total,
                 pending: total,
@@ -1115,6 +1143,88 @@ fn after_publish(source: &Path, target: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebuildable_v3_is_not_charged_or_copied_and_skip_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("source");
+        let to = dir.path().join("target");
+        let log = dir.path().join("migration.jsonl");
+        fs::create_dir_all(from.join("blobs/v3/family/views/scope")).unwrap();
+        let old = from.join("blobs/v3/family/views/scope/payload");
+        File::create(&old)
+            .unwrap()
+            .set_len(8 * 1024 * 1024 * 1024)
+            .unwrap();
+        let mut fixtures = Vec::new();
+        for item in migration_items() {
+            let relative = match item.entry {
+                EntryKind::Directory => PathBuf::from(item.source_name).join("child/data"),
+                EntryKind::File => PathBuf::from(item.source_name),
+            };
+            let source = from.join(&relative);
+            fs::create_dir_all(source.parent().unwrap()).unwrap();
+            let payload = if matches!(item.merge, MergeKind::TrustJson) {
+                b"[]\n".to_vec()
+            } else {
+                format!("fixture:{}", item.name).into_bytes()
+            };
+            fs::write(&source, &payload).unwrap();
+            let destination = match item.entry {
+                EntryKind::Directory => {
+                    target_path_from_root(&to, &Harness::Opencode, *item).join("child/data")
+                }
+                EntryKind::File => target_path_from_root(&to, &Harness::Opencode, *item),
+            };
+            fixtures.push((source, destination, payload));
+        }
+        let bytes: u64 = fixtures
+            .iter()
+            .map(|(_, _, bytes)| bytes.len() as u64)
+            .sum();
+        let result = run_with_options(
+            Args {
+                from: Some(from.clone()),
+                to: to.clone(),
+                harness: Harness::Opencode,
+                log: Some(log.clone()),
+                status: false,
+            },
+            Options {
+                disk_free_override: Some(bytes * 2),
+                ..Options::default()
+            },
+        );
+        assert_eq!(
+            result,
+            ExitStatus::Success,
+            "rebuildable v3 must not consume migration headroom"
+        );
+        assert!(!to.join("blobs/v3").exists());
+        assert!(old.exists(), "migration leaves the source in place");
+        assert_eq!(fs::metadata(old).unwrap().len(), 8 * 1024 * 1024 * 1024);
+        for (source, destination, payload) in fixtures {
+            assert_eq!(fs::read(source).unwrap(), payload);
+            assert_eq!(fs::read(destination).unwrap(), payload);
+        }
+        let records: Vec<serde_json::Value> = fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let skip = records
+            .iter()
+            .find(|r| r["subtree"] == "blobs/v3" && r["action"] == "skipped")
+            .expect("report must name skipped v3");
+        assert_eq!(
+            skip["reason"],
+            "rebuildable; will be rebuilt at the new location"
+        );
+        assert_eq!(
+            skip["source_disposition"],
+            "retained; old blobs/v3 can be deleted"
+        );
+    }
 
     #[test]
     fn preflight_checks_free_space_on_the_volume_of_each_destination() {
