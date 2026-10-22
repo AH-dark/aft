@@ -1,0 +1,1 @@
+- `aft profile` now lists the heaviest stacks of a busy thread whose work spreads over many small calls, instead of an empty list, and when debug symbols cannot be used it prints the raw stacks with the reason on each affected thread instead of failing.
