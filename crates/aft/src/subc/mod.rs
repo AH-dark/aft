@@ -21367,9 +21367,34 @@ mod connection_close_tests {
         daemon: TcpStream,
         reader_rx: mpsc::Receiver<Result<DecodedFrame, SubcError>>,
         reader_task: JoinHandle<()>,
+        /// Set when the reader task drops the module's read half, which
+        /// happens only once that task has stopped.
+        reader_dropped: Arc<AtomicBool>,
         writer_tx: mpsc::Sender<WriterFrame>,
         writer_task: JoinHandle<Result<(), subc_transport::FrameIoError>>,
         metrics: Arc<DispatchPathMetrics>,
+    }
+
+    /// The module's read half, recording when it is dropped.
+    struct ObservedRead<R> {
+        inner: R,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for ObservedRead<R> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<R> Drop for ObservedRead<R> {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
     }
 
     async fn connect(
@@ -21395,6 +21420,11 @@ mod connection_close_tests {
         let (read, write) = tokio::io::split(module.unwrap());
         let metrics = Arc::new(DispatchPathMetrics::new());
         let (reader_tx, reader_rx) = mpsc::channel(256);
+        let reader_dropped = Arc::new(AtomicBool::new(false));
+        let read = ObservedRead {
+            inner: read,
+            dropped: Arc::clone(&reader_dropped),
+        };
         let reader_task = spawn_reader_task(read, reader_tx);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
         let writer_task = spawn_writer_task(write, writer_rx, Arc::clone(&metrics));
@@ -21402,6 +21432,7 @@ mod connection_close_tests {
             daemon,
             reader_rx,
             reader_task,
+            reader_dropped,
             writer_tx,
             writer_task,
             metrics,
@@ -21506,6 +21537,66 @@ mod connection_close_tests {
         assert!(
             close.input_ended,
             "the daemon must see EOF and close its side before the module gives up waiting"
+        );
+        let received = tokio::time::timeout(Duration::from_secs(10), daemon_task)
+            .await
+            .expect("daemon finishes")
+            .unwrap();
+        assert!(
+            received == expected,
+            "daemon received the module's exact output"
+        );
+    }
+
+    #[tokio::test]
+    async fn teardown_gives_up_on_a_daemon_that_never_closes_its_side() {
+        let connection = connect(None, None).await;
+        let expected = queue_response(&connection, 8 * 1024).await;
+        let Connection {
+            mut daemon,
+            reader_rx,
+            reader_task,
+            reader_dropped,
+            writer_tx,
+            writer_task,
+            ..
+        } = connection;
+        // This daemon reads the module's output to EOF, sends a little more,
+        // and then keeps its write side open until the test releases it.
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let daemon_task = tokio::spawn(async move {
+            let mut received = Vec::new();
+            daemon.read_to_end(&mut received).await.unwrap();
+            send_pings(&mut daemon, 10).await;
+            let _ = release_rx.await;
+            drop(daemon);
+            received
+        });
+        drop(writer_tx);
+
+        // The guard keeps a close that never gives up from hanging the test.
+        let started = Instant::now();
+        let close = tokio::time::timeout(
+            Duration::from_secs(2),
+            close_daemon_connection(reader_rx, reader_task, writer_task),
+        )
+        .await
+        .expect("close_daemon_connection must stop waiting for a daemon that never closes");
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+
+        close.writer.expect("writer flushes and half-closes");
+        assert!(
+            elapsed >= DAEMON_CLOSE_WAIT && elapsed < Duration::from_secs(2),
+            "close waits out DAEMON_CLOSE_WAIT and no longer: {elapsed:?}"
+        );
+        assert!(
+            !close.input_ended,
+            "the daemon never closed its side, so input did not end"
+        );
+        assert!(
+            reader_dropped.load(Ordering::SeqCst),
+            "the reader task has stopped and released the read half"
         );
         let received = tokio::time::timeout(Duration::from_secs(10), daemon_task)
             .await
