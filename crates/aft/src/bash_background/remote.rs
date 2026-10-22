@@ -719,6 +719,16 @@ pub(crate) struct RemoteTask {
     #[serde(default)]
     pub unknown_len: u64,
     pub cancel_requested: bool,
+    /// A cancellation the runner still has to be sent (or to answer): set,
+    /// with `cancel_requested`, before an owner pause marks the task
+    /// finished, and cleared once the runner acknowledges the cancel or
+    /// reports a terminal for the job, or no job remains that it could reach.
+    /// A task saved finished with this still set gets a worker on replay. If
+    /// a runner job id is saved, that worker sends the cancel, so a restart
+    /// cannot drop it; without one there is nothing it can reach, and the
+    /// worker records the cancellation as failed and clears this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancel_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_pause_cancel: Option<String>,
     pub terminal: Option<TerminalRecord>,
@@ -1470,6 +1480,8 @@ impl OutputSink for TaskSink {
         self.commit(|r| {
             r.job_id = Some(record.job_id);
             r.terminal = Some(record.clone());
+            // The runner has finished with the job: no cancellation is owed.
+            r.cancel_pending = false;
             r.gap_recovery = None;
             if retries_draining(r, verdict) {
                 if let Some(retry) = r.retry.as_mut() {
@@ -1669,6 +1681,7 @@ impl BgTaskRegistry {
             stderr_len: 0,
             unknown_len: 0,
             cancel_requested: false,
+            cancel_pending: false,
             owner_pause_cancel: None,
             terminal: None,
             fallback_digest: None,
@@ -2110,6 +2123,12 @@ impl BgTaskRegistry {
                 .is_some_and(|r| r.cancel_requested);
             if cancel && !cancelled {
                 if let Some(point) = stream.resume_point() {
+                    // Stands in for the daemon stopping before it sent the
+                    // cancellation to the runner.
+                    #[cfg(test)]
+                    if tests::stop_draining_worker(&root) {
+                        return Ok(());
+                    }
                     let result = client
                         .cancel_job(point.job_id)
                         .await
@@ -2974,6 +2993,21 @@ impl BgTaskRegistry {
     }
 
     fn record_remote_cancel(&self, task: &Arc<BgTask>) -> Result<bool, String> {
+        self.record_remote_cancel_owed(task, false)
+    }
+
+    /// Record the cancellation intent on a remote task that is not finished
+    /// yet, and wake its worker. With `owed`, also record that the runner
+    /// is still owed the cancel (`RemoteTask::cancel_pending`), in the same
+    /// write: a caller about to mark the task finished before the worker has
+    /// sent it must leave that debt in the saved record. Nothing is owed for
+    /// a job the runner already reported a terminal for. Returns false when
+    /// the task runs locally.
+    pub(super) fn record_remote_cancel_owed(
+        &self,
+        task: &Arc<BgTask>,
+        owed: bool,
+    ) -> Result<bool, String> {
         {
             let mut db = DeferredDbWrites::new(self, task);
             let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
@@ -2982,6 +3016,9 @@ impl BgTaskRegistry {
                     return Ok(false);
                 };
                 remote.cancel_requested = true;
+                if owed && remote.terminal.is_none() {
+                    remote.cancel_pending = true;
+                }
                 self.persist_task_locked(task, &state.metadata, &mut db)
                     .map_err(|e| e.to_string())?;
             }
@@ -3010,7 +3047,9 @@ impl BgTaskRegistry {
     }
 
     pub(super) fn record_owner_pause_remote(&self, task: &Arc<BgTask>) -> Result<(), String> {
-        self.record_remote_cancel(task)?;
+        // The task is marked finished below, before its worker can have sent
+        // the cancellation; the saved record keeps it owed until then.
+        self.record_remote_cancel_owed(task, true)?;
         self.remote_terminal(task, Verdict::Cancelled, None);
         Ok(())
     }
@@ -3057,6 +3096,12 @@ impl BgTaskRegistry {
             }
             let terminal = state.metadata.is_terminal();
             if let Some(remote) = state.metadata.remote.as_mut() {
+                // A failed cancel stays owed, so a replay after a restart
+                // tries again, unless no runner job id is known: then no
+                // later worker could reach the job either.
+                if result.is_ok() || remote.job_id.is_none() {
+                    remote.cancel_pending = false;
+                }
                 remote.owner_pause_cancel = Some(match result {
                     Ok(()) => "sent".into(),
                     Err(error) => format!("failed: {error}"),

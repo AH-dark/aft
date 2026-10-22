@@ -2151,6 +2151,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        cancel_pending: false,
         owner_pause_cancel: None,
         terminal: None,
         fallback_digest: None,
@@ -3444,6 +3445,7 @@ fn persist_accepted_with_snapshot(
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        cancel_pending: false,
         owner_pause_cancel: None,
         terminal: None,
         fallback_digest: Some(digest),
@@ -5376,6 +5378,7 @@ fn remote_phase_comes_from_acceptance_started_or_output() {
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        cancel_pending: false,
         owner_pause_cancel: None,
         terminal: None,
         fallback_digest: None,
@@ -5491,6 +5494,7 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        cancel_pending: false,
         owner_pause_cancel: None,
         terminal: None,
         fallback_digest: None,
@@ -5879,6 +5883,7 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        cancel_pending: false,
         owner_pause_cancel: None,
         terminal: None,
         fallback_digest: None,
@@ -6937,6 +6942,79 @@ fn assert_saved_paused(json: &Path) {
         saved.remote.unwrap().owner_pause_cancel.as_deref(),
         Some("sent")
     );
+}
+
+fn exec_cancels(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_json::Value> {
+    daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.cancel")
+        .map(|(_, body)| body["params"].clone())
+        .collect()
+}
+
+/// The owner pauses a scope whose `runon` job the runner has accepted, and
+/// the module stops before its worker sends the cancellation. The pause
+/// already saved the task as stopped, so the saved record must also say the
+/// runner is still owed that cancellation: replaying it after the restart
+/// sends it, and the runner job does not keep running unnoticed.
+#[tokio::test]
+async fn a_paused_runon_jobs_unsent_cancel_is_sent_after_a_restart() {
+    let daemon =
+        crate::exec_remote::wire_tests::daemon_with_clients(Script::Cancel, "exec-remote/v1", 2)
+            .await;
+    let dir = tempfile::tempdir().unwrap();
+    let scope = owner_scope("unsent-cancel");
+    let original = registry();
+    let task_id =
+        start_scoped_runon_retry(&original, dir.path(), daemon.connection.clone(), &scope);
+    let job_id = wait_for("the runner must accept the job", || {
+        let task = original.task(&task_id)?;
+        let state = task.state.lock().unwrap();
+        state.metadata.remote.as_ref()?.job_id
+    })
+    .await;
+    // The worker stops right before it would send the cancellation.
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    original.pause_scope(&scope, true).unwrap();
+    remote_worker_exited(&task_id).await;
+    assert!(exec_cancels(&daemon).is_empty(), "the cancel was sent");
+    let json = original.task(&task_id).unwrap().paths.json.clone();
+    let saved = read_task(&json).unwrap();
+    assert_eq!(saved.status, BgTaskStatus::Killed, "{saved:?}");
+    original.detach();
+
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    daemon.wait_for_requests("exec.cancel", 1).await;
+    let cancels = exec_cancels(&daemon);
+    assert_eq!(cancels.len(), 1, "{cancels:?}");
+    assert!(
+        cancels[0].to_string().contains(&job_id.to_string()),
+        "{cancels:?}"
+    );
+    let settled = wait_for("the sent cancellation must be saved", || {
+        let saved = read_task(&json).ok()?;
+        let remote = saved.remote.clone()?;
+        (!remote.cancel_pending && remote.owner_pause_cancel.is_some()).then_some(saved)
+    })
+    .await;
+    assert_eq!(settled.status, BgTaskStatus::Killed, "{settled:?}");
+    assert_eq!(
+        settled.status_reason.as_deref(),
+        Some("paused_by_owner"),
+        "{settled:?}"
+    );
+    assert_eq!(
+        settled.remote.unwrap().owner_pause_cancel.as_deref(),
+        Some("sent")
+    );
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
 }
 
 /// After a module restart, the owner pauses a worker whose saved draining
