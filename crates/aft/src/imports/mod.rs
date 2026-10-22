@@ -1358,11 +1358,33 @@ fn import_prologue_anchor(source: &str, tree: &Tree, lang: LangId) -> (usize, bo
         lang,
         LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Python
     ) {
+        // A run of leading comments is skipped only when a blank line or a
+        // skipped directive/docstring separates it from the code below. A run
+        // directly above the first ordinary statement documents that statement,
+        // so the import goes above the run instead of splitting them.
         let mut cursor = root.walk();
         let mut docstring_seen = false;
+        // End byte of the pending, still-undecided comment run.
+        let mut run_end: Option<usize> = None;
         for child in root.named_children(&mut cursor) {
+            if let Some(end) = run_end {
+                if has_blank_line_between(source, end, child.start_byte()) {
+                    anchor = anchor.max(end);
+                    run_end = None;
+                }
+            }
             if matches!(child.kind(), "comment" | "hash_bang_line") {
-                anchor = anchor.max(child.end_byte());
+                if child.end_byte() <= anchor
+                    || child.kind() == "hash_bang_line"
+                    || (lang == LangId::Python && is_python_encoding_cookie(source, &child))
+                {
+                    // Shebangs and encoding cookies must stay on the file's
+                    // first lines, so they are always kept above the import.
+                    anchor = anchor.max(run_end.unwrap_or(0)).max(child.end_byte());
+                    run_end = None;
+                } else {
+                    run_end = Some(child.end_byte());
+                }
             } else if child.kind() == "expression_statement"
                 && child
                     .named_child(0)
@@ -1371,9 +1393,16 @@ fn import_prologue_anchor(source: &str, tree: &Tree, lang: LangId) -> (usize, bo
             {
                 anchor = child.end_byte();
                 docstring_seen = true;
+                run_end = None;
             } else {
+                // Any comment run still pending is attached to this statement.
+                run_end = None;
                 break;
             }
+        }
+        // Comments with no code after them document nothing; keep them above.
+        if let Some(end) = run_end {
+            anchor = anchor.max(end);
         }
     }
     if lang == LangId::Solidity
@@ -1384,6 +1413,30 @@ fn import_prologue_anchor(source: &str, tree: &Tree, lang: LangId) -> (usize, bo
         anchor = source.find('\n').unwrap_or(source.len());
     }
     (anchor, false)
+}
+
+/// True when the whitespace between two sibling nodes contains an empty line.
+fn has_blank_line_between(source: &str, end: usize, start: usize) -> bool {
+    source
+        .get(end..start)
+        .is_some_and(|gap| gap.matches('\n').count() >= 2)
+}
+
+/// A PEP 263 source-encoding declaration (`# -*- coding: utf-8 -*-`). Python
+/// only honours it on the first or second line of the file.
+fn is_python_encoding_cookie(source: &str, comment: &Node) -> bool {
+    if comment.start_position().row > 1 {
+        return false;
+    }
+    let text = crate::parser::node_text(source, comment);
+    text.match_indices("coding").any(|(at, word)| {
+        let rest = &text[at + word.len()..];
+        let Some(rest) = rest.strip_prefix([':', '=']) else {
+            return false;
+        };
+        rest.trim_start_matches([' ', '\t'])
+            .starts_with(|ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    })
 }
 
 pub(crate) fn import_insertion_text(
@@ -4350,6 +4403,92 @@ mod audit11_regressions {
                 "import x"
             ),
             b"\"doc\"\nfrom __future__ import annotations\n\nimport x\n\nrun()\n"
+        );
+    }
+
+    fn first_ts_import(source: &str) -> String {
+        String::from_utf8(inserted(
+            source,
+            LangId::TypeScript,
+            "x",
+            ImportGroup::External,
+            "import x from 'x';",
+        ))
+        .unwrap()
+    }
+
+    fn first_py_import(source: &str) -> String {
+        String::from_utf8(inserted(
+            source,
+            LangId::Python,
+            "x",
+            ImportGroup::External,
+            "import x",
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn first_import_goes_before_a_jsdoc_attached_to_the_first_declaration() {
+        assert_eq!(
+            first_ts_import("/** Does x */\nexport function foo() {}\n"),
+            "import x from 'x';\n\n/** Does x */\nexport function foo() {}\n"
+        );
+        assert_eq!(
+            first_ts_import("/** Does x */\r\nexport function foo() {}\r\n"),
+            "import x from 'x';\r\n\r\n/** Does x */\r\nexport function foo() {}\r\n"
+        );
+        // A license separated by a blank line is still skipped; the JSDoc
+        // below it stays attached to its declaration.
+        assert_eq!(
+            first_ts_import("/* license */\n\n/** Does x */\nexport function foo() {}\n"),
+            "/* license */\nimport x from 'x';\n\n/** Does x */\nexport function foo() {}\n"
+        );
+    }
+
+    #[test]
+    fn first_import_skips_a_license_followed_by_a_blank_line() {
+        assert_eq!(
+            first_ts_import("/* license */\n\nrun();\n"),
+            "/* license */\nimport x from 'x';\n\nrun();\n"
+        );
+        assert_eq!(
+            first_ts_import("/* license */\r\n\r\nrun();\r\n"),
+            "/* license */\r\nimport x from 'x';\r\n\r\nrun();\r\n"
+        );
+    }
+
+    #[test]
+    fn first_import_follows_a_license_and_adjacent_directive() {
+        assert_eq!(
+            first_ts_import("/* license */\n'use client';\nrun();\n"),
+            "/* license */\n'use client';\nimport x from 'x';\n\nrun();\n"
+        );
+    }
+
+    #[test]
+    fn first_python_import_goes_before_a_comment_attached_to_def() {
+        assert_eq!(
+            first_py_import("# helper for foo\ndef foo():\n    pass\n"),
+            "import x\n\n# helper for foo\ndef foo():\n    pass\n"
+        );
+        assert_eq!(
+            first_py_import("# helper for foo\r\ndef foo():\r\n    pass\r\n"),
+            "import x\r\n\r\n# helper for foo\r\ndef foo():\r\n    pass\r\n"
+        );
+    }
+
+    #[test]
+    fn first_python_import_stays_below_an_encoding_cookie() {
+        // PEP 263 only honours the cookie on line 1 or 2, so it must stay
+        // above the import even when code follows it directly.
+        assert_eq!(
+            first_py_import("# -*- coding: utf-8 -*-\ndef foo():\n    pass\n"),
+            "# -*- coding: utf-8 -*-\nimport x\n\ndef foo():\n    pass\n"
+        );
+        assert_eq!(
+            first_py_import("# -*- coding: utf-8 -*-\r\ndef foo():\r\n    pass\r\n"),
+            "# -*- coding: utf-8 -*-\r\nimport x\r\n\r\ndef foo():\r\n    pass\r\n"
         );
     }
 
