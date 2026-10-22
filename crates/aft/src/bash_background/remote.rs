@@ -2115,6 +2115,16 @@ impl BgTaskRegistry {
                         .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
                         .await?;
                     cancelled = true;
+                } else {
+                    // Before the runner accepts the submission, there is no job
+                    // ID for exec.cancel or attach. Cancel the active call instead.
+                    // The SDK closes its receiver, so this cannot prove the job stopped.
+                    client.cancel_submission(&stream).await.map_err(|error| {
+                        format!(
+                        "remote cancellation before acceptance failed; outcome unknown: {error}"
+                    )
+                    })?;
+                    return Err("remote cancellation requested before acceptance; outcome unknown: no job ID to recover terminal proof".into());
                 }
             }
             let result = tokio::select! {
