@@ -898,6 +898,26 @@ pub struct ViewHealthSnapshot {
     /// Graph-changing publications that built `derived.sqlite` cold instead of
     /// patching the current generation, by reason, since this process started.
     pub cold_builds: crate::views::assembly::ColdBuildCounts,
+    /// The current streak of failed publications, when the latest attempt
+    /// failed for a reason other than waiting for the semantic index. While
+    /// it is set, the served generation is not following checkout changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publication_failure: Option<ViewPublicationFailure>,
+}
+
+/// Why a root's view publications keep failing; see
+/// [`ViewHealthSnapshot::publication_failure`].
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ViewPublicationFailure {
+    /// `missing_payload` when the view names a payload the family blob store
+    /// no longer holds, otherwise `publication_failed`.
+    pub reason: &'static str,
+    /// Failed attempts in the streak, including waits for the semantic index.
+    pub repeat_count: usize,
+    /// The latest attempt's error.
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -8810,6 +8830,9 @@ impl AppContext {
         if !self.config().views.enabled {
             return None;
         }
+        // Read before taking the view runtime lock, so this never holds one
+        // lock while waiting for the other.
+        let publication_failure = self.view_publication_retry.lock().failure_snapshot();
         let state = self
             .view_runtime
             .read()
@@ -8849,6 +8872,7 @@ impl AppContext {
                 })
                 .unwrap_or_default(),
             cold_builds: crate::views::assembly::cold_build_counts(&state.snapshot.view_dir),
+            publication_failure,
         })
     }
 

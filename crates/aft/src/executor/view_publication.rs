@@ -16,26 +16,54 @@ use std::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublicationFailureKind {
     SemanticIndexWaiting,
+    /// The manifest names a payload the family blob store does not hold.
+    MissingPayload,
     Failure,
+}
+
+impl PublicationFailureKind {
+    /// The reason code view health reports for a failing publication.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SemanticIndexWaiting => "waiting_for_semantic_index",
+            Self::MissingPayload => "missing_payload",
+            Self::Failure => "publication_failed",
+        }
+    }
 }
 
 fn classify_publication_failure(error: &str) -> PublicationFailureKind {
     if error == crate::context::VIEW_PUBLICATION_WAITING_FOR_SEMANTIC_INDEX {
         PublicationFailureKind::SemanticIndexWaiting
+    } else if error.contains("manifest references missing") {
+        // `ViewError::MissingBlob` from the closure check, or the manifest
+        // joiner's own missing-payload error during a cold build.
+        PublicationFailureKind::MissingPayload
     } else {
         PublicationFailureKind::Failure
     }
 }
+
+/// The shortest time between two warnings about one root's failing
+/// publication, after the first two. Retries back off from one second to five
+/// minutes, so once the delay passes this interval every retry is logged.
+const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// One retry deadline for both inline and detached publications of a root.
 /// Keeping it on the context preserves the delay when another scheduler wake
 /// supersedes a detached job without changing the checkout.
 pub(crate) struct PublicationRetry {
     error: Option<String>,
+    kind: Option<PublicationFailureKind>,
     failures: usize,
     /// Real failures in the current streak, counted apart from semantic-index
     /// waits so a warm-up wait never uses up the warnings a real fault gets.
     real_failures: usize,
+    /// When the last warning for this streak was logged.
+    last_warned: Option<Instant>,
+    /// Real failures not logged since the last warning.
+    suppressed: usize,
+    log_interval: Duration,
     delay: Duration,
     due: Option<Instant>,
     initial: Duration,
@@ -46,8 +74,12 @@ impl Default for PublicationRetry {
     fn default() -> Self {
         Self {
             error: None,
+            kind: None,
             failures: 0,
             real_failures: 0,
+            last_warned: None,
+            suppressed: 0,
+            log_interval: FAILURE_LOG_INTERVAL,
             delay: Duration::ZERO,
             due: None,
             initial: Duration::from_secs(1),
@@ -61,6 +93,22 @@ impl PublicationRetry {
         self.due
     }
 
+    /// The failing publication streak view health reports, or `None` while
+    /// publications succeed or only wait for the semantic index.
+    pub(crate) fn failure_snapshot(&self) -> Option<crate::context::ViewPublicationFailure> {
+        let kind = self
+            .kind
+            .filter(|kind| *kind != PublicationFailureKind::SemanticIndexWaiting)?;
+        Some(crate::context::ViewPublicationFailure {
+            reason: kind.as_str(),
+            repeat_count: self.failures,
+            error: self.error.clone().unwrap_or_default(),
+            next_retry_ms: self
+                .due
+                .map(|due| due.saturating_duration_since(Instant::now()).as_millis() as u64),
+        })
+    }
+
     pub(crate) fn reset(&mut self, root: &std::path::Path) {
         if self.failures > 1 {
             log::info!(
@@ -71,8 +119,11 @@ impl PublicationRetry {
             );
         }
         self.error = None;
+        self.kind = None;
         self.failures = 0;
         self.real_failures = 0;
+        self.last_warned = None;
+        self.suppressed = 0;
         self.delay = Duration::ZERO;
         self.due = None;
     }
@@ -89,15 +140,22 @@ impl PublicationRetry {
             self.delay = self.initial;
         }
         self.error = Some(error.to_owned());
+        let kind = classify_publication_failure(error);
+        self.kind = Some(kind);
         self.due = Some(Instant::now() + self.delay);
-        let waiting =
-            classify_publication_failure(error) == PublicationFailureKind::SemanticIndexWaiting;
+        let waiting = kind == PublicationFailureKind::SemanticIndexWaiting;
         if !waiting {
             self.real_failures = self.real_failures.saturating_add(1);
         }
-        // Report real failures early, then summarize them on recovery or an
-        // edit. Waiting for the semantic index is expected during warm-up.
-        let warn = !waiting && self.real_failures <= 2;
+        // Report the first two real failures, then every later retry at most
+        // once per `log_interval`, counting the retries left unlogged, so a
+        // publication that never recovers stays visible in the log. Waiting
+        // for the semantic index is expected during warm-up.
+        let warn = !waiting
+            && (self.real_failures <= 2
+                || self
+                    .last_warned
+                    .is_none_or(|at| at.elapsed() >= self.log_interval));
         if waiting {
             log::debug!(
                 "content-addressed view publication waiting root={} repeat_count={} retry_ms={} error={}",
@@ -107,12 +165,15 @@ impl PublicationRetry {
             tests::record_failure(root, self.delay, self.failures, false);
         } else if warn {
             log::warn!(
-                "content-addressed view publication failed root={} repeat_count={} retry_ms={} error={}",
-                root.display(), self.failures, self.delay.as_millis(), error
+                "content-addressed view publication failed root={} reason={} repeat_count={} unlogged_since_last_warning={} retry_ms={} error={}",
+                root.display(), kind.as_str(), self.failures, self.suppressed, self.delay.as_millis(), error
             );
+            self.last_warned = Some(Instant::now());
+            self.suppressed = 0;
             #[cfg(test)]
             tests::record_failure(root, self.delay, self.failures, true);
         } else {
+            self.suppressed = self.suppressed.saturating_add(1);
             #[cfg(test)]
             tests::record_failure(root, self.delay, self.failures, false);
         }

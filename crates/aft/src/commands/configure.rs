@@ -7592,7 +7592,8 @@ impl Drop for ConfigureTailStageGateGuard {
 }
 
 /// Hold the configure tail of `root` (its canonical path) when it reaches
-/// `stage`, a [`ConfigureMaintenanceStage`] label such as `"view_load"`. The
+/// `stage`, a [`ConfigureMaintenanceStage`] label such as `"view_load"`, or
+/// `"view_payload_check"` for the payload check inside the view load. The
 /// first receiver fires once the tail is held; a send on the returned sender
 /// lets it continue.
 #[cfg(test)]
@@ -7621,15 +7622,28 @@ pub(crate) fn gate_configure_tail_stage_for_test(
 
 #[cfg(test)]
 fn wait_on_configure_tail_stage_gate_for_test(root: &Path, stage: ConfigureMaintenanceStage) {
+    wait_on_configure_tail_gate_for_test(
+        root,
+        stage.label(),
+        matches!(stage, ConfigureMaintenanceStage::StorageSweeps),
+    );
+}
+
+/// Holds the caller while a test gate for `root` and `label` is installed:
+/// signals that the gate was reached, then waits for the release. With
+/// `test_release_only`, only the test may release it; otherwise a 60 s timer
+/// also does, so a failed test never leaves a worker parked for good.
+#[cfg(test)]
+fn wait_on_configure_tail_gate_for_test(root: &Path, label: &str, test_release_only: bool) {
     let gate = configure_tail_stage_gates()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
-        .find(|gate| gate.root == root && gate.stage == stage.label())
+        .find(|gate| gate.root == root && gate.stage == label)
         .map(|gate| (gate.reached.clone(), gate.release.clone()));
     if let Some((reached, release)) = gate {
         let _ = reached.try_send(());
-        if matches!(stage, ConfigureMaintenanceStage::StorageSweeps) {
+        if test_release_only {
             // Only the test may release the sweep: a timer must not let an
             // admission reply pass after the supposedly held worker resumes.
             let _ = release.recv();
@@ -8224,6 +8238,87 @@ fn view_verification_publication_path(
     })
 }
 
+/// How long a bind may spend checking that the current generation's payloads
+/// are still in the family blob stores. The check reads only the key index, so
+/// this covers a large checkout; a checkout it does not cover is reported
+/// incomplete and is repaired by its next publication instead.
+const VIEW_PAYLOAD_CHECK_BUDGET: Duration = Duration::from_secs(1);
+
+/// What [`view_payload_check`] found.
+struct ViewPayloadCheck {
+    /// Manifest paths whose payload is missing, with the plane and key.
+    missing: BTreeMap<Vec<u8>, crate::views::assembly::PendingInput>,
+    checked: usize,
+    total: usize,
+}
+
+impl ViewPayloadCheck {
+    fn complete(&self) -> bool {
+        self.checked == self.total
+    }
+}
+
+/// Checks that every payload key `manifest` names is still stored, starting
+/// no new batch after `deadline`. Rows go missing when a corrupt store is
+/// moved aside and recreated empty, or when a store is deleted while the
+/// daemon is stopped. Until a publication repairs them, the served generation
+/// keeps naming the missing keys. Paths found here are scheduled for a
+/// publication, which extracts missing call-graph payloads again from the
+/// working tree and replaces or drops missing semantic keys.
+fn view_payload_check(
+    manifest: &crate::views::Manifest,
+    callgraph: &crate::blob_store::BlobStore,
+    semantic: &crate::blob_store::BlobStore,
+    deadline: Instant,
+) -> Result<ViewPayloadCheck, String> {
+    let mut callgraph_keys = Vec::new();
+    let mut semantic_keys = Vec::new();
+    for (path, entry) in manifest.entries() {
+        match entry {
+            crate::views::ManifestEntry::Regular { planes, .. } => {
+                if let Some(key) = planes.callgraph.as_deref() {
+                    callgraph_keys.push((path.as_bytes(), key));
+                }
+                if let Some(key) = planes.semantic.as_deref() {
+                    semantic_keys.push((path.as_bytes(), key));
+                }
+            }
+            crate::views::ManifestEntry::Synthetic { planes, .. } => {
+                callgraph_keys.push((path.as_bytes(), planes.callgraph.as_str()));
+            }
+            crate::views::ManifestEntry::Symlink { .. }
+            | crate::views::ManifestEntry::Gitlink { .. } => {}
+        }
+    }
+    let mut check = ViewPayloadCheck {
+        missing: BTreeMap::new(),
+        checked: 0,
+        total: 0,
+    };
+    for (plane, store, keys) in [
+        ("callgraph", callgraph, &callgraph_keys),
+        ("semantic", semantic, &semantic_keys),
+    ] {
+        let presence = store
+            .missing_hex_keys(keys.iter().map(|(_, key)| *key), Some(deadline))
+            .map_err(|error| error.to_string())?;
+        check.checked += presence.checked;
+        check.total += presence.total;
+        for (path, key) in keys {
+            if presence.missing.contains(*key) {
+                check.missing.entry(path.to_vec()).or_insert_with(|| {
+                    crate::views::assembly::PendingInput {
+                        plane,
+                        reason: "payload missing from the blob store",
+                        blob_key: Some((*key).to_owned()),
+                    }
+                });
+            }
+        }
+    }
+    Ok(check)
+}
+
 fn open_view_runtime_for_configure(
     input: &ConfigureViewInput,
     job: &ConfigureMaintenanceJob,
@@ -8237,13 +8332,13 @@ fn open_view_runtime_for_configure(
     let scope = crate::path_identity::project_scope_key(&job.canonical_cache_root);
     let view = crate::views::ViewStore::open(&job.storage_root, &scope)
         .map_err(|error| error.to_string())?;
-    let _semantic = crate::blob_store::BlobStore::open(
+    let semantic_store = crate::blob_store::BlobStore::open(
         &job.storage_root,
         family.clone(),
         crate::blob_store::BlobPlane::Semantic,
     )
     .map_err(|error| error.to_string())?;
-    let _callgraph = crate::blob_store::BlobStore::open(
+    let callgraph_store = crate::blob_store::BlobStore::open(
         &job.storage_root,
         family.clone(),
         crate::blob_store::BlobPlane::Callgraph,
@@ -8381,6 +8476,53 @@ fn open_view_runtime_for_configure(
             }
         }
     }
+    if let Some(manifest) = manifest.as_ref() {
+        // Tests hold the check here, under the label `view_payload_check`, to
+        // show that binds are answered while it runs.
+        #[cfg(test)]
+        wait_on_configure_tail_gate_for_test(
+            &job.canonical_cache_root,
+            "view_payload_check",
+            false,
+        );
+        let check = view_payload_check(
+            manifest,
+            &callgraph_store,
+            &semantic_store,
+            Instant::now() + VIEW_PAYLOAD_CHECK_BUDGET,
+        );
+        match check {
+            Ok(check) => {
+                if !check.complete() {
+                    slog_info!(
+                        "content-addressed view payload check incomplete checked={} of {} keys root={}; missing payloads, if any, are repaired by the next publication",
+                        check.checked,
+                        check.total,
+                        job.canonical_cache_root.display()
+                    );
+                }
+                if !check.missing.is_empty() {
+                    slog_warn!(
+                        "content-addressed view names payloads missing from the blob store paths={} checked={} of {} keys root={}; scheduling a publication to repair them",
+                        check.missing.len(),
+                        check.checked,
+                        check.total,
+                        job.canonical_cache_root.display()
+                    );
+                }
+                for (path, input) in check.missing {
+                    pending_paths.insert(path.clone());
+                    pending_inputs.insert(path, input);
+                }
+            }
+            Err(error) => slog_warn!(
+                "content-addressed view payload check failed root={} error={}",
+                job.canonical_cache_root.display(),
+                error
+            ),
+        }
+    }
+    drop((callgraph_store, semantic_store));
     if !pending_paths.is_empty() {
         slog_info!(
             "content-addressed view publication scheduled paths={} root={}",
@@ -10837,6 +10979,723 @@ mod tests {
         .unwrap();
         let outcome = crate::runtime_drain::drain_watcher_events_bounded(&fixture.borrower, 1);
         assert_eq!(outcome.processed, 1);
+    }
+
+    /// A views-on checkout whose call graph an operator removes while the
+    /// daemon is stopped: `blobs/<family>/callgraph.sqlite` and its `-wal` and
+    /// `-shm` files are deleted, while `oid-alias.sqlite` and
+    /// `semantic.sqlite` beside them are kept.
+    struct BlobRemovalFixture {
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        storage: PathBuf,
+        family: String,
+        /// `callers` of `target` and `call_tree` of `caller`, Debug-formatted,
+        /// as the daemon answered before the store was removed.
+        callers_before: String,
+        call_tree_before: String,
+        generation_before: String,
+    }
+
+    const BLOB_REMOVAL_EDITED_LIB: &str =
+        "pub fn caller() { target(); }\npub fn second() { target(); }\npub fn target() {}\nfn unused() {}\n";
+
+    fn blob_removal_callgraph_db(storage: &Path, family: &str) -> PathBuf {
+        storage.join("blobs").join(family).join("callgraph.sqlite")
+    }
+
+    fn blob_removal_payload_rows(storage: &Path, family: &str) -> u64 {
+        let connection =
+            rusqlite::Connection::open(blob_removal_callgraph_db(storage, family)).unwrap();
+        connection
+            .query_row("SELECT COUNT(*) FROM blob_payloads", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn blob_removal_answers(ctx: &AppContext) -> (String, String) {
+        let store = lazy_ready(ctx.callgraph_store_for_ops());
+        let lib = Path::new("lib.rs");
+        (
+            format!("{:?}", store.callers_of(lib, "target", 3).unwrap()),
+            format!("{:?}", store.call_tree(lib, "caller", 3).unwrap()),
+        )
+    }
+
+    fn blob_removal_generation(storage: &Path, root: &Path) -> Option<String> {
+        crate::views::ViewStore::open(storage, &crate::path_identity::project_scope_key(root))
+            .unwrap()
+            .current_generation()
+            .unwrap()
+    }
+
+    /// The daemon has stopped once nothing in this process holds the family's
+    /// call-graph database open. Deleting a file that a connection still holds
+    /// would leave that connection reading the unlinked file, which would hide
+    /// the effect being tested.
+    fn blob_removal_stop(ctx: Arc<AppContext>, storage: &Path, family: &str) {
+        drop(ctx);
+        let database = blob_removal_callgraph_db(storage, family);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while crate::db::file_identity::open_connections(&database) > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a connection to {} outlived the stopped context",
+                database.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Removes the family's call-graph blob store and asserts that the alias and
+    /// semantic stores beside it are left in place.
+    fn blob_removal_delete_store(storage: &Path, family: &str) {
+        let database = blob_removal_callgraph_db(storage, family);
+        assert!(database.is_file());
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", database.display()));
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("removing {}: {error}", path.display()),
+            }
+        }
+        let family_dir = storage.join("blobs").join(family);
+        assert!(!database.exists());
+        assert!(family_dir.join("oid-alias.sqlite").is_file());
+        assert!(family_dir.join("semantic.sqlite").is_file());
+    }
+
+    /// Binds a committed checkout with views and the call graph on, records the
+    /// answers the daemon gives, stops it and removes the call-graph blob store.
+    fn blob_removal_fixture() -> BlobRemovalFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("main");
+        init_git_fixture(&root);
+        lazy_commit(&root, LAZY_LIB, "lib");
+        let root = root.canonicalize().unwrap();
+        let storage = temp.path().join("storage");
+        let family = crate::search_index::artifact_cache_key(&root);
+
+        let ctx = lazy_bind(&root, &storage, "before-removal");
+        let (callers_before, call_tree_before) = blob_removal_answers(&ctx);
+        assert!(callers_before.contains("caller"), "{callers_before}");
+        assert!(call_tree_before.contains("target"), "{call_tree_before}");
+        let generation_before = blob_removal_generation(&storage, &root).unwrap();
+        assert!(crate::views::read::derived_built(
+            &lazy_view_dir(&storage, &root),
+            &generation_before
+        ));
+        // lib.rs and tracked.rs each have one extracted payload.
+        assert_eq!(blob_removal_payload_rows(&storage, &family), 2);
+
+        blob_removal_stop(ctx, &storage, &family);
+        blob_removal_delete_store(&storage, &family);
+        BlobRemovalFixture {
+            _temp: temp,
+            root,
+            storage,
+            family,
+            callers_before,
+            call_tree_before,
+            generation_before,
+        }
+    }
+
+    /// Removing only the blob store used to freeze the view: nothing extracted
+    /// the deleted payloads again, the first edit's closure check found the
+    /// unchanged file's payload missing, and every retry failed the same way.
+    /// A missing payload is now extracted again from the working tree, so the
+    /// restarted daemon keeps answering and the next edit publishes.
+    #[test]
+    fn views_removed_callgraph_blob_store_heals_and_the_next_edit_publishes() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let fixture = blob_removal_fixture();
+        let (root, storage, family) = (&fixture.root, &fixture.storage, &fixture.family);
+
+        let ctx = lazy_bind(root, storage, "after-removal");
+        assert_eq!(
+            blob_removal_answers(&ctx),
+            (
+                fixture.callers_before.clone(),
+                fixture.call_tree_before.clone()
+            ),
+            "the restarted daemon answers from the surviving derived database"
+        );
+
+        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
+        let report = ctx
+            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
+            .expect("the edit publishes although the blob store was removed");
+        assert!(report.published, "{report:?}");
+        assert!(report.pending_paths.is_empty(), "{report:?}");
+        assert_ne!(
+            blob_removal_generation(storage, root).as_deref(),
+            Some(fixture.generation_before.as_str()),
+            "the edit's generation is current"
+        );
+        let (callers_after_edit, _) = blob_removal_answers(&ctx);
+        assert!(
+            callers_after_edit.contains("second"),
+            "the edit's new caller is served: {callers_after_edit}"
+        );
+        // The unchanged file's payload was extracted again, beside the edit's.
+        assert!(blob_removal_has_payload(
+            storage,
+            family,
+            &blob_removal_key(&root.join("tracked.rs"))
+        ));
+        assert!(blob_removal_has_payload(
+            storage,
+            family,
+            &blob_removal_key(&root.join("lib.rs"))
+        ));
+    }
+
+    /// The callgraph key of a file's current bytes, as assembly computes it.
+    fn blob_removal_key(path: &Path) -> String {
+        crate::blob_store::CallgraphKey::from_bytes(
+            &fs::read(path).unwrap(),
+            "rust",
+            crate::views::callgraph::PRODUCER,
+        )
+        .full_key()
+        .to_hex()
+    }
+
+    fn blob_removal_has_payload(storage: &Path, family: &str, key: &str) -> bool {
+        let connection =
+            rusqlite::Connection::open(blob_removal_callgraph_db(storage, family)).unwrap();
+        let key = crate::blob_store::v2::parse_hex32(key).unwrap();
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM blob_payloads WHERE full_key = ?1",
+                [key.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 1
+    }
+
+    /// Deletes every payload row of the family's call-graph store, keeping the
+    /// file, as a lost or truncated store would leave it.
+    fn blob_removal_clear_rows(storage: &Path, family: &str) {
+        let connection =
+            rusqlite::Connection::open(blob_removal_callgraph_db(storage, family)).unwrap();
+        connection
+            .execute_batch("DELETE FROM blob_payloads")
+            .unwrap();
+        drop(connection);
+        assert_eq!(blob_removal_payload_rows(storage, family), 0);
+    }
+
+    fn blob_removal_manifest_key(storage: &Path, root: &Path, path: &str) -> Option<String> {
+        let view =
+            crate::views::ViewStore::open(storage, &crate::path_identity::project_scope_key(root))
+                .unwrap();
+        let generation = view.current_generation().unwrap().unwrap();
+        let manifest = view.load_manifest(&generation).unwrap();
+        match manifest.get(&crate::views::RelPath::new(path.as_bytes().to_vec()).unwrap())? {
+            crate::views::ManifestEntry::Regular { planes, .. } => planes.callgraph.clone(),
+            _ => None,
+        }
+    }
+
+    /// A bound checkout whose call-graph store loses its rows while the daemon
+    /// runs. Returns the live context.
+    fn blob_heal_running_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, String, Arc<AppContext>)
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("main");
+        init_git_fixture(&root);
+        lazy_commit(&root, LAZY_LIB, "lib");
+        let root = root.canonicalize().unwrap();
+        let storage = temp.path().join("storage");
+        let family = crate::search_index::artifact_cache_key(&root);
+        let ctx = lazy_bind(&root, &storage, "running-heal");
+        assert_eq!(blob_removal_payload_rows(&storage, &family), 2);
+        blob_removal_clear_rows(&storage, &family);
+        (temp, root, storage, family, ctx)
+    }
+
+    /// A store SQLite cannot read is moved aside and recreated empty when it
+    /// is opened. The view keeps naming the old payloads; they are extracted
+    /// again, and the next edit publishes.
+    #[test]
+    fn views_corrupt_callgraph_blob_store_is_moved_aside_and_heals() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let fixture = blob_removal_fixture();
+        let (root, storage, family) = (&fixture.root, &fixture.storage, &fixture.family);
+        let database = blob_removal_callgraph_db(storage, family);
+        fs::write(&database, b"this is not a SQLite database\n".repeat(256)).unwrap();
+
+        let ctx = lazy_bind(root, storage, "after-corruption");
+        let family_dir = storage.join("blobs").join(family);
+        let moved_aside = fs::read_dir(&family_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with("callgraph.sqlite.corrupt-"))
+            .count();
+        assert_eq!(moved_aside, 1, "the corrupt store was moved aside");
+        assert_eq!(
+            blob_removal_answers(&ctx),
+            (
+                fixture.callers_before.clone(),
+                fixture.call_tree_before.clone()
+            ),
+        );
+
+        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
+        let report = ctx
+            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
+            .expect("the edit publishes after the corrupt store was replaced");
+        assert!(report.published, "{report:?}");
+        let (callers_after_edit, _) = blob_removal_answers(&ctx);
+        assert!(
+            callers_after_edit.contains("second"),
+            "{callers_after_edit}"
+        );
+        assert!(blob_removal_has_payload(
+            storage,
+            family,
+            &blob_removal_key(&root.join("tracked.rs"))
+        ));
+    }
+
+    /// Bind finds the current generation's missing payloads before any edit
+    /// and schedules the publication that extracts them again.
+    #[test]
+    fn views_emptied_callgraph_blob_store_is_healed_at_bind() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let fixture = blob_removal_fixture();
+        let (root, storage, family) = (&fixture.root, &fixture.storage, &fixture.family);
+
+        let ctx = lazy_bind(root, storage, "after-emptying");
+        assert_eq!(
+            blob_removal_payload_rows(storage, family),
+            2,
+            "bind extracted both payloads again without an edit"
+        );
+        assert_eq!(
+            blob_removal_generation(storage, root).as_deref(),
+            Some(fixture.generation_before.as_str()),
+            "the repair changed no content, so the generation is unchanged"
+        );
+        assert!(ctx
+            .view_runtime_snapshot()
+            .is_some_and(|view| view.pending_paths.is_empty()));
+        assert_eq!(
+            blob_removal_answers(&ctx),
+            (
+                fixture.callers_before.clone(),
+                fixture.call_tree_before.clone()
+            ),
+        );
+        let (_cold_storage, cold) = lazy_cold_store(root);
+        let store = lazy_ready(ctx.callgraph_store_for_ops());
+        assert_eq!(
+            store.edge_snapshot().unwrap(),
+            cold.edge_snapshot().unwrap()
+        );
+    }
+
+    /// Measures, on a checkout of about AFT's size with both payload planes
+    /// populated, what the payload checks cost: the bind-time check of a
+    /// healthy store, and a one-file edit's publication split into the
+    /// assembly probe and the closure probe. Run in a release build:
+    /// `cargo test --release -p agent-file-tools --lib -- --ignored --nocapture
+    /// views_payload_probe_cost`.
+    #[test]
+    #[ignore = "measurement; run on demand in a release build"]
+    fn views_payload_probe_cost_on_a_5000_file_checkout() {
+        use crate::blob_store::{ProbeStats, MEMBERSHIP_PROBE_STATS};
+        use crate::views::assembly::CLOSURE_PROBE_STATS;
+        use std::collections::BTreeMap;
+        const FILES: usize = 5_000;
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        let path = |index: usize| format!("src/m{}/f{index}.rs", index / 100);
+        let body = |index: usize, revision: usize| {
+            format!(
+                "pub fn f{index}() -> usize {{ crate::m{}::f{}::f{}() + {revision} }}\n",
+                ((index + 1) % FILES) / 100,
+                (index + 1) % FILES,
+                (index + 1) % FILES
+            )
+        };
+        for index in 0..FILES {
+            let file = root.join(path(index));
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, body(index, 0)).unwrap();
+        }
+        init_git_fixture(&root);
+        let root = root.canonicalize().unwrap();
+        let family = crate::search_index::artifact_cache_key(&root);
+        let scope = crate::path_identity::project_scope_key(&root);
+        let semantic_keys = |root: &Path| {
+            let mut store = crate::blob_store::BlobStore::open(
+                &storage,
+                family.clone(),
+                crate::blob_store::BlobPlane::Semantic,
+            )
+            .unwrap();
+            (0..FILES)
+                .map(|index| {
+                    let rel = path(index);
+                    let key = crate::blob_store::SemanticKey::for_current(
+                        &fs::read(root.join(&rel)).unwrap(),
+                        rel.as_bytes(),
+                        "bench-model",
+                    )
+                    .full_key();
+                    store.put(&key, &[7_u8; 2048]).unwrap();
+                    (rel.into_bytes(), key.to_hex())
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let request = |changed: BTreeSet<Vec<u8>>, semantic: BTreeMap<Vec<u8>, String>| {
+            crate::views::assembly::AssemblyRequest {
+                storage: storage.clone(),
+                project_root: root.clone(),
+                family: family.clone(),
+                scope: scope.clone(),
+                desired_head: crate::views::assembly::head_tree_fingerprint(
+                    &crate::alias::head_tree_entries(&root).unwrap(),
+                ),
+                changed_paths: changed,
+                semantic_keys: semantic,
+                // tracked.rs has no semantic payload; it must not leave the
+                // publication pending.
+                require_semantic: false,
+                allow_blob_put: true,
+                callgraph: true,
+            }
+        };
+        let all_keys = semantic_keys(&root);
+        let started = Instant::now();
+        let initial =
+            crate::views::assembly::publish_checkout(&request(BTreeSet::new(), all_keys.clone()))
+                .unwrap();
+        assert!(initial.published && initial.pending_paths.is_empty());
+        eprintln!(
+            "setup: {FILES} files, full publication {} ms",
+            started.elapsed().as_millis()
+        );
+
+        // Bind-time check of a healthy store: the first run on fresh
+        // connections, then repeated runs.
+        let view = crate::views::ViewStore::open(&storage, &scope).unwrap();
+        let manifest = view
+            .load_manifest(&view.current_generation().unwrap().unwrap())
+            .unwrap();
+        let mut bind_runs = Vec::new();
+        for _ in 0..11 {
+            let callgraph = crate::blob_store::BlobStore::open(
+                &storage,
+                family.clone(),
+                crate::blob_store::BlobPlane::Callgraph,
+            )
+            .unwrap();
+            let semantic = crate::blob_store::BlobStore::open(
+                &storage,
+                family.clone(),
+                crate::blob_store::BlobPlane::Semantic,
+            )
+            .unwrap();
+            MEMBERSHIP_PROBE_STATS.with(|stats| stats.set(ProbeStats::default()));
+            let started = Instant::now();
+            let check = super::view_payload_check(
+                &manifest,
+                &callgraph,
+                &semantic,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+            let elapsed = started.elapsed();
+            assert!(check.complete() && check.missing.is_empty());
+            // Every file has both keys; tracked.rs has only a call-graph key.
+            assert_eq!(check.total, FILES * 2 + 1);
+            bind_runs.push((elapsed, MEMBERSHIP_PROBE_STATS.with(|stats| stats.get())));
+        }
+        let first = bind_runs[0];
+        let mut warm = bind_runs[1..]
+            .iter()
+            .map(|(elapsed, _)| *elapsed)
+            .collect::<Vec<_>>();
+        warm.sort();
+        eprintln!(
+            "bind check, healthy, {} keys: first {:.2} ms ({} queries), median of 10 {:.2} ms ({} queries)",
+            FILES * 2 + 1,
+            first.0.as_secs_f64() * 1000.0,
+            first.1.queries,
+            warm[warm.len() / 2].as_secs_f64() * 1000.0,
+            bind_runs[1].1.queries,
+        );
+
+        // One-file edits. `live`: the caller passes every semantic key, as the
+        // legacy semantic flow does; `none`: it passes none, so every reused
+        // entry's semantic key is probed as well.
+        for (variant, pass_semantic) in [("live", true), ("none", false)] {
+            let mut runs = Vec::new();
+            for edit in 0..7 {
+                let index = edit * 701 % FILES + usize::from(!pass_semantic);
+                let rel = path(index);
+                fs::write(
+                    root.join(&rel),
+                    body(index, edit + 1 + 100 * usize::from(!pass_semantic)),
+                )
+                .unwrap();
+                let semantic = if pass_semantic {
+                    semantic_keys(&root)
+                } else {
+                    BTreeMap::new()
+                };
+                MEMBERSHIP_PROBE_STATS.with(|stats| stats.set(ProbeStats::default()));
+                CLOSURE_PROBE_STATS.with(|stats| stats.set(ProbeStats::default()));
+                let started = Instant::now();
+                let report = crate::views::assembly::publish_checkout(&request(
+                    BTreeSet::from([rel.into_bytes()]),
+                    semantic,
+                ))
+                .unwrap();
+                let total = started.elapsed();
+                assert!(report.published, "{report:?}");
+                runs.push((
+                    total,
+                    MEMBERSHIP_PROBE_STATS.with(|stats| stats.get()),
+                    CLOSURE_PROBE_STATS.with(|stats| stats.get()),
+                ));
+            }
+            // The first edit also pays for the first incremental patch.
+            let mut sorted = runs[1..].to_vec();
+            sorted.sort_by_key(|(total, _, _)| *total);
+            let (total, assembly, closure) = sorted[sorted.len() / 2];
+            let ms = |nanos: u128| nanos as f64 / 1_000_000.0;
+            eprintln!(
+                "one-file edit [{variant}] median of 6: publication {:.2} ms; assembly probe {:.2} ms ({} queries, {:.1}% of publication); closure probe {:.2} ms ({} queries)",
+                total.as_secs_f64() * 1000.0,
+                ms(assembly.nanos),
+                assembly.queries,
+                ms(assembly.nanos) * 100.0 / (total.as_secs_f64() * 1000.0),
+                ms(closure.nanos),
+                closure.queries,
+            );
+            for (run, (total, assembly, closure)) in runs.iter().enumerate() {
+                eprintln!(
+                    "  [{variant}] edit {run}: publication {:.2} ms, assembly probe {:.2} ms/{}q, closure probe {:.2} ms/{}q",
+                    total.as_secs_f64() * 1000.0,
+                    ms(assembly.nanos),
+                    assembly.queries,
+                    ms(closure.nanos),
+                    closure.queries
+                );
+            }
+        }
+    }
+
+    /// A missing payload whose file changed since the view was published is
+    /// extracted from the file's current content, under its new key.
+    #[test]
+    fn views_missing_payload_of_a_changed_file_is_extracted_under_its_new_key() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let (_temp, root, storage, family, ctx) = blob_heal_running_fixture();
+        let old_tracked_key = blob_removal_key(&root.join("tracked.rs"));
+        assert_eq!(
+            blob_removal_manifest_key(&storage, &root, "tracked.rs").as_deref(),
+            Some(old_tracked_key.as_str())
+        );
+        // Nothing reports this change: only lib.rs is published below.
+        fs::write(
+            root.join("tracked.rs"),
+            "fn tracked() { crate::target(); }\n",
+        )
+        .unwrap();
+        let new_tracked_key = blob_removal_key(&root.join("tracked.rs"));
+
+        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
+        let report = ctx
+            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
+            .expect("the edit publishes");
+        assert!(report.published, "{report:?}");
+        assert_eq!(
+            blob_removal_manifest_key(&storage, &root, "tracked.rs").as_deref(),
+            Some(new_tracked_key.as_str()),
+            "the changed file is published under its current content's key"
+        );
+        assert!(blob_removal_has_payload(
+            &storage,
+            &family,
+            &new_tracked_key
+        ));
+        assert!(!blob_removal_has_payload(
+            &storage,
+            &family,
+            &old_tracked_key
+        ));
+        let (callers_after_edit, _) = blob_removal_answers(&ctx);
+        assert!(
+            callers_after_edit.contains("second"),
+            "{callers_after_edit}"
+        );
+    }
+
+    /// The bind check reads keys, not payloads, and an exhausted budget is
+    /// reported as incomplete rather than as a store with nothing missing.
+    #[test]
+    fn views_payload_check_names_missing_paths_and_reports_an_exhausted_budget() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let (_temp, root, storage, family, _ctx) = blob_heal_running_fixture();
+        let view = crate::views::ViewStore::open(
+            &storage,
+            &crate::path_identity::project_scope_key(&root),
+        )
+        .unwrap();
+        let manifest = view
+            .load_manifest(&view.current_generation().unwrap().unwrap())
+            .unwrap();
+        let callgraph = crate::blob_store::BlobStore::open(
+            &storage,
+            family.clone(),
+            crate::blob_store::BlobPlane::Callgraph,
+        )
+        .unwrap();
+        let semantic = crate::blob_store::BlobStore::open(
+            &storage,
+            family.clone(),
+            crate::blob_store::BlobPlane::Semantic,
+        )
+        .unwrap();
+
+        let check = super::view_payload_check(
+            &manifest,
+            &callgraph,
+            &semantic,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(check.complete());
+        assert_eq!(
+            check.missing.keys().cloned().collect::<Vec<_>>(),
+            vec![b"lib.rs".to_vec(), b"tracked.rs".to_vec()]
+        );
+        assert!(check
+            .missing
+            .values()
+            .all(|input| input.plane == "callgraph"));
+
+        let exhausted = super::view_payload_check(
+            &manifest,
+            &callgraph,
+            &semantic,
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap_or_else(Instant::now),
+        )
+        .unwrap();
+        assert!(!exhausted.complete());
+        assert!(exhausted.missing.is_empty());
+    }
+
+    /// A missing payload whose file cannot be read leaves that path out of the
+    /// generation with a failed status; the rest of the publication lands.
+    #[test]
+    fn views_missing_payload_of_an_unreadable_file_fails_only_that_path() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let (_temp, root, storage, _family, ctx) = blob_heal_running_fixture();
+        // A directory where the tracked file was: the path still exists, but
+        // reading it as a file fails.
+        fs::remove_file(root.join("tracked.rs")).unwrap();
+        fs::create_dir(root.join("tracked.rs")).unwrap();
+
+        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
+        let report = ctx
+            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
+            .expect("one unreadable path does not fail the publication");
+        assert!(report.published, "{report:?}");
+        assert!(
+            blob_removal_manifest_key(&storage, &root, "tracked.rs").is_none(),
+            "the unreadable path is not published with a missing payload"
+        );
+        let status = crate::path_status::PathStatusStore::open(&lazy_view_dir(&storage, &root))
+            .unwrap()
+            .status_for(b"tracked.rs")
+            .unwrap()
+            .expect("the unreadable path has a status");
+        assert_eq!(status.state, crate::path_status::PathState::Failed);
+        assert_eq!(
+            status.reason,
+            crate::views::assembly::MISSING_PAYLOAD_SOURCE_UNREADABLE
+        );
+        let (callers_after_edit, _) = blob_removal_answers(&ctx);
+        assert!(
+            callers_after_edit.contains("second"),
+            "{callers_after_edit}"
+        );
+    }
+
+    /// Removing the checkout's view directory together with the blob store
+    /// makes the next bind publish from scratch: every file is extracted
+    /// again, and the rebuilt graph answers as before and takes later edits.
+    #[test]
+    fn views_removed_callgraph_blob_store_and_view_rebuild_on_restart() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let fixture = blob_removal_fixture();
+        let (root, storage, family) = (&fixture.root, &fixture.storage, &fixture.family);
+        let view_dir = lazy_view_dir(storage, root);
+        fs::remove_dir_all(&view_dir).unwrap();
+
+        let ctx = lazy_bind(root, storage, "after-removal");
+        let generation = blob_removal_generation(storage, root).expect("republished at bind");
+        assert!(crate::views::read::derived_built(&view_dir, &generation));
+        assert!(ctx
+            .view_runtime_snapshot()
+            .is_some_and(|view| view.pending_paths.is_empty()));
+        assert_eq!(
+            blob_removal_payload_rows(storage, family),
+            2,
+            "both files were extracted again"
+        );
+        assert_eq!(
+            blob_removal_answers(&ctx),
+            (
+                fixture.callers_before.clone(),
+                fixture.call_tree_before.clone()
+            ),
+        );
+        let (_cold_storage, cold) = lazy_cold_store(root);
+        let store = lazy_ready(ctx.callgraph_store_for_ops());
+        assert_eq!(
+            store.edge_snapshot().unwrap(),
+            cold.edge_snapshot().unwrap()
+        );
+        drop(store);
+
+        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
+        let report = ctx
+            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
+            .unwrap();
+        assert!(report.published, "{report:?}");
+        assert!(report.pending_paths.is_empty(), "{report:?}");
+        let (callers_after_edit, _) = blob_removal_answers(&ctx);
+        assert!(
+            callers_after_edit.contains("second"),
+            "{callers_after_edit}"
+        );
     }
 
     #[test]

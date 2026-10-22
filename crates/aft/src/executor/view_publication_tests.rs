@@ -54,8 +54,51 @@ fn semantic_index_waits_do_not_silence_the_first_real_failure() {
     retry.failed(root.path(), real);
     assert!(
         !failures.next().3,
-        "later repeats are summarized on recovery"
+        "a repeat inside the log interval is counted, not logged"
     );
+}
+
+/// A publication that keeps failing over a missing payload stays visible:
+/// health names a typed reason, and the log keeps reporting the streak once
+/// per interval with the number of retries it did not log.
+#[test]
+fn persistent_missing_payload_failures_keep_logging_and_report_a_typed_reason() {
+    let root = tempfile::tempdir().unwrap();
+    let failures = Failures::new(root.path().to_path_buf());
+    let error = "manifest references missing Callgraph blob 00ff";
+    assert_eq!(
+        classify_publication_failure(error),
+        PublicationFailureKind::MissingPayload
+    );
+    let mut retry = PublicationRetry::default();
+    assert!(retry.failure_snapshot().is_none());
+    for _ in 0..3 {
+        retry.failed(root.path(), error);
+    }
+    assert!(failures.next().3);
+    assert!(failures.next().3);
+    assert!(!failures.next().3, "inside the log interval");
+    assert_eq!(retry.suppressed, 1);
+
+    // Every later backoff step that falls outside the interval is logged.
+    for repeat in 4..=6 {
+        retry.last_warned = Instant::now().checked_sub(retry.log_interval);
+        retry.failed(root.path(), error);
+        let (_, _, count, warned) = failures.next();
+        assert_eq!(count, repeat);
+        assert!(warned, "backoff step {repeat} is logged");
+        assert_eq!(retry.suppressed, 0);
+    }
+
+    let failure = retry
+        .failure_snapshot()
+        .expect("a failing streak is reported");
+    assert_eq!(failure.reason, "missing_payload");
+    assert_eq!(failure.repeat_count, 6);
+    assert_eq!(failure.error, error);
+    assert!(failure.next_retry_ms.is_some());
+    retry.reset(root.path());
+    assert!(retry.failure_snapshot().is_none());
 }
 
 static CAS_TIMINGS: LazyLock<Mutex<HashMap<PathBuf, Vec<Duration>>>> =

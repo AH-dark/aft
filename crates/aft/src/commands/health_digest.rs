@@ -184,6 +184,7 @@ mod tests {
             skipped_paths: Default::default(),
             skipped_path_sample: Vec::new(),
             cold_builds: Default::default(),
+            publication_failure: None,
         };
         assert_eq!(ticket_current_view(Some(snapshot.clone()), None), None);
         assert_eq!(

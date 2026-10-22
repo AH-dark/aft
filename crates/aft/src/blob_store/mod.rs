@@ -36,6 +36,30 @@ thread_local! {
     pub(crate) static PAYLOAD_READ_COUNTS: std::cell::Cell<PayloadReadCounts> = const {
         std::cell::Cell::new(PayloadReadCounts { bytes: 0, blake3_calls: 0 })
     };
+    /// Membership queries [`BlobStore::missing_hex_keys`] ran on this thread,
+    /// and how long they took in total.
+    pub(crate) static MEMBERSHIP_PROBE_STATS: std::cell::Cell<ProbeStats> = const {
+        std::cell::Cell::new(ProbeStats { queries: 0, nanos: 0 })
+    };
+}
+
+/// Counts and total time of the membership queries one probe path ran.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProbeStats {
+    pub queries: usize,
+    pub nanos: u128,
+}
+
+#[cfg(test)]
+impl ProbeStats {
+    pub(crate) fn add(cell: &std::cell::Cell<Self>, queries: usize, started: std::time::Instant) {
+        let current = cell.get();
+        cell.set(Self {
+            queries: current.queries + queries,
+            nanos: current.nanos + started.elapsed().as_nanos(),
+        });
+    }
 }
 
 /// The SQLite busy wait used by every blob-store connection.
@@ -129,6 +153,30 @@ CREATE TABLE IF NOT EXISTS blob_quarantine (
 
 const CONTAINS_SQL: &str = "SELECT 1 FROM blob_payloads INDEXED BY blob_membership
                            WHERE full_key = ?1";
+
+/// Keys asked about in one membership query by [`BlobStore::missing_hex_keys`];
+/// well under SQLite's bound-parameter limit.
+const MEMBERSHIP_BATCH: usize = 500;
+
+/// What [`BlobStore::missing_hex_keys`] found.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct KeyPresence {
+    /// Keys, spelled as the caller gave them, that have no payload row. A key
+    /// that is not 64 hex digits can never have a row and is reported here too.
+    pub missing: std::collections::BTreeSet<String>,
+    /// Distinct keys checked before the check finished or ran out of time.
+    pub checked: usize,
+    /// Distinct keys the caller asked about.
+    pub total: usize,
+}
+
+impl KeyPresence {
+    /// False when the deadline stopped the check early: keys beyond `checked`
+    /// are unknown, not present.
+    pub fn complete(&self) -> bool {
+        self.checked == self.total
+    }
+}
 
 /// The two repository-family blob planes.  Trigram data is per-view derived
 /// state and deliberately is not represented here.
@@ -634,6 +682,66 @@ impl BlobStore {
             .is_some())
     }
 
+    /// Finds which of `keys` (hex full keys, as manifests spell them) have no
+    /// payload row. It reads only the payload-free key index, in sorted batches
+    /// of [`MEMBERSHIP_BATCH`] keys with one query each, never payload bytes.
+    /// With a `deadline`, no new batch starts once it has passed, and the
+    /// result says how many keys were checked so the caller can tell an
+    /// incomplete check from a clean one.
+    pub fn missing_hex_keys<'k>(
+        &self,
+        keys: impl IntoIterator<Item = &'k str>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<KeyPresence, BlobStoreError> {
+        // Sorted hex sorts like the key bytes, so batches follow the index.
+        let keys = keys
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut presence = KeyPresence {
+            total: keys.len(),
+            ..KeyPresence::default()
+        };
+        for batch in keys.chunks(MEMBERSHIP_BATCH) {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                break;
+            }
+            let decoded = batch
+                .iter()
+                .filter_map(|key| v2::parse_hex32(key))
+                .collect::<Vec<_>>();
+            let mut present = std::collections::BTreeSet::new();
+            if !decoded.is_empty() {
+                #[cfg(test)]
+                let started = std::time::Instant::now();
+                let sql = format!(
+                    "SELECT full_key FROM blob_payloads INDEXED BY blob_membership
+                     WHERE full_key IN ({})",
+                    vec!["?"; decoded.len()].join(",")
+                );
+                let mut statement = self.connection.prepare_cached(&sql)?;
+                let rows = statement.query_map(
+                    rusqlite::params_from_iter(decoded.iter().map(|key| key.as_slice())),
+                    |row| row.get::<_, Vec<u8>>(0),
+                )?;
+                for key in rows {
+                    present.insert(key?);
+                }
+                #[cfg(test)]
+                MEMBERSHIP_PROBE_STATS.with(|stats| ProbeStats::add(stats, 1, started));
+            }
+            for key in batch {
+                let stored = v2::parse_hex32(key).is_some_and(|bytes| present.contains(&bytes[..]));
+                if !stored {
+                    presence.missing.insert((*key).to_owned());
+                }
+            }
+            presence.checked += batch.len();
+        }
+        Ok(presence)
+    }
+
     /// Reads a payload only after verifying its stored digest and schema. A
     /// malformed row is indistinguishable from a miss to consumers, but remains
     /// on disk for quarantine/forensics rather than being rewritten in place.
@@ -1110,6 +1218,53 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn missing_hex_keys_batches_index_probes_and_reports_an_expired_budget_as_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = BlobStore::open(dir.path(), "presence", BlobPlane::Callgraph).unwrap();
+        // More than one batch, every other key stored.
+        let keys = (0..(MEMBERSHIP_BATCH * 2 + 7))
+            .map(|index| CallgraphKey::for_current(&index.to_le_bytes(), "rust").full_key())
+            .collect::<Vec<_>>();
+        for key in keys.iter().step_by(2) {
+            store.put(key, b"payload").unwrap();
+        }
+        let hex = keys.iter().map(FullKey::to_hex).collect::<Vec<_>>();
+        let malformed = "not-a-key".to_string();
+        let asked = hex.iter().chain([&malformed, &hex[0]]);
+
+        let presence = store
+            .missing_hex_keys(asked.clone().map(String::as_str), None)
+            .unwrap();
+        assert!(presence.complete());
+        assert_eq!(presence.total, keys.len() + 1, "duplicates count once");
+        let expected = hex
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .chain([&malformed])
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(presence.missing, expected);
+
+        let expired = store
+            .missing_hex_keys(
+                asked.map(String::as_str),
+                Some(
+                    std::time::Instant::now()
+                        .checked_sub(Duration::from_millis(1))
+                        .unwrap_or_else(std::time::Instant::now),
+                ),
+            )
+            .unwrap();
+        assert!(
+            !expired.complete(),
+            "an expired budget is not a clean check"
+        );
+        assert_eq!(expired.checked, 0);
+        assert!(expired.missing.is_empty());
+    }
+
     #[test]
     fn contains_uses_covering_index_without_payload_reads() {
         let dir = tempfile::tempdir().unwrap();

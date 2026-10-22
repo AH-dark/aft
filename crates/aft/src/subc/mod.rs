@@ -19869,6 +19869,101 @@ mod tests {
         }
     }
 
+    /// The bind-time check that a view's payloads are still stored runs in the
+    /// configure tail, after the bind is answered: a bind never waits on it.
+    /// Held inside the check, the tail leaves the first bind already answered
+    /// and still lets another session's bind of the root be answered.
+    #[test]
+    fn route_binds_are_answered_while_the_view_payload_check_is_held() {
+        const ACK_BOUND: Duration = Duration::from_secs(2);
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let configured = ConfiguredRoot::unconfigured(&executor);
+        let root = configured.canonical_root.clone();
+        // A published generation with call-graph keys gives the check work.
+        let report =
+            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+                storage: configured.storage.path().to_path_buf(),
+                project_root: root.clone(),
+                family: crate::search_index::artifact_cache_key(&root),
+                scope: crate::path_identity::project_scope_key(&root),
+                desired_head: crate::views::assembly::head_tree_fingerprint(
+                    &crate::alias::head_tree_entries(&root).unwrap(),
+                ),
+                changed_paths: std::collections::BTreeSet::new(),
+                semantic_keys: Default::default(),
+                require_semantic: false,
+                allow_blob_put: true,
+                callgraph: true,
+            })
+            .unwrap();
+        assert!(report.published, "{report:?}");
+        let (_gate, check_held, release) =
+            crate::commands::configure::gate_configure_tail_stage_for_test(
+                root.clone(),
+                "view_payload_check",
+            );
+        let views_bind = |index: usize| {
+            let mut request = configured.bind_request(index, "opencode");
+            request.params["config"] = json!([{
+                "tier": "user",
+                "source": "/u/aft.jsonc",
+                "doc": json!({
+                    "views": { "enabled": true },
+                    "indexes": { "semantic": false, "trigram": false, "callgraph": true },
+                })
+                .to_string(),
+            }]);
+            request
+        };
+
+        let started = Instant::now();
+        let first = configured
+            .submit_bind(&executor, views_bind(0))
+            .blocking_recv()
+            .expect("first bind completes");
+        let first_ack = started.elapsed();
+        assert!(first.success, "{}", first.data);
+        assert!(
+            check_held.try_recv().is_err(),
+            "the payload check ran before the bind was answered"
+        );
+        let tail = executor.submit_maintenance_async(
+            configured.root.clone(),
+            Lane::MaintenanceCommit,
+            format!("subc-maintenance-drain-configure-tail-{}", root.display()),
+            Box::new(|ctx| {
+                let requeue = runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
+                Response::success("tail", json!({ "requeue": requeue }))
+            }),
+        );
+        check_held
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the configure tail reaches the payload check");
+
+        let second_started = Instant::now();
+        let mut second = configured.submit_bind(&executor, views_bind(1));
+        let mut second_ack = None;
+        while second_started.elapsed() < ACK_BOUND {
+            if let Ok(response) = second.try_recv() {
+                assert!(response.success, "{}", response.data);
+                second_ack = Some(second_started.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let _ = release.send(());
+        assert!(tail.blocking_recv().expect("tail completion").success);
+        crate::commands::configure::drain_deferred_configure_maintenance(&configured.ctx);
+        eprintln!(
+            "bind acks with the payload check held: first={first_ack:?} second={second_ack:?}"
+        );
+        assert!(
+            second_ack.is_some(),
+            "a bind was not answered within {ACK_BOUND:?} while the payload check was held"
+        );
+    }
+
     /// After a daemon restart every session of a root rebinds at once, while
     /// that root's first configure tail runs one long unit that cannot step
     /// aside (a view or artifact load on a large root). The herd rebinds with

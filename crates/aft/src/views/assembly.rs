@@ -71,6 +71,11 @@ struct Candidate {
 thread_local! {
     static RETAINED_CANDIDATE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static HEAD_REWRITE: std::cell::RefCell<Option<HeadRewrite>> = const { std::cell::RefCell::new(None) };
+    /// Queries the publication closure's blob probe ran on this thread, and
+    /// how long it took in total.
+    pub(crate) static CLOSURE_PROBE_STATS: std::cell::Cell<crate::blob_store::ProbeStats> = const {
+        std::cell::Cell::new(crate::blob_store::ProbeStats { queries: 0, nanos: 0 })
+    };
 }
 
 #[cfg(test)]
@@ -520,6 +525,11 @@ pub fn prepare_checkout_deferring(
     // from the bytes in hand so classifying it later needs no second read.
     let mut fresh_semantic_classes = std::collections::HashMap::new();
     let mut candidates = Vec::with_capacity(head.len());
+    let reader = CandidateReader {
+        request,
+        previous_entries: &previous_entries,
+        callgraph: &callgraph,
+    };
 
     #[cfg(test)]
     let head = rewrite_head_for_test(head);
@@ -601,74 +611,10 @@ pub fn prepare_checkout_deferring(
                     fresh_semantic_classes
                         .insert(tracked.rel_path.clone(), semantic_class_of_bytes(&source));
                 }
-                let resolution_input = is_resolution_input(&tracked.rel_path);
-                let language = if resolution_input {
-                    Some("config".to_string())
-                } else {
-                    super::callgraph::source_language(&absolute)
-                        .map(|language| format!("{language:?}").to_lowercase())
-                };
-                let (key, payload) = language
-                    .as_deref()
-                    .filter(|_| request.callgraph)
-                    .map(|language| {
-                        let key = CallgraphKey::from_bytes(
-                            &source,
-                            language,
-                            crate::views::callgraph::PRODUCER,
-                        )
-                        .full_key();
-                        let key_hex = key.to_hex();
-                        let callgraph_is_current = previous_entries
-                            .get(&tracked.rel_path)
-                            .is_some_and(|entry| {
-                                manifest_entry_callgraph_key(entry) == Some(key_hex.as_str())
-                            });
-                        let payload = if callgraph_is_current {
-                            None
-                        } else {
-                            missing_callgraph_payload(
-                                &callgraph,
-                                &key,
-                                &source,
-                                language,
-                                resolution_input,
-                            )?
-                        };
-                        Ok::<_, ViewError>((key, payload))
-                    })
-                    .transpose()?
-                    .map_or((None, None), |(key, payload)| (Some(key), payload));
-                let callgraph_key = key.as_ref().map(FullKey::to_hex);
-                if language.is_some() {
-                    // Freshly read content decides whether the call graph
-                    // skips this member; reused members keep their record.
-                    let non_utf8 = request.callgraph
-                        && !resolution_input
-                        && std::str::from_utf8(&source).is_err();
-                    fresh_skips.push((
-                        tracked.rel_path.clone(),
-                        non_utf8.then_some(SkipReason::NonUtf8Source),
-                    ));
-                }
-                // Only a new payload can seed an alias. Cached or read-only
-                // candidates need neither their source bytes nor tracked row.
-                let needs_source = payload.is_some() && request.allow_blob_put;
-                candidates.push(Candidate {
-                    path: rel_path,
-                    entry: ManifestEntry::Regular {
-                        mode: if executable { 0o100755 } else { 0o100644 },
-                        planes: RegularPlanes {
-                            semantic: request.semantic_keys.get(&tracked.rel_path).cloned(),
-                            callgraph: callgraph_key,
-                        },
-                        resolution_input,
-                    },
-                    key,
-                    payload,
-                    tracked: needs_source.then_some(tracked),
-                    source: needs_source.then_some(source),
-                });
+                let (candidate, skip) =
+                    reader.regular(rel_path, &absolute, executable, source, Some(tracked), true)?;
+                fresh_skips.extend(skip);
+                candidates.push(candidate);
             }
             GitMode::Other(mode) => {
                 // Git's tree reader canonicalizes every entry mode before
@@ -690,6 +636,16 @@ pub fn prepare_checkout_deferring(
             }
         }
     }
+
+    let healed = heal_missing_payloads(
+        &reader,
+        &semantic,
+        &mut candidates,
+        &mut fresh_skips,
+        &mut fresh_reads,
+        phase,
+    )?;
+    drop(reader);
 
     timing.phase("candidate_assembly");
     profile.candidates = candidates.len();
@@ -927,7 +883,20 @@ pub fn prepare_checkout_deferring(
             .collect(),
         keep_pending: semantic_pending_paths.clone(),
         marked_through,
-        failed: semantic_failures.into_iter().collect(),
+        // A path whose missing payload could not be rebuilt (an unreadable
+        // file, or a synthetic entry) is left out of this generation and
+        // marked failed once the generation is served. The mark stays until a
+        // later generation includes the path: settlement clears failed rows
+        // only for members.
+        failed: semantic_failures
+            .into_iter()
+            .chain(healed.unreadable.into_iter().map(|unreadable| {
+                (
+                    unreadable.rel_path,
+                    MISSING_PAYLOAD_SOURCE_UNREADABLE.to_owned(),
+                )
+            }))
+            .collect(),
         // The call graph and the semantic plane can both report a path; a
         // skip from either one wins over the other's all-clear.
         fresh_skips: fresh_skips
@@ -1683,6 +1652,10 @@ impl PublicationClosure for SqliteClosure {
     }
 
     fn probe_blobs(&self, keys: &[(ArtifactPlane, &str)]) -> Result<()> {
+        #[cfg(test)]
+        let started = Instant::now();
+        #[cfg(test)]
+        let mut queries = 0;
         let mut present = BTreeSet::new();
         for (plane_id, plane) in [ArtifactPlane::Semantic, ArtifactPlane::Callgraph]
             .into_iter()
@@ -1702,6 +1675,10 @@ impl PublicationClosure for SqliteClosure {
                     continue;
                 };
                 self.contains_blob(plane, first_valid)?;
+                #[cfg(test)]
+                {
+                    queries += 1;
+                }
                 let connections = self.connections.borrow();
                 let Some(connection) = connections.get(&(plane == ArtifactPlane::Semantic)) else {
                     continue;
@@ -1714,6 +1691,10 @@ impl PublicationClosure for SqliteClosure {
                     continue;
                 }
                 let sql = membership_query(decoded.len());
+                #[cfg(test)]
+                {
+                    queries += 1;
+                }
                 let mut statement = connection.prepare_cached(&sql)?;
                 for key in statement.query_map(rusqlite::params_from_iter(&decoded), |row| {
                     row.get::<_, Vec<u8>>(0)
@@ -1724,6 +1705,10 @@ impl PublicationClosure for SqliteClosure {
         }
         // Return the first missing key in manifest order, even though membership
         // reads are grouped by plane and sorted for index locality.
+        #[cfg(test)]
+        CLOSURE_PROBE_STATS.with(|stats| {
+            crate::blob_store::ProbeStats::add(stats, queries, started);
+        });
         for &(plane, key) in keys {
             let plane_id = usize::from(plane == ArtifactPlane::Callgraph);
             if decode_hex(key).is_none_or(|key| !present.contains(&(plane_id, key))) {
@@ -1893,6 +1878,324 @@ fn missing_callgraph_payload(
     Ok(Some(blob.to_bytes().map_err(|error| {
         ViewError::InvalidManifest(error.to_string())
     })?))
+}
+
+/// The path-status reason recorded for a path left out of a generation because
+/// its call-graph payload was missing from the family blob store and could not
+/// be rebuilt from the working tree: the file is unreadable, or the entry is
+/// synthetic and has no file.
+pub const MISSING_PAYLOAD_SOURCE_UNREADABLE: &str =
+    "callgraph payload missing from the blob store and the source could not be read";
+
+/// Turns working-tree files into manifest candidates for one assembly.
+struct CandidateReader<'a> {
+    request: &'a AssemblyRequest,
+    previous_entries: &'a BTreeMap<Vec<u8>, ManifestEntry>,
+    callgraph: &'a BlobStore,
+}
+
+impl CandidateReader<'_> {
+    /// Builds the candidate for a regular file from its `source` bytes, and
+    /// the skip outcome its fresh content decides, if it has a call-graph
+    /// language.
+    ///
+    /// With `trust_previous_key`, content whose key equals the previous
+    /// manifest's key is not looked up or extracted: its payload is taken to
+    /// be stored, which [`heal_missing_payloads`] then checks for all such
+    /// candidates in one batched probe. Without it, a payload the store lacks
+    /// is always extracted.
+    fn regular(
+        &self,
+        rel_path: RelPath,
+        absolute: &Path,
+        executable: bool,
+        source: Vec<u8>,
+        tracked: Option<crate::alias::TrackedPath>,
+        trust_previous_key: bool,
+    ) -> Result<(Candidate, Option<(Vec<u8>, Option<SkipReason>)>)> {
+        let request = self.request;
+        let resolution_input = is_resolution_input(rel_path.as_bytes());
+        let language = if resolution_input {
+            Some("config".to_string())
+        } else {
+            super::callgraph::source_language(absolute)
+                .map(|language| format!("{language:?}").to_lowercase())
+        };
+        let (key, payload) = language
+            .as_deref()
+            .filter(|_| request.callgraph)
+            .map(|language| {
+                let key =
+                    CallgraphKey::from_bytes(&source, language, crate::views::callgraph::PRODUCER)
+                        .full_key();
+                let key_hex = key.to_hex();
+                let callgraph_is_current = trust_previous_key
+                    && self
+                        .previous_entries
+                        .get(rel_path.as_bytes())
+                        .is_some_and(|entry| {
+                            manifest_entry_callgraph_key(entry) == Some(key_hex.as_str())
+                        });
+                let payload = if callgraph_is_current {
+                    None
+                } else {
+                    missing_callgraph_payload(
+                        self.callgraph,
+                        &key,
+                        &source,
+                        language,
+                        resolution_input,
+                    )?
+                };
+                Ok::<_, ViewError>((key, payload))
+            })
+            .transpose()?
+            .map_or((None, None), |(key, payload)| (Some(key), payload));
+        let callgraph_key = key.as_ref().map(FullKey::to_hex);
+        // Freshly read content decides whether the call graph skips this
+        // member; reused members keep their record.
+        let skip = language.is_some().then(|| {
+            let non_utf8 =
+                request.callgraph && !resolution_input && std::str::from_utf8(&source).is_err();
+            (
+                rel_path.as_bytes().to_vec(),
+                non_utf8.then_some(SkipReason::NonUtf8Source),
+            )
+        });
+        // Only a new payload can seed an alias. Cached or read-only
+        // candidates need neither their source bytes nor tracked row.
+        let needs_source = payload.is_some() && request.allow_blob_put && tracked.is_some();
+        let semantic = request.semantic_keys.get(rel_path.as_bytes()).cloned();
+        Ok((
+            Candidate {
+                path: rel_path,
+                entry: ManifestEntry::Regular {
+                    mode: if executable { 0o100755 } else { 0o100644 },
+                    planes: RegularPlanes {
+                        semantic,
+                        callgraph: callgraph_key,
+                    },
+                    resolution_input,
+                },
+                key,
+                payload,
+                tracked: tracked.filter(|_| needs_source),
+                source: needs_source.then_some(source),
+            },
+            skip,
+        ))
+    }
+}
+
+/// A path [`heal_missing_payloads`] had to leave out of the generation.
+struct UnreadablePath {
+    rel_path: Vec<u8>,
+}
+
+/// What [`heal_missing_payloads`] changed.
+#[derive(Default)]
+struct HealOutcome {
+    /// Files read again because their call-graph payload was missing.
+    reextracted: usize,
+    /// Entries whose missing semantic key was swapped for one the caller
+    /// just stored.
+    semantic_replaced: usize,
+    /// Entries whose missing semantic key was dropped, with nothing stored to
+    /// replace it.
+    semantic_dropped: usize,
+    /// Call-graph keys dropped because the call graph is off.
+    callgraph_dropped: usize,
+    unreadable: Vec<UnreadablePath>,
+}
+
+/// Makes sure the candidates name no payload the family blob store lacks.
+///
+/// A candidate reused from the previous manifest, or read again with an
+/// unchanged key, is not extracted: its payload is taken to be stored. Rows can
+/// still be gone. A store that SQLite reports as corrupt is moved aside and
+/// recreated empty when it is opened, and an operator can delete a store while
+/// the daemon is stopped. Without this repair, such a candidate would name a
+/// missing key, the publication's closure check would refuse it on every
+/// retry, and the view would stop following edits for good.
+///
+/// This checks those keys in one batched index probe per plane, without
+/// reading payloads, and repairs only the candidates whose rows are gone:
+/// - a missing call-graph payload is extracted again from the working-tree
+///   file. When the file changed since the previous manifest, its current
+///   content is extracted under its new key, as an edit would be. Unchanged
+///   content keeps its semantic key while that payload is still stored;
+/// - a file that can no longer be read is left out of the generation and
+///   recorded as failed, so one path never fails the whole publication; a file
+///   deleted since the checkout was listed is left out like any deletion;
+/// - with the call graph off, a missing call-graph key is dropped, as a
+///   publication with the call graph off writes no key;
+/// - a missing semantic key becomes the key the caller just stored for the
+///   path, or no key, leaving the path pending for semantic work; the entry
+///   keeps its call-graph key.
+fn heal_missing_payloads(
+    reader: &CandidateReader<'_>,
+    semantic: &BlobStore,
+    candidates: &mut Vec<Candidate>,
+    fresh_skips: &mut Vec<(Vec<u8>, Option<SkipReason>)>,
+    fresh_reads: &mut std::collections::HashSet<Vec<u8>>,
+    phase: &mut impl FnMut(&str) -> Result<()>,
+) -> Result<HealOutcome> {
+    let request = reader.request;
+    let mut outcome = HealOutcome::default();
+    // Candidates carrying a payload are stored by the put loop; the rest
+    // assume their call-graph payload is already there.
+    let callgraph_missing = reader
+        .callgraph
+        .missing_hex_keys(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.payload.is_none())
+                .filter_map(|candidate| manifest_entry_callgraph_key(&candidate.entry)),
+            None,
+        )
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
+        .missing;
+    // The caller stored the semantic keys it supplies just before assembly;
+    // only keys carried over from the previous manifest can be gone.
+    let semantic_missing = semantic
+        .missing_hex_keys(
+            candidates
+                .iter()
+                .filter_map(|candidate| match &candidate.entry {
+                    ManifestEntry::Regular { planes, .. } => planes
+                        .semantic
+                        .as_deref()
+                        .map(|key| (candidate.path.as_bytes(), key)),
+                    _ => None,
+                })
+                .filter(|(path, key)| {
+                    request.semantic_keys.get(*path).map(String::as_str) != Some(*key)
+                })
+                .map(|(_, key)| key),
+            None,
+        )
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
+        .missing;
+    if callgraph_missing.is_empty() && semantic_missing.is_empty() {
+        return Ok(outcome);
+    }
+
+    let mut healed = Vec::with_capacity(candidates.len());
+    for mut candidate in candidates.drain(..) {
+        let callgraph_gone = candidate.payload.is_none()
+            && manifest_entry_callgraph_key(&candidate.entry)
+                .is_some_and(|key| callgraph_missing.contains(key));
+        if callgraph_gone {
+            let key = manifest_entry_callgraph_key(&candidate.entry)
+                .unwrap_or_default()
+                .to_owned();
+            match &mut candidate.entry {
+                ManifestEntry::Regular { planes, .. } if !request.callgraph => {
+                    planes.callgraph = None;
+                    outcome.callgraph_dropped += 1;
+                }
+                ManifestEntry::Regular { mode, planes, .. } => {
+                    let executable = *mode == 0o100755;
+                    // The semantic payload is a separate plane: when it is
+                    // still stored, repairing the call graph must not lose it.
+                    let stored_semantic = planes
+                        .semantic
+                        .clone()
+                        .filter(|semantic| !semantic_missing.contains(semantic));
+                    let absolute = request
+                        .project_root
+                        .join(path_from_bytes(candidate.path.as_bytes()));
+                    phase("working_tree_read")?;
+                    match read_working_tree_file(&absolute) {
+                        Ok(Some(source)) => {
+                            fresh_reads.insert(candidate.path.as_bytes().to_vec());
+                            let (mut fresh, skip) = reader.regular(
+                                candidate.path,
+                                &absolute,
+                                executable,
+                                source,
+                                None,
+                                false,
+                            )?;
+                            // Unchanged content (the same call-graph key) keeps
+                            // the semantic key it had, unless the caller just
+                            // stored one. Changed content takes only what the
+                            // caller stored, as an edit would.
+                            let unchanged =
+                                manifest_entry_callgraph_key(&fresh.entry) == Some(key.as_str());
+                            if let ManifestEntry::Regular { planes, .. } = &mut fresh.entry {
+                                if unchanged && planes.semantic.is_none() {
+                                    planes.semantic = stored_semantic;
+                                }
+                            }
+                            fresh_skips.extend(skip);
+                            healed.push(fresh);
+                            outcome.reextracted += 1;
+                        }
+                        // Deleted after the checkout was listed: a deletion.
+                        Ok(None) => {}
+                        Err(error) => {
+                            log::warn!(
+                                "view payload missing and its source is unreadable; leaving the path out of this generation root={} path={} key={key} error={error}",
+                                request.project_root.display(),
+                                String::from_utf8_lossy(candidate.path.as_bytes()),
+                            );
+                            outcome.unreadable.push(UnreadablePath {
+                                rel_path: candidate.path.as_bytes().to_vec(),
+                            });
+                        }
+                    }
+                    continue;
+                }
+                // Nothing in the checkout can rebuild a synthetic entry's
+                // payload, so it is left out like an unreadable file.
+                ManifestEntry::Synthetic { .. }
+                | ManifestEntry::Symlink { .. }
+                | ManifestEntry::Gitlink { .. } => {
+                    log::warn!(
+                        "view payload missing for a synthetic entry; leaving it out of this generation root={} path={} key={key}",
+                        request.project_root.display(),
+                        String::from_utf8_lossy(candidate.path.as_bytes()),
+                    );
+                    outcome.unreadable.push(UnreadablePath {
+                        rel_path: candidate.path.as_bytes().to_vec(),
+                    });
+                    continue;
+                }
+            }
+        }
+        if let ManifestEntry::Regular { planes, .. } = &mut candidate.entry {
+            if planes
+                .semantic
+                .as_deref()
+                .is_some_and(|key| semantic_missing.contains(key))
+            {
+                planes.semantic = request
+                    .semantic_keys
+                    .get(candidate.path.as_bytes())
+                    .cloned();
+                if planes.semantic.is_some() {
+                    outcome.semantic_replaced += 1;
+                } else {
+                    outcome.semantic_dropped += 1;
+                }
+            }
+        }
+        healed.push(candidate);
+    }
+    *candidates = healed;
+    log::info!(
+        "view payloads missing from the blob store handled root={} callgraph_missing={} reextracted={} callgraph_dropped={} unreadable={} semantic_missing={} semantic_replaced={} semantic_dropped={}",
+        request.project_root.display(),
+        callgraph_missing.len(),
+        outcome.reextracted,
+        outcome.callgraph_dropped,
+        outcome.unreadable.len(),
+        semantic_missing.len(),
+        outcome.semantic_replaced,
+        outcome.semantic_dropped,
+    );
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -2215,6 +2518,279 @@ mod closure_connection_tests;
 #[cfg(test)]
 #[path = "semantic_fill_tests.rs"]
 mod semantic_fill_tests;
+
+#[cfg(test)]
+mod payload_heal_tests {
+    use super::*;
+
+    fn git(project: &Path, args: &[&str]) {
+        assert!(std::process::Command::new("git")
+            .current_dir(project)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn semantic_key(manifest: &Manifest, path: &[u8]) -> Option<String> {
+        match manifest.get(&RelPath::new(path.to_vec()).unwrap()) {
+            Some(ManifestEntry::Regular { planes, .. }) => planes.semantic.clone(),
+            _ => None,
+        }
+    }
+
+    fn clear_semantic_rows(storage: &Path, family: &str) {
+        let store = BlobStore::open(storage, family, BlobPlane::Semantic).unwrap();
+        Connection::open(store.path())
+            .unwrap()
+            .execute_batch("DELETE FROM blob_payloads")
+            .unwrap();
+    }
+
+    fn clear_callgraph_rows(storage: &Path, family: &str) {
+        let store = BlobStore::open(storage, family, BlobPlane::Callgraph).unwrap();
+        Connection::open(store.path())
+            .unwrap()
+            .execute_batch("DELETE FROM blob_payloads")
+            .unwrap();
+    }
+
+    fn callgraph_key(manifest: &Manifest, path: &[u8]) -> Option<String> {
+        match manifest.get(&RelPath::new(path.to_vec()).unwrap()) {
+            Some(ManifestEntry::Regular { planes, .. }) => planes.callgraph.clone(),
+            _ => None,
+        }
+    }
+
+    /// A committed checkout of `lib.rs` and `other.rs`, published with a
+    /// stored semantic payload for `lib.rs`. Returns the project, the storage,
+    /// the request, `lib.rs`'s semantic key and the published manifest.
+    fn two_plane_checkout(
+        family: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        AssemblyRequest,
+        String,
+        Manifest,
+    ) {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let lib = b"pub fn example() {}\n";
+        fs::write(project.path().join("lib.rs"), lib).unwrap();
+        fs::write(project.path().join("other.rs"), "pub fn other() {}\n").unwrap();
+        git(project.path(), &["init", "--quiet"]);
+        git(project.path(), &["add", "."]);
+        git(project.path(), &["commit", "--quiet", "-m", "base"]);
+        let key = crate::blob_store::SemanticKey::for_current(lib, b"lib.rs", "model").full_key();
+        BlobStore::open(storage.path(), family, BlobPlane::Semantic)
+            .unwrap()
+            .put(&key, b"vector")
+            .unwrap();
+        let request = AssemblyRequest {
+            storage: storage.path().to_path_buf(),
+            project_root: project.path().to_path_buf(),
+            family: family.into(),
+            scope: format!("{family}-scope"),
+            desired_head: "head".into(),
+            changed_paths: BTreeSet::new(),
+            semantic_keys: BTreeMap::from([(b"lib.rs".to_vec(), key.to_hex())]),
+            require_semantic: true,
+            allow_blob_put: true,
+            callgraph: true,
+        };
+        let initial = publish_checkout(&request).unwrap();
+        assert!(initial.published, "{initial:?}");
+        let manifest = initial.manifest.unwrap();
+        assert_eq!(semantic_key(&manifest, b"lib.rs"), Some(key.to_hex()));
+        (project, storage, request, key.to_hex(), manifest)
+    }
+
+    /// Repairing a missing call-graph payload heals only that plane: an
+    /// unchanged file keeps its semantic key while that payload is still
+    /// stored, even when the caller supplies no semantic keys (as a
+    /// publication with read-only shared artifacts does), so the file is not
+    /// left pending semantic work.
+    #[test]
+    fn views_callgraph_heal_keeps_a_stored_semantic_key() {
+        let family = "callgraph-heal-keeps-semantic";
+        let (project, storage, mut request, semantic, before) = two_plane_checkout(family);
+        clear_callgraph_rows(storage.path(), family);
+        fs::write(project.path().join("other.rs"), "pub fn other2() {}\n").unwrap();
+        request.changed_paths = BTreeSet::from([b"other.rs".to_vec()]);
+        request.semantic_keys = BTreeMap::new();
+
+        let healed = publish_checkout(&request).unwrap();
+        assert!(healed.published, "{healed:?}");
+        let manifest = healed.manifest.as_ref().unwrap();
+        assert_eq!(semantic_key(manifest, b"lib.rs"), Some(semantic));
+        assert!(
+            !healed.pending_paths.contains(b"lib.rs".as_slice()),
+            "lib.rs is not left pending semantic work: {healed:?}"
+        );
+        let callgraph = callgraph_key(manifest, b"lib.rs").unwrap();
+        assert_eq!(Some(callgraph.clone()), callgraph_key(&before, b"lib.rs"));
+        let store = BlobStore::open(storage.path(), family, BlobPlane::Callgraph).unwrap();
+        assert!(store
+            .missing_hex_keys([callgraph.as_str()], None)
+            .unwrap()
+            .missing
+            .is_empty());
+    }
+
+    /// The mirror case: a missing semantic payload drops only the semantic key
+    /// and leaves the stored call-graph key in place.
+    #[test]
+    fn views_semantic_heal_keeps_a_stored_callgraph_key() {
+        let family = "semantic-heal-keeps-callgraph";
+        let (project, storage, mut request, _semantic, before) = two_plane_checkout(family);
+        clear_semantic_rows(storage.path(), family);
+        fs::write(project.path().join("other.rs"), "pub fn other2() {}\n").unwrap();
+        request.changed_paths = BTreeSet::from([b"other.rs".to_vec()]);
+        request.semantic_keys = BTreeMap::new();
+
+        let healed = publish_checkout(&request).unwrap();
+        assert!(healed.published, "{healed:?}");
+        let manifest = healed.manifest.as_ref().unwrap();
+        assert_eq!(semantic_key(manifest, b"lib.rs"), None);
+        assert!(healed.pending_paths.contains(b"lib.rs".as_slice()));
+        assert_eq!(
+            callgraph_key(manifest, b"lib.rs"),
+            callgraph_key(&before, b"lib.rs"),
+            "the stored call-graph key is kept"
+        );
+    }
+
+    /// A semantic key carried over from the previous manifest whose payload
+    /// is gone is replaced by the key the caller just stored for the path, or
+    /// dropped when there is none, leaving the path pending for semantic work.
+    /// The publication does not name the missing key, so its closure check
+    /// does not fail.
+    #[test]
+    fn views_missing_semantic_payload_is_replaced_or_dropped_not_published() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let lib = b"pub fn example() {}\n";
+        fs::write(project.path().join("lib.rs"), lib).unwrap();
+        fs::write(project.path().join("other.rs"), "pub fn other() {}\n").unwrap();
+        git(project.path(), &["init", "--quiet"]);
+        git(project.path(), &["add", "."]);
+        git(project.path(), &["commit", "--quiet", "-m", "base"]);
+        let family = "semantic-heal-family";
+        let put = |model: &str| {
+            let key = crate::blob_store::SemanticKey::for_current(lib, b"lib.rs", model).full_key();
+            BlobStore::open(storage.path(), family, BlobPlane::Semantic)
+                .unwrap()
+                .put(&key, b"vector")
+                .unwrap();
+            key.to_hex()
+        };
+        let first = put("model-a");
+        let mut request = AssemblyRequest {
+            storage: storage.path().to_path_buf(),
+            project_root: project.path().to_path_buf(),
+            family: family.into(),
+            scope: "semantic-heal-scope".into(),
+            desired_head: "head".into(),
+            changed_paths: BTreeSet::new(),
+            semantic_keys: BTreeMap::from([(b"lib.rs".to_vec(), first.clone())]),
+            require_semantic: true,
+            allow_blob_put: true,
+            callgraph: true,
+        };
+        let initial = publish_checkout(&request).unwrap();
+        assert!(initial.published, "{initial:?}");
+        assert_eq!(
+            semantic_key(initial.manifest.as_ref().unwrap(), b"lib.rs"),
+            Some(first.clone())
+        );
+
+        // The stored payload is lost; the caller stores a payload under a
+        // newer key for lib.rs, which is reused while other.rs is published.
+        clear_semantic_rows(storage.path(), family);
+        let second = put("model-b");
+        request.changed_paths = BTreeSet::from([b"other.rs".to_vec()]);
+        request.semantic_keys = BTreeMap::from([(b"lib.rs".to_vec(), second.clone())]);
+        let replaced = publish_checkout(&request).unwrap();
+        assert!(replaced.published, "{replaced:?}");
+        assert_eq!(
+            semantic_key(replaced.manifest.as_ref().unwrap(), b"lib.rs"),
+            Some(second)
+        );
+
+        // Lost again, and the caller has nothing to store for lib.rs.
+        clear_semantic_rows(storage.path(), family);
+        request.semantic_keys = BTreeMap::new();
+        let dropped = publish_checkout(&request).unwrap();
+        assert!(dropped.published, "{dropped:?}");
+        assert_eq!(
+            semantic_key(dropped.manifest.as_ref().unwrap(), b"lib.rs"),
+            None
+        );
+        assert!(dropped.pending_paths.contains(b"lib.rs".as_slice()));
+    }
+
+    /// A path left out because its missing payload could not be rebuilt is
+    /// marked failed only once its generation is served, like every other
+    /// status change: preparing the generation writes nothing.
+    #[test]
+    fn views_unrebuildable_payload_is_marked_failed_only_after_its_generation_is_served() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(project.path().join("lib.rs"), "pub fn lib() {}\n").unwrap();
+        fs::write(project.path().join("other.rs"), "pub fn other() {}\n").unwrap();
+        git(project.path(), &["init", "--quiet"]);
+        git(project.path(), &["add", "."]);
+        git(project.path(), &["commit", "--quiet", "-m", "base"]);
+        let mut request = AssemblyRequest {
+            storage: storage.path().to_path_buf(),
+            project_root: project.path().to_path_buf(),
+            family: "unrebuildable-family".into(),
+            scope: "unrebuildable-scope".into(),
+            desired_head: "head".into(),
+            changed_paths: BTreeSet::new(),
+            semantic_keys: BTreeMap::new(),
+            require_semantic: false,
+            allow_blob_put: true,
+            callgraph: true,
+        };
+        assert!(publish_checkout(&request).unwrap().published);
+        let store = BlobStore::open(storage.path(), &request.family, BlobPlane::Callgraph).unwrap();
+        Connection::open(store.path())
+            .unwrap()
+            .execute_batch("DELETE FROM blob_payloads")
+            .unwrap();
+        drop(store);
+        // lib.rs can no longer be read as a file; other.rs changes.
+        fs::remove_file(project.path().join("lib.rs")).unwrap();
+        fs::create_dir(project.path().join("lib.rs")).unwrap();
+        fs::write(project.path().join("other.rs"), "pub fn other2() {}\n").unwrap();
+        request.changed_paths = BTreeSet::from([b"other.rs".to_vec()]);
+        let view = ViewStore::open(storage.path(), &request.scope).unwrap();
+        let status = || {
+            crate::path_status::PathStatusStore::open(view.view_dir())
+                .unwrap()
+                .status_for(b"lib.rs")
+                .unwrap()
+        };
+
+        let mut prepared = prepare_checkout(&request, &mut |_| Ok(())).unwrap();
+        assert_eq!(status(), None, "preparing the generation wrote no status");
+        let report = prepared.commit().unwrap();
+        assert!(report.published, "{report:?}");
+        assert!(report
+            .manifest
+            .as_ref()
+            .unwrap()
+            .get(&RelPath::new(b"lib.rs".to_vec()).unwrap())
+            .is_none());
+        prepared.settle_status();
+        let failed = status().expect("marked once the generation is served");
+        assert_eq!(failed.state, crate::path_status::PathState::Failed);
+        assert_eq!(failed.reason, MISSING_PAYLOAD_SOURCE_UNREADABLE);
+    }
+}
 
 #[cfg(test)]
 #[path = "cold_fallback_tests.rs"]

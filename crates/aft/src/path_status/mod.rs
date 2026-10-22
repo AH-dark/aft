@@ -104,8 +104,9 @@ pub(crate) struct StatusIntent {
     /// a newer preparation that marked pending while this settlement waited
     /// to be applied, so the settlement leaves it alone.
     pub marked_through: u64,
-    /// Members that cannot be read for their semantic vectors, with the
-    /// failure; they are marked failed.
+    /// Paths to mark failed, with the failure: members that cannot be read
+    /// for their semantic vectors, and paths left out of the generation
+    /// because a missing payload could not be rebuilt.
     pub failed: std::collections::BTreeMap<Vec<u8>, String>,
     /// Skip outcomes for members read afresh: `Some` records a skip, `None`
     /// removes one. Members reused unread keep their rows, since their
