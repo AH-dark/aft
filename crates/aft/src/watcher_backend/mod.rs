@@ -96,6 +96,8 @@ pub(crate) use fsevents::ProjectWatcher;
 #[cfg(target_os = "linux")]
 pub(crate) use inotify::ProjectWatcher;
 #[cfg(windows)]
+pub(crate) use windows::DirectoryWatcher;
+#[cfg(windows)]
 pub(crate) use windows::ProjectWatcher;
 
 /// Whether the backend compiled into this binary inherits an exclusion down

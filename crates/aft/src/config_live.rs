@@ -1180,6 +1180,30 @@ impl Drop for ConfigFileWatch {
 
 const CONFIG_WATCH_POLL: Duration = Duration::from_millis(200);
 
+/// The watcher a config-file watch keeps on one directory at a time. macOS
+/// and Windows use AFT's own backends; notify's Windows watcher can leave a
+/// read re-armed on a closed handle when a watch stops (see the Windows
+/// `DirectoryWatcher`).
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) type ConfigDirectoryWatcher = crate::watcher_backend::DirectoryWatcher;
+#[cfg(not(any(target_os = "macos", windows)))]
+pub(crate) type ConfigDirectoryWatcher = notify::RecommendedWatcher;
+
+pub(crate) fn new_config_directory_watcher(
+    tx: mpsc::Sender<notify::Result<notify::Event>>,
+    counters: Arc<crate::context::WatcherCounters>,
+) -> notify::Result<ConfigDirectoryWatcher> {
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        Ok(ConfigDirectoryWatcher::new(tx, counters))
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let _ = counters;
+        notify::recommended_watcher(tx)
+    }
+}
+
 fn run_config_file_watch(
     file: PathBuf,
     on_change: Arc<dyn Fn() + Send + Sync>,
@@ -1189,13 +1213,8 @@ fn run_config_file_watch(
     #[cfg(test)] attach_gate: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
 ) {
     use notify::RecursiveMode;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     use notify::Watcher;
-
-    #[cfg(target_os = "macos")]
-    type ConfigDirectoryWatcher = crate::watcher_backend::DirectoryWatcher;
-    #[cfg(not(target_os = "macos"))]
-    type ConfigDirectoryWatcher = notify::RecommendedWatcher;
 
     let Some(dir) = file.parent().map(Path::to_path_buf) else {
         return;
@@ -1215,18 +1234,13 @@ fn run_config_file_watch(
         );
     }
     let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
-    #[cfg(target_os = "macos")]
-    let mut watcher = ConfigDirectoryWatcher::new(tx, counters);
-    #[cfg(not(target_os = "macos"))]
-    let mut watcher = match notify::recommended_watcher(tx) {
+    let mut watcher = match new_config_directory_watcher(tx, counters) {
         Ok(watcher) => watcher,
         Err(error) => {
             crate::slog_warn!("config watch for {} failed: {}", file.display(), error);
             return;
         }
     };
-    #[cfg(not(target_os = "macos"))]
-    let _ = counters;
     let mut attachment = DirAttachment::new(dir.clone());
     let attach = |watcher: &mut ConfigDirectoryWatcher, attachment: &mut DirAttachment| {
         attachment.attach(&mut |op| match op {
