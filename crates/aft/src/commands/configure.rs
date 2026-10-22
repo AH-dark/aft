@@ -13872,6 +13872,9 @@ mod tests {
     }
 
     fn cache_tier_failure(transport: &str, failure: &str) {
+        // Tests elsewhere set AFT_STORAGE_DIR process-wide, which outranks the
+        // storage_dir this fixture configures; hold the shared env lock without it.
+        let _storage_env = crate::test_env::without_storage_override();
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         let storage = temp.path().join("storage");

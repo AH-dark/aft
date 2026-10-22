@@ -1081,6 +1081,9 @@ mod tests {
 
     #[test]
     fn split_cache_root_bash_launch_persists_the_real_task_under_durable_storage() {
+        // Tests elsewhere set AFT_STORAGE_DIR process-wide, which outranks the
+        // configured storage_dir; hold the shared env lock without it.
+        let _storage_env = crate::test_env::without_storage_override();
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
