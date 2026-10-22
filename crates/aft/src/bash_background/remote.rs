@@ -776,11 +776,6 @@ pub(crate) struct RemoteTask {
         skip_serializing_if = "super::return_files::StagingRecord::is_empty"
     )]
     pub return_staging: super::return_files::StagingRecord,
-    /// The seqs an expired replay skipped before its manifest. They are
-    /// normally the chunks the runner no longer keeps, but may have held
-    /// output, which the report then says.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub return_gap: Option<(u64, u64)>,
 }
 
 /// This session's earlier remote job that still held the workspace when the
@@ -1454,7 +1449,6 @@ impl OutputSink for TaskSink {
         self.commit(|r| {
             r.return_first_seq = None;
             r.return_staging = Default::default();
-            r.return_gap = None;
             r.job_id = Some(accepted.job_id);
             r.queue_position = Some(accepted.queue_position);
             r.accepted = true;
@@ -1579,9 +1573,6 @@ impl OutputSink for TaskSink {
         self.returns = Some(returns);
         let unknown_len = self.output_progress.unknown_len;
         self.progress(chunk.seq, None, unknown_len)
-    }
-    fn return_gap_skipped(&mut self, first: u64, last: u64) -> io::Result<()> {
-        self.commit(|r| r.return_gap = Some((first, last)))
     }
     fn return_manifest(&mut self, manifest: &ReturnManifest) -> io::Result<()> {
         let report = match self.unsaved_return_report.take() {
@@ -1872,7 +1863,6 @@ impl BgTaskRegistry {
             returned_files: None,
             return_first_seq: None,
             return_staging: Default::default(),
-            return_gap: None,
         });
         metadata.pipeline_segments = single_top_level_pipeline(command)
             .map(|p| p.segments.into_iter().map(|s| s.label).collect())
@@ -3297,8 +3287,8 @@ pub(crate) fn remote_report(
         })
         .filter_map(|entry| entry.checkout_path.as_deref())
         .collect();
-    let returned = (!returned_files.is_empty())
-        .then(|| super::return_files::render_report(returned_files, remote.return_gap));
+    let returned =
+        (!returned_files.is_empty()).then(|| super::return_files::render_report(returned_files));
     match (returned, render_terminal_report(terminal, &copied_back)) {
         (Some(returned), Some(report)) => Some(format!("{returned}\n{report}")),
         (returned, report) => returned.or(report),
