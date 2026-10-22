@@ -4627,32 +4627,27 @@ mod grant_path_tests {
         .unwrap_or_else(|_| panic!("the remote task never reached: {what}"));
     }
 
-    /// Before the runner accepts the job, the launch reply reports status
-    /// `starting`, tells the caller not to rerun, and warns that input capture is
-    /// unconfirmed. After acceptance, the launch reply reports status `running`
-    /// without the input-capture warning.
     #[cfg(unix)]
-    fn assert_accepted_launch_reply(done: &BashDeferredCompletion, task_id: &str, case: &str) {
+    #[derive(Clone, Copy)]
+    enum ReplyDecided {
+        AfterAcceptance,
+        MayPrecedeAcceptance,
+    }
+
+    #[cfg(unix)]
+    fn assert_launch_reply(
+        done: &BashDeferredCompletion,
+        task_id: &str,
+        case: &str,
+        decided: ReplyDecided,
+    ) {
         let response = done.response_for_test();
         let text = done.text_for_test().unwrap();
         assert!(response.success, "{case}: {response:?}");
         assert_eq!(response.data["task_id"], task_id, "{case}: {response:?}");
-        match response.data["status"].as_str() {
-            Some("starting") => {
-                assert_eq!(
-                    response.data["remote_phase"], "submitting",
-                    "{case}: {response:?}"
-                );
-                assert!(
-                    text.contains(REMOTE_ADMISSION_PENDING_NOTE),
-                    "{case}: pending reply must warn against rerunning: {text}"
-                );
-                assert!(
-                    text.contains(REMOTE_INPUT_CAPTURE_WARNING),
-                    "{case}: pending reply must identify unconfirmed input capture: {text}"
-                );
-            }
-            Some("running") => {
+        match decided {
+            ReplyDecided::AfterAcceptance => {
+                assert_eq!(response.data["status"], "running", "{case}: {response:?}");
                 assert!(
                     !text.contains(REMOTE_INPUT_CAPTURE_WARNING),
                     "{case}: {text}"
@@ -4662,9 +4657,35 @@ mod grant_path_tests {
                     "{case}: {response:?}"
                 );
             }
-            status => panic!(
-                "{case}: expected a starting or running launch reply, got {status:?}: {response:?}"
-            ),
+            ReplyDecided::MayPrecedeAcceptance => match response.data["status"].as_str() {
+                Some("starting") => {
+                    assert_eq!(
+                        response.data["remote_phase"], "submitting",
+                        "{case}: {response:?}"
+                    );
+                    assert!(
+                        text.contains(REMOTE_ADMISSION_PENDING_NOTE),
+                        "{case}: pending reply must warn against rerunning: {text}"
+                    );
+                    assert!(
+                        text.contains(REMOTE_INPUT_CAPTURE_WARNING),
+                        "{case}: pending reply must identify unconfirmed input capture: {text}"
+                    );
+                }
+                Some("running") => {
+                    assert!(
+                        !text.contains(REMOTE_INPUT_CAPTURE_WARNING),
+                        "{case}: {text}"
+                    );
+                    assert!(
+                        !response.data.to_string().contains("hasn't confirmed"),
+                        "{case}: {response:?}"
+                    );
+                }
+                status => panic!(
+                    "{case}: expected a starting or running launch reply, got {status:?}: {response:?}"
+                ),
+            },
         }
     }
 
@@ -5352,14 +5373,18 @@ mod grant_path_tests {
         assert!(registered_at.elapsed() < Duration::from_secs(1));
         let response = done.response_for_test();
         let text = done.text_for_test().unwrap();
-        assert!(response.success, "{response:?}");
         let task_id = response.data["task_id"].as_str().unwrap().to_owned();
+        // The acceptance gate stays closed until after this pending reply is checked.
+        assert_launch_reply(
+            &done,
+            &task_id,
+            "reply before acceptance",
+            ReplyDecided::MayPrecedeAcceptance,
+        );
         assert_eq!(response.data["status"], "starting", "{response:?}");
         assert_eq!(response.data["remote_phase"], "submitting", "{response:?}");
         assert!(text.contains("promoted to background"), "{text}");
         assert!(text.contains(&task_id), "{text}");
-        assert!(text.contains(REMOTE_ADMISSION_PENDING_NOTE), "{text}");
-        assert!(text.contains(REMOTE_INPUT_CAPTURE_WARNING), "{text}");
         assert!(ctx
             .bash_background()
             .remote_progress(&task_id, "deadline-session")
@@ -5832,6 +5857,10 @@ mod grant_path_tests {
             },
         )
         .await;
+        wait_for_task_state(&ctx, "runner accepted", |registry| {
+            registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
+        })
+        .await;
         wait_for_task_state(&ctx, "completed", |registry| {
             registry.is_task_terminal(&task_id)
         })
@@ -5842,7 +5871,13 @@ mod grant_path_tests {
             .await
             .expect("the released launch must answer")
             .unwrap();
-        assert_accepted_launch_reply(&done, &task_id, "reply after completion");
+        // Acceptance and completion were observed before releasing the dispatch.
+        assert_launch_reply(
+            &done,
+            &task_id,
+            "reply after completion",
+            ReplyDecided::AfterAcceptance,
+        );
         assert_eq!(
             ctx.bash_background()
                 .observed_status(&task_id, "deadline-session", 0)
@@ -5916,7 +5951,8 @@ mod grant_path_tests {
                     .await
                     .expect("the released launch must answer")
                     .unwrap();
-                assert_accepted_launch_reply(&done, &task_id, &case);
+                // Acceptance was observed before the held dispatch returns.
+                assert_launch_reply(&done, &task_id, &case, ReplyDecided::AfterAcceptance);
                 if !finished {
                     daemon.output_gate.notify_one();
                     wait_for_task_state(&ctx, "completed", |registry| {
