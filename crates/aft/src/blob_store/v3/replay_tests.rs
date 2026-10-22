@@ -45,7 +45,9 @@ fn fixture(reuse: bool) -> Fixture {
     let registry = FamilyRegistry::open(&storage, FAMILY).unwrap();
     let checkout = storage.join("checkout");
     fs::create_dir_all(&checkout).unwrap();
-    let registration = registry.register_view(HOLDER, &checkout).unwrap();
+    let registration = registry
+        .register_view_with_storage(&storage, HOLDER, &checkout)
+        .unwrap();
     let payload = vec![0x5a; 64 * 1024];
     let key = FamilyKey::new(FamilyPlane::Semantic, *blake3::hash(&payload).as_bytes());
     registration

@@ -1160,7 +1160,9 @@ fn a_v3_copy_killed_at_either_v3_boundary_keeps_its_source_and_restarts() {
         let root = storage.path().join("root-a");
         fs::create_dir_all(&root).unwrap();
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
-        let view = registry.register_view("scope-a", &root).unwrap();
+        let view = registry
+            .register_view_with_storage(storage.path(), "scope-a", &root)
+            .unwrap();
         let key = put_garbage(&view, b"payload copied into v3");
         let payload = trigram_store(storage.path()).get(&key).unwrap().unwrap();
         let control = tempdir().unwrap();
@@ -1284,7 +1286,7 @@ fn a_v2_publication_crosses_no_v3_boundary_and_keeps_its_schema() {
     let storage = tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
     let view = registry
-        .register_view("scope-a", &storage.path().join("root-a"))
+        .register_view_with_storage(storage.path(), "scope-a", &storage.path().join("root-a"))
         .unwrap();
     publish(&view, &[("a.txt", b"first")], None);
     let store =

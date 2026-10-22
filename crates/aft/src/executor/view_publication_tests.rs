@@ -815,7 +815,9 @@ fn callgraph_producer_change_republishes_an_existing_generation() {
     let fixture = Fixture::new();
     let root = fixture.job_root();
     let registry = FamilyRegistry::open(fixture._storage.path(), "publication-fixture").unwrap();
-    let owner = registry.register_view("query", &root).unwrap();
+    let owner = registry
+        .register_view_with_storage(fixture._storage.path(), "query", &root)
+        .unwrap();
     let access = ViewAccess::Owner(owner.clone());
     let policy = crate::blob_store::v2::TrigramPolicy {
         max_file_size: 1 << 20,
