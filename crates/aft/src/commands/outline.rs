@@ -618,8 +618,8 @@ struct TestRegion {
 }
 
 /// What the multi-file structure map needs from one parse of a file beyond
-/// its symbols: the test regions it collapses and, for Rust, the required
-/// methods of each trait it previews. Both depend only on the file's own
+/// its symbols: the test regions it collapses and, for Rust, the methods
+/// declared in each trait it previews. Both depend only on the file's own
 /// text, so they are stored next to the symbols in the shared symbol cache
 /// under the same freshness key, and a warm outline renders the file without
 /// reading or parsing it. Test includes are resolved at render time, because
@@ -2510,8 +2510,9 @@ thread_local! {
 
 /// Whether a multi-file outline should stop before examining another file
 /// because the request deadline is less than [`OUTLINE_BATCH_RETURN_MARGIN`]
-/// away. Parsing is not deadline-aware, so this check between files is what
-/// keeps a long batch from running past the deadline and failing outright.
+/// away. Parsing is not deadline-aware, so this check between files keeps a
+/// long batch from starting another file it has no time for; a file already
+/// being parsed can still run past the deadline.
 fn outline_batch_deadline_reached(files_examined: usize) -> bool {
     #[cfg(test)]
     if let Some(limit) = OUTLINE_BATCH_DEADLINE_AFTER_FILES.with(std::cell::Cell::get) {
@@ -2567,9 +2568,10 @@ pub(crate) fn outline_examined_files(req: &RawRequest) -> Vec<&str> {
 /// Outline `files` and render their structure map within `max_bytes`.
 ///
 /// Files are outlined in the order the map shows them (by display path), and
-/// outlining stops as soon as the rendered output budget is spent: a file
-/// that could not be shown is never read or parsed. Those files still count
-/// in `total_requested`, so the footer reports them as not shown. Outlining
+/// outlining stops as soon as the rendered output budget is spent: the first
+/// file that does not fit has been read and parsed, but later files are not.
+/// The files not shown still count in `total_requested`, so the footer
+/// reports them as not shown. Outlining
 /// also stops when the request deadline is close (see
 /// [`outline_batch_deadline_reached`]), returning the files shown so far.
 #[allow(clippy::too_many_arguments)]
@@ -3375,7 +3377,7 @@ fn add_trait_member_previews(
     apply_trait_member_previews(&previews, entries);
 }
 
-/// Collect each trait's range and its required method rows from the tree,
+/// Collect each trait's range and its method rows from the tree,
 /// so they can be cached and attached later without the tree.
 fn collect_trait_member_previews(
     node: tree_sitter::Node<'_>,
