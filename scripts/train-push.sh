@@ -952,7 +952,7 @@ read_required_check_results() {
   local sha="$1"
   CHECK_RUN_RESULTS="$(gh_query_or_refuse "check runs for required contexts on $sha" "$OPERATOR_GH" \
     api --paginate "repos/$repo_slug/commits/$sha/check-runs?per_page=100" \
-    --jq '.check_runs[] | [(.name // ""), (.status // ""), (.conclusion // ""), (.created_at // "")] | @tsv')" || return "$?"
+    --jq '.check_runs[] | [(.name // ""), (.status // ""), (.conclusion // "-"), (.created_at // "")] | @tsv')" || return "$?"
   COMMIT_STATUS_RESULTS="$(gh_query_or_refuse "commit statuses for required contexts on $sha" "$OPERATOR_GH" \
     api --paginate "repos/$repo_slug/commits/$sha/status?per_page=100" \
     --jq '.statuses[] | [(.context // ""), (.state // ""), (.created_at // "")] | @tsv')" || return "$?"

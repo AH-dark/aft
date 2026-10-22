@@ -187,9 +187,25 @@ if [ "${1:-}" = "api" ]; then
       printf '%s\n' "$poll_count" > "$STATE/required_check_polls"
       initial_polls="$(cat "$STATE/required_initial_polls" 2>/dev/null || echo 0)"
       if [ "$poll_count" -le "$initial_polls" ]; then
-        cat "$STATE/required_check_runs.initial" 2>/dev/null || true
+        results_file="$STATE/required_check_runs.initial"
       else
-        cat "$STATE/required_check_runs.final" 2>/dev/null || true
+        results_file="$STATE/required_check_runs.final"
+      fi
+      if [[ "$jq_arg" == *'(.conclusion // "-")'* ]]; then
+        python3 - "$results_file" <<'PY'
+import pathlib, sys
+source = pathlib.Path(sys.argv[1])
+if source.exists():
+    for line in source.read_text().splitlines():
+        fields = line.split('\t')
+        while len(fields) < 4:
+            fields.append('')
+        if not fields[2]:
+            fields[2] = '-'
+        print('\t'.join(fields))
+PY
+      else
+        cat "$results_file" 2>/dev/null || true
       fi
       exit 0
       ;;
@@ -1390,6 +1406,28 @@ test_required_check_uses_latest_run_state() {
   fi
 }
 
+test_required_check_newer_pending_waits() {
+  local dir sha polls
+  dir="$(new_fixture required-check-newer-pending)"
+  add_train_commit "$dir/work" required-check-newer-pending
+  sha="$(git -C "$dir/work" rev-parse HEAD)"
+  printf 'linux\n' > "$dir/ci-state/required_contexts"
+  printf '1\n' > "$dir/ci-state/required_initial_polls"
+  printf 'linux\tcompleted\tsuccess\t2026-01-01T00:00:00Z\nlinux\tin_progress\t\t2026-01-02T00:00:00Z\n' \
+    > "$dir/ci-state/required_check_runs.initial"
+  printf 'linux\tcompleted\tsuccess\t2026-01-03T00:00:00Z\n' \
+    > "$dir/ci-state/required_check_runs.final"
+  run_train "$dir" required-check-newer-pending
+  polls="$(cat "$dir/ci-state/required_check_polls" 2>/dev/null || echo 0)"
+  if [ "$LAST_RC" -eq 0 ] && [ "$polls" -ge 2 ] &&
+    [[ "$LAST_OUT" == *"waiting for required status checks on $sha"* ]] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$sha" ]; then
+    ok 'a newer pending run keeps the same required context pending until success'
+  else
+    fail "a newer pending run keeps the same required context pending until success (rc=$LAST_RC polls=$polls)"
+  fi
+}
+
 test_required_check_missing_times_out() {
   local dir base polls
   dir="$(new_fixture required-check-missing)"
@@ -1444,6 +1482,7 @@ run_stack_tests() {
   test_required_check_waits_on_land_recovery
   test_required_check_failure_is_red
   test_required_check_uses_latest_run_state
+  test_required_check_newer_pending_waits
   test_required_check_missing_times_out
   test_protection_unreadable_falls_back
 }
@@ -1593,6 +1632,7 @@ case "${TRAIN_PUSH_TEST_CASE:-}" in
   required-check-land) test_required_check_waits_on_land_recovery ;;
   required-check-failure) test_required_check_failure_is_red ;;
   required-check-latest) test_required_check_uses_latest_run_state ;;
+  required-check-newer-pending) test_required_check_newer_pending_waits ;;
   required-check-missing) test_required_check_missing_times_out ;;
   protection-unreadable) test_protection_unreadable_falls_back ;;
   skew-log-fallback) test_skew_log_query_fallback ;;
