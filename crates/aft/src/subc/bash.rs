@@ -4572,6 +4572,7 @@ mod grant_path_tests {
             timing,
             cancel,
             Arc::new(DispatchPathMetrics::new()),
+            Instant::now(),
         )
         .await
     }
@@ -4586,6 +4587,7 @@ mod grant_path_tests {
         timing: Arc<BashTimingForTest>,
         cancel: BashWaitCancel,
         metrics: Arc<DispatchPathMetrics>,
+        received_at: Instant,
     ) -> (mpsc::Receiver<BashDeferredCompletion>, String) {
         let rx = with_bash_timing_for_test(Some(timing.clone()), || {
             deadline_test_call_controlled(
@@ -4593,7 +4595,7 @@ mod grant_path_tests {
                 root,
                 held_remote_runon_stub,
                 arguments,
-                Instant::now(),
+                received_at,
                 false,
                 false,
                 metrics,
@@ -5197,6 +5199,7 @@ mod grant_path_tests {
                 drain: drain::ModuleDrainWindow::default(),
             },
             metrics.clone(),
+            Instant::now(),
         )
         .await;
         wait_for_task_state(&ctx, "Accepted", |registry| {
@@ -5889,11 +5892,10 @@ mod grant_path_tests {
     }
 
     /// This test checks launch replies after the input-capture wait ends once
-    /// the runner has accepted the job. The wait can end because AFT begins
-    /// restarting or because its deadline expires. Before acceptance, the reply
-    /// reports `starting` and warns against rerunning; afterward it reports
-    /// `running` without the capture warning. Even if the job finishes before
-    /// the reply is sent, the launch call returns its task handle, not the result.
+    /// the runner has accepted the job. Module-drain replies are decided only after
+    /// acceptance is observed; a capture deadline may instead return a pending reply
+    /// before the runner accepts the job. A completed job still returns its task
+    /// handle, not the finished result.
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_wait_ended_after_accepted_keeps_launch_reply() {
@@ -5909,7 +5911,10 @@ mod grant_path_tests {
                     },
                     if finished { "finished" } else { "running" }
                 );
-                let script = if finished {
+                let gate_acceptance_after_deadline = !drain_ends_wait && finished;
+                let script = if gate_acceptance_after_deadline {
+                    Script::GatedAcceptanceThenExit
+                } else if finished {
                     Script::Plain
                 } else {
                     Script::GatedStages { position: 1 }
@@ -5917,7 +5922,6 @@ mod grant_path_tests {
                 let (daemon, _dir, root, executor, ctx) = capture_fixture(script).await;
                 let mut timing = BashTimingForTest::new(Instant::now());
                 if !drain_ends_wait {
-                    // The capture deadline passes while the dispatch is held.
                     Arc::get_mut(&mut timing).unwrap().capture_wait =
                         Some(Duration::from_millis(1));
                 }
@@ -5930,14 +5934,61 @@ mod grant_path_tests {
                     route: PersistentCancelSignal::new(),
                     drain: drain::ModuleDrainWindow::default(),
                 };
-                let (mut rx, task_id) = held_capture_call(
-                    &executor,
-                    &root,
-                    json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000}),
-                    timing.clone(),
-                    cancel.clone(),
-                )
-                .await;
+                let received_at = if gate_acceptance_after_deadline {
+                    Instant::now() - Duration::from_secs(2)
+                } else {
+                    Instant::now()
+                };
+                let (mut rx, task_id) = held_capture_call_with_metrics(
+                &executor,
+                &root,
+                json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000}),
+                timing.clone(),
+                cancel.clone(),
+                Arc::new(DispatchPathMetrics::new()),
+                received_at,
+            )
+            .await;
+                if gate_acceptance_after_deadline {
+                    // Keep Accepted behind the runner gate until the 1 ms deadline reply is sent.
+                    daemon.wait_for_requests("exec.run", 1).await;
+                    assert_eq!(
+                        ctx.bash_background()
+                            .runon_inputs_captured(&task_id, "deadline-session"),
+                        Some(false),
+                        "the runner remains behind its acceptance gate after the capture deadline"
+                    );
+                    assert!(
+                        Instant::now() >= received_at + Duration::from_millis(1),
+                        "the one-millisecond capture deadline must expire before Accepted"
+                    );
+                    tokio::time::timeout(Duration::from_secs(5), timing.startup.armed.notified())
+                        .await
+                        .expect("startup handoff must be waiting for its test gate");
+                    timing.startup.fire.notify_one();
+                    let done = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                        .await
+                        .expect("the expired capture deadline must answer before Accepted")
+                        .unwrap();
+                    assert_eq!(
+                        ctx.bash_background()
+                            .runon_inputs_captured(&task_id, "deadline-session"),
+                        Some(false),
+                        "the reply is selected while the runner is still gated"
+                    );
+                    daemon.acceptance_gate.notify_one();
+                    wait_for_task_state(&ctx, "Accepted and completed", |registry| {
+                        registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
+                            && registry.is_task_terminal(&task_id)
+                    })
+                    .await;
+                    BashTimingForTest::release(&timing.result);
+                    // The reply was selected before acceptance, so its starting status is accurate.
+                    assert_launch_reply(&done, &task_id, &case, ReplyDecided::MayPrecedeAcceptance);
+                    assert_eq!(done.response_for_test().data["status"], "starting");
+                    continue;
+                }
+
                 wait_for_task_state(&ctx, "Accepted", |registry| {
                     registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
                         && (!finished || registry.is_task_terminal(&task_id))
@@ -5951,8 +6002,13 @@ mod grant_path_tests {
                     .await
                     .expect("the released launch must answer")
                     .unwrap();
-                // Acceptance was observed before the held dispatch returns.
-                assert_launch_reply(&done, &task_id, &case, ReplyDecided::AfterAcceptance);
+                if drain_ends_wait {
+                    // Acceptance was observed before the module drain decided the reply.
+                    assert_launch_reply(&done, &task_id, &case, ReplyDecided::AfterAcceptance);
+                } else {
+                    // The capture deadline can decide the reply before Accepted is observed.
+                    assert_launch_reply(&done, &task_id, &case, ReplyDecided::MayPrecedeAcceptance);
+                }
                 if !finished {
                     daemon.output_gate.notify_one();
                     wait_for_task_state(&ctx, "completed", |registry| {
