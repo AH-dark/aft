@@ -4021,8 +4021,7 @@ fn run_subc_mode_inner(
         drop(ctx);
         // Saved paused tasks may still owe their runner a cancel; send those
         // now rather than when (if ever) their projects bind again.
-        #[cfg(unix)]
-        crate::bash_background::BgTaskRegistry::start_owed_cancel_pass(&storage_dir);
+        crate::bash_background::note_storage_root(&storage_dir);
         let stream =
             connect_and_authenticate(connection_file_path, lifecycle_probe.as_ref()).await?;
         log::info!(

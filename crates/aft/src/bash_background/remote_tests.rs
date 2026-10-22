@@ -7174,8 +7174,17 @@ async fn saved_task_owing_a_cancel(
         saved.remote.unwrap().cancel_pending,
         "the cancel must be owed"
     );
+    assert!(
+        owed_marker(dir, &task_id).is_file(),
+        "the owed cancel must be indexed"
+    );
     assert!(exec_cancels(&daemon).is_empty(), "the cancel was sent");
     (daemon, task_id, job_id, json)
+}
+
+/// The owed-cancel index entry for a task saved under storage `dir`.
+fn owed_marker(dir: &Path, task_id: &str) -> PathBuf {
+    dir.join("bash-owed-cancels").join(task_id)
 }
 
 /// Run the startup pass that sends owed cancels under `storage` to its end,
@@ -7210,6 +7219,14 @@ fn assert_owed_cancel_sent_once(
     assert!(!remote.cancel_pending, "{remote:?}");
     assert_eq!(remote.owner_pause_cancel.as_deref(), Some("sent"));
     assert_eq!(exec_runs(daemon).len(), 1, "never resubmitted");
+    let storage = json
+        .ancestors()
+        .find(|dir| dir.join("bash-tasks").is_dir())
+        .unwrap();
+    assert!(
+        !owed_marker(storage, &saved.task_id).exists(),
+        "the settled cancel must leave the index"
+    );
 }
 
 /// A paused worker's checkout may never bind again after a restart, so its
@@ -7283,6 +7300,103 @@ async fn the_owed_cancel_pass_retries_until_the_runner_is_reachable() {
         .unwrap();
     assert_eq!(report.sent, 1, "{report:?}");
     assert_owed_cancel_sent_once(&daemon, job_id, &json);
+}
+
+/// The production entry point: `configure` of a standalone process (here
+/// for another project) starts the owed cancel pass for its storage root.
+/// The runner gets the paused task's cancel although the task's own project
+/// never binds.
+#[tokio::test]
+async fn configure_sends_an_owed_runner_cancel_without_binding_its_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, task_id, job_id, json) = saved_task_owing_a_cancel(dir.path(), 2).await;
+    let other = tempfile::tempdir().unwrap();
+    let ctx = Arc::new(restarted_context(other.path()));
+    let configure = {
+        let (ctx, other, storage) = (
+            ctx.clone(),
+            other.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
+        tokio::task::spawn_blocking(move || {
+            // The configured storage root, not a worker-wide override.
+            let _storage = crate::test_env::without_storage_override();
+            crate::commands::configure::handle_configure(
+                &crate::protocol::RawRequest {
+                    id: "configure-other-project".into(),
+                    command: "configure".into(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: serde_json::json!({
+                        "project_root": other,
+                        "storage_dir": storage,
+                        "harness": "opencode",
+                    }),
+                },
+                &ctx,
+            )
+        })
+    };
+    daemon.wait_for_requests("exec.cancel", 1).await;
+    let configured = configure.await.unwrap();
+    assert!(configured.success, "{configured:?}");
+    wait_for("the sent cancel must be saved", || {
+        let remote = read_task(&json).ok()?.remote?;
+        (!remote.cancel_pending).then_some(())
+    })
+    .await;
+    assert_owed_cancel_sent_once(&daemon, job_id, &json);
+    assert!(
+        ctx.bash_background().task_for_test(&task_id).is_none(),
+        "the task's project was not bound"
+    );
+    assert_eq!(remote_workers(&task_id), (1, 1), "no worker was started");
+}
+
+/// The pass reads only the owed-cancel index, not the task history: with 200
+/// other finished records saved beside the one owing a cancel, it examines
+/// one marker.
+#[tokio::test]
+async fn the_owed_cancel_pass_reads_only_owed_markers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _task_id, job_id, json) = saved_task_owing_a_cancel(dir.path(), 2).await;
+    let finished = read_task(&json).unwrap();
+    for n in 0..200u64 {
+        let mut record = finished.clone();
+        record.task_id = format!("bash-{:016x}", 0xabc000 + n);
+        record.remote.as_mut().unwrap().cancel_pending = false;
+        let layout = crate::bash_background::persistence::create_task_layout(
+            dir.path(),
+            &record.session_id,
+            &record.task_id,
+        )
+        .unwrap();
+        write_task_at(&layout, &record).unwrap();
+    }
+    let report = run_owed_cancel_pass(dir.path()).await;
+    assert_eq!(report.examined, 1, "{report:?}");
+    assert_eq!(report.sent, 1, "{report:?}");
+    assert_owed_cancel_sent_once(&daemon, job_id, &json);
+}
+
+/// A marker left behind after its record stopped owing the cancel (a crash
+/// between the record write and the marker's removal) is removed by the
+/// pass, which sends nothing.
+#[tokio::test]
+async fn a_stale_owed_cancel_marker_is_removed_without_sending() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, task_id, _job_id, json) = saved_task_owing_a_cancel(dir.path(), 2).await;
+    let mut saved = read_task(&json).unwrap();
+    saved.remote.as_mut().unwrap().cancel_pending = false;
+    write_task(&json, &saved).unwrap();
+    let report = run_owed_cancel_pass(dir.path()).await;
+    assert_eq!(
+        (report.examined, report.stale_markers, report.sent),
+        (1, 1, 0),
+        "{report:?}"
+    );
+    assert!(exec_cancels(&daemon).is_empty());
+    assert!(!owed_marker(dir.path(), &task_id).exists());
 }
 
 /// The startup pass has claimed a saved task's owed cancel when its project

@@ -1519,7 +1519,10 @@ impl OutputSink for TaskSink {
                         )));
                 }
             }
-        })
+        })?;
+        // The saved record no longer owes a cancel; drop its index entry.
+        remove_owed_cancel_marker(&self.task.paths);
+        Ok(())
     }
 }
 
@@ -1912,7 +1915,15 @@ impl BgTaskRegistry {
                     apply_owed_cancel_outcome(&task, outcome);
                     let mut db = DeferredDbWrites::new(self, &task);
                     if let Ok(state) = task.state.lock() {
-                        let _ = self.persist_task_locked(&task, &state.metadata, &mut db);
+                        let saved = self.persist_task_locked(&task, &state.metadata, &mut db);
+                        let still_owed = state
+                            .metadata
+                            .remote
+                            .as_ref()
+                            .is_some_and(|remote| remote.cancel_pending);
+                        if saved.is_ok() && !still_owed {
+                            remove_owed_cancel_marker(&task.paths);
+                        }
                     }
                     return Ok(());
                 }
@@ -3155,6 +3166,9 @@ impl BgTaskRegistry {
                 };
                 remote.cancel_requested = true;
                 if owed && remote.terminal.is_none() {
+                    // Indexed before the record says so (see
+                    // `write_owed_cancel_marker`).
+                    write_owed_cancel_marker(&task.paths);
                     remote.cancel_pending = true;
                 }
                 self.persist_task_locked(task, &state.metadata, &mut db)
@@ -3201,6 +3215,7 @@ impl BgTaskRegistry {
             let remote = state.metadata.remote.as_mut().unwrap();
             remote.cancel_requested = true;
             if remote.terminal.is_none() {
+                write_owed_cancel_marker(&task.paths);
                 remote.cancel_pending = true;
             }
             self.persist_task_locked(task, &state.metadata, &mut db)
@@ -3271,7 +3286,15 @@ impl BgTaskRegistry {
                     Err(error) => format!("failed: {error}"),
                 });
             }
-            let _ = self.persist_task_locked(task, &state.metadata, &mut db);
+            let saved = self.persist_task_locked(task, &state.metadata, &mut db);
+            let still_owed = state
+                .metadata
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.cancel_pending);
+            if saved.is_ok() && !still_owed {
+                remove_owed_cancel_marker(&task.paths);
+            }
             terminal
         };
         task.kill_settled.notify_all();
@@ -3378,12 +3401,72 @@ fn apply_owed_cancel_outcome(task: &BgTask, outcome: &str) {
     task.kill_settled.notify_all();
 }
 
-/// How many saved task records the startup pass's discovery scan reads at
-/// most. A storage root holds every session's task history; the scan stops
-/// here rather than scaling without bound. (A record found to owe a cancel is
-/// read again before sending and when its outcome is saved.)
+/// The owed-cancel index: next to each storage directory's `bash-tasks`
+/// (the storage root's own and each harness directory's), one marker file
+/// per saved remote task that owes its runner a cancel
+/// (`RemoteTask::cancel_pending`), named by task id and holding its session
+/// directory. It sits beside `bash-tasks`, not inside it, because the
+/// persisted-task sweep treats every directory in `bash-tasks` as a session.
+///
+/// A marker is written before the record that sets `cancel_pending` and
+/// removed after the record that clears it is saved, so a crash leaves at
+/// worst a marker whose record owes nothing, which the startup pass removes.
+/// If writing a marker fails (logged), that cancel is not indexed: replay of
+/// its project still sends it, but the startup pass will not find it. The
+/// pass lists only these markers.
 #[cfg(unix)]
-const OWED_CANCEL_SCAN_LIMIT: usize = 20_000;
+const OWED_CANCEL_MARKERS: &str = "bash-owed-cancels";
+
+/// The owed-cancel marker for a task, beside its storage directory's
+/// `bash-tasks` (see `OWED_CANCEL_MARKERS`).
+#[cfg(unix)]
+fn owed_cancel_marker(paths: &TaskPaths) -> Option<PathBuf> {
+    let storage_dir = paths.session_dir.parent()?.parent()?;
+    Some(storage_dir.join(OWED_CANCEL_MARKERS).join(&paths.task_id))
+}
+
+/// Index a cancel the task's record is about to owe. A failure is logged:
+/// the record still owes the cancel, and replay still sends it, but the
+/// startup pass will not find it.
+#[cfg(unix)]
+fn write_owed_cancel_marker(paths: &TaskPaths) {
+    let Some(marker) = owed_cancel_marker(paths) else {
+        return;
+    };
+    let written = marker
+        .parent()
+        .map_or(Ok(()), crate::private_storage::create_dir_all)
+        .and_then(|()| {
+            crate::private_storage::write(&marker, paths.session_dir.as_os_str().as_encoded_bytes())
+        });
+    if let Err(error) = written {
+        crate::slog_warn!(
+            "owed runner cancel for task {} not indexed at {}: {error}",
+            paths.task_id,
+            marker.display()
+        );
+    }
+}
+
+/// Drop a task's owed-cancel marker once its saved record owes nothing.
+#[cfg(unix)]
+fn remove_owed_cancel_marker(paths: &TaskPaths) {
+    if let Some(marker) = owed_cancel_marker(paths) {
+        remove_marker_file(&marker);
+    }
+}
+
+#[cfg(unix)]
+fn remove_marker_file(marker: &Path) {
+    match fs::remove_file(marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => crate::slog_warn!(
+            "owed runner cancel marker {} not removed: {error}",
+            marker.display()
+        ),
+    }
+}
 
 /// Connection attempts per owed cancel, and the first wait between them; the
 /// wait doubles after each failed attempt: 1, 2, 4, 8 and 16 seconds in
@@ -3399,11 +3482,16 @@ const OWED_CANCEL_FIRST_BACKOFF: Duration = Duration::from_millis(50);
 #[cfg(unix)]
 #[derive(Debug, Default)]
 pub(crate) struct OwedCancelReport {
+    /// Owed-cancel markers read; no other task record is opened.
     pub examined: usize,
     pub sent: usize,
     pub failed: usize,
     pub cleared_without_job: usize,
+    /// Left to a remote worker of this process, or to the replay of a task
+    /// saved unfinished, which sends the cancel itself.
     pub left_to_worker: usize,
+    /// Markers whose record owed nothing (or was gone), removed unsent.
+    pub stale_markers: usize,
 }
 
 #[cfg(unix)]
@@ -3415,13 +3503,14 @@ impl BgTaskRegistry {
     /// runner its cancel. If the module stops in between, the record keeps
     /// the cancel owed (`RemoteTask::cancel_pending`); replay sends it, but a
     /// paused worker's checkout may never bind again, and its runner job then
-    /// holds a runner slot until its own deadline. This pass reads saved
-    /// task records directly (the storage root's own task directory and each
-    /// harness directory beneath it, at most `OWED_CANCEL_SCAN_LIMIT`
-    /// records) and sends the owed cancels one after another on one dedicated
-    /// background thread, never on the request loop. It starts no project, binds no root and restores no
-    /// task. Runs once per storage root per process; later calls return
-    /// `None`.
+    /// holds a runner slot until its own deadline. This pass lists the
+    /// owed-cancel index (`OWED_CANCEL_MARKERS`) of the storage root and of
+    /// each harness directory beneath it, so its cost follows the number of
+    /// owed cancels, not the task history, reads only the indexed records,
+    /// and sends their cancels one after another on one dedicated background
+    /// thread, never on the request loop. It starts no project, binds no
+    /// root and restores no task. Runs once per storage root per process
+    /// (see `note_storage_root`); later calls return `None`.
     pub(crate) fn start_owed_cancel_pass(
         storage_root: &Path,
     ) -> Option<std::thread::JoinHandle<OwedCancelReport>> {
@@ -3450,13 +3539,14 @@ impl BgTaskRegistry {
                     }
                 };
                 crate::slog_info!(
-                    "owed runner cancels under {}: examined={} sent={} failed={} cleared_without_job={} left_to_worker={}",
+                    "owed runner cancels under {}: examined={} sent={} failed={} cleared_without_job={} left_to_worker={} stale_markers={}",
                     storage_root.display(),
                     report.examined,
                     report.sent,
                     report.failed,
                     report.cleared_without_job,
-                    report.left_to_worker
+                    report.left_to_worker,
+                    report.stale_markers
                 );
                 report
             })
@@ -3465,73 +3555,82 @@ impl BgTaskRegistry {
     }
 }
 
-/// Saved finished remote tasks under `storage_root` that owe their runner a
-/// cancel, as (session directory, task id), with how many records were read.
+/// One indexed owed cancel: its marker, the task's session directory and
+/// its task id.
 #[cfg(unix)]
-fn owed_cancel_candidates(storage_root: &Path) -> (Vec<(PathBuf, String)>, usize) {
-    let mut storage_dirs = vec![storage_root.to_path_buf()];
+struct OwedCancelMarker {
+    marker: PathBuf,
+    session_dir: PathBuf,
+    task_id: String,
+}
+
+/// The owed-cancel markers under `storage_root`: its own index and each
+/// harness directory's (see `OWED_CANCEL_MARKERS`). A marker whose name is
+/// not a task id, or that cannot be read, is skipped and logged.
+#[cfg(unix)]
+fn owed_cancel_markers(storage_root: &Path) -> Vec<OwedCancelMarker> {
+    let mut index_dirs = vec![storage_root.join(OWED_CANCEL_MARKERS)];
     if let Ok(entries) = fs::read_dir(storage_root) {
-        let mut harness_dirs = entries
+        let mut harness_indexes = entries
             .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.join("bash-tasks").is_dir())
+            .map(|entry| entry.path().join(OWED_CANCEL_MARKERS))
+            .filter(|index| index.is_dir())
             .collect::<Vec<_>>();
-        harness_dirs.sort();
-        storage_dirs.extend(harness_dirs);
+        harness_indexes.sort();
+        index_dirs.extend(harness_indexes);
     }
-    let mut candidates = Vec::new();
-    let mut examined = 0;
-    'dirs: for storage_dir in storage_dirs {
-        let Ok(sessions) = fs::read_dir(storage_dir.join("bash-tasks")) else {
+    let mut markers = Vec::new();
+    for index in index_dirs {
+        let Ok(entries) = fs::read_dir(&index) else {
             continue;
         };
-        let mut session_dirs = sessions
+        let mut entries = entries
             .flatten()
             .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
             .collect::<Vec<_>>();
-        session_dirs.sort();
-        for session_dir in session_dirs {
-            let Ok((task_ids, _invalid)) = discover_task_ids(&session_dir) else {
+        entries.sort();
+        for marker in entries {
+            let Some(task_id) = marker
+                .file_name()
+                .and_then(OsStr::to_str)
+                .filter(|name| validate_task_id(name).is_ok())
+                .map(str::to_owned)
+            else {
+                crate::slog_warn!(
+                    "owed runner cancel index entry {} ignored",
+                    marker.display()
+                );
                 continue;
             };
-            for task_id in task_ids {
-                if examined >= OWED_CANCEL_SCAN_LIMIT {
-                    crate::slog_warn!(
-                        "owed runner cancel pass stopped after reading {examined} task records under {}",
-                        storage_root.display()
-                    );
-                    break 'dirs;
-                }
-                examined += 1;
-                let Ok(metadata) = resolve_task_layout(&session_dir, &task_id)
-                    .and_then(|layout| read_task_at(&layout))
-                else {
-                    continue;
-                };
-                if metadata.task_id == task_id
-                    && metadata.is_terminal()
-                    && metadata
-                        .remote
-                        .as_ref()
-                        .is_some_and(|remote| remote.cancel_pending)
-                {
-                    candidates.push((session_dir.clone(), task_id));
-                }
+            match fs::read(&marker) {
+                Ok(bytes) => markers.push(OwedCancelMarker {
+                    session_dir: PathBuf::from(String::from_utf8_lossy(&bytes).into_owned()),
+                    marker,
+                    task_id,
+                }),
+                Err(error) => crate::slog_warn!(
+                    "owed runner cancel marker {} unreadable: {error}",
+                    marker.display()
+                ),
             }
         }
     }
-    (candidates, examined)
+    markers
 }
 
 #[cfg(unix)]
 async fn send_owed_cancels(storage_root: &Path) -> OwedCancelReport {
-    let (candidates, examined) = owed_cancel_candidates(storage_root);
+    let markers = owed_cancel_markers(storage_root);
     let mut report = OwedCancelReport {
-        examined,
+        examined: markers.len(),
         ..Default::default()
     };
-    for (session_dir, task_id) in candidates {
+    for OwedCancelMarker {
+        marker,
+        session_dir,
+        task_id,
+    } in markers
+    {
         {
             let mut owed = owed_cancels()
                 .lock()
@@ -3557,13 +3656,14 @@ async fn send_owed_cancels(storage_root: &Path) -> OwedCancelReport {
         let mut owed = owed_cancels()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let outcome = save_owed_cancel_outcome(&session_dir, &task_id, sent);
+        let outcome = save_owed_cancel_outcome(&session_dir, &task_id, &marker, sent);
         let adopters = match owed.claims.remove(&task_id) {
             Some(OwedCancelOwner::Pass { adopters }) => adopters,
             _ => Vec::new(),
         };
         match outcome {
-            OwedCancelOutcome::NoLongerOwed => {}
+            OwedCancelOutcome::Stale => report.stale_markers += 1,
+            OwedCancelOutcome::Kept => report.left_to_worker += 1,
             OwedCancelOutcome::Settled(outcome) => {
                 if outcome == "sent" {
                     report.sent += 1;
@@ -3588,9 +3688,13 @@ async fn send_owed_cancels(storage_root: &Path) -> OwedCancelReport {
 
 #[cfg(unix)]
 enum OwedCancelOutcome {
-    /// Nothing was sent: the record could not be read, or it no longer owes
-    /// a cancel (a worker settled it first).
-    NoLongerOwed,
+    /// Nothing was sent, and the marker was removed: the record is gone, or
+    /// owes no cancel (a worker settled it first, or a crash left the marker
+    /// after its record was cleared).
+    Stale,
+    /// Nothing was sent, and the marker stays: the record could not be read,
+    /// or the task was saved unfinished, so its replay sends the cancel.
+    Kept,
     /// No longer owed: the runner acknowledged the cancel, or no job id was
     /// saved for any cancel to reach. Writing the outcome to the record is
     /// best effort; a failed write is logged.
@@ -3603,12 +3707,12 @@ enum OwedCancelOutcome {
 /// What sending one owed cancel did, before it is saved.
 #[cfg(unix)]
 enum OwedCancelSend {
-    NoLongerOwed,
+    /// The record is gone or owes no cancel.
+    NotOwed,
+    /// The record could not be read, or the task is saved unfinished.
+    Kept,
     /// Whether the record stops owing the cancel, and the outcome to save.
-    Done {
-        cleared: bool,
-        outcome: String,
-    },
+    Done { cleared: bool, outcome: String },
 }
 
 /// Save one owed cancel's outcome to the task's record. The record is
@@ -3618,10 +3722,16 @@ enum OwedCancelSend {
 fn save_owed_cancel_outcome(
     session_dir: &Path,
     task_id: &str,
+    marker: &Path,
     sent: OwedCancelSend,
 ) -> OwedCancelOutcome {
-    let OwedCancelSend::Done { cleared, outcome } = sent else {
-        return OwedCancelOutcome::NoLongerOwed;
+    let (cleared, outcome) = match sent {
+        OwedCancelSend::NotOwed => {
+            remove_marker_file(marker);
+            return OwedCancelOutcome::Stale;
+        }
+        OwedCancelSend::Kept => return OwedCancelOutcome::Kept,
+        OwedCancelSend::Done { cleared, outcome } => (cleared, outcome),
     };
     let saved = resolve_task_layout(session_dir, task_id).and_then(|layout| {
         let mut record = read_task_at(&layout)?;
@@ -3633,10 +3743,13 @@ fn save_owed_cancel_outcome(
         }
         write_task_at(&layout, &record)
     });
-    if let Err(error) = saved {
-        crate::slog_warn!(
+    match saved {
+        // The marker goes only once the record says nothing is owed.
+        Ok(()) if cleared => remove_marker_file(marker),
+        Ok(()) => {}
+        Err(error) => crate::slog_warn!(
             "owed runner cancel for task {task_id}: outcome {outcome} not saved: {error}"
-        );
+        ),
     }
     if cleared {
         OwedCancelOutcome::Settled(outcome)
@@ -3648,20 +3761,32 @@ fn save_owed_cancel_outcome(
 /// Send one saved task's owed cancel.
 #[cfg(unix)]
 async fn send_owed_cancel(session_dir: &Path, task_id: &str) -> OwedCancelSend {
-    let Ok(metadata) =
-        resolve_task_layout(session_dir, task_id).and_then(|layout| read_task_at(&layout))
-    else {
-        return OwedCancelSend::NoLongerOwed;
+    // Read under the claim: a worker that stopped before the claim was
+    // taken may have sent the cancel already.
+    let metadata = match resolve_task_layout(session_dir, task_id)
+        .and_then(|layout| read_task_at(&layout))
+    {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return OwedCancelSend::NotOwed,
+        Err(error) => {
+            crate::slog_warn!(
+                "owed runner cancel for task {task_id}: record unreadable, left owed: {error}"
+            );
+            return OwedCancelSend::Kept;
+        }
     };
-    // Read again under the claim: a worker that stopped before the claim
-    // was taken may have sent the cancel already.
     let Some(remote) = metadata
         .remote
         .as_ref()
-        .filter(|remote| remote.cancel_pending && metadata.is_terminal())
+        .filter(|remote| remote.cancel_pending && metadata.task_id == task_id)
     else {
-        return OwedCancelSend::NoLongerOwed;
+        return OwedCancelSend::NotOwed;
     };
+    if !metadata.is_terminal() {
+        // Saved unfinished: the replay of its project restores the task and
+        // its worker cancels the job.
+        return OwedCancelSend::Kept;
+    }
     let (cleared, outcome) = match remote.job_id {
         None => {
             crate::slog_info!(
