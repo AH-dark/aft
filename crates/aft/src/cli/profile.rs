@@ -177,18 +177,27 @@ pub fn run(args: Vec<OsString>) -> Result<(), ProfileError> {
         args.dsym.as_deref(),
     )
     .and_then(|debug| symbolicate(&mut threads, &debug, &target.image));
-    if let Err(error) = symbolicated {
-        let reason = match preserve_raw_sample(target.pid, &captured.raw) {
-            Ok(path) => format!(
-                "{error}; the unsymbolicated sample was kept at {}",
-                path.display()
-            ),
-            Err(keep_error) => {
-                format!("{error}; the unsymbolicated sample could not be kept either: {keep_error}")
+    match symbolicated {
+        Err(error) => {
+            let reason = match preserve_raw_sample(target.pid, &captured.raw) {
+                Ok(path) => format!(
+                    "{error}; the unsymbolicated sample was kept at {}",
+                    path.display()
+                ),
+                Err(keep_error) => {
+                    format!(
+                        "{error}; the unsymbolicated sample could not be kept either: {keep_error}"
+                    )
+                }
+            };
+            eprintln!("aft profile: symbols unavailable: {reason}");
+            mark_symbols_unavailable(&mut threads, &target.image, &reason);
+        }
+        Ok(()) => {
+            if let Some(warning) = partial_symbols_warning(&threads) {
+                eprintln!("{warning}");
             }
-        };
-        eprintln!("aft profile: symbols unavailable: {reason}");
-        mark_symbols_unavailable(&mut threads, &target.image, &reason);
+        }
     }
 
     let mut report = build_report(target_report, captured.sampler, threads);
@@ -2177,6 +2186,22 @@ fn is_resolved_symbol(symbol: &str) -> bool {
     !symbol.is_empty() && !symbol.starts_with("??") && !symbol.starts_with("0x")
 }
 
+/// One stderr line for a run where symbolization worked but left some frames
+/// raw, so that a partial result is announced even when nobody reads each
+/// thread's `symbols_unavailable`.
+fn partial_symbols_warning(threads: &[SampleThread]) -> Option<String> {
+    let affected = threads
+        .iter()
+        .filter(|thread| thread.symbols_unavailable.is_some())
+        .count();
+    (affected > 0).then(|| {
+        format!(
+            "aft profile: symbols unavailable for some frames on {affected} of {} thread(s); see symbols_unavailable on each affected thread",
+            threads.len()
+        )
+    })
+}
+
 /// When no debug symbols could be used at all, every thread that has frames
 /// from the profiled image keeps those frames raw and carries the reason.
 fn mark_symbols_unavailable(threads: &mut [SampleThread], image: &Path, reason: &str) {
@@ -2779,23 +2804,31 @@ fn mb_signed(bytes: i64) -> String {
 }
 
 fn print_human(report: &ProfileReport) {
-    println!("AFT CPU profile ({})", report.sampler);
-    println!("pid: {}", report.target.pid);
-    println!("image: {}", report.target.image);
-    println!("sha256: {}", report.target.sha256);
-    println!("version: {}", report.target.version);
-    print!("{}", render_target_identity(&report.target));
-    println!("\nThread census (running / total):");
+    print!("{}", render_human(report));
+}
+
+fn render_human(report: &ProfileReport) -> String {
+    let mut out = String::new();
+    writeln!(out, "AFT CPU profile ({})", report.sampler).unwrap();
+    writeln!(out, "pid: {}", report.target.pid).unwrap();
+    writeln!(out, "image: {}", report.target.image).unwrap();
+    writeln!(out, "sha256: {}", report.target.sha256).unwrap();
+    writeln!(out, "version: {}", report.target.version).unwrap();
+    out.push_str(&render_target_identity(&report.target));
+    writeln!(out, "\nThread census (running / total):").unwrap();
     let mut threads = report.threads.iter().collect::<Vec<_>>();
     threads.sort_by(|left, right| right.running_samples.cmp(&left.running_samples));
     for thread in threads {
         if thread.parse_inconsistent {
-            println!(
+            writeln!(
+                out,
                 "  {} {}: (parse inconsistent: leaves={} declared={}) — {}",
                 thread.id, thread.name, thread.leaf_samples, thread.total_samples, thread.verdict
-            );
+            )
+            .unwrap();
         } else {
-            println!(
+            writeln!(
+                out,
                 "  {} {}: {} / {} running ({} waiting) — {}",
                 thread.id,
                 thread.name,
@@ -2803,10 +2836,16 @@ fn print_human(report: &ProfileReport) {
                 thread.total_samples,
                 thread.waiting_samples,
                 thread.verdict
-            );
+            )
+            .unwrap();
+        }
+        // Shown on every affected thread, waiting or below the hot cutoff
+        // too, so a raw stack is never mistaken for a symbolized one.
+        if let Some(reason) = &thread.symbols_unavailable {
+            writeln!(out, "    {} symbols unavailable: {reason}", thread.id).unwrap();
         }
     }
-    println!("\nHot running threads:");
+    writeln!(out, "\nHot running threads:").unwrap();
     for thread in report
         .threads
         .iter()
@@ -2814,7 +2853,8 @@ fn print_human(report: &ProfileReport) {
         .take(TOP_THREADS)
     {
         for path in &thread.heaviest_paths {
-            println!(
+            writeln!(
+                out,
                 "  {} ({}): {}{}",
                 thread.id,
                 path.samples,
@@ -2824,19 +2864,18 @@ fn print_human(report: &ProfileReport) {
                 } else {
                     ""
                 }
-            );
-        }
-        if let Some(reason) = &thread.symbols_unavailable {
-            println!("  {} symbols unavailable: {reason}", thread.id);
+            )
+            .unwrap();
         }
     }
-    println!("\nTop inclusive running symbols:");
+    writeln!(out, "\nTop inclusive running symbols:").unwrap();
     for symbol in &report.top_symbols {
-        println!("  {:>5} {}", symbol.inclusive_samples, symbol.symbol);
+        writeln!(out, "  {:>5} {}", symbol.inclusive_samples, symbol.symbol).unwrap();
     }
     if let Some(raw) = &report.raw_sample {
-        println!("\nRaw sampler output:\n{raw}");
+        writeln!(out, "\nRaw sampler output:\n{raw}").unwrap();
     }
+    out
 }
 
 fn render_target_identity(target: &TargetReport) -> String {
@@ -3517,6 +3556,72 @@ mod tests {
     }
 
     #[test]
+    fn symbol_gaps_are_shown_on_every_affected_thread_past_the_hot_cutoff() {
+        let thread = |id: &str, samples: u64, frame: &str, reason: Option<&str>| SampleThread {
+            id: id.to_string(),
+            name: format!("worker-{id}"),
+            declared_samples: samples,
+            nodes: vec![SampleNode {
+                parent: None,
+                samples,
+                frame: frame.to_string(),
+                offset: None,
+            }],
+            symbols_unavailable: reason.map(str::to_string),
+        };
+        let busy = "???  (in ck-aft)  load address 0x1000 + 0x10";
+        let parked = "__psynch_cvwait  (in libsystem_kernel.dylib) + 8";
+        let past_cutoff = "3 frame(s) in ck-aft did not resolve in the debug symbols";
+        let waiting = "no cached debug symbols for loaded UUID ABC";
+        let mut threads = (1..=TOP_THREADS as u64)
+            .map(|rank| thread(&format!("hot{rank}"), 100 - rank, busy, None))
+            .collect::<Vec<_>>();
+        // Ranked sixth by running samples, so it is not among the hot threads.
+        threads.push(thread("cool", 5, busy, Some(past_cutoff)));
+        threads.push(thread("parked", 50, parked, Some(waiting)));
+        let target = TargetReport {
+            pid: 1,
+            image: "/tmp/ck-aft".to_string(),
+            sha256: "test".to_string(),
+            version: "test".to_string(),
+            debug_id: "test".to_string(),
+            image_on_disk_differs: false,
+            image_on_disk_status: "readable".to_string(),
+            image_on_disk_debug_id: None,
+        };
+        let report = build_report(target, "test".to_string(), threads);
+
+        let human = render_human(&report);
+        assert!(
+            human.contains(&format!("cool symbols unavailable: {past_cutoff}")),
+            "{human}"
+        );
+        assert!(
+            human.contains(&format!("parked symbols unavailable: {waiting}")),
+            "{human}"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        let reasons = json["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|thread| {
+                Some((
+                    thread["id"].as_str()?.to_string(),
+                    thread["symbols_unavailable"].as_str()?.to_string(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons,
+            vec![
+                ("cool".to_string(), past_cutoff.to_string()),
+                ("parked".to_string(), waiting.to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn hot_leaf_is_reported_as_an_exact_stack() {
         let node = |parent: Option<usize>, samples: u64, frame: &str| SampleNode {
             parent,
@@ -3556,6 +3661,7 @@ mod tests {
             .collect::<HashMap<_, _>>();
         apply_symbols(&mut threads, &symbols, image);
         assert_eq!(threads[0].symbols_unavailable, None);
+        assert_eq!(partial_symbols_warning(&threads), None);
         assert!(threads[0]
             .nodes
             .iter()
@@ -3572,6 +3678,8 @@ mod tests {
         );
         apply_symbols(&mut threads, &symbols, image);
         let reason = threads[0].symbols_unavailable.clone().unwrap();
+        let warning = partial_symbols_warning(&threads).unwrap();
+        assert!(warning.contains("on 1 of 1 thread(s)"), "{warning}");
         assert!(
             reason.contains("did not resolve in the debug symbols"),
             "{reason}"
