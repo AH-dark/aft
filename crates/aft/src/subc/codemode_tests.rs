@@ -520,12 +520,23 @@ fn second_head(f: &mut Fixture, root: &ProjectRootId, session: &str, trust: Bind
     f.routes.insert(channel(3), identity);
 }
 
+fn assert_ambiguous_field(f: &Fixture, field: &str) {
+    let body = call("read", json!({"path": "notes.txt"}));
+    let error = refusal(admit(&f.routes, channel(9), Some(&body)));
+    assert_eq!(error.code, RUN_OWNER_NOT_BOUND);
+    let detail = error.detail.as_ref().unwrap();
+    assert_eq!(detail["reason"], "head_route_ambiguous");
+    assert!(detail["fields"].as_array().unwrap().contains(&json!(field)));
+    assert_eq!(detail["channels"], json!([1, 3]));
+    assert!(error.message.contains(field), "{}", error.message);
+}
+
 #[test]
 fn codemode_head_routes_that_disagree_on_root_are_ambiguous() {
     let mut f = linked_fixture();
     let (_other_dir, other_root) = test_root("codemode-second-head");
     second_head(&mut f, &other_root, "head-a-session", BindTrust::FirstParty);
-    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+    assert_ambiguous_field(&f, "root");
 }
 
 #[test]
@@ -533,7 +544,7 @@ fn codemode_head_routes_that_disagree_on_session_are_ambiguous() {
     let mut f = linked_fixture();
     let root = f.head_root.clone();
     second_head(&mut f, &root, "another-head-session", BindTrust::FirstParty);
-    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+    assert_ambiguous_field(&f, "session");
 }
 
 #[test]
@@ -541,7 +552,7 @@ fn codemode_head_routes_that_disagree_on_trust_are_ambiguous() {
     let mut f = linked_fixture();
     let root = f.head_root.clone();
     second_head(&mut f, &root, "head-a-session", BindTrust::Untrusted);
-    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+    assert_ambiguous_field(&f, "trust");
 }
 
 #[test]
@@ -554,7 +565,7 @@ fn codemode_head_routes_that_disagree_on_project_root_are_ambiguous() {
         .unwrap()
         .project_root
         .push("different-project-root");
-    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+    assert_ambiguous_field(&f, "project_root");
 }
 
 #[test]
@@ -564,7 +575,7 @@ fn codemode_head_routes_that_disagree_on_harness_are_ambiguous() {
     second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
     let second = f.routes.get_mut(&channel(3)).unwrap();
     Arc::get_mut(&mut second.0).unwrap().harness = "another-harness".into();
-    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+    assert_ambiguous_field(&f, "harness");
 }
 
 #[test]
@@ -575,7 +586,7 @@ fn codemode_head_routes_that_disagree_on_spawn_principal_are_ambiguous() {
     let second = f.routes.get_mut(&channel(3)).unwrap();
     Arc::get_mut(&mut second.0).unwrap().spawn_principal =
         crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty;
-    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+    assert_ambiguous_field(&f, "spawn_principal");
 }
 
 #[test]
@@ -587,7 +598,7 @@ fn codemode_head_routes_that_disagree_on_consumer_elicitation_are_ambiguous() {
     Arc::get_mut(&mut second.0)
         .unwrap()
         .consumer_elicitation_capable = true;
-    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+    assert_ambiguous_field(&f, "consumer_elicitation_capable");
 }
 
 #[test]
@@ -597,7 +608,7 @@ fn codemode_head_routes_that_disagree_on_disabled_tools_are_ambiguous() {
     second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
     let second = f.routes.get_mut(&channel(3)).unwrap();
     Arc::get_mut(&mut second.0).unwrap().disabled_tools = Arc::new(vec!["read".into()]);
-    assert_eq!(refusal_reason(&f), "head_route_ambiguous");
+    assert_ambiguous_field(&f, "disabled_tools");
 }
 
 #[test]
@@ -610,6 +621,130 @@ fn codemode_head_routes_that_agree_are_served() {
     let body = call("read", json!({"path": "notes.txt"}));
     let effective = owner(admit(&f.routes, channel(9), Some(&body)));
     assert_eq!(effective.session, "head-a-session");
+}
+
+fn multi_checkout_head(harness: &str, run_at_head_root: bool) -> Fixture {
+    let mut f = linked_fixture();
+    // Both plugins cache tool routes by root, harness and session. Working in
+    // another checkout opens another route carrying the same head scope.
+    let (other_dir, other_root) = test_root("codemode-second-checkout");
+    f._dirs.push(other_dir);
+    let mut other = route(
+        &other_root,
+        "head-a-session",
+        head_stamp("head-a", "agent-a"),
+        CallMode::Classic,
+    );
+    Arc::get_mut(&mut other.0).unwrap().disabled_tools = Arc::new(vec!["edit".into()]);
+    f.routes.insert(channel(3), other);
+    for id in [channel(1), channel(3)] {
+        let data = Arc::get_mut(&mut f.routes.get_mut(&id).unwrap().0).unwrap();
+        data.harness = harness.into();
+        data.consumer_elicitation_capable = true;
+        if let AuthenticatedPrincipal::RouteBind {
+            route_channel,
+            route_epoch,
+            harness: principal_harness,
+            ..
+        } = &mut data.spawn_principal
+        {
+            *route_channel = id.channel;
+            *route_epoch = id.epoch;
+            *principal_harness = harness.into();
+        }
+    }
+    if run_at_head_root {
+        f.routes.insert(
+            channel(9),
+            route(
+                &f.head_root,
+                "run-session",
+                run_stamp("agent-a", "head-a", Some("linked")),
+                CallMode::Codemode,
+            ),
+        );
+    }
+    f
+}
+
+#[test]
+fn codemode_head_route_regression_multi_checkout_selects_runs_root() {
+    for harness in ["opencode", "pi"] {
+        let f = multi_checkout_head(harness, true);
+        let head = &f.routes[&channel(1)];
+        let body = call("read", json!({"path": "README.md", "endLine": 5}));
+        let effective = owner(admit(&f.routes, channel(9), Some(&body)));
+        // Keep one route's principal, disabled tools and elicitation capability
+        // together; never combine access settings across the two checkouts.
+        assert!(Arc::ptr_eq(
+            &effective.run_owner.as_ref().unwrap().head.0,
+            &head.0
+        ));
+        assert_eq!(effective.root, head.root);
+        assert_eq!(effective.project_root, head.project_root);
+        assert_eq!(effective.spawn_principal, head.spawn_principal);
+        assert_eq!(effective.disabled_tools, head.disabled_tools);
+        assert_eq!(
+            effective.consumer_elicitation_capable,
+            head.consumer_elicitation_capable
+        );
+    }
+}
+
+#[test]
+fn codemode_multi_checkout_head_without_matching_root_refuses_naming_root() {
+    for harness in ["opencode", "pi"] {
+        let f = multi_checkout_head(harness, false);
+        let body = call("read", json!({"path": "README.md"}));
+        let error = refusal(admit(&f.routes, channel(9), Some(&body)));
+        let detail = error.detail.as_ref().unwrap();
+        assert_eq!(detail["reason"], "head_route_ambiguous");
+        assert!(detail["fields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("root")));
+        assert_eq!(detail["channels"], json!([1, 3]));
+    }
+}
+
+#[test]
+fn codemode_head_route_regression_same_root_conflict_names_fields_and_channels() {
+    let mut f = multi_checkout_head("opencode", true);
+    let root = f.head_root.clone();
+    second_head(&mut f, &root, "head-a-session", BindTrust::Untrusted);
+    let second = f.routes.get_mut(&channel(3)).unwrap();
+    Arc::get_mut(&mut second.0).unwrap().role = tool_provider::RouteRole::ToolProviderV1;
+    let body = call("read", json!({"path": "notes.txt"}));
+    let (error, lines) =
+        crate::logging::capture_log_lines(|| refusal(admit(&f.routes, channel(9), Some(&body))));
+    assert_eq!(error.code, RUN_OWNER_NOT_BOUND);
+    let detail = error.detail.as_ref().unwrap();
+    assert_eq!(detail["reason"], "head_route_ambiguous");
+    assert_eq!(detail["fields"], json!(["trust"]));
+    assert_eq!(detail["channels"], json!([1, 3]));
+    assert!(error.message.contains("trust"), "{}", error.message);
+    let diagnostic = lines
+        .iter()
+        .find(|line| line.contains("codemode call refused:"))
+        .expect("the refusal is logged");
+    assert!(
+        diagnostic.contains("\"fields\":[\"trust\"]"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("\"channels\":[1,3]"), "{diagnostic}");
+    let info = lines
+        .iter()
+        .find(|line| line.contains("codemode head route ambiguity:"))
+        .expect("the ambiguity is logged at INFO");
+    assert!(
+        info.contains("run_id=run-1 fields=trust channels=1,3"),
+        "{info}"
+    );
+    for root in f._dirs.iter().map(|dir| dir.path().to_string_lossy()) {
+        assert!(!error.message.contains(root.as_ref()));
+        assert!(!detail.to_string().contains(root.as_ref()));
+        assert!(!diagnostic.contains(root.as_ref()));
+    }
 }
 
 #[test]

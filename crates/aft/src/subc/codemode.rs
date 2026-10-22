@@ -227,16 +227,17 @@ fn resolve_owner(
             .and_then(|head| head.attributes.agent_id.as_deref())
             == Some(agent_id)
     });
-    // Channel order cannot choose between different access settings for one
-    // head, so refuse when routes disagree on any setting the call inherits.
-    heads.sort_by_key(|(channel, identity)| {
-        (
-            identity.role != tool_provider::RouteRole::ToolProviderV1,
-            channel.channel,
-            channel.epoch,
-        )
-    });
-    let Some((_, head)) = heads.first() else {
+    // Plugins cache a session's routes per project root. Prefer the head routes
+    // at the run's root, so a route opened while working in another checkout
+    // does not compete with this checkout's head. A run may also bind elsewhere:
+    // without a matching root, all head candidates must still agree on access.
+    // Neither provider role nor channel order establishes authority. Compare
+    // every eligible route, then inherit one complete identity, never a union.
+    if heads.iter().any(|(_, head)| head.root == run.root) {
+        heads.retain(|(_, head)| head.root == run.root);
+    }
+    heads.sort_by_key(|(channel, _)| (channel.channel, channel.epoch));
+    let Some((head_channel, head)) = heads.first() else {
         return Err(not_bound(
             "agent_mismatch",
             "the head route's agent is not the agent the run is on",
@@ -244,24 +245,60 @@ fn resolve_owner(
             Some(run_id),
         ));
     };
-    if heads.iter().any(|(_, other)| {
-        other.root != head.root
-            || other.project_root != head.project_root
-            || other.harness != head.harness
-            || other.session != head.session
-            || other.trust != head.trust
-            || !same_principal_access(&other.spawn_principal, &head.spawn_principal)
-            || other.consumer_elicitation_capable != head.consumer_elicitation_capable
-            || other.disabled_tools != head.disabled_tools
-    }) {
-        return Err(not_bound(
-            "head_route_ambiguous",
-            "the head scope's routes disagree on access settings",
-            Some(agent_id),
-            Some(run_id),
-        ));
+    for (other_channel, other) in &heads {
+        let fields = head_access_differences(head, other);
+        if !fields.is_empty() {
+            let channels = [head_channel.channel, other_channel.channel];
+            crate::slog_info!(
+                "codemode head route ambiguity: run_id={run_id} fields={} channels={},{}",
+                fields.join(","),
+                channels[0],
+                channels[1]
+            );
+            return Err(subc_protocol::ErrorBody::new(
+                RUN_OWNER_NOT_BOUND,
+                format!(
+                    "the head scope's routes {} and {} disagree on access settings: {}",
+                    channels[0],
+                    channels[1],
+                    fields.join(", ")
+                ),
+            )
+            .with_detail(json!({
+                "reason": "head_route_ambiguous",
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "fields": fields,
+                "channels": channels,
+            })));
+        }
     }
     Ok(effective_identity(run, head, agent_id, run_id, route))
+}
+
+fn head_access_differences(head: &RouteIdentity, other: &RouteIdentity) -> Vec<&'static str> {
+    [
+        ("root", other.root != head.root),
+        ("project_root", other.project_root != head.project_root),
+        ("harness", other.harness != head.harness),
+        ("session", other.session != head.session),
+        ("trust", other.trust != head.trust),
+        (
+            "spawn_principal",
+            !same_principal_access(&other.spawn_principal, &head.spawn_principal),
+        ),
+        (
+            "consumer_elicitation_capable",
+            other.consumer_elicitation_capable != head.consumer_elicitation_capable,
+        ),
+        (
+            "disabled_tools",
+            other.disabled_tools != head.disabled_tools,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(field, differs)| differs.then_some(field))
+    .collect()
 }
 
 /// Whether two head routes' sandbox principals grant the same access. Each route
