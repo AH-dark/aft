@@ -1604,8 +1604,44 @@ struct LocalFallback {
 
 #[cfg(unix)]
 impl BgTaskRegistry {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_remote(
+        &self,
+        launch: super::super::RemoteLaunch,
+        plan: SpawnPlan,
+        command: &str,
+        shell_path: PathBuf,
+        session_id: String,
+        workdir: PathBuf,
+        env: HashMap<String, String>,
+        hard_kill: super::super::HardKill,
+        storage_dir: PathBuf,
+        slot: super::super::TaskSlot,
+        notify: bool,
+        compressed: bool,
+        root: Option<PathBuf>,
+    ) -> Result<String, String> {
+        self.spawn_remote_typed(
+            launch,
+            plan,
+            command,
+            shell_path,
+            session_id,
+            workdir,
+            env,
+            hard_kill,
+            storage_dir,
+            slot,
+            notify,
+            compressed,
+            root,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_remote_typed(
         &self,
         launch: super::super::RemoteLaunch,
         mut plan: SpawnPlan,
@@ -1620,13 +1656,14 @@ impl BgTaskRegistry {
         notify: bool,
         compressed: bool,
         root: Option<PathBuf>,
-    ) -> Result<String, String> {
+    ) -> Result<String, RegistryError> {
         let _admission = self.background_admission_guard(slot);
-        self.check_background_slot(slot, &session_id)?;
+        self.check_background_slot_typed(slot, &session_id)?;
         let layout = match plan.prepared_task() {
             Some(p) => p.resolved_task(),
             None => allocate_task_layout(&storage_dir, &session_id).map_err(|e| e.to_string())?,
         };
+        let layout_cleanup = UncommittedLayout::new(&layout);
         if plan.prepared_task().is_none() {
             let environment =
                 crate::sandbox_spawn::approved_payload_environment(&env, &std::env::temp_dir());
@@ -1714,8 +1751,9 @@ impl BgTaskRegistry {
         // had already refused as "not started" could still run here.
         if let Err(error) = super::super::commit_spawn_receipt(&task_id) {
             let _ = delete_resolved_task(&layout);
-            return Err(error);
+            return Err(RegistryError::StartupDeadline(error));
         }
+        layout_cleanup.disarm();
         self.dual_write_task(&layout.paths, &metadata);
         self.insert_rehydrated_task(metadata, layout.paths, false)?;
         let task = self.task(&task_id).unwrap();

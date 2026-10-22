@@ -1692,6 +1692,21 @@ fn write_task_in_dir(
 ) -> io::Result<()> {
     crate::production_storage::refuse_write(&dir.path().join(name))?;
     #[cfg(test)]
+    TASK_IO_FAULT.with(|slot| {
+        if matches!(slot.get(), Some(TaskIoFault::RecordWriteNotFound)) {
+            // Fail one record write without moving live output directories.
+            // Keep "not found" in the storage diagnostic to exercise typed
+            // task-absence classification, not just generic write failures.
+            slot.set(None);
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "injected task record storage not found",
+            ))
+        } else {
+            Ok(())
+        }
+    })?;
+    #[cfg(test)]
     if task.status == BgTaskStatus::Running {
         task_io_fault_for_test(true)?;
     }
@@ -1716,6 +1731,9 @@ fn write_task_in_dir(
 #[derive(Clone, Copy)]
 pub(crate) enum TaskIoFault {
     LayoutEnospc,
+    RecordWriteNotFound,
+    OutputHandlesEnospc,
+    OutputHandlesMisleadingText,
     RunningEnospc,
     #[cfg(unix)]
     RunningDelay(std::time::Duration),
@@ -2736,6 +2754,16 @@ impl TaskIoHandles {
         mode: BgMode,
         capture_pipeline_status: bool,
     ) -> io::Result<Self> {
+        #[cfg(test)]
+        match TASK_IO_FAULT.with(std::cell::Cell::get) {
+            Some(TaskIoFault::OutputHandlesEnospc) => return Err(task_storage_full_for_test()),
+            Some(TaskIoFault::OutputHandlesMisleadingText) => {
+                return Err(io::Error::other(
+                    "storage limit exceeded; startup deadline expired",
+                ));
+            }
+            _ => {}
+        }
         if task.paths.layout != TaskLayout::Directory {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

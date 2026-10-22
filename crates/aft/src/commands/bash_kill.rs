@@ -34,9 +34,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     let storage_dir = crate::bash_background::task_storage_dir(ctx);
     let result = ctx
         .bash_background()
-        .kill(&task_id, req.session())
+        .kill_typed(&task_id, req.session())
         .or_else(|message| {
-            if !message.contains("not found") {
+            if !message.is_missing_task() {
                 return Err(message);
             }
             {
@@ -52,10 +52,10 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                         .replay_session(&storage_dir, req.session())
                 };
             }
-            ctx.bash_background().kill(&task_id, req.session())
+            ctx.bash_background().kill_typed(&task_id, req.session())
         })
         .or_else(|message| {
-            if !message.contains("not found") {
+            if !message.is_missing_task() {
                 return Err(message);
             }
             let config = ctx.config();
@@ -63,17 +63,17 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 return Err(message);
             };
             ctx.bash_background()
-                .kill_relaxed(&task_id, project_root, &storage_dir)
+                .kill_relaxed_typed(&task_id, project_root, &storage_dir)
         });
 
     match result {
         Ok(snapshot) => Response::success(&req.id, json!(snapshot)),
-        Err(message) if message.contains("not found") => Response::error(
+        Err(message) if message.is_missing_task() => Response::error(
             &req.id,
             "task_not_found",
             format_unknown_polled_task_message(&task_id, req.host_tool_names().shell()),
         ),
-        Err(message) => Response::error(&req.id, "kill_failed", message),
+        Err(message) => Response::error(&req.id, "kill_failed", message.to_string()),
     }
 }
 

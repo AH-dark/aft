@@ -607,17 +607,8 @@ fn resolve_workdir(workdir: Option<&Path>, ctx: &AppContext) -> PathBuf {
     }
 }
 
-/// Generic retry loop for the Windows shell-fallback path. Walks the
-/// `candidates` list, calling `try_one(shell)` for each; on `NotFound`
-/// continues to the next candidate, on success returns the child, on
-/// other errors returns immediately. Extracted from `spawn_shell_command`
-/// so tests can exercise the retry decision logic without a real
-/// `Command::spawn` (mock closures simulate per-shell outcomes).
-///
-/// `Child` is generic so tests can substitute a unit type or mock value;
-/// production callers always pass `std::process::Child`. Compiled for tests
-/// only so the retry-decision unit tests can run on macOS/Linux dev machines
-/// without leaving dead code in non-test builds.
+/// Inject spawn outcomes into the same piped retry policy used on Windows.
+/// This adapter preserves the existing test diagnostics; it has no retry loop.
 #[cfg(test)]
 fn try_spawn_with_fallback<C, F>(
     candidates: &[crate::windows_shell::WindowsShell],
@@ -626,45 +617,33 @@ fn try_spawn_with_fallback<C, F>(
 where
     F: FnMut(&crate::windows_shell::WindowsShell) -> std::io::Result<C>,
 {
-    let mut last_error: Option<String> = None;
-    for (idx, shell) in candidates.iter().enumerate() {
-        match try_one(shell) {
-            Ok(child) => {
-                if idx > 0 {
-                    crate::slog_warn!(
-                        "bash spawn fell back to {} after {} earlier candidate(s) failed; \
-                     the cached PATH probe disagreed with runtime spawn — likely PATH \
-                     inheritance, antivirus / AppLocker / Defender ASR, or sandbox policy.",
-                        shell.binary(),
-                        idx
-                    );
+    use crate::windows_shell::{spawn_piped_candidates, CandidateFailure, PipedAttemptError};
+    match spawn_piped_candidates(candidates, |shell, _| {
+        try_one(shell).map_err(PipedAttemptError::Spawn)
+    }) {
+        Ok((child, _, _)) => Ok(child),
+        Err(CandidateFailure::Stopped {
+            index,
+            error: PipedAttemptError::Spawn(error),
+        }) => Err(format!(
+            "failed to spawn bash command via {}: {error}",
+            candidates[index].binary()
+        )),
+        Err(CandidateFailure::Exhausted { last }) => {
+            let last_error = match last {
+                Some((index, PipedAttemptError::Spawn(error))) => {
+                    format!("{}: {error}", candidates[index].binary())
                 }
-                return Ok(child);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                crate::slog_warn!(
-                    "bash spawn: {} returned NotFound at runtime — trying next candidate",
-                    shell.binary()
-                );
-                last_error = Some(format!("{}: {e}", shell.binary()));
-                continue;
-            }
-            Err(e) => {
-                // Non-NotFound errors (permission denied, OOM, etc.) are not
-                // remediated by trying a different shell — return immediately.
-                return Err(format!(
-                    "failed to spawn bash command via {}: {e}",
-                    shell.binary()
-                ));
-            }
+                _ => "no candidates were attempted".into(),
+            };
+            Err(format!("failed to spawn bash command: no Windows shell could be spawned. Last error: {last_error}. PATH-probed candidates: {:?}",
+                candidates.iter().map(|shell| shell.binary()).collect::<Vec<_>>()))
         }
+        Err(CandidateFailure::Stopped {
+            error: PipedAttemptError::Setup(message),
+            ..
+        }) => Err(message),
     }
-    Err(format!(
-        "failed to spawn bash command: no Windows shell could be spawned. \
-         Last error: {}. PATH-probed candidates: {:?}",
-        last_error.unwrap_or_else(|| "no candidates were attempted".to_string()),
-        candidates.iter().map(|s| s.binary()).collect::<Vec<_>>()
-    ))
 }
 
 #[cfg(test)]

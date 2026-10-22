@@ -465,6 +465,91 @@ fn is_posix_shell_name(path: &Path) -> bool {
     POSIX_NAMES.iter().any(|name| *name == stem)
 }
 
+#[derive(Debug)]
+pub(crate) enum CandidateFailure<E> {
+    Stopped { index: usize, error: E },
+    Exhausted { last: Option<(usize, E)> },
+}
+
+enum Attempt<E> {
+    Next(E),
+    Stop(E),
+}
+
+fn spawn_candidates<C, E>(
+    candidates: &[WindowsShell],
+    mut spawn: impl FnMut(&WindowsShell) -> Result<C, Attempt<E>>,
+) -> Result<(C, usize), CandidateFailure<E>> {
+    let mut last = None;
+    for (index, shell) in candidates.iter().enumerate() {
+        match spawn(shell) {
+            Ok(child) => return Ok((child, index)),
+            Err(Attempt::Next(error)) => last = Some((index, error)),
+            Err(Attempt::Stop(error)) => return Err(CandidateFailure::Stopped { index, error }),
+        }
+    }
+    Err(CandidateFailure::Exhausted { last })
+}
+
+#[derive(Debug)]
+pub(crate) enum PipedAttemptError {
+    Setup(String),
+    Spawn(std::io::Error),
+}
+
+pub(crate) fn spawn_piped_candidates<C>(
+    candidates: &[WindowsShell],
+    mut spawn: impl FnMut(&WindowsShell, bool) -> Result<C, PipedAttemptError>,
+) -> Result<(C, usize, bool), CandidateFailure<PipedAttemptError>> {
+    spawn_candidates(candidates, |shell| {
+        for breakaway in [true, false] {
+            match spawn(shell, breakaway) {
+                Ok(child) => return Ok((child, !breakaway)),
+                Err(PipedAttemptError::Spawn(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Err(Attempt::Next(PipedAttemptError::Spawn(error)));
+                }
+                Err(PipedAttemptError::Spawn(error))
+                    if breakaway && error.raw_os_error() == Some(5) =>
+                {
+                    // A restrictive Job Object can reject breakaway even though
+                    // this shell exists. Retry the same shell without that flag.
+                    continue;
+                }
+                Err(error) => return Err(Attempt::Stop(error)),
+            }
+        }
+        unreachable!("the without-breakaway attempt always returns")
+    })
+    .map(|((child, without_breakaway), index)| (child, index, without_breakaway))
+}
+
+pub(crate) enum PtyAttemptError {
+    Wrapper(String),
+    Spawn(String),
+}
+
+pub(crate) fn spawn_pty_candidates<C>(
+    candidates: &[WindowsShell],
+    mut spawn: impl FnMut(&WindowsShell) -> Result<C, PtyAttemptError>,
+) -> Result<(C, usize), CandidateFailure<String>> {
+    spawn_candidates(candidates, |shell| match spawn(shell) {
+        Ok(child) => Ok(child),
+        Err(PtyAttemptError::Wrapper(error)) => Err(Attempt::Next(error)),
+        Err(PtyAttemptError::Spawn(error)) => {
+            let message = format!("{shell:?}: {error}");
+            // portable-pty reports Windows launch failures as text. Preserve
+            // its existing missing-shell policy, separately from piped I/O errors.
+            if message.contains("NotFound") || message.contains("not recognized") {
+                Err(Attempt::Next(message))
+            } else {
+                Err(Attempt::Stop(message))
+            }
+        }
+    })
+}
+
 fn powershell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -495,6 +580,115 @@ fn batch_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn production_notfound_retry_skips_breakaway_and_advances_candidate() {
+        let candidates = [super::WindowsShell::Pwsh, super::WindowsShell::Powershell];
+        let mut attempts = Vec::new();
+        let (child, index, without) =
+            super::spawn_piped_candidates(&candidates, |shell, breakaway| {
+                attempts.push((shell.clone(), breakaway));
+                if matches!(shell, super::WindowsShell::Pwsh) {
+                    Err(super::PipedAttemptError::Spawn(
+                        std::io::ErrorKind::NotFound.into(),
+                    ))
+                } else {
+                    Ok(7)
+                }
+            })
+            .unwrap();
+        assert_eq!((child, index, without), (7, 1, false));
+        assert_eq!(
+            attempts,
+            vec![
+                (super::WindowsShell::Pwsh, true),
+                (super::WindowsShell::Powershell, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn production_breakaway_denial_retries_only_the_same_shell() {
+        let candidates = [super::WindowsShell::Pwsh, super::WindowsShell::Cmd];
+        let mut attempts = Vec::new();
+        let (_, index, without) = super::spawn_piped_candidates(&candidates, |shell, breakaway| {
+            attempts.push((shell.clone(), breakaway));
+            if breakaway {
+                Err(super::PipedAttemptError::Spawn(
+                    std::io::Error::from_raw_os_error(5),
+                ))
+            } else {
+                Ok(7)
+            }
+        })
+        .unwrap();
+        assert_eq!((index, without), (0, true));
+        assert_eq!(
+            attempts,
+            vec![
+                (super::WindowsShell::Pwsh, true),
+                (super::WindowsShell::Pwsh, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn production_nonmissing_error_after_breakaway_stops_candidates() {
+        let candidates = [super::WindowsShell::Pwsh, super::WindowsShell::Cmd];
+        let mut count = 0;
+        let result: Result<((), usize, bool), _> =
+            super::spawn_piped_candidates(&candidates, |_, breakaway| {
+                count += 1;
+                Err(super::PipedAttemptError::Spawn(if breakaway {
+                    std::io::Error::from_raw_os_error(5)
+                } else {
+                    std::io::ErrorKind::PermissionDenied.into()
+                }))
+            });
+        assert!(matches!(
+            result,
+            Err(super::CandidateFailure::Stopped { index: 0, .. })
+        ));
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn production_pty_wrapper_and_missing_shell_failures_advance() {
+        let candidates = [
+            super::WindowsShell::Pwsh,
+            super::WindowsShell::Powershell,
+            super::WindowsShell::Cmd,
+        ];
+        let mut count = 0;
+        let (child, index) = super::spawn_pty_candidates(&candidates, |shell| {
+            count += 1;
+            match shell {
+                super::WindowsShell::Pwsh => Err(super::PtyAttemptError::Wrapper(
+                    "write wrapper failed".into(),
+                )),
+                super::WindowsShell::Powershell => {
+                    Err(super::PtyAttemptError::Spawn("NotFound".into()))
+                }
+                _ => Ok(7),
+            }
+        })
+        .unwrap();
+        assert_eq!((child, index, count), (7, 2, 3));
+    }
+
+    #[test]
+    fn production_pty_nonmissing_failure_stops_candidates() {
+        let candidates = [super::WindowsShell::Pwsh, super::WindowsShell::Cmd];
+        let mut count = 0;
+        let result: Result<((), usize), _> = super::spawn_pty_candidates(&candidates, |_| {
+            count += 1;
+            Err(super::PtyAttemptError::Spawn("AccessDenied".into()))
+        });
+        assert!(matches!(
+            result,
+            Err(super::CandidateFailure::Stopped { index: 0, .. })
+        ));
+        assert_eq!(count, 1);
+    }
     use super::*;
 
     #[cfg(windows)]
