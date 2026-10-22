@@ -6475,7 +6475,8 @@ where
                     if tx.send(Ok(decoded)).await.is_err() {
                         // The loop is done with the connection. Keep consuming
                         // input until the daemon closes its side, so the
-                        // socket is never closed with unread bytes.
+                        // socket is not closed over unread bytes (teardown
+                        // bounds this wait; see `close_daemon_connection`).
                         discard_input_until_eof(&mut read).await;
                         return;
                     }
@@ -21490,7 +21491,7 @@ mod connection_close_tests {
             ..
         } = connection;
         // This daemon closes its side only after it has read the module's EOF,
-        // and keeps sending until then.
+        // and keeps its write side open until then.
         let daemon_task = tokio::spawn(async move {
             let mut received = Vec::new();
             daemon.read_to_end(&mut received).await.unwrap();
