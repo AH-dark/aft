@@ -3205,11 +3205,23 @@ fn prepared_cache_warning(
 /// its cache volume change state, with `prepared` carrying the fresh volume
 /// check. Unlike a connect it re-resolves no config file: the session keeps
 /// the configuration it is running with (see `handle_configure_inner`).
+/// Re-run the connect request `req` to recheck the cache location, unless a
+/// connect started after `req` was retained (`connect_generation` changed).
+/// The newer connect's settings stand, and the next probe checks them; an old
+/// request re-run over them would restore its storage root, harness and other
+/// process settings.
 pub(crate) fn handle_cache_recovery(
     req: &RawRequest,
+    connect_generation: u64,
     ctx: &AppContext,
     prepared: &Config,
 ) -> Response {
+    if ctx.connect_generation() != connect_generation {
+        return Response::success(
+            &req.id,
+            json!({"cache_recovery": "dropped", "reason": "a newer connect replaced the request"}),
+        );
+    }
     handle_configure_prepared(req, ctx, Some(prepared))
 }
 
@@ -3218,6 +3230,9 @@ fn handle_configure_prepared(
     ctx: &AppContext,
     prepared: Option<&Config>,
 ) -> Response {
+    if prepared.is_none() {
+        ctx.note_connect_started();
+    }
     let _sources_scope = crate::config_live::configure_sources_scope();
     // Configure can change the project root, search paths or server
     // overrides, and follows installs the file watcher may not report, so the

@@ -464,7 +464,9 @@ impl StandingActor {
                 if cache_state_matches(&ctx.config(), &prepared) {
                     continue;
                 }
-                let Some(mut request) = ctx.cache_recovery_request_if_due(now) else {
+                let Some((mut request, connect_generation)) =
+                    ctx.cache_recovery_request_if_due(now)
+                else {
                     continue;
                 };
                 request.id.clone_from(&id);
@@ -473,7 +475,12 @@ impl StandingActor {
                     root,
                     id,
                     Arc::new(move |ctx| {
-                        crate::commands::configure::handle_cache_recovery(&request, ctx, &prepared)
+                        crate::commands::configure::handle_cache_recovery(
+                            &request,
+                            connect_generation,
+                            ctx,
+                            &prepared,
+                        )
                     }),
                 );
             }
@@ -1462,6 +1469,58 @@ mod tests {
     }
 
     #[test]
+    fn cache_recovery_queued_before_a_reconnect_leaves_the_new_connection() {
+        let session = BoundCacheSession::start();
+        // The probe takes the retained connect request and prepares the cache
+        // root, then queues the recovery.
+        let (old_request, generation) = session
+            .ctx
+            .cache_recovery_request_if_due(std::time::Instant::now())
+            .expect("the connect request is retained for cache recovery");
+        let mut prepared = session.ctx.config().as_ref().clone();
+        root_cache::prepare_cache_root(&mut prepared);
+        // A reconnect with another storage root and harness lands before the
+        // queued recovery runs.
+        let new_storage = session.temp.path().join("storage-after-reconnect");
+        let reconnect: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "reconnect", "command": "configure", "harness": "pi",
+            "project_root": session.project, "storage_dir": new_storage,
+            "cortexkit_user_config_path": session.user_file,
+        }))
+        .unwrap();
+        let response = crate::commands::configure::handle_configure(&reconnect, &session.ctx);
+        assert!(response.success, "{response:?}");
+        let connected = session.ctx.config();
+        assert_eq!(
+            connected.storage_dir.as_deref(),
+            Some(new_storage.as_path())
+        );
+        // The cache volume is enrolled to the first storage root, so the new
+        // connection may report it unavailable; the recovery must not change
+        // the new connection's cache state either way.
+        let connected_cache_state = session.ctx.cache_unavailable_reason();
+
+        let recovery = crate::commands::configure::handle_cache_recovery(
+            &old_request,
+            generation,
+            &session.ctx,
+            &prepared,
+        );
+        assert!(recovery.success, "{recovery:?}");
+        let after = session.ctx.config();
+        assert_eq!(
+            after.storage_dir, connected.storage_dir,
+            "the old connect request moved the session back to its old storage root"
+        );
+        assert_eq!(after.harness, connected.harness);
+        assert_eq!(after.cache_epoch, connected.cache_epoch);
+        assert_eq!(
+            session.ctx.cache_unavailable_reason(),
+            connected_cache_state
+        );
+    }
+
+    #[test]
     fn cache_root_refresh_keeps_a_deferred_cache_dir_edit_deferred() {
         let session = BoundCacheSession::start();
         let connected = session.ctx.config().cache_dir.clone();
@@ -1489,7 +1548,8 @@ mod tests {
         let retained = session
             .ctx
             .cache_recovery_request_if_due(last_tick + std::time::Duration::from_secs(61))
-            .expect("the connect request is retained for cache recovery");
+            .expect("the connect request is retained for cache recovery")
+            .0;
         assert_eq!(
             retained.id, "connect",
             "a probe that found the cache volume unchanged re-ran configure"

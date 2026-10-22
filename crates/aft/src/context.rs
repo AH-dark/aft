@@ -4159,7 +4159,14 @@ pub struct AppContext {
     /// config file texts the last configure applied, the pending-reload flag
     /// and the root's own config file watches.
     config_live: crate::config_live::ConfigLiveState,
-    cache_recovery: parking_lot::Mutex<Option<(crate::protocol::RawRequest, Option<Instant>)>>,
+    /// The last successful connect request (kept for cache recovery), when it
+    /// was last re-run, and the connect generation it belongs to.
+    cache_recovery: parking_lot::Mutex<Option<(crate::protocol::RawRequest, Option<Instant>, u64)>>,
+    /// Counts connects (configure requests other than a cache recovery). A
+    /// deferred cache recovery carries the generation its request belongs to
+    /// and is dropped if a connect started since, so an old connect request
+    /// is never re-run over a newer connection's settings.
+    connect_generation: std::sync::atomic::AtomicU64,
     // Rebinds can leave workers on old paths; keep each distinct root locked
     // until this context and its in-flight snapshots have been retired.
     cache_leases: parking_lot::Mutex<Vec<Arc<crate::root_cache::CacheLease>>>,
@@ -5034,6 +5041,7 @@ impl AppContext {
             config_pin_identity: next_config_pin_identity(),
             config_live: crate::config_live::ConfigLiveState::default(),
             cache_recovery: parking_lot::Mutex::new(None),
+            connect_generation: std::sync::atomic::AtomicU64::new(0),
             cache_leases: parking_lot::Mutex::new(cache_leases),
             last_request_at: parking_lot::Mutex::new(Instant::now()),
             path_restriction_root_memo: parking_lot::Mutex::new(None),
@@ -8742,26 +8750,39 @@ impl AppContext {
         crate::root_cache::cache_unavailable(&self.config())
     }
 
+    /// A connect is starting: any deferred cache recovery queued for an
+    /// earlier connect is now stale.
+    pub(crate) fn note_connect_started(&self) {
+        self.connect_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn connect_generation(&self) -> u64 {
+        self.connect_generation.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn retain_cache_recovery_request(&self, request: &crate::protocol::RawRequest) {
+        let generation = self.connect_generation();
         *self.cache_recovery.lock() = self
             .config()
             .cache_dir
             .as_ref()
-            .map(|_| (request.clone(), None));
+            .map(|_| (request.clone(), None, generation));
     }
 
+    /// The retained connect request, with the connect generation it belongs
+    /// to, at most once per minute.
     pub(crate) fn cache_recovery_request_if_due(
         &self,
         now: Instant,
-    ) -> Option<crate::protocol::RawRequest> {
+    ) -> Option<(crate::protocol::RawRequest, u64)> {
         let mut recovery = self.cache_recovery.lock();
-        let (request, checked) = recovery.as_mut()?;
+        let (request, checked, generation) = recovery.as_mut()?;
         if checked.is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(60))
         {
             return None;
         }
         *checked = Some(now);
-        Some(request.clone())
+        Some((request.clone(), *generation))
     }
 
     /// Harness-scoped storage directory. Requires configure to have set a harness;
