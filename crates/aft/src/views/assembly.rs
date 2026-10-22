@@ -516,6 +516,9 @@ pub fn prepare_checkout_deferring(
     // Members whose bytes this publication reads, as opposed to reusing the
     // previous generation's entry for unchanged content.
     let mut fresh_reads = std::collections::HashSet::new();
+    // What the semantic index would make of each member read here, worked out
+    // from the bytes in hand so classifying it later needs no second read.
+    let mut fresh_semantic_classes = std::collections::HashMap::new();
     let mut candidates = Vec::with_capacity(head.len());
 
     #[cfg(test)]
@@ -592,6 +595,12 @@ pub fn prepare_checkout_deferring(
                     continue;
                 };
                 fresh_reads.insert(tracked.rel_path.clone());
+                if request.require_semantic
+                    && crate::semantic_index::is_semantic_indexed_extension(&absolute)
+                {
+                    fresh_semantic_classes
+                        .insert(tracked.rel_path.clone(), semantic_class_of_bytes(&source));
+                }
                 let resolution_input = is_resolution_input(&tracked.rel_path);
                 let language = if resolution_input {
                     Some("config".to_string())
@@ -725,7 +734,12 @@ pub fn prepare_checkout_deferring(
             if excludes_semantic(path) && !fresh_reads.contains(path) {
                 continue;
             }
-            match semantic_source_class(&absolute) {
+            // Only a member this publication reused unread touches the disk.
+            let class = match fresh_semantic_classes.get(path) {
+                Some(class) => Ok(*class),
+                None => semantic_source_class(&absolute),
+            };
+            match class {
                 Ok(SemanticSourceClass::Skipped(reason)) => {
                     fresh_skips.push((path.to_vec(), Some(reason)));
                 }
@@ -1782,6 +1796,7 @@ fn lacks_callgraph_key(entry: &ManifestEntry, rel_path: &[u8]) -> bool {
 }
 
 /// What the semantic index makes of a member file's bytes on disk.
+#[derive(Clone, Copy, Debug)]
 enum SemanticSourceClass {
     /// The index reads files like this one; whether the walk it uses lists
     /// the file is decided separately.
@@ -1792,11 +1807,23 @@ enum SemanticSourceClass {
     Gone,
 }
 
-/// Applies the semantic index's own read rules to `absolute`: it skips files
-/// over `MAX_SEMANTIC_FILE_BYTES` without reading them, and cannot read one
-/// that is not UTF-8 (`semantic_index::collect_semantic_file`). Any other read
-/// error is returned: it is not a property of the content, and nothing says
-/// the index would fare better.
+/// The semantic index's own read rules applied to bytes already read: it
+/// skips files over `MAX_SEMANTIC_FILE_BYTES` without reading them, and cannot
+/// read one that is not UTF-8 (`semantic_index::collect_semantic_file`).
+fn semantic_class_of_bytes(bytes: &[u8]) -> SemanticSourceClass {
+    if bytes.len() as u64 > crate::semantic_index::MAX_SEMANTIC_FILE_BYTES {
+        SemanticSourceClass::Skipped(SkipReason::SemanticFileTooLarge)
+    } else if std::str::from_utf8(bytes).is_err() {
+        SemanticSourceClass::Skipped(SkipReason::NonUtf8Source)
+    } else {
+        SemanticSourceClass::Readable
+    }
+}
+
+/// Applies the same rules to `absolute` on disk, for a member this
+/// publication did not read: the size from metadata, so an oversized file is
+/// never read, then the bytes. Any other read error is returned: it is not a
+/// property of the content, and nothing says the index would fare better.
 fn semantic_source_class(absolute: &Path) -> std::io::Result<SemanticSourceClass> {
     let metadata = match fs::metadata(absolute) {
         Ok(metadata) => metadata,
@@ -1811,10 +1838,7 @@ fn semantic_source_class(absolute: &Path) -> std::io::Result<SemanticSourceClass
         ));
     }
     match crate::project_content::read(absolute) {
-        Ok(bytes) if std::str::from_utf8(&bytes).is_err() => {
-            Ok(SemanticSourceClass::Skipped(SkipReason::NonUtf8Source))
-        }
-        Ok(_) => Ok(SemanticSourceClass::Readable),
+        Ok(bytes) => Ok(semantic_class_of_bytes(&bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SemanticSourceClass::Gone),
         Err(error) => Err(error),
     }
@@ -2928,5 +2952,56 @@ mod status_settlement_tests {
             );
         }
         drop(newer);
+    }
+
+    /// A member this publication read is classified for the semantic index
+    /// from the bytes already in hand; only a member it reuses unread is read
+    /// again for that.
+    #[test]
+    fn views_semantic_classification_reads_a_fresh_member_once() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        fs::write(root.join("stale.py"), "def stale():\n    pass\n").unwrap();
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "stale",
+            ],
+        );
+        let storage = tempfile::tempdir().unwrap();
+        let stale = root.join("stale.py");
+        let reads = |probe: &crate::project_content::Probe| {
+            probe.paths().iter().filter(|path| **path == stale).count()
+        };
+
+        // Every member is read: stale.py, unkeyed, is classified from that read.
+        let probe = crate::project_content::Probe::new(&root);
+        let report = publish_checkout(&semantic_request(
+            &root,
+            storage.path(),
+            "head-1",
+            &["file_0.ts"],
+        ))
+        .unwrap();
+        assert_eq!(report.pending_paths, BTreeSet::from([b"stale.py".to_vec()]));
+        assert_eq!(reads(&probe), 1, "a freshly read member was read again");
+        drop(probe);
+
+        // Assembly reads file_0.ts and reuses stale.py unread, so semantic
+        // classification reads stale.py, once.
+        let probe = crate::project_content::Probe::new(&root);
+        let mut incremental = semantic_request(&root, storage.path(), "head-2", &["file_0.ts"]);
+        incremental.changed_paths = BTreeSet::from([b"file_0.ts".to_vec()]);
+        let report = publish_checkout(&incremental).unwrap();
+        assert_eq!(report.pending_paths, BTreeSet::from([b"stale.py".to_vec()]));
+        assert_eq!(reads(&probe), 1);
     }
 }
