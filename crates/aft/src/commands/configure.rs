@@ -194,6 +194,104 @@ fn wait_on_configure_semantic_snapshot_gate_for_test(request_id: &str) {
 #[cfg(not(test))]
 fn wait_on_configure_semantic_snapshot_gate_for_test(_request_id: &str) {}
 
+/// Parks a configure of one root at a fixed point, so a test can hold it
+/// there. `ConfigPublished` is right after the new configuration is
+/// published and before the cache root, artifact access and degraded reasons
+/// follow it: the window in which a reader admitted beside the configure
+/// would see a half-published root. `WriterAdmitted` is right after the
+/// configure is admitted as the root's exclusive writer, before any change
+/// and before the commit seal: where a bind that loses a race with route
+/// teardown must still stop.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigureGateStage {
+    WriterAdmitted,
+    ConfigPublished,
+}
+
+#[cfg(test)]
+struct ConfigureCommitGate {
+    root: PathBuf,
+    stage: ConfigureGateStage,
+    reached: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+static CONFIGURE_COMMIT_GATE: std::sync::Mutex<Vec<ConfigureCommitGate>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Arm a one-shot gate at `ConfigPublished` for the next configure of `root`.
+/// Returns a receiver that fires when that configure parks and a sender that
+/// releases it. Gates for other roots, used by tests running in parallel, are
+/// independent.
+#[cfg(test)]
+pub(crate) fn gate_configure_commit_for_test(
+    root: PathBuf,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    gate_configure_stage_for_test(root, ConfigureGateStage::ConfigPublished)
+}
+
+/// Arm a one-shot gate at `stage` for the next configure of `root` that
+/// reaches it.
+#[cfg(test)]
+pub(crate) fn gate_configure_stage_for_test(
+    root: PathBuf,
+    stage: ConfigureGateStage,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    CONFIGURE_COMMIT_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(ConfigureCommitGate {
+            root,
+            stage,
+            reached: reached_tx,
+            release: release_rx,
+        });
+    (reached_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_on_configure_gate_for_test(root: &Path, stage: ConfigureGateStage) {
+    let gate = {
+        let mut gates = CONFIGURE_COMMIT_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gates
+            .iter()
+            .position(|gate| gate.root == root && gate.stage == stage)
+            .map(|index| gates.swap_remove(index))
+    };
+    if let Some(gate) = gate {
+        let _ = gate.reached.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(60));
+    }
+}
+
+#[cfg(test)]
+fn wait_on_configure_commit_gate_for_test(root: &Path) {
+    wait_on_configure_gate_for_test(root, ConfigureGateStage::ConfigPublished);
+}
+
+#[cfg(test)]
+fn wait_on_configure_writer_gate_for_test(root: &Path) {
+    wait_on_configure_gate_for_test(root, ConfigureGateStage::WriterAdmitted);
+}
+
+#[cfg(not(test))]
+fn wait_on_configure_commit_gate_for_test(_root: &Path) {}
+
+#[cfg(not(test))]
+fn wait_on_configure_writer_gate_for_test(_root: &Path) {}
+
 #[cfg(test)]
 thread_local! {
     static SEMANTIC_REFRESH_RESTART_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1744,7 +1842,11 @@ fn only_lsp_process_state_changed(previous: &Config, next: &Config) -> bool {
 /// root configuration: the bind admits their reload and queues its start after
 /// acknowledgement, without requiring exclusive use beside existing readers.
 fn fast_path_admissible(ctx: &AppContext, canonical_root: &Path, config: &Config) -> bool {
-    if ctx.subc_unbound_quiesced() || ctx.database_runtime_failed() {
+    // A provisional identity is finalized only by a full bind.
+    if ctx.subc_unbound_quiesced()
+        || ctx.database_runtime_failed()
+        || ctx.artifact_identity_provisional()
+    {
         return false;
     }
     if ctx.cached_worktree_bridge(canonical_root).is_none() {
@@ -3061,6 +3163,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // memoized TypeScript server choices are recomputed.
     crate::lsp::typescript_project::clear_typescript_selection();
     let response = handle_configure_inner(req, ctx);
+    crate::provisional_identity_retry::note_configure_outcome(ctx, req, response.success);
     // A successful configure applied the files it read; record them so a live
     // config reload can tell later edits apart and knows what is deferred.
     ctx.begin_configure_ack_step("finish_configure");
@@ -3445,6 +3548,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     generation: ctx.configure_generation(),
                     root_path: root_path.clone(),
                     canonical_cache_root: canonical_root.clone(),
+                    project_key: ctx
+                        .cached_artifact_cache_key(canonical_root)
+                        .unwrap_or_default(),
                     harness: harness.clone(),
                     storage_root: storage_root.clone(),
                     harness_dir: storage_root.join(harness.storage_segment()),
@@ -3651,6 +3757,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         && !root_too_broad
         && (!parent_folder || crate::views::parent::held_by(ctx, &canonical_cache_root))
         && !ctx.database_runtime_failed()
+        && !ctx.artifact_identity_provisional()
         && current_fingerprint.as_ref() == Some(&requested_fingerprint)
         && ctx.configure_warm_key_matches(&preflight_warm_key)
         && ctx.is_worktree_bridge() == is_worktree_bridge
@@ -3718,6 +3825,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 generation,
                 root_path: root_path.clone(),
                 canonical_cache_root: canonical_cache_root.clone(),
+                project_key: ctx
+                    .cached_artifact_cache_key(&canonical_cache_root)
+                    .unwrap_or_default(),
                 harness: harness.clone(),
                 storage_root: storage_root.clone(),
                 harness_dir: storage_root.join(harness.storage_segment()),
@@ -3788,6 +3898,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(deferred) = defer_to_exclusive_configure(&req.id) {
         return deferred;
     }
+    wait_on_configure_writer_gate_for_test(&canonical_cache_root);
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
@@ -3826,10 +3937,13 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let format_tool_cache_clear_needed = effective_configure_changed;
 
     let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    // Choose a durable identity at the first bind that needs an artifact key.
+    // With indexes and views off, keep the no-key, no-Git-probe fast path.
     let artifact_key_needed = !root_too_broad
         && (next_config.indexes.trigram
             || next_config.indexes.semantic
-            || next_config.indexes.callgraph);
+            || next_config.indexes.callgraph
+            || next_config.views.enabled);
     ctx.begin_configure_ack_phase("cache_key_resolve");
     ctx.begin_configure_ack_step("artifact_key");
     let mut cache_key_profile = CacheKeyResolveProfile::new(&canonical_cache_root);
@@ -3848,30 +3962,58 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
+    let mut identity_provisional = false;
     let project_key = match project_key_result {
-        Some(Ok(key)) => Some(key),
+        Some(Ok(Some(key))) => Some(key),
+        Some(Ok(None)) => {
+            identity_provisional = true;
+            degraded_reasons.push(crate::search_index::PROVISIONAL_IDENTITY_REASON.to_string());
+            None
+        }
         Some(Err(error)) => {
-            return Response::error_with_data(
-                &req.id,
-                "cache_key_probe_failed",
-                error.to_string(),
-                json!({
-                    "retryable": true,
-                    "root": error.root().display().to_string(),
-                    "detail": error.detail(),
-                }),
-            );
+            if let Some(reason) = error.provisional_git_reason() {
+                identity_provisional = true;
+                degraded_reasons.push(reason);
+                None
+            } else {
+                return Response::error_with_data(
+                    &req.id,
+                    "cache_key_probe_failed",
+                    error.to_string(),
+                    json!({
+                        "retryable": true,
+                        "root": error.root().display().to_string(),
+                        "detail": error.detail(),
+                    }),
+                );
+            }
         }
         None => None,
     };
+    if identity_provisional {
+        // An unreadable legacy identity pin in aft.db or a failed Git probe
+        // leaves the identity unsettled. Serve tools that do not need indexes,
+        // but write no artifacts, ownership or retention records under a key
+        // the next bind may replace. A busy aft.db is retried in the
+        // background (`crate::provisional_identity_retry`); a failed Git probe
+        // waits for the next bind.
+        next_config.indexes.trigram = false;
+        next_config.indexes.semantic = false;
+        next_config.indexes.callgraph = false;
+        next_config.views.enabled = false;
+    }
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
     ctx.begin_configure_ack_step("retention_bind");
     let retention_started = Instant::now();
-    let retention_result = crate::storage_retention::record_bind(
-        &storage_root,
-        &canonical_cache_root,
-        project_key.as_deref().unwrap_or_default(),
-    );
+    let retention_result = if identity_provisional {
+        Ok(())
+    } else {
+        crate::storage_retention::record_bind(
+            &storage_root,
+            &canonical_cache_root,
+            project_key.as_deref().unwrap_or_default(),
+        )
+    };
     cache_key_profile.retention_bind = retention_started.elapsed();
     if let Err(error) = retention_result {
         return retention_binding_failure(&req.id, error);
@@ -3955,12 +4097,15 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let callgraph_writer_capability = root_cache_storage_ok
         && !is_worktree_bridge
         && !artifact_owner_read_only
-        && !root_too_broad;
+        && !root_too_broad
+        && !identity_provisional;
     // A parent folder, like HOME, runs no project-wide work over the folder
     // itself; its children are served from their own sessions' results.
-    let inspect_writer_capability = root_cache_storage_ok && !root_too_broad && !parent_folder;
+    let inspect_writer_capability =
+        root_cache_storage_ok && !root_too_broad && !parent_folder && !identity_provisional;
     let heavy_root_work_allowed = !root_too_broad
         && !parent_folder
+        && !identity_provisional
         && !degraded_reasons.iter().any(|reason| reason == "home_root");
 
     // Commit seal: past this point the configure mutates AppContext and must
@@ -3998,6 +4143,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         .set_search_paths(next_config.lsp_paths_extra.clone());
     ctx.begin_configure_ack_step("config_publish");
     ctx.set_config(next_config.clone());
+    wait_on_configure_commit_gate_for_test(&canonical_cache_root);
     ctx.begin_configure_ack_step("hashline");
     register_hashline_for_configure(
         ctx,
@@ -4075,6 +4221,12 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // heavy-work entry point reads the same cheap gate instead of re-deriving
     // directory-scope rules independently.
     ctx.set_degraded_reasons(degraded_reasons.clone());
+    if identity_provisional {
+        // This bind published no key. A reader on another thread may have
+        // cached a Git-derived key for the root before the reasons above
+        // said provisional; the settled identity can key differently.
+        ctx.forget_unsettled_artifact_cache_key(&canonical_cache_root, &root_path);
+    }
     ctx.set_heavy_root_work_allowed(heavy_root_work_allowed);
     if root_too_broad {
         ctx.stop_watcher_runtime();
@@ -4084,7 +4236,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // first request after this bind is already answered by it. Starting only
     // spawns its worker.
     ctx.begin_configure_ack_step("views_parent");
-    if !root_too_broad {
+    if !root_too_broad && !identity_provisional {
         crate::views::parent::activate(ctx, &canonical_cache_root, &storage_root, &parent_semantic);
     }
     ctx.begin_configure_ack_step("warm_key");
@@ -4363,6 +4515,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         generation: configure_generation,
         root_path: root_path.clone(),
         canonical_cache_root: canonical_cache_root.clone(),
+        project_key: project_key.clone(),
         harness: harness.clone(),
         storage_root,
         harness_dir: ctx.harness_dir(),
@@ -4969,7 +5122,6 @@ fn schedule_artifact_loads_admitted(
     semantic_view_work_allowed: bool,
 ) -> ArtifactLoadStarts {
     let canonical_cache_root = ctx.canonical_cache_root();
-    let project_key = ctx.memoized_artifact_cache_key(&canonical_cache_root);
     let config = ctx.config();
     let storage_dir = config.storage_dir.clone();
     let search_index_max_file_size = config.search_index_max_file_size;
@@ -4980,6 +5132,21 @@ fn schedule_artifact_loads_admitted(
         &config.index.roots,
     );
     drop(config);
+    let project_key = match ctx
+        .cached_artifact_cache_key(&canonical_cache_root)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            ctx.memoized_readonly_artifact_cache_key(
+                &canonical_cache_root,
+                &crate::bash_background::storage_dir(storage_dir.as_deref()),
+            )
+        }) {
+        Ok(key) => key,
+        Err(error) => {
+            crate::slog_warn!("saved artifact loads unavailable: {}", error);
+            return (None, None);
+        }
+    };
     // A root no session has open never starts a semantic build, a view fill
     // or a refresh; it takes the read-only arm below, which reads a saved
     // index if there is one.
@@ -6771,6 +6938,8 @@ fn cancel_unbound_configure_jobs(
 }
 
 pub(crate) fn cancel_deferred_configure_maintenance(ctx: &AppContext) -> usize {
+    // An unbound root does no indexing, so it stops retrying its identity too.
+    crate::provisional_identity_retry::cancel(ctx);
     let parked = ctx
         .take_parked_configure_tail()
         .map(|state| {
@@ -6890,6 +7059,10 @@ pub(crate) struct ConfigureMaintenanceState {
 }
 
 impl ConfigureMaintenanceState {
+    pub(crate) fn jobs_is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
     pub(crate) fn has_ready_job(&self) -> bool {
         let now = self.replay_retry_cutoff.unwrap_or_else(Instant::now);
         self.jobs.iter().any(|continuation| {
@@ -6954,7 +7127,7 @@ pub(crate) fn standalone_configure_maintenance_pending(
     state: &mut ConfigureMaintenanceState,
 ) -> bool {
     state.absorb_enqueued(ctx);
-    state.has_ready_job()
+    state.has_ready_job() || (state.jobs.is_empty() && ctx.provisional_identity_retry().is_due())
 }
 
 /// Finish request-critical configure work before standalone dispatch resumes.
@@ -7086,6 +7259,12 @@ pub(crate) fn drain_standalone_configure_unit(
 ) -> bool {
     state.absorb_enqueued(ctx);
     drop_superseded_parked_continuations(ctx, state);
+    if state.jobs.is_empty() && crate::provisional_identity_retry::drain_inline(ctx) {
+        // The retry replayed the bind on this request thread, where the
+        // standalone loop runs every configure request. Its tail is queued on
+        // the context and runs from the next unit, as after a bind request.
+        return true;
+    }
     if !state.select_ready_job(ctx) {
         return false;
     }
@@ -7132,7 +7311,17 @@ pub(crate) fn drain_standalone_configure_unit(
     drain_deferred_configure_maintenance_unit(ctx, state)
 }
 
+/// Drain deferred configure work on the calling thread. For callers that
+/// also run configure requests on this thread (in-process embedders, the
+/// warmup command, tests): a bind the identity retry replays here runs on
+/// that same thread, serialized with their other configure requests. The
+/// attached daemon uses [`drain_deferred_configure_maintenance_yielding`]
+/// instead, which never replays a bind; the daemon submits the replay
+/// through the executor as a route bind.
 pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
+    if ctx.configure_tail_idle() {
+        crate::provisional_identity_retry::drain_inline(ctx);
+    }
     drain_configure_tail(ctx, false);
 }
 
@@ -7215,13 +7404,13 @@ fn import_legacy_view_once(
         return Ok(false);
     };
     let semantic_config = &input.semantic;
-    let mut request = crate::migration::SemanticMigrationRequest::for_root(
+    let mut request = crate::migration::SemanticMigrationRequest::for_root_with_key(
         view.storage.clone(),
         job.canonical_cache_root.clone(),
+        view.family.clone(),
         crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(&semantic_config, 1)
             .as_string(),
     );
-    request.family.clone_from(&view.family);
     request.view.clone_from(&view.scope);
     if request.legacy_semantic_path().is_file() {
         request.configured_model_fingerprint = crate::migration::configured_fingerprint_for_legacy(
@@ -8042,6 +8231,9 @@ fn open_view_runtime_for_configure(
     #[cfg(any(test, feature = "test-timing-hooks"))]
     crate::views::semantic_runtime::delay_startup_io_for_test("VIEW_OPEN");
     let family = input.family.clone();
+    if family.is_empty() {
+        return Err("view requires a settled artifact identity".to_string());
+    }
     let scope = crate::path_identity::project_scope_key(&job.canonical_cache_root);
     let view = crate::views::ViewStore::open(&job.storage_root, &scope)
         .map_err(|error| error.to_string())?;
@@ -8252,7 +8444,7 @@ struct ConfigureViewInput {
 impl ConfigureViewInput {
     fn capture(ctx: &AppContext, job: &ConfigureMaintenanceJob) -> Self {
         Self {
-            family: ctx.memoized_artifact_cache_key(&job.canonical_cache_root),
+            family: job.project_key.clone(),
             git_common_dir: ctx.git_common_dir(),
             callgraph: ctx.config().indexes.callgraph,
             defer_callgraph: ctx.defer_callgraph_build(),
@@ -8422,6 +8614,11 @@ fn delay_configure_storage_sweeps_for_debug() {
 }
 
 fn callgraph_configure_warm_allowed(ctx: &AppContext) -> bool {
+    // Without usable Git, keep callgraph cold builds on demand. An idle
+    // configure must not start a corpus-scale build just because Git is missing.
+    if !crate::developer_tools::git_usable() {
+        return false;
+    }
     // Integration fixtures disable the watcher and historically expect their
     // tiny non-repository callgraphs to be ready before the first request.
     if std::env::var_os("AFT_TEST_DISABLE_FILE_WATCHER").is_some() {
@@ -8464,6 +8661,25 @@ mod tests {
             "{}",
             lines[1]
         );
+    }
+
+    #[test]
+    fn gitless_configure_keeps_callgraph_warming_on_demand() {
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(root.path()).unwrap();
+        let ctx = test_context();
+        ctx.update_config(|config| config.project_root = Some(root.clone()));
+        let _probe = crate::search_index::force_git_root_commit_probe_transient_for_paths_for_test(
+            vec![root],
+            "Git unavailable",
+        );
+        crate::developer_tools::with_git_usable_for_test(true, || {
+            assert!(super::callgraph_configure_warm_allowed(&ctx))
+        });
+        crate::developer_tools::with_git_usable_for_test(false, || {
+            assert!(!super::callgraph_configure_warm_allowed(&ctx))
+        });
     }
 
     /// The watcher only sees changes made after it subscribes, so its start
@@ -11083,6 +11299,68 @@ mod tests {
     }
 
     #[test]
+    fn build_key_memo_does_not_bypass_first_configure_identity_bind() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let build_key = ctx.memoized_artifact_cache_key(&root);
+        assert_eq!(
+            ctx.cached_artifact_cache_key(&root),
+            Some(build_key.clone())
+        );
+        assert_eq!(
+            crate::root_identity::read(&root, storage.path()).unwrap(),
+            None
+        );
+
+        init_git_fixture(&root);
+        let bound_key = ctx
+            .memoized_artifact_cache_key_for_configure(&root, &root, storage.path(), None)
+            .unwrap()
+            .unwrap();
+        assert_ne!(bound_key, build_key);
+        assert_eq!(ctx.cached_artifact_cache_key(&root), Some(bound_key));
+        assert!(matches!(
+            crate::root_identity::read(&root, storage.path()).unwrap(),
+            Some(crate::root_identity::Identity::Git { .. })
+        ));
+    }
+
+    #[test]
+    fn configure_view_keeps_saved_path_key_when_git_is_added_before_maintenance() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let request = configure_request_with_params(json!({
+            "project_root": root, "harness": "pi", "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "views": {"enabled": true},
+                "indexes": {"trigram": false, "semantic": false, "callgraph": false}
+            }))],
+        }));
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        let job = ctx.drain_configure_maintenance().pop().unwrap();
+        let saved_key = crate::search_index::artifact_path_identity_key(&root);
+        assert_eq!(job.project_key, saved_key);
+        assert_eq!(
+            crate::root_identity::read(&root, storage.path()).unwrap(),
+            Some(crate::root_identity::Identity::Path)
+        );
+        init_git_fixture(&root);
+        assert_ne!(crate::search_index::artifact_cache_key(&root), saved_key);
+
+        let other_context = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let input = super::ConfigureViewInput::capture(&other_context, &job);
+        assert_eq!(input.family, saved_key);
+        let prepared = super::open_view_runtime_for_configure(&input, &job).unwrap();
+        assert_eq!(prepared.snapshot.family, saved_key);
+    }
+
+    #[test]
     fn superseded_standalone_view_load_never_installs_its_snapshot() {
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -13638,7 +13916,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_configure_rejects_git_like_root_when_cache_key_probe_fails_without_memo() {
+    fn handle_configure_keeps_unreadable_git_unindexed_without_saving_a_path_identity() {
         let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
@@ -13647,7 +13925,7 @@ mod tests {
         let canonical_root = std::fs::canonicalize(&root).expect("canonical root");
         let _override =
             crate::search_index::force_git_root_commit_probe_transient_for_paths_for_test(
-                vec![root.clone(), canonical_root],
+                vec![root.clone(), canonical_root.clone()],
                 "spawn failed: Too many open files (os error 24)",
             );
         let ctx = test_context();
@@ -13663,15 +13941,361 @@ mod tests {
         let response = handle_configure_for_test(&req, &ctx);
 
         assert!(
-            !response.success,
-            "configure must reject ambiguous git identity"
+            response.success,
+            "direct tools must remain usable: {response:?}"
         );
-        assert_eq!(response.data["code"], "cache_key_probe_failed");
-        assert_eq!(response.data["retryable"], true);
+        assert!(ctx.artifact_identity_provisional());
+        assert!(!ctx.config().indexes.trigram);
+        assert!(!ctx.config().indexes.semantic);
+        assert!(!ctx.config().indexes.callgraph);
+        assert!(!ctx.config().views.enabled);
+        let reason = ctx.artifact_identity_provisional_reason().unwrap();
+        assert!(reason.contains("git_identity_unavailable"), "{reason}");
+        assert!(reason.contains("Too many open files"), "{reason}");
+        assert_eq!(ctx.cached_artifact_cache_key(&canonical_root), None);
+        assert_eq!(crate::root_identity::read(&root, &storage).unwrap(), None);
         let path_key = crate::search_index::artifact_path_identity_key_for_test(&root);
         assert!(!storage.join("index").join(&path_key).exists());
         assert!(!storage.join("semantic").join(&path_key).exists());
         assert!(!storage.join("callgraph").join(&path_key).exists());
+    }
+
+    /// Hold aft.db in an exclusive transaction. In rollback-journal mode this
+    /// also blocks readers, so the bind cannot read its legacy identity pin.
+    fn hold_aft_db_exclusively(storage: &std::path::Path) -> rusqlite::Connection {
+        std::fs::create_dir_all(storage).unwrap();
+        let lock = rusqlite::Connection::open(storage.join("aft.db")).unwrap();
+        lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        lock
+    }
+
+    fn trigram_bind_request(root: &std::path::Path, storage: &std::path::Path) -> RawRequest {
+        configure_request_with_params(json!({
+            "project_root": root,
+            "harness": "opencode",
+            "storage_dir": storage,
+            "config": [user_tier(json!({
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
+                "views": { "enabled": false },
+            }))],
+        }))
+    }
+
+    /// A git checkout and its storage folder, with aft.db held busy.
+    fn busy_bind_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, rusqlite::Connection) {
+        let temp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        let root = base.join("repo");
+        init_git_fixture(&root);
+        let storage = base.join("storage");
+        let lock = hold_aft_db_exclusively(&storage);
+        (temp, root, storage, lock)
+    }
+
+    fn has_busy_provisional_reason(ctx: &AppContext) -> bool {
+        ctx.degraded_reasons()
+            .iter()
+            .any(|reason| reason == crate::search_index::PROVISIONAL_IDENTITY_REASON)
+    }
+
+    #[test]
+    fn busy_aft_db_at_first_bind_enables_indexes_once_the_database_frees() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_temp, root, storage, lock) = busy_bind_fixture();
+        let ctx = test_context();
+        let request = trigram_bind_request(&root, &storage);
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::from_secs(600),
+            || {
+                let response = super::handle_configure(&request, &ctx);
+                assert!(response.success, "{}", response.data);
+                assert!(
+                    has_busy_provisional_reason(&ctx),
+                    "{:?}",
+                    ctx.degraded_reasons()
+                );
+                assert!(!ctx.config().indexes.trigram);
+                // The bind's own tail runs first; a retry never interleaves with it.
+                super::drain_deferred_configure_maintenance(&ctx);
+
+                // While aft.db stays busy an attempt changes nothing.
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert_eq!(
+                    ctx.provisional_identity_retry().attempts_for_test(),
+                    Some(1)
+                );
+                assert!(!ctx.config().indexes.trigram);
+                assert_eq!(crate::root_identity::read(&root, &storage).unwrap(), None);
+                assert_eq!(ctx.cached_artifact_cache_key(&root), None);
+
+                lock.execute_batch("ROLLBACK").unwrap();
+                drop(lock);
+                // No second bind: the next maintenance drain settles the root.
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert!(
+                    ctx.artifact_identity_provisional_reason().is_none(),
+                    "{:?}",
+                    ctx.degraded_reasons()
+                );
+                assert!(ctx.config().indexes.trigram);
+                assert!(!ctx.provisional_identity_retry().is_armed());
+                assert!(crate::root_identity::read(&root, &storage)
+                    .unwrap()
+                    .is_some());
+                assert!(ctx.cached_artifact_cache_key(&root).is_some());
+            },
+        );
+    }
+
+    /// While aft.db is busy, a reader outside configure (standing-root
+    /// maintenance reads every session actor's key) can only derive the
+    /// root's key from Git. With an older standing path pin for the root in
+    /// aft.db, the identity settles on the path key instead, so that Git-only
+    /// key must never be cached as the root's key, and caching it must not
+    /// stop the retry.
+    #[test]
+    fn provisional_root_caches_no_git_only_key_and_still_settles() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        let root = base.join("repo");
+        init_git_fixture(&root);
+        let storage = base.join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        {
+            let mut database = crate::db::open(&storage.join("aft.db")).unwrap();
+            crate::db::standing_roots::ensure_standing_root(
+                &mut database,
+                &crate::db::standing_roots::StandingRootRecord {
+                    literal_path: root.display().to_string(),
+                    resolved_target: root.display().to_string(),
+                    resolved_git_toplevel: None,
+                    scoped_relative_path: None,
+                },
+                &[crate::config::IndexKind::Search],
+            )
+            .unwrap();
+        }
+        let lock = hold_aft_db_exclusively(&storage);
+        let ctx = test_context();
+        // A reader that ran before the bind published its degraded reasons.
+        let git_key = ctx.memoized_artifact_cache_key(&root);
+        assert_eq!(
+            ctx.cached_artifact_cache_key(&root).as_deref(),
+            Some(git_key.as_str())
+        );
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::from_secs(600),
+            || {
+                let response =
+                    super::handle_configure(&trigram_bind_request(&root, &storage), &ctx);
+                assert!(response.success, "{}", response.data);
+                assert!(
+                    has_busy_provisional_reason(&ctx),
+                    "{:?}",
+                    ctx.degraded_reasons()
+                );
+                let cached_after_bind = ctx.cached_artifact_cache_key(&root);
+                super::drain_deferred_configure_maintenance(&ctx);
+
+                // A standing-maintenance pass reads the key while aft.db is busy.
+                assert_eq!(ctx.memoized_artifact_cache_key(&root), git_key);
+                let cached_after_pass = ctx.cached_artifact_cache_key(&root);
+
+                lock.execute_batch("ROLLBACK").unwrap();
+                drop(lock);
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert!(
+                    ctx.artifact_identity_provisional_reason().is_none(),
+                    "{:?}",
+                    ctx.degraded_reasons()
+                );
+                assert!(ctx.config().indexes.trigram);
+                let settled = ctx
+                    .cached_artifact_cache_key(&root)
+                    .expect("the settled bind publishes its key");
+                assert_eq!(
+                    settled,
+                    crate::search_index::artifact_path_identity_key_for_test(&root)
+                );
+                assert_ne!(
+                    settled, git_key,
+                    "the fixture must settle on a key the Git-only derivation does not produce"
+                );
+                assert_eq!(ctx.memoized_artifact_cache_key(&root), settled);
+                assert_eq!(
+                    cached_after_bind, None,
+                    "a provisional bind keeps no key cached for its root"
+                );
+                assert_eq!(
+                    cached_after_pass, None,
+                    "a read of a provisional root's key does not cache it"
+                );
+            },
+        );
+    }
+
+    /// A replay can resolve and memoize the settled key and still be refused
+    /// before its commit (for example by a storage error at its retention or
+    /// artifact-owner step). The root then stays provisional with the settled
+    /// key already in the context's key caches, and the retry must replay it
+    /// again rather than read the cached key as proof that it settled.
+    #[test]
+    fn identity_retry_replays_again_after_a_replay_refused_past_its_key_step() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_temp, root, storage, lock) = busy_bind_fixture();
+        let ctx = test_context();
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::from_secs(600),
+            || {
+                let response =
+                    super::handle_configure(&trigram_bind_request(&root, &storage), &ctx);
+                assert!(response.success, "{}", response.data);
+                super::drain_deferred_configure_maintenance(&ctx);
+                lock.execute_batch("ROLLBACK").unwrap();
+                drop(lock);
+
+                // Simulate the key caches after a replay resolves its key but is
+                // refused before its commit.
+                let key = ctx
+                    .memoized_artifact_cache_key_for_configure(&root, &root, &storage, None)
+                    .unwrap()
+                    .expect("aft.db is free, so the identity settles");
+                assert_eq!(
+                    ctx.cached_artifact_cache_key(&root).as_deref(),
+                    Some(key.as_str())
+                );
+                assert!(has_busy_provisional_reason(&ctx));
+                assert!(ctx.provisional_identity_retry().is_armed());
+
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert!(
+                    ctx.artifact_identity_provisional_reason().is_none(),
+                    "{:?}",
+                    ctx.degraded_reasons()
+                );
+                assert!(ctx.config().indexes.trigram);
+                assert!(!ctx.provisional_identity_retry().is_armed());
+                assert_eq!(ctx.cached_artifact_cache_key(&root), Some(key));
+            },
+        );
+    }
+
+    #[test]
+    fn busy_aft_db_retry_gives_up_and_names_the_remedy() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_temp, root, storage, lock) = busy_bind_fixture();
+        let ctx = test_context();
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::ZERO,
+            || {
+                let response =
+                    super::handle_configure(&trigram_bind_request(&root, &storage), &ctx);
+                assert!(response.success, "{}", response.data);
+                super::drain_deferred_configure_maintenance(&ctx);
+                super::drain_deferred_configure_maintenance(&ctx);
+            },
+        );
+        let reasons = ctx.degraded_reasons();
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason == crate::search_index::PROVISIONAL_IDENTITY_EXHAUSTED_REASON),
+            "{reasons:?}"
+        );
+        assert!(!has_busy_provisional_reason(&ctx), "{reasons:?}");
+        assert!(ctx.artifact_identity_provisional());
+        assert!(!ctx.provisional_identity_retry().is_armed());
+        assert!(!ctx.config().indexes.trigram);
+        drop(lock);
+    }
+
+    #[test]
+    fn busy_aft_db_retry_stops_when_the_root_unbinds() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_temp, root, storage, lock) = busy_bind_fixture();
+        let ctx = test_context();
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::from_secs(600),
+            || {
+                let response =
+                    super::handle_configure(&trigram_bind_request(&root, &storage), &ctx);
+                assert!(response.success, "{}", response.data);
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert!(ctx.provisional_identity_retry().is_armed());
+
+                ctx.mark_subc_unbound();
+                lock.execute_batch("ROLLBACK").unwrap();
+                drop(lock);
+                super::drain_deferred_configure_maintenance(&ctx);
+                super::drain_deferred_configure_maintenance(&ctx);
+            },
+        );
+        assert!(!ctx.provisional_identity_retry().is_armed());
+        assert!(!ctx.config().indexes.trigram);
+        assert!(
+            has_busy_provisional_reason(&ctx),
+            "{:?}",
+            ctx.degraded_reasons()
+        );
+        assert_eq!(crate::root_identity::read(&root, &storage).unwrap(), None);
+        assert_eq!(ctx.cached_artifact_cache_key(&root), None);
+    }
+
+    #[test]
+    fn quiescing_a_root_cancels_its_identity_retry() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_temp, root, storage, lock) = busy_bind_fixture();
+        let ctx = test_context();
+        let response = super::handle_configure(&trigram_bind_request(&root, &storage), &ctx);
+        assert!(response.success, "{}", response.data);
+        assert!(ctx.provisional_identity_retry().is_armed());
+        super::cancel_deferred_configure_maintenance(&ctx);
+        assert!(!ctx.provisional_identity_retry().is_armed());
+        drop(lock);
+    }
+
+    #[test]
+    fn dubious_ownership_identity_does_not_retry_in_the_background() {
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root.join(".git")).expect("create git marker");
+        let storage = temp.path().join("storage");
+        let _override =
+            crate::search_index::force_git_root_commit_probe_transient_for_paths_for_test(
+                vec![root.clone()],
+                "fatal: detected dubious ownership in repository",
+            );
+        let ctx = test_context();
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::from_secs(600),
+            || {
+                let response =
+                    super::handle_configure(&trigram_bind_request(&root, &storage), &ctx);
+                assert!(response.success, "{}", response.data);
+                let reason = ctx.artifact_identity_provisional_reason().unwrap();
+                assert!(reason.contains("dubious ownership"), "{reason}");
+                assert!(!ctx.provisional_identity_retry().is_armed());
+                let generation = ctx.configure_generation();
+                super::drain_deferred_configure_maintenance(&ctx);
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert_eq!(
+                    ctx.configure_generation(),
+                    generation,
+                    "no bind may be replayed for an unreadable Git identity"
+                );
+            },
+        );
+        assert!(!ctx.config().indexes.trigram);
     }
 
     #[test]
@@ -20698,7 +21322,8 @@ mod tests {
                         None,
                         &mut profile.key,
                     )
-                    .unwrap();
+                    .unwrap()
+                    .expect("a free aft.db gives a settled identity");
                 assert_eq!(
                     profile.key.git_spawns,
                     usize::from(label == "cold_context" || sample == 0)

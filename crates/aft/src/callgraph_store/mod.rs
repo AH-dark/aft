@@ -2263,10 +2263,9 @@ impl RefreshOpenFailure {
     fn readiness_changed(&self, root: &RefreshRoot) -> bool {
         (self.writer_excluded
             && !crate::root_cache::writer_lease_path(&root.callgraph_dir).exists())
-            || read_pointer(
-                &root.callgraph_dir,
-                &crate::search_index::artifact_cache_key(&root.project_root),
-            ) != self.published_generation
+            || project_key_for_store(&root.callgraph_dir, &root.project_root).is_ok_and(|key| {
+                read_pointer(&root.callgraph_dir, &key) != self.published_generation
+            })
     }
 }
 
@@ -2321,10 +2320,9 @@ fn refresh_readiness_watch(
     let root = root.clone();
     let watch_dir = fs_canonicalize(&root.callgraph_dir).map_err(notify::Error::io)?;
     let lease = crate::root_cache::writer_lease_path(&watch_dir);
-    let pointer = pointer_path(
-        &watch_dir,
-        &crate::search_index::artifact_cache_key(&root.project_root),
-    );
+    let project_key = project_key_for_store(&root.callgraph_dir, &root.project_root)
+        .map_err(|error| notify::Error::generic(&error.to_string()))?;
+    let pointer = pointer_path(&watch_dir, &project_key);
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
         let Ok(event) = event else { return };
         let lease_released = refresh_lease_release_event(&event, &lease);
@@ -3393,10 +3391,10 @@ fn process_callgraph_refresh_batch(
         .iter()
         .map(CallgraphRefreshState::installed_store_snapshot)
         .collect::<Vec<_>>();
-    let published_generation = read_pointer(
-        &batch.root.callgraph_dir,
-        &crate::search_index::artifact_cache_key(&batch.root.project_root),
-    );
+    let published_generation =
+        project_key_for_store(&batch.root.callgraph_dir, &batch.root.project_root)
+            .ok()
+            .and_then(|key| read_pointer(&batch.root.callgraph_dir, &key));
     let opened = if test_seam.fail_open {
         Ok(None)
     } else {
@@ -5429,6 +5427,27 @@ impl ResolverIndex for DiskProjectIndex<'_> {
     }
 }
 
+/// Configure and standing builds pass their chosen key in `storage/callgraph/key`.
+/// Readers, leases and publication must reuse it instead of probing Git again.
+/// Standing subtree keys are longer than session keys; deriving a session key
+/// here would address a different publication even for the same saved identity.
+/// Standalone stores are not keyed subdirectories under `callgraph/`, so resolve
+/// their saved identity in their own directory without writing identity metadata.
+fn project_key_for_store(callgraph_dir: &Path, project_root: &Path) -> Result<String> {
+    if callgraph_dir
+        .parent()
+        .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "callgraph"))
+    {
+        return callgraph_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .ok_or_else(|| CallGraphStoreError::Unavailable("invalid callgraph cache key".into()));
+    }
+    crate::search_index::artifact_cache_key_read_only(project_root, callgraph_dir)
+        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))
+}
+
 impl CallGraphStore {
     pub fn open_if_enabled(
         options: CallGraphStoreOptions,
@@ -5442,7 +5461,7 @@ impl CallGraphStore {
     }
 
     pub fn open(callgraph_dir: PathBuf, project_root: PathBuf) -> Result<Self> {
-        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        let project_key = project_key_for_store(&callgraph_dir, &project_root)?;
         let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
         else {
             return Err(CallGraphStoreError::Unavailable(
@@ -5484,7 +5503,7 @@ impl CallGraphStore {
         project_root: PathBuf,
     ) -> Result<Option<ReadonlyCallGraphStore>> {
         crate::private_storage::tighten_keyed_dir(&callgraph_dir, "callgraph");
-        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        let project_key = project_key_for_store(&callgraph_dir, &project_root)?;
         // A generation written by a newer build is refused by name rather than
         // reported as not built (which would send callers to a cold build) or
         // served from an older legacy partition.
@@ -5606,7 +5625,7 @@ impl CallGraphStore {
         allow_root_repair: bool,
         role: WriterConnectionRole,
     ) -> Result<Option<Self>> {
-        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        let project_key = project_key_for_store(&callgraph_dir, &project_root)?;
         let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
         else {
             return Ok(None);
@@ -5691,7 +5710,7 @@ impl CallGraphStore {
         chunk_size: usize,
         require_new_publication: bool,
     ) -> Result<(Self, ColdBuildStats)> {
-        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        let project_key = project_key_for_store(&callgraph_dir, &project_root)?;
         let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
         else {
             let operation = if require_new_publication {
@@ -5737,7 +5756,7 @@ impl CallGraphStore {
         files: &[PathBuf],
         chunk_size: usize,
     ) -> Result<(Self, Option<ColdBuildStats>)> {
-        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        let project_key = project_key_for_store(&callgraph_dir, &project_root)?;
         let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
         else {
             return Err(CallGraphStoreError::Unavailable(
@@ -5826,7 +5845,7 @@ impl CallGraphStore {
         callgraph_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<Self>> {
-        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        let project_key = project_key_for_store(&callgraph_dir, &project_root)?;
         let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
         else {
             return Ok(None);
@@ -6130,7 +6149,7 @@ impl CallGraphStore {
     }
 
     pub fn needs_cold_build(callgraph_dir: &Path, project_root: &Path) -> Result<bool> {
-        let project_key = crate::search_index::artifact_cache_key(project_root);
+        let project_key = project_key_for_store(callgraph_dir, project_root)?;
         // A cold build is needed unless a ready generation (or ready legacy DB)
         // is currently published.
         Ok(resolve_ready_target(callgraph_dir, &project_key).is_none())
@@ -10913,7 +10932,15 @@ fn open_readonly_connection_before(path: &Path, deadline: Instant) -> Result<Tra
 }
 
 fn sqlite_readonly_uri(path: &Path) -> String {
-    let raw = path.to_string_lossy().replace('\\', "/");
+    let path = crate::db::lifecycle::sqlite_open_path(path);
+    let lossy = path.to_string_lossy();
+    if lossy.starts_with(r"\\?\") {
+        // Windows reads a `\\?\` path literally, so its backslashes stay
+        // backslashes (percent-encoded) instead of becoming `/`. SQLite drops
+        // the leading `/` of `/\\?\` when it resolves the file name.
+        return format!("file:///{}?mode=ro", percent_encode_sqlite_uri_path(&lossy));
+    }
+    let raw = lossy.replace('\\', "/");
     let encoded = percent_encode_sqlite_uri_path(&raw);
     if raw.starts_with('/') {
         format!("file://{encoded}?mode=ro")
@@ -24841,6 +24868,16 @@ mod cold_build_insert_tests {
         assert_eq!(
             sqlite_readonly_uri(Path::new(r"C:\Users\name with spaces\db#1.sqlite")),
             "file:///C:/Users/name%20with%20spaces/db%231.sqlite?mode=ro"
+        );
+    }
+
+    /// A `\\?\` path keeps its backslashes: Windows does not treat `/` as a
+    /// separator inside one, so turning them into `/` would name another file.
+    #[test]
+    fn sqlite_readonly_uri_keeps_windows_verbatim_paths_literal() {
+        assert_eq!(
+            sqlite_readonly_uri(Path::new(r"\\?\C:\Users\name with spaces\db#1.sqlite")),
+            "file:///%5C%5C%3F%5CC:%5CUsers%5Cname%20with%20spaces%5Cdb%231.sqlite?mode=ro"
         );
     }
 

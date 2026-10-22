@@ -781,9 +781,13 @@ impl Child {
     }
 
     /// The child's artifact family, the same key its own sessions use.
-    fn family(&self) -> &str {
-        self.family
-            .get_or_init(|| crate::search_index::artifact_cache_key(&self.root))
+    fn family(&self, storage: &Path) -> Result<&str, String> {
+        if self.family.get().is_none() {
+            let key = crate::search_index::artifact_cache_key_read_only(&self.root, storage)
+                .map_err(|error| error.to_string())?;
+            let _ = self.family.set(key);
+        }
+        Ok(self.family.get().expect("resolved child family"))
     }
 
     /// The child's path relative to the parent, slash-separated, for gaps.
@@ -842,8 +846,8 @@ impl Child {
         // The family registry lists a repository's per-checkout views. A
         // reader never creates one: a child whose own sessions never
         // published such a view has nothing to read yet.
-        let Some(registry) =
-            FamilyRegistry::open_existing(storage, self.family()).map_err(|e| e.to_string())?
+        let Some(registry) = FamilyRegistry::open_existing(storage, self.family(storage)?)
+            .map_err(|e| e.to_string())?
         else {
             return Ok(None);
         };

@@ -71,9 +71,20 @@ impl SemanticMigrationRequest {
         configured_model_fingerprint: impl Into<String>,
     ) -> Self {
         let project_root = project_root.into();
+        let family = crate::search_index::artifact_cache_key_for_build(&project_root);
+        Self::for_root_with_key(storage, project_root, family, configured_model_fingerprint)
+    }
+
+    pub(crate) fn for_root_with_key(
+        storage: impl Into<PathBuf>,
+        project_root: impl Into<PathBuf>,
+        family: impl Into<String>,
+        configured_model_fingerprint: impl Into<String>,
+    ) -> Self {
+        let project_root = project_root.into();
         Self {
             storage: storage.into(),
-            family: crate::search_index::artifact_cache_key(&project_root),
+            family: family.into(),
             view: crate::path_identity::project_scope_key(&project_root),
             project_root,
             configured_model_fingerprint: configured_model_fingerprint.into(),
@@ -550,7 +561,8 @@ pub fn rebuild_legacy_callgraph_once(
     chunk_size: usize,
 ) -> Result<CallgraphMigrationOutcome, MigrationError> {
     let project_root = fs::canonicalize(project_root)?;
-    let family = crate::search_index::artifact_cache_key(&project_root);
+    let family = crate::search_index::artifact_cache_key_read_only(&project_root, storage)
+        .map_err(io::Error::other)?;
     let callgraph_dir = storage.join("callgraph").join(family);
     let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
     let (_store, rebuilt) =

@@ -231,9 +231,29 @@ pub fn classify_resolved_standing_root(
     })
 }
 
-/// Resolve a configured spelling into the durable identity it records. The
-/// literal spelling remains untouched; only the recorded target is canonical.
+/// Observe a root in the default storage namespace without creating a binding.
 pub fn resolve_standing_root(literal_path: &str) -> Result<ResolvedStandingRoot, ScopedKeyError> {
+    let storage = crate::bash_background::storage_dir(None);
+    resolve_standing_root_in_storage(literal_path, &storage, false)
+}
+
+/// Configured standing roots use `persist=true`; read-only health reports use
+/// `false`. Both resolve the identity stored under `storage`. StandingRoots::reconcile
+/// separately checks that the literal path still points at its pinned target.
+pub(crate) fn resolve_standing_root_in_storage(
+    literal_path: &str,
+    storage: &Path,
+    persist: bool,
+) -> Result<ResolvedStandingRoot, ScopedKeyError> {
+    resolve_standing_root_with_recheck(literal_path, storage, persist, true)
+}
+
+pub(crate) fn resolve_standing_root_with_recheck(
+    literal_path: &str,
+    storage: &Path,
+    persist: bool,
+    force: bool,
+) -> Result<ResolvedStandingRoot, ScopedKeyError> {
     let home = crate::environment::non_empty_os_var("HOME")
         .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
         .map(PathBuf::from);
@@ -247,19 +267,27 @@ pub fn resolve_standing_root(literal_path: &str) -> Result<ResolvedStandingRoot,
         path: expanded,
         detail: error.to_string(),
     })?;
-    let git_toplevel = find_git_toplevel(&target)?;
-    let identity = classify_resolved_standing_root(&target, git_toplevel.as_deref())?;
-
-    let resolved_target = unicode_path(&target)?;
-    let resolved_git_toplevel = git_toplevel.as_deref().map(unicode_path).transpose()?;
-    let scoped_relative_path = identity.scoped_relative_path().map(str::to_string);
-
+    let mut timings = crate::search_index::ArtifactCacheKeyTimings::default();
+    let identity = crate::search_index::resolve_root_identity_with_recheck(
+        &target,
+        &target,
+        storage,
+        None,
+        &mut timings,
+        persist,
+        force,
+    )
+    .map_err(|error| ScopedKeyError::GitProbe {
+        path: target.clone(),
+        detail: error.to_string(),
+    })?;
+    let (toplevel, relative) = identity.topology();
     Ok(ResolvedStandingRoot {
         literal_path: literal_path.to_string(),
-        resolved_target,
-        resolved_git_toplevel,
-        scoped_relative_path,
-        artifact_key: identity.artifact_key().to_string(),
+        resolved_target: unicode_path(&target)?,
+        resolved_git_toplevel: toplevel.as_deref().map(unicode_path).transpose()?,
+        scoped_relative_path: relative,
+        artifact_key: identity.key(&target, true),
     })
 }
 
@@ -307,10 +335,8 @@ fn unicode_path(path: &Path) -> Result<String, ScopedKeyError> {
         .ok_or_else(|| ScopedKeyError::NonUnicodePath(path.to_path_buf()))
 }
 
+#[cfg(test)]
 fn find_git_toplevel(path: &Path) -> Result<Option<PathBuf>, ScopedKeyError> {
-    if !crate::developer_tools::git_usable() {
-        return Ok(None);
-    }
     let stdout = match crate::git_probe::toplevel(path) {
         Ok(stdout) => stdout,
         Err(crate::git_probe::ProbeError::Spawn(error)) => {

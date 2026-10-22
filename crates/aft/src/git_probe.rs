@@ -46,6 +46,7 @@ pub(crate) fn command() -> Command {
 
 /// `git rev-parse --show-toplevel`, run with `-C root` from AFT's own working
 /// directory.
+#[cfg(test)]
 pub(crate) fn toplevel(root: &Path) -> Result<Vec<u8>, ProbeError> {
     Probe::new(root, ChildDirectory::Inherited).run(&["rev-parse", "--show-toplevel"])
 }
@@ -123,6 +124,14 @@ impl<'a> Probe<'a> {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        // Unavailable Git cannot attest repository absence. Do not launch the
+        // developer-tools installer while trying to determine an identity.
+        if !crate::developer_tools::git_usable() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON,
+            ));
+        }
         let output = self.command().args(args).output()?;
         self.spawned += 1;
         Ok(output)

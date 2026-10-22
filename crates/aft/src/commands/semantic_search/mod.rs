@@ -2116,6 +2116,23 @@ fn handle_semantic_search_inner(
             external_source,
         );
     }
+    // An unsettled artifact identity keeps indexes off until the next bind;
+    // answer through the bounded grep fallback and disclose the bind failure.
+    if let Some(reason) = ctx.artifact_identity_provisional_reason() {
+        return semantic_unavailable_grep_fallback_response(
+            req,
+            ctx,
+            &params,
+            &shape,
+            "unavailable",
+            reason,
+            "identity provisional",
+            false,
+            Vec::new(),
+            &project_root,
+            top_k,
+        );
+    }
     let semantic_status_snapshot = match try_read_with_budget(
         ctx.semantic_index_status(),
         INTERACTIVE_ARTIFACT_READ_BUDGET,
@@ -7523,9 +7540,12 @@ fn semantic_artifact_persisted(ctx: &AppContext) -> bool {
     let Some(storage) = ctx.config().storage_dir.clone() else {
         return false;
     };
+    let Ok(key) = ctx.memoized_readonly_artifact_cache_key(&root, &storage) else {
+        return false;
+    };
     storage
         .join("semantic")
-        .join(ctx.memoized_artifact_cache_key(&root))
+        .join(key)
         .join("semantic.bin")
         .is_file()
 }
@@ -13765,6 +13785,77 @@ mod split_request_tests {
                 "{result}"
             );
         }
+    }
+
+    #[test]
+    fn external_search_reuses_saved_path_identity_after_git_is_added() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let session = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (_dir, root) = project();
+        let owner = external_context(&root, storage.path(), false);
+        let key = owner
+            .memoized_artifact_cache_key_for_configure(&root, &root, storage.path(), None)
+            .unwrap()
+            .expect("settled path identity");
+        assert_eq!(
+            crate::root_identity::read(&root, storage.path()).unwrap(),
+            Some(crate::root_identity::Identity::Path)
+        );
+        save_external_index(&root, storage.path());
+
+        git_init(&root);
+        assert!(std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "add",
+                "."
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "initial"
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert_ne!(crate::search_index::artifact_cache_key(&root), key);
+
+        let ctx = external_context(session.path(), storage.path(), false);
+        let response = crate::readonly_artifacts::with_borrowed_search_load_limits_for_test(
+            10_000,
+            Duration::from_secs(5),
+            || {
+                search(
+                    &ctx,
+                    serde_json::json!({
+                        "query": "scheduler drains the work queue", "pattern": "load_config", "path": root,
+                    }),
+                )
+            },
+        );
+        assert_external_split(&response, &root);
+        assert_eq!(
+            response["saved_index_check"]["complete"], true,
+            "{response}"
+        );
+        assert_eq!(
+            response["saved_index_check"]["files_examined"], 5,
+            "{response}"
+        );
     }
 
     #[test]

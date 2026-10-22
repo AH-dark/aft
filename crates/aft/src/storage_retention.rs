@@ -962,7 +962,7 @@ fn mount_matches(binding: &Binding) -> bool {
     let boot_volume = mount_point(Path::new("/")).as_deref() == Some(Path::new("/"));
     #[cfg(not(target_os = "macos"))]
     let boot_volume = false;
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     let uuid_at = |path: &Path| {
         let probe_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if let Some(uuid) = test_volume_uuids()
@@ -974,7 +974,7 @@ fn mount_matches(binding: &Binding) -> bool {
         }
         volume_uuid(path)
     };
-    #[cfg(not(test))]
+    #[cfg(not(any(test, debug_assertions)))]
     let uuid_at = volume_uuid;
     mount_matches_with(
         binding,
@@ -985,10 +985,56 @@ fn mount_matches(binding: &Binding) -> bool {
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn test_volume_uuids() -> &'static Mutex<HashMap<PathBuf, String>> {
     static UUIDS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
     UUIDS.get_or_init(Default::default)
+}
+
+/// A scoped mounted-volume identity for debug-build integration fixtures.
+/// No environment variable can install an override, and release builds have
+/// neither this guard nor the override lookup.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct TestVolumeUuidGuard {
+    anchor: PathBuf,
+    previous: Option<String>,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for TestVolumeUuidGuard {
+    fn drop(&mut self) {
+        let mut uuids = test_volume_uuids()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = self.previous.take() {
+            uuids.insert(self.anchor.clone(), previous);
+        } else {
+            uuids.remove(&self.anchor);
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn test_volume_uuid_guard(
+    storage: &Path,
+    anchor: &Path,
+    uuid: &str,
+) -> io::Result<TestVolumeUuidGuard> {
+    let storage = fs::canonicalize(storage)?;
+    let anchor = fs::canonicalize(anchor)?;
+    if !anchor.starts_with(&storage) || uuid.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a test volume identity needs a named anchor inside its storage root",
+        ));
+    }
+    let previous = test_volume_uuids()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(anchor.clone(), uuid.to_owned());
+    Ok(TestVolumeUuidGuard { anchor, previous })
 }
 
 fn mount_matches_with(
@@ -999,12 +1045,9 @@ fn mount_matches_with(
     boot_volume: bool,
 ) -> bool {
     let Some((anchor, dev)) = &binding.volume else {
-        // Memo/owner bindings without volume information are accepted only for
-        // managed worker paths, never for an unattributed external checkout.
-        return binding
-            .root
-            .to_string_lossy()
-            .contains("/cortexkit/alfonso/worktrees/");
+        // A missing path cannot prove its original volume is mounted. Keep
+        // records without volume evidence until a bind records that identity.
+        return false;
     };
     if let Some(identity) = &binding.stable_volume {
         if let Some(uuid) = &identity.uuid {
@@ -1024,7 +1067,9 @@ fn mount_matches_with(
         // disk. The running system snapshot may receive a new st_dev at reboot.
         return true;
     }
-    device_at(anchor) == Some(*dev)
+    // Legacy device numbers can be reused after reboot or media replacement.
+    // Only the proven boot-volume exception above can expire a legacy record.
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3911,6 +3956,100 @@ mod storage_retention_tests {
             .path()
             .join(format!("retention/roots/{scope}.json"))
             .is_file());
+    }
+
+    #[test]
+    fn legacy_path_spelling_never_proves_volume_continuity() {
+        let temp = tempfile::tempdir().unwrap();
+        let binding = Binding {
+            root: temp.path().join("cortexkit/alfonso/worktrees/absent"),
+            artifact_key: "0123456789abcdef".into(),
+            last_bound_ms: 0,
+            volume: None,
+            stable_volume: None,
+            linked_worktree: false,
+        };
+        let mounted = mount_matches_with(&binding, &|_| None, &|_| Some(42), Some("boot"), false);
+        assert_eq!(
+            binding_eligibility_with_mount(&binding, ROOT_GRACE_MS + 1, mounted),
+            RootEligibility::MountMismatch
+        );
+    }
+
+    #[test]
+    fn legacy_nonboot_anchor_or_device_without_recorded_identity_is_retained() {
+        let temp = tempfile::tempdir().unwrap();
+        for (anchor, boot_volume) in [
+            ("/", false),
+            ("/Volumes/external", false),
+            ("/Volumes/external", true),
+        ] {
+            let binding = Binding {
+                root: temp.path().join("absent"),
+                artifact_key: "0123456789abcdef".into(),
+                last_bound_ms: 0,
+                volume: Some((PathBuf::from(anchor), 42)),
+                stable_volume: None,
+                linked_worktree: false,
+            };
+            let mounted = mount_matches_with(
+                &binding,
+                &|_| None,
+                &|_| Some(42),
+                Some("boot"),
+                boot_volume,
+            );
+            assert_eq!(
+                binding_eligibility_with_mount(&binding, ROOT_GRACE_MS + 1, mounted),
+                RootEligibility::MountMismatch,
+                "anchor={anchor}, boot_volume={boot_volume}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_boot_anchor_proves_continuity_despite_a_changed_device_number() {
+        let temp = tempfile::tempdir().unwrap();
+        let binding = Binding {
+            root: temp.path().join("absent"),
+            artifact_key: "0123456789abcdef".into(),
+            last_bound_ms: 0,
+            volume: Some((PathBuf::from("/"), 42)),
+            stable_volume: None,
+            linked_worktree: false,
+        };
+        let mounted =
+            mount_matches_with(&binding, &|_| None, &|_| Some(99), Some("new-boot"), true);
+        assert_eq!(
+            binding_eligibility_with_mount(&binding, ROOT_GRACE_MS + 1, mounted),
+            RootEligibility::Due
+        );
+    }
+
+    #[test]
+    fn absent_root_git_uncertainty_is_not_volume_evidence() {
+        let (temp, root, scope) = fixture();
+        let _uuid = uuid_backed_binding(temp.path(), &scope);
+        fs::remove_dir(&root).unwrap();
+        assert!(matches!(
+            crate::git_probe::toplevel(&root),
+            Err(crate::git_probe::ProbeError::Failed {
+                kind: crate::git_probe::FailureKind::Other,
+                ..
+            })
+        ));
+        let mut binding: Binding =
+            read_json(&temp.path().join(format!("retention/roots/{scope}.json"))).unwrap();
+        assert_eq!(
+            binding_eligibility(&binding, ROOT_GRACE_MS + 1),
+            RootEligibility::Due
+        );
+        binding.volume = None;
+        binding.stable_volume = None;
+        assert_eq!(
+            binding_eligibility(&binding, ROOT_GRACE_MS + 1),
+            RootEligibility::MountMismatch
+        );
     }
 
     #[test]

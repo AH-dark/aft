@@ -1361,6 +1361,11 @@ struct RootMeta {
     /// A ConfigureTail drain for this root is submitted and has not completed.
     /// Counted across roots against `CONFIGURE_TAIL_CONCURRENCY`.
     configure_tail_in_flight: bool,
+    /// Cancellation for the background identity retry's replayed bind while
+    /// it is queued or running. Maintenance treats the root as having a bind
+    /// in flight, and quiescing the root cancels it, as route teardown
+    /// cancels a route's own pending bind.
+    identity_replay: Option<JobCancellation>,
 }
 
 #[derive(Debug)]
@@ -1483,6 +1488,9 @@ struct MaintenanceCompletion {
     unacked_bg_keys: Option<HashSet<String>>,
     requeue_kind: Option<MaintenanceDrainKind>,
     diagnostics_on_edit: Option<bool>,
+    /// A bind the identity retry found ready to replay; the loop submits it
+    /// as a route bind of this root.
+    identity_replay: Option<crate::provisional_identity_retry::PreparedReplay>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1516,6 +1524,8 @@ struct MaintenanceJobOutcome {
     /// The root's `lsp.diagnostics_on_edit` after a config reload, which the
     /// route loop keeps its own copy of for tool calls.
     diagnostics_on_edit: Option<bool>,
+    /// See [`MaintenanceCompletion::identity_replay`].
+    identity_replay: Option<crate::provisional_identity_retry::PreparedReplay>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1573,6 +1583,7 @@ impl RootMeta {
             teardown_persist_submitted_at: None,
             ttl_retention_logged: None,
             configure_tail_in_flight: false,
+            identity_replay: None,
         }
     }
 
@@ -1936,6 +1947,18 @@ fn quiesce_unbound_root_with(
         ctx.bash_background()
             .replace_live_delivery_sessions(HashSet::new());
     }
+    // A bind replayed by the identity retry is this root's bind in flight.
+    // Cancel it as route teardown cancels a route's own pending bind: queued,
+    // it is removed; running, it stops at its next checkpoint before the
+    // commit seal and publishes nothing. One that already sealed finishes, and
+    // its completion quiesces the root again (`finish_identity_replay`).
+    if let Some(replay) = meta.identity_replay.as_ref() {
+        let outcome = executor.cancel_job(root_id, replay);
+        log::debug!(
+            "subc attach: cancelled identity retry bind for quiescing root {} ({outcome:?})",
+            root_id.as_path().display()
+        );
+    }
     let cancelled = if root_id.as_path().is_dir() {
         executor.cancel_queued_root_maintenance(root_id)
     } else {
@@ -2239,10 +2262,7 @@ fn reap_idle_roots_with_presence(
     metrics: &DispatchPathMetrics,
     presence: &RootPresence,
 ) -> IdleReapOutcome {
-    let pending_bind_roots = pending_binds
-        .values()
-        .map(|pending| pending.bind_root_id.clone())
-        .collect::<HashSet<_>>();
+    let pending_bind_roots = roots_with_bind_in_flight(pending_binds, live_roots);
     let mut census = ReapBlockerCensus::default();
     let mut candidates = Vec::new();
 
@@ -2752,10 +2772,7 @@ fn submit_due_maintenance_jobs(
     maintenance_tx: &mpsc::Sender<MaintenanceCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
 ) {
-    let pending_bind_roots = pending_binds
-        .values()
-        .map(|pending| pending.bind_root_id.clone())
-        .collect::<HashSet<_>>();
+    let pending_bind_roots = roots_with_bind_in_flight(pending_binds, live_roots);
     let (due_jobs, deferred_jobs) = due_maintenance_jobs(
         live_roots,
         Some(executor),
@@ -4817,6 +4834,10 @@ where
     });
     let mut next_standing_pass_at = tokio::time::Instant::now();
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<MaintenanceCompletion>(256);
+    // Completions of binds replayed by the identity retry; see
+    // `finish_identity_replay`.
+    let (identity_replay_done_tx, mut identity_replay_done_rx) =
+        mpsc::unbounded_channel::<IdentityReplayDone>();
     let (bash_deferred_tx, mut bash_deferred_rx) =
         mpsc::channel::<bash::BashDeferredCompletion>(256);
     let (deferred_response_tx, mut deferred_response_rx) =
@@ -5883,6 +5904,9 @@ where
                     meta.note_activity();
                 }
             }
+            Some(done) = identity_replay_done_rx.recv() => {
+                finish_identity_replay(&done, &mut live_roots, &routes, &executor);
+            }
             Some(completion) = maintenance_rx.recv() => {
                 decrement_counted_channel(&dispatch_path_metrics.maintenance_queued);
                 let root_id = completion.root_id.clone();
@@ -5911,6 +5935,36 @@ where
                 };
                 if requiesce {
                     quiesce_unbound_root(&root_id, &mut live_roots, &executor);
+                }
+                if let Some(replay) = completion.identity_replay {
+                    // An unbound root does no indexing; its retry is dropped.
+                    if let Some(meta) = live_roots
+                        .get_mut(&root_id)
+                        .filter(|meta| !meta.unbound_quiesced && meta.identity_replay.is_none())
+                    {
+                        let session = replay.session();
+                        let replayed = submit_identity_replay_bind(
+                            &executor,
+                            meta,
+                            root_id.clone(),
+                            replay,
+                            &standing_actor,
+                        );
+                        let done_tx = identity_replay_done_tx.clone();
+                        let done_root = root_id.clone();
+                        tokio::spawn(async move {
+                            let response = await_executor_response(
+                                replayed,
+                                "subc-bind-identity-retry".to_string(),
+                            )
+                            .await;
+                            let _ = done_tx.send(IdentityReplayDone {
+                                root_id: done_root,
+                                session,
+                                response,
+                            });
+                        });
+                    }
                 }
                 push::clear_stale_bg_wakes_for_empty_sessions(
                     &root_id,
@@ -9936,6 +9990,120 @@ async fn handle_tool_call(
     Ok(())
 }
 
+/// The ConfigureTail maintenance job: drain the root's configure tail, then,
+/// once nothing of it is left, check the background identity retry. A retry
+/// that finds aft.db free is handed back to the loop as a bind to submit, and
+/// is never replayed inside this job: the job holds only the actor's read
+/// gate, while a configure that changes the root must run as its exclusive
+/// writer (see `crate::provisional_identity_retry`).
+fn run_configure_tail_maintenance(ctx: &AppContext) -> MaintenanceJobOutcome {
+    // Stepping aside leaves the rest parked on the context; the requeue (or
+    // the next tick's tail probe) resumes it once the waiting writer has run.
+    let stepped_aside = runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
+    runtime_drain::drain_configure_warning_events(ctx);
+    let identity_replay = (!stepped_aside && ctx.configure_tail_idle())
+        .then(|| crate::provisional_identity_retry::poll(ctx))
+        .flatten();
+    MaintenanceJobOutcome {
+        requeue_kind: stepped_aside.then_some(MaintenanceDrainKind::ConfigureTail),
+        identity_replay,
+        ..MaintenanceJobOutcome::default()
+    }
+}
+
+/// Submit a replayed bind exactly as the loop submits a route bind, so the
+/// executor gives it a route bind's admission: a shared hold first, and the
+/// exclusive writer barrier once configure asks to change the root. The
+/// root's meta keeps the bind's cancellation while it is in flight, so
+/// maintenance defers the root as for any bind in flight and quiescing the
+/// root cancels it (`quiesce_unbound_root_with`).
+///
+/// Like a route bind, a replay whose configure commits then runs the
+/// standing half of the bind (`StandingActor::begin_session_bind`) before
+/// its admission ends. The provisional bind claimed only the standing entry
+/// for its own folder; once the identity settles, that step pauses every
+/// standing entry sharing the settled key, such as a sibling checkout of the
+/// same repository, so the two never publish into one index family.
+fn submit_identity_replay_bind(
+    executor: &Executor,
+    meta: &mut RootMeta,
+    root_id: ProjectRootId,
+    replay: crate::provisional_identity_retry::PreparedReplay,
+    standing_actor: &Arc<standing::StandingActor>,
+) -> oneshot::Receiver<Response> {
+    let request_id = replay.request_id();
+    let standing_actor = Arc::clone(standing_actor);
+    let (completion, cancellation) = executor.submit_bind_cancellable_async(
+        root_id,
+        request_id,
+        Arc::new(move |ctx| replay.run(ctx, |ctx| standing_actor.begin_session_bind(ctx))),
+    );
+    meta.identity_replay = Some(cancellation);
+    completion
+}
+
+/// A replayed bind finished (completed, failed, or cancelled).
+struct IdentityReplayDone {
+    root_id: ProjectRootId,
+    session: String,
+    response: Response,
+}
+
+/// Settle the loop's record of a replayed bind. If the root quiesced while
+/// the replay was in flight, quiesce it again, as the loop does for a route
+/// bind whose route was torn down: a replay that sealed its commit before
+/// the cancel landed may have opened semantic admission for its session and
+/// queued a configure tail, and an unbound root keeps neither.
+fn finish_identity_replay(
+    done: &IdentityReplayDone,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    executor: &Arc<Executor>,
+) {
+    let Some(meta) = live_roots.get_mut(&done.root_id) else {
+        return;
+    };
+    meta.identity_replay = None;
+    if !done.response.success {
+        log::debug!(
+            "subc attach: identity retry bind for root {} did not complete: {}",
+            done.root_id.as_path().display(),
+            done.response.data
+        );
+    }
+    if !meta.unbound_quiesced {
+        return;
+    }
+    let session_routed = routes
+        .values()
+        .any(|route| route.root == done.root_id && route.session == done.session);
+    if !session_routed {
+        crate::semantic_admission::note_closed(&done.session, done.root_id.as_path());
+    }
+    quiesce_unbound_root(&done.root_id, live_roots, executor);
+}
+
+/// Roots with a bind in flight: a route's pending bind or a replayed bind
+/// from the identity retry. Maintenance defers these roots and the idle
+/// reaper retains them. Route-teardown quiesce decisions deliberately count
+/// only route binds: a replay must not keep an unrouted root bound; it is
+/// cancelled by that quiesce instead.
+fn roots_with_bind_in_flight(
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    live_roots: &HashMap<ProjectRootId, RootMeta>,
+) -> HashSet<ProjectRootId> {
+    pending_binds
+        .values()
+        .map(|pending| pending.bind_root_id.clone())
+        .chain(
+            live_roots
+                .iter()
+                .filter(|(_, meta)| meta.identity_replay.is_some())
+                .map(|(root_id, _)| root_id.clone()),
+        )
+        .collect()
+}
+
 fn submit_maintenance_job(
     executor: &Arc<Executor>,
     root_id: ProjectRootId,
@@ -9972,6 +10140,7 @@ fn submit_maintenance_job(
                     unacked_bg_keys: None,
                     requeue_kind: drained.has_more.then_some(kind),
                     diagnostics_on_edit: None,
+                    identity_replay: None,
                 }
             }
             MaintenanceDrainKind::Lsp => {
@@ -9987,20 +10156,10 @@ fn submit_maintenance_job(
                     // partial batch needs an immediate continuation.
                     requeue_kind: (drained.has_more && drained.processed > 0).then_some(kind),
                     diagnostics_on_edit: None,
+                    identity_replay: None,
                 }
             }
-            MaintenanceDrainKind::ConfigureTail => {
-                // Stepping aside leaves the rest parked on the context; the
-                // requeue (or the next tick's tail probe) resumes it once the
-                // waiting writer has run.
-                let stepped_aside =
-                    runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
-                runtime_drain::drain_configure_warning_events(ctx);
-                MaintenanceJobOutcome {
-                    requeue_kind: stepped_aside.then_some(kind),
-                    ..MaintenanceJobOutcome::default()
-                }
-            }
+            MaintenanceDrainKind::ConfigureTail => run_configure_tail_maintenance(ctx),
             MaintenanceDrainKind::CompletionDrains => {
                 runtime_drain::drain_search_index_events(ctx);
                 runtime_drain::drain_callgraph_store_events(ctx);
@@ -10018,6 +10177,7 @@ fn submit_maintenance_job(
                     unacked_bg_keys: Some(ctx.bash_background().unacked_wake_keys()),
                     requeue_kind: None,
                     diagnostics_on_edit: None,
+                    identity_replay: None,
                 }
             }
             MaintenanceDrainKind::ConfigReload => {
@@ -10089,6 +10249,7 @@ fn submit_maintenance_job(
                 unacked_bg_keys: outcome.unacked_bg_keys,
                 requeue_kind: outcome.requeue_kind,
                 diagnostics_on_edit: outcome.diagnostics_on_edit,
+                identity_replay: outcome.identity_replay,
             },
         )
         .await;
@@ -16424,6 +16585,7 @@ mod tests {
             generation: ctx.configure_generation(),
             root_path: root_path.clone(),
             canonical_cache_root: root_path.clone(),
+            project_key: String::new(),
             harness: crate::harness::Harness::Opencode,
             storage_root: storage_root.clone(),
             harness_dir: storage_root.join("opencode"),
@@ -18593,6 +18755,801 @@ mod tests {
                 )
                 .0
         }
+    }
+
+    /// What a reader can observe of a root's identity state.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct IdentityView {
+        indexes_on: bool,
+        provisional: bool,
+        key_cached: bool,
+    }
+
+    impl IdentityView {
+        fn of(ctx: &AppContext, root: &Path) -> Self {
+            let config = ctx.config();
+            Self {
+                indexes_on: config.indexes.trigram || config.indexes.callgraph,
+                provisional: ctx.artifact_identity_provisional(),
+                key_cached: ctx.cached_artifact_cache_key(root).is_some(),
+            }
+        }
+
+        /// Either the whole provisional state (indexes off, identity
+        /// provisional) or the whole settled state (indexes on, identity
+        /// settled, key published). Anything else is a half-published root.
+        fn consistent(self) -> bool {
+            (!self.indexes_on && self.provisional)
+                || (self.indexes_on && !self.provisional && self.key_cached)
+        }
+    }
+
+    /// One read from another session: the four read tools a route serves
+    /// while the root settles, with the identity state seen before and after.
+    fn identity_retry_read(
+        ctx: &AppContext,
+        root: &Path,
+        index: usize,
+    ) -> (Vec<IdentityView>, Vec<Response>) {
+        let file = root.join("module_1.rs");
+        let request = |command: &str, params: serde_json::Value| {
+            let mut value = params;
+            value["id"] = json!(format!("identity-retry-read-{command}-{index}"));
+            value["command"] = json!(command);
+            serde_json::from_value::<RawRequest>(value).unwrap()
+        };
+        let before = IdentityView::of(ctx, root);
+        let responses = vec![
+            crate::commands::grep::handle_grep(
+                &request("grep", json!({ "pattern": "function_1" })),
+                ctx,
+            ),
+            crate::commands::outline::handle_outline(
+                &request("outline", json!({ "file": file })),
+                ctx,
+            ),
+            crate::commands::semantic_search::handle_semantic_search(
+                &request(
+                    "semantic_search",
+                    json!({ "query": "function_1", "top_k": 3 }),
+                ),
+                ctx,
+            ),
+            crate::commands::callers::handle_callers(
+                &request("callers", json!({ "file": file, "symbol": "function_1" })),
+                ctx,
+            ),
+        ];
+        (vec![before, IdentityView::of(ctx, root)], responses)
+    }
+
+    /// Whether a refused `semantic_search` is the ordinary answer of a root
+    /// whose identity has settled and whose trigram index was just switched on
+    /// and is still building. Every freshly enabled root answers this way until
+    /// its first trigram build lands, so it is not a torn root. It counts only
+    /// when the identity seen before and after the read is the same fully
+    /// settled state, and the refusal names exactly that state: trigram
+    /// building and semantic off, as this fixture configures them. A read that
+    /// straddled a change of identity, or a refusal for any other reason,
+    /// still fails the test.
+    fn settled_search_still_building(views: &[IdentityView], data: &serde_json::Value) -> bool {
+        let settled = IdentityView {
+            indexes_on: true,
+            provisional: false,
+            key_cached: true,
+        };
+        views.iter().all(|view| *view == settled)
+            && data["code"] == "search_lanes_unavailable"
+            && data["lanes"]["trigram"]["status"] == "building"
+            && data["lanes"]["semantic"]["status"] == "off"
+    }
+
+    /// A root whose bind found aft.db busy settles through the background
+    /// retry while another session keeps reading it, and no read observes a
+    /// half-published root: the replayed bind runs as the actor's exclusive
+    /// writer, exactly like a route bind that changes the root.
+    #[test]
+    fn identity_retry_replay_is_admitted_as_a_bind_so_reads_never_see_a_torn_root() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let configured = ConfiguredRoot::unconfigured(&executor);
+        let root_id = configured.root.clone();
+        let canonical_root = configured.canonical_root.clone();
+        let ctx = Arc::clone(&configured.ctx);
+
+        // Rollback-journal mode, so the exclusive transaction also blocks the
+        // bind's read of its legacy identity pin.
+        let lock = rusqlite::Connection::open(configured.storage.path().join("aft.db")).unwrap();
+        lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let bind: RawRequest = serde_json::from_value(json!({
+            "id": "subc-bind-identity-retry-test",
+            "command": "configure",
+            "project_root": configured.dir.path(),
+            "storage_dir": configured.storage.path(),
+            "harness": "opencode",
+            "session_id": "identity-retry-session",
+            "config": [{
+                "tier": "user",
+                "source": "/u/aft.jsonc",
+                "doc": json!({
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": true },
+                    "views": { "enabled": false },
+                }).to_string(),
+            }],
+        }))
+        .unwrap();
+        let bound = configured
+            .submit_bind(&executor, bind)
+            .blocking_recv()
+            .expect("provisional bind completes");
+        assert!(bound.success, "{}", bound.data);
+        assert!(
+            ctx.artifact_identity_provisional(),
+            "{:?}",
+            ctx.degraded_reasons()
+        );
+        assert!(!ctx.config().indexes.trigram);
+
+        // Another session reads the root throughout.
+        let stop = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let reader = {
+            let (executor, root_id, canonical_root, stop, reads) = (
+                Arc::clone(&executor),
+                root_id.clone(),
+                canonical_root.clone(),
+                Arc::clone(&stop),
+                Arc::clone(&reads),
+            );
+            std::thread::spawn(move || {
+                let mut index = 0;
+                while !stop.load(Ordering::SeqCst) {
+                    index += 1;
+                    let (root, sink) = (canonical_root.clone(), Arc::clone(&reads));
+                    let read = executor.submit(
+                        root_id.clone(),
+                        Lane::PureRead,
+                        format!("identity-retry-read-{index}"),
+                        Box::new(move |ctx| {
+                            sink.lock().push(identity_retry_read(ctx, &root, index));
+                            Response::success("read", json!({}))
+                        }),
+                    );
+                    let _ = read.recv_timeout(Duration::from_secs(60));
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+
+        // The configure-tail maintenance tick, as the module loop runs it, and
+        // the loop's submission of any replay that tick hands back.
+        let (commit_reached, commit_release) =
+            crate::commands::configure::gate_configure_commit_for_test(canonical_root.clone());
+        let replay_response = Arc::new(parking_lot::Mutex::new(None));
+        let standing = Arc::new(standing::StandingActor::new(
+            ctx.app(),
+            Arc::clone(&executor),
+        ));
+        let pump = {
+            let (executor, root_id, stop, replay_response, standing) = (
+                Arc::clone(&executor),
+                root_id.clone(),
+                Arc::clone(&stop),
+                Arc::clone(&replay_response),
+                Arc::clone(&standing),
+            );
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let (outcome_tx, outcome_rx) = crossbeam_channel::bounded(1);
+                    let tail = executor.submit_maintenance_async(
+                        root_id.clone(),
+                        Lane::MaintenanceCommit,
+                        "subc-maintenance-drain-configure-tail-identity-retry".to_string(),
+                        Box::new(move |ctx| {
+                            let _ = outcome_tx.send(run_configure_tail_maintenance(ctx));
+                            Response::success("tail", json!({}))
+                        }),
+                    );
+                    let _ = tail.blocking_recv();
+                    if let Ok(outcome) = outcome_rx.try_recv() {
+                        if let Some(replay) = outcome.identity_replay {
+                            let mut meta = RootMeta::new(Instant::now());
+                            let replayed = submit_identity_replay_bind(
+                                &executor,
+                                &mut meta,
+                                root_id.clone(),
+                                replay,
+                                &standing,
+                            );
+                            *replay_response.lock() = replayed.blocking_recv().ok();
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+        };
+
+        // Let the retry see the busy database at least once, then free it.
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(ctx.artifact_identity_provisional());
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+
+        // The replayed bind is parked in its commit: configuration published,
+        // cache root, artifact access and degraded reasons not yet.
+        commit_reached
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the retry replays the bind once aft.db is free");
+        let gated_root = canonical_root.clone();
+        let gated_read = executor.submit(
+            root_id.clone(),
+            Lane::PureRead,
+            "identity-retry-gated-read".to_string(),
+            Box::new(move |ctx| {
+                let view = IdentityView::of(ctx, &gated_root);
+                Response::success(
+                    "gated",
+                    json!({
+                        "indexes_on": view.indexes_on,
+                        "provisional": view.provisional,
+                        "key_cached": view.key_cached,
+                    }),
+                )
+            }),
+        );
+        let during_commit = gated_read.recv_timeout(Duration::from_millis(500)).ok();
+        commit_release.send(()).unwrap();
+        let gated = during_commit.unwrap_or_else(|| {
+            gated_read
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the read runs once the replayed bind commits")
+        });
+        let gated_view = IdentityView {
+            indexes_on: gated.data["indexes_on"] == true,
+            provisional: gated.data["provisional"] == true,
+            key_cached: gated.data["key_cached"] == true,
+        };
+        assert!(
+            gated_view.consistent(),
+            "a read admitted while the replayed bind was committing saw a half-published root: {gated_view:?}"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while ctx.artifact_identity_provisional() {
+            assert!(Instant::now() < deadline, "{:?}", ctx.degraded_reasons());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // A few more reads against the settled root.
+        std::thread::sleep(Duration::from_millis(300));
+        stop.store(true, Ordering::SeqCst);
+        reader.join().unwrap();
+        pump.join().unwrap();
+
+        let replayed = replay_response.lock().take();
+        assert!(
+            replayed.as_ref().is_some_and(|response| response.success),
+            "the replay ran through the bind submission: {replayed:?}"
+        );
+        let reads = std::mem::take(&mut *reads.lock());
+        assert!(!reads.is_empty());
+        for (views, responses) in &reads {
+            for view in views {
+                assert!(
+                    view.consistent(),
+                    "a read saw a half-published root: {view:?}"
+                );
+            }
+            for (tool, response) in responses[..3].iter().enumerate() {
+                if !response.success
+                    && tool == 2
+                    && settled_search_still_building(views, &response.data)
+                {
+                    continue;
+                }
+                assert!(
+                    response.success,
+                    "read failed while the root settled: {views:?} {}",
+                    response.data
+                );
+            }
+            assert_ne!(
+                responses[3].data["code"], "internal_error",
+                "{}",
+                responses[3].data
+            );
+        }
+        assert!(reads.iter().any(|(views, _)| views[0].provisional));
+        assert!(reads.iter().any(|(views, _)| !views[1].provisional));
+        let config = ctx.config();
+        assert!(config.indexes.trigram && config.indexes.callgraph);
+        assert!(ctx.cached_artifact_cache_key(&canonical_root).is_some());
+        assert!(
+            crate::root_identity::read(&canonical_root, configured.storage.path())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A standing-roots pass over every session actor meets one whose bind
+    /// left the identity provisional because aft.db was busy. When that pass
+    /// runs after aft.db frees but before the retry's next attempt, the retry
+    /// must still settle the root and turn its indexes on, and the pass must
+    /// leave no key cached for the provisional root.
+    #[test]
+    fn standing_pass_over_a_provisional_session_keeps_its_identity_retry() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let configured = ConfiguredRoot::unconfigured(&executor);
+        let canonical_root = configured.canonical_root.clone();
+        let ctx = Arc::clone(&configured.ctx);
+        let standing_dir = tempfile::tempdir().unwrap();
+        std::fs::write(standing_dir.path().join("lib.rs"), "pub fn standing() {}\n").unwrap();
+        let standing_root = std::fs::canonicalize(standing_dir.path()).unwrap();
+
+        // Rollback-journal mode, so the exclusive transaction also blocks the
+        // bind's read of its legacy identity pin.
+        let lock = rusqlite::Connection::open(configured.storage.path().join("aft.db")).unwrap();
+        lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let bind: RawRequest = serde_json::from_value(json!({
+            "id": "subc-bind-identity-retry-standing",
+            "command": "configure",
+            "project_root": configured.dir.path(),
+            "storage_dir": configured.storage.path(),
+            "harness": "opencode",
+            "session_id": "identity-retry-standing-session",
+            "config": [{
+                "tier": "user",
+                "source": "/u/aft.jsonc",
+                "doc": json!({
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": false },
+                    "views": { "enabled": false },
+                    "index": { "roots": [{ "path": standing_root, "indexes": ["search"] }] },
+                }).to_string(),
+            }],
+        }))
+        .unwrap();
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::from_secs(600),
+            || {
+                let bound = crate::commands::configure::handle_configure(&bind, &ctx);
+                assert!(bound.success, "{}", bound.data);
+                assert!(
+                    ctx.artifact_identity_provisional(),
+                    "{:?}",
+                    ctx.degraded_reasons()
+                );
+                assert!(!ctx.config().indexes.trigram);
+                assert_eq!(ctx.config().index.roots.len(), 1);
+                // The bind's own tail; the retry never interleaves with it.
+                crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+                assert!(ctx.provisional_identity_retry().is_armed());
+
+                lock.execute_batch("ROLLBACK").unwrap();
+                drop(lock);
+
+                let standing =
+                    super::standing::StandingActor::new(ctx.app(), Arc::clone(&executor))
+                        .with_startup_storage_dir(configured.storage.path());
+                let derivations = ctx.artifact_cache_key_derivation_count_for_test();
+                standing.tick();
+                assert_eq!(
+                    ctx.artifact_cache_key_derivation_count_for_test(),
+                    derivations,
+                    "the standing pass claims a provisional session by its folder, not a key"
+                );
+                let cached_after_pass = ctx.cached_artifact_cache_key(&canonical_root);
+
+                crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+                assert!(
+                    ctx.artifact_identity_provisional_reason().is_none(),
+                    "{:?}",
+                    ctx.degraded_reasons()
+                );
+                assert!(ctx.config().indexes.trigram);
+                assert!(!ctx.provisional_identity_retry().is_armed());
+                assert!(ctx.cached_artifact_cache_key(&canonical_root).is_some());
+                assert_eq!(
+                    cached_after_pass, None,
+                    "the pass must not cache a key for a provisional root"
+                );
+            },
+        );
+    }
+
+    /// A session whose Git identity is unreadable (here every root-commit
+    /// probe for its folder fails, as a dubious-ownership refusal does) stays
+    /// provisional with no background retry; only a later bind tries the
+    /// identity again. Meanwhile standing maintenance for another folder
+    /// keeps ticking. Neither the bind's standing step nor
+    /// any tick may ask Git about the session's folder: nothing caches a
+    /// failed Git answer, so every ask costs three Git attempts and their
+    /// retry sleeps, and it delays maintenance of the other folder.
+    #[test]
+    fn standing_ticks_over_an_unreadable_git_session_ask_git_nothing() {
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let configured = ConfiguredRoot::unconfigured(&executor);
+        let canonical_root = configured.canonical_root.clone();
+        let ctx = Arc::clone(&configured.ctx);
+        let standing_dir = tempfile::tempdir().unwrap();
+        std::fs::write(standing_dir.path().join("lib.rs"), "pub fn standing() {}\n").unwrap();
+        let standing_root = std::fs::canonicalize(standing_dir.path()).unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Its sender is dropped at once, so no probe attempt is held.
+        let (_, release) = std::sync::mpsc::channel();
+        let _probe =
+            crate::search_index::force_git_root_commit_probe_held_transient_for_paths_for_test(
+                vec![canonical_root.clone()],
+                Arc::clone(&attempts),
+                release,
+            );
+        let bind: RawRequest = serde_json::from_value(json!({
+            "id": "subc-bind-unreadable-git-standing",
+            "command": "configure",
+            "project_root": configured.dir.path(),
+            "storage_dir": configured.storage.path(),
+            "harness": "opencode",
+            "session_id": "unreadable-git-standing-session",
+            "config": [{
+                "tier": "user",
+                "source": "/u/aft.jsonc",
+                "doc": json!({
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": false },
+                    "views": { "enabled": false },
+                    "index": { "roots": [{ "path": standing_root, "indexes": ["search"] }] },
+                }).to_string(),
+            }],
+        }))
+        .unwrap();
+        let bound = crate::commands::configure::handle_configure(&bind, &ctx);
+        assert!(bound.success, "{}", bound.data);
+        let reason = ctx
+            .artifact_identity_provisional_reason()
+            .expect("an unreadable Git identity leaves the bind provisional");
+        assert!(
+            reason.starts_with(crate::search_index::GIT_IDENTITY_UNAVAILABLE_REASON),
+            "{reason}"
+        );
+        assert!(!ctx.provisional_identity_retry().is_armed());
+        assert!(
+            attempts.load(Ordering::SeqCst) > 0,
+            "the bind asks Git through the stubbed probe"
+        );
+
+        let standing = super::standing::StandingActor::new(ctx.app(), Arc::clone(&executor))
+            .with_startup_storage_dir(configured.storage.path());
+        let before = attempts.load(Ordering::SeqCst);
+        standing.begin_session_bind(&ctx);
+        for _ in 0..8 {
+            standing.tick();
+        }
+        assert!(
+            executor
+                .actor_context(&ProjectRootId::from_path(&standing_root).unwrap())
+                .is_some(),
+            "the ticks reached the standing passes, which run after the session check"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst) - before,
+            0,
+            "standing maintenance asked Git about a session folder whose Git identity is unreadable"
+        );
+        assert!(ctx.artifact_identity_provisional());
+    }
+
+    /// A bind that finds aft.db busy leaves the session provisional, so its
+    /// standing step claims only the standing entry for its own folder, and a
+    /// standing entry for a sibling checkout of the same repository stays
+    /// active. When the identity retry settles the session, its replayed bind
+    /// must take that sibling over from standing maintenance, inside the
+    /// bind's admission and before the session's first index load starts.
+    /// Otherwise both checkouts publish into one index family and replace
+    /// each other's results.
+    #[test]
+    fn identity_retry_settle_pauses_a_sibling_standing_entry_before_the_session_builds() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let configured = ConfiguredRoot::unconfigured(&executor);
+        let root_id = configured.root.clone();
+        let canonical_root = configured.canonical_root.clone();
+        let ctx = Arc::clone(&configured.ctx);
+        let sibling_parent = tempfile::tempdir().unwrap();
+        let sibling = sibling_parent.path().join("sibling");
+        let mut clone = std::process::Command::new("git");
+        crate::test_env::apply_hermetic_git_env(&mut clone);
+        assert!(clone
+            .args(["clone", "--quiet"])
+            .arg(configured.dir.path())
+            .arg(&sibling)
+            .status()
+            .unwrap()
+            .success());
+        let sibling = std::fs::canonicalize(&sibling).unwrap();
+        let sibling_literal = sibling.to_string_lossy().into_owned();
+
+        // Rollback-journal mode, so the exclusive transaction also blocks the
+        // bind's read of its legacy identity pin.
+        let lock = rusqlite::Connection::open(configured.storage.path().join("aft.db")).unwrap();
+        lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let bind: RawRequest = serde_json::from_value(json!({
+            "id": "subc-bind-identity-retry-sibling",
+            "command": "configure",
+            "project_root": configured.dir.path(),
+            "storage_dir": configured.storage.path(),
+            "harness": "opencode",
+            "session_id": "identity-retry-sibling-session",
+            "config": [{
+                "tier": "user",
+                "source": "/u/aft.jsonc",
+                "doc": json!({
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": false },
+                    "views": { "enabled": false },
+                    "index": { "roots": [{ "path": sibling_literal, "indexes": ["search"] }] },
+                }).to_string(),
+            }],
+        }))
+        .unwrap();
+        let bound = configured
+            .submit_bind(&executor, bind)
+            .blocking_recv()
+            .expect("provisional bind completes");
+        assert!(bound.success, "{}", bound.data);
+        assert!(
+            ctx.artifact_identity_provisional(),
+            "{:?}",
+            ctx.degraded_reasons()
+        );
+        assert!(!ctx.config().indexes.trigram);
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+
+        // The standing half of the provisional bind: with no key yet it claims
+        // only the session's own folder, so the sibling's entry stays active.
+        let standing = Arc::new(
+            standing::StandingActor::new(ctx.app(), Arc::clone(&executor))
+                .with_startup_storage_dir(configured.storage.path()),
+        );
+        standing.begin_session_bind(&ctx);
+        assert!(
+            standing.admits_build_for_test(&sibling_literal),
+            "fixture: the provisional bind leaves the sibling's standing entry active"
+        );
+
+        let loads_before =
+            crate::commands::configure::configure_artifact_load_attempts_for_root_for_test(
+                &canonical_root,
+            );
+        let replay = pump_until_identity_replay(&executor, &root_id);
+        let mut meta = RootMeta::new(Instant::now());
+        let replayed =
+            submit_identity_replay_bind(&executor, &mut meta, root_id.clone(), replay, &standing)
+                .blocking_recv()
+                .expect("replayed bind completes");
+        assert!(replayed.success, "{}", replayed.data);
+        assert!(
+            ctx.artifact_identity_provisional_reason().is_none(),
+            "{:?}",
+            ctx.degraded_reasons()
+        );
+        assert!(ctx.config().indexes.trigram);
+        let settled_key = ctx
+            .cached_artifact_cache_key(&canonical_root)
+            .expect("the settled bind publishes its key");
+        assert_eq!(
+            standing
+                .entry_artifact_key_for_test(&sibling_literal)
+                .as_deref(),
+            Some(settled_key.as_str()),
+            "fixture: the sibling's standing entry shares the session's settled key"
+        );
+        // The session's index loads start only from its configure tail, which
+        // has not run yet; the sibling must already be paused here.
+        assert_eq!(
+            crate::commands::configure::configure_artifact_load_attempts_for_root_for_test(
+                &canonical_root
+            ),
+            loads_before,
+            "the session's index load started before its configure tail ran"
+        );
+        assert!(
+            !standing.admits_build_for_test(&sibling_literal),
+            "the settled session's replayed bind left the sibling's standing entry publishing into its index family"
+        );
+
+        // Run the session's configure tail until its first search load
+        // starts; standing maintenance stays paused through it and after.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while crate::commands::configure::configure_artifact_load_attempts_for_root_for_test(
+            &canonical_root,
+        ) == loads_before
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the settled session's search load never started"
+            );
+            let tail = executor.submit_maintenance_async(
+                root_id.clone(),
+                Lane::MaintenanceCommit,
+                "subc-maintenance-drain-configure-tail-identity-retry-sibling".to_string(),
+                Box::new(|ctx| {
+                    run_configure_tail_maintenance(ctx);
+                    Response::success("tail", json!({}))
+                }),
+            );
+            let _ = tail.blocking_recv();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!standing.admits_build_for_test(&sibling_literal));
+        standing.tick();
+        assert!(
+            !standing.admits_build_for_test(&sibling_literal),
+            "maintenance resumed a standing entry the bound session took over"
+        );
+    }
+
+    /// Run the configure-tail maintenance job on the root's actor, as the module
+    /// loop's tick does, until the identity retry hands back a bind to replay.
+    fn pump_until_identity_replay(
+        executor: &Executor,
+        root_id: &ProjectRootId,
+    ) -> crate::provisional_identity_retry::PreparedReplay {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (outcome_tx, outcome_rx) = crossbeam_channel::bounded(1);
+            let tail = executor.submit_maintenance_async(
+                root_id.clone(),
+                Lane::MaintenanceCommit,
+                "subc-maintenance-drain-configure-tail-identity-retry".to_string(),
+                Box::new(move |ctx| {
+                    let _ = outcome_tx.send(run_configure_tail_maintenance(ctx));
+                    Response::success("tail", json!({}))
+                }),
+            );
+            let _ = tail.blocking_recv();
+            if let Some(replay) = outcome_rx
+                .try_recv()
+                .ok()
+                .and_then(|outcome| outcome.identity_replay)
+            {
+                return replay;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the identity retry never found aft.db free"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The last route unbinds while a replayed bind is admitted as the root's
+    /// writer but has not sealed its commit. Quiescing the root cancels the
+    /// replay like a route's own pending bind: it publishes nothing, schedules
+    /// and installs no index load, starts no watcher, and the root stays
+    /// quiesced.
+    #[test]
+    fn quiescing_the_root_cancels_an_admitted_identity_retry_bind() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let configured = ConfiguredRoot::unconfigured(&executor);
+        let root_id = configured.root.clone();
+        let canonical_root = configured.canonical_root.clone();
+        let ctx = Arc::clone(&configured.ctx);
+        let mut live_roots = HashMap::from([(root_id.clone(), RootMeta::new(Instant::now()))]);
+
+        let lock = rusqlite::Connection::open(configured.storage.path().join("aft.db")).unwrap();
+        lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let bind: RawRequest = serde_json::from_value(json!({
+            "id": "subc-bind-identity-retry-unbind-test",
+            "command": "configure",
+            "project_root": configured.dir.path(),
+            "storage_dir": configured.storage.path(),
+            "harness": "opencode",
+            "session_id": "identity-retry-unbind-session",
+            "config": [{
+                "tier": "user",
+                "source": "/u/aft.jsonc",
+                "doc": json!({
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": true },
+                    "views": { "enabled": false },
+                }).to_string(),
+            }],
+        }))
+        .unwrap();
+        let bound = configured
+            .submit_bind(&executor, bind)
+            .blocking_recv()
+            .expect("provisional bind completes");
+        assert!(bound.success, "{}", bound.data);
+        assert!(
+            ctx.artifact_identity_provisional(),
+            "{:?}",
+            ctx.degraded_reasons()
+        );
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+
+        let replay = pump_until_identity_replay(&executor, &root_id);
+        let watcher_before = ctx.watcher_runtime_thread_id_for_test();
+        let (writer_admitted, release_writer) =
+            crate::commands::configure::gate_configure_stage_for_test(
+                canonical_root.clone(),
+                crate::commands::configure::ConfigureGateStage::WriterAdmitted,
+            );
+        let session = replay.session();
+        let standing = Arc::new(standing::StandingActor::new(
+            ctx.app(),
+            Arc::clone(&executor),
+        ));
+        let replayed = submit_identity_replay_bind(
+            &executor,
+            live_roots.get_mut(&root_id).unwrap(),
+            root_id.clone(),
+            replay,
+            &standing,
+        );
+        assert!(
+            roots_with_bind_in_flight(&HashMap::new(), &live_roots).contains(&root_id),
+            "maintenance must treat the replay as a bind in flight"
+        );
+        writer_admitted
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the replay is admitted as the root's writer");
+
+        // The last route unbinds: route teardown fences the lifecycle, then
+        // quiesces the root.
+        ctx.mark_subc_unbound();
+        quiesce_unbound_root(&root_id, &mut live_roots, &executor);
+        release_writer.send(()).unwrap();
+        let response = replayed.blocking_recv().expect("replay completes");
+
+        // State the replay left, before `finish_identity_replay` settles its
+        // completion.
+        assert_eq!(
+            response.data["code"], "request_cancelled",
+            "a replay that loses the race to quiesce must not commit: {}",
+            response.data
+        );
+        assert!(!ctx.config().indexes.trigram && !ctx.config().indexes.callgraph);
+        assert!(
+            ctx.artifact_identity_provisional(),
+            "{:?}",
+            ctx.degraded_reasons()
+        );
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        assert!(ctx.search_index().read().unwrap().is_none());
+        assert!(ctx.callgraph_store_rx().lock().is_none());
+        assert!(ctx.callgraph_store().read().unwrap().is_none());
+        assert!(ctx.semantic_index_rx().lock().is_none());
+        assert_eq!(ctx.cached_artifact_cache_key(&canonical_root), None);
+        assert_eq!(
+            crate::root_identity::read(&canonical_root, configured.storage.path()).unwrap(),
+            None
+        );
+        assert_eq!(ctx.watcher_runtime_thread_id_for_test(), watcher_before);
+        assert!(!ctx.configure_tail_has_work());
+
+        finish_identity_replay(
+            &IdentityReplayDone {
+                root_id: root_id.clone(),
+                session,
+                response,
+            },
+            &mut live_roots,
+            &HashMap::new(),
+            &executor,
+        );
+        assert!(ctx.subc_unbound_quiesced());
+        assert!(live_roots[&root_id].unbound_quiesced);
+        assert!(live_roots[&root_id].identity_replay.is_none());
+        assert!(!roots_with_bind_in_flight(&HashMap::new(), &live_roots).contains(&root_id));
+        assert!(!ctx.config().indexes.trigram);
+        assert_eq!(ctx.watcher_runtime_thread_id_for_test(), watcher_before);
     }
 
     /// A [`ConfiguredRoot`] whose configure tail runs on the executor and is

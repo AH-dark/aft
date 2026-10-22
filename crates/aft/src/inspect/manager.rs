@@ -4789,7 +4789,7 @@ impl Tier2PhaseTimings {
         if worked < TIER2_WORK_LOG_THRESHOLD {
             return;
         }
-        let key = crate::search_index::artifact_cache_key(project_root);
+        let key = crate::search_index::artifact_cache_key_for_build(project_root);
         crate::slog_info!("{}", self.render(category, project_root, &key));
     }
 
@@ -5051,7 +5051,7 @@ thread_local! {
 }
 
 fn log_tier2_benchmark_category_start(job: &InspectJob) {
-    let key = crate::search_index::artifact_cache_key(&job.project_root);
+    let key = crate::search_index::artifact_cache_key_for_build(&job.project_root);
     let scope = crate::logging::IndexBuildScope::new(
         crate::logging::IndexPlane::Tier2,
         &job.project_root,
@@ -5451,7 +5451,8 @@ fn current_view_projection_result(
                 return Err(CheckoutViewUnavailable::Pending);
             }
         }
-        let family = crate::search_index::artifact_cache_key(project_root);
+        let family = crate::search_index::artifact_cache_key_read_only(project_root, &storage)
+            .map_err(|error| error.to_string())?;
         if !crate::views::read::derived_built(view.view_dir(), &generation) {
             // A linked worktree builds its own graph on first use. Until then the
             // main checkout's graph answers while the published files match it.
@@ -6001,7 +6002,8 @@ fn callgraph_store_dir_from_inspect_dir(
     } else {
         inspect_dir.parent()?
     };
-    let project_key = crate::search_index::artifact_cache_key(project_root);
+    let project_key =
+        crate::search_index::artifact_cache_key_read_only(project_root, storage_dir).ok()?;
     Some(storage_dir.join("callgraph").join(project_key))
 }
 

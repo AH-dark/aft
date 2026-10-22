@@ -483,6 +483,60 @@ pub(super) fn production_write_gate(path: &Path) -> rusqlite::Result<()> {
     })
 }
 
+/// Windows refuses an ordinary path of `MAX_PATH` (260 UTF-16 units, the
+/// terminating NUL included) or more. SQLite opens every sidecar file by
+/// appending to the database path: `-journal`, `-wal`, `-shm`, and up to the
+/// 12-character super-journal suffix `-mjXXXXXXXXX`. A database whose own path
+/// still fits can therefore open and then fail its first write with
+/// `SQLITE_CANTOPEN` ("unable to open database file") once the journal name
+/// passes the limit. Callgraph stores of standing subtrees hit this: both the
+/// directory and the file name carry the 64-character standing key.
+///
+/// Paths too long to keep that 12-character headroom, and that can be made
+/// into an absolute drive or UNC path, are spelled in the
+/// `\\?\` form instead, which Windows accepts up to 32,767 units and SQLite
+/// passes through unchanged, so its sidecar names inherit the prefix. The
+/// threshold equals the one Rust's `std::fs` uses before it switches to the
+/// same form. Shorter paths, non-Windows paths, and paths already in a
+/// device or `\\?\` form are returned as they are, so how every other
+/// database is named does not change.
+pub(crate) fn sqlite_open_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        const MAX_PATH: usize = 260;
+        const LONGEST_SQLITE_SUFFIX: usize = 12;
+        let units = path.as_os_str().encode_wide().count();
+        if units + LONGEST_SQLITE_SUFFIX < MAX_PATH {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        let Some(text) = path.to_str() else {
+            return std::borrow::Cow::Borrowed(path);
+        };
+        if text.starts_with(r"\\?\") || text.starts_with(r"\\.\") {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        // `absolute` turns `/` into `\` and resolves `.` and `..`, which a
+        // `\\?\` path must not contain because Windows reads it literally.
+        let Some(absolute) = std::path::absolute(path)
+            .ok()
+            .and_then(|absolute| absolute.to_str().map(str::to_owned))
+        else {
+            return std::borrow::Cow::Borrowed(path);
+        };
+        if let Some(share) = absolute.strip_prefix(r"\\") {
+            return std::borrow::Cow::Owned(PathBuf::from(format!(r"\\?\UNC\{share}")));
+        }
+        let bytes = absolute.as_bytes();
+        if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == br":\" {
+            return std::borrow::Cow::Owned(PathBuf::from(format!(r"\\?\{absolute}")));
+        }
+        std::borrow::Cow::Borrowed(path)
+    }
+    #[cfg(not(windows))]
+    std::borrow::Cow::Borrowed(path)
+}
+
 impl TrackedConnection {
     pub fn open(path: &Path, store: SqliteStore) -> rusqlite::Result<Self> {
         Self::open_attributed(path, store, path.display().to_string())
@@ -496,7 +550,7 @@ impl TrackedConnection {
         production_write_gate(path)?;
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(path, OpenFlags::default())?;
-        Self::from_connection_attributed(Connection::open(path)?, store, root_id)
+        Self::from_connection_attributed(Connection::open(sqlite_open_path(path))?, store, root_id)
     }
 
     pub fn open_with_flags(
@@ -509,11 +563,17 @@ impl TrackedConnection {
         }
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(Path::new(path), flags)?;
-        Self::from_connection_attributed(
-            Connection::open_with_flags(path, flags)?,
-            store,
-            path.to_owned(),
-        )
+        // A `file:` URI is already in SQLite's URI syntax, so it is passed
+        // through rather than treated as a filesystem path. The caller that
+        // builds the URI must spell long paths itself (see the callgraph
+        // store's `sqlite_readonly_uri`).
+        let connection = if flags.contains(OpenFlags::SQLITE_OPEN_URI) && path.starts_with("file:")
+        {
+            Connection::open_with_flags(path, flags)?
+        } else {
+            Connection::open_with_flags(sqlite_open_path(Path::new(path)), flags)?
+        };
+        Self::from_connection_attributed(connection, store, path.to_owned())
     }
 
     pub fn open_path_with_flags(
@@ -527,7 +587,7 @@ impl TrackedConnection {
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(path, flags)?;
         Self::from_connection_attributed(
-            Connection::open_with_flags(path, flags)?,
+            Connection::open_with_flags(sqlite_open_path(path), flags)?,
             store,
             path.display().to_string(),
         )
@@ -797,6 +857,59 @@ impl Drop for TrackedConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows refuses ordinary paths of 260 characters or more, and SQLite
+    /// opens each sidecar by appending to the database path. Through a
+    /// tracked connection, a database whose own path fits but whose
+    /// `-journal` does not, and one whose own path is already too long, must
+    /// both take writes in rollback and WAL mode and reopen read-only.
+    #[cfg(windows)]
+    #[test]
+    fn tracked_connections_open_databases_past_the_windows_path_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut nested = std::path::absolute(dir.path()).unwrap();
+        while nested.as_os_str().len() < 200 {
+            nested = nested.join("0123456789abcdef0123456789");
+        }
+        std::fs::create_dir_all(&nested).unwrap();
+        for (length, mode) in [(255, "DELETE"), (255, "WAL"), (300, "DELETE"), (300, "WAL")] {
+            let stem = length - nested.as_os_str().len() - 1 - ".sqlite".len() - mode.len();
+            let database = nested.join(format!("{mode}{}.sqlite", "x".repeat(stem)));
+            assert_eq!(database.as_os_str().len(), length);
+            let writer = TrackedConnection::open(&database, SqliteStore::CallgraphGeneration)
+                .unwrap_or_else(|error| panic!("{mode} open at {length}: {error}"));
+            writer.pragma_update(None, "journal_mode", mode).unwrap();
+            writer
+                .execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+                .unwrap_or_else(|error| panic!("{mode} write at {length}: {error}"));
+            let reader = TrackedConnection::open_path_with_flags(
+                &database,
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+                SqliteStore::CallgraphGeneration,
+            )
+            .unwrap_or_else(|error| panic!("{mode} read-only open at {length}: {error}"));
+            let rows: i64 = reader
+                .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+                .unwrap_or_else(|error| panic!("{mode} read at {length}: {error}"));
+            assert_eq!(rows, 1);
+            drop((reader, writer));
+        }
+    }
+
+    /// Paths with room for SQLite's longest sidecar suffix reach SQLite as
+    /// they were given, so ordinary databases keep their names everywhere.
+    #[test]
+    fn sqlite_open_path_leaves_ordinary_paths_unchanged() {
+        let path = Path::new("storage/callgraph/0123456789abcdef/graph.sqlite");
+        assert_eq!(sqlite_open_path(path), path);
+        let long = PathBuf::from("x".repeat(400));
+        #[cfg(not(windows))]
+        assert_eq!(sqlite_open_path(&long), long.as_path());
+        #[cfg(windows)]
+        assert!(sqlite_open_path(&long)
+            .to_string_lossy()
+            .starts_with(r"\\?\"));
+    }
 
     fn store_count(snapshot: &SqliteConnectionSnapshot, store: SqliteStore) -> u64 {
         snapshot

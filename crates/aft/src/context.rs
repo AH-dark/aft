@@ -2298,6 +2298,7 @@ pub(crate) struct ConfigureMaintenanceJob {
     pub(crate) generation: u64,
     pub(crate) root_path: PathBuf,
     pub(crate) canonical_cache_root: PathBuf,
+    pub(crate) project_key: String,
     pub(crate) harness: Harness,
     pub(crate) storage_root: PathBuf,
     pub(crate) harness_dir: PathBuf,
@@ -3647,6 +3648,11 @@ struct BorrowedIndexCacheKey {
     artifact: crate::readonly_artifacts::BorrowedArtifactGeneration,
 }
 
+struct ReadonlyArtifactCacheKey {
+    record: Option<crate::root_identity::RecordStamp>,
+    key: String,
+}
+
 type BorrowedSearchResult = crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>>;
 
 #[derive(Debug, Default)]
@@ -4100,7 +4106,19 @@ pub struct AppContext {
     /// next tail drain resumes it before anything newly enqueued.
     parked_configure_tail:
         parking_lot::Mutex<Option<crate::commands::configure::ConfigureMaintenanceState>>,
+    /// The background identity retry armed when aft.db was busy at this
+    /// root's bind. See [`crate::provisional_identity_retry`].
+    provisional_identity_retry: crate::provisional_identity_retry::RetrySlot,
     artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
+    /// Only successful configure binds may populate this memo. Build-derived
+    /// keys remain observable by status but cannot skip identity verification.
+    /// Entries are keyed by (storage root, project path): each storage root
+    /// keeps its own saved identity record, so a reconfigure that moves the
+    /// cache location must read the new root's record instead of reusing the
+    /// key another storage root chose for the same folder.
+    configure_artifact_cache_keys: parking_lot::Mutex<BTreeMap<(PathBuf, PathBuf), String>>,
+    readonly_artifact_cache_keys:
+        parking_lot::Mutex<BTreeMap<(PathBuf, PathBuf), ReadonlyArtifactCacheKey>>,
     artifact_cache_key_derivations: AtomicU64,
     borrowed_index_cache: parking_lot::Mutex<BorrowedIndexCache>,
     /// Successful git worktree probes, keyed by canonical root and guarded by
@@ -4813,7 +4831,10 @@ impl AppContext {
             database_open: parking_lot::Mutex::new(Default::default()),
             database_open_idle: parking_lot::Condvar::new(),
             parked_configure_tail: parking_lot::Mutex::new(None),
+            provisional_identity_retry: Default::default(),
             artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
+            configure_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
+            readonly_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             artifact_cache_key_derivations: AtomicU64::new(0),
             borrowed_index_cache: parking_lot::Mutex::new(BorrowedIndexCache::default()),
             worktree_bridge_cache: parking_lot::Mutex::new(BTreeMap::new()),
@@ -6424,6 +6445,24 @@ impl AppContext {
                 .try_lock()
                 .is_none_or(|tail| tail.as_ref().is_some_and(|state| state.has_ready_job()))
             || !self.configure_warnings_rx.is_empty()
+            || self.provisional_identity_retry.is_due()
+    }
+
+    /// No configure-tail work is queued or parked. The background identity
+    /// retry replays a bind only then, so it never interleaves with a tail.
+    pub(crate) fn configure_tail_idle(&self) -> bool {
+        self.configure_maintenance_jobs.lock().is_empty()
+            && self
+                .parked_configure_tail
+                .lock()
+                .as_ref()
+                .is_none_or(|tail| tail.jobs_is_empty())
+    }
+
+    pub(crate) fn provisional_identity_retry(
+        &self,
+    ) -> &crate::provisional_identity_retry::RetrySlot {
+        &self.provisional_identity_retry
     }
 
     /// Hold the lock behind one maintenance probe for the duration of
@@ -6690,20 +6729,126 @@ impl AppContext {
         if let Some(key) = keys.get(canonical_root).cloned() {
             return key;
         }
-        let key = crate::search_index::artifact_cache_key(canonical_root);
+        let key = crate::search_index::artifact_cache_key_for_build(canonical_root);
         self.artifact_cache_key_derivations
             .fetch_add(1, Ordering::SeqCst);
-        keys.insert(canonical_root.to_path_buf(), key.clone());
+        // Status reports the artifact key used by builds without probing Git.
+        // Configure uses a separate memo so it still verifies the root identity.
+        //
+        // A bound root whose identity is provisional has no key yet: configure
+        // published none, and the key derived here comes from Git alone. The
+        // settled identity can key differently, because it may keep an older
+        // path or repository pin from aft.db or the root's identity record
+        // (see `resolve_root_identity_for_bind`). So the caller gets this
+        // derivation, but it is not remembered: a passive reader of the
+        // cache must not mistake it for the bound key. The check runs under
+        // the cache lock, so it pairs with `forget_unsettled_artifact_cache_key`,
+        // which a provisional configure calls after publishing its degraded
+        // reasons.
+        if !self.bound_identity_unsettled(canonical_root) {
+            keys.insert(canonical_root.to_path_buf(), key.clone());
+        }
         key
     }
 
+    /// The artifact key for `canonical_root`, or `None` when it is this
+    /// context's bound root and its last bind left the identity provisional.
+    ///
+    /// A provisional root has no key yet, and deriving one asks Git again on
+    /// every call: nothing caches a failed Git answer, so a root whose Git
+    /// identity is unreadable (for example a dubious-ownership refusal) costs
+    /// three Git attempts and their retry sleeps each time. Readers that poll,
+    /// such as standing-root maintenance, use this instead of
+    /// [`Self::memoized_artifact_cache_key`] and handle the provisional root
+    /// without a key.
+    pub(crate) fn settled_artifact_cache_key(&self, canonical_root: &Path) -> Option<String> {
+        if self.bound_identity_unsettled(canonical_root) {
+            return None;
+        }
+        Some(self.memoized_artifact_cache_key(canonical_root))
+    }
+
+    /// True when `root` is this context's bound root and its last bind left
+    /// the identity provisional.
+    fn bound_identity_unsettled(&self, root: &Path) -> bool {
+        if !self.artifact_identity_provisional() {
+            return false;
+        }
+        self.canonical_cache_root_opt().as_deref() == Some(root)
+            || self.config().project_root.as_deref() == Some(root)
+    }
+
+    /// Drop any key cached for a root whose bind just left the identity
+    /// provisional. A key derived while the configure was still publishing
+    /// (before its degraded reasons said provisional) may have been cached by
+    /// a reader on another thread, such as standing-root maintenance.
+    pub(crate) fn forget_unsettled_artifact_cache_key(
+        &self,
+        canonical_root: &Path,
+        raw_root: &Path,
+    ) {
+        let mut keys = self.artifact_cache_keys.lock();
+        keys.remove(canonical_root);
+        keys.remove(raw_root);
+    }
+
+    pub(crate) fn memoized_readonly_artifact_cache_key(
+        &self,
+        canonical_root: &Path,
+        storage: &Path,
+    ) -> Result<String, crate::search_index::ArtifactCacheKeyProbeError> {
+        self.memoized_readonly_artifact_cache_key_with(canonical_root, storage, || {
+            crate::search_index::artifact_cache_key_read_only(canonical_root, storage)
+        })
+    }
+
+    fn memoized_readonly_artifact_cache_key_with(
+        &self,
+        canonical_root: &Path,
+        storage: &Path,
+        derive: impl FnOnce() -> Result<String, crate::search_index::ArtifactCacheKeyProbeError>,
+    ) -> Result<String, crate::search_index::ArtifactCacheKeyProbeError> {
+        let cache_key = (canonical_root.to_path_buf(), storage.to_path_buf());
+        let before = crate::root_identity::record_stamp(canonical_root, storage);
+        if let Ok(record) = &before {
+            let keys = self.readonly_artifact_cache_keys.lock();
+            if let Some(entry) = keys.get(&cache_key).filter(|entry| entry.record == *record) {
+                return Ok(entry.key.clone());
+            }
+        }
+        // Git and legacy database probes must not hold the context-wide mutex:
+        // one slow root must not delay readers of unrelated roots.
+        let key = derive()?;
+        self.artifact_cache_key_derivations
+            .fetch_add(1, Ordering::SeqCst);
+        // Only remember a derivation whose record stayed stable. Unreadable
+        // metadata or a concurrent configure leaves this lookup uncached.
+        if let (Ok(before), Ok(after)) = (
+            before,
+            crate::root_identity::record_stamp(canonical_root, storage),
+        ) {
+            if before == after {
+                self.readonly_artifact_cache_keys.lock().insert(
+                    cache_key,
+                    ReadonlyArtifactCacheKey {
+                        record: after,
+                        key: key.clone(),
+                    },
+                );
+            }
+        }
+        Ok(key)
+    }
+
+    /// `Ok(None)` means the root's identity is provisional for this bind; see
+    /// [`crate::search_index::artifact_cache_key_for_bind_profiled`].
     pub fn memoized_artifact_cache_key_for_configure(
         &self,
         raw_root: &Path,
         canonical_root: &Path,
         storage_root: &Path,
         git_common_dir: Option<&Path>,
-    ) -> Result<String, crate::search_index::ArtifactCacheKeyProbeError> {
+    ) -> Result<Option<String>, crate::search_index::ArtifactCacheKeyProbeError> {
         self.memoized_artifact_cache_key_for_configure_profiled(
             raw_root,
             canonical_root,
@@ -6720,36 +6865,58 @@ impl AppContext {
         storage_root: &Path,
         git_common_dir: Option<&Path>,
         timings: &mut crate::search_index::ArtifactCacheKeyTimings,
-    ) -> Result<String, crate::search_index::ArtifactCacheKeyProbeError> {
+    ) -> Result<Option<String>, crate::search_index::ArtifactCacheKeyProbeError> {
         {
             let waiting = Instant::now();
-            let keys = self.artifact_cache_keys.lock();
+            let keys = self.configure_artifact_cache_keys.lock();
             timings.context_memo_wait += waiting.elapsed();
+            let storage = storage_root.to_path_buf();
             if let Some(key) = keys
-                .get(canonical_root)
-                .or_else(|| keys.get(raw_root))
+                .get(&(storage.clone(), canonical_root.to_path_buf()))
+                .or_else(|| keys.get(&(storage, raw_root.to_path_buf())))
                 .cloned()
             {
                 timings.context_cache_hit = true;
-                return Ok(key);
+                // The root-only cache feeds artifact loads and the call-graph
+                // directory. After the storage root changes and changes back,
+                // it may still hold the other root's key, so refresh it on a
+                // hit too. The lock order matches the miss path below.
+                let mut current = self.artifact_cache_keys.lock();
+                current.insert(canonical_root.to_path_buf(), key.clone());
+                current.insert(raw_root.to_path_buf(), key.clone());
+                return Ok(Some(key));
             }
         }
 
-        let key = crate::search_index::artifact_cache_key_with_memo_profiled(
+        // A provisional key is never memoized, so the next bind resolves the
+        // identity again and can finalize it.
+        let Some(key) = crate::search_index::artifact_cache_key_for_bind_profiled(
             canonical_root,
             raw_root,
             storage_root,
             git_common_dir,
             timings,
-        )?;
+        )?
+        else {
+            return Ok(None);
+        };
         self.artifact_cache_key_derivations
             .fetch_add(1, Ordering::SeqCst);
         let waiting = Instant::now();
+        let mut verified = self.configure_artifact_cache_keys.lock();
+        verified.insert(
+            (storage_root.to_path_buf(), canonical_root.to_path_buf()),
+            key.clone(),
+        );
+        verified.insert(
+            (storage_root.to_path_buf(), raw_root.to_path_buf()),
+            key.clone(),
+        );
         let mut keys = self.artifact_cache_keys.lock();
         timings.context_memo_wait += waiting.elapsed();
         keys.insert(canonical_root.to_path_buf(), key.clone());
         keys.insert(raw_root.to_path_buf(), key.clone());
-        Ok(key)
+        Ok(Some(key))
     }
 
     #[cfg(test)]
@@ -6799,7 +6966,15 @@ impl AppContext {
     ) -> crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>> {
         let canonical_root =
             std::fs::canonicalize(external_root).unwrap_or_else(|_| external_root.to_path_buf());
-        let project_key = self.memoized_artifact_cache_key(&canonical_root);
+        let storage = crate::bash_background::storage_dir(storage_dir);
+        let project_key = match self.memoized_readonly_artifact_cache_key(&canonical_root, &storage)
+        {
+            Ok(key) => key,
+            Err(error) => {
+                crate::slog_warn!("borrowed search index unavailable: {}", error);
+                return crate::readonly_artifacts::ReadOnlyArtifact::Absent;
+            }
+        };
         let Some(artifact) = crate::readonly_artifacts::search_index_artifact_generation_with_key(
             &project_key,
             storage_dir,
@@ -6886,7 +7061,15 @@ impl AppContext {
     ) -> crate::readonly_artifacts::ReadOnlyArtifact<Arc<SemanticIndex>> {
         let canonical_root =
             std::fs::canonicalize(external_root).unwrap_or_else(|_| external_root.to_path_buf());
-        let project_key = self.memoized_artifact_cache_key(&canonical_root);
+        let storage = crate::bash_background::storage_dir(storage_dir);
+        let project_key = match self.memoized_readonly_artifact_cache_key(&canonical_root, &storage)
+        {
+            Ok(key) => key,
+            Err(error) => {
+                crate::slog_warn!("borrowed semantic index unavailable: {}", error);
+                return crate::readonly_artifacts::ReadOnlyArtifact::Absent;
+            }
+        };
         let Some(artifact) = crate::readonly_artifacts::semantic_index_artifact_generation_with_key(
             &project_key,
             storage_dir,
@@ -8359,6 +8542,17 @@ impl AppContext {
         true
     }
 
+    /// Swap one degraded reason for another in place, keeping the order.
+    /// Returns whether `from` was present.
+    pub(crate) fn replace_degraded_reason(&self, from: &str, to: &str) -> bool {
+        let mut reasons = self.degraded_reasons.lock();
+        let Some(index) = reasons.iter().position(|reason| reason == from) else {
+            return false;
+        };
+        reasons[index] = to.to_string();
+        true
+    }
+
     /// Snapshot of current degraded-mode reasons. Order is stable
     /// (insertion order from `set_degraded_reasons`) so UI rendering and
     /// snapshot diffs are deterministic.
@@ -8386,6 +8580,27 @@ impl AppContext {
             .lock()
             .iter()
             .any(|reason| reason == "root_too_broad")
+    }
+
+    /// The bound root's artifact identity was provisional at its last bind
+    /// (aft.db was busy or Git was unreadable), so its index lanes are off.
+    /// A busy aft.db is retried in the background
+    /// ([`crate::provisional_identity_retry`]); an unreadable Git identity
+    /// waits for the next bind.
+    pub(crate) fn artifact_identity_provisional(&self) -> bool {
+        self.artifact_identity_provisional_reason().is_some()
+    }
+
+    pub(crate) fn artifact_identity_provisional_reason(&self) -> Option<String> {
+        self.degraded_reasons
+            .lock()
+            .iter()
+            .find(|reason| {
+                reason.as_str() == crate::search_index::PROVISIONAL_IDENTITY_REASON
+                    || reason.as_str() == crate::search_index::PROVISIONAL_IDENTITY_EXHAUSTED_REASON
+                    || reason.starts_with(crate::search_index::GIT_IDENTITY_UNAVAILABLE_REASON)
+            })
+            .cloned()
     }
 
     pub fn cache_role(&self) -> &'static str {
@@ -8659,12 +8874,12 @@ impl AppContext {
                     .fingerprint()
                     .map(crate::semantic_index::SemanticIndexFingerprint::as_string)
                     .ok_or_else(|| "semantic index fingerprint is unavailable".to_string())?;
-                let mut request = crate::migration::SemanticMigrationRequest::for_root(
+                let mut request = crate::migration::SemanticMigrationRequest::for_root_with_key(
                     snapshot.storage.clone(),
                     root.clone(),
+                    snapshot.family.clone(),
                     fingerprint,
                 );
-                request.family.clone_from(&snapshot.family);
                 request.view.clone_from(&snapshot.scope);
                 let handoff = crate::migration::store_live_semantic_blobs(&request, &index)
                     .map_err(|error| error.to_string())?;
@@ -9062,9 +9277,14 @@ impl AppContext {
 
     pub fn callgraph_store_dir(&self) -> PathBuf {
         if let Some(root) = self.callgraph_project_root() {
-            self.storage_dir()
+            let storage = self.storage_dir();
+            let key = self.cached_artifact_cache_key(&root).or_else(|| {
+                self.memoized_readonly_artifact_cache_key(&root, &storage)
+                    .ok()
+            });
+            storage
                 .join("callgraph")
-                .join(self.memoized_artifact_cache_key(&root))
+                .join(key.as_deref().unwrap_or("unconfigured"))
         } else {
             self.storage_dir().join("callgraph").join("unconfigured")
         }
@@ -9751,16 +9971,21 @@ impl AppContext {
         // A published generation written by a newer build (or a reader floor
         // above this build) is refused by name; no cold build is started to
         // replace it.
+        let project_key =
+            match self.memoized_readonly_artifact_cache_key(&project_root, &self.storage_dir()) {
+                Ok(key) => key,
+                Err(error) => {
+                    return CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(
+                        error.to_string(),
+                    ));
+                }
+            };
         if let Some(refusal) = crate::persisted_format::refusal_covering(
             crate::persisted_format::PersistedStore::CallgraphStore,
             &callgraph_dir,
         )
         .or_else(|| {
-            crate::callgraph_store::check_published_format(
-                &callgraph_dir,
-                &self.memoized_artifact_cache_key(&project_root),
-            )
-            .err()
+            crate::callgraph_store::check_published_format(&callgraph_dir, &project_key).err()
         }) {
             return CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(
                 refusal.to_string(),
@@ -15049,6 +15274,58 @@ pub(crate) fn configure_bind_effects_for_test(root: &Path, session_id: &str) -> 
         .get(&(root.to_path_buf(), session_id.to_string()))
         .copied()
         .unwrap_or((0, 0))
+}
+
+#[cfg(test)]
+mod readonly_artifact_cache_key_tests {
+    use super::*;
+
+    #[test]
+    fn slow_readonly_identity_derivation_does_not_block_other_roots() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let slow = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let slow_root = std::fs::canonicalize(slow.path()).unwrap();
+        let other_root = std::fs::canonicalize(other.path()).unwrap();
+        let ctx = Arc::new(AppContext::new(
+            default_language_provider_factory(),
+            Config::default(),
+        ));
+        let expected = ctx
+            .memoized_readonly_artifact_cache_key(&other_root, storage.path())
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let slow_ctx = Arc::clone(&ctx);
+        let slow_storage = storage.path().to_path_buf();
+        let slow_worker = std::thread::spawn(move || {
+            slow_ctx.memoized_readonly_artifact_cache_key_with(&slow_root, &slow_storage, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                crate::search_index::artifact_cache_key_read_only(&slow_root, &slow_storage)
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let other_ctx = Arc::clone(&ctx);
+        let other_storage = storage.path().to_path_buf();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let other_worker = std::thread::spawn(move || {
+            finished_tx
+                .send(other_ctx.memoized_readonly_artifact_cache_key(&other_root, &other_storage))
+                .unwrap();
+        });
+        let result = finished_rx.recv_timeout(Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        slow_worker.join().unwrap().unwrap();
+        other_worker.join().unwrap();
+        assert_eq!(
+            result
+                .expect("another root must finish while the first derivation is paused")
+                .unwrap(),
+            expected
+        );
+    }
 }
 
 #[cfg(test)]

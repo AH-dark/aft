@@ -4212,6 +4212,7 @@ pub(crate) fn configure_search_order_context_for_test(
         generation: ctx.configure_generation(),
         root_path: root.to_path_buf(),
         canonical_cache_root: canonical_root,
+        project_key: String::new(),
         harness: crate::harness::Harness::Opencode,
         storage_root: storage.to_path_buf(),
         harness_dir: storage.join("opencode"),

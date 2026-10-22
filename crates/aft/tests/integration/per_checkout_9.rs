@@ -390,10 +390,14 @@ fn trigram_artifact(root: &Path, storage: &Path) -> PathBuf {
 }
 
 /// Waits until the child session's trigram index is ready and persisted.
+/// Each round also runs the configure-tail drain both runtimes run on their
+/// maintenance tick: a child whose bind met a busy aft.db settles its identity
+/// there once the database is free, and only then starts its index.
 fn wait_trigram(ctx: &AppContext, root: &Path, storage: &Path) {
     let deadline = Instant::now() + DEADLINE;
     loop {
         drain(ctx);
+        aft::runtime_drain::drain_deferred_configure_maintenance(ctx);
         let ready = ctx
             .search_index()
             .read()
@@ -405,8 +409,11 @@ fn wait_trigram(ctx: &AppContext, root: &Path, storage: &Path) {
         }
         assert!(
             Instant::now() < deadline,
-            "child trigram index never persisted: {}",
-            root.display()
+            "child trigram index never persisted: {}; enabled={}; key={:?}; degraded={:?}",
+            root.display(),
+            ctx.config().indexes.trigram,
+            ctx.cached_artifact_cache_key(root),
+            ctx.degraded_reasons(),
         );
         thread::sleep(Duration::from_millis(20));
     }

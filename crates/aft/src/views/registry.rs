@@ -34,6 +34,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub use crate::storage_retention::TestVolumeUuidGuard;
+
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 use crate::blob_store::v2::{
@@ -372,6 +376,18 @@ impl FamilyRegistry {
 
     pub fn storage(&self) -> &Path {
         &self.inner.storage
+    }
+
+    /// Treat the `anchor` path under this registry's storage as a mounted volume
+    /// for a fixture. Dropping the guard restores real volume discovery.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn test_volume_uuid_guard(
+        &self,
+        anchor: &Path,
+        uuid: &str,
+    ) -> std::io::Result<TestVolumeUuidGuard> {
+        crate::storage_retention::test_volume_uuid_guard(self.storage(), anchor, uuid)
     }
 
     pub fn path(&self) -> &Path {

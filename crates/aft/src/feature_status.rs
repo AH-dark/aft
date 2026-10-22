@@ -90,6 +90,11 @@ pub mod cause {
     pub const HOME_ROOT: &str = "home_root";
     /// The root is too broad for watching or project-wide indexing.
     pub const ROOT_TOO_BROAD: &str = "root_too_broad";
+    /// The root's artifact identity is not settled yet: aft.db was busy when
+    /// it was bound (retried in the background until the database is free),
+    /// or its Git identity was unreadable (retried at the root's next bind).
+    /// Indexes stay off until the identity settles.
+    pub const IDENTITY_PROVISIONAL: &str = "identity_provisional";
     /// The configured embedding backend is currently unreachable.
     pub const SEMANTIC_BACKEND_UNAVAILABLE: &str = "semantic_backend_unavailable";
     /// The local embedding backend needs an ONNX Runtime that AFT cannot
@@ -198,6 +203,11 @@ pub fn observed_index_status(ctx: &AppContext, plane: IndexPlane) -> IndexObserv
     // cause rather than as configured off.
     if ctx.is_home_root() {
         return IndexObservation::unavailable(cause::HOME_ROOT);
+    }
+    // Configure also forces every index off while the root's identity is
+    // provisional; that too is not the user's choice.
+    if ctx.artifact_identity_provisional() {
+        return IndexObservation::unavailable(cause::IDENTITY_PROVISIONAL);
     }
     if !plane.enabled_in(&ctx.config()) {
         return IndexObservation::off();

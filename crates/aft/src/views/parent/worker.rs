@@ -220,8 +220,15 @@ fn install_trigram(session: &ParentSession, child: &Child, trigram: TrigramChild
 
 fn refresh_trigram(session: &ParentSession, child: &Child) {
     let keep_going = || !session.stopped();
+    let family = match child.family(&session.storage) {
+        Ok(family) => family,
+        Err(error) => {
+            *write(&child.trigram) = Plane::Gap(error);
+            return;
+        }
+    };
     let artifact = crate::readonly_artifacts::search_index_artifact_generation_with_key(
-        child.family(),
+        family,
         Some(&session.storage),
     );
     let Some(artifact) = artifact else {
@@ -237,8 +244,7 @@ fn refresh_trigram(session: &ParentSession, child: &Child) {
         // and through the backstop, never by reading the artifact again.
         return;
     }
-    let cache_dir =
-        crate::search_index::resolve_cache_dir_with_key(child.family(), Some(&session.storage));
+    let cache_dir = crate::search_index::resolve_cache_dir_with_key(family, Some(&session.storage));
     child.loads.fetch_add(1, Ordering::SeqCst);
     let opened = crate::readonly_artifacts::open_search_index_background(
         &child.root,
@@ -593,12 +599,19 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
     // needs it. Until then the main checkout's graph answers for it while the
     // published files match; otherwise the child's call-graph plane reports
     // that the graph has not been built yet.
+    let family = match child.family(&session.storage) {
+        Ok(family) => family,
+        Err(error) => {
+            *write(&child.callgraph) = Plane::Gap(error);
+            return;
+        }
+    };
     if !super::super::read::derived_built(&view_dir, &generation) {
         let main = store.load_manifest(&generation).ok().map(|manifest| {
             super::super::read::main_checkout_callgraph(
                 &session.storage,
                 &child.root,
-                child.family(),
+                family,
                 &generation,
                 &manifest,
             )
@@ -622,7 +635,7 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
     }
     match super::super::read::open_published_callgraph(
         child.root.clone(),
-        child.family().to_owned(),
+        family.to_owned(),
         view_dir,
         &generation,
         Some(pin),

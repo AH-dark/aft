@@ -289,7 +289,10 @@ pub(crate) fn main_checkout_callgraph(
     };
     if main_root == project_root
         || checkout_diverged(project_root)
-        || crate::search_index::artifact_cache_key(&main_root) != family
+        || crate::search_index::artifact_cache_key_read_only(&main_root, storage)
+            .ok()
+            .as_deref()
+            != Some(family)
         || super::assembly::manifest_lacks_callgraph(manifest)
     {
         return Unavailable;
