@@ -1,0 +1,104 @@
+{
+  "schema": 1,
+  "status": "blocked",
+  "baseline_source": "5a736ae671ea92ae17209ae3be75068faa6fc8ed",
+  "candidate_results_recorded": false,
+  "verdict": null,
+  "parity": "not_run",
+  "worker_samples": 0,
+  "medians": null,
+  "reason": "The unchanged-main public semantic readiness witness did not complete within the separately authorized 1800-second base_preparation phase. The task stopped at that bound; no larger budget or fake model was used.",
+  "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "build": {
+    "command": "cargo build -p agent-file-tools --release --bin aft --example views_perf_daemon",
+    "runon": "linux,8c,net",
+    "result": "Finished release profile [optimized + debuginfo] in 19m 44s",
+    "baseline_warning": "function version_for_loaded_image_with is never used (crates/aft/src/cli/profile.rs:962)"
+  },
+  "model": {
+    "name": "all-MiniLM-L6-v2",
+    "repository": "Qdrant/all-MiniLM-L6-v2-onnx",
+    "revision": "d13954661f83248295ba75c1ed411eef3b7b936e",
+    "model_onnx_sha256": "bbd7b466f6d58e646fdc2bd5fd67b2f5e93c0b687011bd4548c420f7bd46f0c5",
+    "tokenizer_json_sha256": "851ca67100d372ca3ae031a6abd168f53489eebfd7d89523f35c5c9b4d372c3c",
+    "onnxruntime": "1.24.4",
+    "library_sha256": "d132535d051344ff5c64c9c200004150559049a81ed330eb4422c1962fb6b7e4"
+  },
+  "corpus": {
+    "name": "aft",
+    "commit": "05d40ac417db6137a4204521bd3c59853325e968",
+    "source": "scripts/views-performance-corpus.json",
+    "provisioning": "Original slice-1 provision() adds its committed witness and configuration to disposable clones/worktrees. The operator checkout was not changed."
+  },
+  "attempts": [
+    {
+      "command": "python3 scripts/views-performance-gate.py --output scripts/views-performance-baselines/slice-4a-baseline-acquisition-1 --subjects target/slice-4a-baseline-subjects-1 --roots 5 --views on --warmup-minutes 0 --activity-minutes 0 --quiet-minutes 0 --semantic --ready-timeout 120",
+      "runon": "linux,8c,net",
+      "exit": 1,
+      "error": "InsecureParentDirectory: target mode 509 (0775)",
+      "remedy_applied": "Made the private remote target subject parent mode 0700."
+    },
+    {
+      "command": "python3 scripts/views-performance-gate.py --output scripts/views-performance-baselines/slice-4a-baseline-acquisition-2 --subjects target/slice-4a-baseline-subjects-2 --roots 5 --views on --warmup-minutes 0 --activity-minutes 0 --quiet-minutes 0 --semantic --ready-timeout 120",
+      "runon": "linux,8c,net",
+      "exit": 1,
+      "error": "semantic view unavailable: embedding model: ONNX Runtime not found",
+      "remedy_applied": "Downloaded the pinned ORT library and real model; copied them into each disposable subject's managed storage/cache without forwarding additional environment variables."
+    },
+    {
+      "invocation": "Inline Python acquisition using the original slice-1 provision(), Broker, counter_delta(), process_sample(), and semantic_witness(); semantic enabled, trigram/callgraph disabled for the semantic-only G1 subset.",
+      "runon": "linux,8c",
+      "base_preparation_budget_seconds": 120,
+      "worker_budget_seconds": 120,
+      "exit": 1,
+      "error": "public transport timeout before the first base witness",
+      "observed_logs": [
+        "using plugin-managed ONNX Runtime at <subject>/storage/onnxruntime/1.24.4/libonnxruntime.so",
+        "local embedder ready: model=all-MiniLM-L6-v2 intra_threads=4 intra_threads_source=parallelism available_parallelism=8 cgroup_quota_threads=none token_type_ids=true",
+        "semantic view loaded ... load_ms=415",
+        "indexing start ... kind=semantic view fill total=None",
+        "semantic query embed: backend=fastembed model=all-MiniLM-L6-v2 elapsed_ms=9 budget_ms=3000 outcome=ok"
+      ]
+    },
+    {
+      "task": "bash-a345dc21cab11349",
+      "invocation": "Inline Python acquisition as above, planned three runs of six fresh roots: one separately charged base_preparation phase plus five sequential worker binds per run. Prewarmed runtime/model, fresh stores. Base readiness polls bounded by 1800 seconds; individual requests bounded by 120 seconds; worker readiness budgets 120 seconds.",
+      "runon": "linux,8c",
+      "base_preparation_budget_seconds": 1800,
+      "worker_budget_seconds": 120,
+      "exit": 1,
+      "runner_elapsed_seconds": 1988,
+      "base_phase_completed": false,
+      "worker_samples": 0,
+      "captured_output": "gate.MeasurementError: public transport timeout; see <worktree>/target/slice-4a-g1-baseline-final/0/daemon.log; raised by Broker.call -> Broker.read at scripts/views-performance-gate.py:256/267/270. No successful base or worker row was emitted.",
+      "interpretation_limit": "This establishes failure to obtain the required public semantic witness, not whether all corpus embeddings themselves had completed. No wall/CPU median or go/adjust verdict is inferred.",
+      "diagnostic_gap": "A follow-up remote job could not read target/slice-4a-g1-baseline-final/0/daemon.log (FileNotFoundError). Only the captured task output is retained in this receipt; no surviving raw acquisition log is claimed."
+    }
+  ],
+  "metric_keys_reserved_for_successful_acquisition": [
+    "semantic.bind_to_ready_s",
+    "metrics.views_work.source_hashes",
+    "metrics.views_work.own_generation_folds",
+    "cpu_seconds",
+    "rss_bytes",
+    "physical_bytes_written",
+    "model_calls"
+  ],
+  "red_selection_tests_before_implementation": {
+    "command": "cargo test -p agent-file-tools --lib -- base_ref_ --nocapture",
+    "runon": "linux,8c,net",
+    "result": "FAILED. 1 passed; 2 failed; 7970 filtered out",
+    "failed": [
+      "views::semantic_runtime::tests::base_ref_marker_and_variable_are_required",
+      "views::semantic_runtime::tests::base_ref_unmarked_storage_warns_exactly_once"
+    ],
+    "captured_output": "base_ref_unmarked_storage_warns_exactly_once: assertion left == right failed, left: 0, right: 1. base_ref_marker_and_variable_are_required: child base_ref_selection_child FAILED (prototype selection must be reported)."
+  },
+  "parent_rulings": [
+    "Harness fence extended to forward exactly AFT_VIEWS_BASE_REF_PROTOTYPE and write the marker; no other environment variable forwarding.",
+    "scripts/test_views_performance_gate.py granted only for the prototype activation self-test, without altering existing tests.",
+    "Kill test may use a test-only post-query rendezvous rather than inventing a DurabilityStep; SIGKILL, bounded waits, registry/protection comparison, leaked-pin positive control required.",
+    "Initial base_preparation may take up to 1800 seconds, separately reported and excluded from worker numbers; if it exceeds that limit, stop and report a blocker."
+  ],
+  "next_action": "Diagnose the unchanged-main public readiness-witness failure on a runner retaining its raw daemon/query logs. Once the real pinned corpus and model yield a base within the authorized budget, acquire and commit the G1-subset baseline before candidate results, then finish compilation, parity, mutation proofs, measurements, Windows compile and the tracked go/adjust note. The current prototype and tests are uncommitted, unverified drafts, not a mergeable delivery."
+}

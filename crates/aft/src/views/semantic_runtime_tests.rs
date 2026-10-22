@@ -726,6 +726,887 @@ fn query(runtime: &CheckoutSemantic, text: &str) -> SemanticQuery {
     runtime.search(&vector(text), 100, &|_| true).unwrap()
 }
 
+#[test]
+fn base_ref_selection_child() {
+    let Ok(mode) = std::env::var("AFT_BASE_REF_SELECTION_CHILD") else {
+        return;
+    };
+    let _ = env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Warn)
+        .try_init();
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    if mode == "marked" || mode == "default" {
+        std::fs::write(storage.path().join("views-harness.marker"), b"test\n").unwrap();
+    }
+    let first = CheckoutSemantic::new(
+        storage.path(),
+        "family",
+        "first",
+        root.path(),
+        producer(),
+        Weak::new(),
+    )
+    .unwrap();
+    let second = CheckoutSemantic::new(
+        storage.path(),
+        "family",
+        "second",
+        root.path(),
+        producer(),
+        Weak::new(),
+    )
+    .unwrap();
+    assert_eq!(first.base_ref_prototype, mode == "marked");
+    assert_eq!(second.base_ref_prototype, mode == "marked");
+    assert_eq!(first.installed().generation().name(), "empty");
+    assert_eq!(second.installed().generation().name(), "empty");
+    let active = super::super::io::work_snapshot()["base_ref_prototype"]
+        .as_bool()
+        .unwrap_or(false);
+    assert_eq!(
+        active,
+        mode == "marked",
+        "prototype selection must be reported"
+    );
+    first.load().unwrap();
+    refresh(&first, &Model::default());
+    second.load().unwrap();
+    assert_eq!(
+        second
+            .installed()
+            .generation()
+            .name()
+            .starts_with("base-ref-"),
+        mode == "marked" && cfg!(unix)
+    );
+    if mode != "marked" {
+        assert!(lock(&first.base_ref_pin).is_none());
+        assert!(lock(&second.base_ref_pin).is_none());
+    }
+}
+
+fn base_ref_selection(mode: &str, enabled: bool) -> std::process::Output {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "views::semantic_runtime::tests::base_ref_selection_child",
+            "--nocapture",
+        ])
+        .env("AFT_BASE_REF_SELECTION_CHILD", mode);
+    if enabled {
+        child.env("AFT_VIEWS_BASE_REF_PROTOTYPE", "1");
+    } else {
+        child.env_remove("AFT_VIEWS_BASE_REF_PROTOTYPE");
+    }
+    child
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = child.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("selection child exceeded 30 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    if output.status.success() {
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "selection child did not execute its exact test"
+        );
+    }
+    output
+}
+
+#[test]
+fn base_ref_marker_and_variable_are_required() {
+    let output = base_ref_selection("marked", true);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let output = base_ref_selection("default", false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn base_ref_unmarked_storage_warns_exactly_once() {
+    let output = base_ref_selection("unmarked", true);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let warnings = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        warnings.matches("AFT_VIEWS_BASE_REF_PROTOTYPE").count(),
+        1,
+        "{warnings}"
+    );
+}
+
+#[cfg(unix)]
+fn base_ref_runtime(storage: &Path, scope: &str, root: &Path) -> CheckoutSemantic {
+    let mut runtime =
+        CheckoutSemantic::new(storage, "family", scope, root, producer(), Weak::new()).unwrap();
+    if !runtime.base_ref_prototype {
+        runtime.base_ref_prototype = true;
+        super::super::io::BASE_REF_PROTOTYPE_USERS.fetch_add(1, Ordering::Relaxed);
+    }
+    runtime.driver().register_write_intent();
+    runtime.load().unwrap();
+    runtime
+}
+
+#[cfg(unix)]
+#[test]
+fn base_ref_top_k_matches_strict_including_prebind_edit() {
+    let storage = tempfile::tempdir().unwrap();
+    let main = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    write_tree(main.path(), FILES);
+    write_tree(worker.path(), FILES);
+    let model = Model::default();
+    let base = base_ref_runtime(storage.path(), "main", main.path());
+    refresh(&base, &model);
+    for modified in [false, true] {
+        if modified {
+            std::fs::write(
+                worker.path().join("src/alpha.rs"),
+                "pub fn distinct_worker_value() -> u64 { 9981 }\n",
+            )
+            .unwrap();
+        }
+        let suffix = if modified { "edited" } else { "clean" };
+        let prototype = base_ref_runtime(
+            storage.path(),
+            &format!("prototype-{suffix}"),
+            worker.path(),
+        );
+        assert_eq!(
+            prototype
+                .installed()
+                .generation()
+                .name()
+                .starts_with("base-ref-"),
+            !modified
+        );
+        if !modified {
+            assert_eq!(prototype.driver().take_reconcile_work().walks, 0);
+        }
+        refresh(&prototype, &model);
+        let strict = open(storage.path(), &format!("strict-{suffix}"), worker.path());
+        refresh(&strict, &model);
+        for text in [
+            "alpha total",
+            "beta cache insert",
+            "gamma parse",
+            "distinct worker value",
+        ] {
+            for top_k in [1, 3, 100] {
+                let expected = strict.search(&vector(text), top_k, &|_| true).unwrap();
+                let actual = prototype.search(&vector(text), top_k, &|_| true).unwrap();
+                assert!(actual.complete());
+                assert_eq!(
+                    rows(worker.path(), &actual.results),
+                    rows(worker.path(), &expected.results)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn base_ref_membership_changes_take_strict_path() {
+    for change in ["add", "delete", "symlink"] {
+        let storage = tempfile::tempdir().unwrap();
+        let main = tempfile::tempdir().unwrap();
+        let worker = tempfile::tempdir().unwrap();
+        write_tree(main.path(), FILES);
+        write_tree(worker.path(), FILES);
+        let base = base_ref_runtime(storage.path(), "main", main.path());
+        refresh(&base, &Model::default());
+        match change {
+            "add" => std::fs::write(worker.path().join("new.rs"), "fn added() {}\n").unwrap(),
+            "delete" => std::fs::remove_file(worker.path().join("src/alpha.rs")).unwrap(),
+            _ => {
+                std::fs::remove_file(worker.path().join("src/alpha.rs")).unwrap();
+                std::os::unix::fs::symlink(
+                    main.path().join("src/alpha.rs"),
+                    worker.path().join("src/alpha.rs"),
+                )
+                .unwrap();
+            }
+        }
+        let runtime = base_ref_runtime(storage.path(), "worker", worker.path());
+        assert!(
+            !runtime
+                .installed()
+                .generation()
+                .name()
+                .starts_with("base-ref-"),
+            "{change}"
+        );
+        assert!(runtime.driver().take_reconcile_work().walks > 0, "{change}");
+    }
+}
+
+#[test]
+fn base_ref_pending_is_not_ready() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let runtime = open(storage.path(), "main", root.path());
+    assert!(!base_ref_ready(&runtime.installed()));
+    refresh(&runtime, &Model::default());
+    assert!(base_ref_ready(&runtime.installed()));
+}
+
+#[cfg(unix)]
+#[test]
+fn base_ref_does_not_inherit_private_git_administration() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let runtime = base_ref_runtime(storage.path(), "builder", root.path());
+    refresh(&runtime, &Model::default());
+    let mut manifest = runtime.installed().generation().manifest().clone();
+    let git = super::super::RelPath::from_os_path(Path::new(".git")).unwrap();
+    let bytes = b"gitdir: /private/checkout/administration\n";
+    manifest
+        .insert(
+            git.clone(),
+            super::super::manifest_v2::EntryV2::regular(
+                crate::blob_store::v2::ContentHash::of(bytes),
+                bytes.len() as u64,
+                super::super::manifest_v2::EntryPlanes::default(),
+            ),
+        )
+        .unwrap();
+    let snapshot = LiveDelta::new(Arc::new(OpenGeneration::new(
+        "git-file-builder",
+        manifest,
+        None,
+    )))
+    .snapshot();
+    runtime
+        .driver()
+        .install(
+            runtime.access(),
+            &snapshot,
+            runtime.driver().revision(runtime.access()),
+        )
+        .unwrap();
+    runtime.remember_base();
+    let pin = lock(&runtime.base_ref_pin).as_ref().cloned().unwrap();
+    assert!(pin.generation.manifest().get(&git).is_none());
+    assert!(pin
+        .generation
+        .manifest()
+        .get(&super::super::RelPath::from_os_path(Path::new("src/alpha.rs")).unwrap())
+        .is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn base_ref_changed_stat_is_not_stable() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.rs");
+    std::fs::write(&path, "fn before() {}\n").unwrap();
+    let before = std::fs::metadata(&path).unwrap();
+    assert!(base_ref_stable(&before, &before));
+    std::fs::write(&path, "fn after_and_larger() {}\n").unwrap();
+    assert!(!base_ref_stable(
+        &before,
+        &std::fs::metadata(&path).unwrap()
+    ));
+}
+
+#[test]
+fn base_ref_is_not_a_configuration_key() {
+    assert!(!include_str!("../../../../assets/aft.schema.json").contains("base_ref_prototype"));
+    let defaults = serde_json::to_value(crate::config::Config::default()).unwrap();
+    assert!(defaults.get("base_ref_prototype").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn base_ref_identity_mismatch_takes_strict_path() {
+    let storage = tempfile::tempdir().unwrap();
+    let other_storage = tempfile::tempdir().unwrap();
+    let main = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    write_tree(main.path(), FILES);
+    write_tree(worker.path(), FILES);
+    let base = base_ref_runtime(storage.path(), "main", main.path());
+    refresh(&base, &Model::default());
+    let pin = lock(&base.base_ref_pin).as_ref().cloned().unwrap();
+    assert!(pin.compatible(storage.path(), "family", &producer().id()));
+    for mismatch in ["storage", "family", "producer"] {
+        assert!(
+            !pin.compatible(
+                if mismatch == "storage" {
+                    other_storage.path()
+                } else {
+                    storage.path()
+                },
+                if mismatch == "family" {
+                    "other"
+                } else {
+                    "family"
+                },
+                &if mismatch == "producer" {
+                    SemanticProducer::current("other-model", EmbedTextCaps::default()).id()
+                } else {
+                    producer().id()
+                },
+            ),
+            "{mismatch}"
+        );
+        let mut runtime = CheckoutSemantic::new(
+            if mismatch == "storage" {
+                other_storage.path()
+            } else {
+                storage.path()
+            },
+            if mismatch == "family" {
+                "other"
+            } else {
+                "family"
+            },
+            mismatch,
+            worker.path(),
+            if mismatch == "producer" {
+                SemanticProducer::current("other-model", EmbedTextCaps::default())
+            } else {
+                producer()
+            },
+            Weak::new(),
+        )
+        .unwrap();
+        runtime.base_ref_prototype = true;
+        super::super::io::BASE_REF_PROTOTYPE_USERS.fetch_add(1, Ordering::Relaxed);
+        runtime.load().unwrap();
+        assert!(
+            !runtime
+                .installed()
+                .generation()
+                .name()
+                .starts_with("base-ref-"),
+            "{mismatch}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn base_ref_edit_invalidates_and_refreshes_strictly() {
+    let storage = tempfile::tempdir().unwrap();
+    let main = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    write_tree(main.path(), FILES);
+    write_tree(worker.path(), FILES);
+    let model = Model::default();
+    let base = base_ref_runtime(storage.path(), "main", main.path());
+    refresh(&base, &model);
+    let runtime = base_ref_runtime(storage.path(), "worker", worker.path());
+    assert!(runtime
+        .installed()
+        .generation()
+        .name()
+        .starts_with("base-ref-"));
+    let path = worker.path().join("src/alpha.rs");
+    std::fs::write(&path, "pub fn changed_after_bind() -> u32 { 29 }\n").unwrap();
+    runtime.driver().record_absolute_change(&path);
+    assert!(!query(&runtime, "alpha").complete());
+    refresh(&runtime, &model);
+    assert!(!runtime
+        .installed()
+        .generation()
+        .name()
+        .starts_with("base-ref-"));
+    assert_eq!(
+        rows(
+            worker.path(),
+            &query(&runtime, "changed after bind").results
+        ),
+        cold(worker.path(), "changed after bind").0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn base_ref_active_prebind_write_waits_even_without_begin_notification() {
+    let storage = tempfile::tempdir().unwrap();
+    let main = tempfile::tempdir().unwrap();
+    let worker = tempfile::tempdir().unwrap();
+    write_tree(main.path(), FILES);
+    write_tree(worker.path(), FILES);
+    let base = base_ref_runtime(storage.path(), "main", main.path());
+    refresh(&base, &Model::default());
+    // The root already exists, but its new semantic driver is not listening
+    // when the write begins. The root-wide active count must still fence bind.
+    let delta = Arc::new(Mutex::new(LiveDelta::new(Arc::clone(
+        base.installed().generation(),
+    ))));
+    super::super::intent::register(worker.path(), &delta);
+    let path = worker.path().join("src/alpha.rs");
+    let writing = super::super::intent::record_paths([path.as_path()]);
+    assert!(super::super::intent::active(worker.path()));
+    let mut runtime = CheckoutSemantic::new(
+        storage.path(),
+        "family",
+        "worker",
+        worker.path(),
+        producer(),
+        Weak::new(),
+    )
+    .unwrap();
+    runtime.base_ref_prototype = true;
+    super::super::io::BASE_REF_PROTOTYPE_USERS.fetch_add(1, Ordering::Relaxed);
+    runtime.driver().register_write_intent();
+    assert!(
+        runtime.load().is_err(),
+        "an active write was declared ready"
+    );
+    assert_eq!(runtime.installed().generation().name(), "empty");
+    drop(writing);
+    assert!(!super::super::intent::active(worker.path()));
+    runtime.load().unwrap();
+    assert!(runtime
+        .installed()
+        .generation()
+        .name()
+        .starts_with("base-ref-"));
+}
+
+#[cfg(unix)]
+#[test]
+fn base_ref_kill_child() {
+    let Ok(subject) = std::env::var("AFT_BASE_REF_KILL_SUBJECT") else {
+        return;
+    };
+    let subject = PathBuf::from(subject);
+    let storage = subject.join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    std::fs::write(storage.join("views-harness.marker"), b"test\n").unwrap();
+    let main = subject.join("main");
+    let worker = subject.join("worker");
+    write_tree(&main, FILES);
+    write_tree(&worker, FILES);
+    let model = Model::default();
+    let base = open(&storage, "main", &main);
+    refresh(&base, &model);
+    let runtime = open(&storage, "worker", &worker);
+    refresh(&runtime, &model);
+    let borrowed = runtime
+        .installed()
+        .generation()
+        .name()
+        .starts_with("base-ref-");
+    assert_eq!(borrowed, std::env::var(BASE_REF_ENV).as_deref() == Ok("1"));
+    let answer = query(&runtime, "beta cache insert");
+    assert!(answer.complete());
+    assert!(!answer.results.is_empty());
+    std::fs::write(subject.join("ready"), b"semantic query served\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+        std::hint::black_box((&base, &runtime, &answer));
+    }
+    panic!("kill-test parent did not send SIGKILL within 30 seconds");
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct BaseRefKilledInventory {
+    registry: std::collections::BTreeMap<String, usize>,
+    protections: std::collections::BTreeMap<String, usize>,
+    worker_files: Vec<PathBuf>,
+}
+
+#[cfg(unix)]
+fn base_ref_normalize(value: &mut serde_json::Value, subject: &Path) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (name, value) in fields {
+                if [
+                    "owner_pid",
+                    "owner_start",
+                    "pid",
+                    "start_time",
+                    "hostname",
+                    "created_at",
+                    "renewed_at",
+                    "created_at_ms",
+                    "registered_at_ms",
+                    "last_bind_ms",
+                    "last_publish_ms",
+                    "opened_at_ms",
+                    "acquired_at_ms",
+                    "measured_at_ms",
+                    "reader_id",
+                    "session_id",
+                    "generation",
+                ]
+                .contains(&name.as_str())
+                {
+                    *value = serde_json::json!("<run-specific>");
+                } else {
+                    base_ref_normalize(value, subject);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                base_ref_normalize(item, subject);
+            }
+        }
+        serde_json::Value::String(text) => {
+            *text = text.replace(subject.to_str().unwrap(), "<subject>");
+        }
+        _ => {}
+    }
+}
+
+#[cfg(unix)]
+fn base_ref_files(path: &Path) -> Vec<PathBuf> {
+    if !path.exists() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            files.extend(base_ref_files(&entry.path()));
+        } else {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    files
+}
+
+#[cfg(unix)]
+fn base_ref_killed_inventory(subject: &Path, prototype: bool) -> BaseRefKilledInventory {
+    use std::os::unix::process::ExitStatusExt;
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "views::semantic_runtime::tests::base_ref_kill_child",
+            "--nocapture",
+        ])
+        .env("AFT_BASE_REF_KILL_SUBJECT", subject);
+    if prototype {
+        command.env(BASE_REF_ENV, "1");
+    } else {
+        command.env_remove(BASE_REF_ENV);
+    }
+    let mut child = command.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !subject.join("ready").exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "kill-test child exited before serving a query"
+        );
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("kill-test child did not become ready within 30 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    assert_eq!(child.wait().unwrap().signal(), Some(9));
+    // Open only after SIGKILL, before any recovery or GC pass. This never
+    // inspects a live SQLite file through a second descriptor.
+    let connection = rusqlite::Connection::open_with_flags(
+        subject.join("storage/blobs/v2/family/members.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let tables = connection.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
+        .query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    let mut registry = std::collections::BTreeMap::new();
+    for table in tables {
+        registry.insert(format!("table:{table}"), 1);
+        let sql = format!("SELECT * FROM \"{}\"", table.replace('"', "\"\""));
+        let mut statement = connection.prepare(&sql).unwrap();
+        let columns = statement
+            .column_names()
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>();
+        let rows = statement
+            .query_map([], |row| {
+                let mut fields = serde_json::Map::new();
+                for (index, name) in columns.iter().enumerate() {
+                    use rusqlite::types::ValueRef;
+                    let value = match row.get_ref(index)? {
+                        ValueRef::Null => serde_json::Value::Null,
+                        ValueRef::Integer(value) => serde_json::json!(value),
+                        ValueRef::Real(value) => serde_json::json!(value),
+                        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+                            match std::str::from_utf8(bytes) {
+                                Ok(text) => serde_json::json!(text),
+                                Err(_) => serde_json::json!(bytes),
+                            }
+                        }
+                    };
+                    fields.insert(name.clone(), value);
+                }
+                Ok(serde_json::Value::Object(fields))
+            })
+            .unwrap();
+        for row in rows {
+            let mut row = row.unwrap();
+            // Publication timestamps may be NULL for a reference adopter,
+            // which intentionally never publishes a worker generation.
+            base_ref_normalize(&mut row, subject);
+            *registry
+                .entry(format!("{table}:{}", serde_json::to_string(&row).unwrap()))
+                .or_insert(0) += 1;
+        }
+    }
+    drop(connection);
+    let storage = subject.join("storage");
+    BaseRefKilledInventory {
+        registry,
+        protections: base_ref_protection_inventory(&storage),
+        worker_files: base_ref_files(
+            &super::super::registry::view_dir(&storage, "worker").unwrap(),
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn base_ref_protection_inventory(storage: &Path) -> std::collections::BTreeMap<String, usize> {
+    let mut inventory = std::collections::BTreeMap::new();
+    for scope in std::fs::read_dir(storage.join("views/v2")).unwrap() {
+        let scope = scope.unwrap();
+        if !scope.file_type().unwrap().is_dir() {
+            continue;
+        }
+        let name = scope.file_name().to_string_lossy().into_owned();
+        for kind in ["pins", "readers"] {
+            let directory = scope.path().join(kind);
+            for file in base_ref_files(&directory) {
+                let relative = file.strip_prefix(&directory).unwrap();
+                let filename = file.file_name().unwrap().to_string_lossy();
+                let temporary = filename.starts_with('.') || filename.contains(".tmp.");
+                let canonical_path = if kind == "readers" && !temporary {
+                    format!("{name}/readers/<generation>/<holder>.json")
+                } else if kind == "pins" && filename.starts_with("live-") && !temporary {
+                    format!(
+                        "{name}/pins/<live>.{}",
+                        file.extension().unwrap().to_string_lossy()
+                    )
+                } else {
+                    format!("{name}/{kind}/{}", relative.display())
+                };
+                let bytes = std::fs::read(&file).unwrap();
+                let canonical = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    Ok(mut value) => {
+                        base_ref_normalize(&mut value, storage.parent().unwrap());
+                        serde_json::to_vec(&value).unwrap()
+                    }
+                    Err(_) => bytes,
+                };
+                let key = format!("{canonical_path}:{}", blake3::hash(&canonical).to_hex());
+                *inventory.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+    inventory
+}
+
+#[cfg(unix)]
+fn base_ref_no_extra_protection(
+    control: &std::collections::BTreeMap<String, usize>,
+    candidate: &std::collections::BTreeMap<String, usize>,
+) -> bool {
+    candidate
+        .iter()
+        .all(|(key, count)| *count <= control.get(key).copied().unwrap_or(0))
+        && !candidate.keys().any(|key| key.starts_with("worker/"))
+}
+
+#[cfg(unix)]
+#[test]
+fn base_ref_sigkill_leaves_no_extra_rows_or_protection() {
+    let control = tempfile::tempdir().unwrap();
+    let prototype = tempfile::tempdir().unwrap();
+    let control_inventory = base_ref_killed_inventory(control.path(), false);
+    let prototype_inventory = base_ref_killed_inventory(prototype.path(), true);
+    let members = |inventory: &BaseRefKilledInventory| {
+        inventory
+            .registry
+            .iter()
+            .filter(|(key, _)| key.starts_with("members:"))
+            .map(|(key, count)| (key.clone(), *count))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    assert_eq!(members(&prototype_inventory), members(&control_inventory));
+    assert!(prototype_inventory.registry.iter().all(|(key, count)| *count <= control_inventory.registry.get(key).copied().unwrap_or(0)), "control={control_inventory:?} prototype={prototype_inventory:?}");
+    assert!(
+        base_ref_no_extra_protection(
+            &control_inventory.protections,
+            &prototype_inventory.protections
+        ),
+        "control={control_inventory:?} prototype={prototype_inventory:?}"
+    );
+    assert!(
+        prototype_inventory.worker_files.is_empty(),
+        "the reference adopter wrote durable files: {:?}",
+        prototype_inventory.worker_files
+    );
+    assert!(!prototype.path().join("storage/blobs/v3").exists());
+    let pins = super::super::registry::view_dir(&prototype.path().join("storage"), "worker")
+        .unwrap()
+        .join("pins");
+    std::fs::create_dir_all(&pins).unwrap();
+    // A synthetic extra pin must fail the same inventory comparison used
+    // immediately after the real process kill.
+    std::fs::write(pins.join("leaked.json"), b"leaked reference\n").unwrap();
+    let leaked = base_ref_protection_inventory(&prototype.path().join("storage"));
+    assert!(
+        !base_ref_no_extra_protection(&control_inventory.protections, &leaked),
+        "a deliberately leaked pin escaped detection"
+    );
+}
+
+/// Real-model parity reuses a quiescent harness store, never a live daemon's
+/// SQLite files. Only the small pre-bind edit may need a new embedding.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the pinned corpus and real-model cache from the performance harness"]
+fn base_ref_real_model_parity_including_prebind_edit() {
+    let _ = env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Info)
+        .try_init();
+    let required = |name| PathBuf::from(std::env::var(name).expect(name));
+    let storage = required("AFT_VIEWS_PARITY_STORAGE");
+    let main = required("AFT_VIEWS_PARITY_MAIN");
+    let worker = required("AFT_VIEWS_PARITY_WORKER");
+    let family = std::env::var("AFT_VIEWS_PARITY_FAMILY").unwrap();
+    let config = crate::config::SemanticBackendConfig::default();
+    let mut model = crate::semantic_index::EmbeddingModel::from_config(&config).unwrap();
+    let fingerprint = model.fingerprint_for_view(&config).unwrap();
+    let producer = SemanticProducer::current(fingerprint.as_string(), fingerprint.embed_text_caps);
+    let open = |scope: &str, root: &Path, prototype: bool| {
+        let mut runtime = CheckoutSemantic::new(
+            &storage,
+            &family,
+            scope,
+            root,
+            producer.clone(),
+            Weak::new(),
+        )
+        .unwrap();
+        if prototype && !runtime.base_ref_prototype {
+            runtime.base_ref_prototype = true;
+            super::super::io::BASE_REF_PROTOTYPE_USERS.fetch_add(1, Ordering::Relaxed);
+        }
+        runtime.driver().register_write_intent();
+        runtime.load().unwrap();
+        runtime
+    };
+    let base = open("real-parity-main", &main, true);
+    assert!(
+        base.plane()
+            .pending_work(base.access(), &base.installed())
+            .is_empty(),
+        "the real-model store must be prewarmed under the same producer"
+    );
+    base.refresh(FillBudget::default(), &mut |texts| model.embed(texts))
+        .unwrap();
+    assert!(
+        lock(&base.base_ref_pin).is_some(),
+        "the prewarmed strict snapshot was not remembered as a ready prototype base"
+    );
+    struct RestoreFile(PathBuf, Vec<u8>);
+    impl Drop for RestoreFile {
+        fn drop(&mut self) {
+            std::fs::write(&self.0, &self.1).unwrap();
+        }
+    }
+    let probe = worker.join("views_perf_probe.rs");
+    let restore = RestoreFile(probe.clone(), std::fs::read(&probe).unwrap());
+    let mut comparisons = 0;
+    for modified in [false, true] {
+        let suffix = if modified { "edited" } else { "clean" };
+        if modified {
+            let changed = String::from_utf8(restore.1.clone()).unwrap().replace(
+                "{ probe_alpha() } // TODO VIEWS_PERF_STATE_ALPHA",
+                "{ probe_beta() } // TODO VIEWS_PERF_STATE_BETA",
+            );
+            assert_ne!(changed.as_bytes(), restore.1);
+            std::fs::write(&probe, changed).unwrap();
+        }
+        let strict = open(&format!("real-strict-{suffix}"), &worker, false);
+        assert!(
+            strict
+                .plane()
+                .pending_work(strict.access(), &strict.installed())
+                .len()
+                <= 1
+        );
+        strict
+            .refresh(FillBudget::default(), &mut |texts| model.embed(texts))
+            .unwrap();
+        let prototype = open(&format!("real-prototype-{suffix}"), &worker, true);
+        assert_eq!(
+            prototype
+                .installed()
+                .generation()
+                .name()
+                .starts_with("base-ref-"),
+            !modified
+        );
+        assert!(
+            prototype
+                .plane()
+                .pending_work(prototype.access(), &prototype.installed())
+                .len()
+                <= 1
+        );
+        prototype
+            .refresh(FillBudget::default(), &mut |texts| model.embed(texts))
+            .unwrap();
+        for text in [
+            "function probe_entry in views_perf_probe.rs",
+            "how are view generations published",
+            "how does semantic vector search score candidates",
+        ] {
+            let query_vector = model.embed(vec![text.to_owned()]).unwrap().remove(0);
+            for top_k in [1, 3, 20] {
+                let expected = strict.search(&query_vector, top_k, &|_| true).unwrap();
+                let actual = prototype.search(&query_vector, top_k, &|_| true).unwrap();
+                assert!(expected.complete() && actual.complete());
+                assert_eq!(
+                    rows(&worker, &actual.results),
+                    rows(&worker, &expected.results),
+                    "state={suffix} query={text} top_k={top_k}"
+                );
+                comparisons += 1;
+            }
+        }
+    }
+    assert_eq!(comparisons, 18);
+    eprintln!("REAL_MODEL_BASE_REF_PARITY: 18 exact top-k comparisons passed on one worker, including a pre-bind edit");
+}
+
 use super::super::first_load::MembershipWalker;
 
 /// Two worktrees of one family with identical content embed each chunk once

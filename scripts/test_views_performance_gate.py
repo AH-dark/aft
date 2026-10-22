@@ -19,6 +19,141 @@ SPEC.loader.exec_module(gate)
 
 
 class MeasurementContractTests(unittest.TestCase):
+    def test_semantic_witness_accepts_captured_targeted_ready_reply(self):
+        capture = json.loads((Path(__file__).parent / "views-performance-baselines/slice-4a-witness-ready.json").read_text())
+        self.assertEqual(gate.SEMANTIC_QUERY, capture["request"]["query"])
+        self.assertTrue(gate.semantic_witness(capture["reply"], Path(capture["probe_path"]), capture["marker"]))
+
+    def test_semantic_witness_rejects_captured_building_reply(self):
+        capture = json.loads((Path(__file__).parent / "views-performance-baselines/slice-4a-witness-not-ready.json").read_text())
+        self.assertFalse(gate.semantic_witness(capture["reply"], Path(capture["probe_path"]), capture["marker"]))
+
+    def test_semantic_witness_requires_public_semantic_lane(self):
+        capture = json.loads((Path(__file__).parent / "views-performance-baselines/slice-4a-witness-ready.json").read_text())
+        answer = capture["reply"]
+        for lane in [None, {}, {"status": "building"}]:
+            with self.subTest(lane=lane):
+                answer["lanes"] = {} if lane is None else {"semantic": lane}
+                self.assertFalse(gate.semantic_witness(answer, Path(capture["probe_path"]), capture["marker"]))
+
+    def test_prototype_on_requires_active_metric(self):
+        with patch.dict(gate.os.environ, {"AFT_VIEWS_BASE_REF_PROTOTYPE": "1"}):
+            for counters in ({}, {"base_ref_prototype": False}, {"base_ref_prototype": 1}):
+                with self.subTest(counters=counters):
+                    with self.assertRaisesRegex(gate.MeasurementError, "base_ref_prototype: true"):
+                        gate.require_base_ref_prototype(counters)
+            gate.require_base_ref_prototype({"base_ref_prototype": True})
+        with patch.dict(gate.os.environ, {"AFT_VIEWS_BASE_REF_PROTOTYPE": "0"}):
+            gate.require_base_ref_prototype({})
+
+    def test_inactive_prototype_arms_reject_active_metric(self):
+        for requested in ["0", "1"]:
+            with patch.dict(gate.os.environ, {"AFT_VIEWS_BASE_REF_PROTOTYPE": requested}):
+                for views, semantic in [(False, False), (False, True), (True, False), (True, True)]:
+                    if requested == "1" and views and semantic:
+                        continue
+                    with self.subTest(requested=requested, views=views, semantic=semantic):
+                        for counters in [{}, {"base_ref_prototype": False}]:
+                            gate.require_base_ref_prototype(counters, views=views, semantic=semantic)
+                        with self.assertRaisesRegex(gate.MeasurementError, "inactive arm"):
+                            gate.require_base_ref_prototype({"base_ref_prototype": True}, views=views, semantic=semantic)
+
+    def run_prototype_pair(self, semantic, force_active):
+        """Exercise run_arm and its witness logic with a fake transport."""
+        configurations = {}
+
+        def provision(_source, _pin, subject, count, config):
+            self.assertEqual(count, 1)
+            root = subject / "repo"
+            root.mkdir()
+            (root / gate.PROBE).write_text(gate.BASE)
+            (subject / "storage").mkdir()
+            configurations[subject] = config
+            return [root], {}
+
+        class Broker:
+            request_timeout = 1
+
+            def __init__(self, _binary, _broker, subject, root, _timeout):
+                self.root = root
+                self.config = configurations[subject]
+                self.pid = 123
+                self.registry = str(subject / "storage")
+                self.identity = {"pid": self.pid, "registry": self.registry}
+                self.initial_sample = {"start_ticks": 1}
+                self.ticks = 0
+
+            def health(self):
+                enabled = self.config["views"]["enabled"] and self.config["indexes"]["semantic"]
+                counters = dict.fromkeys(gate.COUNTERS, self.ticks)
+                counters.update(pid=self.pid, base_ref_prototype=enabled or force_active)
+                return {"metrics": {"views_work": counters}}
+
+            def sample(self):
+                self.ticks += 1
+                return {"health": self.health(), "process": {
+                    "monotonic_s": self.ticks, "cpu_seconds": self.ticks,
+                    "physical_bytes_written": self.ticks, "rss_bytes": 100,
+                }}
+
+            def call(self, op, **args):
+                if op == "bind":
+                    return {"bound": True}
+                path = str(self.root / gate.PROBE)
+                token = "VIEWS_PERF_STATE_ALPHA"
+                ready = {"trigram": {"status": "ready"}}
+                return {
+                    "grep": {"success": True, "complete": True, "matches": [{"file": path, "line_text": token}], "index": ready},
+                    "glob": {"success": True, "complete": True, "total": 1, "files": [path], "index": ready},
+                    "search": {"success": True, "complete": True, "results": [{"file": path, "snippet": gate.BASE}],
+                               "semantic_status": "ready" if semantic else "disabled",
+                               "lanes": {**ready, "semantic": {"status": "ready" if semantic else "off"}}},
+                    "callgraph": {"success": True, "name": "probe_entry", "children": [{"name": "probe_alpha", "resolved": True}]},
+                    "zoom": {"success": True, "content": gate.BASE, "annotations": {"calls_out": [{"name": "probe_alpha"}]}},
+                    "inspect": {"success": True, "complete": True, "details": {"todos": [token]}},
+                }[args["name"]]
+
+            def close(self):
+                pass
+
+        class BindOnlyAcquisition(gate.Acquisition):
+            def idle(self, *_args):
+                pass
+
+            def workload(self, *_args):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            args = SimpleNamespace(
+                semantic=semantic, model="m", subjects=directory / "subjects", source=directory,
+                corpus="corpus", state_timeout=1, ready_timeout=1, request_timeout=1,
+                graph_inspect=False, warmup_minutes=0, activity_minutes=0, quiet_minutes=0,
+                cycle_seconds=1, binary=directory / "aft", broker=directory / "broker",
+            )
+            args.subjects.mkdir()
+            with patch.object(gate, "provision", side_effect=provision), \
+                    patch.object(gate, "Broker", Broker), \
+                    patch.object(gate, "Acquisition", BindOnlyAcquisition), \
+                    patch.object(gate, "git", return_value=""), \
+                    patch("sys.stdout", new=io.StringIO()):
+                results = [gate.run_arm(args, {"commit": "fixture"}, 1, views,
+                                       directory / ("views-on" if views else "views-off"))
+                           for views in [False, True]]
+            return results
+
+    def test_prototype_paired_views_matrix_succeeds(self):
+        with patch.dict(gate.os.environ, {"AFT_VIEWS_BASE_REF_PROTOTYPE": "1"}):
+            for semantic in [True, False]:
+                with self.subTest(semantic=semantic, force_active=False):
+                    results = self.run_prototype_pair(semantic, False)
+                    self.assertEqual([row["views"] for row in results], [False, True])
+                    self.assertEqual([row["status"] for row in results], ["measured", "measured"])
+                with self.subTest(semantic=semantic, force_active=True):
+                    results = self.run_prototype_pair(semantic, True)
+                    self.assertEqual([row["status"] for row in results],
+                                     ["failed", "measured" if semantic else "failed"])
+
     def test_bad_pid_is_rejected(self):
         with self.assertRaisesRegex(gate.MeasurementError, "PID"):
             gate.validate_subject(123, 456, "registry", "registry")
@@ -143,7 +278,8 @@ class MeasurementContractTests(unittest.TestCase):
         path = Path("/intended") / gate.PROBE
         token = "VIEWS_PERF_STATE_BETA"
         row = {"file": str(path), "snippet": token}
-        answer = {"success": True, "complete": True, "semantic_status": "ready", "results": [row]}
+        answer = {"success": True, "complete": True, "semantic_status": "ready", "results": [row],
+                  "lanes": {"semantic": {"status": "ready"}}}
         self.assertTrue(gate.semantic_witness(answer, path, token))
         row["snippet"] = "VIEWS_PERF_STATE_ALPHA"
         self.assertFalse(gate.semantic_witness(answer, path, token))

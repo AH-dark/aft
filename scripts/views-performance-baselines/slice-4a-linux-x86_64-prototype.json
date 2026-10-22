@@ -1,0 +1,836 @@
+{
+  "schema": 1,
+  "arm": "base_ref_prototype",
+  "status": "measured",
+  "implementation_commit": "1a5084698de12bf74350464a4213b646a57866fb",
+  "baseline_commit": "6ea92a991b02ae38ca1d06ea7acbf08a09f27ecc",
+  "binary_sha256": "4aa9ea617146b749ccd4363884f529f039a40522a22b8c2825bea135f75707f3",
+  "broker_sha256": "5370c18a4dd575541c86cedb4f784a427e8a10a9c319a6d4aa3226b5e8b98b45",
+  "harness_sha256": "a4322bd79043ed98f9f4b363ad004c4d15d3509fdc2bf54cabb3e04f299eda30",
+  "platform": "Linux-7.0.0-34-generic-x86_64-with-glibc2.43",
+  "host": "cortexkit-builder",
+  "cpu_affinity": [
+    1,
+    2,
+    3,
+    4,
+    6,
+    7,
+    12,
+    14,
+    17,
+    18,
+    19,
+    20,
+    22,
+    23,
+    28,
+    30
+  ],
+  "model": {
+    "onnxruntime": "1.24.4",
+    "library_sha256": "d132535d051344ff5c64c9c200004150559049a81ed330eb4422c1962fb6b7e4",
+    "model_revision": "d13954661f83248295ba75c1ed411eef3b7b936e"
+  },
+  "corpus": {
+    "repository": "https://github.com/cortexkit/aft.git",
+    "commit": "05d40ac417db6137a4204521bd3c59853325e968"
+  },
+  "inventory": {
+    "commit": "05d40ac417db6137a4204521bd3c59853325e968",
+    "tracked_files": 5377,
+    "tracked_bytes": 87031923,
+    "policy_sha256": {
+      ".cortexkit/.gitignore": "c0b75343171c8bdb2333aad153bd7247cf9e8a899fc3152daaaa214bf47262f5",
+      ".cortexkit/aft.jsonc": "87e6777009df5cc9b74d6adffaa000a266fda621f8e5addfbd5d85d743a60b25",
+      ".gitattributes": "6b26de7558a6ea601e1b9ea422849a2debc5c15b6db447d513de30bcdcc5c8ef",
+      ".gitignore": "2e8dc0b97619b42454704c212d7dcb316d3fa940b882519bcda7791c5971e3fe",
+      "benchmarks/.gitignore": "77da9a882838cc2aecba1862075e93784d572d0493c7a303710fca0341fda8fc",
+      "benchmarks/compression-tokens/.gitignore": "4d56952b0fb13bf8f9b6c13a6d4c34a075bac3af447636a1df4335d7576e2f97",
+      "benchmarks/inspect-field-audit/.gitignore": "5f3a07204096307e6d89b7fe76f126f37593c68e7bde5aa0be94ab18ec9d7a39",
+      "benchmarks/settle-time/.gitignore": "7d2e927462d6deccc4b2835488bb63acbc054c715df38acee11826437795c98c",
+      "packages/opencode-plugin/.gitignore": "84f8a6f9091882a1b508ddbc8cc96dcb006011d1206414ba424754d73660000d"
+    },
+    "base_workload_commit": "7b421f9554579a3cdb1daa5ba6e865d7c25fc27f",
+    "changed_workload_commit": "a191372ac18ddbad0462be7c1dee2e172b88019a",
+    "base_workload_tree": "dbed38822622564133983f8f80e55a974ba0f0a7",
+    "changed_workload_tree": "77ca6964370b3edf7fc358064a4e28e1989078a6",
+    "common_git_dir": ".git",
+    "config_override_paths": [
+      ".cortexkit/aft.jsonc",
+      ".cortexkit/aft.opencode.jsonc"
+    ],
+    "config_sha256": "26e2766938391c75e8cf5cfa51abdbfc58a59c569a5679273e973abbb507769a"
+  },
+  "config": {
+    "views": {
+      "enabled": true
+    },
+    "indexes": {
+      "trigram": true,
+      "semantic": true,
+      "callgraph": true
+    },
+    "disabled_tools": [],
+    "inspect": {
+      "enabled": true
+    },
+    "lsp": {
+      "auto_install": false,
+      "disabled": [
+        "rust",
+        "typescript",
+        "python",
+        "go",
+        "bash",
+        "yaml",
+        "ty"
+      ]
+    },
+    "semantic": {
+      "backend": "fastembed",
+      "max_files": 20000,
+      "model": "all-MiniLM-L6-v2"
+    }
+  },
+  "worker_samples": [
+    {
+      "root_index": 1,
+      "repetition": 0,
+      "position": 0,
+      "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/root-1",
+      "semantic": {
+        "bind_to_ready_s": 1.4106429379899055
+      },
+      "cpu_seconds": 2.4399999999996,
+      "physical_bytes_written": 4718592,
+      "rss_bytes": 2270969856,
+      "model_calls": 0,
+      "query_embedding_observations": 1,
+      "counter_delta": {
+        "source_hashes": 19941,
+        "source_hash_bytes": 266244709,
+        "content_reads": 21538,
+        "content_read_bytes": 319923989,
+        "full_walks": 5,
+        "applicability_walks": 1,
+        "logical_aggregates": 0,
+        "own_generation_folds": 0
+      },
+      "ready_reply": {
+        "success": true,
+        "complete": true,
+        "semantic_status": "ready",
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "ready",
+            "reason": null
+          }
+        }
+      },
+      "state_marker_proved": true,
+      "peak_rss_samples": 15,
+      "base_ref_prototype": true,
+      "base_reference_installed": true
+    },
+    {
+      "root_index": 2,
+      "repetition": 0,
+      "position": 1,
+      "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/root-2",
+      "semantic": {
+        "bind_to_ready_s": 1.4613166758790612
+      },
+      "cpu_seconds": 2.819999999999709,
+      "physical_bytes_written": 4571136,
+      "rss_bytes": 2615250944,
+      "model_calls": 0,
+      "query_embedding_observations": 1,
+      "counter_delta": {
+        "source_hashes": 19941,
+        "source_hash_bytes": 266244709,
+        "content_reads": 21538,
+        "content_read_bytes": 319923989,
+        "full_walks": 5,
+        "applicability_walks": 1,
+        "logical_aggregates": 0,
+        "own_generation_folds": 0
+      },
+      "ready_reply": {
+        "success": true,
+        "complete": true,
+        "semantic_status": "ready",
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "ready",
+            "reason": null
+          }
+        }
+      },
+      "state_marker_proved": true,
+      "peak_rss_samples": 15,
+      "base_ref_prototype": true,
+      "base_reference_installed": true
+    },
+    {
+      "root_index": 3,
+      "repetition": 0,
+      "position": 2,
+      "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/root-3",
+      "semantic": {
+        "bind_to_ready_s": 1.4639257118105888
+      },
+      "cpu_seconds": 2.930000000000291,
+      "physical_bytes_written": 4583424,
+      "rss_bytes": 2968662016,
+      "model_calls": 0,
+      "query_embedding_observations": 1,
+      "counter_delta": {
+        "source_hashes": 19941,
+        "source_hash_bytes": 266244709,
+        "content_reads": 21538,
+        "content_read_bytes": 319923989,
+        "full_walks": 5,
+        "applicability_walks": 1,
+        "logical_aggregates": 0,
+        "own_generation_folds": 0
+      },
+      "ready_reply": {
+        "success": true,
+        "complete": true,
+        "semantic_status": "ready",
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "ready",
+            "reason": null
+          }
+        }
+      },
+      "state_marker_proved": true,
+      "peak_rss_samples": 15,
+      "base_ref_prototype": true,
+      "base_reference_installed": true
+    },
+    {
+      "root_index": 4,
+      "repetition": 0,
+      "position": 3,
+      "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/root-4",
+      "semantic": {
+        "bind_to_ready_s": 1.4573644138872623
+      },
+      "cpu_seconds": 2.9099999999998545,
+      "physical_bytes_written": 4550656,
+      "rss_bytes": 5973032960,
+      "model_calls": 0,
+      "query_embedding_observations": 1,
+      "counter_delta": {
+        "source_hashes": 19941,
+        "source_hash_bytes": 266244709,
+        "content_reads": 21538,
+        "content_read_bytes": 319923989,
+        "full_walks": 5,
+        "applicability_walks": 1,
+        "logical_aggregates": 0,
+        "own_generation_folds": 0
+      },
+      "ready_reply": {
+        "success": true,
+        "complete": true,
+        "semantic_status": "ready",
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "ready",
+            "reason": null
+          }
+        }
+      },
+      "state_marker_proved": true,
+      "peak_rss_samples": 15,
+      "base_ref_prototype": true,
+      "base_reference_installed": true
+    },
+    {
+      "root_index": 5,
+      "repetition": 0,
+      "position": 4,
+      "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/root-5",
+      "semantic": {
+        "bind_to_ready_s": 1.4082343271002173
+      },
+      "cpu_seconds": 2.7399999999997817,
+      "physical_bytes_written": 4550656,
+      "rss_bytes": 3645140992,
+      "model_calls": 0,
+      "query_embedding_observations": 1,
+      "counter_delta": {
+        "source_hashes": 19941,
+        "source_hash_bytes": 266244709,
+        "content_reads": 21538,
+        "content_read_bytes": 319923989,
+        "full_walks": 5,
+        "applicability_walks": 1,
+        "logical_aggregates": 0,
+        "own_generation_folds": 0
+      },
+      "ready_reply": {
+        "success": true,
+        "complete": true,
+        "semantic_status": "ready",
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "ready",
+            "reason": null
+          }
+        }
+      },
+      "state_marker_proved": true,
+      "peak_rss_samples": 14,
+      "base_ref_prototype": true,
+      "base_reference_installed": true
+    },
+    {
+      "root_index": 6,
+      "repetition": 1,
+      "position": 0,
+      "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/root-6",
+      "semantic": {
+        "bind_to_ready_s": 1.3486427189782262
+      },
+      "cpu_seconds": 2.7100000000000364,
+      "physical_bytes_written": 4542464,
+      "rss_bytes": 4020723712,
+      "model_calls": 0,
+      "query_embedding_observations": 1,
+      "counter_delta": {
+        "source_hashes": 19941,
+        "source_hash_bytes": 266244709,
+        "content_reads": 21538,
+        "content_read_bytes": 319923989,
+        "full_walks": 5,
+        "applicability_walks": 1,
+        "logical_aggregates": 0,
+        "own_generation_folds": 0
+      },
+      "ready_reply": {
+        "success": true,
+        "complete": true,
+        "semantic_status": "ready",
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "ready",
+            "reason": null
+          }
+        }
+      },
+      "state_marker_proved": true,
+      "peak_rss_samples": 14,
+      "base_ref_prototype": true,
+      "base_reference_installed": true
+    },
+    {
+      "root_index": 7,
+      "repetition": 1,
+      "position": 1,
+      "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/root-7",
+      "semantic": {
+        "bind_to_ready_s": 1.3248979810159653
+      },
+      "cpu_seconds": 2.5900000000001455,
+      "physical_bytes_written": 4550656,
+      "rss_bytes": 4334579712,
+      "model_calls": 0,
+      "query_embedding_observations": 1,
+      "counter_delta": {
+        "source_hashes": 19941,
+        "source_hash_bytes": 266244709,
+        "content_reads": 21538,
+        "content_read_bytes": 319923989,
+        "full_walks": 5,
+        "applicability_walks": 1,
+        "logical_aggregates": 0,
+        "own_generation_folds": 0
+      },
+      "ready_reply": {
+        "success": true,
+        "complete": true,
+        "semantic_status": "ready",
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "ready",
+            "reason": null
+          }
+        }
+      },
+      "state_marker_proved": true,
+      "peak_rss_samples": 14,
+      "base_ref_prototype": true,
+      "base_reference_installed": true
+    },
+    {
+      "root_index": 8,
+      "repetition": 1,
+      "position": 2,
+      "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/root-8",
+      "semantic": {
+        "bind_to_ready_s": 1.2955488488078117
+      },
+      "cpu_seconds": 2.5100000000002183,
+      "physical_bytes_written": 4567040,
+      "rss_bytes": 4664475648,
+      "model_calls": 0,
+      "query_embedding_observations": 1,
+      "counter_delta": {
+        "source_hashes": 19941,
+        "source_hash_bytes": 266244709,
+        "content_reads": 21538,
+        "content_read_bytes": 319923989,
+        "full_walks": 5,
+        "applicability_walks": 1,
+        "logical_aggregates": 0,
+        "own_generation_folds": 0
+      },
+      "ready_reply": {
+        "success": true,
+        "complete": true,
+        "semantic_status": "ready",
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "ready",
+            "reason": null
+          }
+        }
+      },
+      "state_marker_proved": true,
+      "peak_rss_samples": 13,
+      "base_ref_prototype": true,
+      "base_reference_installed": true
+    },
+    {
+      "root_index": 9,
+      "repetition": 1,
+      "position": 3,
+      "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/root-9",
+      "semantic": {
+        "bind_to_ready_s": 1.3239146911073476
+      },
+      "cpu_seconds": 2.6099999999996726,
+      "physical_bytes_written": 4550656,
+      "rss_bytes": 5009653760,
+      "model_calls": 0,
+      "query_embedding_observations": 1,
+      "counter_delta": {
+        "source_hashes": 19941,
+        "source_hash_bytes": 266244709,
+        "content_reads": 21538,
+        "content_read_bytes": 319923989,
+        "full_walks": 5,
+        "applicability_walks": 1,
+        "logical_aggregates": 0,
+        "own_generation_folds": 0
+      },
+      "ready_reply": {
+        "success": true,
+        "complete": true,
+        "semantic_status": "ready",
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "ready",
+            "reason": null
+          }
+        }
+      },
+      "state_marker_proved": true,
+      "peak_rss_samples": 14,
+      "base_ref_prototype": true,
+      "base_reference_installed": true
+    },
+    {
+      "root_index": 10,
+      "repetition": 1,
+      "position": 4,
+      "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/root-10",
+      "semantic": {
+        "bind_to_ready_s": 1.338903991971165
+      },
+      "cpu_seconds": 2.5399999999999636,
+      "physical_bytes_written": 4550656,
+      "rss_bytes": 5309825024,
+      "model_calls": 0,
+      "query_embedding_observations": 1,
+      "counter_delta": {
+        "source_hashes": 19941,
+        "source_hash_bytes": 266244711,
+        "content_reads": 21538,
+        "content_read_bytes": 319923990,
+        "full_walks": 5,
+        "applicability_walks": 1,
+        "logical_aggregates": 0,
+        "own_generation_folds": 0
+      },
+      "ready_reply": {
+        "success": true,
+        "complete": true,
+        "semantic_status": "ready",
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "ready",
+            "reason": null
+          }
+        }
+      },
+      "state_marker_proved": true,
+      "peak_rss_samples": 14,
+      "base_ref_prototype": true,
+      "base_reference_installed": true
+    },
+    {
+      "root_index": 11,
+      "repetition": 2,
+      "position": 0,
+      "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/root-11",
+      "semantic": {
+        "bind_to_ready_s": 1.4235850959084928
+      },
+      "cpu_seconds": 2.5900000000001455,
+      "physical_bytes_written": 4546560,
+      "rss_bytes": 5671096320,
+      "model_calls": 0,
+      "query_embedding_observations": 1,
+      "counter_delta": {
+        "source_hashes": 19941,
+        "source_hash_bytes": 266244711,
+        "content_reads": 21538,
+        "content_read_bytes": 319923990,
+        "full_walks": 5,
+        "applicability_walks": 1,
+        "logical_aggregates": 0,
+        "own_generation_folds": 0
+      },
+      "ready_reply": {
+        "success": true,
+        "complete": true,
+        "semantic_status": "ready",
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "ready",
+            "reason": null
+          }
+        }
+      },
+      "state_marker_proved": true,
+      "peak_rss_samples": 15,
+      "base_ref_prototype": true,
+      "base_reference_installed": true
+    },
+    {
+      "root_index": 12,
+      "repetition": 2,
+      "position": 1,
+      "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/root-12",
+      "semantic": {
+        "bind_to_ready_s": 1.2663209540769458
+      },
+      "cpu_seconds": 2.5100000000002183,
+      "physical_bytes_written": 4554752,
+      "rss_bytes": 5973139456,
+      "model_calls": 0,
+      "query_embedding_observations": 1,
+      "counter_delta": {
+        "source_hashes": 19949,
+        "source_hash_bytes": 266248950,
+        "content_reads": 21538,
+        "content_read_bytes": 319923990,
+        "full_walks": 5,
+        "applicability_walks": 1,
+        "logical_aggregates": 0,
+        "own_generation_folds": 0
+      },
+      "ready_reply": {
+        "success": true,
+        "complete": true,
+        "semantic_status": "ready",
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "ready",
+            "reason": null
+          }
+        }
+      },
+      "state_marker_proved": true,
+      "peak_rss_samples": 13,
+      "base_ref_prototype": true,
+      "base_reference_installed": true
+    },
+    {
+      "root_index": 13,
+      "repetition": 2,
+      "position": 2,
+      "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/root-13",
+      "semantic": {
+        "bind_to_ready_s": 2.90421099611558
+      },
+      "cpu_seconds": 2.5299999999997453,
+      "physical_bytes_written": 4562944,
+      "rss_bytes": 12002934784,
+      "model_calls": 0,
+      "query_embedding_observations": 1,
+      "counter_delta": {
+        "source_hashes": 19957,
+        "source_hash_bytes": 266253189,
+        "content_reads": 21538,
+        "content_read_bytes": 319923990,
+        "full_walks": 5,
+        "applicability_walks": 1,
+        "logical_aggregates": 0,
+        "own_generation_folds": 0
+      },
+      "ready_reply": {
+        "success": true,
+        "complete": true,
+        "semantic_status": "ready",
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "ready",
+            "reason": null
+          }
+        }
+      },
+      "state_marker_proved": true,
+      "peak_rss_samples": 29,
+      "base_ref_prototype": true,
+      "base_reference_installed": true
+    },
+    {
+      "root_index": 14,
+      "repetition": 2,
+      "position": 3,
+      "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/root-14",
+      "semantic": {
+        "bind_to_ready_s": 1.3855332098901272
+      },
+      "cpu_seconds": 2.550000000000182,
+      "physical_bytes_written": 4554752,
+      "rss_bytes": 6604333056,
+      "model_calls": 0,
+      "query_embedding_observations": 1,
+      "counter_delta": {
+        "source_hashes": 19949,
+        "source_hash_bytes": 266248950,
+        "content_reads": 21538,
+        "content_read_bytes": 319923990,
+        "full_walks": 5,
+        "applicability_walks": 1,
+        "logical_aggregates": 0,
+        "own_generation_folds": 0
+      },
+      "ready_reply": {
+        "success": true,
+        "complete": true,
+        "semantic_status": "ready",
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "ready",
+            "reason": null
+          }
+        }
+      },
+      "state_marker_proved": true,
+      "peak_rss_samples": 14,
+      "base_ref_prototype": true,
+      "base_reference_installed": true
+    },
+    {
+      "root_index": 15,
+      "repetition": 2,
+      "position": 4,
+      "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/root-15",
+      "semantic": {
+        "bind_to_ready_s": 1.637600971153006
+      },
+      "cpu_seconds": 2.7799999999997453,
+      "physical_bytes_written": 4558848,
+      "rss_bytes": 6940602368,
+      "model_calls": 0,
+      "query_embedding_observations": 1,
+      "counter_delta": {
+        "source_hashes": 19949,
+        "source_hash_bytes": 266248950,
+        "content_reads": 21538,
+        "content_read_bytes": 319923990,
+        "full_walks": 6,
+        "applicability_walks": 1,
+        "logical_aggregates": 0,
+        "own_generation_folds": 0
+      },
+      "ready_reply": {
+        "success": true,
+        "complete": true,
+        "semantic_status": "ready",
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "ready",
+            "reason": null
+          }
+        }
+      },
+      "state_marker_proved": true,
+      "peak_rss_samples": 17,
+      "base_ref_prototype": true,
+      "base_reference_installed": true
+    }
+  ],
+  "method": "One separately charged fresh-store base_preparation, retained while 15 distinct fresh physical workers bind sequentially as five positions times three repetitions; no base wall/CPU/writes/model calls included in worker deltas. Same pinned real model, corpus and trigram-on configuration in both arms. rss_bytes is the maximum process-tree RSS sampled every 100ms during each worker interval. Model calls count indexing calls from real fill reports; query embedding observations are recorded separately. No overlapping root intervals are summed.",
+  "query": "function probe_entry in views_perf_probe.rs",
+  "base_budget_s": 1800,
+  "worker_budget_s": 120,
+  "request_budget_s": 30,
+  "polling_s": {
+    "base": 60,
+    "worker": 0.05
+  },
+  "base_readiness": "Public semantic witness plus a settled base fill report; the fill report establishes base construction is complete, never substitutes for public readiness.",
+  "parity": "18 exact real-model top-k comparisons on the same worker passed before acquisition, including a pre-bind edit; strict fallback for changed content.",
+  "base_preparation": {
+    "root_index": 0,
+    "repetition": null,
+    "position": null,
+    "root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/6d75dd56448a4a9c/2be5fae243ecd1a69e8a0e26ef5da711b9e2a4b8e31fc3ea5735634ccc2a602f/bg_735689e06642cc1b/target/slice-4a-g1-prototype-trigram/repo",
+    "semantic": {
+      "bind_to_ready_s": 969.324199117953
+    },
+    "cpu_seconds": 5948.56,
+    "physical_bytes_written": 10438791168,
+    "rss_bytes": 1888841728,
+    "model_calls": 1082,
+    "query_embedding_observations": 1,
+    "counter_delta": {
+      "source_hashes": 28737,
+      "source_hash_bytes": 453799554,
+      "content_reads": 23757,
+      "content_read_bytes": 305080264,
+      "full_walks": 20,
+      "applicability_walks": 1,
+      "logical_aggregates": 1,
+      "own_generation_folds": 2
+    },
+    "ready_reply": {
+      "success": true,
+      "complete": true,
+      "semantic_status": "ready",
+      "lanes": {
+        "trigram": {
+          "status": "ready",
+          "reason": null
+        },
+        "semantic": {
+          "status": "ready",
+          "reason": null
+        }
+      }
+    },
+    "state_marker_proved": true,
+    "peak_rss_samples": 0,
+    "base_ref_prototype": true,
+    "base_reference_installed": false
+  },
+  "medians": {
+    "cpu_seconds": 2.5900000000001455,
+    "physical_bytes_written": 4554752,
+    "rss_bytes": 5009653760,
+    "model_calls": 0,
+    "semantic.bind_to_ready_s": 1.4082343271002173,
+    "metrics.views_work.source_hashes": 19941,
+    "metrics.views_work.own_generation_folds": 0
+  },
+  "sample_grid": {
+    "fresh_positions": 5,
+    "repetitions": 3,
+    "distinct_physical_workers": 15,
+    "aggregation": "median of the 15 observed fresh-worker intervals"
+  },
+  "comparison": {
+    "baseline_receipt": "slice-4a-linux-x86_64-baseline.json",
+    "median_change_percent": {
+      "cpu_seconds": -28.453038674026978,
+      "physical_bytes_written": -38.63134657836645,
+      "rss_bytes": 7.619301538361367,
+      "model_calls": 0,
+      "semantic.bind_to_ready_s": -21.553279581047224,
+      "metrics.views_work.source_hashes": -17.863909712496906,
+      "metrics.views_work.own_generation_folds": -100.0
+    },
+    "hash_plus_fold_calls": {
+      "baseline": 24279,
+      "prototype": 19941,
+      "drop_percent": 17.86729272210552
+    },
+    "checks": {
+      "bind_time_improves_at_least_30_percent": false,
+      "hash_plus_fold_calls_drop_at_least_50_percent": false,
+      "other_metrics_regress_at_most_5_percent": false
+    },
+    "verdict": "adjust"
+  },
+  "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28); Python 3.14.4"
+}

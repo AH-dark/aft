@@ -27,17 +27,103 @@ use crate::semantic_index::SemanticIndex;
 
 use super::contracts::{PlaneAdapter, PlaneLoader, ViewAccess};
 use super::first_load::{
-    CheckoutDriver, CompositePlane, ConfiguredMembershipWalker, InstalledDriver, SiblingLoader,
+    CheckoutDriver, CompositePlane, ConfiguredMembershipWalker, FirstLoadDriver, InstalledDriver,
+    MembershipWalker, SiblingLoader,
 };
 use super::intent::{WriteIntent, WriteIntentListener, WritePhase};
 use super::manifest_v2::Producers;
 use super::registry::{FamilyRegistry, ViewRegistration};
 use super::semantic::{FillBudget, FillReport, SemanticPlane, SemanticProducer, SemanticQuery};
-use super::snapshot::{DiskState, Snapshot};
+use super::snapshot::{DiskState, LiveDelta, OpenGeneration, Snapshot};
 
 /// Producer written into the manifest header for the trigram and callgraph
 /// planes, which this semantic-only runtime does not register.
 pub const UNREGISTERED_PRODUCER: &str = "unregistered";
+
+const BASE_REF_ENV: &str = "AFT_VIEWS_BASE_REF_PROTOTYPE";
+
+fn base_ref_selected(storage: &Path) -> bool {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let Some(value) = std::env::var_os(BASE_REF_ENV) else {
+        return false;
+    };
+    if value == "1" && storage.join("views-harness.marker").is_file() {
+        return true;
+    }
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        crate::slog_warn!("{BASE_REF_ENV} ignored: requires value 1 and views-harness.marker in the effective storage root");
+    }
+    false
+}
+
+/// An Arc is the prototype's only acquisition pin. No reference, pin or read
+/// marker is written for an adopter; a restart must use the strict loader.
+struct PrototypeBase {
+    storage: PathBuf,
+    family: String,
+    producer: String,
+    generation: Arc<OpenGeneration>,
+}
+
+impl PrototypeBase {
+    fn compatible(&self, storage: &Path, family: &str, producer: &str) -> bool {
+        self.storage == storage && self.family == family && self.producer == producer
+    }
+}
+
+fn prototype_bases() -> &'static Mutex<Vec<Weak<PrototypeBase>>> {
+    static BASES: OnceLock<Mutex<Vec<Weak<PrototypeBase>>>> = OnceLock::new();
+    BASES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn base_ref_ready(snapshot: &Snapshot) -> bool {
+    use super::manifest_v2::EntryV2;
+    use super::readiness::PlaneState;
+    snapshot.generation().name() != "empty"
+        && snapshot.live_entries().next().is_none()
+        && snapshot.pending_intent().next().is_none()
+        && snapshot
+            .generation()
+            .manifest()
+            .entries()
+            .all(|(path, entry)| {
+                matches!(entry, EntryV2::Regular { planes, .. }
+                if !super::semantic::applies_to(path)
+                    || matches!(planes.semantic, Some(PlaneState::Ready { .. })))
+            })
+}
+
+fn base_ref_stable(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (
+            before.dev(),
+            before.ino(),
+            before.len(),
+            before.mode(),
+            before.mtime(),
+            before.mtime_nsec(),
+            before.ctime(),
+            before.ctime_nsec(),
+        ) == (
+            after.dev(),
+            after.ino(),
+            after.len(),
+            after.mode(),
+            after.mtime(),
+            after.mtime_nsec(),
+            after.ctime(),
+            after.ctime_nsec(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        // Change-sensitive file identity is not implemented on non-Unix targets.
+        let _ = (before, after);
+        false
+    }
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -87,6 +173,8 @@ pub struct CheckoutSemantic {
     driver: Arc<CheckoutDriver>,
     loader: SiblingLoader,
     plane: Arc<SemanticPlane>,
+    base_ref_prototype: bool,
+    base_ref_pin: Mutex<Option<Arc<PrototypeBase>>>,
     /// Serializes reload, fill and fold, so two refreshes never interleave
     /// their publications.
     refresh: Mutex<()>,
@@ -116,6 +204,7 @@ impl CheckoutSemantic {
         producer: SemanticProducer,
         wake: Weak<CheckoutSemanticSlot>,
     ) -> Result<Self, String> {
+        let base_ref_prototype = base_ref_selected(storage);
         let plane = shared_plane(storage, producer);
         let registry = FamilyRegistry::open(storage, family).map_err(|error| error.to_string())?;
         let owner = registry
@@ -145,6 +234,13 @@ impl CheckoutSemantic {
         super::intent::register_listener(&listener);
         let access = ViewAccess::Owner(owner.clone());
         hold_view(plane.as_ref(), &access);
+        if base_ref_prototype {
+            super::io::BASE_REF_PROTOTYPE_USERS.fetch_add(1, Ordering::Relaxed);
+            crate::slog_info!(
+                "{BASE_REF_ENV}=1: harness-only in-process semantic base references active root={}",
+                root.display()
+            );
+        }
         Ok(Self {
             root: root.to_path_buf(),
             access,
@@ -152,6 +248,8 @@ impl CheckoutSemantic {
             driver,
             loader,
             plane,
+            base_ref_prototype,
+            base_ref_pin: Mutex::new(None),
             refresh: Mutex::new(()),
             unfolded: AtomicBool::new(false),
             refresh_attempts: AtomicUsize::new(0),
@@ -181,13 +279,139 @@ impl CheckoutSemantic {
         self.driver.installed_snapshot()
     }
 
-    /// Strictly reconciles the checkout, publishes its own generation (which
-    /// folds every installed fill) and installs it.
+    /// Strictly reconciles, publishes and installs the checkout's own generation.
+    /// The harness-only prototype may instead install a byte-verified in-process
+    /// base; any unsupported input uses the strict loader.
     pub fn load(&self) -> Result<Snapshot, String> {
+        if let Some(snapshot) = self.try_base_reference() {
+            return Ok(snapshot);
+        }
         self.loader
             .load(&self.access)
             .map(|outcome| outcome.snapshot)
             .map_err(|error| error.to_string())
+    }
+
+    fn remember_base(&self) {
+        if !self.base_ref_prototype {
+            return;
+        }
+        let snapshot = self.installed();
+        if !base_ref_ready(&snapshot) || snapshot.generation().name().starts_with("base-ref-") {
+            return;
+        }
+        let name = format!(
+            "base-ref-{}-{}",
+            self.owner.scope(),
+            snapshot.generation().name()
+        );
+        if lock(&self.base_ref_pin)
+            .as_ref()
+            .is_some_and(|base| base.generation.name() == name)
+        {
+            return;
+        }
+        let mut manifest = snapshot.generation().manifest().clone();
+        // A worktree's .git file names its private administrative directory;
+        // unlike source or ignore files, those bytes never enter semantic keys.
+        manifest
+            .set(
+                super::RelPath::from_os_path(Path::new(".git")).unwrap(),
+                None,
+            )
+            .expect("removing an entry preserves manifest validity");
+        let base = Arc::new(PrototypeBase {
+            storage: self.owner.registry().storage().to_path_buf(),
+            family: self.owner.family().to_owned(),
+            producer: self.plane.semantic_producer().id(),
+            generation: Arc::new(OpenGeneration::new(name, manifest, None)),
+        });
+        let mut bases = lock(prototype_bases());
+        bases.retain(|base| base.strong_count() > 0);
+        bases.push(Arc::downgrade(&base));
+        *lock(&self.base_ref_pin) = Some(base);
+    }
+
+    fn try_base_reference(&self) -> Option<Snapshot> {
+        if !self.base_ref_prototype || self.installed().generation().name() != "empty" {
+            return None;
+        }
+        let producer = self.plane.semantic_producer().id();
+        let base = lock(prototype_bases())
+            .iter()
+            .rev()
+            .filter_map(Weak::upgrade)
+            .find(|base| {
+                base.compatible(
+                    self.owner.registry().storage(),
+                    self.owner.family(),
+                    &producer,
+                )
+            })?;
+        let snapshot = LiveDelta::new(Arc::clone(&base.generation)).snapshot();
+        if !base_ref_ready(&snapshot) {
+            return None;
+        }
+        let revision = self.driver.revision(&self.access);
+        if super::intent::active(&self.root) {
+            return None;
+        }
+        // No Git-derived or cached stat evidence proves content equality here.
+        // Hash each member with before/after metadata checks for read stability,
+        // but do not derive attachments or fold inherited-ready entries. Any
+        // delta or unsupported observation sends the whole bind strict.
+        let files = ConfiguredMembershipWalker.files(&self.root).ok()?;
+        let manifest = base.generation.manifest();
+        let mut members = std::collections::BTreeSet::new();
+        for absolute in files {
+            let path =
+                super::RelPath::from_os_path(absolute.strip_prefix(&self.root).ok()?).ok()?;
+            if path.as_bytes() == b".git" {
+                continue;
+            }
+            let before = std::fs::symlink_metadata(&absolute).ok()?;
+            if !before.is_file() {
+                crate::slog_info!("semantic base reference strict fallback root={} path={path:?} reason=non_regular", self.root.display());
+                return None;
+            }
+            let bytes = match super::assembly::read_working_tree_file(&absolute) {
+                Ok(Some(bytes)) => bytes,
+                _ => {
+                    crate::slog_info!("semantic base reference strict fallback root={} path={path:?} reason=source_read", self.root.display());
+                    return None;
+                }
+            };
+            let after = std::fs::symlink_metadata(&absolute).ok()?;
+            if !base_ref_stable(&before, &after) {
+                return None;
+            }
+            if DiskState::of_bytes(&bytes) != base.generation.disk_state(&path) {
+                crate::slog_info!(
+                    "semantic base reference strict fallback root={} path={path:?} reason=content",
+                    self.root.display()
+                );
+                return None;
+            }
+            members.insert(path);
+        }
+        if members.len() != manifest.entries().count() || super::intent::active(&self.root) {
+            crate::slog_info!("semantic base reference strict fallback root={} reason=membership members={} base={}", self.root.display(), members.len(), manifest.entries().count());
+            return None;
+        }
+        if let Err(error) = self.driver.install(&self.access, &snapshot, revision) {
+            crate::slog_info!(
+                "semantic base reference strict fallback root={} reason=install error={error}",
+                self.root.display()
+            );
+            return None;
+        }
+        *lock(&self.base_ref_pin) = Some(base);
+        crate::slog_info!(
+            "semantic base reference installed root={} generation={}",
+            self.root.display(),
+            snapshot.generation().name()
+        );
+        Some(snapshot)
     }
 
     /// Brings the checkout's vectors up to date within `budget`.
@@ -239,6 +463,7 @@ impl CheckoutSemantic {
         crate::cold_build_limiter::progress::stage("preparing");
         let reconcile_started = Instant::now();
         if needs_reload(&snapshot) {
+            lock(&self.base_ref_pin).take();
             snapshot = if snapshot.generation().name() == "empty" {
                 self.load().map_err(RefreshError::classify)?
             } else {
@@ -248,6 +473,18 @@ impl CheckoutSemantic {
             };
         }
         let reconcile = reconcile_started.elapsed();
+        if lock(&self.base_ref_pin)
+            .as_ref()
+            .is_some_and(|base| Arc::ptr_eq(&base.generation, snapshot.generation()))
+        {
+            // Even an empty ordinary fill creates a durable LivePin. Inherited
+            // ready entries need no fill; their prototype pin must stay an Arc.
+            let mut report = FillReport::default();
+            report.timing.mutex_wait = mutex_wait;
+            report.timing.reconcile = reconcile;
+            report.timing.queue_setup = queue_setup;
+            return Ok(report);
+        }
         // The size probe runs on the reconciled snapshot, so it counts the
         // work the edits actually left. It also runs under the process-wide
         // preparation limit.
@@ -296,6 +533,7 @@ impl CheckoutSemantic {
             }
             report.timing.fold = fold_started.elapsed();
         }
+        self.remember_base();
         Ok(report)
     }
 
@@ -407,6 +645,9 @@ impl CheckoutSemantic {
 
 impl Drop for CheckoutSemantic {
     fn drop(&mut self) {
+        if self.base_ref_prototype {
+            super::io::BASE_REF_PROTOTYPE_USERS.fetch_sub(1, Ordering::Relaxed);
+        }
         // A lane restarted with the same producer shares this plane and view
         // (same family and scope). Only the last checkout runtime of a view
         // releases its state, or a superseded worker exiting would wipe the

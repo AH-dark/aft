@@ -25,6 +25,7 @@ COUNTERS = (
     "full_walks", "applicability_walks", "logical_aggregates", "own_generation_folds",
 )
 PROBE = "views_perf_probe.rs"
+SEMANTIC_QUERY = "function probe_entry in views_perf_probe.rs"
 EDIT_STATES = ("atomic_edit", "revert", "tool_write", "tool_revert", "branch_switch", "branch_return")
 
 
@@ -53,6 +54,18 @@ def require_counters(counters):
         if type(counters.get(name)) is not int or counters[name] < 0:
             raise MeasurementError(f"missing/invalid production counter {name}")
     return counters
+
+
+def require_base_ref_prototype(counters, *, views=True, semantic=True):
+    # Each arm starts a fresh daemon; the opt-in selects the base-ref prototype
+    # only when both views and semantic search are enabled.
+    expected = (os.environ.get("AFT_VIEWS_BASE_REF_PROTOTYPE") == "1"
+                and views and semantic)
+    active = counters.get("base_ref_prototype") is True
+    if expected and not active:
+        raise MeasurementError("prototype-on acquisition did not report metrics.views_work.base_ref_prototype: true")
+    if not expected and active:
+        raise MeasurementError("inactive arm unexpectedly reported metrics.views_work.base_ref_prototype: true")
 
 
 def counter_delta(before, after):
@@ -121,6 +134,7 @@ def lexical_witness(grep, glob, search, path, token):
 
 def semantic_witness(answer, path, token):
     return (answer.get("success") is True and answer.get("semantic_status") == "ready"
+            and answer.get("lanes", {}).get("semantic", {}).get("status") == "ready"
             and answer.get("complete") is True
             and any(Path(row.get("file", "")) == path and token in row.get("snippet", "")
                     for row in answer.get("results", [])))
@@ -222,7 +236,7 @@ class Broker:
         self.out = out
         self.buffer = b""
         self.stderr = (out / "broker.log").open("w")
-        env = {key: os.environ[key] for key in ("PATH", "TMPDIR", "LD_LIBRARY_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR") if key in os.environ}
+        env = {key: os.environ[key] for key in ("PATH", "TMPDIR", "LD_LIBRARY_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "AFT_VIEWS_BASE_REF_PROTOTYPE") if key in os.environ}
         env.update({"RUST_LOG": "info", "RUSTC_WRAPPER": "", "CARGO_BUILD_RUSTC_WRAPPER": ""})
         self.proc = subprocess.Popen([str(broker), str(binary), str(out), str(root)],
                                      env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr, start_new_session=True)
@@ -357,6 +371,7 @@ def provision(source, pin, out, count, config):
         roots.append(root)
     for directory in ("home/.config/cortexkit", "config/cortexkit", "home", "data", "cache", "storage"):
         (out / directory).mkdir(parents=True, exist_ok=True)
+    (out / "storage/views-harness.marker").write_text("isolated views performance subject\n")
     dump(out / "config/cortexkit/aft.jsonc", config)
     dump(out / "home/.config/cortexkit/aft.jsonc", config)
     inventory.update({"base_workload_commit": base, "changed_workload_commit": changed,
@@ -472,7 +487,7 @@ class Acquisition:
                     and token in json.dumps(inspect.get("details", {})))
             latest = checks
             if self.semantic:
-                semantic_answer = self.tool(channel, "search", {"query": "function probe returning the number twenty nine", "includeTests": True, "topK": 20}, state)
+                semantic_answer = self.tool(channel, "search", {"query": SEMANTIC_QUERY, "includeTests": True, "topK": 20}, state)
                 semantic_status = semantic_answer.get("semantic_status")
                 observe("semantic", semantic_witness(semantic_answer, self.roots[channel] / PROBE, token))
             else:
@@ -640,6 +655,8 @@ def run_arm(args, corpus, count, views, out):
         # Include delayed checkpoint/writeback work in a separate, explicit tail.
         acquisition.idle(max(2, args.quiet_minutes * 60), "quiet")
         final = acquisition.sample("final")
+        require_base_ref_prototype(final["health"]["metrics"]["views_work"],
+                                   views=views, semantic=args.semantic)
         result["final"] = final
         result["storage"] = storage_sample(subject / "storage")
         result["counter_delta"] = counter_delta(initial["health"]["metrics"]["views_work"], final["health"]["metrics"]["views_work"])
