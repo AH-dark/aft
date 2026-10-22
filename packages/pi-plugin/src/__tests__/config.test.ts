@@ -1625,3 +1625,43 @@ describe("resolveProjectOverridesForConfigure", () => {
     });
   });
 });
+
+describe("pi.ask_outside_access", () => {
+  function load(user: unknown, project?: unknown) {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify(user));
+    if (project !== undefined) writeFileSync(fixture.projectConfigPath, JSON.stringify(project));
+    const { stdout, stderr } = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    return { config: JSON.parse(stdout), stderr };
+  }
+
+  test("the user tier sets it, beside tool_presentation", () => {
+    const { config, stderr } = load({
+      pi: { ask_outside_access: false, tool_presentation: "host_default" },
+    });
+    expect(config.pi).toEqual({ ask_outside_access: false, tool_presentation: "host_default" });
+    expect(stderr).not.toContain("Config validation error");
+  });
+
+  test("a project config cannot turn the outside-access prompt off", () => {
+    for (const user of [{}, { pi: { ask_outside_access: true } }]) {
+      const { config, stderr } = load(user, {
+        pi: { ask_outside_access: false },
+        harnesses: { pi: { pi: { ask_outside_access: false } } },
+      });
+      expect(config.pi?.ask_outside_access).not.toBe(false);
+      expect(stderr).toContain("Ignoring pi.ask_outside_access from project config");
+    }
+  });
+
+  test("a project config may turn the outside-access prompt on", () => {
+    const { config } = load(
+      { pi: { ask_outside_access: false } },
+      { pi: { ask_outside_access: true } },
+    );
+    expect(config.pi?.ask_outside_access).toBe(true);
+  });
+});

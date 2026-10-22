@@ -7,7 +7,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { bindToolRegistrationFunnel } from "../tool-registration.js";
-import { callBridge, callToolCallForSession, withOutsidePermissions } from "../tools/_shared.js";
+import {
+  callBridge,
+  callToolCallForSession,
+  withOutsidePermissionOperation,
+  withOutsidePermissions,
+} from "../tools/_shared.js";
 import type { PluginContext } from "../types.js";
 
 const ask = (id: string) => ({
@@ -139,7 +144,7 @@ describe("engine outside-access asks", () => {
     expect(prompt).toHaveBeenCalledTimes(1);
   });
 
-  test("a refusal or missing UI never sends approved IDs", async () => {
+  test("a refusal never sends approved IDs", async () => {
     const send = mock(async () => ask("no"));
     await expect(
       withOutsidePermissions(
@@ -149,26 +154,37 @@ describe("engine outside-access asks", () => {
       ),
     ).rejects.toMatchObject({ code: "permission_denied" });
     expect(send).toHaveBeenCalledTimes(1);
-    await expect(withOutsidePermissions({}, undefined, send)).rejects.toMatchObject({
-      code: "permission_denied",
-    });
-    expect(send).toHaveBeenCalledTimes(2);
   });
 
-  test("a session without Pi's own screen is denied at once, without a prompt", async () => {
-    for (const mode of ["rpc", "json", "print"]) {
-      const send = mock(async () => ask(mode));
-      const confirm = mock(async () => true);
-      const extCtx = { ...context(confirm), mode } as unknown as ExtensionContext;
-      const error = await withOutsidePermissions({}, extCtx, send).catch((e: unknown) => e);
-      expect(error).toMatchObject({ code: "permission_denied" });
-      const message = (error as Error).message;
-      expect(message).toContain("none was possible");
-      // The denial names no path, so it cannot tell the agent what exists.
-      expect(message).not.toContain("/outside/");
-      expect(confirm).not.toHaveBeenCalled();
-      expect(send).toHaveBeenCalledTimes(1);
+  test("a session without Pi's own screen proceeds without a prompt", async () => {
+    // Print, JSON and RPC sessions, and a call with no extension context,
+    // get no AFT prompt (only Pi's own terminal UI is asked): outside access
+    // is allowed as it was before AFT asked, and nothing waits on an RPC
+    // client's answer.
+    const confirm = mock(async () => true);
+    const contexts: Array<[string, ExtensionContext | undefined]> = [
+      ...["rpc", "json", "print"].map((mode): [string, ExtensionContext] => [
+        mode,
+        { ...context(confirm), mode } as unknown as ExtensionContext,
+      ]),
+      ["no ui", { hasUI: false, ui: { confirm } } as unknown as ExtensionContext],
+      ["no context", undefined],
+    ];
+    for (const [label, extCtx] of contexts) {
+      const sends: Array<Record<string, unknown>> = [];
+      const send = async (args: Record<string, unknown>) => {
+        sends.push(structuredClone(args));
+        return sends.length === 1 ? ask(label) : { success: true, text: "outside file body" };
+      };
+      const result = await withOutsidePermissionOperation(
+        () => withOutsidePermissions({}, extCtx, send),
+        undefined,
+        { harness: "pi", askOnPi: true },
+      );
+      expect(result.text).toBe("outside file body");
+      expect(sends[1]?.permissions_granted).toEqual([`outside:${label}`]);
     }
+    expect(confirm).not.toHaveBeenCalled();
   });
 
   test("Pi's terminal UI still prompts for outside access", async () => {
@@ -373,5 +389,134 @@ describe("outside-access approvals that expire", () => {
     });
     expect(confirm).toHaveBeenCalledTimes(3);
     expect(engine.sends).toHaveLength(4);
+  });
+});
+
+/**
+ * Register one tool through the real registration funnel with `config`, and
+ * run it once in `extCtx` against an engine that asks for one outside path
+ * and then answers with the file's body.
+ */
+async function runRegistered(
+  config: Record<string, unknown>,
+  extCtx: ExtensionContext,
+  harness: "pi" | "omp" = "pi",
+  engineAnswer: Record<string, unknown> = { success: true, text: "outside file body" },
+) {
+  const sends: Array<Record<string, unknown>> = [];
+  const bridge = {
+    toolCall: async (_session: unknown, _name: string, args: Record<string, unknown>) => {
+      sends.push(structuredClone(args));
+      return sends.length === 1 && engineAnswer.success !== false ? ask("knob") : engineAnswer;
+    },
+  } as unknown as AftProjectTransport;
+  let registered: ToolDefinition | undefined;
+  const pi = bindToolRegistrationFunnel(
+    {
+      registerTool: (tool: ToolDefinition) => {
+        registered = tool;
+      },
+    } as unknown as ExtensionAPI,
+    { config } as unknown as PluginContext,
+    harness,
+  );
+  pi.registerTool({
+    name: "test_read",
+    label: "read",
+    description: "fixture",
+    parameters: Type.Object({}),
+    execute: async (_id, _params, _signal, _update, ctx) => {
+      const result = await callToolCallForSession(
+        bridge,
+        "read",
+        { path: "/outside/knob" },
+        "captured",
+        ctx,
+      );
+      if (result.success === false)
+        throw Object.assign(new Error(String(result.message)), { code: result.code });
+      return { content: [{ type: "text" as const, text: result.text }], details: {} };
+    },
+  });
+  if (!registered) throw new Error("tool not registered");
+  const outcome = await registered.execute(
+    "call",
+    {},
+    new AbortController().signal,
+    undefined,
+    extCtx,
+  );
+  return { text: (outcome.content[0] as { text: string }).text, sends };
+}
+
+const tui = (confirm: (...args: unknown[]) => Promise<boolean>) =>
+  ({ ...context(confirm), mode: "tui" }) as unknown as ExtensionContext;
+
+describe("pi.ask_outside_access", () => {
+  test("Pi's terminal UI asks when the setting is on, and by default", async () => {
+    for (const config of [{ pi: { ask_outside_access: true } }, {}]) {
+      const confirm = mock(async () => true);
+      const { text, sends } = await runRegistered(config, tui(confirm));
+      expect(text).toBe("outside file body");
+      expect(confirm).toHaveBeenCalledTimes(1);
+      expect(sends[1]?.permissions_granted).toEqual(["outside:knob"]);
+    }
+  });
+
+  test("with the setting off Pi's terminal UI does not ask and the file is read", async () => {
+    const confirm = mock(async () => false);
+    const { text, sends } = await runRegistered(
+      { pi: { ask_outside_access: false } },
+      tui(confirm),
+    );
+    expect(text).toBe("outside file body");
+    expect(confirm).not.toHaveBeenCalled();
+    expect(sends[1]?.permissions_granted).toEqual(["outside:knob"]);
+  });
+
+  test("a print or RPC session gets the file without asking, setting on or off", async () => {
+    for (const ask_outside_access of [true, false]) {
+      for (const mode of ["print", "rpc"]) {
+        const confirm = mock(async () => false);
+        const extCtx = { ...context(confirm), mode } as unknown as ExtensionContext;
+        const { text } = await runRegistered({ pi: { ask_outside_access } }, extCtx);
+        expect(text).toBe("outside file body");
+        expect(confirm).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  test("an engine refusal (floor or restrict_to_project_root) is never retried or asked about", async () => {
+    // Floors and a configured restriction are engine denials, not asks: no
+    // mode turns them into an approval.
+    const refusal = { success: false, code: "path_outside_root", message: "refused" };
+    const modes: ExtensionContext[] = [
+      tui(mock(async () => true)),
+      { ...context(mock(async () => true)), mode: "print" } as unknown as ExtensionContext,
+      { ...context(mock(async () => true)), mode: "rpc" } as unknown as ExtensionContext,
+    ];
+    for (const harness of ["pi", "omp"] as const) {
+      for (const ask_outside_access of [true, false]) {
+        for (const extCtx of modes) {
+          const error = await runRegistered(
+            { pi: { ask_outside_access } },
+            extCtx,
+            harness,
+            refusal,
+          ).catch((e: unknown) => e);
+          expect(error).toMatchObject({ code: "path_outside_root" });
+          expect((extCtx.ui.confirm as ReturnType<typeof mock>).mock.calls).toHaveLength(0);
+        }
+      }
+    }
+  });
+
+  test("on OMP AFT never asks: OMP's approval mode decides through the tools' tiers", async () => {
+    for (const ask_outside_access of [true, false]) {
+      const confirm = mock(async () => false);
+      const { text } = await runRegistered({ pi: { ask_outside_access } }, tui(confirm), "omp");
+      expect(text).toBe("outside file body");
+      expect(confirm).not.toHaveBeenCalled();
+    }
   });
 });

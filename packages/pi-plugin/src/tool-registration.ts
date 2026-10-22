@@ -7,7 +7,9 @@ import { resolveBashConfig, resolvedDisabledTools } from "./config.js";
 import { detectPiHarness, type PiHarness } from "./harness.js";
 import { withOmpInternalUrls } from "./omp-internal-urls.js";
 import {
+  outsideAccessPolicyFor,
   prepareToolDefinitionForRegistration,
+  recordSessionCwd,
   withOutsidePermissionOperation,
 } from "./tools/_shared.js";
 import { registerAstTools } from "./tools/ast.js";
@@ -241,9 +243,12 @@ export function bindToolRegistrationFunnel(
     originalRegisterTool({
       ...prepared,
       execute(toolCallId, params, signal, onUpdate, context) {
+        recordSessionCwd((context as { cwd?: unknown } | undefined)?.cwd);
         return withOutsidePermissionOperation(
           () => prepared.execute(toolCallId, params, signal, onUpdate, context),
           signal,
+          // Read per call: a live config reload replaces `ctx.config`.
+          outsideAccessPolicyFor(ctx, effectiveHarness),
         );
       },
     } as ToolDefinition<TParams, TDetails, TState>);

@@ -861,6 +861,12 @@ function buildSchema(): Record<string, unknown> {
             description:
               "Pi and OMP tool presentation mode. 'top_level' registers tools with loadMode: essential on OMP so they appear at top level (default). 'host_default' uses host default loadMode (mounting tools under xd:// on OMP). User and project tiers are accepted with project precedence.",
           },
+          ask_outside_access: {
+            type: "boolean",
+            default: true,
+            description:
+              "Plain Pi only: ask before an AFT tool reaches a path outside the project. On (default), Pi's own terminal UI asks; print, JSON and RPC sessions have no screen to ask on and allow it without asking. Off, outside access is allowed without asking. Credentials, AFT's data folder, sandbox.read_deny and restrict_to_project_root: true refuse either way. Does not apply on OMP, where OMP's approval mode (tools.approvalMode) decides through the tools' declared approval tiers. A project config may turn it on, never off.",
+          },
         },
         additionalProperties: false,
         description: "Pi and OMP harness-specific configuration.",

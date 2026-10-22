@@ -108,7 +108,7 @@ import {
   registerPiToolSurface,
   resolvePiToolSurface,
 } from "./tool-registration.js";
-import { resolveSessionId } from "./tools/_shared.js";
+import { recordSessionCwd, resolveSessionId } from "./tools/_shared.js";
 import { registerBashTool } from "./tools/bash.js";
 import type { PluginContext } from "./types.js";
 import { registerWorkflowHints } from "./workflow-hints.js";
@@ -949,6 +949,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     ) => void
   )("session_start", (_event, extCtx) => {
     const sessionID = extCtx ? resolveSessionId(extCtx as ExtensionContext) : undefined;
+    recordSessionCwd((extCtx as ExtensionContext | undefined)?.cwd);
     observeFreshSessionStart(
       pool,
       (extCtx as ExtensionContext | undefined)?.cwd ?? projectRoot,

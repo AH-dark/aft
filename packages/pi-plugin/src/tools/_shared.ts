@@ -33,6 +33,8 @@ import { forwardPendingBashWaitDetach } from "../bash-wait-detach.js";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import type { PiToolPresentation } from "../config.js";
 import type { PiHarness } from "../harness.js";
+import { detectPiHarness } from "../harness.js";
+import { type OmpToolTier, ompApprovalFor } from "../omp-approval.js";
 import { isPiWorkerSession } from "../session-kind.js";
 import type { PluginContext } from "../types.js";
 
@@ -135,12 +137,33 @@ export type PreparedToolDefinition<
   TState = unknown,
 > = ToolDefinition<TParams, TDetails, TState> & {
   loadMode?: "essential" | "discoverable";
+  /** OMP's capability tier for one call; see `omp-approval.ts`. */
+  approval?: (args: unknown) => OmpToolTier;
 };
+
+/** The working directory of the session that last ran an AFT tool or started. */
+let lastSessionCwd: string | undefined;
+
+/**
+ * Remember the session's project directory. OMP evaluates a tool's approval
+ * tier before the call runs and without its context, so the tier is judged
+ * against the most recent session directory, or the process directory before
+ * any session reported one.
+ */
+export function recordSessionCwd(cwd: unknown): void {
+  if (typeof cwd === "string" && cwd.length > 0) lastSessionCwd = cwd;
+}
+
+function sessionProjectRoot(): string | undefined {
+  return lastSessionCwd ?? process.cwd();
+}
 
 /**
  * Funnel helper that applies harness-specific adjustments to a ToolDefinition:
  * - On OMP: attaches `loadMode: "essential"` when presentation is "top_level",
- *   and folds `promptSnippet` and `promptGuidelines` into `description`.
+ *   folds `promptSnippet` and `promptGuidelines` into `description`, and
+ *   declares the tool's approval tier (`ompApprovalFor`).
+ *   Upstream Pi has no approval gate, so it gets no `approval` field.
  * - On Pi (or unknown): leaves definition fields untouched (Pi renders snippet
  *   and guidelines itself; unknown behaves as pi).
  */
@@ -164,10 +187,14 @@ export function prepareToolDefinitionForRegistration<
     tool.promptGuidelines,
   );
 
+  const prepare = tool.prepareArguments as ((args: unknown) => unknown) | undefined;
+  const approval = ompApprovalFor(tool.name, sessionProjectRoot, prepare);
+
   return {
     ...tool,
     ...(foldedDescription !== undefined ? { description: foldedDescription } : {}),
     ...(presentation === "top_level" ? { loadMode: "essential" } : {}),
+    ...(approval ? { approval } : {}),
   };
 }
 
@@ -222,19 +249,41 @@ export class BridgeError extends Error {
 }
 
 const hostPermissionGrants = new WeakMap<object, readonly string[]>();
-/** State private to one host `execute` call: preview continuations, and the
- * call's own cancellation signal. */
+
+/**
+ * How AFT answers the engine's outside-access asks for one call.
+ * - `harness`: on OMP, OMP's own approval mode decides through the tools'
+ *   declared tiers, so AFT never asks there.
+ * - `askOnPi`: the user's `pi.ask_outside_access` setting (default on).
+ */
+export interface OutsideAccessPolicy {
+  harness: PiHarness;
+  askOnPi: boolean;
+}
+
+/** State private to one host `execute` call: preview continuations, the
+ * call's own cancellation signal, and how outside-access asks are answered. */
 interface PermissionOperation {
   continuations: Map<string, string[]>;
   signal?: AbortSignal;
+  policy?: OutsideAccessPolicy;
 }
 const permissionOperations = new AsyncLocalStorage<PermissionOperation>();
 
 /** Run one host `execute` call. `signal` is the call's own cancellation
  * signal (the one Pi passes to `execute`); an outside-access prompt for the
- * call stops on it as well as on the extension context's signal. */
-export function withOutsidePermissionOperation<T>(run: () => T, signal?: AbortSignal): T {
-  return permissionOperations.run({ continuations: new Map(), signal }, run);
+ * call stops on it as well as on the extension context's signal. A nested
+ * call without its own `policy` keeps the enclosing call's. */
+export function withOutsidePermissionOperation<T>(
+  run: () => T,
+  signal?: AbortSignal,
+  policy?: OutsideAccessPolicy,
+): T {
+  const inherited = policy ?? permissionOperations.getStore()?.policy;
+  return permissionOperations.run(
+    { continuations: new Map(), signal, ...(inherited ? { policy: inherited } : {}) },
+    run,
+  );
 }
 
 /** Every signal that cancels this call: the extension context's and the
@@ -292,7 +341,47 @@ export function canPromptForOutsideAccess(
   return extCtx.mode === undefined || extCtx.mode === "tui";
 }
 
-/** The engine owns containment; Pi only presents its exact outside-path asks. */
+/**
+ * Whether AFT asks the user before an outside access, or approves the
+ * engine's ask itself. Approving itself is the behaviour from before AFT
+ * asked at all: outside access is allowed, and the engine's floors
+ * (credentials, AFT's data folder, `sandbox.read_deny`) and a configured
+ * `restrict_to_project_root` still refuse, because those are denials, never
+ * asks. AFT asks only on plain Pi, with `pi.ask_outside_access` on, in Pi's
+ * own terminal UI; print, JSON and RPC sessions are never asked, so nothing
+ * waits on an answer.
+ */
+export function promptsForOutsideAccess(
+  extCtx: ExtensionContext | undefined,
+  policy: OutsideAccessPolicy,
+): boolean {
+  if (policy.harness === "omp" || !policy.askOnPi) return false;
+  return extCtx !== undefined && canPromptForOutsideAccess(extCtx);
+}
+
+/** The policy for a call made outside a registered tool's `execute`. */
+function defaultOutsideAccessPolicy(): OutsideAccessPolicy {
+  return { harness: detectPiHarness(), askOnPi: true };
+}
+
+/** The outside-access policy `ctx`'s current config selects on `harness`. */
+export function outsideAccessPolicyFor(
+  ctx: PluginContext,
+  harness: PiHarness = detectPiHarness(),
+): OutsideAccessPolicy {
+  return { harness, askOnPi: ctx.config.pi?.ask_outside_access ?? true };
+}
+
+/** The policy of the registered tool call running now, if any. */
+export function currentOutsideAccessPolicy(): OutsideAccessPolicy | undefined {
+  return permissionOperations.getStore()?.policy;
+}
+
+/**
+ * The engine owns containment; Pi only answers its exact outside-path asks,
+ * by asking the user or, where `promptsForOutsideAccess` says no one is to be
+ * asked, by approving them itself.
+ */
 export async function withOutsidePermissions<T extends Record<string, unknown>>(
   args: Record<string, unknown>,
   extCtx: ExtensionContext | undefined,
@@ -303,7 +392,12 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
 ): Promise<T> {
   const { permissions_granted: _untrusted, ...clean } = args;
   const inherited = hostPermissionGrants.get(args) ?? [];
-  const continuations = permissionOperations.getStore()?.continuations;
+  const operationState = permissionOperations.getStore();
+  const continuations = operationState?.continuations;
+  const prompt = promptsForOutsideAccess(
+    extCtx,
+    operationState?.policy ?? defaultOutsideAccessPolicy(),
+  );
   const signals = cancellationSignals(extCtx);
   const key = JSON.stringify([sessionId, permissionOperation(operation, clean)]);
   let granted = [...(continuations?.get(key) ?? [])];
@@ -356,14 +450,6 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
       if (granted.length) continuations?.set(key, granted);
       return response;
     }
-    if (!extCtx || !canPromptForOutsideAccess(extCtx)) {
-      // Deny at once rather than wait for an answer nobody can give. The
-      // message names no path, so it says nothing about what exists there.
-      throw new BridgeError(
-        "Permission denied: outside access needs approval, but this Pi session has no screen to show a prompt on, so none was possible.",
-        "permission_denied",
-      );
-    }
     // The same operation on the same path is the same request. An ask that
     // names no path can only be told apart by its own grant ID.
     const askKey = (ask: (typeof asks)[number]) =>
@@ -390,15 +476,20 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
     }
     for (const ask of asks) {
       throwIfCancelled(signals);
-      const approved = await extCtx.ui.confirm(
-        "Allow outside access?",
-        `${ask.operation ?? "access"}: ${ask.path ?? ""}`,
-        { signal: signals.length > 1 ? AbortSignal.any(signals) : signals[0] },
-      );
-      // An answer that arrives after cancellation is ignored.
-      throwIfCancelled(signals);
-      if (!approved)
-        throw new BridgeError("Permission denied: outside access was denied.", "permission_denied");
+      if (prompt && extCtx) {
+        const approved = await extCtx.ui.confirm(
+          "Allow outside access?",
+          `${ask.operation ?? "access"}: ${ask.path ?? ""}`,
+          { signal: signals.length > 1 ? AbortSignal.any(signals) : signals[0] },
+        );
+        // An answer that arrives after cancellation is ignored.
+        throwIfCancelled(signals);
+        if (!approved)
+          throw new BridgeError(
+            "Permission denied: outside access was denied.",
+            "permission_denied",
+          );
+      }
       approvedThisCall.add(askKey(ask));
       const id = ask.grant_id;
       if (id && !granted.includes(id)) granted.push(id);
