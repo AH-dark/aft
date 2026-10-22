@@ -1155,6 +1155,7 @@ fn content_hash_for_source(source: &str) -> blake3::Hash {
 #[cfg(test)]
 thread_local! {
     static FRESHNESS_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
+    static CACHE_REFRESH_TEST_MUTATOR: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
     static CACHE_REFRESH_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -2070,7 +2071,9 @@ impl FileParser {
         &mut self,
         path: &Path,
     ) -> Result<(Arc<Vec<Symbol>>, bool, bool), AftError> {
-        {
+        // Bound contention retries without growing the stack. The last attempt
+        // bypasses the symbol-cache snapshot and parses one coherent source read.
+        for attempt in 0..=3 {
             let canon = path.to_path_buf();
             let current_mtime = crate::bounded_io::metadata(path)
                 .and_then(|m| m.modified())
@@ -2080,15 +2083,18 @@ impl FileParser {
 
             // Snapshot the entry before checking the file: hashing a touched file must
             // not block cache writers. Refresh metadata only if the entry is unchanged.
-            let cached = self
-                .symbol_cache
-                .read()
-                .map_err(|_| AftError::ParseError {
-                    message: "symbol cache lock poisoned".to_string(),
-                })?
-                .entries
-                .get(&canon)
-                .cloned();
+            let cached = if attempt < 3 {
+                self.symbol_cache
+                    .read()
+                    .map_err(|_| AftError::ParseError {
+                        message: "symbol cache lock poisoned".to_string(),
+                    })?
+                    .entries
+                    .get(&canon)
+                    .cloned()
+            } else {
+                None
+            };
             if let Some(cached) = cached {
                 if cached_file_is_fresh(
                     path,
@@ -2103,6 +2109,12 @@ impl FileParser {
                             if let Some((arrived, released)) = slot.borrow_mut().take() {
                                 arrived.wait();
                                 released.wait();
+                            }
+                        });
+                        #[cfg(test)]
+                        CACHE_REFRESH_TEST_MUTATOR.with(|slot| {
+                            if let Some(mutator) = slot.borrow_mut().as_mut() {
+                                mutator();
                             }
                         });
                         let mut cache =
@@ -2121,11 +2133,11 @@ impl FileParser {
                                 // A concurrent writer replaced the snapshot while we hashed.
                                 // Retry rather than returning superseded symbols.
                                 drop(cache);
-                                return self.extract_symbols_shared_inner(path);
+                                continue;
                             }
                         } else {
                             drop(cache);
-                            return self.extract_symbols_shared_inner(path);
+                            continue;
                         }
                     }
                     return Ok((cached.symbols, false, true));
@@ -2177,8 +2189,9 @@ impl FileParser {
                 )
             };
 
-            Ok((symbols, cache_changed, false))
+            return Ok((symbols, cache_changed, false));
         }
+        unreachable!("the uncached final attempt returns")
     }
 
     /// Drop one local parse tree while preserving its shared extracted symbols.
@@ -12736,6 +12749,35 @@ end.
 #[cfg(test)]
 mod audit11_regressions {
     use super::*;
+
+    #[test]
+    fn sustained_cache_refresh_contention_falls_back_after_three_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.rs");
+        std::fs::write(&file, "pub fn original() {}\n").unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        let mut parser = FileParser::new();
+        parser.extract_symbols(&file).unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(2, 0)).unwrap();
+        let cache = parser.symbol_cache();
+        let key = file.clone();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = calls.clone();
+        CACHE_REFRESH_TEST_MUTATOR.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let call = counted.get() + 1;
+                counted.set(call);
+                if call <= 5 {
+                    cache.write().unwrap().entries.get_mut(&key).unwrap().mtime =
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(call + 2);
+                }
+            }))
+        });
+        let symbols = parser.extract_symbols(&file).unwrap();
+        CACHE_REFRESH_TEST_MUTATOR.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(symbols[0].name, "original");
+        assert_eq!(calls.get(), 3);
+    }
 
     fn symbols(source: &str, lang: LangId) -> Vec<Symbol> {
         let tree = parse_source_with_cached_parser(Path::new("fixture"), source, lang).unwrap();
