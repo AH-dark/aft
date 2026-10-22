@@ -406,9 +406,9 @@ pub fn replacement_detail(source: &str, needle: &str, matches: &[FuzzyMatch]) ->
 
 /// Final pass: windows of whole lines that hold the needle's text with line
 /// breaks and spacing moved, as a formatter reflow does. A window matches
-/// when its non-whitespace text equals the needle's and its whitespace runs,
-/// collapsed to single spaces, also agree. Candidates come from one linear
-/// scan (see [`ReflowCandidates`]), in ascending order of their first line.
+/// when its text, with every whitespace run collapsed to one space and the
+/// ends trimmed, equals the needle's. One linear scan finds every such
+/// window (see [`ReflowCandidates`]), in ascending order of its first line.
 fn find_reflow_matches(
     haystack_lines: &[&str],
     needle_lines: &[&str],
@@ -416,20 +416,13 @@ fn find_reflow_matches(
     haystack: &str,
     needle: &str,
 ) -> Vec<FuzzyMatch> {
-    let needle_text = needle_lines.join("\n");
-    let normalized_needle = normalize_reflow_whitespace(&needle_text);
-    let needle_non_whitespace = strip_reflow_whitespace(&needle_text);
-    if normalized_needle.is_empty() || needle_non_whitespace.is_empty() {
+    let normalized_needle = normalize_reflow_whitespace(&needle_lines.join("\n"));
+    if normalized_needle.is_empty() {
         return Vec::new();
     }
 
     let mut matches = Vec::new();
-    for (start, end) in ReflowCandidates::new(haystack_lines, &needle_non_whitespace) {
-        let window_text = haystack_lines[start..end].join("\n");
-        if normalize_reflow_whitespace(&window_text) != normalized_needle {
-            continue;
-        }
-
+    for (start, end) in ReflowCandidates::new(haystack_lines, &normalized_needle) {
         let byte_start = line_offsets[start];
         let byte_end = if end < line_offsets.len() {
             line_offsets[end]
@@ -443,6 +436,8 @@ fn find_reflow_matches(
 }
 
 fn normalize_reflow_whitespace(s: &str) -> String {
+    #[cfg(test)]
+    crate::patch::matcher::REFLOW_WORK.with(|work| work.set(work.get() + s.len()));
     let mut normalized = String::new();
     let mut in_whitespace = false;
 
@@ -461,9 +456,11 @@ fn normalize_reflow_whitespace(s: &str) -> String {
     normalized
 }
 
+#[cfg(test)]
 fn strip_reflow_whitespace(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
+
 /// Normalize Unicode punctuation to ASCII equivalents.
 fn normalize_unicode(s: &str) -> String {
     s.chars()
@@ -746,6 +743,30 @@ mod tests {
             .map(|m| (m.byte_start, m.byte_len, m.pass))
             .collect()
     }
+
+    // BEGIN reflow-work-bound test
+    /// A repetitive file whose lines all match the needle's text, but the
+    /// needle's last line differs only in spacing ("ab" for "a b"). Every
+    /// whitespace-stripped occurrence was a spacing near miss that used to be
+    /// rescanned in full before being rejected: about 18,000 windows of 28 KB.
+    /// The whole pass, building its stream, scanning it and normalizing any
+    /// text, stays within a small multiple of the file plus needle size.
+    #[test]
+    fn reflow_pass_work_is_linear_on_repetitive_spacing_misses() {
+        let haystack = "a b\n".repeat(25_000);
+        let needle = "a b\n".repeat(6_999) + "ab";
+        let haystack_lines: Vec<&str> = haystack.lines().collect();
+        let needle_lines: Vec<&str> = needle.lines().collect();
+        let offsets = compute_line_offsets(&haystack);
+        crate::patch::matcher::REFLOW_WORK.with(|work| work.set(0));
+        let matches =
+            find_reflow_matches(&haystack_lines, &needle_lines, &offsets, &haystack, &needle);
+        let work = crate::patch::matcher::REFLOW_WORK.with(std::cell::Cell::get);
+        assert!(matches.is_empty());
+        let size = haystack.len() + needle.len();
+        assert!(work <= 4 * size, "{work} units of work for {size} bytes");
+    }
+    // END reflow-work-bound test
 
     /// The linear reflow pass returns the same matches, byte ranges included,
     /// as the old window scan on generated inputs: whitespace-only lines,

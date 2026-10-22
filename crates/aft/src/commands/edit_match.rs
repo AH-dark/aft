@@ -1165,7 +1165,7 @@ mod tests {
     /// used to spend seconds in the whitespace-reflow pass, whose window scan
     /// cost file lines × match lines. The pass now scans linearly: the reply
     /// is the usual not-found message, the scan stays within two steps per
-    /// stripped byte, and the file is untouched. A 64 KiB reflowed match on the
+    /// byte of the whitespace-normalized file, and the file is untouched. A 64 KiB reflowed match on the
     /// same file still applies.
     #[test]
     fn large_match_reflow_search_is_linear_and_still_applies() {
@@ -1175,7 +1175,12 @@ mod tests {
             .map(|index| format!("    let value_{index} = compute({index}, \"text\");\n"))
             .collect::<Vec<_>>();
         let source = lines.concat();
-        let stripped_bytes = source.chars().filter(|ch| !ch.is_whitespace()).count();
+        // The search scans the file with every whitespace run collapsed to one space.
+        let normalized_bytes = source
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .len();
         fs::write(&path, &source).unwrap();
         let ctx = AppContext::new(Box::new(StubProvider), Config::default());
         let request = |id: &str, needle: &str, replacement: &str| -> RawRequest {
@@ -1217,8 +1222,8 @@ mod tests {
                 ),
             );
             assert!(
-                steps <= 2 * stripped_bytes,
-                "{steps} scan steps for {stripped_bytes} stripped bytes"
+                steps <= 2 * normalized_bytes,
+                "{steps} scan steps for {normalized_bytes} normalized bytes"
             );
         }
         assert_eq!(fs::read_to_string(&path).unwrap(), source);

@@ -98,6 +98,8 @@ pub fn normalize_indent(input: &str) -> String {
 pub fn normalize_reflow_whitespace(input: &str) -> String {
     #[cfg(test)]
     REFLOW_WINDOW_ALLOCATIONS.with(|count| count.set(count.get() + 1));
+    #[cfg(test)]
+    REFLOW_WORK.with(|work| work.set(work.get() + input.len()));
     let mut collapsed = String::with_capacity(input.len());
     let mut in_whitespace = false;
 
@@ -241,6 +243,10 @@ fn unicode_characters(input: &str) -> impl Iterator<Item = char> + '_ {
     })
 }
 
+/// Collapse whitespace runs to one space and drop leading and trailing
+/// whitespace, lazily. Only the reference scan in the tests still checks
+/// windows this way.
+#[cfg(test)]
 fn collapsed_whitespace(chars: impl Iterator<Item = char>) -> impl Iterator<Item = char> {
     let mut started = false;
     let mut space = false;
@@ -271,21 +277,39 @@ thread_local! {
     /// Byte steps of the reflow search's substring scan, so tests can check
     /// that it stays linear in the file and pattern sizes.
     pub(crate) static REFLOW_SCAN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Work done by the reflow pass: each file character read to build its
+    /// stream, each step building the needle's failure table and scanning the
+    /// stream, and each byte normalized. Tests bound this by the file and
+    /// needle sizes for the whole pass.
+    pub(crate) static REFLOW_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Line windows whose non-whitespace text equals a needle's non-whitespace
-/// text exactly, in ascending order of their first line.
+#[cfg(test)]
+fn count_scan_step() {
+    REFLOW_SCAN_STEPS.with(|steps| steps.set(steps.get() + 1));
+    REFLOW_WORK.with(|work| work.set(work.get() + 1));
+}
+
+/// Line windows whose text equals a needle's text once whitespace is
+/// normalized (every whitespace run, line breaks included, collapsed to one
+/// space and the ends trimmed), in ascending order of their first line.
 ///
-/// A reflowed match keeps every non-whitespace character and only moves line
-/// breaks and spacing, so its candidates are exactly the occurrences of the
-/// needle's whitespace-stripped bytes in the file's whitespace-stripped byte
-/// stream that start where a line with content starts and end where a line
-/// with content ends. Building the stream once and scanning it with
-/// Knuth-Morris-Pratt finds every occurrence, overlapping ones included, and
-/// the line-boundary check walks two forward-only cursors, so the whole
-/// search is linear in the file and needle sizes. Extending a window from every
-/// line instead cost file lines × needle lines: seconds for a large failed
-/// match. Callers still check each candidate's spacing themselves.
+/// The file is normalized once into a stream: every whitespace run between
+/// two non-whitespace characters becomes one space, and each line with
+/// content records where its first character starts and its last character
+/// ends in that stream. A window from line `s` to line `e` normalizes to
+/// exactly the stream bytes from line `s`'s start to line `e - 1`'s end:
+/// normalization trims the window's leading and trailing whitespace, and
+/// every remaining whitespace run lies inside that span. So
+/// the matching windows are exactly the occurrences of the needle's
+/// normalized bytes that start where a line with content starts and end
+/// where a line with content ends. Knuth-Morris-Pratt finds every
+/// occurrence, overlapping ones included, and the line-boundary check walks
+/// two forward-only cursors, so the whole search, spacing included, is
+/// linear in the file and needle sizes and never rescans a window.
+/// Extending a window from every line instead cost file lines × needle
+/// lines, and checking each whitespace-stripped hit's spacing afterwards
+/// cost candidates × needle size on repetitive files.
 pub(crate) struct ReflowCandidates<'a> {
     stream: Vec<u8>,
     needle: &'a [u8],
@@ -303,33 +327,56 @@ pub(crate) struct ReflowCandidates<'a> {
 }
 
 impl<'a> ReflowCandidates<'a> {
-    /// Candidates among `lines`, numbered from 0 like `lines` itself.
-    /// `needle_non_whitespace` must already have every whitespace character
-    /// removed and must not be empty.
-    pub(crate) fn new(lines: &[&str], needle_non_whitespace: &'a str) -> Self {
-        let needle = needle_non_whitespace.as_bytes();
+    /// Matching windows among `lines`, numbered from 0 like `lines` itself.
+    /// `needle_normalized` must already be normalized as described on the
+    /// type (see [`normalize_reflow_whitespace`]) and must not be empty.
+    pub(crate) fn new(lines: &[&str], needle_normalized: &'a str) -> Self {
+        let needle = needle_normalized.as_bytes();
         // Sized up front so building the stream allocates a fixed number of
         // times, never once per line.
-        let mut stream = Vec::with_capacity(lines.iter().map(|line| line.len()).sum());
+        let mut stream = Vec::with_capacity(lines.iter().map(|line| line.len() + 1).sum::<usize>());
         let mut starts = Vec::with_capacity(lines.len());
         let mut ends = Vec::with_capacity(lines.len());
+        // A space is owed once whitespace follows emitted text; it is written
+        // only when more text follows, so the stream has no leading or
+        // trailing space and never two in a row.
+        let mut owe_space = false;
         for (index, line) in lines.iter().enumerate() {
-            let begin = stream.len();
-            for ch in line.chars().filter(|ch| !ch.is_whitespace()) {
+            let mut first = None;
+            let mut last = 0;
+            for ch in line.chars() {
+                #[cfg(test)]
+                REFLOW_WORK.with(|work| work.set(work.get() + 1));
+                if ch.is_whitespace() {
+                    owe_space = !stream.is_empty();
+                    continue;
+                }
+                if owe_space {
+                    stream.push(b' ');
+                    owe_space = false;
+                }
+                first.get_or_insert(stream.len());
                 let mut buffer = [0u8; 4];
                 stream.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
+                last = stream.len();
             }
-            if stream.len() > begin {
-                starts.push((begin, index));
-                ends.push((stream.len(), index));
+            if let Some(first) = first {
+                starts.push((first, index));
+                ends.push((last, index));
             }
+            // The break between this line and the next is whitespace too.
+            owe_space = !stream.is_empty();
         }
         // failure[i]: length of the longest proper prefix of needle[..=i]
         // that is also its suffix.
         let mut failure = vec![0; needle.len()];
         let mut length = 0;
         for index in 1..needle.len() {
+            #[cfg(test)]
+            REFLOW_WORK.with(|work| work.set(work.get() + 1));
             while length > 0 && needle[index] != needle[length] {
+                #[cfg(test)]
+                REFLOW_WORK.with(|work| work.set(work.get() + 1));
                 length = failure[length - 1];
             }
             if needle[index] == needle[length] {
@@ -364,11 +411,11 @@ impl Iterator for ReflowCandidates<'_> {
             self.position += 1;
             while self.matched > 0 && self.needle[self.matched] != byte {
                 #[cfg(test)]
-                REFLOW_SCAN_STEPS.with(|steps| steps.set(steps.get() + 1));
+                count_scan_step();
                 self.matched = self.failure[self.matched - 1];
             }
             #[cfg(test)]
-            REFLOW_SCAN_STEPS.with(|steps| steps.set(steps.get() + 1));
+            count_scan_step();
             if self.needle[self.matched] == byte {
                 self.matched += 1;
             }
@@ -415,25 +462,15 @@ pub fn find_reflow_match(
     pattern: &[&str],
     start_index: usize,
 ) -> Option<(usize, usize)> {
-    let needle_text = pattern.join("\n");
-    let normalized_needle = normalize_reflow_whitespace(&needle_text);
-    let needle_non_whitespace = strip_reflow_whitespace(&needle_text);
-    if normalized_needle.is_empty() || needle_non_whitespace.is_empty() {
+    let normalized_needle = normalize_reflow_whitespace(&pattern.join("\n"));
+    if normalized_needle.is_empty() {
         return None;
     }
     let searched = lines.get(start_index..).unwrap_or_default();
     let mut first_match = None;
-    for (start, end) in ReflowCandidates::new(searched, &needle_non_whitespace) {
+    for (start, end) in ReflowCandidates::new(searched, &normalized_needle) {
         #[cfg(test)]
         REFLOW_STARTS.with(|count| count.set(count.get() + 1));
-        let window_chars = || {
-            searched[start..end]
-                .iter()
-                .flat_map(|line| line.chars().chain(std::iter::once('\n')))
-        };
-        if !collapsed_whitespace(window_chars()).eq(normalized_needle.chars()) {
-            continue;
-        }
         if first_match
             .replace((start_index + start, end - start))
             .is_some()
@@ -1188,9 +1225,9 @@ mod audit11_regressions {
             find_reflow_match(&["x", "a", "b"], &["a b"], 0),
             Some((1, 2))
         );
-        // Only the needle is normalized (once collapsed, once stripped) per
-        // search; file lines and candidate windows are compared in place.
-        assert_eq!(REFLOW_WINDOW_ALLOCATIONS.with(|count| count.get()), 4);
+        // Only the needle is normalized, once per search; file lines are
+        // streamed in place and candidate windows are never materialized.
+        assert_eq!(REFLOW_WINDOW_ALLOCATIONS.with(|count| count.get()), 2);
     }
 }
 
@@ -1338,22 +1375,25 @@ pub(crate) mod reflow_test_support {
         }
     }
 
+    fn stripped(text: &str) -> String {
+        text.chars().filter(|ch| !ch.is_whitespace()).collect()
+    }
+
+    fn normalized(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     /// Every `(start, end)` line window whose first and last lines have
-    /// content and whose non-whitespace text is exactly `needle`, by
+    /// content and whose whitespace-normalized text is exactly `needle`, by
     /// checking all windows.
     pub(crate) fn brute_force_candidates(lines: &[&str], needle: &str) -> Vec<(usize, usize)> {
-        let stripped = |text: &str| {
-            text.chars()
-                .filter(|ch| !ch.is_whitespace())
-                .collect::<String>()
-        };
         let mut candidates = Vec::new();
         for start in 0..lines.len() {
             for end in start + 1..=lines.len() {
                 if stripped(lines[start]).is_empty() || stripped(lines[end - 1]).is_empty() {
                     continue;
                 }
-                if stripped(&lines[start..end].concat()) == needle {
+                if normalized(&lines[start..end].join("\n")) == needle {
                     candidates.push((start, end));
                 }
             }
@@ -1361,14 +1401,31 @@ pub(crate) mod reflow_test_support {
         candidates
     }
 
-    /// Occurrences of `needle` anywhere in the lines' stripped byte stream,
-    /// aligned to line boundaries or not.
+    /// Windows with content at both ends whose non-whitespace text equals
+    /// `needle`'s but whose spacing differs: the near misses a search on
+    /// stripped text alone would have had to reject.
+    pub(crate) fn spacing_misses(lines: &[&str], needle: &str) -> usize {
+        let (needle_stripped, needle_normalized) = (stripped(needle), normalized(needle));
+        let mut misses = 0;
+        for start in 0..lines.len() {
+            for end in start + 1..=lines.len() {
+                if stripped(lines[start]).is_empty() || stripped(lines[end - 1]).is_empty() {
+                    continue;
+                }
+                let window = lines[start..end].join("\n");
+                if stripped(&window) == needle_stripped && normalized(&window) != needle_normalized
+                {
+                    misses += 1;
+                }
+            }
+        }
+        misses
+    }
+
+    /// Occurrences of the normalized `needle` anywhere in the lines'
+    /// normalized text, aligned to line boundaries or not.
     pub(crate) fn stream_occurrences(lines: &[&str], needle: &str) -> usize {
-        let stream = lines
-            .iter()
-            .flat_map(|line| line.chars())
-            .filter(|ch| !ch.is_whitespace())
-            .collect::<String>();
+        let stream = normalized(&lines.join("\n"));
         (0..stream.len())
             .filter(|&at| stream.is_char_boundary(at) && stream[at..].starts_with(needle))
             .count()
@@ -1444,14 +1501,14 @@ mod reflow_linear {
 
     /// The linear search returns what the old scan returned on generated
     /// inputs covering whitespace-only lines, tabs, CRLF, repeated blocks,
-    /// overlapping candidates, near-miss needles and needles at either end of
-    /// the file. Its candidate list also equals a brute-force list, which
-    /// checks the line-boundary alignment on its own: the spacing check would
-    /// otherwise reject misaligned windows and hide a broken alignment check.
+    /// overlapping candidates, near-miss needles (including ones with the
+    /// same text but different spacing) and needles at either end of the
+    /// file. Its window list also equals a brute-force list of every
+    /// window, which pins the line-boundary alignment directly.
     #[test]
     fn linear_reflow_match_equals_the_window_scan_on_generated_inputs() {
         let mut rng = Rng::new(0x5eed_0001);
-        let (mut found, mut spacing_rejected, mut misaligned) = (0, 0, 0);
+        let (mut found, mut spacing_near_misses, mut misaligned) = (0, 0, 0);
         for case in 0..10_000 {
             let mut lines = file_lines(&mut rng);
             if rng.below(3) == 0 {
@@ -1471,34 +1528,49 @@ mod reflow_linear {
             );
             found += usize::from(actual.is_some());
 
-            let stripped = strip_reflow_whitespace(&needle);
-            if stripped.is_empty() {
+            let normalized = normalize_reflow_whitespace(&needle);
+            if normalized.is_empty() {
                 continue;
             }
-            let candidates = ReflowCandidates::new(&lines, &stripped).collect::<Vec<_>>();
+            let candidates = ReflowCandidates::new(&lines, &normalized).collect::<Vec<_>>();
             assert_eq!(
                 candidates,
-                brute_force_candidates(&lines, &stripped),
+                brute_force_candidates(&lines, &normalized),
                 "case {case}: lines {lines:?} needle {needle:?}"
             );
-            let normalized = normalize_reflow_whitespace(&needle);
-            spacing_rejected += candidates
-                .iter()
-                .filter(|&&(start, end)| {
-                    normalize_reflow_whitespace(&lines[start..end].join("\n")) != normalized
-                })
-                .count();
-            misaligned += stream_occurrences(&lines, &stripped) - candidates.len();
+            spacing_near_misses += spacing_misses(&lines, &needle);
+            misaligned += stream_occurrences(&lines, &normalized) - candidates.len();
         }
         // The generator must exercise every branch the oracle comparison
         // relies on, or an equal result proves little.
         assert!(found > 300, "only {found} matches");
         assert!(
-            spacing_rejected > 300,
-            "only {spacing_rejected} spacing rejections"
+            spacing_near_misses > 300,
+            "only {spacing_near_misses} spacing near misses"
         );
         assert!(misaligned > 300, "only {misaligned} misaligned occurrences");
     }
+
+    // BEGIN reflow-work-bound test
+    /// A repetitive file whose lines all match the hunk's text, but the
+    /// hunk's last line differs only in spacing ("ab" for "a b"). Every
+    /// whitespace-stripped occurrence was a spacing near miss that used to be
+    /// rescanned in full before being rejected: about 18,000 windows of 28 KB.
+    /// The whole pass, building its stream, scanning it and normalizing or
+    /// comparing any text, stays within a small multiple of the file plus
+    /// hunk size.
+    #[test]
+    fn reflow_pass_work_is_linear_on_repetitive_spacing_misses() {
+        let lines = vec!["a b"; 25_000];
+        let mut pattern = vec!["a b"; 6_999];
+        pattern.push("ab");
+        REFLOW_WORK.with(|work| work.set(0));
+        assert_eq!(find_reflow_match(&lines, &pattern, 0), None);
+        let work = REFLOW_WORK.with(|work| work.get());
+        let size = lines.len() * "a b\n".len() + pattern.join("\n").len();
+        assert!(work <= 4 * size, "{work} units of work for {size} bytes");
+    }
+    // END reflow-work-bound test
 
     /// The candidate scan does at most two steps per stream byte however the
     /// file repeats: here 25,000 identical lines against a 7,000-line needle,
@@ -1508,7 +1580,8 @@ mod reflow_linear {
         let lines = vec!["    value += 1;"; 25_000];
         let mut pattern = vec!["value += 1;"; 7_000];
         pattern.push("value += 2;");
-        let stream_bytes = lines.len() * "value+=1;".len();
+        // The normalized stream: each line's text and one separating space.
+        let stream_bytes = lines.len() * "value += 1; ".len();
         REFLOW_SCAN_STEPS.with(|steps| steps.set(0));
         assert_eq!(find_reflow_match(&lines, &pattern, 0), None);
         let steps = REFLOW_SCAN_STEPS.with(|steps| steps.get());
