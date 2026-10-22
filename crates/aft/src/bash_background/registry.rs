@@ -3781,6 +3781,7 @@ impl BgTaskRegistry {
         // recoverable PID checkpoint in the existing record format.
         metadata.child_pid = Some(child_pid);
         metadata.pgid = Some(child_pid as i32);
+        metadata.child_start_time_ms = crate::root_cache::process_start_time_ms(child_pid);
         if let Err(error) = self.persist_task(&paths, &metadata) {
             drop(child.stdin.take());
             let _ = child.wait();
@@ -3899,10 +3900,7 @@ impl BgTaskRegistry {
             let mut state = task
                 .lock_state()
                 .map_err(|_| "background task lock poisoned".to_string())?;
-            if self.inner.shutdown.load(Ordering::SeqCst)
-                || state.metadata.status.is_terminal()
-                || state.kill_in_flight
-            {
+            if state.metadata.status.is_terminal() || state.kill_in_flight {
                 false
             } else if let TaskRuntime::Piped(Some(child)) = &mut state.runtime {
                 if let Some(mut release) = child.stdin.take() {
@@ -19435,6 +19433,61 @@ mod tests {
                 Some(dir.to_path_buf()),
             )
             .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_during_registered_spawn_does_not_abort_identity_gate() {
+        let registry = BgTaskRegistry::default();
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *registry.inner.before_bootstrap_release.lock().unwrap() = Some((arrived_tx, release_rx));
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_path_buf();
+        let marker = project.join("command-ran");
+        let command = format!("printf ran > '{}'", marker.display());
+        let spawning = registry.clone();
+        let worker = std::thread::spawn(move || {
+            spawn_unsandboxed_for_kill_test(&spawning, &project, &command)
+        });
+        let task_id = arrived_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("task must register before the identity gate is released");
+        let _cleanup = {
+            struct KillTaskOnDrop(BgTaskRegistry, String);
+            impl Drop for KillTaskOnDrop {
+                fn drop(&mut self) {
+                    let _ = self.0.kill(&self.1, "session");
+                }
+            }
+            KillTaskOnDrop(registry.clone(), task_id.clone())
+        };
+
+        // The shutdown flag also stops the watchdog. This child is already
+        // registered, so spawning must write the release line rather than abort it.
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), task_id);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(&marker).ok().as_deref() != Some("ran") {
+            assert!(
+                Instant::now() < deadline,
+                "the accepted command did not run after identity release"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let task = registry.task_for_test(&task_id).unwrap();
+        let exit_deadline = Instant::now() + Duration::from_secs(5);
+        while read_exit_marker(&task.paths).unwrap().is_none() {
+            assert!(
+                Instant::now() < exit_deadline,
+                "accepted command did not publish its exit marker"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let snapshot = registry.kill(&task_id, "session").unwrap();
+        assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
     }
 
     #[cfg(unix)]

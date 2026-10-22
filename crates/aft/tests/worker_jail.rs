@@ -105,21 +105,64 @@ impl Drop for Jail {
     }
 }
 
-fn cleanup_sandbox_task_process_groups(process_groups: &[i32]) -> (Vec<i32>, Vec<i32>) {
-    let leaked = wait_for_process_groups(process_groups, Duration::from_millis(250));
-    for pgid in process_groups {
+#[derive(Debug)]
+struct RecordedSandboxProcessGroup {
+    task_id: String,
+    child_pid: Option<u32>,
+    pgid: i32,
+    child_start_time_ms: Option<u64>,
+    terminal: bool,
+}
+
+fn process_group_skip_reason(group: &RecordedSandboxProcessGroup) -> Option<&'static str> {
+    if group.terminal {
+        return Some("task is already terminal");
+    }
+    let Some(child_pid) = group.child_pid else {
+        return Some("task has no recorded child PID");
+    };
+    if child_pid != group.pgid as u32 {
+        return Some("recorded child PID is not the process-group leader");
+    }
+    let Some(expected_start_time_ms) = group.child_start_time_ms else {
+        return Some("process start time was not recorded at spawn");
+    };
+    let Some(actual_start_time_ms) = aft::root_cache::process_start_time_ms(child_pid) else {
+        return Some("process-group leader is absent or its start time is unavailable");
+    };
+    (actual_start_time_ms != expected_start_time_ms)
+        .then_some("process-group leader start time differs from spawn time")
+}
+
+fn cleanup_sandbox_task_process_groups(
+    process_groups: &[RecordedSandboxProcessGroup],
+) -> (Vec<i32>, Vec<i32>) {
+    let mut owned_groups = std::collections::BTreeSet::new();
+    for group in process_groups {
+        if let Some(reason) = process_group_skip_reason(group) {
+            eprintln!(
+                "worker-jail teardown skipped process group {} for task {}: {reason}",
+                group.pgid, group.task_id
+            );
+        } else {
+            owned_groups.insert(group.pgid);
+        }
+    }
+    let owned_groups = owned_groups.into_iter().collect::<Vec<_>>();
+    let leaked = wait_for_process_groups(&owned_groups, Duration::from_millis(250));
+    for pgid in &owned_groups {
         unsafe {
             libc::kill(-*pgid, libc::SIGKILL);
         }
     }
-    let remaining = wait_for_process_groups(process_groups, Duration::from_secs(2));
+    let remaining = wait_for_process_groups(&owned_groups, Duration::from_secs(2));
     (leaked, remaining)
 }
 
-fn sandbox_task_process_groups(data: &Path) -> Vec<i32> {
+fn sandbox_task_process_groups(data: &Path) -> Vec<RecordedSandboxProcessGroup> {
     let root = data.join("cortexkit/aft/cache/aft/runner/bash-tasks");
     let mut pending = vec![root];
-    let mut groups = std::collections::BTreeSet::new();
+    let mut groups = Vec::new();
     while let Some(directory) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(directory) else {
             continue;
@@ -142,13 +185,19 @@ fn sandbox_task_process_groups(data: &Path) -> Vec<i32> {
                 };
                 if task.sandbox_native {
                     if let Some(pgid) = task.pgid.filter(|pgid| *pgid > 1) {
-                        groups.insert(pgid);
+                        groups.push(RecordedSandboxProcessGroup {
+                            task_id: task.task_id,
+                            child_pid: task.child_pid,
+                            pgid,
+                            child_start_time_ms: task.child_start_time_ms,
+                            terminal: task.status.is_terminal(),
+                        });
                     }
                 }
             }
         }
     }
-    groups.into_iter().collect()
+    groups
 }
 
 fn process_group_has_live_members(pgid: i32) -> bool {
@@ -182,6 +231,19 @@ fn wait_for_process_groups(groups: &[i32], timeout: Duration) -> Vec<i32> {
     }
 }
 
+fn persist_sandbox_task_for_test(
+    data: &Path,
+    task: &aft::bash_background::persistence::PersistedTask,
+) {
+    let session_dir = data.join("cortexkit/aft/cache/aft/runner/bash-tasks/session");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join(format!("{}.json", task.task_id)),
+        serde_json::to_vec(task).unwrap(),
+    )
+    .unwrap();
+}
+
 struct KillProcessGroupOnDrop(i32);
 
 impl Drop for KillProcessGroupOnDrop {
@@ -211,8 +273,6 @@ fn worker_jail_teardown_kills_recorded_sandbox_process_groups() {
     let _kill_group_on_drop = KillProcessGroupOnDrop(pgid);
     assert!(process_group_has_live_members(pgid));
 
-    let session_dir = data.join("cortexkit/aft/cache/aft/runner/bash-tasks/session");
-    std::fs::create_dir_all(&session_dir).unwrap();
     let mut task = aft::bash_background::persistence::PersistedTask::starting(
         "bash-0000000000000001".into(),
         "session".into(),
@@ -224,15 +284,13 @@ fn worker_jail_teardown_kills_recorded_sandbox_process_groups() {
         false,
     );
     task.sandbox_native = true;
-    task.pgid = Some(pgid);
-    std::fs::write(
-        session_dir.join("bash-0000000000000001.json"),
-        serde_json::to_vec(&task).unwrap(),
-    )
-    .unwrap();
+    task.mark_running(child.id(), pgid);
+    assert!(task.child_start_time_ms.is_some());
+    persist_sandbox_task_for_test(&data, &task);
 
     let groups = sandbox_task_process_groups(&data);
-    assert_eq!(groups, [pgid]);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].pgid, pgid);
     let (leaked, remaining) = cleanup_sandbox_task_process_groups(&groups);
     assert_eq!(leaked, [pgid], "the live fixture shell must be detected");
     assert!(
@@ -240,6 +298,104 @@ fn worker_jail_teardown_kills_recorded_sandbox_process_groups() {
         "teardown must kill every recorded group"
     );
     assert!(!process_group_has_live_members(pgid));
+    assert!(!child.wait().unwrap().success());
+}
+
+#[test]
+fn worker_jail_teardown_skips_reused_process_group() {
+    use std::os::unix::process::CommandExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let release = temp.path().join("release");
+    let mut child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            &format!("while ! test -f {}; do sleep .02; done", quote(&release)),
+        ])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pgid = i32::try_from(child.id()).unwrap();
+    let kill_group_on_drop = KillProcessGroupOnDrop(pgid);
+    assert!(process_group_has_live_members(pgid));
+
+    let mut task = aft::bash_background::persistence::PersistedTask::starting(
+        "bash-0000000000000002".into(),
+        "session".into(),
+        "reused group fixture".into(),
+        temp.path().to_path_buf(),
+        Some(temp.path().to_path_buf()),
+        Some(60_000),
+        false,
+        false,
+    );
+    task.sandbox_native = true;
+    task.mark_running(child.id(), pgid);
+    let spawn_start_time_ms = task.child_start_time_ms.expect("start time at spawn");
+    task.child_start_time_ms = Some(spawn_start_time_ms.saturating_add(1));
+    persist_sandbox_task_for_test(&data, &task);
+
+    let groups = sandbox_task_process_groups(&data);
+    let (leaked, remaining) = cleanup_sandbox_task_process_groups(&groups);
+    assert!(leaked.is_empty(), "unowned groups are not checked as leaks");
+    assert!(remaining.is_empty());
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::pid_t, 0) },
+        0,
+        "a reused process group must not be signalled"
+    );
+    assert!(process_group_has_live_members(pgid));
+
+    drop(kill_group_on_drop);
+    assert!(!child.wait().unwrap().success());
+}
+
+#[test]
+fn worker_jail_teardown_skips_terminal_process_group() {
+    use std::os::unix::process::CommandExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let release = temp.path().join("release");
+    let mut child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            &format!("while ! test -f {}; do sleep .02; done", quote(&release)),
+        ])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pgid = i32::try_from(child.id()).unwrap();
+    let kill_group_on_drop = KillProcessGroupOnDrop(pgid);
+
+    let mut task = aft::bash_background::persistence::PersistedTask::starting(
+        "bash-0000000000000003".into(),
+        "session".into(),
+        "terminal task fixture".into(),
+        temp.path().to_path_buf(),
+        Some(temp.path().to_path_buf()),
+        Some(60_000),
+        false,
+        false,
+    );
+    task.sandbox_native = true;
+    task.mark_running(child.id(), pgid);
+    task.mark_terminal(aft::bash_background::BgTaskStatus::Completed, Some(0), None);
+    persist_sandbox_task_for_test(&data, &task);
+
+    let groups = sandbox_task_process_groups(&data);
+    let (leaked, remaining) = cleanup_sandbox_task_process_groups(&groups);
+    assert!(leaked.is_empty());
+    assert!(remaining.is_empty());
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::pid_t, 0) },
+        0,
+        "a terminal task's saved pgid must not be signalled"
+    );
+    assert!(process_group_has_live_members(pgid));
+
+    drop(kill_group_on_drop);
     assert!(!child.wait().unwrap().success());
 }
 
@@ -3107,7 +3263,9 @@ async fn worker_jail_teardown_kills_sandboxed_shell_groups_during_unwind() {
     assert!(task.sandbox_native, "fixture must start a sandboxed shell");
     let pgid = task.pgid.expect("running shell process group");
     assert!(
-        sandbox_task_process_groups(&jail.data).contains(&pgid),
+        sandbox_task_process_groups(&jail.data)
+            .iter()
+            .any(|group| group.pgid == pgid),
         "teardown must find this native shell's process group"
     );
     assert!(process_group_has_live_members(pgid));
