@@ -225,6 +225,84 @@ class CISpeedWorkflowTests(unittest.TestCase):
     def test_direct_ci_storm_nextest_run_keeps_all_failures(self) -> None:
         self.assertIn("cargo nextest run --no-fail-fast", workflow_job("unit-linux-storm"))
 
+    def test_nextest_install_requires_cache_retry_and_published_checksum(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        action_path = root / ".github/actions/setup-nextest/action.yml"
+        action = workflow_gates.parse_workflow(str(action_path))
+        self.assertEqual(action["inputs"]["version"]["default"], "0.9.138")
+        steps = action["runs"]["steps"]
+
+        cache = next(step for step in steps if step.get("id") == "nextest-cache")
+        self.assertEqual(cache["uses"], "actions/cache@v4")
+        self.assertEqual(cache["with"]["path"], "~/.cargo/bin/cargo-nextest*")
+        self.assertIn("cargo-nextest-${{ inputs.version }}-${{ runner.os }}", cache["with"]["key"])
+        self.assertIn("${{ runner.arch }}", cache["with"]["key"])
+
+        install = next(step for step in steps if step.get("name") == "Download and install cargo-nextest")
+        self.assertEqual(install["if"], "steps.nextest-cache.outputs.cache-hit != 'true'")
+        script = install["run"]
+        self.assertIn("--retry-all-errors", script)
+        self.assertIn("--retry-max-time 180", script)
+        self.assertIn('--output "$archive"', script)
+        self.assertIn('test -s "$archive"', script)
+        self.assertIn("sha256sum --check --status", script)
+        self.assertIn("shasum -a 256 --check --status", script)
+        self.assertIn('tar -xzf "$archive"', script)
+        for digest in (
+            "3793bf0c27607b196f502c39b2108f571de89fcda7586ae6beefa11ee177b216",
+            "124baa34d160355fa8a8bed053856270cfcf132659e76a0bc8bbcdfc093266b7",
+            "e4606198dd067299f16863dcf5b9be007b9cae041e468c417884fc224760c0f4",
+        ):
+            self.assertIn(digest, script)
+
+    def test_tool_downloads_are_never_piped_to_tar(self) -> None:
+        root = Path(__file__).resolve().parents[2] / ".github"
+        violations = []
+        paths = (
+            *root.glob("workflows/*.yml"),
+            *root.glob("workflows/*.yaml"),
+            *root.glob("actions/**/*.yml"),
+            *root.glob("actions/**/*.yaml"),
+        )
+        for path in paths:
+            text = path.read_text().replace("\\\n", " ")
+            if re.search(r"(?im)\b(?:curl|wget)\b[^\n]*\|\s*tar\b", text):
+                violations.append(str(path.relative_to(root.parent)))
+        self.assertEqual(violations, [], "download archives to a file before validating and extracting them")
+
+    def test_nextest_has_one_shared_installer_for_every_workflow_site(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        github = root / ".github"
+        download_sites = [
+            path.relative_to(root).as_posix()
+            for path in github.rglob("*.yml")
+            if "get.nexte.st/" in path.read_text()
+        ]
+        self.assertEqual(download_sites, [".github/actions/setup-nextest/action.yml"])
+
+        unit = workflow_gates.parse_workflow(str(github / "workflows/_unit-suite.yml"))
+        uses = [
+            step.get("uses")
+            for job in unit["jobs"].values()
+            for step in job.get("steps", [])
+        ]
+        self.assertEqual(uses.count("./.github/actions/setup-nextest"), 13)
+        shard = workflow_gates.parse_workflow(str(github / "actions/integration-shard/action.yml"))
+        self.assertEqual(
+            sum(step.get("uses") == "./.github/actions/setup-nextest" for step in shard["runs"]["steps"]),
+            1,
+        )
+
+    def test_pyright_npm_install_retries_transient_registry_errors(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        action = workflow_gates.parse_workflow(str(root / ".github/actions/integration-shard/action.yml"))
+        install = next(step for step in action["runs"]["steps"] if step.get("name") == "Install Pyright integration dependency")
+        command = install["run"]
+        self.assertIn("pyright@1.1.411", command)
+        self.assertIn("--fetch-retries=5", command)
+        self.assertIn("--fetch-retry-mintimeout=10000", command)
+        self.assertIn("--fetch-retry-maxtimeout=60000", command)
+
     def test_library_does_not_embed_per_commit_build_script_environment(self) -> None:
         root = Path(__file__).resolve().parents[2] / "crates/aft"
         emitted = set(re.findall(r"cargo:rustc-env=([A-Z0-9_]+)=", (root / "build.rs").read_text()))

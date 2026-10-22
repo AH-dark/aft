@@ -21,18 +21,7 @@ runs:
       with:
         targets: x86_64-pc-windows-msvc
 
-    - name: Install cargo-nextest (direct, installer-action-independent)
-      shell: bash
-      run: |
-        set -euo pipefail
-        case "$(uname -s)" in
-          Linux) plat="linux" ;;
-          Darwin) plat="mac" ;;
-          *) plat="windows-tar" ;;
-        esac
-        mkdir -p "$HOME/.cargo/bin"
-        curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
-        "$HOME/.cargo/bin/cargo-nextest" --version
+    - uses: ./.github/actions/setup-nextest
 
     - uses: actions/setup-node@v5
       if: inputs.platform != 'windows'
@@ -41,7 +30,7 @@ runs:
     - name: Install Pyright integration dependency
       if: inputs.platform == 'linux'
       shell: bash
-      run: npm install --global pyright@1.1.411
+      run: npm install --global --fetch-retries=5 --fetch-retry-mintimeout=10000 --fetch-retry-maxtimeout=60000 pyright@1.1.411
     - uses: oven-sh/setup-bun@v2
       if: inputs.platform != 'windows'
       with:
