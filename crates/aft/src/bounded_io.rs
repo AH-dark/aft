@@ -126,6 +126,8 @@ pub(crate) struct Budget {
     directories: Arc<Mutex<HashMap<PathBuf, Arc<Probe>>>>,
     traversable: Arc<Mutex<HashSet<PathBuf>>>,
     permissions: Arc<Mutex<Vec<PermissionObservation>>>,
+    /// Set once the end of the budget has been kept back for the reply.
+    reply_margin_kept: bool,
     #[cfg(test)]
     measurements: Arc<Measurements>,
     #[cfg(test)]
@@ -148,6 +150,7 @@ impl Budget {
             directories: Arc::new(Mutex::new(HashMap::new())),
             traversable: Arc::new(Mutex::new(HashSet::new())),
             permissions: Arc::new(Mutex::new(Vec::new())),
+            reply_margin_kept: false,
             #[cfg(test)]
             measurements: Arc::new(Measurements::default()),
             #[cfg(test)]
@@ -374,15 +377,22 @@ pub(crate) fn with_budget<T>(budget: Option<Budget>, work: impl FnOnce() -> T) -
 pub(crate) fn enter(budget: Option<Budget>) -> Scope {
     Scope(CURRENT.with(|current| current.replace(budget)))
 }
-/// Make sure the current request has at least `duration` left for
-/// filesystem access, moving its deadline later if less remains. This is for
-/// a request whose slow part has already succeeded and whose result is on
-/// local disk, such as a downloaded URL document: running out of budget
-/// while reading it back would throw that result away.
-pub(crate) fn reserve_current(duration: Duration) {
+/// Keep the last `margin` of the current request's budget for its reply:
+/// move the filesystem deadline `margin` earlier for the rest of the
+/// command. A request calls this before its last filesystem work, so a
+/// stalled read fails while the reply can still reach the caller in time.
+/// Only the first call moves the deadline, so a command that reads several
+/// documents keeps one margin, not one per document.
+pub(crate) fn keep_reply_margin(margin: Duration) {
     CURRENT.with(|current| {
         if let Some(budget) = current.borrow_mut().as_mut() {
-            budget.deadline = budget.deadline.max(Instant::now() + duration);
+            if !budget.reply_margin_kept {
+                budget.reply_margin_kept = true;
+                budget.deadline = budget
+                    .deadline
+                    .checked_sub(margin)
+                    .unwrap_or(budget.deadline);
+            }
         }
     });
 }

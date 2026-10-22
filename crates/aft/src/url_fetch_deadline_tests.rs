@@ -67,12 +67,20 @@ fn fetch_within(
     (result, started.elapsed())
 }
 
+/// The call budget most tests run under. The fetch deadline is 2 s of it:
+/// the rest is the read-back reserve and the reply margin.
+const CALL_BUDGET: Duration = Duration::from_secs(5);
+/// A fetch under [`CALL_BUDGET`] must have returned by this time: its 2 s
+/// deadline plus 1 s for scheduling on a loaded machine.
+const FETCH_DONE_BY: Duration = Duration::from_secs(3);
+
 /// Long enough that a fetch which ignored its deadline could not finish a
 /// test in time, short enough that leftover server threads end soon.
 const SERVER_STALL: Duration = Duration::from_secs(60);
 
 #[test]
-fn fetch_deadline_is_the_call_budget_less_the_margin_capped_at_the_ceiling() {
+fn fetch_deadline_is_the_call_budget_less_the_read_back_reserve_and_reply_margin_capped_at_the_ceiling(
+) {
     let near = |deadline: FetchDeadline, expected: Duration| {
         let allowed = deadline.allowed;
         assert!(
@@ -82,9 +90,9 @@ fn fetch_deadline_is_the_call_budget_less_the_margin_capped_at_the_ceiling() {
     };
     near(FetchDeadline::for_current_call(), URL_FETCH_CEILING);
     for (budget, expected) in [
-        (Duration::from_secs(3), Duration::from_secs(2)),
+        (Duration::from_secs(5), Duration::from_secs(2)),
         (Duration::from_secs(60), URL_FETCH_CEILING),
-        (Duration::from_millis(500), Duration::ZERO),
+        (Duration::from_millis(2_500), Duration::ZERO),
     ] {
         let _call = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(budget)));
         near(FetchDeadline::for_current_call(), expected);
@@ -96,7 +104,7 @@ fn header_stall_times_out_in_the_headers_phase_within_the_call_budget() {
     let storage = tempfile::tempdir().unwrap();
     let address = serve(|_, _stream| thread::sleep(SERVER_STALL));
     let (result, elapsed) = fetch_within(
-        Duration::from_secs(3),
+        CALL_BUDGET,
         &url(address, "/silent.md"),
         storage.path(),
         local(),
@@ -106,8 +114,8 @@ fn header_stall_times_out_in_the_headers_phase_within_the_call_budget() {
     assert_eq!(error.phase(), Some(FetchPhase::Headers), "{error}");
     assert!(error.to_string().contains("headers phase"), "{error}");
     assert!(
-        elapsed < Duration::from_secs(3),
-        "the fetch outlived its call budget: {elapsed:?}"
+        elapsed < FETCH_DONE_BY,
+        "the fetch outlived its deadline: {elapsed:?}"
     );
 }
 
@@ -129,7 +137,7 @@ fn body_drip_stops_at_the_whole_body_deadline() {
         }
     });
     let (result, elapsed) = fetch_within(
-        Duration::from_secs(3),
+        CALL_BUDGET,
         &url(address, "/drip.md"),
         storage.path(),
         local(),
@@ -138,8 +146,8 @@ fn body_drip_stops_at_the_whole_body_deadline() {
     assert_eq!(error.code(), "url_fetch_timeout", "{error}");
     assert_eq!(error.phase(), Some(FetchPhase::Body), "{error}");
     assert!(
-        elapsed < Duration::from_secs(3),
-        "the body read outlived its call budget: {elapsed:?}"
+        elapsed < FETCH_DONE_BY,
+        "the body read outlived its deadline: {elapsed:?}"
     );
 }
 
@@ -176,10 +184,10 @@ fn transient_failures_retry_while_the_backoff_and_an_attempt_fit() {
 fn transient_failures_do_not_retry_when_the_backoff_and_an_attempt_do_not_fit() {
     let storage = tempfile::tempdir().unwrap();
     let (address, accepted) = hang_up_server();
-    // 1.6 s of budget leaves a 0.6 s fetch deadline: less than the first
+    // 3.6 s of budget leaves a 0.6 s fetch deadline: less than the first
     // backoff plus one useful attempt.
     let (result, elapsed) = fetch_within(
-        Duration::from_millis(1_600),
+        Duration::from_millis(3_600),
         &url(address, "/closed.md"),
         storage.path(),
         local(),
@@ -207,9 +215,7 @@ fn outline_reports_the_typed_timeout_and_its_phase() {
         "file": url(address, "/silent.md"),
     }))
     .unwrap();
-    let _call = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(
-        Duration::from_secs(3),
-    )));
+    let _call = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(CALL_BUDGET)));
     let started = Instant::now();
     let response = crate::commands::outline::handle_outline(&req, &ctx);
     assert!(!response.success);
@@ -219,7 +225,7 @@ fn outline_reports_the_typed_timeout_and_its_phase() {
         response.data
     );
     assert_eq!(response.data["phase"], "headers", "{:?}", response.data);
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(started.elapsed() < FETCH_DONE_BY);
 }
 
 fn stalled_lookup() -> HostLookup {
@@ -237,7 +243,7 @@ fn stalled_name_lookup_times_out_in_the_dns_phase_before_the_ssrf_check_answers(
         ..UrlFetchOptions::default()
     };
     let (result, elapsed) = fetch_within(
-        Duration::from_secs(3),
+        CALL_BUDGET,
         "http://slow-dns.test/doc.md",
         storage.path(),
         options,
@@ -245,7 +251,7 @@ fn stalled_name_lookup_times_out_in_the_dns_phase_before_the_ssrf_check_answers(
     let error = result.expect_err("a lookup that never answers must fail");
     assert_eq!(error.code(), "url_fetch_timeout", "{error}");
     assert_eq!(error.phase(), Some(FetchPhase::Dns), "{error}");
-    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    assert!(elapsed < FETCH_DONE_BY, "{elapsed:?}");
 }
 
 #[test]
@@ -259,7 +265,7 @@ fn stalled_name_lookup_inside_the_connection_times_out_in_the_dns_phase() {
         ..UrlFetchOptions::default()
     };
     let (result, elapsed) = fetch_within(
-        Duration::from_secs(3),
+        CALL_BUDGET,
         "http://slow-dns.test/doc.md",
         storage.path(),
         options,
@@ -267,7 +273,7 @@ fn stalled_name_lookup_inside_the_connection_times_out_in_the_dns_phase() {
     let error = result.expect_err("a lookup that never answers must fail");
     assert_eq!(error.code(), "url_fetch_timeout", "{error}");
     assert_eq!(error.phase(), Some(FetchPhase::Dns), "{error}");
-    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    assert!(elapsed < FETCH_DONE_BY, "{elapsed:?}");
 }
 
 #[test]
@@ -280,7 +286,7 @@ fn host_resolving_to_a_private_address_is_refused() {
         ..UrlFetchOptions::default()
     };
     let (result, _) = fetch_within(
-        Duration::from_secs(3),
+        CALL_BUDGET,
         "http://intranet.test/doc.md",
         storage.path(),
         options,
@@ -373,10 +379,10 @@ fn a_timed_out_url_fails_from_memory_without_a_new_fetch() {
         thread::sleep(SERVER_STALL);
     });
     let target = url(address, "/silent.md");
-    let (first, _) = fetch_within(Duration::from_secs(3), &target, storage.path(), local());
+    let (first, _) = fetch_within(CALL_BUDGET, &target, storage.path(), local());
     assert_eq!(first.unwrap_err().code(), "url_fetch_timeout");
 
-    let (second, elapsed) = fetch_within(Duration::from_secs(3), &target, storage.path(), local());
+    let (second, elapsed) = fetch_within(CALL_BUDGET, &target, storage.path(), local());
     let error = second.expect_err("the remembered failure is repeated");
     assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
     assert_eq!(error.code(), "url_fetch_timeout", "{error}");
@@ -394,12 +400,8 @@ fn server_errors_and_client_errors_other_than_408_and_429_are_remembered() {
     let (address, seen) = status_server();
     for path in ["/503", "/404", "/408", "/429"] {
         for _ in 0..2 {
-            let (result, _) = fetch_within(
-                Duration::from_secs(3),
-                &url(address, path),
-                storage.path(),
-                local(),
-            );
+            let (result, _) =
+                fetch_within(CALL_BUDGET, &url(address, path), storage.path(), local());
             assert!(result.is_err(), "{path}");
         }
     }
@@ -415,14 +417,14 @@ fn a_remembered_failure_expires_and_the_url_is_fetched_again() {
     let storage = tempfile::tempdir().unwrap();
     let (address, seen) = status_server();
     let target = url(address, "/flaky");
-    let (first, _) = fetch_within(Duration::from_secs(3), &target, storage.path(), local());
+    let (first, _) = fetch_within(CALL_BUDGET, &target, storage.path(), local());
     assert!(first.unwrap_err().to_string().contains("HTTP 503"));
 
     age_remembered_failure(
         &FailureKey::new(storage.path(), &target, true),
         FAILURE_MEMORY + Duration::from_secs(1),
     );
-    let (second, _) = fetch_within(Duration::from_secs(3), &target, storage.path(), local());
+    let (second, _) = fetch_within(CALL_BUDGET, &target, storage.path(), local());
     second.expect("an expired failure no longer stands in for the fetch");
     assert_eq!(seen.lock().unwrap().get("/flaky"), Some(&2));
 }
@@ -498,10 +500,10 @@ fn a_stalled_connect_ends_at_the_connect_limit() {
         connect_delay: Some(SERVER_STALL),
         ..local()
     };
-    // An 11 s fetch deadline: the 10 s connect limit ends the first attempt,
+    // A 14 s budget leaves an 11 s fetch deadline: the 10 s connect limit ends the first attempt,
     // and the second does not fit in what is left.
     let (result, elapsed) = fetch_within(
-        Duration::from_secs(12),
+        Duration::from_secs(14),
         &url(address, "/unreachable.md"),
         storage.path(),
         options,
@@ -572,4 +574,65 @@ fn a_cached_html_page_is_served_from_the_cache_without_a_new_fetch() {
     );
     // An unchanged file keeps the parsed symbols of the last call valid.
     assert_eq!(fs::metadata(&second).unwrap().modified().unwrap(), modified);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fetch_ending_inside_its_deadline_and_a_stalled_read_back_still_reply_before_the_call_budget() {
+    let storage = tempfile::tempdir().unwrap();
+    // A 6 s call: the fetch deadline is 3 s, and this server answers at
+    // 2.6 s, so the download ends just inside it.
+    let budget = Duration::from_secs(6);
+    let answer_after = Duration::from_millis(2_600);
+    let address = serve(move |_, mut stream| {
+        thread::sleep(answer_after);
+        let body = b"# Late\n\n## Section\n\ntext\n";
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/markdown\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(body);
+    });
+    let target = url(address, "/late.md");
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            url_fetch_allow_private: true,
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let req: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "late-url",
+        "command": "outline",
+        "file": target,
+    }))
+    .unwrap();
+    // The first filesystem access to the downloaded document never finishes.
+    let document = cache_content_path_for_url(storage.path(), &target, ".md");
+    let stalled_read_back = crate::bounded_io::stall_running_helper(&document);
+    let _call = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(budget)));
+    let started = Instant::now();
+    let response = crate::commands::outline::handle_outline(&req, &ctx);
+    let elapsed = started.elapsed();
+    drop(stalled_read_back);
+
+    assert!(
+        elapsed >= answer_after,
+        "the download completed: {elapsed:?}"
+    );
+    assert!(document.exists(), "the download reached the cache");
+    assert!(!response.success, "{:?}", response.data);
+    assert_ne!(
+        response.data["code"], "url_fetch_timeout",
+        "{:?}",
+        response.data
+    );
+    // The stalled read gives up before the reply margin, so the reply is
+    // ready with that margin to spare.
+    assert!(
+        elapsed + URL_REPLY_MARGIN / 2 < budget,
+        "the reply came {elapsed:?} into a {budget:?} call"
+    );
 }

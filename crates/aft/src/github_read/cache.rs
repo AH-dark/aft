@@ -1542,7 +1542,8 @@ mod tests {
         let started = std::time::Instant::now();
         let error = crate::commands::read::wait_for_github_read(start)
             .expect_err("no copy can stand in for the running read");
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // The wait ends one reply margin before the 1.3 s call budget.
+        assert!(started.elapsed() < std::time::Duration::from_millis(1_300));
         assert_eq!(error.code(), "github_read_pending", "{error}");
         assert!(
             error.to_string().contains("retry this call shortly"),

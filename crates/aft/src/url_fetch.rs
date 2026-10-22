@@ -40,9 +40,15 @@ const MAX_REDIRECTS: usize = 5;
 /// phase (name lookup, connect, response headers, body) shares this one
 /// deadline, so redirects and retries cannot multiply it.
 const URL_FETCH_CEILING: Duration = Duration::from_secs(20);
-/// Time kept back from the call's budget so that converting, caching and
-/// rendering the fetched document still fit before the call's own deadline.
-const URL_FETCH_RETURN_MARGIN: Duration = Duration::from_secs(1);
+/// The last part of the call's budget, kept for building and sending the
+/// reply. Neither the download nor reading the downloaded document back may
+/// use it, so the reply reaches the caller before the call's own deadline.
+pub(crate) const URL_REPLY_MARGIN: Duration = Duration::from_secs(1);
+/// The part of the call's budget before the reply margin that the download
+/// leaves for the work after it: converting HTML, writing the cache, and
+/// reading the document back. A download that ends at its deadline still has
+/// this much time for that work.
+const URL_READ_BACK_RESERVE: Duration = Duration::from_secs(2);
 /// A transient failure is retried only when the backoff plus at least this
 /// much time for the next attempt still fit before the fetch deadline.
 const MIN_USEFUL_ATTEMPT: Duration = Duration::from_secs(1);
@@ -179,8 +185,8 @@ impl UrlFetchError {
 }
 
 /// One deadline for a whole fetch, taken from the call's filesystem budget
-/// (less a margin for the reply) and capped at [`URL_FETCH_CEILING`]. A call
-/// with no budget gets the ceiling.
+/// (less the read-back reserve and the reply margin) and capped at
+/// [`URL_FETCH_CEILING`]. A call with no budget gets the ceiling.
 #[derive(Debug, Clone, Copy)]
 struct FetchDeadline {
     at: Instant,
@@ -194,7 +200,7 @@ impl FetchDeadline {
         let at = match crate::bounded_io::current() {
             Some(budget) => budget
                 .deadline
-                .checked_sub(URL_FETCH_RETURN_MARGIN)
+                .checked_sub(URL_REPLY_MARGIN + URL_READ_BACK_RESERVE)
                 .unwrap_or(now)
                 .clamp(now, ceiling),
             None => ceiling,
