@@ -748,6 +748,118 @@ fn publication_omits_staged_and_unstaged_working_tree_deletions() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// An upgrade that bumps the call-graph producer finds the checkout's view
+/// already published under the previous producer. The owner must rebuild and
+/// serve a new generation rather than keep serving, or refusing, the old one.
+#[test]
+fn callgraph_producer_change_republishes_an_existing_generation() {
+    use crate::blob_store::v2::FamilyPlane;
+    use crate::views::{
+        callgraph::{BlobReader, PRODUCER},
+        contracts::{PlaneAdapter, PlaneLoader, ViewAccess},
+        first_load::{
+            CallgraphBridge, CheckoutDriver, ConfiguredMembershipWalker, SiblingLoader,
+            TrigramBridge,
+        },
+        manifest_v2::{GenerationName, Producers},
+        registry::FamilyRegistry,
+    };
+    // The producer the previous release stamped on its generations.
+    const PREVIOUS_PRODUCER: &str = "ruled-callgraph-v9-without-ast-index";
+    assert_ne!(PREVIOUS_PRODUCER, PRODUCER);
+    let fixture = Fixture::new();
+    let root = fixture.job_root();
+    let registry = FamilyRegistry::open(fixture._storage.path(), "publication-fixture").unwrap();
+    let owner = registry.register_view("query", &root).unwrap();
+    let access = ViewAccess::Owner(owner.clone());
+    let policy = crate::blob_store::v2::TrigramPolicy {
+        max_file_size: 1 << 20,
+    };
+    let load = || {
+        let trigram = Arc::new(TrigramBridge::new(
+            fixture._storage.path().to_owned(),
+            policy,
+        ));
+        let callgraph = Arc::new(CallgraphBridge::default());
+        let adapters: Vec<Arc<dyn PlaneAdapter>> =
+            vec![trigram.adapter.clone(), callgraph.adapter.clone()];
+        let driver = Arc::new(
+            CheckoutDriver::new(
+                owner.clone(),
+                Producers {
+                    trigram: policy.fingerprint_hex(),
+                    semantic: None,
+                    callgraph: PRODUCER.into(),
+                },
+                None,
+                Arc::new(ConfiguredMembershipWalker),
+                vec![trigram.clone(), callgraph.clone()],
+            )
+            .with_adapters(adapters.clone()),
+        );
+        let loaded = SiblingLoader::new(driver, adapters).load(&access).unwrap();
+        (callgraph, loaded)
+    };
+
+    // Build the checkout's generation, then publish the same files stamped
+    // with the previous producer, as the previous release left it on disk.
+    let (_, built) = load();
+    let views = owner.view_store().unwrap();
+    let built_name = built.snapshot.generation().name().to_string();
+    let mut previous = built.snapshot.generation().manifest().clone();
+    previous.header_mut().producers.callgraph = PREVIOUS_PRODUCER.into();
+    let previous_name = GenerationName::for_manifest(&previous).unwrap();
+    let store = owner.open_store(FamilyPlane::Callgraph).unwrap();
+    // The current build refuses to materialize under another producer, so the
+    // previous generation reuses the database built for the same files.
+    std::fs::copy(
+        views.derived_path(&built_name).unwrap(),
+        views.derived_path(&previous_name.to_string()).unwrap(),
+    )
+    .unwrap();
+    let prepared = views
+        .prepare_v2(&previous_name, Some(&built_name), &previous, None)
+        .unwrap();
+    views.commit_v2(prepared, None).unwrap();
+    let previous_name = previous_name.to_string();
+    assert_eq!(
+        views.current_generation().unwrap().as_deref(),
+        Some(previous_name.as_str())
+    );
+
+    let (callgraph, current) = load();
+    assert!(
+        current.pending_planes.is_empty(),
+        "{:?}",
+        current.pending_planes
+    );
+    let generation = current.snapshot.generation();
+    assert_ne!(generation.name(), previous_name);
+    assert_eq!(generation.manifest().header().producers.callgraph, PRODUCER);
+    assert_eq!(
+        views.current_generation().unwrap().as_deref(),
+        Some(generation.name())
+    );
+    let reader = callgraph
+        .adapter
+        .reader(&access, &current.snapshot)
+        .unwrap();
+    assert!(reader
+        .store
+        .node_for(Path::new("tracked.rs"), "previous")
+        .is_ok());
+
+    // The served database equals a cold build of the new manifest.
+    let cold_dir = tempfile::tempdir().unwrap();
+    let cold = cold_dir.path().join("cold.sqlite");
+    crate::views::callgraph::materialize(&cold, generation.manifest(), &BlobReader(store.reader()))
+        .unwrap();
+    crate::views::materialization::parity::assert_logical_parity(
+        &views.derived_path(generation.name()).unwrap(),
+        &cold,
+    );
+}
+
 #[test]
 fn publication_omits_file_deleted_after_head_listing() {
     let fixture = Fixture::new();

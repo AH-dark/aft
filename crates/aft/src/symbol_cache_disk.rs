@@ -21,7 +21,11 @@ pub const FORMAT_VERSION: u32 = 3;
 /// Bump this whenever symbol-extraction logic changes: tree-sitter grammar
 /// upgrades, query updates, extractor behavior, or symbol shape changes. A
 /// mismatch rejects persisted symbols so they are regenerated on next access.
-pub const SCHEMA_VERSION: u32 = 4;
+///
+/// Version 5: Go type aliases are extracted, specs inside a grouped
+/// `type (...)` declaration get their own ranges, and HTML headings that
+/// share a row no longer get inverted section ranges.
+pub const SCHEMA_VERSION: u32 = 5;
 
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_PATH_BYTES: usize = 16 * 1024;

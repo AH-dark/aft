@@ -30,7 +30,10 @@ use super::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 
 /// Bump when extracted evidence, its encoding or interpretation changes. Version
 /// 9 omits the extraction-only AST index from stored payloads; facts are unchanged.
-pub const PRODUCER: &str = "ruled-callgraph-v9-without-ast-index";
+/// Version 10 stores the parser's corrected symbols: Go type aliases, separate
+/// ranges for specs in a grouped `type (...)` block, and non-inverted ranges for
+/// HTML headings that share a row.
+pub const PRODUCER: &str = "ruled-callgraph-v10-go-alias-and-heading-ranges";
 
 #[derive(Clone, Debug)]
 pub struct CallgraphAttachment {

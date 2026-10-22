@@ -12856,4 +12856,72 @@ mod audit11_regressions {
             "\u{feff}<html>\r\n<h1>C</h1><h1>B</h1>\r\n</html>\r\n".as_bytes()
         );
     }
+
+    /// A disk cache written before Go aliases and grouped type specs got
+    /// their own symbols passes every per-file freshness check, because the
+    /// source is unchanged. Only the extraction schema version can reject it.
+    #[test]
+    fn symbol_cache_written_before_go_alias_extraction_is_rebuilt() {
+        // The symbol-extraction schema version this release replaces.
+        const PREVIOUS_SCHEMA_VERSION: u32 = 4;
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let file = root.join("types.go");
+        let source = "package main\r\ntype (\r\n\tFirst struct{}\r\n\tSecond = First\r\n)\r\n";
+        std::fs::write(&file, source).unwrap();
+        let metadata = std::fs::metadata(&file).unwrap();
+
+        // What the previous extractor stored: no alias, and the grouped spec
+        // ranged over the whole declaration.
+        let mut previous = SymbolCache::new();
+        previous.set_project_root(root.clone());
+        previous.insert(
+            file.clone(),
+            metadata.modified().unwrap(),
+            metadata.len(),
+            blake3::hash(source.as_bytes()),
+            vec![Symbol {
+                name: "First".to_string(),
+                kind: SymbolKind::Struct,
+                range: crate::symbols::Range {
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 4,
+                    end_col: 1,
+                },
+                signature: None,
+                scope_chain: Vec::new(),
+                exported: true,
+                parent: None,
+            }],
+        );
+        symbol_cache_disk::write_to_disk(&previous, storage.path(), "go-alias").unwrap();
+        let cache_file = symbol_cache_disk::cache_path(storage.path(), "go-alias");
+        let mut bytes = std::fs::read(&cache_file).unwrap();
+        // Header: 8-byte magic, then the format and schema versions.
+        bytes[12..16].copy_from_slice(&PREVIOUS_SCHEMA_VERSION.to_le_bytes());
+        std::fs::write(&cache_file, bytes).unwrap();
+
+        let mut cache = SymbolCache::new();
+        cache.set_project_root(root.clone());
+        cache.load_from_disk(storage.path(), "go-alias", &root);
+        let mut parser = FileParser::with_symbol_cache(Arc::new(RwLock::new(cache)));
+        let symbols = parser.extract_symbols(&file).unwrap();
+        let names = symbols
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol.name.as_str(),
+                    symbol.range.start_line,
+                    symbol.range.end_line,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![("First", 2, 2), ("Second", 3, 3)],
+            "{symbols:?}"
+        );
+    }
 }
