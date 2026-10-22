@@ -27,7 +27,7 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
     def workflow(self, name):
         return parser.parse_workflow(str(ROOT / ".github/workflows" / name))
 
-    def test_main_and_train_native_e2e_always_use_stage(self):
+    def test_main_and_train_native_e2e_use_the_staging_selector(self):
         self.assertEqual(self.workflow("tests.yml")["jobs"]["e2e"]["with"]["cargo_profile"], "stage")
         suite = self.workflow("_e2e-suite.yml")
         self.assertEqual(suite["on"]["workflow_call"]["inputs"]["cargo_profile"]["default"], "stage")
@@ -38,6 +38,17 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
             self.assertNotIn("needs", job)
             self.assertEqual(job["if"], "${{ github.event_name != 'pull_request' }}")
             self.assertNotIn("pack-binary", commands(job))
+
+    def test_macos_landing_e2e_uses_debug_without_changing_publication(self):
+        job = self.workflow("_e2e-suite.yml")["jobs"]["e2e-macos"]
+        self.assertEqual(job["env"]["CARGO_PROFILE"], "${{ inputs.cargo_profile == 'stage' && 'dev' || 'release' }}")
+        self.assertEqual(job["env"]["CARGO_PROFILE_DIR"], "${{ inputs.cargo_profile == 'stage' && 'debug' || 'release' }}")
+        self.assertEqual(job["env"]["CARGO_PROFILE_DEV_DEBUG"], "line-tables-only")
+        self.assertIn('cargo build --profile "$CARGO_PROFILE"', commands(job))
+        for command in ('codesign -f -s -', 'codesign --verify --strict', '"target/$CARGO_PROFILE_DIR/aft" --version'):
+            self.assertIn(command, commands(job))
+        run = next(step for step in job["steps"] if step.get("run") == "bash tests/macos-e2e/run.sh")
+        self.assertEqual(run["env"]["AFT_BINARY_PATH"], "${{ github.workspace }}/target/${{ env.CARGO_PROFILE_DIR }}/aft")
 
     def test_every_publish_job_requires_shipped_e2e_on_release_sha(self):
         jobs = self.workflow("release.yml")["jobs"]
