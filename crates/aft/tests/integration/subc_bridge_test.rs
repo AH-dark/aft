@@ -3561,6 +3561,118 @@ fn subc_bridge_bash_watch_regex_pattern_round_trips_validation() {
     );
 }
 
+/// A plugin's bash_watch sends `start` to bash_regex_match. Over subc the
+/// daemon card can be older than the plugin, so the call must reach an older
+/// handler and be answered, not refused. This copy of the handler as released
+/// in v0.62.0 has no `start` field and, like that release, does not deny
+/// unknown fields.
+fn v0_62_bash_regex_match(req: &RawRequest) -> Response {
+    #[derive(serde::Deserialize)]
+    struct Params {
+        pattern: String,
+        text: String,
+    }
+    let raw = req
+        .params
+        .get("params")
+        .cloned()
+        .unwrap_or_else(|| req.params.clone());
+    let params: Params = match serde_json::from_value(raw) {
+        Ok(params) => params,
+        Err(error) => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                format!("bash_regex_match: invalid params: {error}"),
+            )
+        }
+    };
+    let regex = regex::RegexBuilder::new(&params.pattern)
+        .multi_line(true)
+        .build()
+        .expect("test pattern compiles");
+    match regex.find(&params.text) {
+        Some(found) => Response::success(
+            &req.id,
+            json!({
+                "matched": true,
+                "match_text": found.as_str(),
+                "match_offset": found.start(),
+            }),
+        ),
+        None => Response::success(&req.id, json!({ "matched": false })),
+    }
+}
+
+fn older_regex_handler_bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    if req.command == "bash_regex_match" {
+        return v0_62_bash_regex_match(&req);
+    }
+    bridge_dispatch(req, ctx)
+}
+
+async fn call_regex_with_start(stream: &mut tokio::net::TcpStream, corr: u64) -> Value {
+    let reply = call_tool_response(
+        stream,
+        1,
+        corr,
+        "bash_regex_match",
+        json!({ "pattern": "^xREADY", "text": "xREADY", "start": 1 }),
+        "bash_watch regex scan with start",
+    )
+    .await;
+    assert_tool_success(&reply, "bash_watch regex scan with start");
+    reply
+}
+
+async fn drive_regex_start_older_handler_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    let reply = call_regex_with_start(&mut stream, 340).await;
+    // The older handler ignored `start`: it searched from byte 0, where the
+    // context character looks like the start of input, and echoed nothing.
+    // The plugins drop a match reported before `start` for this reason.
+    assert_eq!(reply["matched"], true, "{reply}");
+    assert_eq!(reply["match_offset"], 0, "{reply}");
+    assert!(reply.get("start").is_none(), "{reply}");
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_regex_start_current_handler_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    let reply = call_regex_with_start(&mut stream, 341).await;
+    // The current handler searches from `start`, where ^ sees the real "x".
+    assert_eq!(reply["matched"], false, "{reply}");
+    assert_eq!(reply["start"], 1, "{reply}");
+    send_connection_goodbye(&mut stream).await;
+}
+
+#[test]
+fn subc_bridge_bash_regex_match_start_reaches_an_older_handler_unrefused() {
+    run_subc_bridge_production_test_with_dispatch(
+        "subc_bridge_bash_regex_match_start_reaches_an_older_handler_unrefused",
+        Duration::from_secs(30),
+        drive_regex_start_older_handler_daemon,
+        |_, _, _| {},
+        older_regex_handler_bridge_dispatch,
+    );
+}
+
+#[test]
+fn subc_bridge_bash_regex_match_start_is_honoured_by_the_current_handler() {
+    run_subc_bridge_production_test(
+        "subc_bridge_bash_regex_match_start_is_honoured_by_the_current_handler",
+        Duration::from_secs(30),
+        drive_regex_start_current_handler_daemon,
+        |_, _, _| {},
+    );
+}
+
 #[test]
 fn subc_bridge_bash_nonzero_exit_renders_exit_code() {
     run_subc_bridge_test(
