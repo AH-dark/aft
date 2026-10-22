@@ -505,29 +505,52 @@ fn seeded_row_present(path: &Path) -> bool {
 /// Writes the v3 tree in a child process that is then killed while it holds
 /// the registry open, so `members.sqlite` keeps its `-wal` and `-shm` the way
 /// a running or crashed v3 writer leaves them.
-fn seed_v3(fixture: &Fixture, family: &str) {
+/// Kills and reaps the v3 writer child when dropped, including when a
+/// readiness check panics, so a failed seed never leaves the child parked.
+struct WriterChild(Child);
+
+impl Drop for WriterChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Starts the v3 writer child. With `never_ready` it parks without writing
+/// anything, which only the guard test uses.
+fn spawn_v3_writer(fixture: &Fixture, family: &str, never_ready: bool) -> (WriterChild, PathBuf) {
     let ready = fixture.home.join("v3-writer.ready");
     let mut command = Command::new(std::env::current_exe().unwrap());
     hermetic(&mut command, &fixture.home);
-    let mut child = command
+    command
         .args(["--exact", "v3_isolation::g7_v3_writer_child", "--nocapture"])
         .env("AFT_G7_V3_STORAGE", &fixture.storage)
         .env("AFT_G7_V3_FAMILY", family)
         .env("AFT_G7_V3_READY", &ready)
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + SLACK;
+        .stdout(Stdio::null());
+    if never_ready {
+        command.env("AFT_G7_V3_NEVER_READY", "1");
+    }
+    (WriterChild(command.spawn().unwrap()), ready)
+}
+
+fn wait_until_ready(child: &mut WriterChild, ready: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
     while !ready.exists() {
         assert!(
-            child.try_wait().unwrap().is_none(),
+            child.0.try_wait().unwrap().is_none(),
             "the v3 writer exited before it was ready"
         );
         assert!(Instant::now() < deadline, "the v3 writer never got ready");
         thread::sleep(Duration::from_millis(20));
     }
-    child.kill().unwrap();
-    child.wait().unwrap();
+}
+
+fn seed_v3(fixture: &Fixture, family: &str) {
+    let (mut child, ready) = spawn_v3_writer(fixture, family, false);
+    wait_until_ready(&mut child, &ready, SLACK);
+    // Dropping the guard kills the writer while it holds the registry open.
+    drop(child);
     let v3 = fixture.storage.join("blobs/v3").join(family);
     for name in [
         "members.sqlite",
@@ -554,6 +577,11 @@ fn g7_v3_writer_child() {
     };
     let family = std::env::var("AFT_G7_V3_FAMILY").unwrap();
     let ready = PathBuf::from(std::env::var_os("AFT_G7_V3_READY").unwrap());
+    if std::env::var_os("AFT_G7_V3_NEVER_READY").is_some() {
+        loop {
+            thread::park();
+        }
+    }
     v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
     let missing_root = storage.join("g7-missing-checkout");
     v3::publish(&storage, &family, 1 << 20, None, |publication| {
@@ -615,6 +643,25 @@ fn g7_v3_writer_child() {
     loop {
         thread::park();
     }
+}
+
+/// A seed whose writer never gets ready fails, and the failure still kills
+/// and reaps the writer instead of leaving it parked.
+#[test]
+fn a_seed_that_times_out_kills_its_writer() {
+    let fixture = Fixture::new();
+    let (child, ready) = spawn_v3_writer(&fixture, "0123456789abcdef", true);
+    let pid = child.0.id() as libc::pid_t;
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut child = child;
+        wait_until_ready(&mut child, &ready, Duration::from_secs(1));
+    }));
+    assert!(failed.is_err(), "the never-ready writer reported ready");
+    // The guard reaped the child during the unwind, so its pid is gone; a
+    // live or unreaped (zombie) child would still answer signal 0.
+    // SAFETY: kill with signal 0 only checks whether the pid exists.
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    assert!(!alive, "the writer child {pid} outlived the failed seed");
 }
 
 /// Every entry under `blobs/v3/`, which includes the v3 view-dir root: its
