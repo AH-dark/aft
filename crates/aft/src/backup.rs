@@ -8599,11 +8599,12 @@ mod tests {
     /// Run an undo while the namespace holder never lets go (until its 10 s
     /// backstop), and return the undo's result and how long it took.
     fn undo_against_held_namespace(
-        budget: Option<crate::bounded_io::Budget>,
+        budget: Option<Duration>,
     ) -> (Result<(BackupEntry, Option<String>), AftError>, Duration) {
         let storage = tempfile::tempdir().unwrap();
         let (mut store, path, _key, root_entry) = legacy_root_history_fixture(storage.path());
         let holder = NamespaceHolderAfterRepair::install(storage.path());
+        let budget = budget.map(crate::bounded_io::Budget::after);
         let started = Instant::now();
         let restored = crate::bounded_io::with_budget(budget, || {
             store.restore_latest(DEFAULT_SESSION_ID, &path)
@@ -8645,8 +8646,7 @@ mod tests {
     #[test]
     fn default_session_undo_stops_waiting_for_busy_namespace_within_request_budget() {
         let budget = Duration::from_millis(1_500);
-        let (restored, elapsed) =
-            undo_against_held_namespace(Some(crate::bounded_io::Budget::after(budget)));
+        let (restored, elapsed) = undo_against_held_namespace(Some(budget));
         assert_busy_namespace_undo_error(&restored);
         assert!(
             elapsed < budget,
@@ -8665,8 +8665,7 @@ mod tests {
         // holder's 10 s backstop, so an uncapped wait still ends in the busy
         // error, only later.
         let budget = Duration::from_secs(8);
-        let (restored, elapsed) =
-            undo_against_held_namespace(Some(crate::bounded_io::Budget::after(budget)));
+        let (restored, elapsed) = undo_against_held_namespace(Some(budget));
         assert_busy_namespace_undo_error(&restored);
         assert!(
             elapsed >= NAMESPACE_WAIT_CAP
