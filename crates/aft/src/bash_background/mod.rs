@@ -16,6 +16,7 @@ pub mod registry;
 mod temp_cleanup;
 pub mod watchdog;
 pub mod watches;
+pub(crate) mod worker_thread;
 
 use crate::bash_permissions::PermissionAsk;
 use crate::context::AppContext;
@@ -1327,19 +1328,54 @@ pub(crate) fn spawn(
             {
                 let _ = persistence::delete_resolved_task(task);
             }
-            if message.contains("startup deadline expired") {
-                Response::error(request_id, "bash_start_deadline", message)
-            } else if cleanup_plan.is_native_launcher() {
-                Response::error(
-                    request_id,
-                    "sandbox_unavailable",
-                    format!(
-                        "native sandbox failed before command execution: {message}; select sandbox.profile off to disable native sandboxing"
-                    ),
-                )
-            } else {
-                Response::error(request_id, "execution_failed", message)
-            }
+            execution_error_response(request_id, cleanup_plan.is_native_launcher(), message)
+        }
+    }
+}
+
+fn execution_error_response(request_id: &str, native: bool, message: String) -> Response {
+    if message.starts_with("failed to start PTY reader:")
+        || message.starts_with("failed to start PTY waiter:")
+    {
+        // A failure to create a helper thread does not mean the sandbox failed.
+        // The spawned child may already have executed, so do not claim it never
+        // ran or advise disabling sandbox protection.
+        Response::error(request_id, "internal_error", message)
+    } else if message.contains("startup deadline expired") {
+        Response::error(request_id, "bash_start_deadline", message)
+    } else if native {
+        Response::error(
+            request_id,
+            "sandbox_unavailable",
+            format!("native sandbox failed before command execution: {message}; select sandbox.profile off to disable native sandboxing"),
+        )
+    } else {
+        Response::error(request_id, "execution_failed", message)
+    }
+}
+
+#[cfg(test)]
+mod worker_admission_response_tests {
+    use super::*;
+
+    #[test]
+    fn approved_pty_worker_error_is_not_misreported_as_sandbox_failure() {
+        for native in [true, false] {
+            let response = execution_error_response(
+                "worker-refused",
+                native,
+                "failed to start PTY reader: injected worker admission failure".into(),
+            );
+            let wire = serde_json::to_value(response).unwrap();
+            assert_eq!(wire["code"], "internal_error");
+            assert!(!wire["message"]
+                .as_str()
+                .unwrap()
+                .contains("before command execution"));
+            assert!(!wire["message"]
+                .as_str()
+                .unwrap()
+                .contains("disable native sandboxing"));
         }
     }
 }

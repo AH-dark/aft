@@ -52,8 +52,13 @@ struct BashStatusParams {
     task_id: Option<String>,
     #[serde(default)]
     output_mode: Option<String>,
+    /// Raw transport cursor: pages contain at most 64 KiB. output_next_offset
+    /// advances by bytes actually returned; output_has_more keeps terminal
+    /// pattern watches scanning a captured backlog. PTY byte paging omits
+    /// full-history screen replay; request a screen separately without offsets.
     #[serde(default)]
     output_offset: Option<u64>,
+    /// The stderr page has independent stderr_next_offset/stderr_has_more fields.
     #[serde(default)]
     stderr_offset: Option<u64>,
 }
@@ -177,14 +182,26 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             // so it is added only while the task is not terminal; a terminal
             // task's reply is returned without it.
             let in_flight = !snapshot.info.status.is_terminal();
-            let pty_raw = maybe_render_pty_screen(
-                ctx,
-                task_session,
-                &task_id,
-                &mut snapshot,
-                output_mode.as_deref(),
-                disk_paths.as_ref(),
-            );
+            // A byte-paged read returns only its page below. Rendering the PTY
+            // screen would replay the whole PTY log on every page, so the
+            // screen is skipped and a note says how to request it.
+            let pty_raw = if output_offset.is_some() {
+                if snapshot.info.mode == BgMode::Pty
+                    && !matches!(output_mode.as_deref(), Some("raw"))
+                {
+                    snapshot.pty_screen = Some("[PTY screen omitted while paging raw bytes; request screen mode without output_offset.]".into());
+                }
+                None
+            } else {
+                maybe_render_pty_screen(
+                    ctx,
+                    task_session,
+                    &task_id,
+                    &mut snapshot,
+                    output_mode.as_deref(),
+                    disk_paths.as_ref(),
+                )
+            };
             if snapshot.info.mode == BgMode::Pty && snapshot.info.status.is_terminal() {
                 ctx.bash_background()
                     .append_db_hint(&task_id, &mut snapshot.output_preview);
@@ -229,7 +246,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                     } else {
                         crate::bash_background::persistence::TaskArtifact::Stdout
                     };
-                    match read_status_artifact_range(
+                    match read_status_artifact_page(
                         ctx,
                         disk_paths.as_ref(),
                         &task_id,
@@ -237,10 +254,16 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                         artifact,
                         offset,
                     ) {
-                        Ok((bytes, next)) => {
+                        Ok(page) => {
+                            if mode == BgMode::Pty
+                                && matches!(output_mode.as_deref(), Some("raw" | "both"))
+                            {
+                                data["pty_raw"] = json!(String::from_utf8_lossy(&page.bytes));
+                            }
                             data["output_chunk_base64"] =
-                                json!(base64::engine::general_purpose::STANDARD.encode(bytes));
-                            data["output_next_offset"] = json!(next);
+                                json!(base64::engine::general_purpose::STANDARD.encode(page.bytes));
+                            data["output_next_offset"] = json!(page.next_offset);
+                            data["output_has_more"] = json!(page.has_more);
                         }
                         Err(error) => {
                             return Response::error(
@@ -253,7 +276,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 }
                 if mode == BgMode::Pipes {
                     if let Some(offset) = stderr_offset {
-                        match read_status_artifact_range(
+                        match read_status_artifact_page(
                             ctx,
                             disk_paths.as_ref(),
                             &task_id,
@@ -261,10 +284,12 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                             crate::bash_background::persistence::TaskArtifact::Stderr,
                             offset,
                         ) {
-                            Ok((bytes, next)) => {
+                            Ok(page) => {
                                 data["stderr_chunk_base64"] =
-                                    json!(base64::engine::general_purpose::STANDARD.encode(bytes));
-                                data["stderr_next_offset"] = json!(next);
+                                    json!(base64::engine::general_purpose::STANDARD
+                                        .encode(page.bytes));
+                                data["stderr_next_offset"] = json!(page.next_offset);
+                                data["stderr_has_more"] = json!(page.has_more);
                             }
                             Err(error) => {
                                 return Response::error(
@@ -374,24 +399,34 @@ fn maybe_render_pty_screen(
     }
 }
 
-fn read_status_artifact_range(
+fn read_status_artifact_page(
     ctx: &AppContext,
     disk_paths: Option<&crate::bash_background::persistence::TaskPaths>,
     task_id: &str,
     session: &str,
     artifact: crate::bash_background::persistence::TaskArtifact,
     offset: u64,
-) -> Result<(Vec<u8>, u64), String> {
+) -> Result<crate::bash_background::registry::ArtifactPage, String> {
     let Some(paths) = disk_paths else {
         return ctx
             .bash_background()
-            .read_artifact_range(task_id, session, artifact, offset);
+            .read_artifact_page(task_id, session, artifact, offset);
     };
     let read = || -> std::io::Result<_> {
         let mut file = crate::bash_background::persistence::open_task_artifact(paths, artifact)?;
         let len = file.len()?;
         let start = offset.min(len);
-        Ok((file.read_range(start, len - start)?, len))
+        let requested = len
+            .saturating_sub(start)
+            .min(crate::bash_background::registry::ARTIFACT_PAGE_BYTES as u64);
+        let bytes = file.read_range(start, requested)?;
+        let next_offset = start + bytes.len() as u64;
+        let has_more = bytes.len() as u64 == requested && !bytes.is_empty() && next_offset < len;
+        Ok(crate::bash_background::registry::ArtifactPage {
+            bytes,
+            next_offset,
+            has_more,
+        })
     };
     read().map_err(|error| format!("artifact_refused: {error}"))
 }

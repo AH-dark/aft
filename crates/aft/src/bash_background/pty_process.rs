@@ -8,7 +8,6 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use portable_pty::PtySize;
 
@@ -308,6 +307,8 @@ fn try_spawn_pty(
     let killer = child.child.as_ref().unwrap().clone_killer();
     #[cfg(test)]
     fail_pty_setup_for_test(child_pid)?;
+    #[cfg(test)]
+    observe_pty_setup_for_test(child_pid);
     let reader = child
         .master
         .as_ref()
@@ -345,14 +346,16 @@ fn try_spawn_pty(
         Arc::clone(&reader_eof),
         Arc::clone(&coordinator),
         Some(Arc::clone(&writer)),
-    );
+    )
+    .map_err(|error| format!("failed to start PTY reader: {error}"))?;
     spawn_waiter(
         child.child.take().unwrap(),
         exit,
         Arc::clone(&was_killed),
         Arc::clone(&exit_observed),
         Arc::clone(&coordinator),
-    );
+    )
+    .map_err(|error| format!("failed to start PTY waiter: {error}"))?;
 
     Ok(PtyRuntime {
         master: child.master.take(),
@@ -372,6 +375,25 @@ fn try_spawn_pty(
 #[cfg(test)]
 thread_local! {
     static SETUP_FAILURE: std::cell::RefCell<Option<(std::path::PathBuf, Arc<std::sync::atomic::AtomicU32>)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static SETUP_OBSERVATION: std::cell::RefCell<Option<(std::path::PathBuf, Arc<std::sync::atomic::AtomicU32>)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn observe_pty_setup_for_test(pid: Option<u32>) {
+    SETUP_OBSERVATION.with(|observation| {
+        if let Some((ready, observed)) = observation.borrow_mut().take() {
+            observed.store(pid.unwrap(), Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(ready.exists(), "PTY child never armed its HUP handler");
+        }
+    });
 }
 
 #[cfg(test)]
@@ -403,8 +425,8 @@ pub(crate) fn spawn_reader(
     reader_eof: Arc<AtomicBool>,
     coordinator: Arc<CompletionCoordinator>,
     writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
-) {
-    thread::spawn(move || {
+) -> io::Result<()> {
+    super::worker_thread::spawn(super::worker_thread::Worker::PtyReader, move || {
         let result = (|| -> io::Result<()> {
             let mut buf = [0_u8; 8192];
             let mut dsr = DsrScanner::default();
@@ -449,7 +471,7 @@ pub(crate) fn spawn_reader(
         reader_eof.store(result.is_ok(), Ordering::SeqCst);
         reader_done.store(true, Ordering::SeqCst);
         coordinator.signal_one_done();
-    });
+    })
 }
 
 /// Test gates that hold a PTY reader after it reached end-of-file and before
@@ -517,9 +539,9 @@ pub(crate) fn spawn_waiter(
     was_killed: Arc<AtomicBool>,
     exit_observed: Arc<AtomicBool>,
     coordinator: Arc<CompletionCoordinator>,
-) {
+) -> io::Result<()> {
     let mut owned_child = SpawnedPtyChild::new(child);
-    thread::spawn(move || {
+    super::worker_thread::spawn(super::worker_thread::Worker::PtyWaiter, move || {
         let mut child = owned_child.child.take().unwrap();
         let marker = loop {
             match child.wait() {
@@ -552,7 +574,7 @@ pub(crate) fn spawn_waiter(
         drop(exit_file);
         exit_observed.store(true, Ordering::SeqCst);
         coordinator.signal_one_done();
-    });
+    })
 }
 
 fn write_exit_marker(file: &mut File, marker: &ExitMarker) -> io::Result<()> {
@@ -655,7 +677,8 @@ mod tests {
             was_killed,
             Arc::clone(&exit_observed),
             Arc::clone(&coordinator),
-        );
+        )
+        .unwrap();
         coordinator.signal_one_done();
 
         let started = Instant::now();
@@ -860,4 +883,67 @@ fn lifecycle_pty_setup_failure_terminates_and_reaps_child() {
     }
     assert!(result.is_err());
     assert!(!alive, "fallible PTY setup abandoned a live child");
+}
+
+#[cfg(all(test, unix))]
+fn approved_pty_worker_admission_failure(worker: super::worker_thread::Worker) {
+    use super::persistence::{create_task_layout, BgMode};
+    let dir = tempfile::tempdir().unwrap();
+    let layout = create_task_layout(dir.path(), "session", "bash-0000000000000010").unwrap();
+    let mut handles = TaskIoHandles::create(&layout, BgMode::Pty, false).unwrap();
+    let pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    SETUP_OBSERVATION.with(|observation| {
+        *observation.borrow_mut() = Some((dir.path().join("ready"), pid.clone()))
+    });
+    let mut spawned_pgid = None;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::worker_thread::with_refusal(worker, || {
+            try_spawn_pty(
+                &SpawnPlan::Unsandboxed,
+                "bash-0000000000000010",
+                "session",
+                std::ffi::OsStr::new("/bin/sh"),
+                &["-c".into(), "trap '' HUP; : > ready; sleep 30".into()],
+                &layout.paths,
+                dir.path(),
+                &HashMap::new(),
+                24,
+                80,
+                crossbeam_channel::unbounded().0,
+                &mut handles,
+                &mut spawned_pgid,
+            )
+        })
+    }));
+    let pid = pid.load(Ordering::SeqCst);
+    assert_ne!(pid, 0, "refusal did not reach a spawned child");
+    let alive = super::process::is_process_alive(pid);
+    if alive {
+        super::process::terminate_pgid(pid as i32, None);
+    }
+    assert!(!alive, "worker refusal abandoned a live child");
+    assert!(
+        result.is_ok(),
+        "worker admission panicked instead of returning an error"
+    );
+    let error = result
+        .unwrap()
+        .err()
+        .expect("worker refusal must reject the spawn");
+    assert!(
+        error.contains("injected worker admission failure"),
+        "admission failure lost its cause: {error}"
+    );
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn approved_pty_reader_admission_failure_returns_error_and_reaps_child() {
+    approved_pty_worker_admission_failure(super::worker_thread::Worker::PtyReader);
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn approved_pty_waiter_admission_failure_returns_error_and_reaps_child() {
+    approved_pty_worker_admission_failure(super::worker_thread::Worker::PtyWaiter);
 }
