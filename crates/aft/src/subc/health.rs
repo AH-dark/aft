@@ -1700,9 +1700,10 @@ const HEALTH_ALLOCATOR_MAX_AGE_MS: u64 = 30_000;
 /// uncapped row for every actor root, and only `memory.census` reads it; the
 /// compact memory figures in the health reply are measured on every rollup.
 /// A read asks the next rollup for a fresh census, and a read that finds the
-/// census older than one rollup interval wakes the rollup and waits for it
-/// (see [`fresh_memory_census`]), so readers get figures at most one rollup
-/// old.
+/// census older than one rollup interval (`HEALTH_ROLLUP_TTL`) wakes the
+/// rollup and waits for a census measured after it (see
+/// [`fresh_memory_census`]). Only if none is published before the request's
+/// deadline does the read get the older census, with its age.
 const HEALTH_MEMORY_CENSUS_INTERVAL_MS: u64 = 30_000;
 /// How long a `memory.census` request may take when its body names no
 /// `deadline_ms`: the default call timeout of the subc client the census
