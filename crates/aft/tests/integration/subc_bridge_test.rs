@@ -8429,7 +8429,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         format!("project:{}", root1.to_string_lossy())
     );
     let fixtures: Value = serde_json::from_str(include_str!(
-        "../../../../.cortexkit/status-line-fixtures-2026-08-14.json"
+        "../fixtures/status_line/status-line-fixtures-2026-08-14.json"
     ))
     .expect("status line producer fixtures");
     send_frame(

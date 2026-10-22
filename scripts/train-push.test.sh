@@ -1430,6 +1430,30 @@ expect_rc 2 "a missing path-dependency checker refuses"
 expect_out "scripts/check-path-deps.py not found" "the refusal names the missing checker"
 expect_no_out "dependency path resolves outside" "a missing checker is not reported as a path verdict"
 
+# --- refusal: an ignored file is tracked under .cortexkit/ -----------------
+dir="$(new_fixture cortexkit-tracked)"
+printf '/.cortexkit/*\n!/.cortexkit/WORKER.md\n' > "$dir/work/.gitignore"
+mkdir -p "$dir/work/.cortexkit/alfonso/drafts"
+echo "worker guide" > "$dir/work/.cortexkit/WORKER.md"
+echo "private draft" > "$dir/work/.cortexkit/alfonso/drafts/plan.md"
+git -C "$dir/work" add .gitignore .cortexkit/WORKER.md
+git -C "$dir/work" add -f .cortexkit/alfonso/drafts/plan.md
+git -C "$dir/work" commit -qm "track a private draft"
+add_train_commit "$dir/work" "cortexkit-tracked"
+main_before="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+run_train "$dir" cortexkit-tracked
+expect_rc 2 "a tracked ignored file under .cortexkit refuses"
+expect_out ".cortexkit/alfonso/drafts/plan.md" "the refusal lists the tracked ignored file"
+expect_out "ignored files are tracked under .cortexkit/" "the refusal names the reason"
+expect_no_out ".cortexkit/WORKER.md" "a re-included tracked file is not listed"
+# A train that got through would push train/cortexkit-tracked and then land it
+# on main (deleting the train ref), so check both refs.
+if [ -z "$(origin_ref "$dir" refs/heads/train/cortexkit-tracked)" ] && [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$main_before" ]; then
+  ok "nothing is pushed or landed when a private file is tracked"
+else
+  fail "a train with a tracked private file was pushed or landed"
+fi
+
 # --- refusal: no train name ------------------------------------------------
 dir="$(new_fixture usage)"
 run_train "$dir"

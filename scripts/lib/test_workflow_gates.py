@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import re
+import subprocess
+import tempfile
 import unittest
 
 
@@ -454,6 +457,96 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn("python3 scripts/check-path-deps.py", conformance)
         self.assertIn("cargo build -p agent-file-tools", conformance)
         self.assertIn("AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft", conformance)
+
+
+class CortexkitTrackingGateTests(unittest.TestCase):
+    """Private .cortexkit/ files must never be tracked, and CI must say so."""
+
+    ROOT = Path(__file__).resolve().parents[2]
+    SCRIPT = ROOT / "scripts/check-cortexkit-tracking.sh"
+    # Hide the user's and system's Git config so a personal global excludes
+    # file cannot change what the fixture repository ignores.
+    GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+
+    def _git(self, repo: Path, *args: str) -> None:
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=self.GIT_ENV)
+
+    def _check(self, repo: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(self.SCRIPT), str(repo)],
+            capture_output=True, text=True, check=False, env=self.GIT_ENV,
+        )
+
+    def _fixture(self, root: Path) -> Path:
+        """A fresh repository carrying this checkout's real .gitignore.
+
+        A fresh `git init` has no local excludes, so it sees exactly what a CI
+        clone sees: only the committed ignore rules.
+        """
+        repo = root / "repo"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        (repo / ".gitignore").write_text((self.ROOT / ".gitignore").read_text())
+        return repo
+
+    def test_landing_policy_job_runs_the_cortexkit_tracking_check(self) -> None:
+        workflow = workflow_gates.parse_workflow(str(self.ROOT / ".github/workflows/tests.yml"))
+        steps = workflow["jobs"]["landing-policy"]["steps"]
+        matches = [step for step in steps if step.get("run") == "scripts/check-cortexkit-tracking.sh"]
+        self.assertEqual(len(matches), 1, "Landing policy must run the .cortexkit tracking check once")
+        self.assertNotIn("if", matches[0], "the tracking check must run on every Landing policy event")
+        self.assertNotIn("continue-on-error", matches[0])
+
+    def test_committed_ignore_rules_keep_private_cortexkit_files_out(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._fixture(Path(tmp))
+
+            def ignored(path: str) -> bool:
+                result = subprocess.run(
+                    ["git", "-C", str(repo), "check-ignore", "-q", "--no-index", path],
+                    check=False, env=self.GIT_ENV,
+                )
+                self.assertIn(result.returncode, (0, 1), path)
+                return result.returncode == 0
+
+            for path in (
+                ".cortexkit/alfonso/drafts/plan.md",
+                ".cortexkit/alfonso/reports/audit.md",
+                ".cortexkit/internal-docs/investigations/note.md",
+                ".cortexkit/scripts/tool.sh",
+                ".cortexkit/new-private-folder/file.txt",
+            ):
+                with self.subTest(private=path):
+                    self.assertTrue(ignored(path))
+            for path in (
+                ".cortexkit/release-notes/v1.0.0.md",
+                ".cortexkit/skills/example/SKILL.md",
+                ".cortexkit/rules/example.md",
+                ".cortexkit/WORKER.md",
+                ".cortexkit/aft.jsonc",
+            ):
+                with self.subTest(shared=path):
+                    self.assertFalse(ignored(path))
+
+    def test_check_fails_listing_a_force_added_file_and_passes_once_untracked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._fixture(Path(tmp))
+            draft = repo / ".cortexkit/alfonso/drafts/plan.md"
+            draft.parent.mkdir(parents=True)
+            draft.write_text("private\n")
+            (repo / ".cortexkit/WORKER.md").write_text("guide\n")
+            self._git(repo, "add", ".gitignore", ".cortexkit/WORKER.md")
+            self._git(repo, "add", "-f", ".cortexkit/alfonso/drafts/plan.md")
+
+            red = self._check(repo)
+            self.assertEqual(red.returncode, 1, red.stdout + red.stderr)
+            self.assertIn(".cortexkit/alfonso/drafts/plan.md", red.stderr)
+            self.assertNotIn(".cortexkit/WORKER.md", red.stderr)
+
+            self._git(repo, "rm", "--cached", "-q", ".cortexkit/alfonso/drafts/plan.md")
+            green = self._check(repo)
+            self.assertEqual(green.returncode, 0, green.stdout + green.stderr)
+            self.assertTrue(draft.exists(), "git rm --cached must keep the working copy")
 
 
 if __name__ == "__main__":

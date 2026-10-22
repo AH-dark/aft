@@ -7,7 +7,7 @@ scratch="$(mktemp -d "${TMPDIR:-/tmp}/aft-search-mutate.XXXXXX")"
 cleanup() { git -C "$root" worktree remove --force "$scratch" >/dev/null 2>&1 || true; rm -rf "$scratch"; }
 trap cleanup EXIT
 git -C "$root" worktree add --detach "$scratch" "$ref" >/dev/null
-spec=.cortexkit/alfonso/drafts/2026-09-09-aft-search-quality-b1-real-query-benchmark-manifest-gate-baseline-and-remeasure.md
+spec=benchmarks/aft-search/B1.md
 sha=30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17
 run_red() {
   local name="$1" output status applied

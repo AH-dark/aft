@@ -82,6 +82,22 @@ smoke-tests/
 .aft-windows-vm
 benchmarks/aft-search/.bench/
 
+# .cortexkit/ holds private CortexKit working files (drafts, reports, scratch,
+# agent state). Git tracks only the shared parts listed below; the Landing
+# policy CI job and train-push.sh run scripts/check-cortexkit-tracking.sh,
+# which fails if any other file under .cortexkit/ is tracked.
+/.cortexkit/*
+!/.cortexkit/release-notes/
+!/.cortexkit/skills/
+!/.cortexkit/rules/
+!/.cortexkit/WORKER.md
+# Project configuration that AFT and the other CortexKit tools read from the
+# checkout, plus the ignore file that keeps magic-context state out of Git.
+!/.cortexkit/.gitignore
+!/.cortexkit/aft.jsonc
+!/.cortexkit/magic-context.jsonc
+!/.cortexkit/prefrontal.jsonc
+
 # Local investigations can contain private corpus questions, reports and paths.
 /.cortexkit/internal-docs/
 
