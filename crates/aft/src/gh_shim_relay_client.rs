@@ -531,19 +531,77 @@ trait ExchangeIo {
 struct SubcExchangeIo<'a> {
     consumer: &'a SubcConsumer,
     route: &'a subc_client_rs::RouteHandle,
+    #[cfg(test)]
+    clock: Option<TestExchangeClock>,
 }
 
 impl ExchangeIo for SubcExchangeIo<'_> {
     fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            return clock.now();
+        }
         Instant::now()
     }
 
     async fn sleep(&self, delay: Duration) {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            clock.advance(delay);
+            return;
+        }
         tokio::time::sleep(delay).await;
     }
 
     async fn request(&self, bytes: Vec<u8>, options: CallOptions) -> Result<Vec<u8>, CallError> {
-        self.consumer.request(self.route, bytes, options).await
+        #[cfg(test)]
+        let sent = Instant::now();
+        let result = self.consumer.request(self.route, bytes, options).await;
+        #[cfg(test)]
+        if let (Some(clock), Err(_)) = (&self.clock, &result) {
+            clock.advance(sent.elapsed());
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test to run [`route`]'s exchange on a [`TestExchangeClock`]
+    /// on this thread, still against the real subc consumer.
+    static USE_TEST_EXCHANGE_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// An exchange clock for tests that drive the real subc consumer, so how
+/// long the runner takes to deliver an answered reply cannot decide whether
+/// a retry fits in the budget. A reply that arrives takes no time on it; a
+/// retry sleep moves it by the sleep without waiting; a request that fails,
+/// such as one the consumer gave up on at its timeout, moves it by the real
+/// time the consumer waited. It starts at the first reading, which is after
+/// the exchange's start.
+#[cfg(test)]
+struct TestExchangeClock {
+    now: std::cell::Cell<Option<Instant>>,
+}
+
+#[cfg(test)]
+impl TestExchangeClock {
+    fn for_this_thread() -> Option<Self> {
+        USE_TEST_EXCHANGE_CLOCK
+            .with(std::cell::Cell::get)
+            .then(|| Self {
+                now: std::cell::Cell::new(None),
+            })
+    }
+
+    fn now(&self) -> Instant {
+        let now = self.now.get().unwrap_or_else(Instant::now);
+        self.now.set(Some(now));
+        now
+    }
+
+    fn advance(&self, by: Duration) {
+        self.now.set(Some(self.now() + by));
     }
 }
 
@@ -945,6 +1003,8 @@ pub(super) fn route(
                 io: &SubcExchangeIo {
                     consumer: &consumer,
                     route: &route,
+                    #[cfg(test)]
+                    clock: TestExchangeClock::for_this_thread(),
                 },
                 ticket: &ticket,
                 stage: &stage,

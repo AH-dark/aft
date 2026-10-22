@@ -66,6 +66,41 @@ const POLICY: Policy = Policy {
 };
 pub(crate) const PASS_BUDGET: Duration = Duration::from_secs(1);
 
+/// The clock a pass measures its time budget against: the monotonic clock,
+/// unless a test on this thread has frozen it with [`freeze_clock`].
+fn now() -> Instant {
+    #[cfg(test)]
+    if let Some(frozen) = FROZEN_CLOCK.with(std::cell::Cell::get) {
+        return frozen;
+    }
+    Instant::now()
+}
+
+#[cfg(test)]
+thread_local! {
+    static FROZEN_CLOCK: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Stops the reclaim clock on the calling thread until the returned guard is
+/// dropped. A pass started meanwhile never runs out of its time budget, so a
+/// test that checks the page cap or the step size gets the same count on a
+/// slow runner as on a fast one. Passes on other threads are unaffected.
+#[cfg(test)]
+pub(crate) fn freeze_clock() -> FrozenClock {
+    FROZEN_CLOCK.with(|clock| clock.set(Some(Instant::now())));
+    FrozenClock(())
+}
+
+#[cfg(test)]
+pub(crate) struct FrozenClock(());
+
+#[cfg(test)]
+impl Drop for FrozenClock {
+    fn drop(&mut self) {
+        FROZEN_CLOCK.with(|clock| clock.set(None));
+    }
+}
+
 /// Free pages one [`reclaim_all_free_pages`] pass returns at most: 64 MiB at
 /// the usual 4 KiB page size.
 pub(crate) const ALL_FREE_PAGES_MAX_PAGES: u64 = 16_384;
@@ -108,8 +143,8 @@ fn reclaim_with_policy(
     policy: Policy,
 ) -> rusqlite::Result<ReclaimReport> {
     let deadline = deadline
-        .unwrap_or_else(|| Instant::now() + PASS_BUDGET)
-        .min(Instant::now() + PASS_BUDGET);
+        .unwrap_or_else(|| now() + PASS_BUDGET)
+        .min(now() + PASS_BUDGET);
     // Reclaim must not inherit a writer's multi-second busy wait. The caller
     // owns this connection exclusively for the duration of the pass.
     let timeout: u64 = connection.pragma_query_value(None, "busy_timeout", |r| r.get(0))?;
@@ -126,7 +161,7 @@ fn reclaim_inner(
     policy: Policy,
 ) -> rusqlite::Result<ReclaimReport> {
     let mut report = ReclaimReport::default();
-    let stop = || Instant::now() >= deadline || cancelled();
+    let stop = || now() >= deadline || cancelled();
     if stop() {
         report.deferred = true;
         return Ok(report);
