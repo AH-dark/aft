@@ -1496,6 +1496,8 @@ pub(crate) fn dir_identity(path: &Path) -> Option<DirIdentity> {
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
+    // A deep storage or cache path is past the plain-path limit of CreateFileW.
+    let path = crate::windows_path::win32_call_path(path);
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call;
     // the remaining arguments are plain flags and null pointers, and the

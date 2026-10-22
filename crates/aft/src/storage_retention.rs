@@ -986,7 +986,8 @@ fn device(path: &Path) -> Option<u64> {
             filesystem_length: u32,
         ) -> i32;
     }
-    let path = path
+    // A deep cache parent is past the plain-path limit of GetVolumePathNameW.
+    let path = crate::windows_path::win32_call_path(path)
         .as_os_str()
         .encode_wide()
         .chain(Some(0))
