@@ -1,0 +1,23 @@
+name: Configure Defender for disposable Windows CI
+description: Avoid rescanning compiler outputs and extracted test binaries on GitHub-hosted Windows runners
+runs:
+  using: composite
+  steps:
+    - name: Exclude CI build and test paths from Defender
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        # Do not change persistent machines or developer antivirus settings.
+        if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
+          throw 'Defender tuning is restricted to disposable GitHub-hosted Windows runners'
+        }
+        $paths = @(
+          $env:GITHUB_WORKSPACE
+          $env:TEMP
+          $env:RUNNER_TEMP
+          (Join-Path $env:USERPROFILE '.cargo')
+        ) | Where-Object { $_ } | Sort-Object -Unique
+        Add-MpPreference -ExclusionPath $paths
+        Set-MpPreference -DisableRealtimeMonitoring $true
+        Write-Host "Defender exclusions: $($paths -join '; ')"
+        Get-MpComputerStatus | Select-Object AntivirusEnabled, RealTimeProtectionEnabled
