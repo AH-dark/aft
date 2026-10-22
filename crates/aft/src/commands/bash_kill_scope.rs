@@ -96,6 +96,13 @@ pub(crate) fn handle_bash_kill_scope_with_saved_tasks(
             }
         }
     }
+    // Recovered remote tasks have no worker yet. Start them only now that
+    // their pause is recorded: each worker then cancels a job the runner
+    // already holds, or withholds a resubmission or local fallback, and
+    // records that outcome, which the loop below waits for.
+    for registry in &recovered {
+        registry.start_held_remote_workers();
+    }
     if kill_error.is_none() {
         for (registry, index) in remote_tasks {
             let task = &mut killed[index];

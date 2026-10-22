@@ -1974,14 +1974,24 @@ impl BgTaskRegistry {
                         .as_str()
                         .unwrap_or("unknown")
                         .to_owned();
-                    return self.restored_remote_fallback(
+                    let result = self.restored_remote_fallback(
                         &task,
                         &remote,
                         &reason,
                         refusal_detail.as_deref(),
                     );
+                    // An owner pause recorded before this worker started already
+                    // ended the task, and the fallback above declined to launch.
+                    // The runner refused the job, so withholding the local run
+                    // is the whole cancellation; record it, as `bash.kill_scope`
+                    // waits for it.
+                    self.settle_owner_pause_without_resubmit(&task);
+                    return result;
                 }
                 self.remote_terminal(&task, exec::grade(record), None);
+                // The runner had already finished the job; there is nothing
+                // left to cancel for an owner pause recorded before this worker.
+                self.settle_owner_pause_without_resubmit(&task);
                 return Ok(());
             }
         }
