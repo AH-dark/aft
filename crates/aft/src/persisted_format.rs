@@ -336,7 +336,13 @@ struct StorageRoot {
     spelling: PathBuf,
     canonical: PathBuf,
     /// Resolve parent aliases but keep the root's own link as a logical boundary.
-    boundary: Option<PathBuf>,
+    boundary: Option<RegisteredBoundary>,
+}
+
+#[derive(Debug)]
+struct RegisteredBoundary {
+    path: PathBuf,
+    normalized_spelling: Option<PathBuf>,
 }
 
 fn absolute_route(path: &Path) -> PathBuf {
@@ -371,6 +377,8 @@ thread_local! { static ROOT_RESOLUTIONS: std::cell::Cell<usize> = const { std::c
 thread_local! { static CANONICAL_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 #[cfg(test)]
 thread_local! { static BOUNDARY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+thread_local! { static ALIAS_VERIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 fn storage_root(path: &Path) -> std::sync::Arc<StorageRoot> {
     let spelling = absolute_route(path);
@@ -398,14 +406,14 @@ fn storage_root(path: &Path) -> std::sync::Arc<StorageRoot> {
     // the uncached identity when the cache is full.
     if roots.len() >= 128 {
         drop(roots);
-        let boundary = registered_boundary(&spelling).ok();
+        let boundary = registered_boundary(&spelling, &canonical).ok();
         return std::sync::Arc::new(StorageRoot {
             canonical,
             spelling,
             boundary,
         });
     }
-    let (boundary, warning) = match registered_boundary(&spelling) {
+    let (boundary, warning) = match registered_boundary(&spelling, &canonical) {
         Ok(boundary) => (Some(boundary), None),
         Err(error) => (None, Some(error)),
     };
@@ -430,14 +438,30 @@ fn storage_root(path: &Path) -> std::sync::Arc<StorageRoot> {
 /// Resolve aliases above a declared root, leaving the root's own link lexical.
 /// New cached registrations and explicit uncached queries call this once when
 /// constructing their identity; warm registration never calls it.
-fn registered_boundary(spelling: &Path) -> std::io::Result<PathBuf> {
+fn registered_boundary(spelling: &Path, canonical: &Path) -> std::io::Result<RegisteredBoundary> {
     #[cfg(test)]
     BOUNDARY_READS.with(|count| count.set(count.get() + 1));
     let observed = match (spelling.parent(), spelling.file_name()) {
         (Some(parent), Some(leaf)) => std::fs::canonicalize(parent).map(|parent| parent.join(leaf)),
         _ => std::fs::canonicalize(spelling),
     };
-    observed.map(|boundary| crate::inspect::job::normalize_path(&boundary))
+    let path = crate::inspect::job::normalize_path(&observed?);
+    let normalized = crate::inspect::job::normalize_path(spelling);
+    // Lexical '..' cancellation is a direct spelling only when registration
+    // proves it still reaches this root, rather than crossing a symlink parent.
+    let normalized_spelling = if normalized != spelling {
+        #[cfg(test)]
+        ALIAS_VERIFICATIONS.with(|count| count.set(count.get() + 1));
+        std::fs::canonicalize(&normalized)
+            .is_ok_and(|path| crate::inspect::job::normalize_path(&path) == canonical)
+            .then_some(normalized)
+    } else {
+        None
+    };
+    Ok(RegisteredBoundary {
+        path,
+        normalized_spelling,
+    })
 }
 
 /// Cache an owner's root identity, never its cache-directory targets. Warm or
@@ -482,10 +506,16 @@ impl RouteProbe {
         if self.path.starts_with(&root.canonical) {
             return self.finish(root, &root.canonical);
         }
-        root.boundary
-            .as_ref()
-            .filter(|boundary| self.path.starts_with(boundary))
-            .and_then(|boundary| self.finish(root, boundary))
+        let boundary = root.boundary.as_ref()?;
+        if let Some(spelling) = boundary.normalized_spelling.as_ref() {
+            if self.path.starts_with(spelling) {
+                return self.finish(root, spelling);
+            }
+        }
+        if self.path.starts_with(&boundary.path) {
+            return self.finish(root, &boundary.path);
+        }
+        None
     }
 
     fn alias_could_outrank(
@@ -505,7 +535,7 @@ impl RouteProbe {
                 [
                     spelling.as_path(),
                     root.canonical.as_path(),
-                    boundary.as_path(),
+                    boundary.path.as_path(),
                 ]
                 .into_iter()
                 .any(|prefix| {
@@ -568,18 +598,38 @@ fn owning_route(
         })
         .min_by_key(|(remaining, _, _)| *remaining);
     if let Some(mut selected) = direct {
-        for root in roots {
-            if probe.direct(root).is_some()
-                || !probe.alias_could_outrank(root, &selected.2, selected.0)
-            {
-                continue;
-            }
-            if let Some(key) = probe.under(root) {
-                let remaining = key.strip_prefix(&root.canonical).ok()?.components().count();
-                if remaining < selected.0 {
-                    selected = (remaining, root.clone(), key);
+        loop {
+            let projected = RouteProbe::new(&selected.2);
+            let mut next = None;
+            for root in roots {
+                // Project the selected key (canonical root plus lexical child)
+                // against other registered roots before probing aliases. This
+                // joins /var and /private/var parent spellings without resolving
+                // cache links below the owner.
+                let key = projected.direct(root).or_else(|| {
+                    if probe.direct(root).is_none()
+                        && probe.alias_could_outrank(root, &selected.2, selected.0)
+                    {
+                        probe.under(root)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(key) = key {
+                    let remaining = key.strip_prefix(&root.canonical).ok()?.components().count();
+                    if remaining < selected.0
+                        && next.as_ref().is_none_or(|(best, _, _)| remaining < *best)
+                    {
+                        next = Some((remaining, root.clone(), key));
+                    }
                 }
             }
+            // Each step shortens the normalized child route, so projections
+            // through multiple registered roots cannot cycle.
+            let Some(more_specific) = next else {
+                break;
+            };
+            selected = more_specific;
         }
         return Some((selected.1, selected.2));
     }
@@ -1140,7 +1190,129 @@ mod tests {
     #[test]
     fn uncached_nested_floor_queries_do_no_resolution_after_their_explicit_root_probe() {
         if !isolated_owner_probe("persisted_format::tests::uncached_nested_floor_queries_do_no_resolution_after_their_explicit_root_probe") { return; }
-        let (fixture, outer, inner, _artifact) = nested_storage_roots();
+        uncached_nested_floor_probe(nested_storage_roots());
+    }
+
+    #[test]
+    fn uncached_roots_behind_a_symlinked_parent_do_no_post_query_resolution() {
+        if !isolated_owner_probe("persisted_format::tests::uncached_roots_behind_a_symlinked_parent_do_no_post_query_resolution") { return; }
+        let fixture = tempfile::tempdir().unwrap();
+        let backing = fixture.path().join("real-parent");
+        let parent_alias = fixture.path().join("parent-alias");
+        std::fs::create_dir_all(backing.join("outer/padding")).unwrap();
+        std::fs::create_dir_all(backing.join("other-disk/semantic/key")).unwrap();
+        directory_alias(&backing, &parent_alias);
+        directory_alias(&backing.join("other-disk"), &backing.join("outer/inner"));
+        let outer = parent_alias.join("outer/padding/..");
+        let inner = parent_alias.join("outer/inner");
+        let artifact = inner.join("semantic/key/cache.bin");
+        std::fs::write(&artifact, b"artifact").unwrap();
+        uncached_nested_floor_probe((fixture, outer, inner, artifact));
+    }
+
+    #[test]
+    fn normalized_registered_spellings_must_reach_the_same_root() {
+        let fixture = tempfile::tempdir().unwrap();
+        let a = fixture.path().join("storage-a");
+        let b = fixture.path().join("storage-b");
+        std::fs::create_dir_all(a.join("semantic/key")).unwrap();
+        std::fs::create_dir_all(b.join("child")).unwrap();
+        directory_alias(&b.join("child"), &a.join("link"));
+        let through_parent = a.join("link/..");
+        let identity = storage_root(&through_parent);
+        let path = a.join("semantic/key/cache.bin");
+        std::fs::write(&path, b"artifact").unwrap();
+        let store = PersistedStore::SemanticIndex;
+        if identity.canonical == canonical_scope(&a) {
+            // Some path APIs collapse junction parents before following links.
+            // In that case the normalized spelling really is the same root.
+            assert_eq!(
+                identity
+                    .boundary
+                    .as_ref()
+                    .unwrap()
+                    .normalized_spelling
+                    .as_ref(),
+                Some(&crate::inspect::job::normalize_path(&through_parent))
+            );
+            let floor = UnsupportedPersistedFormat::floor(
+                store,
+                through_parent.join("reader-floor.json"),
+                99,
+            );
+            record(&floor, &through_parent);
+            assert_eq!(gate(store, &path, &path, Some(1)), Err(floor));
+            return;
+        }
+        assert_eq!(identity.canonical, canonical_scope(&b));
+        assert!(
+            identity
+                .boundary
+                .as_ref()
+                .unwrap()
+                .normalized_spelling
+                .is_none(),
+            "lexically cancelling a symlink parent must not invent a direct alias for another root"
+        );
+        let b_floor =
+            UnsupportedPersistedFormat::floor(store, through_parent.join("reader-floor.json"), 100);
+        let a_floor = UnsupportedPersistedFormat::floor(store, a.join("reader-floor.json"), 99);
+        record(&b_floor, &through_parent);
+        record(&a_floor, &a);
+        assert_eq!(gate(store, &path, &path, Some(1)), Err(a_floor));
+    }
+
+    #[test]
+    fn cached_roots_behind_a_symlinked_parent_match_both_spellings_without_probes() {
+        if !isolated_owner_probe("persisted_format::tests::cached_roots_behind_a_symlinked_parent_match_both_spellings_without_probes") { return; }
+        let fixture = tempfile::tempdir().unwrap();
+        let backing = fixture.path().join("real-parent");
+        let alias = fixture.path().join("parent-alias");
+        std::fs::create_dir_all(backing.join("storage/padding")).unwrap();
+        std::fs::create_dir_all(backing.join("storage/semantic/key")).unwrap();
+        directory_alias(&backing, &alias);
+        let registered = alias.join("storage/padding/..");
+        let artifact = alias.join("storage/semantic/key/cache.bin");
+        std::fs::write(&artifact, b"artifact").unwrap();
+        let canonical = std::fs::canonicalize(&artifact).unwrap();
+        let floor = UnsupportedPersistedFormat::floor(
+            PersistedStore::SemanticIndex,
+            registered.join("reader-floor.json"),
+            99,
+        );
+        record(&floor, &registered);
+        let before = (
+            CANONICAL_PROBES.with(|count| count.get()),
+            BOUNDARY_READS.with(|count| count.get()),
+        );
+        let aliases_before = ALIAS_VERIFICATIONS.with(|count| count.get());
+        assert_eq!(aliases_before, 1);
+        register_storage_root(&registered);
+        for path in [&artifact, &canonical] {
+            assert_eq!(
+                gate(PersistedStore::SemanticIndex, path, path, Some(1)),
+                Err(floor.clone())
+            );
+            assert_eq!(
+                refusal_covering(PersistedStore::SemanticIndex, path),
+                Some(floor.clone())
+            );
+        }
+        let after = (
+            CANONICAL_PROBES.with(|count| count.get()),
+            BOUNDARY_READS.with(|count| count.get()),
+        );
+        assert_eq!(
+            after, before,
+            "cached aliases must be normalized before ordinary comparisons"
+        );
+        ALIAS_VERIFICATIONS.with(|count| assert_eq!(count.get(), aliases_before));
+        assert_eq!(floor.path, registered.join("reader-floor.json"));
+    }
+
+    fn uncached_nested_floor_probe(
+        (fixture, outer, inner, _artifact): (tempfile::TempDir, PathBuf, PathBuf, PathBuf),
+    ) {
         for index in 0..140 {
             register_storage_root(&fixture.path().join(format!("registered-{index}")));
         }
@@ -1151,6 +1323,7 @@ mod tests {
         let direct_artifact = inner.join("semantic/key/cache.bin");
         CANONICAL_PROBES.with(|count| count.set(0));
         BOUNDARY_READS.with(|count| count.set(0));
+        ALIAS_VERIFICATIONS.with(|count| count.set(0));
         register_storage_root(&outer);
         register_storage_root(&alias_inner);
         CANONICAL_PROBES.with(|count| assert_eq!(count.get(), 0));
@@ -1166,6 +1339,11 @@ mod tests {
             CANONICAL_PROBES.with(|count| count.get()),
             BOUNDARY_READS.with(|count| count.get()),
         );
+        let aliases_before = ALIAS_VERIFICATIONS.with(|count| count.get());
+        assert_eq!(
+            aliases_before, 1,
+            "the equivalent normalized root spelling is verified once during identity setup"
+        );
         assert_eq!(
             before,
             (2, 2),
@@ -1180,10 +1358,18 @@ mod tests {
             CANONICAL_PROBES.with(|count| count.get()),
             BOUNDARY_READS.with(|count| count.get()),
         );
+        eprintln!(
+            "uncached artifact route: {direct_artifact:?}; owner identities: {:?}",
+            with_registry(|entries| entries
+                .iter()
+                .filter_map(|entry| entry.root.clone())
+                .collect::<Vec<_>>())
+        );
         assert_eq!(
             after, before,
             "beyond-cap gate/clear must not add I/O after the explicit query probes"
         );
+        ALIAS_VERIFICATIONS.with(|count| assert_eq!(count.get(), aliases_before));
         assert_eq!(storage_roots().read().unwrap().len(), 128);
     }
 
