@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -303,7 +304,7 @@ class CISpeedWorkflowTests(unittest.TestCase):
             for job in unit["jobs"].values()
             for step in job.get("steps", [])
         ]
-        self.assertEqual(uses.count("./.github/actions/setup-nextest"), 13)
+        self.assertEqual(uses.count("./.github/actions/setup-nextest"), 14)
         shard = workflow_gates.parse_workflow(str(github / "actions/integration-shard/action.yml"))
         self.assertEqual(
             sum(step.get("uses") == "./.github/actions/setup-nextest" for step in shard["runs"]["steps"]),
@@ -404,6 +405,61 @@ class RustPRAdvisoryWorkflowTests(unittest.TestCase):
             suite["jobs"]["unit-windows-watcher"]["if"],
             "${{ github.event_name != 'pull_request' }}",
         )
+
+
+class LinuxUnitWorkflowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        self.jobs = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))["jobs"]
+
+    def test_linux_archive_covers_units_and_proves_the_uploaded_inventory(self) -> None:
+        archive = self.jobs["unit-linux-nextest-archive"]
+        commands = "\n".join(step.get("run", "") for step in archive["steps"])
+        self.assertIn("(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)", commands)
+        proof = next(step for step in archive["steps"] if step.get("run") == "python3 scripts/rust-test-inventory-proof.py")
+        self.assertEqual(proof["env"]["AFT_NEXTEST_ARCHIVE_FILE"], "${{ runner.temp }}/linux-nextest.tar.zst")
+        for probe in ("platform_verifier_tls_client_subprocess", "panic_hook_preserves_default_backtrace_behavior_and_persists"):
+            steps = [step for step in archive["steps"] if probe in step.get("run", "")]
+            self.assertEqual(len(steps), 1)
+            self.assertIn('cargo nextest run --archive-file "$LINUX_NEXTEST_ARCHIVE"', steps[0]["run"])
+            self.assertNotIn("--partition", steps[0]["run"])
+
+    def test_linux_unit_shards_only_execute_archive_partitions(self) -> None:
+        shard = self.jobs["unit-linux-libtest-shard"]
+        self.assertEqual(shard["needs"], "unit-linux-nextest-archive")
+        self.assertEqual(shard["strategy"]["matrix"]["shard"], ["1", "2", "3"])
+        self.assertEqual(shard["strategy"]["fail-fast"], "false")
+        self.assertEqual(shard["runs-on"], "ubuntu-24.04")
+        gate = next(step for step in shard["steps"] if step.get("run") == "./scripts/rust-test-gate.sh")
+        self.assertEqual(gate["env"]["AFT_GATE_PHASES"], "lib-shard")
+        self.assertEqual(gate["env"]["AFT_UNIT_TEST_RUNNER"], "nextest")
+        self.assertEqual(gate["env"]["AFT_NEXTEST_PARTITION"], "hash:${{ matrix.shard }}/3")
+        self.assertEqual(gate["env"]["AFT_NEXTEST_ARCHIVE_FILE"], "${{ runner.temp }}/linux-nextest.tar.zst")
+        download = next(step for step in shard["steps"] if step.get("uses") == "./.github/actions/download-artifact-retry")
+        self.assertEqual(download["with"]["name"], "linux-nextest-archive")
+
+    def test_required_linux_check_aggregates_shards_and_preserves_isolated_phases(self) -> None:
+        summary = self.jobs["unit-linux-summary"]
+        self.assertEqual(summary["name"], "Unit tests (Linux)")
+        self.assertEqual(summary["if"], "${{ always() && github.event_name != 'pull_request' }}")
+        self.assertEqual(set(summary["needs"]), {
+            "unit-linux", "unit-linux-nextest-archive", "unit-linux-libtest-shard",
+            "unit-linux-nextest", "unit-linux-nextest-2", "unit-linux-nextest-3",
+        })
+        check = next(step for step in summary["steps"] if "needs" in step.get("env", {}).get("NEEDS", ""))
+        self.assertIn("result", check["run"])
+        self.assertIn("success", check["run"])
+        for result in ("success", "failure", "cancelled", "skipped"):
+            with self.subTest(result=result):
+                needs = {name: {"result": "success"} for name in summary["needs"]}
+                needs["unit-linux-libtest-shard"]["result"] = result
+                proc = subprocess.run(
+                    ["bash", "-c", check["run"]], capture_output=True, text=True,
+                    env={**os.environ, "NEEDS": json.dumps(needs)},
+                )
+                self.assertEqual(proc.returncode == 0, result == "success", proc.stdout + proc.stderr)
+        gate = next(step for step in self.jobs["unit-linux"]["steps"] if step.get("run") == "./scripts/rust-test-gate.sh")
+        self.assertEqual(gate["env"]["AFT_GATE_PHASES"], "watcher,conformance")
 
 
 class WindowsUnitWorkflowTests(unittest.TestCase):
