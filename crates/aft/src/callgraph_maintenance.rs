@@ -130,6 +130,10 @@ pub(crate) struct CallgraphReconcileState {
     running: AtomicBool,
     last: parking_lot::Mutex<Option<CallgraphReconcileOutcome>>,
     completed: AtomicU64,
+    #[cfg(all(test, target_os = "linux"))]
+    finished_at: parking_lot::Mutex<Option<std::time::Instant>>,
+    #[cfg(test)]
+    hold: parking_lot::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl CallgraphReconcileState {
@@ -143,6 +147,10 @@ impl CallgraphReconcileState {
     pub(crate) fn pending_reason(&self) -> Option<String> {
         let pending = self.pending.lock();
         (!pending.is_empty()).then(|| pending.join(", "))
+    }
+
+    pub(crate) fn outstanding(&self) -> bool {
+        !self.pending.lock().is_empty() || self.running.load(Ordering::SeqCst)
     }
 
     /// Take the pending request and mark a reconcile as running. Returns None
@@ -173,6 +181,10 @@ impl CallgraphReconcileState {
 
     fn finish(&self, outcome: CallgraphReconcileOutcome) {
         *self.last.lock() = Some(outcome);
+        #[cfg(all(test, target_os = "linux"))]
+        {
+            *self.finished_at.lock() = Some(std::time::Instant::now());
+        }
         self.completed.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -182,6 +194,21 @@ impl CallgraphReconcileState {
 
     pub(crate) fn completed(&self) -> u64 {
         self.completed.load(Ordering::SeqCst)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn finished_at_for_test(&self) -> std::time::Instant {
+        self.finished_at.lock().expect("comparison finished")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.hold.lock() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
     }
 }
 
@@ -194,6 +221,10 @@ pub(crate) struct CallgraphReconcileOwnership {
 }
 
 impl CallgraphReconcileOwnership {
+    pub(crate) fn startup_only(&self) -> bool {
+        self.reasons.len() == 1 && self.reasons[0] == "startup"
+    }
+
     fn finish(&mut self, outcome: CallgraphReconcileOutcome) {
         self.state.finish(outcome);
         self.finished = true;
@@ -238,6 +269,14 @@ impl CallgraphReconcileJob {
             enqueue_refresh,
         } = self;
         let reason = ownership.reasons.join(", ");
+        #[cfg(test)]
+        {
+            let hold = ownership.state.hold.lock().take();
+            if let Some((entered, release)) = hold {
+                let _ = entered.send(());
+                let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+            }
+        }
         let report = match CallGraphStore::open_readonly(callgraph_dir, project_root.clone()) {
             Ok(Some(store)) => store.reconcile_with_disk(max_examined),
             Ok(None) => {

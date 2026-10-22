@@ -1994,7 +1994,7 @@ fn scaling_fixture_path(index: usize) -> String {
 /// and a class from other modules, declares a class with two methods, and
 /// makes direct, imported and method calls, so every graph table (nodes,
 /// refs, edges, dependencies, dispatch hints) grows with the file count.
-fn write_scaling_fixture(root: &Path, files: usize) -> Vec<PathBuf> {
+pub(crate) fn write_scaling_fixture(root: &Path, files: usize) -> Vec<PathBuf> {
     (0..files)
         .map(|index| {
             let other = (index * 7 + 3) % files;

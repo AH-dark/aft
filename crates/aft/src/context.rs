@@ -1977,6 +1977,8 @@ pub(crate) struct WatcherDrainSliceState {
 pub struct CallgraphUnappliedChanges {
     /// Files whose changes the root's call-graph store has not applied.
     pub store_paths: BTreeSet<String>,
+    /// A disk comparison has not yet established which store files changed.
+    pub whole_store: bool,
     /// Files whose changes the checkout's published view has not installed.
     pub view_paths: BTreeSet<String>,
     /// The view is republishing the whole checkout, so which files changed
@@ -1986,7 +1988,10 @@ pub struct CallgraphUnappliedChanges {
 
 impl CallgraphUnappliedChanges {
     pub fn is_empty(&self) -> bool {
-        self.store_paths.is_empty() && self.view_paths.is_empty() && !self.whole_checkout
+        self.store_paths.is_empty()
+            && self.view_paths.is_empty()
+            && !self.whole_checkout
+            && !self.whole_store
     }
 }
 
@@ -6626,6 +6631,18 @@ impl AppContext {
             };
         }
         let project_root = self.callgraph_project_root();
+        if !self.config().views.enabled && self.callgraph_writer() {
+            // Capture the comparison before its downstream refresh queue. The
+            // first query can itself install the reused reader, so an unopened
+            // configured store also needs a conservative whole-store gap.
+            changes.whole_store = self.callgraph_reconcile.outstanding()
+                || (self.configure_generation() > 0
+                    && self
+                        .callgraph_store
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_none());
+        }
         let mut store_paths: BTreeSet<PathBuf> = self.pending_callgraph_store_paths.lock().clone();
         #[cfg(test)]
         pending_capture_boundary_for_test(PendingCaptureBoundary::BeforeWorkerQueue);
@@ -9590,13 +9607,12 @@ impl AppContext {
         let Some(ownership) = self.callgraph_reconcile.begin() else {
             return false;
         };
-        // Until the reconcile's refresh settles, the store may miss edits the
-        // watcher never reported; queries answer `Building` meanwhile. The
-        // guard travels with the refresh batch, or is dropped with the job
-        // when there is nothing to refresh.
-        let catch_up = self.callgraph_catch_up.begin();
+        // Startup keeps serving the last published graph with pending gaps.
+        // Other catch-ups retain their existing bounded-wait contract.
+        let catch_up: Option<crate::callgraph_store::RefreshKeepalive> =
+            (!ownership.startup_only()).then(|| self.callgraph_catch_up.begin() as _);
         let enqueue_refresh: Box<dyn FnOnce(Vec<PathBuf>) + Send> =
-            Box::new(move |paths| enqueue_refresh(paths, Some(catch_up)));
+            Box::new(move |paths| enqueue_refresh(paths, catch_up));
         let job = crate::callgraph_maintenance::CallgraphReconcileJob {
             ownership,
             callgraph_dir: self.callgraph_store_dir(),
@@ -10719,11 +10735,6 @@ impl AppContext {
             // or delaying configure's bind reply.
             self.request_callgraph_reconcile("startup");
             self.start_pending_callgraph_reconcile();
-            if self.callgraph_reconcile.pending_reason().is_some()
-                || self.callgraph_catch_up.outstanding()
-            {
-                return CallgraphStoreAccess::Building;
-            }
         }
         self.clear_callgraph_store_build_denied();
         self.schedule_legacy_callgraph_migration_if_needed(
@@ -17227,6 +17238,256 @@ mod callgraph_store_for_ops_tests {
             .expect("decision log")
     }
 
+    fn restarted_callgraph_context() -> ([TempDir; 2], Arc<AppContext>) {
+        let (dirs, first) = cold_build_context();
+        published_callgraph_for_log_test(&first);
+        let config = first.config().as_ref().clone();
+        drop(first);
+        let restarted = Arc::new(AppContext::new(Box::new(TreeSitterProvider::new()), config));
+        restarted.advance_configure_generation();
+        (dirs, restarted)
+    }
+
+    fn finalized_restart_callers(ctx: &AppContext) -> crate::protocol::Response {
+        let request: RawRequest = serde_json::from_value(json!({
+            "id": "restart-callers", "command": "callers",
+            "file": ctx.callgraph_project_root().unwrap().join("src/lib.rs"), "symbol": "callee"
+        }))
+        .unwrap();
+        let (watcher, pending) = crate::response_finalize::query_pending(ctx, "callers");
+        let mut response = crate::commands::callers::handle_callers(&request, ctx);
+        crate::response_finalize::attach_watcher_query_gap(&mut response, watcher);
+        crate::response_finalize::attach_callgraph_pending_gaps(&mut response, pending.as_ref());
+        response
+    }
+
+    fn wait_for_restart_comparison(ctx: &AppContext) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ctx.callgraph_reconcile.completed() == 0 || ctx.callgraph_reconcile.outstanding() {
+            assert!(
+                Instant::now() < deadline,
+                "startup comparison did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn startup_reconcile_immediate_restart_answers_and_clears_incomplete() {
+        let (_dirs, ctx) = restarted_callgraph_context();
+        let _wait = force_async_callgraph_builds(&ctx);
+        let (entered, release) = ctx.callgraph_reconcile.hold_next_for_test();
+        let response = finalized_restart_callers(&ctx);
+        assert!(
+            response.success,
+            "the first query must serve the reused graph: {response:?}"
+        );
+        assert_eq!(response.data["total_callers"], 1);
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("held startup comparison");
+        drop(release);
+        wait_for_restart_comparison(&ctx);
+        let response = finalized_restart_callers(&ctx);
+        assert!(response.success, "{response:?}");
+        assert_ne!(
+            response.data["complete"], false,
+            "an unchanged comparison must clear the gap: {response:?}"
+        );
+        assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 0);
+    }
+
+    #[test]
+    #[ignore = "manual 60,000-file startup reconciliation measurement"]
+    #[cfg(target_os = "linux")]
+    fn measure_startup_reconcile_on_sixty_thousand_files() {
+        let (dirs, first) = cold_build_context();
+        let root = first.callgraph_project_root().unwrap();
+        std::fs::remove_file(root.join("src/lib.rs")).unwrap();
+        let file_count = std::env::var("AFT_STARTUP_RECONCILE_FILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(60_000);
+        let files = crate::callgraph_store::perf_tests::write_scaling_fixture(&root, file_count);
+        let dir = first.callgraph_store_dir();
+        crate::root_cache::configure_artifact_access(
+            &root,
+            dir.file_name().unwrap().to_str().unwrap(),
+            false,
+        );
+        let build_started = Instant::now();
+        let (store, _) =
+            CallGraphStore::cold_build_with_lease_chunked(dir, root.clone(), &files, 100).unwrap();
+        let generation = store.sqlite_path().to_path_buf();
+        println!(
+            "startup measurement preparation: files={} cold_build_ms={}",
+            files.len(),
+            build_started.elapsed().as_millis()
+        );
+        drop(store);
+        let mut config = first.config().as_ref().clone();
+        config.indexes.trigram = false;
+        config.indexes.semantic = false;
+        config.views.enabled = false;
+        config.project_root = None;
+        drop(first);
+        let ctx = Arc::new(AppContext::new(Box::new(TreeSitterProvider::new()), config));
+        let request: RawRequest = serde_json::from_value(json!({
+            "id": "measure-bind", "command": "configure", "project_root": root,
+            "storage_dir": dirs[1].path(), "harness": "opencode",
+            "config": [{"tier": "user", "source": "/u/aft.jsonc", "doc": json!({
+                "indexes": {"trigram": false, "semantic": false, "callgraph": true},
+                "views": {"enabled": false}
+            }).to_string()}]
+        }))
+        .unwrap();
+        let bind_started = Instant::now();
+        let response = crate::commands::configure::handle_configure(&request, &ctx);
+        let bind_wall = bind_started.elapsed();
+        assert!(response.success, "{response:?}");
+        // Bind timing is separate from the comparison: use a fresh legacy
+        // reader context, without running unrelated configure-tail workers.
+        let config = ctx.config().as_ref().clone();
+        drop(ctx);
+        let ctx = Arc::new(AppContext::new(Box::new(TreeSitterProvider::new()), config));
+        ctx.advance_configure_generation();
+        assert!(
+            !ctx.config().views.enabled,
+            "measurement must use the legacy store"
+        );
+        println!(
+            "startup measurement paths: store={} original={}",
+            ctx.callgraph_store_dir().display(),
+            generation.display()
+        );
+        let _wait = force_async_callgraph_builds(&ctx);
+        let (entered, release) = ctx.callgraph_reconcile.hold_next_for_test();
+        let access_started = Instant::now();
+        let reader = match ctx.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(reader) => reader,
+            CallgraphStoreAccess::Building => panic!("published graph unexpectedly Building"),
+            CallgraphStoreAccess::Off => panic!("callgraph unexpectedly configured off"),
+            CallgraphStoreAccess::Unavailable => panic!(
+                "callgraph unexpectedly unavailable; heavy={} writer={}",
+                ctx.heavy_root_work_allowed(),
+                ctx.callgraph_writer()
+            ),
+            CallgraphStoreAccess::Suspended(reason) => panic!("callgraph suspended: {reason:?}"),
+            CallgraphStoreAccess::Error(error) => panic!("callgraph open failed: {error}"),
+        };
+        let install_wall = access_started.elapsed();
+        assert_eq!(reader.sqlite_path(), generation);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let held_read_started = Instant::now();
+        reader
+            .callers_of(Path::new("src/m0000/f000.ts"), "f0a", 1)
+            .unwrap();
+        let held_read_wall = held_read_started.elapsed();
+        let io_before = std::fs::read_to_string("/proc/self/io").unwrap();
+        let scan_started = Instant::now();
+        drop(release);
+        let mut read_us = Vec::new();
+        while ctx.callgraph_reconcile.outstanding() {
+            let started = Instant::now();
+            let CallgraphStoreAccess::Ready(reader) = ctx.callgraph_store_for_ops() else {
+                panic!("scan blocked published graph access")
+            };
+            reader
+                .callers_of(Path::new("src/m0000/f000.ts"), "f0a", 1)
+                .unwrap();
+            read_us.push(started.elapsed().as_micros());
+            assert!(
+                scan_started.elapsed() < Duration::from_secs(120),
+                "comparison timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let scan_wall = ctx
+            .callgraph_reconcile
+            .finished_at_for_test()
+            .duration_since(scan_started);
+        let io_after = std::fs::read_to_string("/proc/self/io").unwrap();
+        let outcome = ctx.callgraph_reconcile.last().unwrap();
+        assert!(matches!(
+            outcome.action,
+            crate::callgraph_maintenance::CallgraphReconcileAction::Unchanged
+        ));
+        let report = outcome.report.unwrap();
+        assert_eq!(report.examined_files, file_count);
+        assert_eq!(report.hashed_files, file_count);
+        assert_eq!(report.changed_count(), 0);
+        assert!(!ctx.pending_changes_for_query(true).callgraph.whole_store);
+        read_us.sort_unstable();
+        println!("startup measurement: bind_us={} install_us={} held_read_us={} scan_ms={} examined={} hashed={} changed={} read_samples={} read_p50_us={} read_max_us={}",
+            bind_wall.as_micros(), install_wall.as_micros(), held_read_wall.as_micros(), scan_wall.as_millis(),
+            report.examined_files, report.hashed_files, report.changed_count(), read_us.len(),
+            read_us[read_us.len()/2], read_us.last().unwrap());
+        println!("startup process io before:\n{io_before}startup process io after:\n{io_after}");
+    }
+
+    #[test]
+    fn startup_reconcile_held_comparison_serves_incomplete_then_names_changed_files() {
+        let (_dirs, ctx) = restarted_callgraph_context();
+        let _wait = force_async_callgraph_builds(&ctx);
+        let root = ctx.callgraph_project_root().unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn caller() { callee(); }\npub fn callee() {}\npub fn offline() { callee(); }\n",
+        )
+        .unwrap();
+        let held_writer = crate::fs_lock::try_acquire(
+            &crate::root_cache::writer_lease_path(&ctx.callgraph_store_dir()),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let (entered, release) = ctx.callgraph_reconcile.hold_next_for_test();
+        // Install the reused generation before capturing pending state, so the
+        // held-job assertion also covers queries after the first one.
+        let _ = ctx.callgraph_store_for_ops();
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("held startup comparison");
+        let response = finalized_restart_callers(&ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["total_callers"], 1);
+        assert_eq!(response.data["complete"], false, "{response:?}");
+        assert!(
+            response.data["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["kind"] == "callgraph_pending"
+                    && gap["reason"] == "file changes not yet applied to the call graph"),
+            "{response:?}"
+        );
+        let mut notice = String::new();
+        crate::response_finalize::append_callgraph_pending_notice(&mut notice, &response);
+        assert!(
+            notice.contains("Call graph update pending for this checkout:"),
+            "{notice}"
+        );
+        drop(release);
+        wait_for_restart_comparison(&ctx);
+        let response = finalized_restart_callers(&ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["complete"], false, "{response:?}");
+        assert!(names_pending_file(&response, "src/lib.rs"), "{response:?}");
+        drop(held_writer);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let response = finalized_restart_callers(&ctx);
+            if response.data["complete"] != false {
+                assert_eq!(response.data["total_callers"], 2, "{response:?}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "refresh did not settle: {response:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn callgraph_cold_build_logs_pointer_missing() {
         let (_dirs, ctx) = cold_build_context();
@@ -17239,14 +17500,14 @@ mod callgraph_store_for_ops_tests {
         let (_dirs, ctx) = cold_build_context();
         let path = published_callgraph_for_log_test(&ctx);
         let conn = rusqlite::Connection::open(path).unwrap();
-        conn.execute("UPDATE meta SET v = '0' WHERE k = 'schema_version'", [])
+        conn.execute("UPDATE meta SET v = '1' WHERE k = 'schema_version'", [])
             .unwrap();
         drop(conn);
         let log = capture_cold_build_decision(&ctx);
         for expected in [
             "reason=fingerprint or schema stale;",
-            "stored_schema=0;",
-            "current_schema=1;",
+            "stored_schema=1;",
+            "current_schema=2;",
         ] {
             assert!(log.contains(expected), "missing {expected}: {log}");
         }
@@ -17302,6 +17563,15 @@ mod callgraph_store_for_ops_tests {
             [other.path().to_str().unwrap()],
         )
         .unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE meta SET v = ?1 WHERE k = 'workspace_roots'",
+                [json!([other.path().to_str().unwrap()]).to_string()],
+            )
+            .unwrap(),
+            1,
+            "schema-two root metadata must match the conflicting file rows"
+        );
         drop(conn);
         let (_, lines) = crate::logging::capture_log_lines(|| {
             CallGraphStore::open_ready_repairing(

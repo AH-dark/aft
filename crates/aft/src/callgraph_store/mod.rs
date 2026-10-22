@@ -1622,7 +1622,7 @@ mod dispatch_narrowing_tests;
 mod incremental_parity;
 
 #[cfg(test)]
-mod perf_tests;
+pub(crate) mod perf_tests;
 #[cfg(test)]
 pub(crate) mod position_identity_tests;
 mod refresh_wal;
