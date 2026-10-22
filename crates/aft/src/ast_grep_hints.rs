@@ -166,32 +166,68 @@ fn has_regex_escape(src: &str) -> bool {
     false
 }
 
-/// `[a-z]` / `[0-9]` / `[A-Za-z0-9]` — character class with at least one
-/// `lo-hi` range. We deliberately accept `arr[0]`, `map["key"]`, and
-/// meta-var indexing because none of those have a `-` between alphanumerics
-/// inside `[...]`.
+/// Recognize compact regex ranges, not subtraction inside an AST subscript.
+/// A receiver followed by a terminal index is valid code even when the index
+/// resembles a range; only unmistakable character-class shapes warrant advice.
 fn has_char_class_range(src: &str) -> bool {
     let bytes = src.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'[' {
-            // Scan up to the matching `]`. If we find `X-Y` where both X and Y
-            // are alphanumeric ASCII, that's a regex character-class range.
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j] != b']' {
-                if j + 2 < bytes.len()
-                    && bytes[j + 1] == b'-'
-                    && is_ascii_alnum(bytes[j])
-                    && is_ascii_alnum(bytes[j + 2])
-                {
-                    return true;
-                }
-                j += 1;
-            }
-            i = j + 1;
-        } else {
+        if bytes[i] != b'[' {
             i += 1;
+            continue;
         }
+        let Some(close) = bytes[i + 1..]
+            .iter()
+            .position(|byte| *byte == b']')
+            .map(|pos| i + 1 + pos)
+        else {
+            break;
+        };
+        let prefix = src[..i].trim_end();
+        let suffix = src[close + 1..].trim_start();
+        let receiver = prefix
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| is_ascii_word(*byte) || matches!(byte, b')' | b']'));
+        let subscript_tail = suffix.is_empty()
+            || suffix.as_bytes().first().is_some_and(|byte| {
+                matches!(byte, b'.' | b'[' | b')' | b']' | b',' | b';' | b'=' | b'}')
+            });
+        if receiver && subscript_tail {
+            i = close + 1;
+            continue;
+        }
+        let mut j = i + 1;
+        if bytes.get(j) == Some(&b'^') {
+            j += 1;
+        }
+        let mut range = false;
+        let mut valid = true;
+        while j < close {
+            if j + 2 < close && bytes[j + 1] == b'-' {
+                let a = bytes[j];
+                let b = bytes[j + 2];
+                let same_family = (a.is_ascii_lowercase() && b.is_ascii_lowercase())
+                    || (a.is_ascii_uppercase() && b.is_ascii_uppercase())
+                    || (a.is_ascii_digit() && b.is_ascii_digit());
+                if !same_family || a > b {
+                    valid = false;
+                    break;
+                }
+                range = true;
+                j += 3;
+            } else if is_ascii_alnum(bytes[j]) || bytes[j] == b'_' {
+                j += 1;
+            } else {
+                valid = false;
+                break;
+            }
+        }
+        if valid && range {
+            return true;
+        }
+        i = close + 1;
     }
     false
 }
@@ -692,5 +728,28 @@ mod tests {
         assert!(!name_only_meta_var("$NAME($$$)"));
         assert!(!name_only_meta_var("$NAME { $$$ }"));
         assert!(!name_only_meta_var("$NAME<T>"));
+    }
+}
+
+#[cfg(test)]
+mod approved_audit11 {
+    use super::*;
+
+    #[test]
+    fn subtraction_subscripts_do_not_get_character_class_hints() {
+        for pattern in [
+            "arr[i-1]",
+            "$A[$I-1]",
+            "arr[x-y]",
+            "arr[index-1]",
+            "arr[i - 1]",
+            "arr[0-9]",
+            "[i-1]",
+        ] {
+            assert!(detect_regex_misuse(pattern).is_none(), "{pattern}");
+        }
+        for pattern in ["[a-z]", "[0-9]", "[A-Za-z0-9]", "[a-z]+", "foo[a-z]bar"] {
+            assert!(detect_regex_misuse(pattern).is_some(), "{pattern}");
+        }
     }
 }

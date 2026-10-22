@@ -28257,6 +28257,10 @@ edition = "2021"
                 "ruled-callgraph-v6-manifest-root-reexport-resolution",
                 crate::views::callgraph::PRODUCER,
             ),
+            (
+                "ruled-callgraph-v9-without-ast-index",
+                crate::views::callgraph::PRODUCER,
+            ),
         ] {
             let old = CallgraphKey::from_bytes(source, "go", old_version).full_key();
             store

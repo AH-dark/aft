@@ -216,15 +216,25 @@ fn php_snippet_selector(pattern: &str) -> Result<String, PatternError> {
 
 fn pascal_pattern_is_declaration(pattern: &str) -> bool {
     let trimmed = pattern.trim_start().to_lowercase();
-    trimmed.starts_with("program")
-        || trimmed.starts_with("unit")
-        || trimmed.starts_with("procedure")
-        || trimmed.starts_with("function")
-        || trimmed.starts_with("constructor")
-        || trimmed.starts_with("destructor")
-        || trimmed.starts_with("type")
-        || trimmed.starts_with("const")
-        || trimmed.starts_with("var")
+    [
+        "program",
+        "unit",
+        "procedure",
+        "function",
+        "constructor",
+        "destructor",
+        "type",
+        "const",
+        "var",
+    ]
+    .iter()
+    .any(|keyword| {
+        trimmed.strip_prefix(keyword).is_some_and(|rest| {
+            rest.chars()
+                .next()
+                .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+        })
+    })
 }
 
 fn pascal_snippet_selector(pattern: &str) -> Result<String, PatternError> {
@@ -848,5 +858,52 @@ helper();
             !result.contains('$'),
             "Should not contain $ after preprocessing"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit11_regressions {
+    use super::*;
+
+    #[test]
+    fn pascal_declaration_keywords_have_identifier_boundaries() {
+        for expression in [
+            "variable := 1;",
+            "typeinfo(x);",
+            "functionality(x);",
+            "unit_test();",
+        ] {
+            assert!(!pascal_pattern_is_declaration(expression), "{expression}");
+        }
+        for declaration in ["var x: integer;", "FUNCTION Foo;", "type T = integer;"] {
+            assert!(pascal_pattern_is_declaration(declaration), "{declaration}");
+        }
+        let source = "\u{feff}program Demo;\r\nvar variable: Integer;\r\nbegin\r\n  variable := 1;\r\nend.\r\n";
+        let lang = AstGrepLang::Pascal;
+        let pattern = lang.compile_pattern("variable := 1;").unwrap();
+        let grep = lang.ast_grep(source);
+        let edits = grep.root().replace_all(&pattern, "variable := 2");
+        assert_eq!(edits.len(), 1);
+        let mut rewritten = source.as_bytes().to_vec();
+        for edit in edits {
+            rewritten.splice(
+                edit.position..edit.position + edit.deleted_length,
+                edit.inserted_text,
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let config = crate::config::Config {
+            format_on_edit: false,
+            ..Default::default()
+        };
+        crate::edit::write_format_validate(
+            &path,
+            std::str::from_utf8(&rewritten).unwrap(),
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), "\u{feff}program Demo;\r\nvar variable: Integer;\r\nbegin\r\n  variable := 2;\r\nend.\r\n".as_bytes());
     }
 }

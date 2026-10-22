@@ -890,7 +890,10 @@ fn outline_structure_entries(
         let source = crate::parser::read_source(path).map_err(|error| AftError::FileNotFound {
             path: format!("{}: {error}", path.display()),
         })?;
-        let (tree, _) = parser.parse_cloned(path)?;
+        // Parse the bytes just read so test regions are located in the same
+        // source they are sliced from, even if the file changed since the
+        // symbols were extracted.
+        let tree = crate::parser::parse_source_with_cached_parser(path, &source, lang)?;
         captured = (source, tree);
         (captured.0.as_str(), &captured.1)
     };
@@ -6434,5 +6437,55 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
         );
         eprintln!("microseconds per outline operation: {micros_per_operation:?}");
         eprintln!("median: {median}us per outline operation");
+    }
+}
+
+#[cfg(test)]
+mod audit11_regressions {
+    use super::*;
+
+    /// The parser's tree cache treats an equal-size, equal-mtime file as
+    /// unchanged. Test regions must still be located in the bytes outline just
+    /// read, not in a cached tree of the file's earlier contents.
+    #[test]
+    fn structure_entries_parse_the_source_they_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("product.rs");
+        let earlier = "#[cfg(test)]\r\nmod checks { fn case() {} }\r\npub fn product() {}\r\n";
+        let current = "pub fn product() {}\r\n#[cfg(test)]\r\nmod checks { fn case() {} }\r\n";
+        assert_eq!(earlier.len(), current.len());
+        let mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+
+        std::fs::write(&path, earlier).unwrap();
+        filetime::set_file_mtime(&path, mtime).unwrap();
+        let mut parser = FileParser::new();
+        parser.parse(&path).unwrap();
+
+        std::fs::write(&path, current).unwrap();
+        filetime::set_file_mtime(&path, mtime).unwrap();
+        let symbols = crate::parser::parse_source_with_cached_parser(&path, current, LangId::Rust)
+            .and_then(|tree| crate::parser::extract_symbols_from_tree(current, &tree, LangId::Rust))
+            .unwrap();
+
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let entries = outline_structure_entries(
+            &path,
+            &symbols,
+            &mut parser,
+            &ctx,
+            "outline-fixture",
+            "fixture-session",
+            true,
+            None,
+        )
+        .unwrap();
+        let rows = entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.range.start_line))
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![("product", 0), ("checks", 1)], "{entries:?}");
     }
 }

@@ -237,10 +237,12 @@ const GO_QUERY: &str = r#"
   name: (field_identifier) @method.name) @method.def
 
 ;; type declarations (struct and interface)
-(type_declaration
-  (type_spec
+[(type_spec
     name: (type_identifier) @type.name
-    type: (_) @type.body)) @type.def
+    type: (_) @type.body)
+ (type_alias
+    name: (type_identifier) @type.name
+    type: (_) @type.body)] @type.def
 "#;
 
 const C_QUERY: &str = r#"
@@ -1153,6 +1155,7 @@ fn content_hash_for_source(source: &str) -> blake3::Hash {
 #[cfg(test)]
 thread_local! {
     static FRESHNESS_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
+    static CACHE_REFRESH_TEST_MUTATOR: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
     static CACHE_REFRESH_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -2068,93 +2071,115 @@ impl FileParser {
         &mut self,
         path: &Path,
     ) -> Result<(Arc<Vec<Symbol>>, bool, bool), AftError> {
-        let canon = path.to_path_buf();
-        let current_mtime = crate::bounded_io::metadata(path)
-            .and_then(|m| m.modified())
-            .map_err(|e| AftError::FileNotFound {
+        // Bound contention retries without growing the stack. The last attempt
+        // bypasses the symbol-cache snapshot and parses one coherent source read.
+        for attempt in 0..=3 {
+            let canon = path.to_path_buf();
+            let current_mtime = crate::bounded_io::metadata(path)
+                .and_then(|m| m.modified())
+                .map_err(|e| AftError::FileNotFound {
+                    path: format!("{}: {}", path.display(), e),
+                })?;
+
+            // Snapshot the entry before checking the file: hashing a touched file must
+            // not block cache writers. Refresh metadata only if the entry is unchanged.
+            let cached = if attempt < 3 {
+                self.symbol_cache
+                    .read()
+                    .map_err(|_| AftError::ParseError {
+                        message: "symbol cache lock poisoned".to_string(),
+                    })?
+                    .entries
+                    .get(&canon)
+                    .cloned()
+            } else {
+                None
+            };
+            if let Some(cached) = cached {
+                if cached_file_is_fresh(
+                    path,
+                    cached.mtime,
+                    cached.size,
+                    cached.content_hash,
+                    current_mtime,
+                ) {
+                    if cached.mtime != current_mtime {
+                        #[cfg(test)]
+                        CACHE_REFRESH_TEST_BARRIERS.with(|slot| {
+                            if let Some((arrived, released)) = slot.borrow_mut().take() {
+                                arrived.wait();
+                                released.wait();
+                            }
+                        });
+                        #[cfg(test)]
+                        CACHE_REFRESH_TEST_MUTATOR.with(|slot| {
+                            if let Some(mutator) = slot.borrow_mut().as_mut() {
+                                mutator();
+                            }
+                        });
+                        let mut cache =
+                            self.symbol_cache
+                                .write()
+                                .map_err(|_| AftError::ParseError {
+                                    message: "symbol cache lock poisoned".to_string(),
+                                })?;
+                        if let Some(entry) = cache.entries.get_mut(&canon) {
+                            if entry.mtime == cached.mtime
+                                && entry.size == cached.size
+                                && entry.content_hash == cached.content_hash
+                            {
+                                entry.mtime = current_mtime;
+                            } else {
+                                // A concurrent writer replaced the snapshot while we hashed.
+                                // Retry rather than returning superseded symbols.
+                                drop(cache);
+                                continue;
+                            }
+                        } else {
+                            drop(cache);
+                            continue;
+                        }
+                    }
+                    return Ok((cached.symbols, false, true));
+                }
+            }
+
+            let source = read_source(path).map_err(|e| AftError::FileNotFound {
                 path: format!("{}: {}", path.display(), e),
             })?;
+            let size = source.len() as u64;
+            let content_hash = content_hash_for_source(&source);
 
-        // Snapshot the entry before checking the file: hashing a touched file must
-        // not block cache writers. Refresh metadata only if the entry is unchanged.
-        let cached = self
-            .symbol_cache
-            .read()
-            .map_err(|_| AftError::ParseError {
-                message: "symbol cache lock poisoned".to_string(),
-            })?
-            .entries
-            .get(&canon)
-            .cloned();
-        if let Some(cached) = cached {
-            if cached_file_is_fresh(
-                path,
-                cached.mtime,
-                cached.size,
-                cached.content_hash,
-                current_mtime,
-            ) {
-                if cached.mtime != current_mtime {
-                    #[cfg(test)]
-                    CACHE_REFRESH_TEST_BARRIERS.with(|slot| {
-                        if let Some((arrived, released)) = slot.borrow_mut().take() {
-                            arrived.wait();
-                            released.wait();
-                        }
-                    });
-                    let mut cache =
-                        self.symbol_cache
-                            .write()
-                            .map_err(|_| AftError::ParseError {
-                                message: "symbol cache lock poisoned".to_string(),
-                            })?;
-                    if let Some(entry) = cache.entries.get_mut(&canon) {
-                        if entry.mtime == cached.mtime
-                            && entry.size == cached.size
-                            && entry.content_hash == cached.content_hash
-                        {
-                            entry.mtime = current_mtime;
-                        } else {
-                            // A concurrent writer replaced the snapshot while we hashed.
-                            // Retry rather than returning superseded symbols.
-                            drop(cache);
-                            return self.extract_symbols_shared_inner(path);
-                        }
-                    } else {
-                        drop(cache);
-                        return self.extract_symbols_shared_inner(path);
-                    }
-                }
-                return Ok((cached.symbols, false, true));
-            }
-        }
+            let (symbols, modules) = {
+                // Reuse the source we just read instead of letting parse() read the
+                // same file a second time.
+                let (tree, lang) =
+                    self.parse_with_source(path, &source, current_mtime, size, content_hash)?;
+                (
+                    Arc::new(extract_symbols_from_tree(&source, tree, lang)?),
+                    (lang == LangId::Rust)
+                        .then(|| Arc::new(rust_modules(tree.root_node(), &source))),
+                )
+            };
 
-        let source = read_source(path).map_err(|e| AftError::FileNotFound {
-            path: format!("{}: {}", path.display(), e),
-        })?;
-        let size = source.len() as u64;
-        let content_hash = content_hash_for_source(&source);
-
-        let (symbols, modules) = {
-            // Reuse the source we just read instead of letting parse() read the
-            // same file a second time.
-            let (tree, lang) =
-                self.parse_with_source(path, &source, current_mtime, size, content_hash)?;
-            (
-                Arc::new(extract_symbols_from_tree(&source, tree, lang)?),
-                (lang == LangId::Rust).then(|| Arc::new(rust_modules(tree.root_node(), &source))),
-            )
-        };
-
-        let mut symbol_cache = self
-            .symbol_cache
-            .write()
-            .map_err(|_| AftError::ParseError {
-                message: "symbol cache lock poisoned".to_string(),
-            })?;
-        let cache_changed = if let Some(generation) = self.symbol_cache_generation {
-            symbol_cache.generation == generation
-                && symbol_cache.insert_shared(
+            let mut symbol_cache = self
+                .symbol_cache
+                .write()
+                .map_err(|_| AftError::ParseError {
+                    message: "symbol cache lock poisoned".to_string(),
+                })?;
+            let cache_changed = if let Some(generation) = self.symbol_cache_generation {
+                symbol_cache.generation == generation
+                    && symbol_cache.insert_shared(
+                        canon,
+                        current_mtime,
+                        size,
+                        content_hash,
+                        Arc::clone(&symbols),
+                        modules,
+                    )
+            } else {
+                symbol_cache.insert_shared(
                     canon,
                     current_mtime,
                     size,
@@ -2162,18 +2187,11 @@ impl FileParser {
                     Arc::clone(&symbols),
                     modules,
                 )
-        } else {
-            symbol_cache.insert_shared(
-                canon,
-                current_mtime,
-                size,
-                content_hash,
-                Arc::clone(&symbols),
-                modules,
-            )
-        };
+            };
 
-        Ok((symbols, cache_changed, false))
+            return Ok((symbols, cache_changed, false));
+        }
+        unreachable!("the uncached final attempt returns")
     }
 
     /// Drop one local parse tree while preserving its shared extracted symbols.
@@ -2467,7 +2485,7 @@ thread_local! {
 
 /// Extract the text of a node from source.
 pub(crate) fn node_text<'a>(source: &'a str, node: &Node) -> &'a str {
-    &source[node.byte_range()]
+    source.get(node.byte_range()).unwrap_or("")
 }
 
 fn lexical_declaration_has_function_value(node: &Node) -> bool {
@@ -4162,6 +4180,20 @@ fn extract_go_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             (type_name_node, type_body_node, type_def_node)
         {
             let name = node_text(source, &name_node).to_string();
+            // A grouped declaration owns several specs; only an ungrouped spec
+            // includes the `type` keyword in its replacement range.
+            let def_node = def_node
+                .parent()
+                .filter(|parent| {
+                    parent.kind() == "type_declaration" && {
+                        let mut cursor = parent.walk();
+                        let ungrouped = !parent
+                            .children(&mut cursor)
+                            .any(|child| child.kind() == "(");
+                        ungrouped
+                    }
+                })
+                .unwrap_or(def_node);
             let kind = match body_node.kind() {
                 "struct_type" => SymbolKind::Struct,
                 "interface_type" => SymbolKind::Interface,
@@ -8258,7 +8290,8 @@ fn extract_html_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftErr
             .iter()
             .find(|heading| heading.level <= level)
             .map(|heading| heading.symbol.range.start_line.saturating_sub(1))
-            .unwrap_or_else(|| total_lines.saturating_sub(1));
+            .unwrap_or_else(|| total_lines.saturating_sub(1))
+            .max(headings[i].symbol.range.start_line);
         headings[i].symbol.range.end_line = section_end;
         if section_end != headings[i].symbol.range.start_line {
             headings[i].symbol.range.end_col =
@@ -12710,5 +12743,185 @@ end.
         assert_eq!(pipeline.kind, SymbolKind::Function);
         assert_eq!(pipeline.range.start_line, 0);
         assert_eq!(pipeline.range.end_line, 9);
+    }
+}
+
+#[cfg(test)]
+mod audit11_regressions {
+    use super::*;
+
+    #[test]
+    fn sustained_cache_refresh_contention_falls_back_after_three_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.rs");
+        std::fs::write(&file, "pub fn original() {}\n").unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        let mut parser = FileParser::new();
+        parser.extract_symbols(&file).unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(2, 0)).unwrap();
+        let cache = parser.symbol_cache();
+        let key = file.clone();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = calls.clone();
+        CACHE_REFRESH_TEST_MUTATOR.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let call = counted.get() + 1;
+                counted.set(call);
+                if call <= 5 {
+                    cache.write().unwrap().entries.get_mut(&key).unwrap().mtime =
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(call + 2);
+                }
+            }))
+        });
+        let symbols = parser.extract_symbols(&file).unwrap();
+        CACHE_REFRESH_TEST_MUTATOR.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(symbols[0].name, "original");
+        assert_eq!(calls.get(), 3);
+    }
+
+    fn symbols(source: &str, lang: LangId) -> Vec<Symbol> {
+        let tree = parse_source_with_cached_parser(Path::new("fixture"), source, lang).unwrap();
+        extract_symbols_from_tree(source, &tree, lang).unwrap()
+    }
+
+    fn replaced_bytes(source: &str, lang: LangId, name: &str, replacement: &str) -> Vec<u8> {
+        let symbols = symbols(source, lang);
+        let range = &symbols
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .unwrap()
+            .range;
+        let start = crate::edit::line_col_to_byte(source, range.start_line, range.start_col);
+        let end = crate::edit::line_col_to_byte(source, range.end_line, range.end_col);
+        let updated = crate::edit::replace_byte_range(source, start, end, replacement).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.txt");
+        let config = crate::config::Config {
+            format_on_edit: false,
+            ..Default::default()
+        };
+        crate::edit::write_format_validate(&path, &updated, &config, &serde_json::json!({}))
+            .unwrap();
+        std::fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn go_grouped_types_and_aliases_edit_only_the_selected_spec() {
+        let source =
+            "\u{feff}package main\r\ntype (\r\n\tFirst struct{}\r\n\tSecond = First\r\n)\r\n";
+        assert_eq!(replaced_bytes(source, LangId::Go, "First", "First struct{ X int }"),
+            "\u{feff}package main\r\ntype (\r\n\tFirst struct{ X int }\r\n\tSecond = First\r\n)\r\n".as_bytes());
+        assert_eq!(
+            replaced_bytes(source, LangId::Go, "Second", "Second = int"),
+            "\u{feff}package main\r\ntype (\r\n\tFirst struct{}\r\n\tSecond = int\r\n)\r\n"
+                .as_bytes()
+        );
+        assert_eq!(
+            replaced_bytes(
+                "package main\ntype Single = int",
+                LangId::Go,
+                "Single",
+                "type Single = string"
+            ),
+            b"package main\ntype Single = string"
+        );
+    }
+
+    #[test]
+    fn node_text_handles_stale_tree_offsets() {
+        let tree = parse_source_with_cached_parser(
+            Path::new("a.ts"),
+            "const longer = 123;",
+            LangId::TypeScript,
+        )
+        .unwrap();
+        let node = tree.root_node().named_child(0).unwrap();
+        assert_eq!(node_text("x", &node), "");
+        assert_eq!(node_text("\u{e9}", &node), "");
+        let short =
+            parse_source_with_cached_parser(Path::new("a.ts"), "x", LangId::TypeScript).unwrap();
+        assert_eq!(node_text("\u{e9}", &short.root_node()), "");
+    }
+
+    #[test]
+    fn html_same_row_headings_have_noninverted_ranges() {
+        let source = "\u{feff}<html>\r\n<h1>A</h1><h1>B</h1>\r\n</html>\r\n";
+        let headings = symbols(source, LangId::Html);
+        assert_eq!(headings.len(), 2);
+        assert!(headings
+            .iter()
+            .all(|heading| heading.range.end_line >= heading.range.start_line));
+        assert_eq!(
+            replaced_bytes(source, LangId::Html, "A", "<h1>C</h1>"),
+            "\u{feff}<html>\r\n<h1>C</h1><h1>B</h1>\r\n</html>\r\n".as_bytes()
+        );
+    }
+
+    /// A disk cache written before Go aliases and grouped type specs got
+    /// their own symbols passes every per-file freshness check, because the
+    /// source is unchanged. Only the extraction schema version can reject it.
+    #[test]
+    fn symbol_cache_written_before_go_alias_extraction_is_rebuilt() {
+        // The symbol-extraction schema version this release replaces.
+        const PREVIOUS_SCHEMA_VERSION: u32 = 4;
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let file = root.join("types.go");
+        let source = "package main\r\ntype (\r\n\tFirst struct{}\r\n\tSecond = First\r\n)\r\n";
+        std::fs::write(&file, source).unwrap();
+        let metadata = std::fs::metadata(&file).unwrap();
+
+        // What the previous extractor stored: no alias, and the grouped spec
+        // ranged over the whole declaration.
+        let mut previous = SymbolCache::new();
+        previous.set_project_root(root.clone());
+        previous.insert(
+            file.clone(),
+            metadata.modified().unwrap(),
+            metadata.len(),
+            blake3::hash(source.as_bytes()),
+            vec![Symbol {
+                name: "First".to_string(),
+                kind: SymbolKind::Struct,
+                range: crate::symbols::Range {
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 4,
+                    end_col: 1,
+                },
+                signature: None,
+                scope_chain: Vec::new(),
+                exported: true,
+                parent: None,
+            }],
+        );
+        symbol_cache_disk::write_to_disk(&previous, storage.path(), "go-alias").unwrap();
+        let cache_file = symbol_cache_disk::cache_path(storage.path(), "go-alias");
+        let mut bytes = std::fs::read(&cache_file).unwrap();
+        // Header: 8-byte magic, then the format and schema versions.
+        bytes[12..16].copy_from_slice(&PREVIOUS_SCHEMA_VERSION.to_le_bytes());
+        std::fs::write(&cache_file, bytes).unwrap();
+
+        let mut cache = SymbolCache::new();
+        cache.set_project_root(root.clone());
+        cache.load_from_disk(storage.path(), "go-alias", &root);
+        let mut parser = FileParser::with_symbol_cache(Arc::new(RwLock::new(cache)));
+        let symbols = parser.extract_symbols(&file).unwrap();
+        let names = symbols
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol.name.as_str(),
+                    symbol.range.start_line,
+                    symbol.range.end_line,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![("First", 2, 2), ("Second", 3, 3)],
+            "{symbols:?}"
+        );
     }
 }

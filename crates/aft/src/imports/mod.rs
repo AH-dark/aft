@@ -16,7 +16,7 @@ use tree_sitter::{Node, Tree};
 use crate::parser::LangId;
 
 mod c;
-pub(crate) use c::{classify_group_c_import_kind, normalize_include_module};
+pub(crate) use c::{c_insertion_block, classify_group_c_import_kind, normalize_include_module};
 mod csharp;
 mod java;
 mod kotlin;
@@ -1233,6 +1233,236 @@ pub fn find_insertion_point(
     (insert_at, false, false)
 }
 
+/// Internal language-aware insertion used by mutations with a parsed source.
+pub(crate) fn find_insertion_point_with_prologue(
+    source: &str,
+    tree: &Tree,
+    lang: LangId,
+    block: &ImportBlock,
+    group: ImportGroup,
+    module_path: &str,
+    type_only: bool,
+) -> (usize, bool, bool) {
+    let c_block;
+    let block = if matches!(lang, LangId::C | LangId::Cpp) {
+        c_block = c::c_insertion_block(source, tree, block);
+        &c_block
+    } else {
+        block
+    };
+    if !block.imports.is_empty() {
+        let mut insertion = find_insertion_point(source, block, group, module_path, type_only);
+        if lang == LangId::Python {
+            if module_path == "__future__" {
+                insertion = (
+                    block.imports.first().unwrap().byte_range.start,
+                    false,
+                    false,
+                );
+            } else if let Some(last) = block
+                .imports
+                .iter()
+                .filter(|import| import.module_path == "__future__")
+                .last()
+            {
+                insertion.0 = insertion.0.max(skip_newline(source, last.byte_range.end));
+            }
+        }
+        if matches!(lang, LangId::C | LangId::Cpp) {
+            insertion.1 = false;
+            insertion.2 = false;
+        }
+        return insertion;
+    }
+    if lang == LangId::Vue {
+        if let Some((start, _)) = vue_script_content_range(tree) {
+            return (skip_newline(source, start), false, false);
+        }
+    }
+    if matches!(lang, LangId::C | LangId::Cpp) {
+        if let (_, Some(anchor)) = c::default_include_context(source, tree) {
+            return (skip_newline(source, anchor), false, false);
+        }
+    }
+    let (anchor, blank_before) = import_prologue_anchor(source, tree, lang);
+    let at = skip_newline(source, anchor);
+    let next_is_newline = source
+        .as_bytes()
+        .get(at)
+        .is_some_and(|byte| matches!(byte, b'\r' | b'\n'));
+    (at, blank_before, !next_is_newline && at < source.len())
+}
+
+/// Preserve the language's file-leading declarations and executable string
+/// directives before placing a new import into an otherwise empty block.
+fn import_prologue_anchor(source: &str, tree: &Tree, lang: LangId) -> (usize, bool) {
+    let bom = if source.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    let root = tree.root_node();
+    let (strong, skippable): (&[&str], &[&str]) = match lang {
+        LangId::Go => (&["package_clause"], &["comment"]),
+        LangId::Java => (&["package_declaration"], &["comment"]),
+        LangId::Kotlin => (&["package_header"], &["comment"]),
+        LangId::Scala => (&["package_clause"], &["comment"]),
+        LangId::Solidity => (&["pragma_directive"], &["comment"]),
+        LangId::Php => (&["php_tag", "namespace_definition"], &["comment"]),
+        LangId::Perl => (&["package_statement"], &["comment"]),
+        _ => (&[], &[]),
+    };
+    let mut cursor = root.walk();
+    let mut header = None;
+    for child in root.named_children(&mut cursor) {
+        if strong.contains(&child.kind()) {
+            header = Some(
+                if lang == LangId::Php && child.kind() == "namespace_definition" {
+                    let mut cursor = child.walk();
+                    let brace = child
+                        .children(&mut cursor)
+                        .find(|node| node.kind() == "{")
+                        .map(|node| node.end_byte())
+                        .or_else(|| {
+                            crate::parser::node_text(source, &child)
+                                .find('{')
+                                .map(|offset| child.start_byte() + offset + 1)
+                        });
+                    brace.unwrap_or(child.end_byte())
+                } else {
+                    child.end_byte()
+                },
+            );
+        } else if !skippable.contains(&child.kind()) {
+            break;
+        }
+    }
+    if let Some(header) = header {
+        return (header, true);
+    }
+    let mut anchor = bom;
+    if matches!(
+        lang,
+        LangId::TypeScript
+            | LangId::Tsx
+            | LangId::JavaScript
+            | LangId::Python
+            | LangId::Ruby
+            | LangId::Perl
+            | LangId::Lua
+    ) && source[bom..].starts_with("#!")
+    {
+        anchor = source.find('\n').unwrap_or(source.len());
+    }
+    if matches!(
+        lang,
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Python
+    ) {
+        // A run of leading comments is skipped only when a blank line or a
+        // skipped directive/docstring separates it from the code below. A run
+        // directly above the first ordinary statement documents that statement,
+        // so the import goes above the run instead of splitting them.
+        let mut cursor = root.walk();
+        let mut docstring_seen = false;
+        // End byte of the pending, still-undecided comment run.
+        let mut run_end: Option<usize> = None;
+        for child in root.named_children(&mut cursor) {
+            if let Some(end) = run_end {
+                if has_blank_line_between(source, end, child.start_byte()) {
+                    anchor = anchor.max(end);
+                    run_end = None;
+                }
+            }
+            if matches!(child.kind(), "comment" | "hash_bang_line") {
+                if child.end_byte() <= anchor
+                    || child.kind() == "hash_bang_line"
+                    || (lang == LangId::Python && is_python_encoding_cookie(source, &child))
+                {
+                    // Shebangs and encoding cookies must stay on the file's
+                    // first lines, so they are always kept above the import.
+                    anchor = anchor.max(run_end.unwrap_or(0)).max(child.end_byte());
+                    run_end = None;
+                } else {
+                    run_end = Some(child.end_byte());
+                }
+            } else if child.kind() == "expression_statement"
+                && child
+                    .named_child(0)
+                    .is_some_and(|expression| expression.kind() == "string")
+                && (lang != LangId::Python || !docstring_seen)
+            {
+                anchor = child.end_byte();
+                docstring_seen = true;
+                run_end = None;
+            } else {
+                // Any comment run still pending is attached to this statement.
+                run_end = None;
+                break;
+            }
+        }
+        // Comments with no code after them document nothing; keep them above.
+        if let Some(end) = run_end {
+            anchor = anchor.max(end);
+        }
+    }
+    if lang == LangId::Solidity
+        && source[bom..]
+            .trim_start()
+            .starts_with("// SPDX-License-Identifier:")
+    {
+        anchor = source.find('\n').unwrap_or(source.len());
+    }
+    (anchor, false)
+}
+
+/// True when the whitespace between two sibling nodes contains an empty line.
+fn has_blank_line_between(source: &str, end: usize, start: usize) -> bool {
+    source
+        .get(end..start)
+        .is_some_and(|gap| gap.matches('\n').count() >= 2)
+}
+
+/// A PEP 263 source-encoding declaration (`# -*- coding: utf-8 -*-`). Python
+/// only honours it on the first or second line of the file.
+fn is_python_encoding_cookie(source: &str, comment: &Node) -> bool {
+    if comment.start_position().row > 1 {
+        return false;
+    }
+    let text = crate::parser::node_text(source, comment);
+    text.match_indices("coding").any(|(at, word)| {
+        let rest = &text[at + word.len()..];
+        let Some(rest) = rest.strip_prefix([':', '=']) else {
+            return false;
+        };
+        rest.trim_start_matches([' ', '\t'])
+            .starts_with(|ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    })
+}
+
+pub(crate) fn import_insertion_text(
+    source: &str,
+    offset: usize,
+    line: &str,
+    before: bool,
+    after: bool,
+) -> String {
+    let ending = crate::indent::source_line_ending(source);
+    let mut text = String::new();
+    let prefix = &source[..offset];
+    if !prefix.trim_start_matches('\u{feff}').is_empty() && !prefix.ends_with('\n') {
+        text.push_str(ending);
+    }
+    if before {
+        text.push_str(ending);
+    }
+    text.push_str(&line.replace("\r\n", "\n").replace('\n', ending));
+    text.push_str(ending);
+    if after {
+        text.push_str(ending);
+    }
+    text
+}
+
 /// Generate a single import line from a structured [`ImportRequest`]. The full
 /// entry point — engines read the fields they support; unsupported languages
 /// yield an empty string.
@@ -1936,9 +2166,10 @@ fn generate_ts_import_line_base(
 // Python implementation
 // ---------------------------------------------------------------------------
 
-/// Python 3.x standard library module names (top-level modules).
-/// Used for import group classification. Covers the commonly-used modules;
-/// unknown modules are assumed third-party.
+/// Sorted union of commonly used Python 3.x standard-library modules, including
+/// platform-specific names from `sys.stdlib_module_names` (Python 3.10+).
+/// Older entries remain recognized for projects using earlier Python versions.
+/// Reference: https://docs.python.org/3/library/sys.html#sys.stdlib_module_names
 const PYTHON_STDLIB: &[&str] = &[
     "__future__",
     "_thread",
@@ -1958,6 +2189,7 @@ const PYTHON_STDLIB: &[&str] = &[
     "bisect",
     "builtins",
     "bz2",
+    "cProfile",
     "calendar",
     "cgi",
     "cgitb",
@@ -1976,7 +2208,6 @@ const PYTHON_STDLIB: &[&str] = &[
     "contextvars",
     "copy",
     "copyreg",
-    "cProfile",
     "crypt",
     "csv",
     "ctypes",
@@ -2006,6 +2237,7 @@ const PYTHON_STDLIB: &[&str] = &[
     "getpass",
     "gettext",
     "glob",
+    "graphlib",
     "grp",
     "gzip",
     "hashlib",
@@ -2035,8 +2267,10 @@ const PYTHON_STDLIB: &[&str] = &[
     "mimetypes",
     "mmap",
     "modulefinder",
+    "msvcrt",
     "multiprocessing",
     "netrc",
+    "ntpath",
     "numbers",
     "operator",
     "optparse",
@@ -2050,6 +2284,7 @@ const PYTHON_STDLIB: &[&str] = &[
     "platform",
     "plistlib",
     "poplib",
+    "posix",
     "posixpath",
     "pprint",
     "profile",
@@ -2121,6 +2356,8 @@ const PYTHON_STDLIB: &[&str] = &[
     "wave",
     "weakref",
     "webbrowser",
+    "winreg",
+    "winsound",
     "wsgiref",
     "xml",
     "xmlrpc",
@@ -2128,6 +2365,7 @@ const PYTHON_STDLIB: &[&str] = &[
     "zipfile",
     "zipimport",
     "zlib",
+    "zoneinfo",
 ];
 
 /// Classify a Python import into a group.
@@ -2138,7 +2376,14 @@ pub fn classify_group_py(module_path: &str) -> ImportGroup {
     }
     // Check stdlib: use the top-level module name (before first '.')
     let top_module = module_path.split('.').next().unwrap_or(module_path);
-    if PYTHON_STDLIB.contains(&top_module) {
+    if PYTHON_STDLIB
+        .binary_search_by(|module| {
+            #[cfg(test)]
+            PYTHON_STDLIB_COMPARISONS.with(|count| count.set(count.get() + 1));
+            module.cmp(&top_module)
+        })
+        .is_ok()
+    {
         ImportGroup::Stdlib
     } else {
         ImportGroup::External
@@ -2163,7 +2408,7 @@ fn parse_py_imports(source: &str, tree: &Tree) -> ImportBlock {
                     imports.push(imp);
                 }
             }
-            "import_from_statement" => {
+            "import_from_statement" | "future_import_statement" => {
                 if let Some(imp) = parse_py_import_from_statement(source, &node) {
                     imports.push(imp);
                 }
@@ -2231,7 +2476,11 @@ fn parse_py_import_from_statement(source: &str, node: &Node) -> Option<ImportSta
     let raw_text = source[node.byte_range()].to_string();
     let byte_range = node.byte_range();
 
-    let mut module_path = String::new();
+    let mut module_path = if node.kind() == "future_import_statement" {
+        "__future__".to_string()
+    } else {
+        String::new()
+    };
     let mut names = Vec::new();
 
     let mut c = node.walk();
@@ -4075,5 +4324,222 @@ import { c } from 'charlie';
             classify_group_solidity("@openzeppelin/contracts/token/ERC20/ERC20.sol"),
             ImportGroup::External
         );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PYTHON_STDLIB_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod audit11_regressions {
+    use super::*;
+
+    fn inserted(
+        source: &str,
+        lang: LangId,
+        module: &str,
+        group: ImportGroup,
+        line: &str,
+    ) -> Vec<u8> {
+        let tree = crate::parser::parse_source_with_cached_parser(
+            std::path::Path::new("fixture"),
+            source,
+            lang,
+        )
+        .unwrap();
+        let block = parse_imports(source, &tree, lang);
+        let (offset, before, after) =
+            find_insertion_point_with_prologue(source, &tree, lang, &block, group, module, false);
+        let text = import_insertion_text(source, offset, line, before, after);
+        let updated = crate::edit::replace_byte_range(source, offset, offset, &text).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let config = crate::config::Config {
+            format_on_edit: false,
+            ..Default::default()
+        };
+        crate::edit::write_format_validate(&path, &updated, &config, &serde_json::json!({}))
+            .unwrap();
+        std::fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn imports_preserve_crlf_bom_and_unterminated_eof() {
+        let source = "\u{feff}import a from 'a';\r\nimport b from 'b';";
+        assert_eq!(
+            inserted(
+                source,
+                LangId::TypeScript,
+                "z",
+                ImportGroup::External,
+                "import z from 'z';"
+            ),
+            "\u{feff}import a from 'a';\r\nimport b from 'b';\r\nimport z from 'z';\r\n".as_bytes()
+        );
+    }
+
+    #[test]
+    fn import_insertion_preserves_directives_docstrings_and_future_order() {
+        assert_eq!(
+            inserted(
+                "\u{feff}'use client';\r\nrun();\r\n",
+                LangId::TypeScript,
+                "x",
+                ImportGroup::External,
+                "import x from 'x';"
+            ),
+            "\u{feff}'use client';\r\nimport x from 'x';\r\n\r\nrun();\r\n".as_bytes()
+        );
+        assert_eq!(inserted("#!/usr/bin/python\r\n# coding: utf-8\r\n\"\"\"module doc\"\"\"\r\nrun()\r\n", LangId::Python, "__future__", ImportGroup::Stdlib, "from __future__ import annotations"),
+            b"#!/usr/bin/python\r\n# coding: utf-8\r\n\"\"\"module doc\"\"\"\r\nfrom __future__ import annotations\r\n\r\nrun()\r\n");
+        assert_eq!(
+            inserted(
+                "\"doc\"\nfrom __future__ import annotations\nrun()\n",
+                LangId::Python,
+                "x",
+                ImportGroup::External,
+                "import x"
+            ),
+            b"\"doc\"\nfrom __future__ import annotations\n\nimport x\n\nrun()\n"
+        );
+    }
+
+    fn first_ts_import(source: &str) -> String {
+        String::from_utf8(inserted(
+            source,
+            LangId::TypeScript,
+            "x",
+            ImportGroup::External,
+            "import x from 'x';",
+        ))
+        .unwrap()
+    }
+
+    fn first_py_import(source: &str) -> String {
+        String::from_utf8(inserted(
+            source,
+            LangId::Python,
+            "x",
+            ImportGroup::External,
+            "import x",
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn first_import_goes_before_a_jsdoc_attached_to_the_first_declaration() {
+        assert_eq!(
+            first_ts_import("/** Does x */\nexport function foo() {}\n"),
+            "import x from 'x';\n\n/** Does x */\nexport function foo() {}\n"
+        );
+        assert_eq!(
+            first_ts_import("/** Does x */\r\nexport function foo() {}\r\n"),
+            "import x from 'x';\r\n\r\n/** Does x */\r\nexport function foo() {}\r\n"
+        );
+        // A license separated by a blank line is still skipped; the JSDoc
+        // below it stays attached to its declaration.
+        assert_eq!(
+            first_ts_import("/* license */\n\n/** Does x */\nexport function foo() {}\n"),
+            "/* license */\nimport x from 'x';\n\n/** Does x */\nexport function foo() {}\n"
+        );
+    }
+
+    #[test]
+    fn first_import_skips_a_license_followed_by_a_blank_line() {
+        assert_eq!(
+            first_ts_import("/* license */\n\nrun();\n"),
+            "/* license */\nimport x from 'x';\n\nrun();\n"
+        );
+        assert_eq!(
+            first_ts_import("/* license */\r\n\r\nrun();\r\n"),
+            "/* license */\r\nimport x from 'x';\r\n\r\nrun();\r\n"
+        );
+    }
+
+    #[test]
+    fn first_import_follows_a_license_and_adjacent_directive() {
+        assert_eq!(
+            first_ts_import("/* license */\n'use client';\nrun();\n"),
+            "/* license */\n'use client';\nimport x from 'x';\n\nrun();\n"
+        );
+    }
+
+    #[test]
+    fn first_python_import_goes_before_a_comment_attached_to_def() {
+        assert_eq!(
+            first_py_import("# helper for foo\ndef foo():\n    pass\n"),
+            "import x\n\n# helper for foo\ndef foo():\n    pass\n"
+        );
+        assert_eq!(
+            first_py_import("# helper for foo\r\ndef foo():\r\n    pass\r\n"),
+            "import x\r\n\r\n# helper for foo\r\ndef foo():\r\n    pass\r\n"
+        );
+    }
+
+    #[test]
+    fn first_python_import_stays_below_an_encoding_cookie() {
+        // PEP 263 only honours the cookie on line 1 or 2, so it must stay
+        // above the import even when code follows it directly.
+        assert_eq!(
+            first_py_import("# -*- coding: utf-8 -*-\ndef foo():\n    pass\n"),
+            "# -*- coding: utf-8 -*-\nimport x\n\ndef foo():\n    pass\n"
+        );
+        assert_eq!(
+            first_py_import("# -*- coding: utf-8 -*-\r\ndef foo():\r\n    pass\r\n"),
+            "# -*- coding: utf-8 -*-\r\nimport x\r\n\r\ndef foo():\r\n    pass\r\n"
+        );
+    }
+
+    #[test]
+    fn include_guard_insertion_preserves_conditional_context() {
+        let source = "/* license */\r\n#ifndef X_H\r\n#define X_H\r\n#include <stdio.h>\r\n#ifdef OPTIONAL\r\n#include <optional.h>\r\n#endif\r\n#endif\r\n";
+        let tree = crate::parser::parse_source_with_cached_parser(
+            std::path::Path::new("x.h"),
+            source,
+            LangId::C,
+        )
+        .unwrap();
+        let imports = parse_imports(source, &tree, LangId::C);
+        assert_eq!(imports.imports.len(), 2);
+        let default_block = c_insertion_block(source, &tree, &imports);
+        assert_eq!(default_block.imports.len(), 1);
+        assert_eq!(default_block.imports[0].module_path, "stdio.h");
+        assert_eq!(inserted(source, LangId::C, "string.h", ImportGroup::Stdlib, "#include <string.h>"),
+            b"/* license */\r\n#ifndef X_H\r\n#define X_H\r\n#include <stdio.h>\r\n#include <string.h>\r\n#ifdef OPTIONAL\r\n#include <optional.h>\r\n#endif\r\n#endif\r\n");
+        assert_eq!(
+            inserted(
+                "/* license */\n#ifndef X_H\n#define X_H\n#endif\n",
+                LangId::C,
+                "stdio.h",
+                ImportGroup::Stdlib,
+                "#include <stdio.h>"
+            ),
+            b"/* license */\n#ifndef X_H\n#define X_H\n#include <stdio.h>\n#endif\n"
+        );
+    }
+
+    #[test]
+    fn platform_and_recent_python_modules_are_stdlib() {
+        for module in [
+            "zoneinfo", "graphlib", "msvcrt", "winreg", "winsound", "posix", "ntpath",
+        ] {
+            assert_eq!(classify_group_py(module), ImportGroup::Stdlib, "{module}");
+            assert_eq!(
+                classify_group_py(&format!("{module}.child")),
+                ImportGroup::Stdlib
+            );
+        }
+        assert_eq!(classify_group_py("third_party"), ImportGroup::External);
+        assert_eq!(classify_group_py(".zoneinfo"), ImportGroup::Internal);
+    }
+
+    #[test]
+    fn stdlib_membership_uses_logarithmic_comparisons() {
+        PYTHON_STDLIB_COMPARISONS.with(|count| count.set(0));
+        assert_eq!(classify_group_py("zzzz_non_stdlib"), ImportGroup::External);
+        assert!(PYTHON_STDLIB_COMPARISONS.with(|count| count.get()) <= 10);
+        assert!(PYTHON_STDLIB.windows(2).all(|pair| pair[0] < pair[1]));
     }
 }

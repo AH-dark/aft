@@ -102,6 +102,11 @@ pub(crate) fn publication_durability_barrier() -> MutexGuard<'static, ()> {
 /// A payload format change must update the corresponding producer string in the
 /// same edit, because producer versions are components of content-address keys.
 pub const SEMANTIC_PAYLOAD_SCHEMA: u32 = 1;
+/// Not bumped when Go symbol extraction started emitting type aliases and
+/// separate ranges for specs in a grouped `type (...)` block: unchanged Go files
+/// keep their earlier semantic chunk boundaries until they are edited, because a
+/// bump here would re-embed every file in every project. The semantic index's
+/// chunking version was left unchanged for the same reason.
 pub const SEMANTIC_PRODUCER_VERSION: &str = "semantic-v1";
 pub const CALLGRAPH_PAYLOAD_SCHEMA: u32 = 1;
 pub const CALLGRAPH_PRODUCER_VERSION: &str = "callgraph-v8-without-ast-index";
