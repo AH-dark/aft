@@ -194,6 +194,12 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    if let Some(message) =
+        crate::extract::unsupported_extraction_control_flow(&tree, start_byte, end_byte, lang)
+    {
+        return Response::error(&req.id, "unsupported_control_flow", message);
+    }
+
     // --- Detect free variables ---
     let free_vars = detect_free_variables(&source, &tree, start_byte, end_byte, lang);
 
@@ -757,5 +763,92 @@ mod audit11_regressions {
         };
         edit::write_format_validate(&path, &content, &config, &serde_json::json!({})).unwrap();
         assert_eq!(std::fs::read(path).unwrap(), "\u{feff}function helper() {\r\n  run();\r\n}\r\n\r\nfunction outer() {\r\n  helper();\r\n}\r\n".as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod approved_audit11 {
+    use super::*;
+
+    fn extract(source: &str, suffix: &str, start: u32, end: u32) -> (serde_json::Value, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("source.{suffix}"));
+        std::fs::write(&path, source.as_bytes()).unwrap();
+        #[cfg(unix)]
+        let held_original = std::fs::File::open(&path).unwrap();
+        let config = crate::config::Config {
+            storage_dir: Some(dir.path().join("state")),
+            format_on_edit: false,
+            ..Default::default()
+        };
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let req = RawRequest {
+            id: "guard".into(),
+            command: "extract_function".into(),
+            params: serde_json::json!({"file": path, "name": "helper", "start_line": start, "end_line": end, "validate": "off"}),
+            lsp_hints: None,
+            session_id: None,
+        };
+        let response = serde_json::to_value(handle_extract_function(&req, &ctx)).unwrap();
+        if response["code"] == "unsupported_control_flow" {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(
+                    held_original.metadata().unwrap().ino(),
+                    std::fs::metadata(&path).unwrap().ino(),
+                    "guard must refuse before any replacement"
+                );
+            }
+        }
+        (response, std::fs::read(path).unwrap())
+    }
+
+    #[test]
+    fn bare_outer_returns_are_rejected_without_changing_bytes() {
+        for (source, suffix) in [
+            (
+                "\u{feff}function outer() {\r\n    if (done) return;\r\n    finish();\r\n}\r\n",
+                "ts",
+            ),
+            (
+                "\u{feff}def outer():\r\n    if done: return\r\n    finish()\r\n",
+                "py",
+            ),
+            ("function outer() {\n    return /* comment */;\n}\n", "js"),
+        ] {
+            let (response, bytes) = extract(source, suffix, 2, 3);
+            assert_eq!(response["code"], "unsupported_control_flow", "{response}");
+            assert_eq!(bytes, source.as_bytes());
+        }
+    }
+
+    #[test]
+    fn nested_returns_do_not_turn_helper_calls_into_caller_returns() {
+        let source = "\u{feff}function outer(items) {\r\n    items.map(item => { return item; });\r\n    observe();\r\n    finish();\r\n}\r\n";
+        let (response, bytes) = extract(source, "ts", 2, 4);
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(response["return_type"], "void");
+        assert_eq!(bytes, "\u{feff}function helper(items) {\r\n    items.map(item => { return item; });\r\n    observe();\r\n}\r\n\r\nfunction outer(items) {\r\n    helper(items);\r\n    finish();\r\n}\r\n".as_bytes());
+    }
+
+    #[test]
+    fn outer_await_and_yield_are_rejected_without_changing_bytes() {
+        for (source, suffix) in [
+            (
+                "\u{feff}async function outer() {\r\n    await work();\r\n}\r\n",
+                "ts",
+            ),
+            (
+                "\u{feff}function* outer() {\r\n    yield value;\r\n}\r\n",
+                "js",
+            ),
+            ("\u{feff}async def outer():\r\n    await work()\r\n", "py"),
+            ("\u{feff}def outer():\r\n    yield value\r\n", "py"),
+        ] {
+            let (response, bytes) = extract(source, suffix, 2, 3);
+            assert_eq!(response["code"], "unsupported_control_flow", "{response}");
+            assert_eq!(bytes, source.as_bytes());
+        }
     }
 }

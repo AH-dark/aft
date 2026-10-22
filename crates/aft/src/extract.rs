@@ -772,7 +772,7 @@ pub fn detect_return_value(
         }
     }
 
-    if let Some(expr) = find_return_in_range(&root, source, start_byte, end_byte) {
+    if let Some(expr) = find_return_in_range(&root, source, start_byte, end_byte, lang) {
         if !live_bindings.is_empty() {
             return Err(ReturnValueError {
                 message: format!(
@@ -993,49 +993,90 @@ fn is_assignment_node(node: &Node) -> bool {
     )
 }
 
-/// Find an explicit `return` statement in the byte range and return its expression text.
+/// Visit only control flow belonging to the selected scope. Function bodies
+/// introduced inside the selection keep their own returns and suspension points.
+fn visit_extracted_control_flow(
+    node: &Node,
+    start: usize,
+    end: usize,
+    lang: LangId,
+    visitor: &mut impl FnMut(&Node) -> bool,
+) -> bool {
+    if node.end_byte() <= start || node.start_byte() >= end {
+        return false;
+    }
+    let function = is_function_scope_node(node, lang)
+        || (matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript)
+            && matches!(
+                node.kind(),
+                "generator_function" | "generator_function_declaration"
+            ));
+    if function && node.start_byte() >= start {
+        return false;
+    }
+    if node.start_byte() >= start && visitor(node) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if visit_extracted_control_flow(&child, start, end, lang, visitor) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Refuse constructs whose caller-exit or async/generator semantics cannot be
+/// represented by the plain helper and call site, before taking a backup or writing.
+pub(crate) fn unsupported_extraction_control_flow(
+    tree: &Tree,
+    start: usize,
+    end: usize,
+    lang: LangId,
+) -> Option<&'static str> {
+    let mut reason = None;
+    visit_extracted_control_flow(&tree.root_node(), start, end, lang, &mut |node| {
+        reason = match node.kind() {
+            "return_statement" => {
+                let mut cursor = node.walk();
+                let has_value = node.named_children(&mut cursor).any(|child| !child.is_extra());
+                (!has_value).then_some("extract_function: selected range contains an outer bare return; caller exit cannot be preserved")
+            }
+            "await_expression" | "await" => Some("extract_function: selected range contains outer await; async extraction is not supported"),
+            "yield_expression" | "yield" => Some("extract_function: selected range contains outer yield; generator extraction is not supported"),
+            _ => None,
+        };
+        reason.is_some()
+    });
+    reason
+}
+
+/// Find a fully selected outer return expression without entering nested functions.
 fn find_return_in_range(
     node: &Node,
     source: &str,
-    start_byte: usize,
-    end_byte: usize,
+    start: usize,
+    end: usize,
+    lang: LangId,
 ) -> Option<String> {
-    if node.end_byte() <= start_byte || node.start_byte() >= end_byte {
-        return None;
-    }
-
-    if node.kind() == "return_statement"
-        && node.start_byte() >= start_byte
-        && node.end_byte() <= end_byte
-    {
-        // Get the expression after "return"
-        let text = node_text(source, node).trim().to_string();
-        let expr = text
-            .strip_prefix("return")
-            .unwrap_or("")
-            .trim()
-            .trim_end_matches(';')
-            .trim()
-            .to_string();
-        if !expr.is_empty() {
-            return Some(expr);
-        }
-    }
-
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            if let Some(result) = find_return_in_range(&cursor.node(), source, start_byte, end_byte)
-            {
-                return Some(result);
-            }
-            if !cursor.goto_next_sibling() {
-                break;
+    let mut expression = None;
+    visit_extracted_control_flow(node, start, end, lang, &mut |node| {
+        if node.kind() == "return_statement" && node.end_byte() <= end {
+            let text = node_text(source, node).trim();
+            let value = text
+                .strip_prefix("return")
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches(';')
+                .trim();
+            if !value.is_empty() {
+                expression = Some(value.to_string());
+                return true;
             }
         }
-    }
-
-    None
+        false
+    });
+    expression
 }
 
 // ---------------------------------------------------------------------------
@@ -2477,6 +2518,29 @@ mod audit11_regressions {
             let config = crate::config::Config { format_on_edit: false, ..Default::default() };
             crate::edit::write_format_validate(&path, &generated, &config, &serde_json::json!({})).unwrap();
             assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
+        }
+    }
+}
+
+#[cfg(test)]
+mod approved_audit11 {
+    use super::*;
+
+    #[test]
+    fn nested_functions_keep_their_own_returns_await_and_yield() {
+        for (source, lang) in [
+            ("function outer() {\n    const inner = function () { return; }; inner();\n    finish();\n}\n", LangId::JavaScript),
+            ("function outer() {\n    const inner = async () => { await work(); return; }; inner();\n    finish();\n}\n", LangId::TypeScript),
+            ("function outer() {\n    function* inner() { yield value; return; } inner();\n    finish();\n}\n", LangId::JavaScript),
+            ("def outer():\n    async def inner():\n        await work()\n        return\n    finish()\n", LangId::Python),
+            ("def outer():\n    inner = lambda: (yield value)\n    finish()\n", LangId::Python),
+        ] {
+            let tree = crate::parser::parse_source_with_cached_parser(std::path::Path::new("source"), source, lang).unwrap();
+            assert!(!tree.root_node().has_error(), "{}", tree.root_node().to_sexp());
+            let start = source.find('\n').unwrap() + 1;
+            let end = source.find("    finish()").unwrap();
+            assert!(unsupported_extraction_control_flow(&tree, start, end, lang).is_none(), "{source}");
+            assert!(matches!(detect_return_value(source, &tree, start, end, None, lang).unwrap(), ReturnKind::Void), "{source}");
         }
     }
 }
