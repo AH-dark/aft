@@ -568,12 +568,54 @@ fn median_ms(runs: usize, mut query: impl FnMut()) -> f64 {
     samples[samples.len() / 2]
 }
 
+/// The parent session `ctx` serves from, once its first load finished.
 fn parent_session(ctx: &AppContext) -> Arc<aft::views::parent::ParentSession> {
-    let session = aft::views::parent::session_for(ctx).expect("parent session active");
+    let session = started_parent_session(ctx);
     assert!(
         session.wait_rounds(1, DEADLINE),
         "parent folder never finished its first load"
     );
+    session
+}
+
+/// The parent session `ctx` serves from, as soon as it exists; its worker may
+/// still be discovering or loading the children.
+///
+/// A bind that finds aft.db busy (here, usually the fixture children's
+/// background maintenance still writing the shared storage) settles no
+/// identity: configure turns views off, starts no parent session, and arms a
+/// background retry that replays the bind once the database is free. Both
+/// runtimes poll that retry from the configure-tail maintenance drain, so this
+/// runs the same drain until the replay starts the session. Any other reason
+/// for a missing session fails at once, and so does a retry that never lands
+/// within the deadline.
+fn started_parent_session(ctx: &AppContext) -> Arc<aft::views::parent::ParentSession> {
+    let started = Instant::now();
+    let mut retried = false;
+    let session = loop {
+        aft::runtime_drain::drain_deferred_configure_maintenance(ctx);
+        if let Some(session) = aft::views::parent::session_for(ctx) {
+            break session;
+        }
+        let degraded = ctx.degraded_reasons();
+        let busy_bind_retrying = degraded
+            .iter()
+            .any(|reason| reason.contains("aft.db was busy at bind"));
+        assert!(
+            busy_bind_retrying && started.elapsed() < DEADLINE,
+            "parent session active: none after {:?}; views={} degraded={degraded:?}",
+            started.elapsed(),
+            ctx.config().views.enabled,
+        );
+        retried = true;
+        thread::sleep(Duration::from_millis(20));
+    };
+    if retried {
+        eprintln!(
+            "parent session started by the busy-database bind retry after {} ms",
+            started.elapsed().as_millis()
+        );
+    }
     session
 }
 
@@ -1485,12 +1527,13 @@ fn slow_discovery_never_delays_the_bind() {
         "parent folder bind with discovery held answered in {} ms",
         bind.as_millis()
     );
-    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    // Discovery is held, so the first load cannot finish: wait only for the
+    // session to exist, not for `parent_session`'s first load.
+    let session = started_parent_session(&ctx);
     assert!(
         discovery.wait_until_started(DEADLINE),
         "discovery never started"
     );
-    let session = aft::views::parent::session_for(&ctx).expect("parent session");
     assert!(session.discovery().is_none(), "discovery escaped its hold");
     let first = grep(&ctx, "anything");
     let discovered_at = Instant::now() + DEADLINE;
