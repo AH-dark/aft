@@ -493,6 +493,7 @@ fn evicted_worked_roots_keep_only_bookkeeping() {
 
 /// Make output that the builtin `make` filter rewrites: its directory lines
 /// are stripped.
+#[cfg(unix)]
 const MAKE_OUTPUT: &str =
     "make: Entering directory '/work'\ncc -o app main.c\nmake: Leaving directory '/work'\n";
 
