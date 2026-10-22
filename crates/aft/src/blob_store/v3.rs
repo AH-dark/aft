@@ -901,8 +901,9 @@ impl Publication<'_, '_> {
         let mut c = self.plane(key.plane())?;
         #[cfg(test)]
         if replay::unflushed_closure() {
-            // Red control for the power-loss replay only: plane commits stop
-            // syncing, so nothing but the closure flush could make them durable.
+            // Test-only fault injection for the power-loss replay: plane
+            // commits stop syncing, so nothing but the closure flush could make
+            // them durable.
             c.pragma_update(None, "synchronous", 0)?;
         }
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;

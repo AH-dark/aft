@@ -33,8 +33,8 @@ thread_local! {
     static UNFLUSHED_CLOSURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Red control: a publication on this thread neither syncs its plane commits
-/// nor runs the closure flush before `ClosureFlushed`.
+/// Test-only fault injection: a publication on this thread neither syncs its
+/// plane commits nor runs the closure flush before `ClosureFlushed`.
 pub(super) fn unflushed_closure() -> bool {
     UNFLUSHED_CLOSURE.with(std::cell::Cell::get)
 }

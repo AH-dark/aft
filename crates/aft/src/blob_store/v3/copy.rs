@@ -112,8 +112,9 @@ pub fn copy_on_first_use(
 
 #[cfg(test)]
 thread_local! {
-    /// Red controls for the copy tests. Each is set on the copier's own
-    /// thread and never exists outside test builds.
+    /// Test-only fault injection: skip the copier's pin, or treat a live sweep
+    /// lease as absent, so tests can show what each guard prevents. Each is
+    /// set on the copier's own thread and never exists outside test builds.
     pub(super) static SKIP_PIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static SKIP_LEASE_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

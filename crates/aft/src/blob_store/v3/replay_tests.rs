@@ -230,7 +230,8 @@ fn replayed_retry_after_a_failed_floor_directory_sync_is_whole_or_absent() {
     assert_never_torn(&seen);
 }
 
-/// Red control: with the plane commits unsynced and no closure flush before
+/// Test-only fault injection, which this test expects to fail the invariant:
+/// with the plane commits unsynced and no closure flush before
 /// `ClosureFlushed`, some power cut leaves the ledger committed while the
 /// copied row is gone.
 #[test]
