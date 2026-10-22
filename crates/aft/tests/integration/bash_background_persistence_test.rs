@@ -1436,6 +1436,10 @@ fn cleanup_finished_deletes_disk_bundle_of_delivered_terminal() {
     assert!(!paths.stdout.exists());
     assert!(!paths.stderr.exists());
     assert!(!paths.exit.exists());
+    assert!(
+        !paths.session_dir.exists(),
+        "finished-task cleanup left an empty session directory"
+    );
 }
 
 #[test]

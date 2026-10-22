@@ -26,6 +26,45 @@ use crate::db::bash_tasks::BashTaskRow;
 use super::process::LiveDescendant;
 use super::BgTaskStatus;
 
+#[cfg(test)]
+type SessionCreateGate = (
+    PathBuf,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+#[cfg(test)]
+static SESSION_CREATE_GATE: std::sync::OnceLock<std::sync::Mutex<Option<SessionCreateGate>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_session_create_gate_for_test(
+    session_dir: &Path,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *SESSION_CREATE_GATE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((session_dir.to_path_buf(), entered_tx, release_rx));
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_on_session_create_gate_for_test(session_dir: &Path) {
+    let gate = SESSION_CREATE_GATE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .filter(|(gated, _, _)| gated == session_dir);
+    if let Some((_, entered, release)) = gate {
+        let _ = entered.send(());
+        let _ = release.recv();
+    }
+}
+
 pub const SCHEMA_VERSION: u32 = 7;
 pub(crate) const CONTROL_DIR: &str = "control";
 const IO_DIR: &str = "io";
@@ -1060,6 +1099,7 @@ pub fn task_paths(storage_dir: &Path, session_id: &str, task_id: &str) -> io::Re
 
 pub fn allocate_task_layout(storage_dir: &Path, session_id: &str) -> io::Result<ResolvedTask> {
     let session_dir = session_tasks_dir(storage_dir, session_id);
+    let _session_lock = lock_session_directory(&session_dir)?;
     create_private_task_store(&session_dir)?;
     let session = Arc::new(PinnedDir::open(&session_dir)?);
     for _ in 0..32 {
@@ -1083,8 +1123,74 @@ pub fn create_task_layout(
 ) -> io::Result<ResolvedTask> {
     validate_task_id(task_id)?;
     let session_dir = session_tasks_dir(storage_dir, session_id);
+    let _session_lock = lock_session_directory(&session_dir)?;
     create_private_task_store(&session_dir)?;
     create_task_layout_from_session(Arc::new(PinnedDir::open(&session_dir)?), task_id)
+}
+
+fn lock_session_directory(session_dir: &Path) -> io::Result<File> {
+    let task_root = session_dir
+        .parent()
+        .ok_or_else(|| io::Error::other("task session directory has no parent"))?;
+    let storage_root = task_root
+        .parent()
+        .ok_or_else(|| io::Error::other("task root has no storage parent"))?;
+    crate::private_storage::open_dir(storage_root, task_root)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(task_root.join(".session-directory.lock"))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
+fn lock_session_directories(session_dirs: &[&Path]) -> io::Result<Vec<File>> {
+    let mut task_roots = session_dirs
+        .iter()
+        .map(|session_dir| {
+            session_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| io::Error::other("task session directory has no parent"))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    task_roots.sort();
+    task_roots.dedup();
+    task_roots
+        .into_iter()
+        .map(|task_root| {
+            let storage_root = task_root
+                .parent()
+                .ok_or_else(|| io::Error::other("task root has no storage parent"))?;
+            crate::private_storage::open_dir(storage_root, &task_root)?;
+            let lock = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(task_root.join(".session-directory.lock"))?;
+            lock.lock()?;
+            Ok(lock)
+        })
+        .collect()
+}
+
+/// Remove a session directory only when no task or quarantine writer owns it.
+/// The OS rmdir is the emptiness check and removal, so a racing entry survives.
+pub(crate) fn remove_empty_session_directory(session_dir: &Path) -> io::Result<bool> {
+    let _session_lock = lock_session_directory(session_dir)?;
+    match fs::remove_dir(session_dir) {
+        Ok(()) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn create_private_task_store(session_dir: &Path) -> io::Result<()> {
@@ -1105,6 +1211,8 @@ fn create_task_layout_from_session(
     task_id: &str,
 ) -> io::Result<ResolvedTask> {
     validate_task_id(task_id)?;
+    #[cfg(test)]
+    wait_on_session_create_gate_for_test(&session.path);
     let task = session.create_dir_at(OsStr::new(task_id))?;
     let control = task.create_dir_at(OsStr::new(CONTROL_DIR))?;
     let io_dir = task.create_dir_at(OsStr::new(IO_DIR))?;
@@ -1298,6 +1406,12 @@ pub fn quarantine_task_layout(
 ) -> io::Result<()> {
     let result = (|| -> io::Result<()> {
         validate_task_id(task_id)?;
+        let quarantine_session = storage_dir.join("bash-tasks-quarantine").join(
+            session_dir
+                .file_name()
+                .ok_or_else(|| io::Error::other("task session directory has no identity"))?,
+        );
+        let _session_locks = lock_session_directories(&[session_dir, &quarantine_session])?;
         let session = PinnedDir::open(session_dir)?;
         let names = session.list_names()?;
         let flat_prefix = format!("{task_id}.");
@@ -1330,6 +1444,12 @@ pub fn quarantine_invalid_entry(
     entry: &OsStr,
 ) -> io::Result<()> {
     let result = (|| -> io::Result<()> {
+        let quarantine_session = storage_dir.join("bash-tasks-quarantine").join(
+            session_dir
+                .file_name()
+                .ok_or_else(|| io::Error::other("task session directory has no identity"))?,
+        );
+        let _session_locks = lock_session_directories(&[session_dir, &quarantine_session])?;
         let session = PinnedDir::open(session_dir)?;
         refuse_quarantine_of_newer_task(session_dir, &[entry.to_os_string()])?;
         quarantine_names(
@@ -3399,6 +3519,56 @@ extern "system" {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn task_session_rmdir_waits_for_creator_with_an_open_session_directory() {
+        let storage = tempfile::tempdir().unwrap();
+        let initial =
+            super::create_task_layout(storage.path(), "rmdir-race", "bash-0000000000000001")
+                .unwrap();
+        let initial_paths = initial.paths.clone();
+        let session_dir = initial_paths.session_dir.clone();
+        drop(initial);
+        std::fs::remove_dir_all(&initial_paths.dir).unwrap();
+
+        let (creator_entered, release_creator) =
+            super::install_session_create_gate_for_test(&session_dir);
+        std::thread::scope(|scope| {
+            let creator = scope.spawn(|| {
+                super::create_task_layout(storage.path(), "rmdir-race", "bash-0000000000000002")
+            });
+            creator_entered
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("creator did not open the session directory");
+
+            let (remove_started_tx, remove_started_rx) = std::sync::mpsc::channel();
+            let (removed_tx, removed_rx) = std::sync::mpsc::channel();
+            let remove_session_dir = session_dir.clone();
+            let remover = scope.spawn(move || {
+                remove_started_tx.send(()).unwrap();
+                removed_tx
+                    .send(super::remove_empty_session_directory(&remove_session_dir))
+                    .unwrap();
+            });
+            remove_started_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(
+                removed_rx
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .is_err(),
+                "session removal passed a task creator holding the shared gate"
+            );
+
+            release_creator.send(()).unwrap();
+            let created = creator.join().unwrap().unwrap();
+            remover.join().unwrap();
+            let removed = removed_rx.recv().unwrap().unwrap();
+            assert!(!removed, "a session containing a new task was removed");
+            assert!(created.paths.dir.is_dir());
+        });
+        assert!(session_dir.join("bash-0000000000000002").is_dir());
+    }
+
     // Freeze the scope-blind version-7 task shape rather than deserializing
     // through PersistedTask, whose new scope field would hide rollback behavior.
     // Serde's unknown-field handling lets that reader ignore the added stamp.

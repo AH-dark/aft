@@ -7560,6 +7560,14 @@ impl BgTaskRegistry {
                     }
                 }
                 memo.session_read(&session_dir);
+                if let Err(error) =
+                    super::persistence::remove_empty_session_directory(&session_dir)
+                {
+                    crate::slog_warn!(
+                        "failed to remove empty persisted-task session directory {}: {error}",
+                        session_dir.display()
+                    );
+                }
             }
         }
         // The collector runs every few seconds; a zero count is the normal
@@ -8260,11 +8268,27 @@ impl BgTaskRegistry {
                 Ok(()) => {
                     self.forget_finished_delete_attempts(&task_id);
                     self.remove_cleanup_task(&task);
+                    if let Err(error) =
+                        super::persistence::remove_empty_session_directory(&paths.session_dir)
+                    {
+                        crate::slog_warn!(
+                            "failed to remove empty background task session directory {}: {error}",
+                            paths.session_dir.display()
+                        );
+                    }
                     log::debug!("deleted persisted background task bundle {task_id}");
                 }
                 Err(error) if is_task_layout_not_found(&error) => {
                     self.forget_finished_delete_attempts(&task_id);
                     self.remove_cleanup_task(&task);
+                    if let Err(error) =
+                        super::persistence::remove_empty_session_directory(&paths.session_dir)
+                    {
+                        crate::slog_warn!(
+                            "failed to remove empty background task session directory {}: {error}",
+                            paths.session_dir.display()
+                        );
+                    }
                     log::debug!(
                         "skipping persisted background task bundle {task_id}: no recognized layout at {}",
                         paths.dir.display()
@@ -12408,7 +12432,12 @@ fn gc_quarantine(storage_dir: &Path) {
                 );
             }
         }
-        // Leave session directories pinned by concurrent quarantine writers.
+        if let Err(error) = super::persistence::remove_empty_session_directory(&batch.session) {
+            crate::slog_warn!(
+                "failed to remove empty background task quarantine session {}: {error}",
+                batch.session.display()
+            );
+        }
     }
 }
 
@@ -13561,6 +13590,28 @@ pub(crate) mod default_kill_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn persisted_gc_removes_existing_empty_task_and_quarantine_sessions() {
+        let storage = tempfile::tempdir().unwrap();
+        let task_session = storage.path().join("bash-tasks").join("empty-task-session");
+        let quarantine_session = storage
+            .path()
+            .join("bash-tasks-quarantine")
+            .join("empty-quarantine-session");
+        std::fs::create_dir_all(&task_session).unwrap();
+        std::fs::create_dir_all(&quarantine_session).unwrap();
+
+        super::BgTaskRegistry::default()
+            .maybe_gc_persisted(storage.path())
+            .unwrap();
+
+        assert!(!task_session.exists(), "persisted GC left an empty task session");
+        assert!(
+            !quarantine_session.exists(),
+            "quarantine GC left an empty quarantine session"
+        );
+    }
+
     #[test]
     fn completion_tokenization_failure_skips_all_metrics() {
         for failed in ["raw", "rendered"] {
