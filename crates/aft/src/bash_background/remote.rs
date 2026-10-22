@@ -240,15 +240,31 @@ fn hinted_retry_budget_ms(_root: &Path, request: &RunRequest) -> u64 {
 }
 
 /// What the worker that submitted a job keeps for resubmitting it after a
-/// hinted refusal. It lives only in that worker: after a restart a saved
-/// refusal reaches the caller unchanged.
+/// hinted refusal. Every fresh submission (the first one, or one sent after a
+/// draining wait, also when a restarted daemon sends it) starts its own. It
+/// lives only in that worker: a hinted refusal saved before a restart reaches
+/// the caller unchanged.
 #[cfg(unix)]
 struct HintedRetry {
     request: RunRequest,
-    /// When the runner's admission limit for the first submission passes, on
+    /// When the runner's admission limit for the fresh submission passes, on
     /// the retry clock (Unix milliseconds outside tests).
     deadline_ms: u64,
     resubmits: u32,
+}
+
+#[cfg(unix)]
+impl HintedRetry {
+    /// The state for `request`, which is about to be submitted fresh: its
+    /// admission time counts from now.
+    fn start(root: &Path, request: RunRequest) -> Self {
+        Self {
+            deadline_ms: draining_now_ms(root)
+                .saturating_add(hinted_retry_budget_ms(root, &request)),
+            request,
+            resubmits: 0,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1944,9 +1960,11 @@ impl BgTaskRegistry {
             return Err("remote outcome unknown: Windows platform was not acknowledged; cancel requested; result not trusted".into());
         }
         let mut stream = if retry_request.is_some() {
-            let Some(stream) = self.submit_draining_retry(&client, &task, &root).await? else {
+            let Some((stream, retry)) = self.submit_draining_retry(&client, &task, &root).await?
+            else {
                 return Ok(());
             };
+            hinted = Some(retry);
             recovery.resubmitted(
                 &task
                     .state
@@ -1980,12 +1998,7 @@ impl BgTaskRegistry {
                     })
                 })
                 .map_err(|e| e.to_string())?;
-                hinted = Some(HintedRetry {
-                    deadline_ms: draining_now_ms(&root)
-                        .saturating_add(hinted_retry_budget_ms(&root, &request)),
-                    request: request.clone(),
-                    resubmits: 0,
-                });
+                hinted = Some(HintedRetry::start(&root, request.clone()));
             }
             match client.run(&request).await {
                 Ok(stream) => stream,
@@ -2071,12 +2084,13 @@ impl BgTaskRegistry {
                     };
                     if retries_draining(&remote, &verdict) {
                         if self.wait_draining_retry(&task, &root).await?.is_some() {
-                            let Some(next) =
+                            let Some((next, retry)) =
                                 self.submit_draining_retry(&client, &task, &root).await?
                             else {
                                 return Ok(());
                             };
                             stream = next;
+                            hinted = Some(retry);
                             recovery.resubmitted(
                                 &task
                                     .state
@@ -2234,7 +2248,7 @@ impl BgTaskRegistry {
         client: &ExecRemoteClient,
         task: &Arc<BgTask>,
         root: &Path,
-    ) -> Result<Option<exec::RemoteStream>, String> {
+    ) -> Result<Option<(exec::RemoteStream, HintedRetry)>, String> {
         // Recheck after connecting: reconnect time also consumes the retry budget.
         let Some(request) = self.wait_draining_retry(task, root).await? else {
             return Ok(None);
@@ -2272,8 +2286,10 @@ impl BgTaskRegistry {
             self.persist_task_locked(task, &state.metadata, &mut db)
                 .map_err(|e| e.to_string())?;
         }
-        match client.run(&request).await {
-            Ok(stream) => Ok(Some(stream)),
+        // A fresh submission gets its own signer-retry allowance, counted from now.
+        let hinted = HintedRetry::start(root, request);
+        match client.run(&hinted.request).await {
+            Ok(stream) => Ok(Some((stream, hinted))),
             Err(error) if proves_no_start(&error) => {
                 self.refuse_remote_before_dispatch(task, &error.to_string())?;
                 Ok(None)

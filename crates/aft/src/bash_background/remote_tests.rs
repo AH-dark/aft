@@ -6773,3 +6773,79 @@ async fn runon_kill_during_a_signer_retry_wait_ends_the_task_without_resubmittin
         "kill must veto any new exec.run"
     );
 }
+
+/// A draining resubmission is a fresh submission: a signer refusal with a
+/// hint on it is resubmitted too, within an admission time counted from that
+/// resubmission. The shortened budget is spent long before the draining wait
+/// ends, so counting from the first submission would surface the refusal.
+#[tokio::test]
+async fn runon_signer_retry_follows_a_live_draining_resubmission() {
+    let daemon = daemon(
+        Script::DrainingThenSigner {
+            signer_refusals: 1,
+            draining_after_ms: 500,
+            signer_after_ms: 100,
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_hinted_retry_budget(dir.path(), 150);
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let first = clock.now();
+    clock.expect_sleep(first, first + 500).await;
+    clock.advance(500);
+    clock.expect_sleep(first + 500, first + 600).await;
+    assert_eq!(exec_runs(&daemon).len(), 2);
+    clock.advance(100);
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    assert!(done.remote_refusal.is_none(), "{done:?}");
+    let requests = exec_runs(&daemon);
+    assert_eq!(requests.len(), 3);
+    assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_no_retry_sleep(&mut clock);
+}
+
+/// The same after a restart: the saved draining refusal is resumed by a new
+/// daemon, whose draining resubmission meets a hinted signer refusal.
+#[tokio::test]
+async fn runon_signer_retry_follows_a_draining_resubmission_resumed_after_restart() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+        Script::DrainingThenSigner {
+            signer_refusals: 1,
+            draining_after_ms: 200,
+            signer_after_ms: 100,
+        },
+        "exec-remote/v1",
+        2,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_hinted_retry_budget(dir.path(), 150);
+    let mut clock = PausedDrainingClock::new(dir.path());
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    let original = registry();
+    let task = start_runon_retry(&original, dir.path(), daemon.connection.clone());
+    clock.expect_event(DrainingClockEvent::Stopped).await;
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let first = clock.now();
+    clock.expect_sleep(first, first + 200).await;
+    clock.advance(200);
+    clock.expect_sleep(first + 200, first + 300).await;
+    assert_eq!(exec_runs(&daemon).len(), 2);
+    clock.advance(100);
+    let done = terminal(&restarted, &task).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    assert!(done.remote_refusal.is_none(), "{done:?}");
+    let requests = exec_runs(&daemon);
+    assert_eq!(requests.len(), 3);
+    assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_no_retry_sleep(&mut clock);
+}

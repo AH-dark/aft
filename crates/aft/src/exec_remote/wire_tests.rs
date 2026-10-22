@@ -114,6 +114,15 @@ pub(crate) enum Script {
         detail: &'static str,
         retry_after_ms: Option<u64>,
     },
+    /// Refuse the first run as draining with hint `draining_after_ms`, the
+    /// next `signer_refusals` runs with [`signer_refusal`] for
+    /// `runner_sign_unavailable` with hint `signer_after_ms`, then accept
+    /// later runs, which exit 0. No refusal sends `Accepted`.
+    DrainingThenSigner {
+        signer_refusals: u32,
+        draining_after_ms: u64,
+        signer_after_ms: u64,
+    },
     FutureOutcome,
     Expired,
     Utf8,
@@ -303,6 +312,7 @@ pub(crate) async fn daemon_with_capabilities(
                             let attaching = body["method"] == "exec.attach";
                             if !attaching { runs += 1; }
                             let draining = matches!(script, Script::Draining { refusals, .. } | Script::DiskFull { refusals, .. } | Script::SignerRefused { refusals, .. } if runs <= refusals)
+                                || matches!(script, Script::DrainingThenSigner { signer_refusals, .. } if runs <= 1 + signer_refusals)
                                 || matches!(script, Script::DrainingGatedAcceptance) && runs == 1;
                             if attaching && matches!(script, Script::AttachDisconnected) {
                                 // Drop the route and listener; later attach calls and connects fail.
@@ -398,6 +408,14 @@ pub(crate) async fn daemon_with_capabilities(
                                     }
                                     if let (true, Script::SignerRefused { detail, retry_after_ms, .. }) = (draining, script) {
                                         terminal = signer_refusal(detail, retry_after_ms);
+                                    }
+                                    if let (true, Script::DrainingThenSigner { draining_after_ms, signer_after_ms, .. }) = (draining, script) {
+                                        if runs == 1 {
+                                            terminal.retry_after_ms = Some(draining_after_ms);
+                                            terminal.refusal_detail = Some("maintenance".into());
+                                        } else {
+                                            terminal = signer_refusal("runner_sign_unavailable", Some(signer_after_ms));
+                                        }
                                     }
                                     if cancelled && !matches!(script, Script::PersistentTerminalGap | Script::TransientTerminalGap | Script::TerminalGapOnce) { terminal = terminal.with_killed(Killed::Cancel); }
                                     if matches!(script, Script::Deadline) { terminal = terminal.with_killed(Killed::Deadline); }
