@@ -472,11 +472,13 @@ thread_local! {
 /// Test fixture: an executable `git` stub in `directory` that prints `output`.
 #[cfg(all(test, unix))]
 pub(crate) fn write_stub_git_for_test(directory: &Path, output: &str) {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(directory).unwrap();
     let stub = directory.join("git");
-    std::fs::write(&stub, format!("#!/bin/sh\nprintf '%s\\n' '{output}'\n")).unwrap();
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::executable_cache::write_executable(
+        &stub,
+        format!("#!/bin/sh\nprintf '%s\\n' '{output}'\n").as_bytes(),
+    )
+    .unwrap();
 }
 
 /// A child PATH whose first entry is the relative directory `bin`, followed by

@@ -56,6 +56,13 @@ fn temp_file(dir: &Path, name: &str, content: &str) -> PathBuf {
     path
 }
 
+#[cfg(unix)]
+fn temp_executable(dir: &Path, name: &str, content: &str) -> PathBuf {
+    let path = dir.join(name);
+    crate::test_helpers::executable_cache::write_executable(&path, content.as_bytes()).unwrap();
+    path
+}
+
 fn fetch_rows(conn: &Arc<Mutex<Connection>>, order_by: &str) -> Vec<DbBackupRow> {
     let conn = conn.lock().unwrap();
     let sql = format!(
@@ -292,8 +299,7 @@ fn backup_restore_round_trips_binary_bytes() {
 fn backup_restore_preserves_unix_permissions() {
     let project = non_temp_dir().unwrap();
     let mut store = BackupStore::new();
-    let file = temp_file(project.path(), "executable.sh", "#!/bin/sh\nexit 0\n");
-    fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+    let file = temp_executable(project.path(), "executable.sh", "#!/bin/sh\nexit 0\n");
     warm_executable(&file, &["--version"]);
 
     store.snapshot(SESSION, &file, "executable").unwrap();
@@ -311,12 +317,11 @@ fn legacy_db_row_without_restore_meta_reads_mode_from_sidecar() {
     let project = non_temp_dir().unwrap();
     let storage = non_temp_dir().unwrap();
     let (mut store, conn) = store_with_db(storage.path(), Harness::Opencode);
-    let file = temp_file(
+    let file = temp_executable(
         project.path(),
         "legacy-executable.sh",
         "#!/bin/sh\nexit 0\n",
     );
-    fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
     warm_executable(&file, &["--version"]);
     store.snapshot(SESSION, &file, "legacy executable").unwrap();
 
@@ -359,8 +364,7 @@ fn binary_db_fallback_restores_mode_without_sidecar() {
 
     let project = non_temp_dir().unwrap();
     let storage = non_temp_dir().unwrap();
-    let file = temp_file(project.path(), "tool.sh", "#!/bin/sh\necho ORIGINAL\n");
-    fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+    let file = temp_executable(project.path(), "tool.sh", "#!/bin/sh\necho ORIGINAL\n");
     warm_executable(&file, &["--version"]);
     let configure = |id: &str| {
         serde_json::json!({

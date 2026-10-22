@@ -378,7 +378,6 @@ pub fn is_unusable_launcher(path: &Path) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn launcher_read_error_is_retried_without_metadata_changes() {
@@ -451,8 +450,7 @@ mod tests {
     }
 
     fn executable(path: &Path, body: &str) {
-        std::fs::write(path, body).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable_cache::write_executable(path, body.as_bytes()).unwrap();
     }
 
     #[test]

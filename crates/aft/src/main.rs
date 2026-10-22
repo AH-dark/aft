@@ -5,6 +5,10 @@ mod cli;
 mod context_storage;
 
 #[cfg(test)]
+#[path = "../tests/helpers/executable_cache.rs"]
+mod executable_cache;
+
+#[cfg(test)]
 mod test_env {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -3310,20 +3314,18 @@ mod deferred_semantic_search_tests {
     /// Install a fast `tsc` stub that reports one TS2322 error for `target`.
     #[cfg(unix)]
     fn install_fast_tsc_stub(root: &Path, target: &Path) {
-        use std::os::unix::fs::PermissionsExt;
         let bin_dir = root.join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin_dir).expect("create stub bin dir");
         let stub = bin_dir.join("tsc");
-        std::fs::write(
+        crate::executable_cache::write_executable(
             &stub,
             format!(
                 "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version 5.0.0'; exit 0; fi\nprintf '%s(1,7): error TS2322: Type string is not assignable to type number.\\n' '{}'\nexit 2\n",
                 target.display()
-            ),
+            )
+            .as_bytes(),
         )
         .expect("write tsc stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod tsc stub");
         // Pay first-exec cost (macOS assessment) outside the checker timeout.
         let _ = std::process::Command::new(&stub)
             .arg("--version")

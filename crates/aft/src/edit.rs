@@ -2548,7 +2548,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a03_formatter_checker_final_buffer_parity() {
-        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("edge.ts");
         let bin = root.path().join("node_modules/.bin");
@@ -2557,8 +2556,11 @@ mod tests {
         std::fs::write(root.path().join("tsconfig.json"), "{}").unwrap();
         for (tool, value) in [("oxfmt", 3), ("tsc", 4)] {
             let tool_path = bin.join(tool);
-            std::fs::write(&tool_path, format!("#!/bin/sh\nif [ \"$1\" = '--version' ]; then echo '{tool} 1.0'; exit 0; fi\nprintf 'const value = {value};\\n' > '{}'\n", path.display())).unwrap();
-            std::fs::set_permissions(&tool_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::executable_cache::write_executable(
+                &tool_path,
+                format!("#!/bin/sh\nif [ \"$1\" = '--version' ]; then echo '{tool} 1.0'; exit 0; fi\nprintf 'const value = {value};\\n' > '{}'\n", path.display()).as_bytes(),
+            )
+            .unwrap();
         }
         let config = Config {
             project_root: Some(root.path().to_path_buf()),

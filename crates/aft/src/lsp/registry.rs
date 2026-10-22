@@ -2476,17 +2476,7 @@ mod tests {
     /// Helper: write an executable file containing `#!/bin/sh\n` so it
     /// passes both `is_file()` checks and is executable on Unix.
     fn touch_exe(path: &Path) {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(path, perms).unwrap();
-        }
+        crate::executable_cache::write_executable(path, b"#!/bin/sh\nexit 0\n").unwrap();
     }
 
     fn oxlint_def() -> ServerDef {

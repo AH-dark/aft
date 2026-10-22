@@ -2468,8 +2468,7 @@ mod tests {
 
     #[cfg(unix)]
     fn write_executable(path: &Path, body: &str) {
-        fs::write(path, body).unwrap();
-        set_executable(path).unwrap();
+        crate::executable_cache::write_executable(path, body.as_bytes()).unwrap();
     }
 
     #[cfg(unix)]

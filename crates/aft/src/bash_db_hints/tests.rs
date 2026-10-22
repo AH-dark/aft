@@ -174,8 +174,7 @@ fn real_readonly_database_and_quoted_identifiers() {
 fn real_probe_timeout_is_counted_and_once_only() {
     let dir = database("CREATE TABLE tasks(id TEXT);");
     let binary = dir.path().join("sqlite3");
-    std::fs::write(&binary, "#!/bin/sh\nsleep 5\n").unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::executable_cache::write_executable(&binary, b"#!/bin/sh\nsleep 5\n").unwrap();
     let command = format!(
         "'{}' store.db 'SELECT missing FROM tasks'",
         binary.display()
@@ -219,8 +218,7 @@ fn real_probe_uses_same_launcher_and_no_user_flags() {
     let dir = database("CREATE TABLE tasks(id TEXT);");
     let launcher = dir.path().join("launcher");
     let record = dir.path().join("probe-argv");
-    std::fs::write(&launcher, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n# Real launchers report unenforceable rules on stderr; that must not cost the hint.\necho 'sandbox-launch: unenforced=[socket_deny]' >&2\n[ \"$1\" = sandbox-launch ] || exit 1\nshift 3\n[ \"$1\" = -- ] || exit 1\nshift\nexec \"$@\"\n", record.display())).unwrap();
-    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::executable_cache::write_executable(&launcher, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n# Real launchers report unenforceable rules on stderr; that must not cost the hint.\necho 'sandbox-launch: unenforced=[socket_deny]' >&2\n[ \"$1\" = sandbox-launch ] || exit 1\nshift 3\n[ \"$1\" = -- ] || exit 1\nshift\nexec \"$@\"\n", record.display()).as_bytes()).unwrap();
     let profile = SandboxProfile {
         data_policy: Default::default(),
         v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,

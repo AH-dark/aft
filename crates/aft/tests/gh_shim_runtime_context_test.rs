@@ -5,7 +5,6 @@ mod test_helpers;
 
 use std::fs;
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -314,31 +313,21 @@ fn write_project_repo_for(root: &Path, name: &str, repository: &str) -> PathBuf 
 fn write_upstream_gh(bin: &Path) {
     let gh = bin.join("gh");
     fs::create_dir_all(bin).expect("create fake upstream bin directory");
-    fs::write(
+    test_helpers::executable_cache::write_executable(
         &gh,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_SHIM_TEST_RECORD\"\nprintf 'r2-passthrough\\n'\nexit 73\n",
+        b"#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_SHIM_TEST_RECORD\"\nprintf 'r2-passthrough\\n'\nexit 73\n",
     )
     .expect("write fake upstream gh");
-    let mut permissions = fs::metadata(&gh)
-        .expect("read fake upstream gh metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&gh, permissions).expect("make fake upstream gh executable");
 }
 
 fn write_upstream_gh_user_api(bin: &Path) {
     let gh = bin.join("gh");
     fs::create_dir_all(bin).expect("create fake upstream bin directory");
-    fs::write(
+    test_helpers::executable_cache::write_executable(
         &gh,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_SHIM_TEST_RECORD\"\n[ \"$1\" = api ] || exit 73\nprintf '289616620\\n'\n",
+        b"#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_SHIM_TEST_RECORD\"\n[ \"$1\" = api ] || exit 73\nprintf '289616620\\n'\n",
     )
     .expect("write fake upstream gh API");
-    let mut permissions = fs::metadata(&gh)
-        .expect("read fake upstream gh metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&gh, permissions).expect("make fake upstream gh executable");
 }
 
 fn write_numeric_ids(state_home: &Path, ids: Value) {

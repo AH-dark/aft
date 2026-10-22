@@ -20920,23 +20920,20 @@ mod tests {
         std::fs::write(temp.path().join("go.mod"), "module example.test\ngo 1.21\n").unwrap();
         let bin_dir = temp.path().join("node_modules/.bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        use std::os::unix::fs::PermissionsExt;
 
         let go = bin_dir.join("go");
-        std::fs::write(
+        crate::executable_cache::write_executable(
             &go,
-            "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then exit 0; fi\nif [ \"$1\" = \"--version\" ]; then exit 2; fi\nexit 1\n",
+            b"#!/bin/sh\nif [ \"$1\" = \"version\" ]; then exit 0; fi\nif [ \"$1\" = \"--version\" ]; then exit 2; fi\nexit 1\n",
         )
         .unwrap();
-        std::fs::set_permissions(&go, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let gofmt = bin_dir.join("gofmt");
-        std::fs::write(
+        crate::executable_cache::write_executable(
             &gofmt,
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 2; fi\ncat >/dev/null\nexit 0\n",
+            b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 2; fi\ncat >/dev/null\nexit 0\n",
         )
         .unwrap();
-        std::fs::set_permissions(&gofmt, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut languages = std::collections::HashSet::new();
         languages.insert(crate::parser::LangId::Go);
@@ -22172,12 +22169,7 @@ mod tests {
             .navigation_requires_deferred_execution(&source, ctx.config().as_ref()));
 
         let binary = lsp_bin.path().join(binary_name);
-        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::executable_cache::write_executable(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
         let generation = ctx.configure_generation();
         let mut lsp_params = base_params;
         lsp_params["lsp_paths_extra"] = json!([lsp_bin.path()]);

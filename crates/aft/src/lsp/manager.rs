@@ -8833,12 +8833,7 @@ mod diagnostic_capacity_tests {
         let bin_dir = tempfile::tempdir().unwrap();
         let binary_name = "aft-test-pushed-lsp";
         let binary = bin_dir.path().join(binary_name);
-        fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::executable_cache::write_executable(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
 
         let config = Config {
             project_root: Some(root.path().to_path_buf()),
@@ -9226,8 +9221,6 @@ mod inspect_path_tests {
     #[cfg(unix)]
     #[test]
     fn per_package_biome_resolves_in_a_bun_workspace() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let root = crate::inspect::job::canonicalize_normalized(temp_dir.path()).join("workspace");
         let write = |relative: &str, contents: &str| {
@@ -9254,11 +9247,12 @@ mod inspect_path_tests {
             );
             // Behaves like the real CLI's `--version`; resolution only needs
             // an executable file.
-            let biome = write(
-                &format!("packages/{package}/node_modules/.bin/biome"),
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version: 2.5.1'; exit 0; fi\nexit 1\n",
-            );
-            std::fs::set_permissions(&biome, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let biome = root.join(format!("packages/{package}/node_modules/.bin/biome"));
+            crate::executable_cache::write_executable(
+                &biome,
+                b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version: 2.5.1'; exit 0; fi\nexit 1\n",
+            )
+            .unwrap();
         }
         let config = Config {
             project_root: Some(root.clone()),
@@ -9661,8 +9655,6 @@ mod typescript_worktree_tests {
     #[cfg(unix)]
     #[test]
     fn root_scripts_outside_every_typescript_project_are_a_named_gap() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().unwrap();
         let root = crate::inspect::job::canonicalize_normalized(temp.path()).join("workspace");
         let write = |relative: &str, contents: &str| {
@@ -9692,9 +9684,9 @@ mod typescript_worktree_tests {
         let tools = temp.path().join("tools").join("node_modules").join(".bin");
         std::fs::create_dir_all(&tools).unwrap();
         let fake = tools.join("typescript-language-server");
-        std::fs::write(
+        crate::executable_cache::write_executable(
             &fake,
-            r#"#!/bin/sh
+            br#"#!/bin/sh
 len=0
 while IFS= read -r line; do
   line=$(printf '%s' "$line" | tr -d '\r')
@@ -9709,7 +9701,6 @@ exit 1
 "#,
         )
         .unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let config = Config {
             project_root: Some(root.clone()),

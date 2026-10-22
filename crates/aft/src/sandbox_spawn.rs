@@ -4817,9 +4817,21 @@ fn install_worker_mktemp(temp_dir: &Path) -> Result<(), String> {
     // Apple mktemp prefers confstr(_CS_DARWIN_USER_TEMP_DIR) over TMPDIR
     // when no template is supplied. An explicit template keeps that default
     // operation inside the task; user-supplied templates retain their meaning.
-    std::fs::write(
-        &shim,
-        r#"#!/bin/sh
+    use std::io::Write;
+    static NEXT_TEMPORARY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let temporary = bin.join(format!(
+        ".mktemp.{}.{}",
+        std::process::id(),
+        NEXT_TEMPORARY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut staged = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| format!("failed to stage task temporary helper: {error}"))?;
+    let written = (|| {
+        staged.write_all(
+            br#"#!/bin/sh
 for argument do
     case "$argument" in
         -*) flags=${argument#-}
@@ -4829,10 +4841,20 @@ for argument do
 done
 exec /usr/bin/mktemp "$@" "${TMPDIR:?}/tmp.XXXXXXXX"
 "#,
-    )
-    .map_err(|error| format!("failed to write task temporary helper: {error}"))?;
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-        .map_err(|error| format!("failed to make task temporary helper executable: {error}"))
+        )?;
+        staged.set_permissions(std::fs::Permissions::from_mode(0o755))
+    })();
+    drop(staged);
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("failed to write task temporary helper: {error}"));
+    }
+    // A child must never execute this helper while another process still has
+    // its inode open for writing; Linux reports ETXTBSY (text file busy) in that situation.
+    std::fs::rename(&temporary, &shim).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("failed to publish task temporary helper: {error}")
+    })
 }
 
 pub(crate) fn is_managed_task_temp_dir(path: &Path) -> bool {
@@ -6524,14 +6546,17 @@ mod tests {
         shell: &[&str],
     ) -> SupervisorRun {
         use std::os::fd::AsRawFd;
-        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
         let temp = project.join("temp");
         std::fs::create_dir_all(&temp).unwrap();
         let launcher = root.path().join("launcher");
-        std::fs::write(&launcher, launcher_body).unwrap();
-        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::executable_cache::write_executable_with_mode(
+            &launcher,
+            launcher_body.as_bytes(),
+            0o700,
+        )
+        .unwrap();
         let profile = SandboxProfile::build(
             vec![project],
             vec![],

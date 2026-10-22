@@ -230,15 +230,13 @@ impl WireRestore {
     }
 
     fn install_shell_launcher(&self) -> Box<dyn std::any::Any> {
-        use std::os::unix::fs::PermissionsExt;
         let launcher = self._dir.path().join("sandbox-profile-capture");
         let profile = self.revived.project_root.join("last-profile.json");
         // Capture the normally resolved profile, then execute a real command.
         // Native sandbox enforcement belongs to the platform sandbox tests.
-        std::fs::write(&launcher, format!(
+        crate::executable_cache::write_executable(&launcher, format!(
             "#!/bin/sh\nshift\n[ \"$1\" = --profile-json ] || exit 91\nprintf '%s' \"$2\" > '{}'\nshift 2\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n", profile.display()
-        )).unwrap();
-        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ).as_bytes()).unwrap();
         Box::new(crate::sandbox_spawn::install_sandbox_launcher_for_test(
             &self.revived.project_root,
             launcher,

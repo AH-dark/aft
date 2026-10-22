@@ -60,22 +60,8 @@ pub fn cached_executable_named_in(root: &Path, bytes: &[u8], name: &str) -> io::
         .prefix(".pending-")
         .tempdir_in(cache_root)?;
     let pending = pending_dir.path().join("executable");
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&pending)?;
-        file.write_all(bytes)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o755))?;
-        }
-        #[cfg(target_os = "linux")]
-        file.sync_all()?;
-        #[cfg(not(target_os = "linux"))]
-        file.sync_all()?;
-    }
+    write_executable_with_mode(&pending, bytes, 0o755)?;
+    OpenOptions::new().read(true).open(&pending)?.sync_all()?;
 
     match fs::hard_link(&pending, &path) {
         Ok(()) => {}
@@ -102,6 +88,96 @@ pub fn link_cached_path(source: &Path, destination: &Path) -> io::Result<PathBuf
 pub fn link_cached_executable(destination: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     let cached = cached_executable(bytes)?;
     link_cached_path(&cached, destination)
+}
+
+/// Executing an executable while any process still has it open for writing can fail
+/// with `ETXTBSY` (text file busy) on Linux. A short-lived writer process keeps test-thread forks
+/// from inheriting the staged file's write descriptor before it is renamed.
+pub fn write_executable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_executable_with_mode(path, bytes, 0o755)
+}
+
+/// Publish a staged executable with the requested Unix permission bits.
+pub fn write_executable_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    static NEXT_TEMPORARY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let (temporary_path, file) = loop {
+        let temporary_path = parent.join(format!(
+            ".{file_name}.tmp.{}.{}",
+            std::process::id(),
+            NEXT_TEMPORARY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+        {
+            Ok(file) => break (temporary_path, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    drop(file);
+
+    let write_result = write_staged_bytes(&temporary_path, bytes);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = fs::set_permissions(&temporary_path, fs::Permissions::from_mode(mode)) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    if let Err(error) = fs::rename(&temporary_path, path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_staged_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::process::{Command, Stdio};
+
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", "/bin/cat > \"$1\"", "aft-test-executable-writer"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let write_result = writer
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("test executable writer has no stdin"))
+        .and_then(|mut stdin| stdin.write_all(bytes));
+    let status = writer.wait()?;
+    write_result?;
+    if !status.success() {
+        return Err(io::Error::other("test executable writer process failed"));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_staged_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)?
+        .write_all(bytes)
 }
 
 fn verify_cached(path: &Path, bytes: &[u8]) -> io::Result<()> {

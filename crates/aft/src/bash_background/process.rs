@@ -641,9 +641,7 @@ mod tests {
                 let probe = temp.path().join("probe");
                 // A redirection probe would create Bash's own saved stderr fd
                 // and falsely report it as an inherited control descriptor.
-                std::fs::write(&probe, "#!/bin/bash\nif [ ! -c /dev/fd/0 ] || IFS= read -r input; then\n  echo 'command stdin was not restored to /dev/null' >&2\n  exit 44\nfi\nif [ ! -e /dev/fd/1 ] || [ ! -e /dev/fd/2 ]; then\n  echo 'descriptor lookup cannot see open stdio' >&2\n  exit 43\nfi\nfor fd in 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do\n  if [ -e \"/dev/fd/$fd\" ]; then\n    echo \"leaked control fd $fd\" >&2\n    exit 42\n  fi\ndone\nprintf clean\n").unwrap();
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+                crate::executable_cache::write_executable(&probe, "#!/bin/bash\nif [ ! -c /dev/fd/0 ] || IFS= read -r input; then\n  echo 'command stdin was not restored to /dev/null' >&2\n  exit 44\nfi\nif [ ! -e /dev/fd/1 ] || [ ! -e /dev/fd/2 ]; then\n  echo 'descriptor lookup cannot see open stdio' >&2\n  exit 43\nfi\nfor fd in 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do\n  if [ -e \"/dev/fd/$fd\" ]; then\n    echo \"leaked control fd $fd\" >&2\n    exit 42\n  fi\ndone\nprintf clean\n".as_bytes()).unwrap();
                 let payload = if pipeline {
                     format!("'{}' | cat", probe.display())
                 } else {
@@ -896,11 +894,10 @@ fn lifecycle_empty_group_avoids_proc_scan() {
 #[cfg(target_os = "linux")]
 #[test]
 fn lifecycle_scope_probe_deadline_falls_back() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let launcher = dir.path().join("systemd-run");
-    std::fs::write(&launcher, "#!/bin/sh\nsleep 0.1\nexit 0\n").unwrap();
-    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::executable_cache::write_executable(&launcher, b"#!/bin/sh\nsleep 0.1\nexit 0\n")
+        .unwrap();
     assert!(
         !probe_systemd_scope(&launcher, Duration::ZERO),
         "expired probe still reported availability"

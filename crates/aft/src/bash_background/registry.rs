@@ -13458,7 +13458,6 @@ mod tests {
     use std::fs;
     use std::io::Write;
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};
@@ -20384,14 +20383,12 @@ mod tests {
         fs::create_dir(&sandbox_temp).unwrap();
         let launcher_script = project.path().join("sandbox-launch");
         let launcher = PathBuf::from("/bin/sh");
-        fs::write(
+        crate::executable_cache::write_executable_with_mode(
             &launcher_script,
-            "while [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -- ]; then\n    shift\n    exec \"$@\"\n  fi\n  shift\ndone\nexit 78\n",
+            b"while [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -- ]; then\n    shift\n    exec \"$@\"\n  fi\n  shift\ndone\nexit 78\n",
+            0o700,
         )
         .unwrap();
-        let mut permissions = fs::metadata(&launcher_script).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&launcher_script, permissions).unwrap();
 
         let profile = crate::sandbox_profile::SandboxProfile::build(
             vec![project.path().to_path_buf()],
