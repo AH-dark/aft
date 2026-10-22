@@ -150,14 +150,13 @@ pub(crate) fn spawn_pty_for_command(
         } else {
             shell_candidates()
         };
-        let mut last_err = String::from("no Windows shell candidates available");
-
-        for shell in candidates {
+        let attempt = crate::windows_shell::spawn_pty_candidates(&candidates, |shell| {
             let wrapper_body = shell.wrapper_script_bytes(user_command, &paths.exit);
-            let wrapper_path = windows_wrapper_path(paths, &shell);
+            let wrapper_path = windows_wrapper_path(paths, shell);
             if let Err(error) = crate::private_storage::write(&wrapper_path, wrapper_body) {
-                last_err = format!("write wrapper {wrapper_path:?}: {error}");
-                continue;
+                return Err(crate::windows_shell::PtyAttemptError::Wrapper(format!(
+                    "write wrapper {wrapper_path:?}: {error}"
+                )));
             }
 
             let mut wrapper_env;
@@ -176,7 +175,7 @@ pub(crate) fn spawn_pty_for_command(
                 .map(OsString::from)
                 .collect();
 
-            match try_spawn_pty(
+            try_spawn_pty(
                 spawn_plan,
                 task_id,
                 session_id,
@@ -190,20 +189,16 @@ pub(crate) fn spawn_pty_for_command(
                 wake_tx.clone(),
                 io_handles,
                 spawned_pgid,
-            ) {
-                Ok(runtime) => return Ok(runtime),
-                Err(error) => {
-                    let msg = format!("{shell:?}: {error}");
-                    if msg.contains("NotFound") || msg.contains("not recognized") {
-                        last_err = msg;
-                        continue;
-                    }
-                    return Err(msg);
-                }
-            }
+            )
+            .map_err(crate::windows_shell::PtyAttemptError::Spawn)
+        });
+        match attempt {
+            Ok((runtime, _)) => Ok(runtime),
+            Err(crate::windows_shell::CandidateFailure::Stopped { error, .. }) => Err(error),
+            Err(crate::windows_shell::CandidateFailure::Exhausted { last }) => Err(last
+                .map(|(_, error)| error)
+                .unwrap_or_else(|| "no Windows shell candidates available".into())),
         }
-
-        Err(last_err)
     }
 }
 

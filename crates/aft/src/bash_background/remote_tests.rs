@@ -7226,3 +7226,36 @@ async fn runon_signer_zero_hint_after_the_deadline_surfaces_the_refusal() {
     assert_eq!(exec_runs(&daemon).len(), 1, "no request after the deadline");
     assert_no_retry_sleep(&mut clock);
 }
+
+#[test]
+fn precommit_remote_handle_failure_removes_layout() {
+    use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+    let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
+    let registry = registry();
+    let result = with_task_io_fault(TaskIoFault::OutputHandlesEnospc, || {
+        registry.spawn_remote(
+            launch(dir.path().join("unused-connection")),
+            SpawnPlan::Unsandboxed,
+            "exit 0",
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::Default,
+            dir.path().into(),
+            crate::bash_background::TaskSlot::Foreground,
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+    });
+    assert!(result.unwrap_err().contains("No space left on device"));
+    let session = session_tasks_dir(dir.path(), "session");
+    assert_eq!(
+        fs::read_dir(session).unwrap().count(),
+        0,
+        "uncommitted remote layout leaked"
+    );
+    assert!(registry.list(0).is_empty());
+}

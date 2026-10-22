@@ -1,6 +1,9 @@
 #[cfg(unix)]
 use crate::posix_spawn::Child;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+#[cfg(test)]
+#[path = "launch_tests.rs"]
+mod launch_tests;
 #[cfg(not(windows))]
 use std::ffi::OsString;
 use std::fs;
@@ -47,8 +50,8 @@ use super::persistence::{
     open_task_artifact, quarantine_invalid_entry, quarantine_task_layout, read_exit_marker,
     read_task_at, resolve_task_layout, resolve_uninitialized_task_layout, session_tasks_dir,
     uninitialized_layout_is_recent, unix_millis, update_task_at, validate_task_id,
-    write_kill_marker_if_absent, write_task_at, BgMode, ExitMarker, PersistedTask, TaskArtifact,
-    TaskIoHandles, TaskPaths,
+    write_kill_marker_if_absent, write_task_at, BgMode, ExitMarker, PersistedTask, ResolvedTask,
+    TaskArtifact, TaskIoHandles, TaskPaths,
 };
 #[cfg(unix)]
 use super::process::terminate_pgid;
@@ -66,6 +69,68 @@ use super::watches::{
 use super::{BgTaskInfo, BgTaskStatus};
 use crate::db::bash_tasks::BashTaskRow;
 use crate::db::bash_watches::BashPatternWatchRow;
+
+struct UncommittedLayout<'a> {
+    task: &'a ResolvedTask,
+    armed: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum RegistryError {
+    TaskNotFound(String),
+    TaskLimit(String),
+    StartupDeadline(String),
+    Operation(String),
+}
+
+impl RegistryError {
+    pub(crate) fn is_missing_task(&self) -> bool {
+        matches!(self, Self::TaskNotFound(_))
+    }
+}
+
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TaskNotFound(id) => write!(f, "background task not found: {id}"),
+            Self::TaskLimit(message)
+            | Self::StartupDeadline(message)
+            | Self::Operation(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for RegistryError {
+    fn from(message: String) -> Self {
+        Self::Operation(message)
+    }
+}
+
+impl From<&str> for RegistryError {
+    fn from(message: &str) -> Self {
+        Self::Operation(message.into())
+    }
+}
+
+impl<'a> UncommittedLayout<'a> {
+    fn new(task: &'a ResolvedTask) -> Self {
+        Self { task, armed: true }
+    }
+
+    fn disarm(mut self) {
+        // Once a receipt/record commits, status must retain even a failed
+        // launch. Later failure handling owns that record, not this guard.
+        self.armed = false;
+    }
+}
+
+impl Drop for UncommittedLayout<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = delete_resolved_task(self.task);
+        }
+    }
+}
 /// Default timeout for background bash tasks: 30 minutes.
 /// Agents can override per-call via the `timeout` parameter (in ms); see
 /// [`super::HardKill`].
@@ -2075,7 +2140,7 @@ impl BgTaskRegistry {
             }
         }
         match first_error {
-            Some(error) => Err(error),
+            Some(error) => Err(error.to_string()),
             None => Ok(killed),
         }
     }
@@ -3639,11 +3704,85 @@ impl BgTaskRegistry {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_shell_in_slot(
+        &self,
+        spawn_plan: SpawnPlan,
+        command: &str,
+        shell: super::BashShell,
+        shell_path: PathBuf,
+        session_id: String,
+        workdir: PathBuf,
+        env: HashMap<String, String>,
+        hard_kill: super::HardKill,
+        storage_dir: PathBuf,
+        slot: super::TaskSlot,
+        notify_on_completion: bool,
+        compressed: bool,
+        project_root: Option<PathBuf>,
+    ) -> Result<String, String> {
+        self.spawn_with_shell_in_slot_typed(
+            spawn_plan,
+            command,
+            shell,
+            shell_path,
+            session_id,
+            workdir,
+            env,
+            hard_kill,
+            storage_dir,
+            slot,
+            notify_on_completion,
+            compressed,
+            project_root,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_pty_with_shell(
+        &self,
+        spawn_plan: SpawnPlan,
+        command: &str,
+        shell: super::BashShell,
+        shell_path: PathBuf,
+        session_id: String,
+        workdir: PathBuf,
+        env: HashMap<String, String>,
+        hard_kill: super::HardKill,
+        storage_dir: PathBuf,
+        max_running: usize,
+        notify_on_completion: bool,
+        compressed: bool,
+        project_root: Option<PathBuf>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<String, String> {
+        self.spawn_pty_with_shell_typed(
+            spawn_plan,
+            command,
+            shell,
+            shell_path,
+            session_id,
+            workdir,
+            env,
+            hard_kill,
+            storage_dir,
+            max_running,
+            notify_on_completion,
+            compressed,
+            project_root,
+            rows,
+            cols,
+        )
+        .map_err(|error| error.to_string())
+    }
+
     /// Spawns a piped task. A [`super::TaskSlot::Foreground`] command always
     /// starts; a background launch is refused when its slots are all taken.
     #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn_with_shell_in_slot(
+    pub(crate) fn spawn_with_shell_in_slot_typed(
         &self,
         spawn_plan: SpawnPlan,
         command: &str,
@@ -3658,7 +3797,7 @@ impl BgTaskRegistry {
         notify_on_completion: bool,
         compressed: bool,
         project_root: Option<PathBuf>,
-    ) -> Result<String, String> {
+    ) -> Result<String, RegistryError> {
         self.start_watchdog();
 
         #[cfg(target_os = "linux")]
@@ -3667,7 +3806,7 @@ impl BgTaskRegistry {
         let linux_scope = false;
 
         let _admission = self.background_admission_guard(slot);
-        if let Err(refusal) = self.check_background_slot(slot, &session_id) {
+        if let Err(refusal) = self.check_background_slot_typed(slot, &session_id) {
             if let Some(prepared) = spawn_plan.prepared_task() {
                 let _ = delete_resolved_task(&prepared.resolved_task());
             }
@@ -3698,19 +3837,22 @@ impl BgTaskRegistry {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     let _ = delete_resolved_task(&task);
-                    return Err(error);
+                    return Err(error.into());
                 }
             };
             let task = prepared.resolved_task();
             (spawn_plan.with_prepared_task(prepared), task)
         };
+        let layout_cleanup = UncommittedLayout::new(&task_layout);
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
         let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
 
         if self.task(&task_id).is_some() {
             let _ = delete_resolved_task(&task_layout);
-            return Err("background task id collided with a live task".to_string());
+            return Err(RegistryError::Operation(
+                "background task id collided with a live task".into(),
+            ));
         }
 
         let mut metadata = PersistedTask::starting(
@@ -3770,9 +3912,7 @@ impl BgTaskRegistry {
         super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
-            return Err(format!(
-                "failed to persist background task metadata: {error}"
-            ));
+            return Err(format!("failed to persist background task metadata: {error}").into());
         }
 
         let mut io_handles =
@@ -3784,8 +3924,9 @@ impl BgTaskRegistry {
         // a refused startup leaves no task record anywhere.
         if let Err(error) = super::commit_spawn_receipt(&task_id) {
             let _ = delete_resolved_task(&task_layout);
-            return Err(error);
+            return Err(RegistryError::StartupDeadline(error));
         }
+        layout_cleanup.disarm();
         self.dual_write_task(&paths, &metadata);
         let mut child = match spawn_detached_child(
             &spawn_plan,
@@ -3813,7 +3954,7 @@ impl BgTaskRegistry {
                 } else {
                     let _ = delete_task_bundle(&paths);
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
 
@@ -3834,9 +3975,7 @@ impl BgTaskRegistry {
             );
             let _ = self.persist_task(&paths, &metadata);
             let _ = self.insert_rehydrated_task(metadata, paths.clone(), true);
-            return Err(format!(
-                "failed to persist background task metadata: {error}"
-            ));
+            return Err(format!("failed to persist background task metadata: {error}").into());
         }
         metadata.mark_running(child_pid, child_pid as i32);
         if crate::privacy_spawn::requested(&env) {
@@ -4040,7 +4179,7 @@ impl BgTaskRegistry {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn_pty_with_shell(
+    pub(crate) fn spawn_pty_with_shell_typed(
         &self,
         spawn_plan: SpawnPlan,
         command: &str,
@@ -4057,12 +4196,12 @@ impl BgTaskRegistry {
         project_root: Option<PathBuf>,
         rows: u16,
         cols: u16,
-    ) -> Result<String, String> {
+    ) -> Result<String, RegistryError> {
         self.start_watchdog();
 
         let _admission =
             self.background_admission_guard(super::TaskSlot::Background { max: max_running });
-        if let Err(refusal) = self.check_background_slot(
+        if let Err(refusal) = self.check_background_slot_typed(
             super::TaskSlot::Background { max: max_running },
             &session_id,
         ) {
@@ -4098,7 +4237,7 @@ impl BgTaskRegistry {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     let _ = delete_resolved_task(&task);
-                    return Err(error);
+                    return Err(error.into());
                 }
             };
             let task = prepared.resolved_task();
@@ -4107,6 +4246,7 @@ impl BgTaskRegistry {
         #[cfg(windows)]
         let task_layout = allocate_task_layout(&storage_dir, &session_id)
             .map_err(|error| format!("failed to create PTY task layout: {error}"))?;
+        let layout_cleanup = UncommittedLayout::new(&task_layout);
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
         let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
@@ -4135,9 +4275,7 @@ impl BgTaskRegistry {
         super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
-            return Err(format!(
-                "failed to persist background task metadata: {error}"
-            ));
+            return Err(format!("failed to persist background task metadata: {error}").into());
         }
         let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pty, false)
             .map_err(|error| format!("failed to pre-open PTY output handles: {error}"))?;
@@ -4146,8 +4284,9 @@ impl BgTaskRegistry {
         // Commit point; see `spawn_with_shell`.
         if let Err(error) = super::commit_spawn_receipt(&task_id) {
             let _ = delete_resolved_task(&task_layout);
-            return Err(error);
+            return Err(RegistryError::StartupDeadline(error));
         }
+        layout_cleanup.disarm();
         self.dual_write_task(&paths, &metadata);
 
         let mut spawned_pgid = None;
@@ -4181,7 +4320,7 @@ impl BgTaskRegistry {
                 } else {
                     let _ = delete_task_bundle(&paths);
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
 
@@ -4352,7 +4491,7 @@ impl BgTaskRegistry {
     /// starts; a background launch is refused when its slots are all taken.
     #[cfg(windows)]
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn_with_shell_in_slot(
+    pub(crate) fn spawn_with_shell_in_slot_typed(
         &self,
         spawn_plan: SpawnPlan,
         command: &str,
@@ -4367,15 +4506,16 @@ impl BgTaskRegistry {
         notify_on_completion: bool,
         compressed: bool,
         project_root: Option<PathBuf>,
-    ) -> Result<String, String> {
+    ) -> Result<String, RegistryError> {
         self.start_watchdog();
 
         let _admission = self.background_admission_guard(slot);
-        self.check_background_slot(slot, &session_id)?;
+        self.check_background_slot_typed(slot, &session_id)?;
 
         let timeout_ms = Some(hard_kill.limit().as_millis() as u64);
         let task_layout = allocate_task_layout(&storage_dir, &session_id)
             .map_err(|error| format!("failed to create background task layout: {error}"))?;
+        let layout_cleanup = UncommittedLayout::new(&task_layout);
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
         let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
@@ -4400,9 +4540,7 @@ impl BgTaskRegistry {
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
-            return Err(format!(
-                "failed to persist background task metadata: {error}"
-            ));
+            return Err(format!("failed to persist background task metadata: {error}").into());
         }
         let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pipes, false)
             .map_err(|error| format!("failed to pre-open task output handles: {error}"))?;
@@ -4411,8 +4549,9 @@ impl BgTaskRegistry {
         // Commit point; see the Unix `spawn_with_shell`.
         if let Err(error) = super::commit_spawn_receipt(&task_id) {
             let _ = delete_resolved_task(&task_layout);
-            return Err(error);
+            return Err(RegistryError::StartupDeadline(error));
         }
+        layout_cleanup.disarm();
         self.dual_write_task(&paths, &metadata);
 
         let child = match spawn_detached_child(
@@ -4439,7 +4578,7 @@ impl BgTaskRegistry {
                 } else {
                     let _ = delete_task_bundle(&paths);
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
 
@@ -6970,16 +7109,26 @@ impl BgTaskRegistry {
         project_root: &Path,
         storage_dir: &Path,
     ) -> Result<BgTaskSnapshot, String> {
+        self.kill_relaxed_typed(task_id, project_root, storage_dir)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn kill_relaxed_typed(
+        &self,
+        task_id: &str,
+        project_root: &Path,
+        storage_dir: &Path,
+    ) -> Result<BgTaskSnapshot, RegistryError> {
         let task = self
             .status_relaxed_task(task_id, project_root, storage_dir)
-            .ok_or_else(|| format!("background task not found: {task_id}"))?;
+            .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
         if task
             .lock_state()
             .map_or(true, |state| state.metadata.scope.is_some())
         {
-            return Err(format!("background task not found: {task_id}"));
+            return Err(RegistryError::TaskNotFound(task_id.into()));
         }
-        self.kill_with_status(task_id, &task.session_id, BgTaskStatus::Killed)
+        self.kill_with_status_reason(task_id, &task.session_id, BgTaskStatus::Killed, None)
     }
 
     pub(crate) fn request_recurring_persisted_gc(&self) {
@@ -7552,6 +7701,7 @@ impl BgTaskRegistry {
             BgTaskStatus::Killed,
             Some(SCOPE_REVOKED_REASON.into()),
         )
+        .map_err(|error| error.to_string())
     }
 
     /// Kill a codemode program's task once its run scope is confirmed ended.
@@ -7566,6 +7716,7 @@ impl BgTaskRegistry {
             BgTaskStatus::Killed,
             Some(RUN_ENDED_REASON.into()),
         )
+        .map_err(|error| error.to_string())
     }
 
     /// Kill a running call's task because its caller withdrew the call
@@ -7582,10 +7733,20 @@ impl BgTaskRegistry {
             BgTaskStatus::Killed,
             Some(WITHDRAWN_REASON.into()),
         )
+        .map_err(|error| error.to_string())
     }
 
     pub fn kill(&self, task_id: &str, session_id: &str) -> Result<BgTaskSnapshot, String> {
-        self.kill_with_status(task_id, session_id, BgTaskStatus::Killed)
+        self.kill_typed(task_id, session_id)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn kill_typed(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<BgTaskSnapshot, RegistryError> {
+        self.kill_with_status_reason(task_id, session_id, BgTaskStatus::Killed, None)
     }
 
     /// Terminate live tasks whose project root has been confirmed absent by
@@ -7638,9 +7799,18 @@ impl BgTaskRegistry {
     }
 
     pub fn promote(&self, task_id: &str, session_id: &str) -> Result<bool, String> {
+        self.promote_typed(task_id, session_id)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn promote_typed(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<bool, RegistryError> {
         let task = self
             .task_for_session(task_id, session_id)
-            .ok_or_else(|| format!("background task not found: {task_id}"))?;
+            .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
         // A promoted foreground command now runs in the background, so it
         // holds a slot from here on, even when every slot was already taken:
         // it is already running, and refusing or killing it would lose its
@@ -7870,6 +8040,7 @@ impl BgTaskRegistry {
             reason.map(hard_kill_reason),
         )
         .map(|_| ())
+        .map_err(|error| error.to_string())
     }
 
     /// The task's own kill deadline, for replies that hand the task back.
@@ -9539,6 +9710,7 @@ impl BgTaskRegistry {
         self.clear_task_watch_state(&task.task_id);
     }
 
+    #[cfg(test)]
     fn kill_with_status(
         &self,
         task_id: &str,
@@ -9546,6 +9718,7 @@ impl BgTaskRegistry {
         terminal_status: BgTaskStatus,
     ) -> Result<BgTaskSnapshot, String> {
         self.kill_with_status_reason(task_id, session_id, terminal_status, None)
+            .map_err(|error| error.to_string())
     }
 
     /// Kill a task in three steps so its state lock is never held while
@@ -9567,7 +9740,7 @@ impl BgTaskRegistry {
         session_id: &str,
         terminal_status: BgTaskStatus,
         reason: Option<String>,
-    ) -> Result<BgTaskSnapshot, String> {
+    ) -> Result<BgTaskSnapshot, RegistryError> {
         #[cfg(feature = "test-timing-hooks")]
         let scope_diagnostic = scope_end_label(reason.as_deref()).is_some();
         #[cfg(feature = "test-timing-hooks")]
@@ -9580,7 +9753,7 @@ impl BgTaskRegistry {
         }
         let task = self
             .task_for_session(task_id, session_id)
-            .ok_or_else(|| format!("background task not found: {task_id}"))?;
+            .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
         #[cfg(unix)]
         if task.lock_state().is_ok_and(|s| s.metadata.remote.is_some()) {
             if scope_end_label(reason.as_deref()).is_some() {
@@ -9594,7 +9767,7 @@ impl BgTaskRegistry {
                         .map_err(|e| e.to_string())?;
                 }
             }
-            return self.kill_remote_task(&task);
+            return self.kill_remote_task(&task).map_err(RegistryError::from);
         }
         let mut terminalized = false;
         let mut kill_signaled = false;
@@ -10996,14 +11169,23 @@ impl BgTaskRegistry {
     /// background launch may while fewer than `max` tasks hold background
     /// slots in this registry (one project root, all sessions). The refusal
     /// lists the caller's own slot holders and how to free one, so the agent
-    /// can act on it without another call. Its first line contains "limit
-    /// exceeded", which `bash_background::spawn` maps to the
-    /// `background_task_limit_exceeded` error code.
+    /// can act on it without another call. The typed refusal maps to
+    /// `background_task_limit_exceeded` without inspecting diagnostic text.
+    #[cfg(test)]
     pub(crate) fn check_background_slot(
         &self,
         slot: super::TaskSlot,
         session_id: &str,
     ) -> Result<(), String> {
+        self.check_background_slot_typed(slot, session_id)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn check_background_slot_typed(
+        &self,
+        slot: super::TaskSlot,
+        session_id: &str,
+    ) -> Result<(), RegistryError> {
         let super::TaskSlot::Background { max } = slot else {
             return Ok(());
         };
@@ -11015,11 +11197,11 @@ impl BgTaskRegistry {
         holders
             .own
             .sort_by_key(|holder| std::cmp::Reverse(holder.age));
-        Err(format_background_slot_refusal(
+        Err(RegistryError::TaskLimit(format_background_slot_refusal(
             &holders.own,
             holders.other_sessions,
             max,
-        ))
+        )))
     }
 
     /// Running tasks that hold a background slot, split into the caller's own
@@ -13170,23 +13352,26 @@ fn spawn_detached_child(
         let with_breakaway =
             FLAG_CREATE_NO_WINDOW | FLAG_CREATE_NEW_PROCESS_GROUP | FLAG_CREATE_BREAKAWAY_FROM_JOB;
         let without_breakaway = FLAG_CREATE_NO_WINDOW | FLAG_CREATE_NEW_PROCESS_GROUP;
-        let mut last_error: Option<String> = None;
-        let mut last_program: Option<PathBuf> = None;
-        for (idx, shell) in candidates.iter().enumerate() {
-            // Per-shell, try with breakaway first. If the process is in a
-            // restrictive job, the breakaway flag triggers Access Denied
-            // (os error 5). Retry once without breakaway.
-            for &flags in &[with_breakaway, without_breakaway] {
-                // Clone the pre-opened O_EXCL capture handles per attempt;
-                // Command::spawn consumes each Stdio wrapper.
-                let stdout = io_handles
-                    .clone_file(TaskArtifact::Stdout)
-                    .map_err(|e| format!("failed to clone stdout capture handle: {e}"))?;
-                let stderr = io_handles
-                    .clone_file(TaskArtifact::Stderr)
-                    .map_err(|e| format!("failed to clone stderr capture handle: {e}"))?;
+        use crate::windows_shell::{CandidateFailure, PipedAttemptError};
+        let attempt = crate::windows_shell::spawn_piped_candidates(
+            &candidates,
+            |shell, breakaway| {
+                let flags = if breakaway {
+                    with_breakaway
+                } else {
+                    without_breakaway
+                };
+                // Each attempt consumes its Stdio wrappers, so clone the retained
+                // exclusive capture handles rather than reopening output paths.
+                let stdout = io_handles.clone_file(TaskArtifact::Stdout).map_err(|e| {
+                    PipedAttemptError::Setup(format!("failed to clone stdout capture handle: {e}"))
+                })?;
+                let stderr = io_handles.clone_file(TaskArtifact::Stderr).map_err(|e| {
+                    PipedAttemptError::Setup(format!("failed to clone stderr capture handle: {e}"))
+                })?;
                 let mut cmd =
-                    detached_shell_command_for(shell.clone(), command, &paths.exit, paths, flags)?;
+                    detached_shell_command_for(shell.clone(), command, &paths.exit, paths, flags)
+                        .map_err(PipedAttemptError::Setup)?;
                 cmd.current_dir(workdir)
                     .stdin(Stdio::null())
                     .stdout(Stdio::from(stdout))
@@ -13196,72 +13381,67 @@ fn spawn_detached_child(
                 if let Some((key, value)) = shell.wrapper_environment(command) {
                     cmd.env(key, value);
                 }
-                match cmd.spawn() {
-                    Ok(child) => {
-                        if idx > 0 {
-                            crate::slog_warn!("background bash spawn fell back to {} after {} earlier candidate(s) failed; \
-                             the cached PATH probe disagreed with runtime spawn — likely PATH \
-                             inheritance, antivirus / AppLocker / Defender ASR, or sandbox policy.",
-                            shell.binary(),
-                            idx);
-                        }
-                        if flags == without_breakaway {
-                            crate::slog_warn!(
-                                "background bash spawn: CREATE_BREAKAWAY_FROM_JOB rejected \
-                             (likely a restrictive Job Object — CI sandbox or MDM policy). \
-                             Spawned without breakaway; the bg task will be torn down if the \
-                             AFT process group is killed."
-                            );
-                        }
-                        return Ok(child);
+                cmd.spawn().map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    crate::slog_warn!("background bash spawn: {} returned NotFound at runtime — trying next candidate", shell.binary());
+                } else if breakaway && error.raw_os_error() == Some(5) {
+                    crate::slog_warn!("background bash spawn: CREATE_BREAKAWAY_FROM_JOB rejected with Access Denied — retrying {} without breakaway", shell.binary());
+                }
+                PipedAttemptError::Spawn(error)
+            })
+            },
+        );
+        match attempt {
+            Ok((child, index, without_breakaway)) => {
+                if index > 0 {
+                    crate::slog_warn!("background bash spawn fell back to {} after {} earlier candidate(s) failed; \
+                        the cached PATH probe disagreed with runtime spawn — likely PATH \
+                        inheritance, antivirus / AppLocker / Defender ASR, or sandbox policy.", candidates[index].binary(), index);
+                }
+                if without_breakaway {
+                    crate::slog_warn!(
+                        "background bash spawn: CREATE_BREAKAWAY_FROM_JOB rejected \
+                        (likely a restrictive Job Object — CI sandbox or MDM policy). \
+                        Spawned without breakaway; the bg task will be torn down if the \
+                        AFT process group is killed."
+                    );
+                }
+                Ok(child)
+            }
+            Err(CandidateFailure::Stopped {
+                error: PipedAttemptError::Setup(message),
+                ..
+            }) => Err(message),
+            Err(CandidateFailure::Stopped {
+                index,
+                error: PipedAttemptError::Spawn(error),
+            }) => Err(super::format_spawn_failure(
+                &format!(
+                    "failed to spawn background bash command via {}",
+                    candidates[index].binary()
+                ),
+                Path::new(candidates[index].binary().as_ref()),
+                workdir,
+                error,
+            )),
+            Err(CandidateFailure::Exhausted { last }) => {
+                let names = candidates
+                    .iter()
+                    .map(|shell| shell.binary())
+                    .collect::<Vec<_>>();
+                let context = format!("failed to spawn background bash command: no Windows shell could be spawned. PATH-probed candidates: {names:?}");
+                match last {
+                    Some((index, PipedAttemptError::Spawn(error))) => {
+                        Err(super::format_spawn_failure(
+                            &context,
+                            Path::new(candidates[index].binary().as_ref()),
+                            workdir,
+                            format!("{}: {error}", candidates[index].binary()),
+                        ))
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        crate::slog_warn!("background bash spawn: {} returned NotFound at runtime — trying next candidate",
-                        shell.binary());
-                        last_error = Some(format!("{}: {e}", shell.binary()));
-                        last_program = Some(PathBuf::from(shell.binary().into_owned()));
-                        // Skip the without-breakaway retry for NotFound — the
-                        // binary itself is missing, breakaway flag is irrelevant.
-                        break;
-                    }
-                    Err(e) if flags == with_breakaway && e.raw_os_error() == Some(5) => {
-                        // Access Denied during breakaway — retry without it.
-                        crate::slog_warn!(
-                            "background bash spawn: CREATE_BREAKAWAY_FROM_JOB rejected with \
-                         Access Denied — retrying {} without breakaway",
-                            shell.binary()
-                        );
-                        last_error = Some(format!("{}: {e}", shell.binary()));
-                        last_program = Some(PathBuf::from(shell.binary().into_owned()));
-                        continue;
-                    }
-                    Err(e) => {
-                        return Err(super::format_spawn_failure(
-                            &format!(
-                                "failed to spawn background bash command via {}",
-                                shell.binary()
-                            ),
-                            Path::new(cmd.get_program()),
-                            cmd.get_current_dir().unwrap_or(workdir),
-                            e,
-                        ));
-                    }
+                    _ => Err(format!("{context}: no candidates were attempted")),
                 }
             }
-        }
-        let candidates = candidates
-            .iter()
-            .map(|shell| shell.binary())
-            .collect::<Vec<_>>();
-        let context = format!(
-            "failed to spawn background bash command: no Windows shell could be spawned. \
-             PATH-probed candidates: {candidates:?}"
-        );
-        match (last_program, last_error) {
-            (Some(program), Some(error)) => Err(super::format_spawn_failure(
-                &context, &program, workdir, error,
-            )),
-            _ => Err(format!("{context}: no candidates were attempted")),
         }
     }
 }

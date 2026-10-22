@@ -28,7 +28,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
 
     match ctx
         .bash_background()
-        .promote(&params.task_id, req.session())
+        .promote_typed(&params.task_id, req.session())
     {
         Ok(promoted) => Response::success(
             &req.id,
@@ -37,11 +37,11 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 "promoted": promoted,
             }),
         ),
-        Err(message) if message.contains("not found") => Response::error(
+        Err(message) if message.is_missing_task() => Response::error(
             &req.id,
             "task_not_found",
             format_unknown_task_message(&params.task_id),
         ),
-        Err(message) => Response::error(&req.id, "execution_failed", message),
+        Err(message) => Response::error(&req.id, "execution_failed", message.to_string()),
     }
 }
