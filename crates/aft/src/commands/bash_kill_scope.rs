@@ -77,12 +77,32 @@ pub(crate) fn handle_bash_kill_scope_with_saved_tasks(
     let mut remote_tasks = Vec::new();
     let mut deadline = Instant::now();
     let mut kill_error = None;
+    // One set of tasks for both passes, each remote member already carrying
+    // the pause: a task cannot slip from remote to local between the passes
+    // and be skipped by both.
+    let mut members = Vec::with_capacity(all_registries.len());
+    for (registry, _) in &all_registries {
+        match registry.begin_scope_pause(&params.scope) {
+            Ok(set) => members.push(set),
+            Err(error) => {
+                kill_error.get_or_insert(error);
+                members.push(Default::default());
+            }
+        }
+    }
     'passes: for remote in [false, true] {
+        if kill_error.is_some() {
+            break;
+        }
         if remote {
+            #[cfg(all(test, unix))]
+            if let Some(root) = saved_storage_root {
+                saved_recovery_gate::pass(root, saved_recovery_gate::Point::BetweenPasses);
+            }
             deadline = Instant::now() + Duration::from_secs(10);
         }
-        for (registry, from_saved_record) in &all_registries {
-            match registry.pause_scope(&params.scope, remote) {
+        for ((registry, from_saved_record), members) in all_registries.iter().zip(&members) {
+            match registry.pause_scope(&params.scope, remote, members) {
                 Ok(report) => {
                     for mut task in report.killed {
                         task.from_saved_record = *from_saved_record;
@@ -114,6 +134,20 @@ pub(crate) fn handle_bash_kill_scope_with_saved_tasks(
             let task = &mut killed[index];
             task.remote =
                 Some(registry.wait_owner_pause_cancel(&task.task_id, &task.session_id, deadline));
+        }
+    }
+    // Never report the pause done while a task it covers could still run.
+    if kill_error.is_none() {
+        let running = all_registries
+            .iter()
+            .zip(&members)
+            .flat_map(|((registry, _), members)| registry.unstopped_pause_members(members))
+            .collect::<Vec<_>>();
+        if !running.is_empty() {
+            kill_error = Some(format!(
+                "tasks still running after the pause: {}",
+                running.join(", ")
+            ));
         }
     }
     #[cfg(all(test, unix))]
@@ -157,6 +191,8 @@ pub(crate) mod saved_recovery_gate {
     pub(crate) enum Point {
         /// After the saved tasks were recovered, before they are paused.
         AfterRecovery,
+        /// After the pass that stops local tasks, before the remote pass.
+        BetweenPasses,
         /// After the pause settled, before the recovery registries detach.
         BeforeDetach,
     }
