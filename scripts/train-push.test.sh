@@ -1440,12 +1440,19 @@ git -C "$dir/work" add .gitignore .cortexkit/WORKER.md
 git -C "$dir/work" add -f .cortexkit/alfonso/drafts/plan.md
 git -C "$dir/work" commit -qm "track a private draft"
 add_train_commit "$dir/work" "cortexkit-tracked"
+main_before="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
 run_train "$dir" cortexkit-tracked
 expect_rc 2 "a tracked ignored file under .cortexkit refuses"
 expect_out ".cortexkit/alfonso/drafts/plan.md" "the refusal lists the tracked ignored file"
 expect_out "ignored files are tracked under .cortexkit/" "the refusal names the reason"
 expect_no_out ".cortexkit/WORKER.md" "a re-included tracked file is not listed"
-[ -z "$(origin_ref "$dir" refs/heads/train/cortexkit-tracked)" ] && ok "nothing is pushed when a private file is tracked" || fail "a train with a tracked private file was pushed"
+# A train that got through would push train/cortexkit-tracked and then land it
+# on main (deleting the train ref), so check both refs.
+if [ -z "$(origin_ref "$dir" refs/heads/train/cortexkit-tracked)" ] && [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$main_before" ]; then
+  ok "nothing is pushed or landed when a private file is tracked"
+else
+  fail "a train with a tracked private file was pushed or landed"
+fi
 
 # --- refusal: no train name ------------------------------------------------
 dir="$(new_fixture usage)"
