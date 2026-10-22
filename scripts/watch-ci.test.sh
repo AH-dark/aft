@@ -29,6 +29,11 @@ cat > "$BIN/gh" <<'GH'
 #!/usr/bin/env bash
 set -u
 STATE="${WATCH_CI_TEST_STATE:?}"
+if [ "${1:-}" = "api" ]; then
+  printf '%s\n' "$*" >> "$STATE/api-calls"
+  printf '[{"total_count":0,"jobs":[]}]\n'
+  exit 0
+fi
 printf '%s\n' "$*" >> "$STATE/calls"
 if [ "${WATCH_CI_TEST_ALWAYS_ERROR:-0}" = 1 ]; then
   echo 'same fake gh error' >&2
