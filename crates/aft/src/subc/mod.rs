@@ -21495,7 +21495,8 @@ mod connection_close_tests {
         };
         let reader_task = spawn_reader_task(read, reader_tx);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
-        let writer_task = spawn_writer_task(write, writer_rx, Arc::clone(&metrics));
+        let (_, pong_rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
+        let writer_task = spawn_writer_task(write, writer_rx, pong_rx, Arc::clone(&metrics));
         Connection {
             daemon,
             reader_rx,
