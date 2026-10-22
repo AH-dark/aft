@@ -2158,6 +2158,15 @@ describe("bash tool adapter", () => {
     expect(atEnd).toContain('matched "READY" in stdout at offset 65531');
   });
 
+  test("an end anchor held at a page edge is found when a full next page starts a line", async () => {
+    // The second page is a full 64 KiB, so trimming to the window would drop
+    // the held READY unless it is kept until this page settles it.
+    const stdout = acrossFirstPage("READY", `\n${"z".repeat(64 * 1024 - 1)}`);
+    const result = await watchExitedRegex(stdout, "READY$");
+    expect(result).toContain('matched "READY" in stdout at offset 65531');
+    expect(result).not.toContain("incomplete");
+  });
+
   test("a word boundary at a page edge is not a match when the word continues", async () => {
     const result = await watchExitedRegex(acrossFirstPage(" READY", "NESS\n"), "\\bREADY\\b");
     expect(result).not.toContain("matched");

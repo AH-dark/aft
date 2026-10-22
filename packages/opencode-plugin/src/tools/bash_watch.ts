@@ -462,8 +462,12 @@ export async function waitForBashStatus(
     output: { text: "", baseOffset: 0 },
     stderr: { text: "", baseOffset: 0 },
   };
-  // A regex match held back at a page edge, per stream (see the scan below).
-  const deferredMatch: Record<OutputStream, boolean> = { output: false, stderr: false };
+  // Stream byte offset of a regex match held back at a page edge, per stream
+  // (see the scan below).
+  const heldMatchAt: Record<OutputStream, number | undefined> = {
+    output: undefined,
+    stderr: undefined,
+  };
   // Set once a regex scan trims older output out of its window; a later
   // no-match exit then cannot rule out a match longer than the window.
   let regexWindowDropped = false;
@@ -534,14 +538,15 @@ export async function waitForBashStatus(
           const chunk = scan.chunks.find((candidate) => candidate.stream === stream);
           const more = streamHasMore(data, stream);
           // A held-back match is checked again once its stream is known to end there.
-          if (!chunk && !(deferredMatch[stream] && !more)) continue;
-          deferredMatch[stream] = false;
+          const held = heldMatchAt[stream];
+          if (!chunk && !(held !== undefined && !more)) continue;
+          heldMatchAt[stream] = undefined;
           const state = scanState[stream];
           if (chunk) {
             if (state.text.length === 0) state.baseOffset = chunk.baseOffset;
             state.text += chunk.text;
             if (waitFor.kind === "regex") {
-              const trimmed = trimWaitScanBuffer(state.text, state.baseOffset, waitFor);
+              const trimmed = trimWaitScanBuffer(state.text, state.baseOffset, waitFor, held);
               if (trimmed.baseOffset !== state.baseOffset) regexWindowDropped = true;
               state.text = trimmed.text;
               state.baseOffset = trimmed.baseOffset;
@@ -552,7 +557,7 @@ export async function waitForBashStatus(
             // A page ends where the read stopped, not where the output ends.
             // A regex match reaching the end of the buffer may depend on what
             // follows ($, \z, \b, a greedy repeat), so it waits for the next page.
-            deferredMatch[stream] = true;
+            heldMatchAt[stream] = state.baseOffset + match.byteOffset;
           } else if (match) {
             if (terminal) {
               sawTerminal = true;
@@ -751,21 +756,35 @@ function coerceMatchOffset(value: unknown): number {
   return Number.isFinite(offset) && offset >= 0 ? offset : 0;
 }
 
+/**
+ * Trims the scan buffer to what a later match still needs. `heldAt`, the
+ * stream byte offset of a regex match held back at a page edge, keeps that
+ * match whole until the next page settles it.
+ */
 function trimWaitScanBuffer(
   text: string,
   baseOffset: number,
   pattern: BashWaitPattern,
+  heldAt?: number,
 ): { text: string; baseOffset: number } {
-  const keepFrom =
+  let keepFrom =
     pattern.kind === "substring"
       ? substringKeepStart(text, pattern.value)
       : regexKeepStart(text, REGEX_WAIT_SCAN_WINDOW_BYTES);
+  if (heldAt !== undefined && heldAt >= baseOffset) {
+    keepFrom = Math.min(keepFrom, charIndexAtByteOffset(text, heldAt - baseOffset));
+  }
   if (keepFrom <= 0) return { text, baseOffset };
 
   return {
     text: text.slice(keepFrom),
     baseOffset: baseOffset + Buffer.byteLength(text.slice(0, keepFrom), "utf8"),
   };
+}
+
+/** The string index of the character that starts `byteOffset` bytes into `text`. */
+function charIndexAtByteOffset(text: string, byteOffset: number): number {
+  return Buffer.from(text, "utf8").subarray(0, byteOffset).toString("utf8").length;
 }
 
 function substringKeepStart(text: string, pattern: string): number {
