@@ -1785,6 +1785,164 @@ fn filtered_scope_distinguishes_no_files_from_no_matches() {
 mod explicit_target_regressions {
     use super::*;
 
+    fn named_ignored_folder_project() -> tempfile::TempDir {
+        setup_project(&[
+            (".gitignore", ".cortexkit/internal-docs/\n*ancestor-cost*\n"),
+            ("src/anchor.md", "index anchor\n"),
+            (
+                ".cortexkit/internal-docs/designs/ancestor-cost.md",
+                "cost design\n",
+            ),
+            (".cortexkit/internal-docs/.gitignore", "hidden-cost.md\n"),
+            (
+                ".cortexkit/internal-docs/designs/.aftignore",
+                "private-cost.md\n",
+            ),
+            (".cortexkit/internal-docs/hidden-cost.md", "hidden\n"),
+            (
+                ".cortexkit/internal-docs/designs/private-cost.md",
+                "private\n",
+            ),
+            (
+                ".cortexkit/internal-docs/node_modules/pkg/cost.md",
+                "dependency\n",
+            ),
+            (".cortexkit/internal-docs/target/debug/cost.md", "build\n"),
+            (".cortexkit/internal-docs/.git/cost.md", "git\n"),
+            (".cortexkit/internal-docs/cost.sqlite", "database\n"),
+            (".cortexkit/internal-docs/cost.sqlite-wal", "wal\n"),
+            (".cortexkit/internal-docs/cost.sqlite-shm", "shm\n"),
+            (".cortexkit/internal-docs/cost.sqlite-journal", "journal\n"),
+        ])
+    }
+
+    #[test]
+    fn glob_named_ignored_folder_overrides_only_ancestor_ignore_rules() {
+        for indexed in [false, true] {
+            let project = named_ignored_folder_project();
+            let mut aft = AftProcess::spawn();
+            if indexed {
+                configure_with_index(&mut aft, project.path());
+                wait_for_index_ready(
+                    &mut aft,
+                    || json!({"id":"ready", "command":"grep", "pattern":"anchor"}),
+                );
+            } else {
+                configure(&mut aft, project.path());
+            }
+            for (path, pattern) in [
+                (None, ".cortexkit/internal-docs/**/*cost*"),
+                (Some(".cortexkit"), "internal-docs/**/*cost*"),
+                (None, ".cortexkit/internal-docs/designs/*cost*"),
+                (None, ".cortexkit/internal-docs/designs/ancestor-cost.md"),
+            ] {
+                let mut request =
+                    json!({"id":"named-ignored", "command":"glob", "pattern":pattern});
+                if let Some(path) = path {
+                    request["path"] = json!(path);
+                }
+                let response = send(&mut aft, request);
+                assert_eq!(response["success"], true, "indexed={indexed}: {response}");
+                assert_eq!(response["total"], 1, "indexed={indexed}: {response}");
+                assert_eq!(response["fallback"], "filesystem", "{response}");
+                assert!(
+                    response["files"][0]
+                        .as_str()
+                        .unwrap()
+                        .replace('\\', "/")
+                        .ends_with("designs/ancestor-cost.md"),
+                    "{response}"
+                );
+            }
+            let response = send(
+                &mut aft,
+                json!({
+                    "id":"unnamed-ignored", "command":"glob", "pattern":"**/*.md"
+                }),
+            );
+            assert_eq!(response["total"], 1, "indexed={indexed}: {response}");
+            assert!(
+                response["files"][0]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("anchor.md"),
+                "{response}"
+            );
+            let response = send(
+                &mut aft,
+                json!({
+                    "id":"visible-prefix", "command":"glob", "pattern":"src/*.md"
+                }),
+            );
+            assert_eq!(response["total"], 1, "{response}");
+            if indexed {
+                assert_eq!(response["fallback"], Value::Null, "{response}");
+            }
+            assert!(aft.shutdown().success());
+        }
+    }
+
+    #[test]
+    fn glob_named_ignored_folder_never_overrides_builtin_directories() {
+        let project = named_ignored_folder_project();
+        let mut aft = AftProcess::spawn();
+        configure(&mut aft, project.path());
+        for directory in ["node_modules/pkg", "target/debug", ".git"] {
+            let response = send(
+                &mut aft,
+                json!({
+                    "id":"builtin", "command":"glob",
+                    "pattern":format!(".cortexkit/internal-docs/{directory}/*cost*")
+                }),
+            );
+            assert_eq!(response["total"], 0, "{response}");
+        }
+        assert!(aft.shutdown().success());
+    }
+
+    #[test]
+    fn glob_named_ignored_folder_cannot_escape_restricted_project() {
+        let project = named_ignored_folder_project();
+        let outside = setup_project(&[
+            (".gitignore", "ignored/\n"),
+            ("ignored/cost.md", "outside\n"),
+        ]);
+        let mut aft = AftProcess::spawn();
+        let response = send(
+            &mut aft,
+            json!({
+                "id":"restricted", "command":"configure", "harness":"opencode", "project_root":project.path(),
+                "config":user_config(json!({"restrict_to_project_root":true, "indexes":{"trigram":false}}))
+            }),
+        );
+        assert_eq!(response["success"], true, "{response}");
+        let mut patterns = vec![format!("{}/ignored/*cost*", outside.path().display())];
+        patterns.push(format!(
+            "../{}/ignored/*cost*",
+            outside.path().file_name().unwrap().to_string_lossy()
+        ));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                outside.path().join("ignored"),
+                project.path().join("escape"),
+            )
+            .unwrap();
+            patterns.push("escape/*cost*".to_string());
+        }
+        for pattern in patterns {
+            let response = send(
+                &mut aft,
+                json!({"id":"escape", "command":"glob", "pattern":pattern}),
+            );
+            assert!(
+                response["success"] == false || response["total"] == 0,
+                "{response}"
+            );
+        }
+        assert!(aft.shutdown().success());
+    }
+
     fn ignored_reports_project() -> tempfile::TempDir {
         setup_project(&[
             (".git/info/exclude", ".cortexkit/alfonso/reports/\n"),
@@ -2040,6 +2198,12 @@ mod explicit_target_regressions {
                     text.contains("1 ignored items (directories counted once)"),
                     "indexed={indexed}: {response}"
                 );
+                let hint = if command == "glob" {
+                    "name the ignored folder in the pattern to search it"
+                } else {
+                    "pass the file path directly to search them"
+                };
+                assert!(text.contains(hint), "{response}");
                 assert!(!text.contains("No searchable files exist"), "{response}");
                 let mut request = reports_request(command, Some("src"));
                 if command == "grep" {

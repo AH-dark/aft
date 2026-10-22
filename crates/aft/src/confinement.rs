@@ -345,9 +345,24 @@ impl ConfinedIgnoreRules {
 
     /// Whether the confined root's own ignore files exclude `path`.
     pub(crate) fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        self.is_ignored_with_root(path, is_dir, None)
+    }
+
+    /// Ignore files above a folder explicitly named in a glob do not apply,
+    /// but all file reads still use the original confinement gate.
+    pub(crate) fn is_ignored_below(&self, path: &Path, is_dir: bool, root: &Path) -> bool {
+        self.is_ignored_with_root(path, is_dir, Some(root))
+    }
+
+    fn is_ignored_with_root(&self, path: &Path, is_dir: bool, ignore_root: Option<&Path>) -> bool {
         let Some(root) = self.fence.gate.as_ref().map(|gate| gate.root.as_path()) else {
             return false;
         };
+        let ignore_root = ignore_root.map(crate::inspect::job::normalize_path);
+        let root = ignore_root
+            .as_deref()
+            .filter(|ignore_root| ignore_root.starts_with(root))
+            .unwrap_or(root);
         // The gate's root has the Windows verbatim prefix (`\\?\C:\...`)
         // stripped, but a walk started from a canonicalized path yields entries
         // that keep it. Compare, load and match in the root's spelling, or no

@@ -43,7 +43,7 @@ fn fallback_walk_limit() -> usize {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn with_walk_limit<R>(limit: usize, run: impl FnOnce() -> R) -> R {
     struct Restore(usize);
     impl Drop for Restore {
@@ -168,10 +168,18 @@ impl ScopeFileCounts {
     }
 
     pub(crate) fn empty_note(&self, include_only: bool) -> String {
+        self.empty_note_with_hint(include_only, "pass the file path directly to search them")
+    }
+
+    pub(crate) fn empty_glob_note(&self) -> String {
+        self.empty_note_with_hint(true, "name the ignored folder in the pattern to search it")
+    }
+
+    fn empty_note_with_hint(&self, include_only: bool, hint: &str) -> String {
         let mut reasons = Vec::new();
         if self.ignored > 0 {
             reasons.push(format!(
-                "{} ignored items (directories counted once) excluded by ignore rules or default skips (.gitignore / info/exclude / .ignore / .aftignore); pass the file path directly to search them",
+                "{} ignored items (directories counted once) excluded by ignore rules or default skips (.gitignore / info/exclude / .ignore / .aftignore); {hint}",
                 self.ignored
             ));
         }
@@ -544,7 +552,7 @@ fn scope_has_files_unbounded(
     let started = Instant::now();
     let skipped = Arc::new(AtomicUsize::new(0));
     let Some(builder) =
-        fallback_target_walk_builder(search_root, Arc::clone(&skipped), ignored_target)
+        fallback_target_walk_builder(search_root, Arc::clone(&skipped), ignored_target, false)
     else {
         return Some(false);
     };
@@ -1078,7 +1086,7 @@ pub(crate) fn fallback_project_walk_builder(
     search_root: &Path,
     skipped_foreign_mounts: Arc<AtomicUsize>,
 ) -> WalkBuilder {
-    target_walk_builder(search_root, skipped_foreign_mounts, false)
+    target_walk_builder(search_root, skipped_foreign_mounts, false, false)
 }
 
 /// The grep/glob directory walker for `search_root`, or `None` when a
@@ -1090,6 +1098,7 @@ fn fallback_target_walk_builder(
     search_root: &Path,
     skipped_foreign_mounts: Arc<AtomicUsize>,
     ignored_target: bool,
+    ignore_ancestors: bool,
 ) -> Option<WalkBuilder> {
     if !crate::context::confinement::admits_walk_root(search_root) {
         return None;
@@ -1098,6 +1107,7 @@ fn fallback_target_walk_builder(
         search_root,
         skipped_foreign_mounts,
         ignored_target,
+        ignore_ancestors,
     ))
 }
 
@@ -1107,6 +1117,7 @@ fn target_walk_builder(
     search_root: &Path,
     skipped_foreign_mounts: Arc<AtomicUsize>,
     ignored_target: bool,
+    ignore_ancestors: bool,
 ) -> WalkBuilder {
     let mut builder = WalkBuilder::new(search_root);
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(search_root).ok();
@@ -1116,6 +1127,7 @@ fn target_walk_builder(
     let confined = crate::context::confinement::ConfinedIgnoreRules::current(
         crate::context::confinement::SEARCH_IGNORE_FILES,
     );
+    let ignore_root = ignore_ancestors.then(|| search_root.to_path_buf());
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
     builder.same_file_system(true).hidden(false);
@@ -1146,18 +1158,7 @@ fn target_walk_builder(
             }
             let name = entry.file_name().to_string_lossy();
             let keep = if is_dir {
-                !matches!(
-                    name.as_ref(),
-                    "node_modules"
-                        | "target"
-                        | "venv"
-                        | ".venv"
-                        | ".git"
-                        | "__pycache__"
-                        | ".tox"
-                        | "dist"
-                        | "build"
-                )
+                !is_fallback_skipped_directory_name(&name)
             } else {
                 !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
             };
@@ -1172,7 +1173,10 @@ fn target_walk_builder(
                 let is_file = file_type.as_ref().is_some_and(std::fs::FileType::is_file);
                 if entry.depth() > 0
                     && (is_dir || is_file)
-                    && (confined.is_ignored(entry.path(), is_dir) || !confined.admits(entry.path()))
+                    && (match &ignore_root {
+                        Some(root) => confined.is_ignored_below(entry.path(), is_dir, root),
+                        None => confined.is_ignored(entry.path(), is_dir),
+                    } || !confined.admits(entry.path()))
                 {
                     return false;
                 }
@@ -1186,7 +1190,27 @@ fn target_walk_builder(
         // its own precedence and pruning to every descendant.
         builder.require_git(false);
     }
+    if ignore_ancestors {
+        // Naming an ignored folder overrides rules above it, not ignore files
+        // inside it or the walker's built-in content and directory exclusions.
+        builder.parents(false).git_global(false).git_exclude(false);
+    }
     builder
+}
+
+pub(crate) fn is_fallback_skipped_directory_name(name: &str) -> bool {
+    matches!(
+        name,
+        "node_modules"
+            | "target"
+            | "venv"
+            | ".venv"
+            | ".git"
+            | "__pycache__"
+            | ".tox"
+            | "dist"
+            | "build"
+    )
 }
 
 /// Used only to decide whether an explicitly named root is ignored. Descendant
@@ -1313,7 +1337,7 @@ fn diagnose_scope_counts_unbounded(
         }
         let mut accepted = HashSet::new();
         let Some(mut builder) =
-            fallback_target_walk_builder(&directory, Arc::clone(&skipped), ignored_target)
+            fallback_target_walk_builder(&directory, Arc::clone(&skipped), ignored_target, false)
         else {
             continue;
         };
@@ -1388,6 +1412,23 @@ pub(crate) fn bounded_fallback_walk_files_for_target(
         fallback_walk_limit(),
         fallback_walk_budget(),
         ignored_target,
+        false,
+    )
+}
+
+pub(crate) fn bounded_glob_walk_in_named_ignored_folder(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+) -> FallbackWalkOutcome {
+    bounded_fallback_walk_files_with_limits_target(
+        filter_root,
+        search_root,
+        filters,
+        fallback_walk_limit(),
+        fallback_walk_budget(),
+        true,
+        true,
     )
 }
 
@@ -1454,6 +1495,7 @@ pub(crate) fn bounded_fallback_walk_files_with_limits(
         max_files,
         budget,
         false,
+        false,
     )
 }
 
@@ -1464,6 +1506,7 @@ fn bounded_fallback_walk_files_with_limits_target(
     max_files: usize,
     budget: Duration,
     ignored_target: bool,
+    ignore_ancestors: bool,
 ) -> FallbackWalkOutcome {
     let filter_root = filter_root.to_path_buf();
     let filters = filters.clone();
@@ -1482,6 +1525,7 @@ fn bounded_fallback_walk_files_with_limits_target(
             max_files,
             deadline,
             ignored_target,
+            ignore_ancestors,
             entry_delay,
             sort_metadata_delay,
         ))
@@ -1502,6 +1546,7 @@ fn walk_files_unbounded(
     max_files: usize,
     deadline: Instant,
     ignored_target: bool,
+    ignore_ancestors: bool,
     entry_delay: Duration,
     sort_metadata_delay: Duration,
 ) -> FallbackWalkOutcome {
@@ -1511,6 +1556,7 @@ fn walk_files_unbounded(
         search_root,
         Arc::clone(&skipped_foreign_mounts),
         ignored_target,
+        ignore_ancestors,
     ) else {
         return FallbackWalkOutcome {
             files: Vec::new(),
@@ -1658,6 +1704,7 @@ fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
         search_root,
         Arc::clone(&skipped_foreign_mounts),
         ignored_target,
+        false,
     ) else {
         return FallbackWalkProgress::default();
     };
