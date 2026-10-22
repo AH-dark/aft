@@ -313,6 +313,22 @@ export function registerLatePowershellTool(
   registerBashTool(boundPi, ctx, semantic, "powershell", false, "powershell");
 }
 
+/**
+ * Replace the `bash` slot when a live config reload flips
+ * `bash.runon_enabled`: Pi copies a tool's schema into its registry, so the
+ * slot is registered again with the new schema. Through the funnel, so on OMP
+ * the replacement keeps `loadMode` and its approval tier.
+ */
+export function reregisterBashTool(
+  pi: ExtensionAPI,
+  ctx: PluginContext,
+  semantic: boolean,
+  harness?: PiHarness,
+): void {
+  const boundPi = bindToolRegistrationFunnel(pi, ctx, harness);
+  registerBashTool(boundPi, ctx, semantic, "bash", false, "bash");
+}
+
 /** Replace Pi's captured revision-read schemas without changing the loaded tool set. */
 export function refreshPiRevisionReadTools(
   pi: ExtensionAPI,

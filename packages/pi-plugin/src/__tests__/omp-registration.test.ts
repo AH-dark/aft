@@ -8,6 +8,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { discoverAndLoadExtensions, ExtensionRunner } from "@earendil-works/pi-coding-agent";
 import { type TSchema, Type } from "typebox";
 import type { AftConfig } from "../config.js";
+import { registerPiConfigErrorState } from "../config-error-state.js";
 import {
   detectPiHarness,
   resetRecordedExtensionApi,
@@ -18,6 +19,7 @@ import {
   bindToolRegistrationFunnel,
   registerLatePowershellTool,
   registerPiToolSurface,
+  reregisterBashTool,
   resolvePiToolSurface,
 } from "../tool-registration.js";
 import {
@@ -217,6 +219,42 @@ describe("Full surface registration funnel", () => {
     expect(bashTool).toBeDefined();
     expect(bashTool?.description).toContain("Run shell commands (timeout in milliseconds");
     expect(bashTool?.description).toContain("- DO NOT use bash for code search or exploration");
+  });
+
+  test("OMP keeps loadMode essential and the exec tier on bash re-registered by a live config reload", () => {
+    const config: AftConfig = { disabled_tools: [], bash: true };
+    const { api, tools } = makeMockApi();
+    Object.assign(api, { arktype: {} });
+    const ctx = makePluginContext(makeMockBridge(() => ({ success: true, text: "ok" })).bridge, {
+      config,
+    });
+    registerPiToolSurface(api, ctx, resolvePiToolSurface(config), "omp");
+    const first = tools.get("bash");
+    // What index.ts does when a reload flips bash.runon_enabled.
+    reregisterBashTool(api, ctx, false);
+    const replaced = tools.get("bash") as unknown as {
+      loadMode?: string;
+      approval?: (args: unknown) => unknown;
+    };
+    expect(replaced).not.toBe(first);
+    expect(replaced.loadMode).toBe("essential");
+    expect(replaced.approval?.({ command: "ls" })).toBe("exec");
+  });
+
+  test("OMP config-error-state tools still go through the funnel", () => {
+    const config: AftConfig = { disabled_tools: [], bash: true };
+    const { api, tools } = makeMockApi();
+    Object.assign(api, { arktype: {}, on: () => {} });
+    registerPiConfigErrorState(api, config, "broken config");
+    expect(tools.size).toBeGreaterThan(0);
+    for (const [name, tool] of tools) {
+      const registered = tool as unknown as {
+        loadMode?: string;
+        approval?: (args: unknown) => unknown;
+      };
+      expect(registered.loadMode).toBe("essential", name);
+      expect(registered.approval?.({})).toBe(OMP_TOOL_TIERS[name]);
+    }
   });
 
   test("OMP host_default leaves loadMode undefined on all tools", () => {

@@ -107,10 +107,10 @@ import {
   refreshPiRevisionReadTools,
   registerLatePowershellTool,
   registerPiToolSurface,
+  reregisterBashTool,
   resolvePiToolSurface,
 } from "./tool-registration.js";
 import { recordSessionCwd, resolveSessionId } from "./tools/_shared.js";
-import { registerBashTool } from "./tools/bash.js";
 import type { PluginContext } from "./types.js";
 import { registerWorkflowHints } from "./workflow-hints.js";
 
@@ -629,7 +629,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       if (remoteGateChanged && surface.hoistBash) {
         // Pi copies schema metadata into its registry, so replace the bash
         // slot when this live safety switch changes, not just its executor.
-        registerBashTool(pi, ctx, surface.semantic, "bash", false, "bash");
+        reregisterBashTool(pi, ctx, surface.semantic);
       }
     },
     notify: (message) => deliverConfigMigrationWarnings([message]),
