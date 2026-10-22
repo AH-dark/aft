@@ -1,0 +1,1 @@
+- Call-graph tools such as trace_to and callers no longer hang forever when the first request after opening a project arrives while background index loading is waiting for a build slot.

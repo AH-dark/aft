@@ -476,6 +476,19 @@ impl ColdBuildLimiter {
     /// already queued in its class instead of retaking the slot it just freed.
     /// A caller without a queued waiter (`ticket` is `None`) skips the rank
     /// check; slot availability and class alternation still apply.
+    ///
+    /// `admitted_after_acquire` runs after the slot is held but never while
+    /// `admission_state` is locked. Callers' predicates take their own locks
+    /// (the root lifecycle lock in `SubcLifecycleAdmission::is_current`), and
+    /// other threads ask for slots while holding those locks
+    /// (`run_if_current` around a callgraph spawn). Running the predicate
+    /// under the limiter lock made each side wait on the other forever. The
+    /// permit is therefore installed first, the lock released, and the
+    /// predicate checked. A refused permit is dropped before any build starts:
+    /// a newly taken slot goes back to the limiter, and a shared root permit
+    /// only loses this request's reference. The admission event and class
+    /// rotation are recorded only once the predicate accepts, so refused work
+    /// still leaves no admission behind.
     fn try_acquire_classified(
         self: &Arc<Self>,
         request: &ColdBuildAdmissionRequest,
@@ -483,24 +496,43 @@ impl ColdBuildLimiter {
         ticket: Option<u64>,
         admitted_after_acquire: impl FnOnce() -> bool,
     ) -> Option<ColdBuildPermit> {
+        let (permit, took_new_slot) = self.install_classified_permit(request, kind, ticket)?;
+        if !admitted_after_acquire() {
+            drop(permit);
+            return None;
+        }
+        if took_new_slot {
+            let mut state = self
+                .admission_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self::record_admission_locked(&mut state, request);
+        }
+        Some(permit)
+    }
+
+    /// The locked half of [`Self::try_acquire_classified`]: share the root's
+    /// existing permit or take and install a new slot. Returns whether a new
+    /// slot was taken, which is what counts as an admission. Runs no caller
+    /// code while `admission_state` is held.
+    fn install_classified_permit(
+        self: &Arc<Self>,
+        request: &ColdBuildAdmissionRequest,
+        kind: &str,
+        ticket: Option<u64>,
+    ) -> Option<(ColdBuildPermit, bool)> {
         let mut state = self
             .admission_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(root) = request.root.as_deref() {
             if let Some(holder) = state.holders_by_root.get(root) {
-                let Some(lease) = holder.permit.upgrade() else {
-                    // The final sharer is dropping and will return the slot after
-                    // removing this entry. Retry rather than briefly double-owning
-                    // capacity for the same root on another free slot.
-                    return None;
-                };
-                if !admitted_after_acquire() {
-                    drop(state);
-                    drop(lease);
-                    return None;
-                }
-                return Some(ColdBuildPermit { lease });
+                // The final sharer is dropping and will return the slot after
+                // removing this entry when the upgrade fails. Retry rather than
+                // briefly double-owning capacity for the same root on another
+                // free slot.
+                let lease = holder.permit.upgrade()?;
+                return Some((ColdBuildPermit { lease }, false));
             }
         }
 
@@ -528,18 +560,14 @@ impl ColdBuildLimiter {
         if !self.try_take_slot() {
             return None;
         }
-        if !admitted_after_acquire() {
-            self.available.fetch_add(1, Ordering::Release);
-            return None;
-        }
-        Self::record_admission_locked(&mut state, request);
-        Some(self.install_permit_locked(
+        let permit = self.install_permit_locked(
             &mut state,
             request.class.label(),
             request.root.as_deref(),
             request.census_label(),
             kind,
-        ))
+        );
+        Some((permit, true))
     }
 
     fn install_permit_locked(
@@ -1245,6 +1273,109 @@ mod tests {
             1,
             "releasing the consumed build permit must restore the limiter slot"
         );
+    }
+
+    /// Runs the lock pattern that deadlocked the daemon: one thread holds its
+    /// own lock (in production the root lifecycle lock, held by
+    /// `run_if_current`) and asks the limiter for a slot, while another
+    /// thread's admission predicate takes that same lock (in production
+    /// `SubcLifecycleAdmission::is_current`). The limiter must not hold its
+    /// internal lock while the predicate runs, or each thread waits on the
+    /// other forever. The predicate gives up after a few seconds so a
+    /// regression fails this test instead of hanging the test binary.
+    fn assert_contender_answers_while_predicate_waits_on_its_lock(
+        limiter: Arc<ColdBuildLimiter>,
+        predicate_request: ColdBuildAdmissionRequest,
+        contender_request: ColdBuildAdmissionRequest,
+    ) {
+        let caller_lock = Arc::new(parking_lot::Mutex::new(()));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+
+        let contender = {
+            let limiter = Arc::clone(&limiter);
+            let caller_lock = Arc::clone(&caller_lock);
+            std::thread::spawn(move || {
+                let _held = caller_lock.lock();
+                held_tx.send(()).expect("test receives the held signal");
+                entered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("predicate starts while the caller lock is held");
+                let permit = try_acquire_classified_with_limiter(&limiter, &contender_request);
+                let _ = answer_tx.send(permit.is_some());
+                permit
+            })
+        };
+        held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("contender holds its lock");
+
+        let predicate = {
+            let limiter = Arc::clone(&limiter);
+            let caller_lock = Arc::clone(&caller_lock);
+            std::thread::spawn(move || {
+                limiter.try_acquire_classified(&predicate_request, "predicate", None, || {
+                    let _ = entered_tx.send(());
+                    caller_lock.try_lock_for(Duration::from_secs(5)).is_some()
+                })
+            })
+        };
+
+        let answer = answer_rx.recv_timeout(Duration::from_secs(2));
+        let contender_permit = contender.join().expect("contender joins");
+        let predicate_permit = predicate.join().expect("predicate thread joins");
+        assert_eq!(
+            answer,
+            Ok(true),
+            "a slot request stalled while another request's admission predicate waited on \
+             the caller's lock: the limiter held its internal lock across the predicate"
+        );
+        assert!(
+            predicate_permit.is_some(),
+            "the predicate request is admitted once the caller lock is free"
+        );
+        drop((contender_permit, predicate_permit));
+    }
+
+    #[test]
+    fn admission_predicate_for_a_new_slot_runs_outside_the_limiter_lock() {
+        assert_contender_answers_while_predicate_waits_on_its_lock(
+            test_limiter(2),
+            ColdBuildAdmissionRequest::new("artifact-load", ColdBuildAdmissionClass::Maintenance),
+            ColdBuildAdmissionRequest::new(
+                "callgraph-background",
+                ColdBuildAdmissionClass::Maintenance,
+            ),
+        );
+    }
+
+    #[test]
+    fn admission_predicate_for_a_shared_root_slot_runs_outside_the_limiter_lock() {
+        let limiter = test_limiter(2);
+        let root_holder = try_acquire_classified_with_limiter(
+            &limiter,
+            &ColdBuildAdmissionRequest::for_root(
+                "/project/shared",
+                "holder",
+                ColdBuildAdmissionClass::Maintenance,
+            ),
+        )
+        .expect("root holder takes a slot");
+        assert_contender_answers_while_predicate_waits_on_its_lock(
+            Arc::clone(&limiter),
+            ColdBuildAdmissionRequest::for_root(
+                "/project/shared",
+                "sharer",
+                ColdBuildAdmissionClass::Maintenance,
+            ),
+            ColdBuildAdmissionRequest::new(
+                "callgraph-background",
+                ColdBuildAdmissionClass::Maintenance,
+            ),
+        );
+        drop(root_holder);
+        assert_eq!(limiter.available.load(Ordering::Acquire), 2);
     }
 }
 
