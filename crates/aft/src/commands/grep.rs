@@ -2191,10 +2191,14 @@ mod tests {
         assert_eq!(lines[1], "src/busy.rs 2");
         assert_eq!(lines.len(), 1 + SUMMARY_FILES_LISTED + 1, "{summary}");
         // Files past the 25 listed roll up by their first two folders, and a
-        // file at the top counts under `./`.
+        // file at the top counts under `./`. Folder labels use the platform's
+        // separator, so Windows prints `top\` and `.\`.
+        let separator = std::path::MAIN_SEPARATOR_STR;
         assert_eq!(
             lines[lines.len() - 1],
-            "+3 more files (3 lines), files/lines per folder: top/ 2/2, ./ 1/1"
+            format!(
+                "+3 more files (3 lines), files/lines per folder: top{separator} 2/2, .{separator} 1/1"
+            )
         );
     }
 
