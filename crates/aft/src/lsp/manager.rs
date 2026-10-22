@@ -4037,8 +4037,13 @@ impl LspManager {
     /// pending; a server exit is reported separately.
     ///
     /// `AppContext` uses the prepare/poll/finish methods directly so channel
-    /// waiting happens without its manager mutex. This convenience method keeps
-    /// the same behavior for standalone manager callers.
+    /// waiting happens without its manager mutex. This convenience method only
+    /// waits: unlike `AppContext::lsp_notify_and_collect_diagnostics`, it sends
+    /// no `textDocument/diagnostic` request, and a manager built outside
+    /// `AppContext` runs no background pulls. A server that has registered for
+    /// pull requests (Pyright does) stops pushing reports for open documents,
+    /// so here it stays pending unless the caller pulls first, for example with
+    /// [`Self::pull_file_diagnostics_with_timeout`].
     pub fn wait_for_post_edit_diagnostics(
         &mut self,
         file_path: &Path,
