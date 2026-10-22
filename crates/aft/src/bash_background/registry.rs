@@ -5864,6 +5864,16 @@ impl BgTaskRegistry {
         if metadata.remote.is_some() && !metadata.is_terminal() {
             return self.restore_claimed_remote_task(metadata, paths);
         }
+        // A finished remote task can still owe its runner a cancellation (an
+        // owner pause marks the task finished before its worker sends it).
+        // Its worker is started once the task is registered below.
+        #[cfg(unix)]
+        let owed_cancel = (metadata.is_terminal()
+            && metadata
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.cancel_pending))
+        .then(|| metadata.task_id.clone());
         let (marker, process_alive) = if matches!(
             metadata.status,
             BgTaskStatus::Starting | BgTaskStatus::Running | BgTaskStatus::Killing
@@ -6007,6 +6017,12 @@ impl BgTaskRegistry {
                 self.insert_rehydrated_task(metadata, paths, true)?;
             }
             _ => {}
+        }
+        #[cfg(unix)]
+        if let Some(task_id) = owed_cancel {
+            if !self.hold_remote_worker(&task_id) {
+                self.resume_remote_task(&task_id)?;
+            }
         }
         Ok(())
     }
