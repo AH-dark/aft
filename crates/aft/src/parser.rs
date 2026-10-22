@@ -237,10 +237,12 @@ const GO_QUERY: &str = r#"
   name: (field_identifier) @method.name) @method.def
 
 ;; type declarations (struct and interface)
-(type_declaration
-  (type_spec
+[(type_spec
     name: (type_identifier) @type.name
-    type: (_) @type.body)) @type.def
+    type: (_) @type.body)
+ (type_alias
+    name: (type_identifier) @type.name
+    type: (_) @type.body)] @type.def
 "#;
 
 const C_QUERY: &str = r#"
@@ -2467,7 +2469,7 @@ thread_local! {
 
 /// Extract the text of a node from source.
 pub(crate) fn node_text<'a>(source: &'a str, node: &Node) -> &'a str {
-    &source[node.byte_range()]
+    source.get(node.byte_range()).unwrap_or("")
 }
 
 fn lexical_declaration_has_function_value(node: &Node) -> bool {
@@ -4162,6 +4164,20 @@ fn extract_go_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             (type_name_node, type_body_node, type_def_node)
         {
             let name = node_text(source, &name_node).to_string();
+            // A grouped declaration owns several specs; only an ungrouped spec
+            // includes the `type` keyword in its replacement range.
+            let def_node = def_node
+                .parent()
+                .filter(|parent| {
+                    parent.kind() == "type_declaration" && {
+                        let mut cursor = parent.walk();
+                        let ungrouped = !parent
+                            .children(&mut cursor)
+                            .any(|child| child.kind() == "(");
+                        ungrouped
+                    }
+                })
+                .unwrap_or(def_node);
             let kind = match body_node.kind() {
                 "struct_type" => SymbolKind::Struct,
                 "interface_type" => SymbolKind::Interface,
@@ -8258,7 +8274,8 @@ fn extract_html_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftErr
             .iter()
             .find(|heading| heading.level <= level)
             .map(|heading| heading.symbol.range.start_line.saturating_sub(1))
-            .unwrap_or_else(|| total_lines.saturating_sub(1));
+            .unwrap_or_else(|| total_lines.saturating_sub(1))
+            .max(headings[i].symbol.range.start_line);
         headings[i].symbol.range.end_line = section_end;
         if section_end != headings[i].symbol.range.start_line {
             headings[i].symbol.range.end_col =
@@ -12710,5 +12727,88 @@ end.
         assert_eq!(pipeline.kind, SymbolKind::Function);
         assert_eq!(pipeline.range.start_line, 0);
         assert_eq!(pipeline.range.end_line, 9);
+    }
+}
+
+#[cfg(test)]
+mod audit11_regressions {
+    use super::*;
+
+    fn symbols(source: &str, lang: LangId) -> Vec<Symbol> {
+        let tree = parse_source_with_cached_parser(Path::new("fixture"), source, lang).unwrap();
+        extract_symbols_from_tree(source, &tree, lang).unwrap()
+    }
+
+    fn replaced_bytes(source: &str, lang: LangId, name: &str, replacement: &str) -> Vec<u8> {
+        let symbols = symbols(source, lang);
+        let range = &symbols
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .unwrap()
+            .range;
+        let start = crate::edit::line_col_to_byte(source, range.start_line, range.start_col);
+        let end = crate::edit::line_col_to_byte(source, range.end_line, range.end_col);
+        let updated = crate::edit::replace_byte_range(source, start, end, replacement).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.txt");
+        let config = crate::config::Config {
+            format_on_edit: false,
+            ..Default::default()
+        };
+        crate::edit::write_format_validate(&path, &updated, &config, &serde_json::json!({}))
+            .unwrap();
+        std::fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn go_grouped_types_and_aliases_edit_only_the_selected_spec() {
+        let source =
+            "\u{feff}package main\r\ntype (\r\n\tFirst struct{}\r\n\tSecond = First\r\n)\r\n";
+        assert_eq!(replaced_bytes(source, LangId::Go, "First", "First struct{ X int }"),
+            "\u{feff}package main\r\ntype (\r\n\tFirst struct{ X int }\r\n\tSecond = First\r\n)\r\n".as_bytes());
+        assert_eq!(
+            replaced_bytes(source, LangId::Go, "Second", "Second = int"),
+            "\u{feff}package main\r\ntype (\r\n\tFirst struct{}\r\n\tSecond = int\r\n)\r\n"
+                .as_bytes()
+        );
+        assert_eq!(
+            replaced_bytes(
+                "package main\ntype Single = int",
+                LangId::Go,
+                "Single",
+                "type Single = string"
+            ),
+            b"package main\ntype Single = string"
+        );
+    }
+
+    #[test]
+    fn node_text_handles_stale_tree_offsets() {
+        let tree = parse_source_with_cached_parser(
+            Path::new("a.ts"),
+            "const longer = 123;",
+            LangId::TypeScript,
+        )
+        .unwrap();
+        let node = tree.root_node().named_child(0).unwrap();
+        assert_eq!(node_text("x", &node), "");
+        assert_eq!(node_text("\u{e9}", &node), "");
+        let short =
+            parse_source_with_cached_parser(Path::new("a.ts"), "x", LangId::TypeScript).unwrap();
+        assert_eq!(node_text("\u{e9}", &short.root_node()), "");
+    }
+
+    #[test]
+    fn html_same_row_headings_have_noninverted_ranges() {
+        let source = "\u{feff}<html>\r\n<h1>A</h1><h1>B</h1>\r\n</html>\r\n";
+        let headings = symbols(source, LangId::Html);
+        assert_eq!(headings.len(), 2);
+        assert!(headings
+            .iter()
+            .all(|heading| heading.range.end_line >= heading.range.start_line));
+        assert_eq!(
+            replaced_bytes(source, LangId::Html, "A", "<h1>C</h1>"),
+            "\u{feff}<html>\r\n<h1>C</h1><h1>B</h1>\r\n</html>\r\n".as_bytes()
+        );
     }
 }
