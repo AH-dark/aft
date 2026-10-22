@@ -737,6 +737,161 @@ fn deleting_copied_rows_lowers_usage_only_at_the_next_covering_measurement() {
     registry.release(reservation).unwrap();
 }
 
+/// Records, at each `ClosureFlushed`, the ledger's outstanding reserved bytes
+/// and whether v3 holds the copied row. At its first `V3FloorRaised` it can
+/// delete that row through the plane store's owning connection, to model a
+/// row that disappears between the reuse check and the touch.
+struct LedgerProbe<'a> {
+    storage: &'a Path,
+    key: FamilyKey,
+    delete_at_first_floor: bool,
+    floors: std::cell::Cell<usize>,
+    flushed: std::cell::RefCell<Vec<(u64, bool)>>,
+}
+impl DurabilityObserver for LedgerProbe<'_> {
+    fn reached(&self, step: DurabilityStep) {
+        match step {
+            DurabilityStep::V3FloorRaised => {
+                self.floors.set(self.floors.get() + 1);
+                if self.delete_at_first_floor && self.floors.get() == 1 {
+                    let path = plane_path(self.storage, FAMILY, self.key.plane()).unwrap();
+                    let database =
+                        connections::shared(&path, Kind::Plane(self.key.plane()), false, false)
+                            .unwrap();
+                    let c = database.connection().unwrap();
+                    c.execute(
+                        "DELETE FROM blob_payloads WHERE full_key = ?1",
+                        [self.key.as_bytes().as_slice()],
+                    )
+                    .unwrap();
+                    checkpoint(&c).unwrap();
+                }
+            }
+            DurabilityStep::ClosureFlushed => {
+                let reserved = LedgerReader::open_existing(self.storage, FAMILY)
+                    .unwrap()
+                    .accounting()
+                    .unwrap()
+                    .reserved_bytes;
+                let present = v3_get(self.storage, &self.key).is_some();
+                self.flushed.borrow_mut().push((reserved, present));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Creates the v3 registry and holds a live reservation that leaves room for
+/// one full copy request of `payload_len` bytes but not for two. Returns the
+/// held bytes.
+fn leave_room_for_one_copy(storage: &Path, payload_len: u64) -> u64 {
+    publish(storage, FAMILY, 0, None, |_| Ok(())).unwrap();
+    let full_request = 2 * payload_len + (1 << 20);
+    let lock = ReservationLock::acquire(storage).unwrap();
+    let mut writer = RegistryWriter::open_existing(storage, FAMILY, &lock).unwrap();
+    let usage = writer.accounting().unwrap().usage();
+    let held = NAMESPACE_BUDGET - usage - full_request - full_request / 6;
+    // The reservation stays outstanding: its owner (this process) is alive.
+    writer.reserve(held).unwrap();
+    held
+}
+
+#[test]
+fn a_repeated_copy_reserves_only_a_touch_and_reuses_the_committed_row() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    // Larger than the touch-sized reservation, so the two can be told apart.
+    let payload = vec![6u8; 4 * 1024 * 1024];
+    let (_store, key) = v1_source(root.path(), &payload);
+    let held = leave_room_for_one_copy(root.path(), payload.len() as u64);
+    let copy = CopySource::V1 {
+        artifact_key: FAMILY,
+        plane: BlobPlane::Semantic,
+        key,
+    };
+    assert_eq!(
+        copy_on_first_use(root.path(), copy, HOLDER, None).unwrap(),
+        CopyOutcome::Copied
+    );
+    // A second full-size request no longer fits the namespace budget.
+    let probe = LedgerProbe {
+        storage: root.path(),
+        key: FamilyKey::new(FamilyPlane::Semantic, key),
+        delete_at_first_floor: false,
+        floors: std::cell::Cell::new(0),
+        flushed: std::cell::RefCell::new(Vec::new()),
+    };
+    assert_eq!(
+        copy_on_first_use(root.path(), copy, HOLDER, Some(&probe)).unwrap(),
+        CopyOutcome::Reused
+    );
+    let flushed = probe.flushed.into_inner();
+    assert_eq!(flushed.len(), 1, "{flushed:?}");
+    let (reserved, present) = flushed[0];
+    assert!(present);
+    assert!(
+        reserved - held < payload.len() as u64,
+        "the reuse attempt reserved {} bytes for a {} byte row",
+        reserved - held,
+        payload.len()
+    );
+    assert_eq!(
+        LedgerReader::open_existing(root.path(), FAMILY)
+            .unwrap()
+            .accounting()
+            .unwrap()
+            .reserved_bytes,
+        held
+    );
+    assert_eq!(
+        v3_get(root.path(), &FamilyKey::new(FamilyPlane::Semantic, key)),
+        Some(payload)
+    );
+}
+
+#[test]
+fn a_row_that_vanishes_before_its_touch_is_copied_under_a_full_reservation() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    let payload = vec![7u8; 4 * 1024 * 1024];
+    let (_store, key) = v1_source(root.path(), &payload);
+    let copy = CopySource::V1 {
+        artifact_key: FAMILY,
+        plane: BlobPlane::Semantic,
+        key,
+    };
+    assert_eq!(
+        copy_on_first_use(root.path(), copy, HOLDER, None).unwrap(),
+        CopyOutcome::Copied
+    );
+    let probe = LedgerProbe {
+        storage: root.path(),
+        key: FamilyKey::new(FamilyPlane::Semantic, key),
+        delete_at_first_floor: true,
+        floors: std::cell::Cell::new(0),
+        flushed: std::cell::RefCell::new(Vec::new()),
+    };
+    assert_eq!(
+        copy_on_first_use(root.path(), copy, HOLDER, Some(&probe)).unwrap(),
+        CopyOutcome::Copied
+    );
+    let flushed = probe.flushed.into_inner();
+    assert_eq!(flushed.len(), 2, "{flushed:?}");
+    // The touch-sized attempt wrote no row; the full attempt did.
+    let (touch_reserved, after_touch) = flushed[0];
+    assert!(
+        !after_touch,
+        "a row was inserted under the touch-sized reservation"
+    );
+    assert!(touch_reserved < payload.len() as u64, "{flushed:?}");
+    let (full_reserved, after_copy) = flushed[1];
+    assert!(after_copy);
+    assert!(full_reserved >= 2 * payload.len() as u64, "{flushed:?}");
+    assert_eq!(
+        v3_get(root.path(), &FamilyKey::new(FamilyPlane::Semantic, key)),
+        Some(payload)
+    );
+}
 #[test]
 fn no_production_path_calls_copy_on_first_use() {
     fn scan(dir: &Path, found: &mut Vec<String>) {

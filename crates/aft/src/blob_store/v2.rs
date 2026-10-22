@@ -1391,15 +1391,19 @@ impl FamilyStoreReader {
         usage(&self.inner)
     }
 
-    /// The stored payload length of `key`, read on the store's own connection
-    /// without reading the payload. A v3 copy sizes its reservation with it.
-    pub(super) fn copy_source_length(&self, key: &FamilyKey) -> StoreResult<Option<u64>> {
+    /// The stored payload length and digest of `key`, read on the store's own
+    /// connection without reading the payload. A v3 copy sizes its
+    /// reservation with them and checks for an equal v3 row.
+    pub(super) fn copy_source_identity(
+        &self,
+        key: &FamilyKey,
+    ) -> StoreResult<Option<(u64, Vec<u8>)>> {
         self.ensure_copy_plane(key)?;
         Ok(lock(&self.inner.connection)
             .query_row(
-                "SELECT length(payload) FROM blob_payloads WHERE full_key = ?1",
+                "SELECT length(payload), payload_digest FROM blob_payloads WHERE full_key = ?1",
                 params![key.as_bytes().as_slice()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?)
     }

@@ -871,11 +871,24 @@ pub struct Publication<'a, 'b> {
 }
 impl Publication<'_, '_> {
     fn plane(&mut self, plane: FamilyPlane) -> Result<connections::Guard<'_>> {
+        self.plane_with(plane, true)?
+            .ok_or(Error::Refused("plane_store_missing"))
+    }
+    /// The plane's publication connection. Without `create`, a plane store
+    /// that does not exist is `None` and nothing is created.
+    fn plane_with(
+        &mut self,
+        plane: FamilyPlane,
+        create: bool,
+    ) -> Result<Option<connections::Guard<'_>>> {
         if let Some(index) = self.planes.iter().position(|(p, _)| *p == plane) {
-            return self.planes[index].1.connection();
+            return self.planes[index].1.connection().map(Some);
         }
         let path = self.registry.dir.join(format!("{}.sqlite", plane.as_str()));
-        let database = connections::shared(&path, Kind::Plane(plane), true, false)?;
+        if !create && !path.try_exists()? {
+            return Ok(None);
+        }
+        let database = connections::shared(&path, Kind::Plane(plane), create, false)?;
         let c = database.connection()?;
         let stored: String =
             c.query_row("SELECT plane FROM store_meta WHERE singleton=1", [], |r| {
@@ -891,7 +904,33 @@ impl Publication<'_, '_> {
         }
         drop(c);
         self.planes.push((plane, database));
-        self.planes.last().expect("inserted plane").1.connection()
+        self.planes
+            .last()
+            .expect("inserted plane")
+            .1
+            .connection()
+            .map(Some)
+    }
+    /// Stamps the plane's current `gc_epoch` on an existing row whose stored
+    /// digest is `digest`. Never inserts and never creates a plane store, so a
+    /// reservation sized for a touch cannot be overrun. `false` means no such
+    /// row exists (any more).
+    fn touch_row(&mut self, key: &FamilyKey, digest: &[u8]) -> Result<bool> {
+        let Some(mut c) = self.plane_with(key.plane(), false)? else {
+            return Ok(false);
+        };
+        #[cfg(test)]
+        if replay::unflushed_closure() {
+            // Test-only fault injection for the power-loss replay, as in put_row.
+            c.pragma_update(None, "synchronous", 0)?;
+        }
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let touched = tx.execute(
+            "UPDATE blob_payloads SET ref_epoch=(SELECT gc_epoch FROM store_meta) WHERE full_key=?1 AND payload_digest=?2",
+            params![key.as_bytes().as_slice(), digest],
+        )?;
+        tx.commit()?;
+        Ok(touched == 1)
     }
     pub fn put(&mut self, key: &FamilyKey, payload: &[u8], payload_schema: u32) -> Result<()> {
         self.put_row(key, payload, payload_schema).map(|_| ())

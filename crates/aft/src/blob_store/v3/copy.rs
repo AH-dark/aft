@@ -31,6 +31,9 @@ use std::time::Instant;
 
 /// The longest a copier waits for a live v2 sweep lease to clear.
 pub const SWEEP_LEASE_WAIT: Duration = Duration::from_secs(120);
+/// The reservation for an attempt that only touches an equal v3 row: room
+/// for the updated pages in the plane and registry WAL frames.
+const TOUCH_REQUEST: u64 = 1 << 20;
 const LEASE_RETRY: Duration = Duration::from_millis(20);
 static PIN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -88,9 +91,22 @@ pub fn copy_on_first_use(
     let key = source.v3_key();
     // Protection first: nothing below reads the source before the pin exists.
     let pin = protect(storage, &source, holder)?;
-    let Some(length) = source_length(storage, &source)? else {
+    let Some((length, digest)) = source_identity(storage, &source)? else {
         return Ok(CopyOutcome::SourceMissing);
     };
+    // An equal row already in v3 (for example, from a copy that committed
+    // before its caller saw the result) needs only a ref_epoch touch, so the
+    // attempt reserves for that alone. The touch never inserts: if the row
+    // is gone by the time the closure runs, that attempt writes nothing and
+    // the full copy below runs under its own full-size reservation.
+    if destination_holds(storage, family, &key, length, &digest)?
+        && publish(storage, family, TOUCH_REQUEST, observer, |publication| {
+            publication.touch_row(&key, &digest)
+        })?
+    {
+        drop(pin);
+        return Ok(CopyOutcome::Reused);
+    }
     // Room for the row, its index entry and WAL frames; the commit charges
     // the measured growth instead.
     let request = length.saturating_mul(2).saturating_add(1 << 20);
@@ -260,7 +276,9 @@ fn v2_reader(storage: &Path, family: &str, key: &FamilyKey) -> Result<Option<Fam
         .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))
 }
 
-fn source_length(storage: &Path, source: &CopySource<'_>) -> Result<Option<u64>> {
+/// The source row's payload length and stored digest, read without reading
+/// the payload.
+fn source_identity(storage: &Path, source: &CopySource<'_>) -> Result<Option<(u64, Vec<u8>)>> {
     match *source {
         CopySource::V1 {
             artifact_key,
@@ -272,19 +290,46 @@ fn source_length(storage: &Path, source: &CopySource<'_>) -> Result<Option<u64>>
             };
             Ok(connection
                 .query_row(
-                    "SELECT length(payload) FROM blob_payloads WHERE full_key = ?1",
+                    "SELECT length(payload), payload_digest FROM blob_payloads WHERE full_key = ?1",
                     [key.as_slice()],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?)
         }
         CopySource::V2 { family, key } => match v2_reader(storage, family, &key)? {
             Some(reader) => reader
-                .copy_source_length(&key)
+                .copy_source_identity(&key)
                 .map_err(|error| Error::Io(std::io::Error::other(error.to_string()))),
             None => Ok(None),
         },
     }
+}
+
+/// Whether v3 already holds `key` with the same stored digest and payload
+/// length, read without reading the payload.
+fn destination_holds(
+    storage: &Path,
+    family: &str,
+    key: &FamilyKey,
+    length: u64,
+    digest: &[u8],
+) -> Result<bool> {
+    if !plane_path(storage, family, key.plane())?.try_exists()? {
+        return Ok(false);
+    }
+    let reader = PlaneReader::open_existing(storage, family, key.plane())?;
+    let row: Option<(u64, Vec<u8>)> = reader
+        .database
+        .connection()?
+        .query_row(
+            "SELECT length(payload), payload_digest FROM blob_payloads WHERE full_key = ?1",
+            [key.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.is_some_and(|(stored_length, stored_digest)| {
+        stored_length == length && stored_digest == digest
+    }))
 }
 
 /// The source payload and its stored `payload_schema`, after checking the
