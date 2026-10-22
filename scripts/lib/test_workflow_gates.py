@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -303,7 +304,7 @@ class CISpeedWorkflowTests(unittest.TestCase):
             for job in unit["jobs"].values()
             for step in job.get("steps", [])
         ]
-        self.assertEqual(uses.count("./.github/actions/setup-nextest"), 13)
+        self.assertEqual(uses.count("./.github/actions/setup-nextest"), 14)
         shard = workflow_gates.parse_workflow(str(github / "actions/integration-shard/action.yml"))
         self.assertEqual(
             sum(step.get("uses") == "./.github/actions/setup-nextest" for step in shard["runs"]["steps"]),
@@ -406,7 +407,110 @@ class RustPRAdvisoryWorkflowTests(unittest.TestCase):
         )
 
 
+class LinuxUnitWorkflowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        self.jobs = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))["jobs"]
+
+    def test_linux_archive_covers_units_and_proves_the_uploaded_inventory(self) -> None:
+        archive = self.jobs["unit-linux-nextest-archive"]
+        commands = "\n".join(step.get("run", "") for step in archive["steps"])
+        self.assertIn("(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)", commands)
+        proof = next(step for step in archive["steps"] if step.get("run") == "python3 scripts/rust-test-inventory-proof.py")
+        self.assertEqual(proof["env"]["AFT_NEXTEST_ARCHIVE_FILE"], "${{ runner.temp }}/linux-nextest.tar.zst")
+        for probe in ("platform_verifier_tls_client_subprocess", "panic_hook_preserves_default_backtrace_behavior_and_persists"):
+            steps = [step for step in archive["steps"] if probe in step.get("run", "")]
+            self.assertEqual(len(steps), 1)
+            self.assertIn('cargo nextest run --archive-file "$LINUX_NEXTEST_ARCHIVE"', steps[0]["run"])
+            self.assertNotIn("--partition", steps[0]["run"])
+
+    def test_linux_unit_shards_only_execute_archive_partitions(self) -> None:
+        shard = self.jobs["unit-linux-libtest-shard"]
+        self.assertEqual(shard["needs"], "unit-linux-nextest-archive")
+        self.assertEqual(shard["strategy"]["matrix"]["shard"], ["1", "2", "3"])
+        self.assertEqual(shard["strategy"]["fail-fast"], "false")
+        self.assertEqual(shard["runs-on"], "ubuntu-24.04")
+        gate = next(step for step in shard["steps"] if step.get("run") == "./scripts/rust-test-gate.sh")
+        self.assertEqual(gate["env"]["AFT_GATE_PHASES"], "lib-shard")
+        self.assertEqual(gate["env"]["AFT_UNIT_TEST_RUNNER"], "nextest")
+        self.assertEqual(gate["env"]["AFT_NEXTEST_PARTITION"], "hash:${{ matrix.shard }}/3")
+        self.assertEqual(gate["env"]["AFT_NEXTEST_ARCHIVE_FILE"], "${{ runner.temp }}/linux-nextest.tar.zst")
+        download = next(step for step in shard["steps"] if step.get("uses") == "./.github/actions/download-artifact-retry")
+        self.assertEqual(download["with"]["name"], "linux-nextest-archive")
+
+    def test_required_linux_check_aggregates_shards_and_preserves_isolated_phases(self) -> None:
+        summary = self.jobs["unit-linux-summary"]
+        self.assertEqual(summary["name"], "Unit tests (Linux)")
+        self.assertEqual(summary["if"], "${{ always() && github.event_name != 'pull_request' }}")
+        self.assertEqual(set(summary["needs"]), {
+            "unit-linux", "unit-linux-nextest-archive", "unit-linux-libtest-shard",
+            "unit-linux-nextest", "unit-linux-nextest-2", "unit-linux-nextest-3",
+        })
+        check = next(step for step in summary["steps"] if "needs" in step.get("env", {}).get("NEEDS", ""))
+        self.assertIn("result", check["run"])
+        self.assertIn("success", check["run"])
+        for result in ("success", "failure", "cancelled", "skipped"):
+            with self.subTest(result=result):
+                needs = {name: {"result": "success"} for name in summary["needs"]}
+                needs["unit-linux-libtest-shard"]["result"] = result
+                proc = subprocess.run(
+                    ["bash", "-c", check["run"]], capture_output=True, text=True,
+                    env={**os.environ, "NEEDS": json.dumps(needs)},
+                )
+                self.assertEqual(proc.returncode == 0, result == "success", proc.stdout + proc.stderr)
+        gate = next(step for step in self.jobs["unit-linux"]["steps"] if step.get("run") == "./scripts/rust-test-gate.sh")
+        self.assertEqual(gate["env"]["AFT_GATE_PHASES"], "watcher,conformance")
+
+
 class WindowsUnitWorkflowTests(unittest.TestCase):
+    def test_windows_defender_tuning_is_shared_and_hosted_only(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        path = root / ".github/actions/windows-ci-defender/action.yml"
+        action = workflow_gates.parse_workflow(str(path))
+        self.assertEqual(action["runs"]["using"], "composite")
+        steps = action["runs"]["steps"]
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["shell"], "pwsh")
+        script = steps[0]["run"]
+        self.assertIn("$env:RUNNER_ENVIRONMENT -ne 'github-hosted'", script)
+        self.assertLess(script.index("throw"), script.index("Add-MpPreference"))
+        for path in ("$env:GITHUB_WORKSPACE", "$env:TEMP", "$env:RUNNER_TEMP", "$env:USERPROFILE"):
+            self.assertIn(path, script)
+        self.assertIn("'.cargo'", script)
+        self.assertIn("Add-MpPreference -ExclusionPath $paths", script)
+        self.assertIn("Set-MpPreference -DisableRealtimeMonitoring $true", script)
+        self.assertIn("Get-MpComputerStatus", script)
+        self.assertNotIn("SilentlyContinue", script)
+
+    def test_every_windows_ci_lane_tunes_defender_before_other_setup(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        action = "./.github/actions/windows-ci-defender"
+        calls = []
+        for filename in ("_unit-suite.yml", "_e2e-suite.yml"):
+            suite = workflow_gates.parse_workflow(str(root / ".github/workflows" / filename))
+            for name, job in suite["jobs"].items():
+                steps = job.get("steps", [])
+                direct = [i for i, step in enumerate(steps) if step.get("uses") == action]
+                if job.get("runs-on") != "windows-2022":
+                    self.assertEqual(direct, [], name)
+                    continue
+                shared = [step for step in steps if step.get("uses") == "./.github/actions/integration-shard"]
+                if shared:
+                    self.assertEqual(shared[0]["with"]["platform"], "windows")
+                else:
+                    self.assertEqual(direct, [1], name)
+                    self.assertNotIn("continue-on-error", steps[1])
+                    calls.append(name)
+        self.assertEqual(set(calls), {
+            "unit-windows-nextest-archive", "unit-windows-libtest-shard", "unit-windows-watcher",
+            "unit-windows-check", "unit-windows-bash", "e2e-windows",
+        })
+        shared = workflow_gates.parse_workflow(str(root / ".github/actions/integration-shard/action.yml"))
+        step = shared["runs"]["steps"][0]
+        self.assertEqual(step["uses"], action)
+        self.assertEqual(step["if"], "inputs.platform == 'windows'")
+        self.assertNotIn("continue-on-error", step)
+
     def test_windows_serial_probes_run_once_in_archive_builder(self) -> None:
         root = Path(__file__).resolve().parents[2]
         suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
