@@ -1157,6 +1157,8 @@ pub struct StatusEmitter {
 struct StatusEmitterState {
     latest: Mutex<Option<PendingStatusSnapshot>>,
     progress_sender: SharedProgressSender,
+    /// Whether this emitter's last push is still being built and sent.
+    emitting: AtomicBool,
 }
 
 enum PendingStatusSnapshot {
@@ -2391,6 +2393,7 @@ impl StatusEmitter {
             state: Arc::new(StatusEmitterState {
                 latest: Mutex::new(None),
                 progress_sender,
+                emitting: AtomicBool::new(false),
             }),
             notify: status_debounce_sender(),
             context: Mutex::new(Weak::new()),
@@ -2440,6 +2443,13 @@ fn status_debounce_sender() -> mpsc::Sender<Weak<StatusEmitterState>> {
 /// `STATUS_DEBOUNCE_MS`, later signals inside it only replace the pending
 /// snapshot, and the window's close pushes the latest one. Windows of
 /// different emitters run independently. Returns once every sender is gone.
+///
+/// This thread only keeps time. Building a push can read the project's
+/// filesystem, which may sit on a slow or unavailable mount, so each push is
+/// built and sent on a thread of its own: one stalled project then delays
+/// only its own status. An emitter whose previous push is still running gets
+/// its window re-armed, so its latest snapshot follows once that push ends
+/// and it never has more than one push thread.
 fn status_debounce_loop(rx: mpsc::Receiver<Weak<StatusEmitterState>>) {
     // Every window has the same length, so arrival order is deadline order.
     let mut windows: VecDeque<(Instant, Weak<StatusEmitterState>)> = VecDeque::new();
@@ -2453,9 +2463,14 @@ fn status_debounce_loop(rx: mpsc::Receiver<Weak<StatusEmitterState>>) {
                 break;
             };
             // A context dropped inside its window pushes nothing.
-            if let Some(state) = state.upgrade() {
-                emit_pending_status(&state);
+            let Some(strong) = state.upgrade() else {
+                continue;
+            };
+            if strong.emitting.swap(true, Ordering::AcqRel) {
+                windows.push_back((now + Duration::from_millis(STATUS_DEBOUNCE_MS), state));
+                continue;
             }
+            spawn_status_emit(strong);
         }
         let signalled = match windows.front() {
             Some((deadline, _)) => {
@@ -2482,6 +2497,83 @@ fn status_debounce_loop(rx: mpsc::Receiver<Weak<StatusEmitterState>>) {
     }
 }
 
+/// Hold a status emission for `root` until the test releases it, so a test
+/// can stand in for a project whose filesystem stalls the status build.
+#[cfg(test)]
+pub(crate) struct StatusEmitGateForTest {
+    root: PathBuf,
+    pub(crate) reached: crossbeam_channel::Receiver<()>,
+    pub(crate) release: crossbeam_channel::Sender<()>,
+}
+
+#[cfg(test)]
+type StatusEmitGates = parking_lot::Mutex<
+    std::collections::HashMap<
+        PathBuf,
+        (
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        ),
+    >,
+>;
+
+#[cfg(test)]
+fn status_emit_gates() -> &'static StatusEmitGates {
+    static GATES: std::sync::OnceLock<StatusEmitGates> = std::sync::OnceLock::new();
+    GATES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn gate_status_emit_for_test(root: &Path) -> StatusEmitGateForTest {
+    let (reached_tx, reached) = crossbeam_channel::unbounded();
+    let (release, release_rx) = crossbeam_channel::unbounded();
+    status_emit_gates()
+        .lock()
+        .insert(root.to_path_buf(), (reached_tx, release_rx));
+    StatusEmitGateForTest {
+        root: root.to_path_buf(),
+        reached,
+        release,
+    }
+}
+
+#[cfg(test)]
+impl Drop for StatusEmitGateForTest {
+    fn drop(&mut self) {
+        status_emit_gates().lock().remove(&self.root);
+        let _ = self.release.send(());
+    }
+}
+
+#[cfg(test)]
+fn wait_on_status_emit_gate_for_test(context: &AppContext) {
+    let Some(root) = context.config().project_root.clone() else {
+        return;
+    };
+    let gate = status_emit_gates().lock().get(&root).cloned();
+    if let Some((reached, release)) = gate {
+        let _ = reached.send(());
+        let _ = release.recv_timeout(Duration::from_secs(30));
+    }
+}
+
+fn spawn_status_emit(state: Arc<StatusEmitterState>) {
+    let spawned = std::thread::Builder::new()
+        .name("aft-status-emit".to_string())
+        .spawn({
+            let state = Arc::clone(&state);
+            move || {
+                emit_pending_status(&state);
+                state.emitting.store(false, Ordering::Release);
+            }
+        });
+    if spawned.is_err() {
+        // No thread to spare: push inline rather than drop the status.
+        emit_pending_status(&state);
+        state.emitting.store(false, Ordering::Release);
+    }
+}
+
 fn emit_pending_status(state: &StatusEmitterState) {
     let snapshot = state
         .latest
@@ -2500,13 +2592,19 @@ fn emit_pending_status(state: &StatusEmitterState) {
     // retired actor (and its watchers/servers) alive.
     let snapshot = match snapshot {
         PendingStatusSnapshot::Ready(snapshot, context) => match context.upgrade() {
-            Some(context) => crate::status_push::project(&context, snapshot),
+            Some(context) => {
+                #[cfg(test)]
+                wait_on_status_emit_gate_for_test(&context);
+                crate::status_push::project(&context, snapshot)
+            }
             None => snapshot,
         },
         PendingStatusSnapshot::Context(context) => {
             let Some(context) = context.upgrade() else {
                 return;
             };
+            #[cfg(test)]
+            wait_on_status_emit_gate_for_test(&context);
             let Some(snapshot) = context.try_build_status_push_snapshot() else {
                 // Keep the previous bar; the next producer signal retries.
                 return;
@@ -19804,6 +19902,57 @@ mod status_emitter_tests {
         assert!(
             retry.contains("D9 U2 C3"),
             "a skipped emission must not consume the change"
+        );
+    }
+
+    /// A context for `root` whose status pushes arrive on the returned
+    /// receiver, registered the way a transport root is.
+    fn bound_ctx_with_frame_rx(root: &Path) -> (Arc<AppContext>, mpsc::Receiver<PushFrame>) {
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        let (tx, rx) = mpsc::channel();
+        ctx.set_progress_sender(Some(Arc::new(Box::new(move |frame| {
+            let _ = tx.send(frame);
+        }))));
+        ctx.bind_status_context();
+        (ctx, rx)
+    }
+
+    /// Building one project's status can touch its filesystem, which may sit
+    /// on a slow or unavailable mount. While that build waits, another
+    /// project's status must still go out within its debounce window.
+    #[test]
+    fn a_stalled_status_build_does_not_delay_another_context() {
+        let slow_root = tempfile::tempdir().unwrap();
+        let fast_root = tempfile::tempdir().unwrap();
+        let (slow, slow_rx) = bound_ctx_with_frame_rx(slow_root.path());
+        let (fast, fast_rx) = bound_ctx_with_frame_rx(fast_root.path());
+        let gate = gate_status_emit_for_test(slow_root.path());
+
+        slow.status_emitter().signal(slow.build_status_snapshot());
+        gate.reached
+            .recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 5_000))
+            .expect("the slow project's status build started");
+        fast.status_emitter().signal(fast.build_status_snapshot());
+        let fast_frame = fast_rx.recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 2_000));
+        // Release before asserting, so a failure does not leave the shared
+        // status machinery blocked for other tests.
+        let _ = gate.release.send(());
+        assert!(
+            matches!(fast_frame, Ok(PushFrame::StatusChanged(_))),
+            "another project's status waited for the stalled build"
+        );
+        assert!(
+            matches!(
+                slow_rx.recv_timeout(Duration::from_secs(10)),
+                Ok(PushFrame::StatusChanged(_))
+            ),
+            "the stalled project's status goes out once its build finishes"
         );
     }
 
