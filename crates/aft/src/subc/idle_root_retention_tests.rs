@@ -359,18 +359,17 @@ fn evicted_worked_roots_keep_only_bookkeeping() {
             ));
             assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
             work_root(&ctx, root.as_path(), storage.path());
-            // Configure's deferred tail starts the watch; give it a moment.
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !ctx.config_live().has_project_fallback_watch() {
-                assert!(
-                    Instant::now() < deadline,
-                    "the legacy project config never got its own watch: {:?}",
-                    ctx.config_live()
-                        .sources()
-                        .map(|sources| sources.project.path)
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            // Configure's deferred tail normally starts this watch once the
+            // project watcher is up. Sync here as well so the fixture does not
+            // depend on when that tail runs.
+            crate::config_live::sync_config_watches(&ctx);
+            assert!(
+                ctx.config_live().has_project_fallback_watch(),
+                "the legacy project config never got its own watch: {:?}",
+                ctx.config_live()
+                    .sources()
+                    .map(|sources| sources.project.path)
+            );
             let mut semantic = ctx.config().semantic.clone();
             semantic.backend = crate::config::SemanticBackend::OpenAiCompatible;
             semantic.base_url = Some("http://127.0.0.1:9".to_string());
