@@ -55,7 +55,8 @@ runs:
         fi
 
         mkdir -p "$HOME/.cargo/bin"
-        archive="$RUNNER_TEMP/cargo-nextest-${NEXTEST_VERSION}-${platform}.tar.gz"
+        archive_name="cargo-nextest-${NEXTEST_VERSION}-${platform}.tar.gz"
+        archive="$RUNNER_TEMP/$archive_name"
         checksum_file="$RUNNER_TEMP/cargo-nextest-${NEXTEST_VERSION}-${release_target}.sha256"
         curl --fail --location --silent --show-error \
           --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 180 \
@@ -67,8 +68,11 @@ runs:
         else
           shasum -a 256 --check --status "$checksum_file"
         fi
-        tar -tzf "$archive" | grep -Eq '(^|/)cargo-nextest(\.exe)?$'
-        tar -xzf "$archive" -C "$HOME/.cargo/bin"
+        (
+          cd "$RUNNER_TEMP"
+          tar -tzf "$archive_name" | grep -Eq '(^|/)cargo-nextest(\.exe)?$'
+          tar -xzf "$archive_name" -C "$HOME/.cargo/bin"
+        )
 
     - name: Verify cargo-nextest version
       shell: bash

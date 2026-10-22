@@ -247,13 +247,30 @@ class CISpeedWorkflowTests(unittest.TestCase):
         self.assertIn('test -s "$archive"', script)
         self.assertIn("sha256sum --check --status", script)
         self.assertIn("shasum -a 256 --check --status", script)
-        self.assertIn('tar -xzf "$archive"', script)
         for digest in (
             "3793bf0c27607b196f502c39b2108f571de89fcda7586ae6beefa11ee177b216",
             "124baa34d160355fa8a8bed053856270cfcf132659e76a0bc8bbcdfc093266b7",
             "e4606198dd067299f16863dcf5b9be007b9cae041e468c417884fc224760c0f4",
         ):
             self.assertIn(digest, script)
+
+    def test_nextest_tar_uses_relative_archive_paths_for_runner_temp(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        action = workflow_gates.parse_workflow(str(root / ".github/actions/setup-nextest/action.yml"))
+        install = next(step for step in action["runs"]["steps"] if step.get("name") == "Download and install cargo-nextest")
+        script = install["run"]
+        tar_calls = [
+            line.strip()
+            for line in script.splitlines()
+            if re.search(r"\btar\s+-(?:t|x)zf\b", line)
+        ]
+        self.assertEqual(len(tar_calls), 2)
+        self.assertIn('cd "$RUNNER_TEMP"', script)
+        self.assertLess(script.index('cd "$RUNNER_TEMP"'), script.index("tar -tzf"))
+        for call in tar_calls:
+            self.assertIn('"$archive_name"', call)
+            self.assertNotIn("$RUNNER_TEMP", call)
+            self.assertNotIn('"$archive"', call)
 
     def test_tool_downloads_are_never_piped_to_tar(self) -> None:
         root = Path(__file__).resolve().parents[2] / ".github"
