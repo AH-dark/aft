@@ -8343,6 +8343,15 @@ impl AppContext {
         self.force_restrict_requests.lock().contains_key(req_id)
     }
 
+    /// The outside-roots rule this request is judged under: the configured
+    /// rule, or deny when the request forces it.
+    pub(crate) fn request_outside_roots(&self, req_id: &str) -> crate::access_policy::OutsideRoots {
+        crate::access_policy::OutsideRoots::for_request(
+            &self.config(),
+            self.request_force_restrict(req_id),
+        )
+    }
+
     fn release_force_restrict(&self, req_id: &str) {
         let mut requests = self.force_restrict_requests.lock();
         match requests.get_mut(req_id) {
@@ -13884,7 +13893,9 @@ impl AppContext {
     ) -> Result<Option<PathRestrictionContext>, crate::protocol::Response> {
         let config = self.config();
         let force_restrict = self.request_force_restrict(req_id);
-        if !config.restrict_to_project_root && !force_restrict {
+        if crate::access_policy::OutsideRoots::for_request(&config, force_restrict)
+            == crate::access_policy::OutsideRoots::Ask
+        {
             return Ok(None);
         }
         let root = match &config.project_root {
@@ -14305,13 +14316,13 @@ impl AppContext {
     }
 
     /// Use the effective configuration snapshot selected for the current tool route.
-    /// Untrusted subc calls may also force restrict_to_project_root for this request,
-    /// even when the user's configuration disables it.
+    /// Untrusted subc calls may also force outside roots: deny for this request,
+    /// even when the user's configuration asks (see [`crate::access_policy::OutsideRoots`]).
     pub fn access_policy(
         &self,
         req_id: &str,
     ) -> Result<crate::access_policy::AccessPolicy, crate::protocol::Response> {
-        use crate::access_policy::{AccessDecision, AccessDenial, AccessPolicy};
+        use crate::access_policy::{AccessDecision, AccessDenial, AccessPolicy, OutsideRoots};
         let config = self.config();
         let standalone = matches!(
             crate::access_policy::current_ask_route(),
@@ -14323,8 +14334,11 @@ impl AppContext {
             .map(|root| vec![self.resolved_path_restriction_root(root)])
             .unwrap_or_default();
         let force_restrict = self.request_force_restrict(req_id);
+        // The standalone exemptions (main checkout, temp scratch) only apply
+        // while outside paths ask; outside roots: deny refuses them.
+        let outside_ask = OutsideRoots::for_request(&config, force_restrict) == OutsideRoots::Ask;
         let mut main_roots = Vec::new();
-        if standalone && !config.restrict_to_project_root && !force_restrict {
+        if standalone && outside_ask {
             // Frozen when the cache role was set, after the linkage between
             // this worktree and its main checkout was verified. It is never
             // resolved again here, so a later symlink or junction swap of the
@@ -14403,7 +14417,7 @@ impl AppContext {
             }
             policy.install_scope_grants(grants, worker);
             policy.mode = mode;
-            if standalone && !config.restrict_to_project_root && !force_restrict {
+            if standalone && outside_ask {
                 policy.standalone_temp_roots =
                     crate::access_policy::temp::allowed_roots(temp_override.as_deref());
             }
@@ -14832,7 +14846,7 @@ impl AppContext {
         // already denied this path. The protected path is still rejected; changing
         // the error spelling must never turn a floor denial into a consent request.
         if decision == AccessDecision::Deny(AccessDenial::Floor)
-            && (self.config().restrict_to_project_root || self.request_force_restrict(req_id))
+            && self.request_outside_roots(req_id) == crate::access_policy::OutsideRoots::Deny
             && !policy.roots.iter().any(|root| identity.starts_with(root))
             && !(operation == AccessOperation::Read && owned_artifact)
         {

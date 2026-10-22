@@ -827,7 +827,7 @@ fn handle_semantic_search_with_disk_fallback(
         }
         match ctx.resolve_external_git_root(&project_root, requested_path, scan_root_is_protected) {
             Ok(root) if root != project_root => {
-                if ctx.config().restrict_to_project_root || ctx.request_force_restrict(&req.id) {
+                if ctx.request_outside_roots(&req.id) == crate::access_policy::OutsideRoots::Deny {
                     return Response::error(
                         &req.id,
                         "path_outside_root",
