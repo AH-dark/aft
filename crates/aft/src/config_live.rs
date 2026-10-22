@@ -633,6 +633,18 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
         }
     };
 
+    // The files resolved cleanly, so the cache location is known again even
+    // though the text differs from the last good text. Clear the flag an
+    // earlier unreadable or invalid user file set and recheck the cache
+    // location the session connected with. Only the flag is cleared: a
+    // changed `storage.cache_dir` stays deferred until the next connect.
+    if ctx.config_unpinned().cache_config_unknown.is_some() {
+        ctx.update_config(|config| {
+            config.cache_config_unknown = None;
+            crate::root_cache::prepare_cache_root(config);
+        });
+    }
+
     {
         let mut record = state.sources.lock();
         if let Some(record) = record.as_mut() {

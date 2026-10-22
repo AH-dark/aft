@@ -371,6 +371,39 @@ fn invalid_user_config_live_disables_caches_without_changing_security_floor() {
 }
 
 #[test]
+fn repaired_user_config_with_new_text_turns_caches_back_on_and_keeps_deferred_keys_deferred() {
+    let fixture = Fixture::new(r#"{"restrict_to_project_root":true}"#, None);
+    assert!(fixture.ctx.cache_unavailable_reason().is_none());
+    write(&fixture.user_path, "{");
+    assert!(matches!(fixture.reload(), ReloadOutcome::Kept { .. }));
+    assert!(fixture
+        .ctx
+        .cache_unavailable_reason()
+        .is_some_and(|reason| reason.contains("cache_dir_config_unknown")));
+
+    // A valid file whose text differs from the last good text: one deferred
+    // key changed, nothing live.
+    write(
+        &fixture.user_path,
+        r#"{"restrict_to_project_root":true,"indexes":{"trigram":false}}"#,
+    );
+    let outcome = fixture.reload();
+    assert_eq!(deferred(&outcome), vec!["indexes.trigram"]);
+    assert!(applied(&outcome).is_empty());
+    let config = fixture.ctx.config();
+    assert!(config.cache_config_unknown.is_none());
+    assert!(
+        fixture.ctx.cache_unavailable_reason().is_none(),
+        "{:?}",
+        fixture.ctx.cache_unavailable_reason()
+    );
+    assert!(
+        config.indexes.trigram,
+        "a deferred key must not change live"
+    );
+}
+
+#[test]
 fn invalid_unrelated_user_edit_live_keeps_caches_on() {
     let fixture = Fixture::new(r#"{"restrict_to_project_root":true}"#, None);
     write(
