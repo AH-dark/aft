@@ -9496,7 +9496,7 @@ impl BgTaskRegistry {
                 scope.scope_ref.clone(),
                 scope.scope_epoch,
             ));
-        if let Err(error) = self.stop_scope_tasks(scope, false, None) {
+        if let Err(error) = self.stop_scope_tasks(scope, false, None, None) {
             log::warn!("scope revocation kill failed: {error}");
         }
         // Finished commands of the ended scope keep no scratch for later reads.
@@ -9504,12 +9504,62 @@ impl BgTaskRegistry {
     }
 
     /// Cancel this scope's current tasks without ending its authority to spawn.
+    ///
+    /// `bash.kill_scope` calls this once for local tasks and once for remote
+    /// ones, after [`Self::begin_scope_pause`] chose `members`, the tasks the
+    /// pause covers. A member already finished by the pause itself (its
+    /// worker settled the recorded intent first) is reported as stopped.
     pub(crate) fn pause_scope(
         &self,
         scope: &subc_protocol::scope::ScopeStamp,
         remote: bool,
+        members: &HashSet<String>,
     ) -> Result<ScopeKillReport, String> {
-        self.stop_scope_tasks(scope, true, Some(remote))
+        self.stop_scope_tasks(scope, true, Some(remote), Some(members))
+    }
+
+    /// Choose the tasks an owner's pause of `scope` covers, its unfinished
+    /// tasks, and record the pause on each remote one before any task is
+    /// stopped. `bash.kill_scope` then stops local and remote tasks in two
+    /// passes, each deciding by where a task runs. Without the recorded
+    /// intent a remote task the runner refuses between the passes could fall
+    /// back to a local command that neither pass stops; with it, the fallback
+    /// does not start and the task ends as paused.
+    pub(crate) fn begin_scope_pause(
+        &self,
+        scope: &subc_protocol::scope::ScopeStamp,
+    ) -> Result<HashSet<String>, String> {
+        let mut members = HashSet::new();
+        for task in self.task_arcs() {
+            let in_scope = task
+                .lock_state()
+                .ok()
+                .and_then(|state| state.metadata.scope.clone())
+                .is_some_and(|stamp| {
+                    stamp.owner == scope.owner
+                        && stamp.scope_ref == scope.scope_ref
+                        && stamp.scope_epoch == scope.scope_epoch
+                });
+            if !in_scope || task.is_terminal() {
+                continue;
+            }
+            #[cfg(unix)]
+            self.record_owner_pause_intent(&task)?;
+            members.insert(task.task_id.clone());
+        }
+        Ok(members)
+    }
+
+    /// The members of an owner's pause (see [`Self::begin_scope_pause`])
+    /// that are still running, which the pause must not report as done.
+    pub(crate) fn unstopped_pause_members(&self, members: &HashSet<String>) -> Vec<String> {
+        let mut running = members
+            .iter()
+            .filter(|task_id| self.task(task_id).is_some_and(|task| !task.is_terminal()))
+            .cloned()
+            .collect::<Vec<_>>();
+        running.sort();
+        running
     }
 
     /// Recover this scope's unfinished tasks that an earlier module instance
@@ -9892,6 +9942,7 @@ impl BgTaskRegistry {
         scope: &subc_protocol::scope::ScopeStamp,
         paused: bool,
         remote: Option<bool>,
+        pause_members: Option<&HashSet<String>>,
     ) -> Result<ScopeKillReport, String> {
         let mut report = ScopeKillReport::default();
         let mut errors = Vec::new();
@@ -9912,7 +9963,21 @@ impl BgTaskRegistry {
                 });
             if let Some(stamp) = stamp {
                 if task.is_terminal() {
-                    report.already_finished += 1;
+                    // A member the pause's own recorded intent already ended
+                    // (its worker settled the pause first) was stopped by this
+                    // pause, not finished before it.
+                    let stopped_by_pause = pause_members
+                        .is_some_and(|members| members.contains(&task.task_id))
+                        && task.lock_state().is_ok_and(|state| {
+                            state.metadata.status == BgTaskStatus::Killed
+                                && state.metadata.status_reason.as_deref()
+                                    == Some(OWNER_PAUSED_REASON)
+                        });
+                    if stopped_by_pause {
+                        self.report_paused_task(&task, &mut report)?;
+                    } else {
+                        report.already_finished += 1;
+                    }
                     continue;
                 }
                 // A run scope's tasks were started by a codemode program.
@@ -9932,33 +9997,15 @@ impl BgTaskRegistry {
                 match killed {
                     Ok(snapshot) if snapshot.info.status == BgTaskStatus::Killed => {
                         if paused {
-                            let mut db = DeferredDbWrites::new(self, &task);
-                            let mut state = task.lock_state().map_err(|_| "task lock poisoned")?;
-                            // Saved after the stop's terminal record: a replay reading between the two writes misses this notice until its next replay.
-                            state.metadata.cancelled_call_unannounced = true;
-                            self.persist_task_locked(&task, &state.metadata, &mut db)
-                                .map_err(|e| e.to_string())?;
-                            drop(state);
-                            self.index_cancelled_call(&task.session_id, &task.task_id);
+                            self.report_paused_task(&task, &mut report)?;
+                        } else {
+                            report.killed.push(ScopeKilledTask {
+                                task_id: task.task_id.clone(),
+                                session_id: task.session_id.clone(),
+                                remote: scope_remote_cancel(&task),
+                                from_saved_record: false,
+                            });
                         }
-                        let remote = task.lock_state().ok().and_then(|state| {
-                            state
-                                .metadata
-                                .remote
-                                .as_ref()
-                                .map(|remote| ScopeRemoteCancel {
-                                    job_id: remote.job_id.map(|id| id.to_string()),
-                                    cancel: remote.owner_pause_cancel.clone().unwrap_or_else(
-                                        || "failed: cancellation outcome unavailable".into(),
-                                    ),
-                                })
-                        });
-                        report.killed.push(ScopeKilledTask {
-                            task_id: task.task_id.clone(),
-                            session_id: task.session_id.clone(),
-                            remote,
-                            from_saved_record: false,
-                        });
                     }
                     Ok(_) => report.already_finished += 1,
                     Err(error) => errors.push(format!("{}: {error}", task.task_id)),
@@ -9970,6 +10017,31 @@ impl BgTaskRegistry {
         } else {
             Err(errors.join("; "))
         }
+    }
+
+    /// Report a task an owner's pause stopped, and leave the session one
+    /// notice that its call was cancelled.
+    fn report_paused_task(
+        &self,
+        task: &Arc<BgTask>,
+        report: &mut ScopeKillReport,
+    ) -> Result<(), String> {
+        {
+            let mut db = DeferredDbWrites::new(self, task);
+            let mut state = task.lock_state().map_err(|_| "task lock poisoned")?;
+            // Saved after the stop's terminal record: a replay reading between the two writes misses this notice until its next replay.
+            state.metadata.cancelled_call_unannounced = true;
+            self.persist_task_locked(task, &state.metadata, &mut db)
+                .map_err(|e| e.to_string())?;
+        }
+        self.index_cancelled_call(&task.session_id, &task.task_id);
+        report.killed.push(ScopeKilledTask {
+            task_id: task.task_id.clone(),
+            session_id: task.session_id.clone(),
+            remote: scope_remote_cancel(task),
+            from_saved_record: false,
+        });
+        Ok(())
     }
 
     pub(crate) fn kill_scope_if_revoked(&self, scope: &subc_protocol::scope::ScopeStamp) {
@@ -12995,6 +13067,24 @@ type PersistedGcSlots = HashMap<PathBuf, PersistedGcSlot>;
 fn persisted_gc_slots() -> &'static Mutex<PersistedGcSlots> {
     static SLOTS: std::sync::OnceLock<Mutex<PersistedGcSlots>> = std::sync::OnceLock::new();
     SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The remote cancellation outcome `bash.kill_scope` reports for a stopped
+/// task, or `None` for a local one.
+fn scope_remote_cancel(task: &BgTask) -> Option<ScopeRemoteCancel> {
+    task.lock_state().ok().and_then(|state| {
+        state
+            .metadata
+            .remote
+            .as_ref()
+            .map(|remote| ScopeRemoteCancel {
+                job_id: remote.job_id.map(|id| id.to_string()),
+                cancel: remote
+                    .owner_pause_cancel
+                    .clone()
+                    .unwrap_or_else(|| "failed: cancellation outcome unavailable".into()),
+            })
+    })
 }
 
 /// Where a registry sends a task's completion and cancelled-call notices.

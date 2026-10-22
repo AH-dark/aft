@@ -2723,12 +2723,26 @@ impl BgTaskRegistry {
         let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)
             .map_err(|e| e.to_string())?;
         let durable = read_task_at(&layout).map_err(|e| e.to_string())?;
-        if durable.remote.as_ref().is_some_and(|r| r.cancel_requested) {
+        // Checked under the state lock that every cancellation intent is
+        // recorded under, so an intent recorded first always prevents the
+        // local start.
+        let cancel_requested = state
+            .metadata
+            .remote
+            .as_ref()
+            .is_some_and(|r| r.cancel_requested)
+            || durable.remote.as_ref().is_some_and(|r| r.cancel_requested);
+        if cancel_requested {
             if let Some(remote) = state.metadata.remote.as_mut() {
                 remote.cancel_requested = true;
             }
             drop(state);
             drop(db);
+            // For an owner pause, not starting the command is the whole
+            // cancellation: the runner refused the job.
+            if self.finish_owner_pause_cancel(task, Ok(())) {
+                return Ok(());
+            }
             self.remote_terminal(
                 task,
                 Verdict::RunLocally {
@@ -3126,6 +3140,32 @@ impl BgTaskRegistry {
         }
         drop(state);
         Ok(self.snapshot_with_terminal_cache(task, 8 * 1024))
+    }
+
+    /// Record an owner's pause on a remote task before `bash.kill_scope`
+    /// stops anything: the pause reason, the cancellation intent and the
+    /// cancel the runner is owed, in one write. From then on its worker
+    /// cancels the job and settles the pause, and a refusal can no longer
+    /// turn it into a local command (`remote_fallback` checks the intent).
+    /// A task already finished or running locally is left alone.
+    pub(super) fn record_owner_pause_intent(&self, task: &Arc<BgTask>) -> Result<(), String> {
+        {
+            let mut db = DeferredDbWrites::new(self, task);
+            let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
+            if state.metadata.is_terminal() || state.metadata.remote.is_none() {
+                return Ok(());
+            }
+            state.metadata.status_reason = Some(super::OWNER_PAUSED_REASON.into());
+            let remote = state.metadata.remote.as_mut().unwrap();
+            remote.cancel_requested = true;
+            if remote.terminal.is_none() {
+                remote.cancel_pending = true;
+            }
+            self.persist_task_locked(task, &state.metadata, &mut db)
+                .map_err(|e| e.to_string())?;
+        }
+        task.remote_cancel_notify.notify_one();
+        Ok(())
     }
 
     pub(super) fn record_owner_pause_remote(&self, task: &Arc<BgTask>) -> Result<(), String> {

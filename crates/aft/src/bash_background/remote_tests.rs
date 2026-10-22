@@ -7129,6 +7129,88 @@ fn exec_cancels(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_js
         .collect()
 }
 
+/// `bash.kill_scope` stops a scope's local tasks in one pass and its remote
+/// tasks in a second. Here the runner refuses a remote task between the two
+/// passes, and its worker would run the command locally instead: the first
+/// pass saw it remote, the second would see it local, so neither would stop
+/// it. The pause must cover it anyway: its local fallback never starts, and
+/// the reply names it as stopped.
+#[tokio::test]
+async fn bash_kill_scope_stops_a_task_that_falls_back_to_local_between_its_passes() {
+    let daemon = daemon(Script::GatedAdmission { refuse: true }, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("local-fallback-ran");
+    let registry = registry();
+    let scope = owner_scope("fallback-between-passes");
+    ensure_git_fixture(dir.path());
+    let task_id = super::super::with_scope_spawn(Some(scope.clone()), || {
+        registry.spawn_remote(
+            launch(daemon.connection.clone()),
+            SpawnPlan::Unsandboxed,
+            &format!("printf x > '{}'", marker.display()),
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            dir.path().into(),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+    })
+    .unwrap();
+    daemon.wait_for_requests("exec.run", 1).await;
+    // The runner refuses the job; hold the worker after it received the
+    // refusal, before it decides on the local fallback.
+    let mut refusal = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeRefusalReport);
+    daemon.acceptance_gate.notify_one();
+    refusal.reached().await;
+    let (between_passes, release_remote_pass) =
+        crate::commands::bash_kill_scope::saved_recovery_gate::arm(
+            dir.path(),
+            crate::commands::bash_kill_scope::saved_recovery_gate::Point::BetweenPasses,
+        );
+    let operation = {
+        let registry = registry.clone();
+        let scope = scope.clone();
+        let storage = dir.path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::commands::bash_kill_scope::handle_bash_kill_scope_with_saved_tasks(
+                serde_json::json!({"scope": scope}),
+                Some(&scope.owner),
+                &[registry],
+                Some(&storage),
+            )
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(30), between_passes)
+        .await
+        .expect("bash.kill_scope must finish its local pass")
+        .unwrap();
+    // Between the passes, the worker acts on the refusal.
+    refusal.release();
+    remote_worker_exited(&task_id).await;
+    release_remote_pass.send(()).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(30), operation)
+        .await
+        .expect("bash.kill_scope must reply")
+        .unwrap();
+    // Give a local child that wrongly started the time to write its marker.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!marker.exists(), "the local fallback ran: {reply:?}");
+    assert!(reply.success, "{reply:?}");
+    let killed = reply.data["killed"].as_array().unwrap();
+    assert!(
+        killed
+            .iter()
+            .any(|entry| entry["task_id"] == task_id.as_str()),
+        "the stopped task must be reported: {reply:?}"
+    );
+    assert_paused(&registry, &task_id);
+}
+
 /// The owner pauses a scope whose `runon` job the runner has accepted, and
 /// the module stops before its worker sends the cancellation. The pause
 /// already saved the task as stopped, so the saved record must also say the
@@ -7155,7 +7237,8 @@ async fn a_paused_runon_jobs_unsent_cancel_is_sent_after_a_restart() {
         .lock()
         .unwrap()
         .insert(dir.path().into());
-    original.pause_scope(&scope, true).unwrap();
+    let members = original.begin_scope_pause(&scope).unwrap();
+    original.pause_scope(&scope, true, &members).unwrap();
     remote_worker_exited(&task_id).await;
     assert!(exec_cancels(&daemon).is_empty(), "the cancel was sent");
     let json = original.task(&task_id).unwrap().paths.json.clone();
@@ -7650,7 +7733,10 @@ async fn concurrent_stop_and_registration_of_a_shared_task_never_deadlock() {
                 .name("stress-stop".into())
                 .spawn(move || {
                     start.wait();
-                    let result = recovery.pause_scope(&scope, true).map(|_| ());
+                    let result = recovery
+                        .begin_scope_pause(&scope)
+                        .and_then(|members| recovery.pause_scope(&scope, true, &members))
+                        .map(|_| ());
                     let _ = finished.send(("stop", result));
                 })
                 .unwrap();
