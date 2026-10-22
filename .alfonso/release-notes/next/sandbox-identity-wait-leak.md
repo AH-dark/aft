@@ -1,0 +1,1 @@
+- A background command that AFT failed to start (for example after an internal error during registration or while AFT was shutting down) no longer leaves a shell process waiting forever; it exits without running the command.

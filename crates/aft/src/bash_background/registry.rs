@@ -3823,6 +3823,7 @@ impl BgTaskRegistry {
         // recoverable PID checkpoint in the existing record format.
         metadata.child_pid = Some(child_pid);
         metadata.pgid = Some(child_pid as i32);
+        metadata.child_start_time_ms = crate::root_cache::process_start_time_ms(child_pid);
         if let Err(error) = self.persist_task(&paths, &metadata) {
             drop(child.stdin.take());
             let _ = child.wait();
@@ -3884,6 +3885,7 @@ impl BgTaskRegistry {
                 pending_terminal_override: None,
             }),
         });
+        let mut bootstrap_gate = BootstrapGateGuard::new(&task);
 
         if !shell.is_powershell() {
             let job = Arc::new(crate::bash_db_hints::HintJob::new(
@@ -3955,6 +3957,9 @@ impl BgTaskRegistry {
                 false
             }
         };
+        if released {
+            bootstrap_gate.disarm();
+        }
         #[cfg(feature = "test-timing-hooks")]
         if released {
             if let Some(gate) = std::env::var_os("AFT_TEST_BASH_AFTER_CREATE_GATE") {
@@ -12953,6 +12958,42 @@ enum LocalIdentityGate {
     CommittedFallback,
 }
 
+#[cfg(unix)]
+struct BootstrapGateGuard<'a> {
+    task: &'a BgTask,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl BootstrapGateGuard<'_> {
+    fn new(task: &BgTask) -> BootstrapGateGuard<'_> {
+        BootstrapGateGuard { task, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BootstrapGateGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Closing the child process's stdin makes it exit before running the user's command.
+        // Recover a poisoned task lock so failed registration can still close stdin.
+        let mut state = self
+            .task
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let TaskRuntime::Piped(Some(child)) = &mut state.runtime {
+            drop(child.stdin.take());
+        }
+    }
+}
+
 /// Spawn a detached background bash child process.
 ///
 /// On Unix this is a single spawn against `/bin/sh`. On Windows it walks
@@ -16334,6 +16375,88 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn poisoned_watchdog_registration_closes_the_identity_gate() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("must-not-run");
+        let registry = super::BgTaskRegistry::default();
+        let inner = Arc::clone(&registry.inner);
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _watchdog_tasks = inner.watchdog_tasks.lock().unwrap();
+            panic!("poison the watchdog task map before spawn registration");
+        }));
+        assert!(poison.is_err());
+
+        let command = format!("printf ran > '{}'", marker.display());
+        let error = registry
+            .spawn(
+                super::SpawnPlan::Unsandboxed,
+                &command,
+                "session".into(),
+                root.path().to_path_buf(),
+                HashMap::new(),
+                super::super::HardKill::After(Duration::from_secs(30)),
+                root.path().to_path_buf(),
+                1,
+                false,
+                false,
+                Some(root.path().to_path_buf()),
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("background watchdog lock poisoned"),
+            "{error}"
+        );
+
+        let task = registry
+            .task_arcs()
+            .into_iter()
+            .next()
+            .expect("task was inserted before watchdog registration failed");
+        let pgid = {
+            let state = task.lock_state().unwrap();
+            let super::TaskRuntime::Piped(Some(child)) = &state.runtime else {
+                panic!("failed registration must retain its child handle");
+            };
+            child.id() as i32
+        };
+        struct KillGroupOnDrop(i32);
+        impl Drop for KillGroupOnDrop {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(-self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _kill_group_on_drop = KillGroupOnDrop(pgid);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            let mut state = task.lock_state().unwrap();
+            let super::TaskRuntime::Piped(Some(child)) = &mut state.runtime else {
+                panic!("failed registration must retain its child handle");
+            };
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            drop(state);
+            assert!(
+                Instant::now() < deadline,
+                "identity-gated child did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), Some(125));
+        assert!(
+            !marker.exists(),
+            "the command ran without an identity release"
+        );
+    }
+
+    #[test]
     fn recovered_terminal_reply_matches_live_status_text() {
         use crate::commands::bash_orchestrate::{decide_bash_step, BashStep};
         for (status, exit, reason, expected) in [
@@ -19556,6 +19679,61 @@ mod tests {
                 Some(dir.to_path_buf()),
             )
             .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_during_registered_spawn_does_not_abort_identity_gate() {
+        let registry = BgTaskRegistry::default();
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *registry.inner.before_bootstrap_release.lock().unwrap() = Some((arrived_tx, release_rx));
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_path_buf();
+        let marker = project.join("command-ran");
+        let command = format!("printf ran > '{}'", marker.display());
+        let spawning = registry.clone();
+        let worker = std::thread::spawn(move || {
+            spawn_unsandboxed_for_kill_test(&spawning, &project, &command)
+        });
+        let task_id = arrived_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("task must register before the identity gate is released");
+        let _cleanup = {
+            struct KillTaskOnDrop(BgTaskRegistry, String);
+            impl Drop for KillTaskOnDrop {
+                fn drop(&mut self) {
+                    let _ = self.0.kill(&self.1, "session");
+                }
+            }
+            KillTaskOnDrop(registry.clone(), task_id.clone())
+        };
+
+        // The shutdown flag also stops the watchdog. This child is already
+        // registered, so spawning must write the release line rather than abort it.
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), task_id);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(&marker).ok().as_deref() != Some("ran") {
+            assert!(
+                Instant::now() < deadline,
+                "the accepted command did not run after identity release"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let task = registry.task_for_test(&task_id).unwrap();
+        let exit_deadline = Instant::now() + Duration::from_secs(5);
+        while read_exit_marker(&task.paths).unwrap().is_none() {
+            assert!(
+                Instant::now() < exit_deadline,
+                "accepted command did not publish its exit marker"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let snapshot = registry.kill(&task_id, "session").unwrap();
+        assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
     }
 
     #[cfg(unix)]

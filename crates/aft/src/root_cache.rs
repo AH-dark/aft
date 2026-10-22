@@ -1168,7 +1168,8 @@ fn process_start_time_override(pid: u32) -> Option<Option<u64>> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn process_start_time_ms(pid: u32) -> Option<u64> {
+/// Return the OS start time for `pid`, in Unix milliseconds, when available.
+pub fn process_start_time_ms(pid: u32) -> Option<u64> {
     #[cfg(test)]
     if let Some(override_value) = process_start_time_override(pid) {
         return override_value;
@@ -1216,7 +1217,8 @@ fn cached_boot_time_secs(
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn process_start_time_ms(pid: u32) -> Option<u64> {
+/// Return the OS start time for `pid`, in Unix milliseconds, when available.
+pub fn process_start_time_ms(pid: u32) -> Option<u64> {
     #[cfg(test)]
     if let Some(override_value) = process_start_time_override(pid) {
         return override_value;
@@ -1264,7 +1266,8 @@ pub(crate) fn process_start_time_ms(pid: u32) -> Option<u64> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn process_start_time_ms(pid: u32) -> Option<u64> {
+/// Return the OS start time for `pid`, in Unix milliseconds, when available.
+pub fn process_start_time_ms(pid: u32) -> Option<u64> {
     #[cfg(test)]
     if let Some(override_value) = process_start_time_override(pid) {
         return override_value;

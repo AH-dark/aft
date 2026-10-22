@@ -643,6 +643,10 @@ pub struct PersistedTask {
     pub exit_marker_unavailable: Option<String>,
     pub child_pid: Option<u32>,
     pub pgid: Option<i32>,
+    /// Process start time recorded for `child_pid`, in Unix milliseconds.
+    /// Used to detect when the OS reuses that PID for a different process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_start_time_ms: Option<u64>,
     /// `Some` records a completed Unix sample, including an empty group. `None`
     /// means sampling is unavailable (Windows and unsupported Unix targets).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -779,6 +783,7 @@ impl PersistedTask {
             exit_marker_unavailable: None,
             child_pid: None,
             pgid: None,
+            child_start_time_ms: None,
             live_descendants: None,
             live_descendants_omitted: 0,
             completion_delivered: !notify_on_completion,
@@ -831,6 +836,7 @@ impl PersistedTask {
         self.status = BgTaskStatus::Running;
         self.child_pid = Some(child_pid);
         self.pgid = Some(pgid);
+        self.child_start_time_ms = crate::root_cache::process_start_time_ms(child_pid);
     }
 
     pub fn mark_terminal(
@@ -933,6 +939,7 @@ impl From<BashTaskRow> for PersistedTask {
             exit_marker_unavailable: None,
             child_pid: row.pid.and_then(|value| u32::try_from(value).ok()),
             pgid: row.pgid.and_then(|value| i32::try_from(value).ok()),
+            child_start_time_ms: None,
             live_descendants: None,
             live_descendants_omitted: 0,
             completion_delivered: row.completion_delivered,

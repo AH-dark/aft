@@ -1,6 +1,19 @@
 use super::*;
 use std::time::{Duration, Instant};
 
+struct StopProjectTasksOnDrop<'a> {
+    ctx: &'a crate::context::AppContext,
+    project_root: &'a Path,
+}
+
+impl Drop for StopProjectTasksOnDrop<'_> {
+    fn drop(&mut self) {
+        self.ctx
+            .bash_background()
+            .kill_running_tasks_for_root(self.project_root);
+    }
+}
+
 fn exercise(kind: &str, shim_enabled: bool, service_available: bool) {
     use crate::config::SandboxMode;
     use crate::sandbox_spawn::{with_spawn_plan_for_test, with_worker_jail, SpawnPlan};
@@ -40,6 +53,12 @@ fn exercise(kind: &str, shim_enabled: bool, service_available: bool) {
         config.sandbox.profile.worker = SandboxMode::Strict;
         config.git.co_author = "off".into();
     });
+    // Assertions can unwind before a response exposes the task ID, so teardown
+    // must stop every command this fixture launched under its temporary root.
+    let _cleanup = StopProjectTasksOnDrop {
+        ctx: &ctx,
+        project_root: project.path(),
+    };
     let mut command = if service_available {
         format!("test -S \"$AFT_GH_READ_SOCKET\" && test -r \"$AFT_GH_READ_CAPABILITY_FILE\" && test -z \"${{AFT_GH_SHIM_TICKET+x}}\" && printf BROKER_PROVIDED > '{}'", marker.display())
     } else {
