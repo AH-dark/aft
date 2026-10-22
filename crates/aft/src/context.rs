@@ -13846,6 +13846,7 @@ impl AppContext {
         content: &str,
         params: &serde_json::Value,
     ) -> Option<crate::lsp::manager::PostEditWaitOutcome> {
+        let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Lsp);
         let wants_diagnostics = params
             .get("diagnostics")
             .and_then(|v| v.as_bool())

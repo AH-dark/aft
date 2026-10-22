@@ -7,7 +7,7 @@
 //!   Pass 4: Normalize Unicode punctuation + trim
 //!   Pass 5: Reflowed line wraps/joins with whitespace-normalized content
 
-use crate::patch::matcher::{find_nearest_miss, NearestMissSearch};
+use crate::patch::matcher::{find_nearest_miss, NearestMissSearch, ReflowCandidates};
 
 // A half-match floor keeps diagnostics useful for a likely stale edit while
 // suppressing suggestions for candidates that share too little of the needle.
@@ -404,8 +404,11 @@ pub fn replacement_detail(source: &str, needle: &str, matches: &[FuzzyMatch]) ->
     serde_json::json!({"pass": pass, "replaced_text": actual})
 }
 
-const REFLOW_NON_WS_TOLERANCE: usize = 8;
-
+/// Final pass: windows of whole lines that hold the needle's text with line
+/// breaks and spacing moved, as a formatter reflow does. A window matches
+/// when its text, with every whitespace run collapsed to one space and the
+/// ends trimmed, equals the needle's. One linear scan finds every such
+/// window (see [`ReflowCandidates`]), in ascending order of its first line.
 fn find_reflow_matches(
     haystack_lines: &[&str],
     needle_lines: &[&str],
@@ -413,65 +416,28 @@ fn find_reflow_matches(
     haystack: &str,
     needle: &str,
 ) -> Vec<FuzzyMatch> {
-    let needle_text = needle_lines.join("\n");
-    let normalized_needle = normalize_reflow_whitespace(&needle_text);
-    let needle_non_whitespace = strip_reflow_whitespace(&needle_text);
-    if normalized_needle.is_empty() || needle_non_whitespace.is_empty() {
+    let normalized_needle = normalize_reflow_whitespace(&needle_lines.join("\n"));
+    if normalized_needle.is_empty() {
         return Vec::new();
     }
 
-    let min_non_whitespace = needle_non_whitespace
-        .len()
-        .saturating_sub(REFLOW_NON_WS_TOLERANCE);
-    let max_non_whitespace = needle_non_whitespace.len() + REFLOW_NON_WS_TOLERANCE;
-    // The scan only needs byte lengths. Materializing a whitespace-stripped String
-    // for every source line made large generated-file misses allocate repeatedly.
-    let line_non_whitespace_lens = reflow_non_whitespace_lens(haystack_lines);
     let mut matches = Vec::new();
-
-    for start in 0..haystack_lines.len() {
-        if !has_reflow_content(haystack_lines[start]) {
-            continue;
-        }
-
-        let mut window_non_whitespace_len = 0usize;
-        for end in (start + 1)..=haystack_lines.len() {
-            let line = haystack_lines[end - 1];
-            window_non_whitespace_len += line_non_whitespace_lens[end - 1];
-
-            if window_non_whitespace_len > max_non_whitespace {
-                break;
-            }
-            if window_non_whitespace_len < min_non_whitespace {
-                continue;
-            }
-            if !has_reflow_content(line) {
-                continue;
-            }
-
-            let window_text = haystack_lines[start..end].join("\n");
-            let window_non_whitespace = strip_reflow_whitespace(&window_text);
-            if window_non_whitespace != needle_non_whitespace {
-                continue;
-            }
-            if normalize_reflow_whitespace(&window_text) != normalized_needle {
-                continue;
-            }
-
-            let byte_start = line_offsets[start];
-            let byte_end = if end < line_offsets.len() {
-                line_offsets[end]
-            } else {
-                haystack.len()
-            };
-            matches.push(boundary_match(haystack, needle, byte_start, byte_end, 5));
-        }
+    for (start, end) in ReflowCandidates::new(haystack_lines, &normalized_needle) {
+        let byte_start = line_offsets[start];
+        let byte_end = if end < line_offsets.len() {
+            line_offsets[end]
+        } else {
+            haystack.len()
+        };
+        matches.push(boundary_match(haystack, needle, byte_start, byte_end, 5));
     }
 
     matches
 }
 
 fn normalize_reflow_whitespace(s: &str) -> String {
+    #[cfg(test)]
+    crate::patch::matcher::REFLOW_WORK.with(|work| work.set(work.get() + s.len()));
     let mut normalized = String::new();
     let mut in_whitespace = false;
 
@@ -490,24 +456,9 @@ fn normalize_reflow_whitespace(s: &str) -> String {
     normalized
 }
 
-fn reflow_non_whitespace_lens(lines: &[&str]) -> Vec<usize> {
-    lines
-        .iter()
-        .map(|line| {
-            line.chars()
-                .filter(|character| !character.is_whitespace())
-                .map(char::len_utf8)
-                .sum()
-        })
-        .collect()
-}
-
+#[cfg(test)]
 fn strip_reflow_whitespace(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
-fn has_reflow_content(s: &str) -> bool {
-    s.chars().any(|c| !c.is_whitespace())
 }
 
 /// Normalize Unicode punctuation to ASCII equivalents.
@@ -693,21 +644,205 @@ mod tests {
     }
 
     #[test]
-    fn reflow_length_precomputation_allocates_only_the_result_vector() {
+    fn reflow_scan_allocations_do_not_grow_with_file_lines() {
         let line =
             "export const generated = café\u{2003}+\t中 + padding_padding_padding_padding;\n";
-        let source = line.repeat(256);
-        let lines: Vec<&str> = source.lines().collect();
-        let expected: Vec<usize> = lines
+        let count = |repeat: usize| {
+            let source = line.repeat(repeat);
+            let lines: Vec<&str> = source.lines().collect();
+            let offsets = compute_line_offsets(&source);
+            let needle = "never present";
+            let ((), allocations) = crate::test_allocations::count(|| {
+                assert!(
+                    find_reflow_matches(&lines, &[needle], &offsets, &source, needle).is_empty()
+                );
+            });
+            allocations
+        };
+        // One stripped byte stream for the whole file, sized up front: the
+        // allocations are fixed, never one per line.
+        let (small, large) = (count(256), count(4_096));
+        assert!(large < 32, "{large} allocations for 4,096 lines");
+        assert!(large <= small + 2, "{small} -> {large} allocations");
+    }
+
+    const REFLOW_NON_WS_TOLERANCE: usize = 8;
+
+    fn has_reflow_content(s: &str) -> bool {
+        s.chars().any(|c| !c.is_whitespace())
+    }
+
+    /// The window-extending scan `find_reflow_matches` used before the
+    /// linear candidate search, kept unchanged as the reference result.
+    fn find_reflow_matches_scan_oracle(
+        haystack_lines: &[&str],
+        needle_lines: &[&str],
+        line_offsets: &[usize],
+        haystack: &str,
+        needle: &str,
+    ) -> Vec<FuzzyMatch> {
+        let needle_text = needle_lines.join("\n");
+        let normalized_needle = normalize_reflow_whitespace(&needle_text);
+        let needle_non_whitespace = strip_reflow_whitespace(&needle_text);
+        if normalized_needle.is_empty() || needle_non_whitespace.is_empty() {
+            return Vec::new();
+        }
+        let min_non_whitespace = needle_non_whitespace
+            .len()
+            .saturating_sub(REFLOW_NON_WS_TOLERANCE);
+        let max_non_whitespace = needle_non_whitespace.len() + REFLOW_NON_WS_TOLERANCE;
+        let line_non_whitespace_lens: Vec<usize> = haystack_lines
             .iter()
-            .map(|line| strip_reflow_whitespace(line).len())
+            .map(|line| {
+                line.chars()
+                    .filter(|character| !character.is_whitespace())
+                    .map(char::len_utf8)
+                    .sum()
+            })
             .collect();
+        let mut matches = Vec::new();
+        for start in 0..haystack_lines.len() {
+            if !has_reflow_content(haystack_lines[start]) {
+                continue;
+            }
+            let mut window_non_whitespace_len = 0usize;
+            for end in (start + 1)..=haystack_lines.len() {
+                let line = haystack_lines[end - 1];
+                window_non_whitespace_len += line_non_whitespace_lens[end - 1];
+                if window_non_whitespace_len > max_non_whitespace {
+                    break;
+                }
+                if window_non_whitespace_len < min_non_whitespace {
+                    continue;
+                }
+                if !has_reflow_content(line) {
+                    continue;
+                }
+                let window_text = haystack_lines[start..end].join("\n");
+                if strip_reflow_whitespace(&window_text) != needle_non_whitespace {
+                    continue;
+                }
+                if normalize_reflow_whitespace(&window_text) != normalized_needle {
+                    continue;
+                }
+                let byte_start = line_offsets[start];
+                let byte_end = if end < line_offsets.len() {
+                    line_offsets[end]
+                } else {
+                    haystack.len()
+                };
+                matches.push(boundary_match(haystack, needle, byte_start, byte_end, 5));
+            }
+        }
+        matches
+    }
 
-        let (actual, allocations) =
-            crate::test_allocations::count(|| reflow_non_whitespace_lens(&lines));
+    fn spans(matches: &[FuzzyMatch]) -> Vec<(usize, usize, u8)> {
+        matches
+            .iter()
+            .map(|m| (m.byte_start, m.byte_len, m.pass))
+            .collect()
+    }
 
-        assert_eq!(actual, expected);
-        assert_eq!(allocations, 1, "length precomputation allocated per line");
+    // BEGIN reflow-work-bound test
+    /// A repetitive file whose lines all match the needle's text, but the
+    /// needle's last line differs only in spacing ("ab" for "a b"). Every
+    /// whitespace-stripped occurrence was a spacing near miss that used to be
+    /// rescanned in full before being rejected: about 18,000 windows of 28 KB.
+    /// The whole pass, building its stream, scanning it and normalizing any
+    /// text, stays within a small multiple of the file plus needle size.
+    #[test]
+    fn reflow_pass_work_is_linear_on_repetitive_spacing_misses() {
+        let haystack = "a b\n".repeat(25_000);
+        let needle = "a b\n".repeat(6_999) + "ab";
+        let haystack_lines: Vec<&str> = haystack.lines().collect();
+        let needle_lines: Vec<&str> = needle.lines().collect();
+        let offsets = compute_line_offsets(&haystack);
+        crate::patch::matcher::REFLOW_WORK.with(|work| work.set(0));
+        let matches =
+            find_reflow_matches(&haystack_lines, &needle_lines, &offsets, &haystack, &needle);
+        let work = crate::patch::matcher::REFLOW_WORK.with(std::cell::Cell::get);
+        assert!(matches.is_empty());
+        let size = haystack.len() + needle.len();
+        assert!(work <= 4 * size, "{work} units of work for {size} bytes");
+    }
+    // END reflow-work-bound test
+
+    /// The linear reflow pass returns the same matches, byte ranges included,
+    /// as the old window scan on generated inputs: whitespace-only lines,
+    /// tabs, CRLF, repeated blocks, overlapping candidates, needles a few
+    /// characters off, and needles at either end of the file.
+    #[test]
+    fn linear_reflow_matches_equal_the_window_scan_on_generated_inputs() {
+        use crate::patch::matcher::reflow_test_support::{file_lines, needle_text, Rng};
+        let mut rng = Rng::new(0x5eed_0002);
+        let (mut cases_with_matches, mut matches_total) = (0, 0);
+        for case in 0..10_000 {
+            let lines = file_lines(&mut rng);
+            let separator = if rng.below(3) == 0 { "\r\n" } else { "\n" };
+            let mut haystack = lines.join(separator);
+            if rng.below(2) == 0 {
+                haystack.push_str(separator);
+            }
+            let mut needle = needle_text(&mut rng, &lines);
+            if rng.below(4) == 0 {
+                needle = needle.replace('\n', "\r\n");
+            }
+            let haystack_lines: Vec<&str> = haystack.lines().collect();
+            let needle_lines: Vec<&str> = needle.lines().collect();
+            let offsets = compute_line_offsets(&haystack);
+            let expected = find_reflow_matches_scan_oracle(
+                &haystack_lines,
+                &needle_lines,
+                &offsets,
+                &haystack,
+                &needle,
+            );
+            let actual =
+                find_reflow_matches(&haystack_lines, &needle_lines, &offsets, &haystack, &needle);
+            assert_eq!(
+                spans(&actual),
+                spans(&expected),
+                "case {case}: haystack {haystack:?} needle {needle:?}"
+            );
+            cases_with_matches += usize::from(!actual.is_empty());
+            matches_total += actual.len();
+        }
+        assert!(
+            cases_with_matches > 300,
+            "only {cases_with_matches} cases matched"
+        );
+        assert!(
+            matches_total > cases_with_matches,
+            "no case had several matches"
+        );
+    }
+
+    /// A large reflowed `match` against a large file is found by the reflow
+    /// pass, as before, and quickly.
+    #[test]
+    fn large_reflowed_needle_still_matches() {
+        let lines = (0..6_000)
+            .map(|index| format!("    call_{index}(argument_{index});"))
+            .collect::<Vec<_>>();
+        let source = lines.join("\n") + "\n";
+        let needle = lines[1_000..3_000]
+            .chunks(2)
+            .map(|pair| {
+                pair.iter()
+                    .map(|line| line.trim())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let matches = find_all_fuzzy(&source, &needle);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].pass, 5);
+        assert_eq!(
+            &source[matches[0].byte_start..matches[0].byte_start + matches[0].byte_len],
+            lines[1_000..3_000].join("\n").trim_start()
+        );
     }
 
     #[test]

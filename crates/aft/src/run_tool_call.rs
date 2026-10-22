@@ -29,6 +29,8 @@ pub struct PhaseTrace {
     waiting_on: WaitingOn,
     waiting_on_build_id: Option<String>,
     wait_ms: u64,
+    arg_shape: Option<String>,
+    edit_phases: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -88,6 +90,12 @@ pub struct ToolCallPhaseDurations {
     pub waiting_on: WaitingOn,
     pub waiting_on_build_id: Option<String>,
     pub wait_ms: u64,
+    /// What the call was asked to do, without any content: the target kind
+    /// and, for edits, the match and replacement sizes and the outcome code.
+    /// See [`tool_call_arg_shape`].
+    pub arg_shape: Option<String>,
+    /// Milliseconds per edit pipeline step, when the call ran any.
+    pub edit_phases: Option<String>,
 }
 
 impl PhaseTrace {
@@ -116,6 +124,8 @@ impl PhaseTrace {
             waiting_on: WaitingOn::None,
             waiting_on_build_id: None,
             wait_ms: 0,
+            arg_shape: None,
+            edit_phases: None,
         }
     }
 
@@ -125,6 +135,7 @@ impl PhaseTrace {
 
     pub fn mark_job_admitted(&mut self) {
         crate::logging::reset_tool_call_wait();
+        crate::logging::reset_edit_phase_times();
         let now = Instant::now();
         self.job_admitted = Some(now);
         if let Some(submitted) = self.executor_submitted {
@@ -146,6 +157,12 @@ impl PhaseTrace {
         self.waiting_on = waiting_on;
         self.waiting_on_build_id = waiting_on_build_id;
         self.wait_ms = wait_ms;
+        self.edit_phases = crate::logging::take_edit_phase_times();
+    }
+
+    /// Record the argument shape the slow-call line reports for this call.
+    pub(crate) fn note_arg_shape(&mut self, shape: String) {
+        self.arg_shape = Some(shape);
     }
 
     pub(crate) fn mark_provider_read_done(&mut self) {
@@ -192,6 +209,8 @@ impl PhaseTrace {
             waiting_on: self.waiting_on,
             waiting_on_build_id: self.waiting_on_build_id,
             wait_ms: self.wait_ms,
+            arg_shape: self.arg_shape,
+            edit_phases: self.edit_phases,
         })
     }
 }
@@ -612,6 +631,11 @@ pub fn run_tool_call(
     ) {
         Err(result) => result,
         Ok(prepared) => {
+            // Only the shape of the arguments is kept, never their content.
+            let arg_shape = phase_trace
+                .is_some()
+                .then(|| tool_call_arg_shape(&prepared.request));
+            let reports_outcome = is_edit_command(&prepared.request.command);
             let skipped_before = app_ctx.backup().lock().latest_skipped_order(
                 ctx.session_id
                     .as_deref()
@@ -651,6 +675,13 @@ pub fn run_tool_call(
             }
             if let Some(trace) = phase_trace.as_mut() {
                 trace.mark_execute_done();
+                if let Some(mut shape) = arg_shape {
+                    if reports_outcome {
+                        shape.push_str(" outcome=");
+                        shape.push_str(&response_outcome(&response));
+                    }
+                    trace.note_arg_shape(shape);
+                }
             }
             finalize_after_breaker = true;
             finish_tool_call_response(
@@ -679,6 +710,111 @@ pub fn run_tool_call(
 
     crate::response_finalize::enforce_reply_ceiling(bare_name, &mut result.text);
     ToolCallOutcome::Unary(result)
+}
+
+/// Commands that change files, whose slow-call line also reports the outcome.
+fn is_edit_command(command: &str) -> bool {
+    matches!(
+        command,
+        "edit_match" | "batch" | "edit_symbol" | "write" | "apply_patch" | "append"
+    )
+}
+
+/// `ok`, or the response's error code reduced to a plain token.
+fn response_outcome(response: &Response) -> String {
+    if response.success {
+        return "ok".to_string();
+    }
+    let code = response.data["code"].as_str().unwrap_or("error");
+    code.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The kind of one target string: `url host=<host>`, `issue`, `pr`, or
+/// `file`. Only a URL's host is kept; paths, URL paths and queries are not.
+fn target_kind(target: &str) -> String {
+    if crate::url_fetch::is_http_url(target) {
+        let host = url::Url::parse(target)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .map(|host| {
+                host.chars()
+                    .filter(|ch| {
+                        ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':' | '[' | ']')
+                    })
+                    .collect::<String>()
+            })
+            .filter(|host| !host.is_empty())
+            .unwrap_or_else(|| "-".to_string());
+        return format!("url host={host}");
+    }
+    if target.starts_with("issue://") {
+        return "issue".to_string();
+    }
+    if target.starts_with("pr://") {
+        return "pr".to_string();
+    }
+    "file".to_string()
+}
+
+/// A content-free summary of a translated request for the slow-call line:
+/// the command, the target kind (`file`, `files[n]`, `directory`,
+/// `targets[n]`, `url host=...`, `issue`, `pr`) and, for edits, the byte
+/// sizes of the match and replacement text. Paths, file contents and edit
+/// text are never included, so the line can name what made a call slow
+/// without exposing what it touched.
+pub(crate) fn tool_call_arg_shape(request: &RawRequest) -> String {
+    let params = &request.params;
+    let text_len = |value: &Value| value.as_str().map_or(0, str::len);
+    let mut fields = vec![format!("cmd={}", request.command)];
+    if let Some(files) = params.get("files").and_then(Value::as_array) {
+        fields.push(format!("target=files[{}]", files.len()));
+    } else if let Some(targets) = params.get("targets").and_then(Value::as_array) {
+        match targets.as_slice() {
+            [only] => {
+                if let Some(file) = only.get("file").and_then(Value::as_str) {
+                    fields.push(format!("target={}", target_kind(file)));
+                }
+            }
+            _ => fields.push(format!("target=targets[{}]", targets.len())),
+        }
+    } else if params.get("directory").is_some_and(Value::is_string) {
+        fields.push("target=directory".to_string());
+    } else if let Some(file) = ["file", "target", "url", "path"]
+        .iter()
+        .find_map(|key| params.get(*key).and_then(Value::as_str))
+    {
+        fields.push(format!("target={}", target_kind(file)));
+    }
+    if let Some(edits) = params.get("edits").and_then(Value::as_array) {
+        let sum = |key: &str| {
+            edits
+                .iter()
+                .map(|edit| edit.get(key).map_or(0, text_len))
+                .sum::<usize>()
+        };
+        fields.push(format!("edits={}", edits.len()));
+        fields.push(format!("match_bytes={}", sum("match")));
+        fields.push(format!("replacement_bytes={}", sum("replacement")));
+    }
+    for (key, label) in [
+        ("match", "match_bytes"),
+        ("replacement", "replacement_bytes"),
+        ("content", "content_bytes"),
+        ("patch_text", "patch_bytes"),
+    ] {
+        if let Some(value) = params.get(key).filter(|value| value.is_string()) {
+            fields.push(format!("{label}={}", text_len(value)));
+        }
+    }
+    fields.join(" ")
 }
 
 fn raw_request_from_translated(
@@ -778,6 +914,192 @@ fn refusal_result(
 mod tests {
     use super::*;
 
+    /// Run one agent `edit` call through `run_tool_call` with a phase trace,
+    /// as the subc transport does, and return the slow-call line it would log.
+    fn slow_edit_line(ctx: &AppContext, root: &std::path::Path, args: Value) -> String {
+        let format = crate::subc_format::FormatContext::from_tool_call("edit", &args, root);
+        let tool_ctx = ToolCallContext {
+            project_root: root.to_path_buf(),
+            session_id: Some("slow-shape".into()),
+            request_id: "slow-shape".into(),
+            diagnostics_on_edit: false,
+            preview: false,
+            edit_slot_survives: None,
+            report_registration_downgrade: false,
+            standard_edit_grammar: true,
+            disabled_tools: None,
+            worker_session: false,
+            host_tool_names: None,
+        };
+        let mut trace = PhaseTrace::new(Instant::now());
+        trace.mark_executor_submitted();
+        trace.mark_job_admitted();
+        let ToolCallOutcome::Unary(_) = run_tool_call(
+            "edit",
+            args,
+            &format,
+            &tool_ctx,
+            ctx,
+            &|request, ctx| match request.command.as_str() {
+                "edit_match" => crate::commands::edit_match::handle_edit_match(&request, ctx),
+                "batch" => crate::commands::batch::handle_batch(&request, ctx),
+                other => panic!("unexpected dispatch of {other}"),
+            },
+            Some(&|_response: &mut Response, _text: &mut String| {}),
+            Some(&mut trace),
+        );
+        let now = Instant::now();
+        let mut phases = trace
+            .finish(ToolCallEgressTiming {
+                enqueued: now,
+                dequeued: now,
+                write_started: now,
+                write_finished: now,
+                frame_bytes: 1,
+                queue_depth: 0,
+                writer_active_at_enqueue: false,
+                writer_queue_was_full: false,
+                reserve_timeouts: 0,
+            })
+            .expect("every phase was marked");
+        phases.total = crate::logging::SLOW_TOOL_CALL_THRESHOLD + Duration::from_millis(1);
+        let _ = crate::logging::take_slow_tool_call_logs_for_test();
+        crate::logging::note_tool_call_trace(
+            "edit",
+            "slow-shape",
+            std::path::Path::new("/repo"),
+            1,
+            1,
+            phases,
+            crate::logging::ToolCallCaller::Agent,
+        );
+        let mut lines = crate::logging::take_slow_tool_call_logs_for_test();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        lines.remove(0)
+    }
+
+    /// The slow-call line names what an edit was asked to do (target kind,
+    /// match and replacement sizes, outcome) and how long each pipeline step
+    /// took, and never carries the edit text or the file's path.
+    #[test]
+    fn slow_edit_line_carries_argument_shape_and_phase_times_but_never_text() {
+        let temp = tempfile::tempdir().unwrap();
+        // Not plain canonicalize: on Windows that returns a verbatim
+        // `\\?\C:\...` path, whose `?` makes the edit translator treat the
+        // target as a possible glob and route the call to `edit_match`
+        // instead of `batch`, which this test pins.
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let file = root.join("private-name.ts");
+        assert!(
+            !crate::commands::edit_match::is_glob_pattern(&file.display().to_string()),
+            "test path {file:?} has glob characters"
+        );
+        std::fs::write(&file, "const value = 1;\n").unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        let missing = "SECRET-MATCH-0123456789";
+        let replacement = "SECRET-REPLACEMENT-abcdefghij";
+        let failed = slow_edit_line(
+            &ctx,
+            &root,
+            serde_json::json!({"path": file, "oldString": missing, "newString": replacement}),
+        );
+        let expected = format!(
+            " wait_ms=0 cmd=batch target=file edits=1 match_bytes={} replacement_bytes={} outcome=batch_edit_failed root=/repo",
+            missing.len(),
+            replacement.len()
+        );
+        assert!(
+            failed.contains(&expected),
+            "expected {expected:?}\nin full slow-call line {failed:?}"
+        );
+
+        let applied = slow_edit_line(
+            &ctx,
+            &root,
+            serde_json::json!({"path": file, "oldString": "value = 1", "newString": "SECRET-NEW = 2"}),
+        );
+        let expected = " cmd=batch target=file edits=1 match_bytes=9 replacement_bytes=14 outcome=ok edit_phases=backup:";
+        assert!(
+            applied.contains(expected),
+            "expected {expected:?}\nin full slow-call line {applied:?}"
+        );
+        for phase in [
+            "write:",
+            ",format:",
+            ",syntax:",
+            ",validate:",
+            ",diff:",
+            ",lsp:",
+        ] {
+            assert!(applied.contains(phase), "missing {phase} in {applied}");
+        }
+        for line in [&failed, &applied] {
+            for secret in [missing, replacement, "SECRET", "private-name", "value = 1"] {
+                assert!(!line.contains(secret), "{secret:?} leaked into {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn arg_shape_names_target_kinds_without_paths_or_url_paths() {
+        let shape = |command: &str, params: Value| {
+            let mut request = params;
+            request["id"] = serde_json::json!("shape");
+            request["command"] = serde_json::json!(command);
+            let request: RawRequest = serde_json::from_value(request).unwrap();
+            tool_call_arg_shape(&request)
+        };
+        assert_eq!(
+            shape("outline", serde_json::json!({"files": ["/a", "/b", "/c"]})),
+            "cmd=outline target=files[3]"
+        );
+        assert_eq!(
+            shape(
+                "outline",
+                serde_json::json!({"directory": "/home/me/secret"})
+            ),
+            "cmd=outline target=directory"
+        );
+        assert_eq!(
+            shape(
+                "outline",
+                serde_json::json!({"file": "https://user:pw@docs.example.com/private/path?token=abc"})
+            ),
+            "cmd=outline target=url host=docs.example.com"
+        );
+        assert_eq!(
+            shape("outline", serde_json::json!({"file": "issue://42"})),
+            "cmd=outline target=issue"
+        );
+        assert_eq!(
+            shape("zoom", serde_json::json!({"targets": [{"file": "pr://7"}]})),
+            "cmd=zoom target=pr"
+        );
+        assert_eq!(
+            shape(
+                "apply_patch",
+                serde_json::json!({"patch_text": "*** Begin Patch"})
+            ),
+            "cmd=apply_patch patch_bytes=15"
+        );
+        assert_eq!(
+            shape(
+                "batch",
+                serde_json::json!({"file": "/x.ts", "edits": [
+                    {"match": "ab", "replacement": "cde"},
+                    {"match": "f", "replacement": ""}
+                ]})
+            ),
+            "cmd=batch target=file edits=2 match_bytes=3 replacement_bytes=3"
+        );
+    }
+
     #[test]
     fn repeat_observation_distinguishes_agent_task_status_from_native_plumbing() {
         assert!(RepeatObservation::for_agent_call(
@@ -815,6 +1137,8 @@ mod tests {
             waiting_on: WaitingOn::None,
             waiting_on_build_id: None,
             wait_ms: 0,
+            arg_shape: None,
+            edit_phases: None,
         };
 
         let phases = trace

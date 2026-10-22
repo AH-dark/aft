@@ -234,9 +234,14 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         narrow: &["path"],
         reasons: &[
             ReasonEntry {
+                reason: Reason::TimeLimit,
+                kind: ReasonKind::Bounding,
+                predicate_name: "outline_batch_deadline_reached, stop_at_deadline, take_back_last_file, build_outline_structure_envelope",
+            },
+            ReasonEntry {
                 reason: Reason::Budget,
                 kind: ReasonKind::Selecting,
-                predicate_name: "MAX_OUTPUT_BYTES, discover_outline_files, handle_outline_files_mode, format_multi_file_tree, budget_rollups_present",
+                predicate_name: "MAX_OUTPUT_BYTES, discover_outline_files, handle_outline_files_mode, MultiFileTreeWriter, requested_outline_files, budget_rollups_present",
             },
             ReasonEntry {
                 reason: Reason::Walk,

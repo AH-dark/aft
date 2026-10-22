@@ -121,31 +121,31 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        let (file_outlines, skipped_files) = match outline_many_files(
+        let walk_incomplete = discovery.walk_truncated
+            || discovery.collection_truncated
+            || discovery.skipped_foreign_mounts > 0;
+        let (rendered, skipped_files) = match outline_many_files(
             &files,
             ctx,
             &req.id,
             req.session(),
             project_root.as_deref(),
             &excluded,
+            MultiFileBudget {
+                max_bytes: MAX_OUTPUT_BYTES,
+                total_requested: files.len(),
+                walk_incomplete,
+                files_capped: false,
+            },
         ) {
             Ok(result) => result,
             Err(resp) => return resp,
         };
 
-        let walk_incomplete = discovery.walk_truncated
-            || discovery.collection_truncated
-            || discovery.skipped_foreign_mounts > 0;
-        let rendered = format_multi_file_tree(
-            &file_outlines,
-            MAX_OUTPUT_BYTES,
-            files.len(),
-            walk_incomplete,
-        );
         let mut body = serde_json::json!({
             "text": rendered.text,
             "discovered": true,
-            "complete": !walk_incomplete && !rendered.truncated,
+            "complete": !walk_incomplete && !rendered.truncated && !rendered.cut_short,
             "output_truncated": rendered.truncated,
             "files_shown": rendered.shown,
             "structure_footer": rendered.footer,
@@ -155,6 +155,9 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             "skipped_files": skipped_files,
             "content_files": rendered.content_files,
         });
+        if rendered.deadline_reached {
+            body["deadline_reached"] = serde_json::json!(true);
+        }
         crate::context::confinement::disclose_denied(&mut body);
         return Response::success(&req.id, body);
     }
@@ -162,43 +165,44 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // Multi-file mode: if "files" array is present, outline each file
     if let Some(files_arr) = req.params.get("files").and_then(|v| v.as_array()) {
         let project_root = ctx.config().project_root.clone();
-        let files: Vec<String> = files_arr
-            .iter()
-            .filter_map(|file_val| file_val.as_str().map(String::from))
-            .collect();
+        let (files, files_capped) = requested_outline_files(files_arr);
+        let files = files.into_iter().map(String::from).collect::<Vec<_>>();
         let total_files_requested = files_arr.len();
-        let (file_outlines, skipped_files) = match outline_many_files(
+        let (rendered, skipped_files) = match outline_many_files(
             &files,
             ctx,
             &req.id,
             req.session(),
             project_root.as_deref(),
             &excluded,
+            MultiFileBudget {
+                max_bytes: MAX_OUTPUT_BYTES,
+                total_requested: total_files_requested,
+                walk_incomplete: false,
+                files_capped,
+            },
         ) {
             Ok(result) => result,
             Err(resp) => return resp,
         };
 
-        let rendered = format_multi_file_tree(
-            &file_outlines,
-            MAX_OUTPUT_BYTES,
-            total_files_requested,
-            false,
-        );
-        // Honest reporting: complete only when no requested file was skipped.
-        // skipped_files names the gaps (missing/unreadable/unparseable inputs).
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "text": rendered.text,
-                "complete": skipped_files.is_empty() && !rendered.truncated,
-                "output_truncated": rendered.truncated,
-                "files_shown": rendered.shown,
-                "structure_footer": rendered.footer,
-                "skipped_files": skipped_files,
-                "content_files": rendered.content_files,
-            }),
-        );
+        // Honest reporting: complete only when no requested file was skipped
+        // and every requested file was examined. skipped_files names the gaps
+        // (missing/unreadable/unparseable inputs); the footer counts files
+        // left unexamined by the file cap, output budget or deadline.
+        let mut body = serde_json::json!({
+            "text": rendered.text,
+            "complete": skipped_files.is_empty() && !rendered.truncated && !rendered.cut_short,
+            "output_truncated": rendered.truncated,
+            "files_shown": rendered.shown,
+            "structure_footer": rendered.footer,
+            "skipped_files": skipped_files,
+            "content_files": rendered.content_files,
+        });
+        if rendered.deadline_reached {
+            body["deadline_reached"] = serde_json::json!(true);
+        }
+        return Response::success(&req.id, body);
     }
 
     // Single-file mode (original behavior)
@@ -596,6 +600,7 @@ struct FileOutline {
     language: Option<LangId>,
 }
 
+#[derive(Clone)]
 struct TestSummary {
     name: String,
     range: Range,
@@ -603,12 +608,93 @@ struct TestSummary {
     unknown_reason: Option<&'static str>,
 }
 
+#[derive(Clone)]
 struct TestRegion {
     summary: TestSummary,
     included_path: Option<String>,
     implicit_include: bool,
     module_scope: Vec<String>,
     standalone: bool,
+}
+
+/// What the multi-file structure map needs from one parse of a file beyond
+/// its symbols: the test regions it collapses and, for Rust, the methods
+/// declared in each trait it previews. Both depend only on the file's own
+/// text, so they are stored next to the symbols in the shared symbol cache
+/// under the same freshness key, and a warm outline renders the file without
+/// reading or parsing it. Test includes are resolved at render time, because
+/// they depend on other files and on the caller's read policy.
+pub(crate) struct OutlineParseFacts {
+    test_regions: Vec<TestRegion>,
+    trait_previews: Vec<(Range, Vec<OutlineEntry>)>,
+}
+
+impl OutlineParseFacts {
+    /// Rough resident size, for the symbol cache's memory estimate.
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        fn entry_bytes(entry: &OutlineEntry) -> u64 {
+            (std::mem::size_of::<OutlineEntry>()
+                + entry.name.len()
+                + entry.kind.len()
+                + entry.signature.as_ref().map_or(0, String::len)) as u64
+                + entry.members.iter().map(entry_bytes).sum::<u64>()
+        }
+        let regions = self
+            .test_regions
+            .iter()
+            .map(|region| {
+                (std::mem::size_of::<TestRegion>()
+                    + region.summary.name.len()
+                    + region.included_path.as_ref().map_or(0, String::len)
+                    + region.module_scope.iter().map(String::len).sum::<usize>())
+                    as u64
+            })
+            .sum::<u64>();
+        let previews = self
+            .trait_previews
+            .iter()
+            .map(|(_, methods)| {
+                std::mem::size_of::<(Range, Vec<OutlineEntry>)>() as u64
+                    + methods.iter().map(entry_bytes).sum::<u64>()
+            })
+            .sum::<u64>();
+        std::mem::size_of::<Self>() as u64 + regions + previews
+    }
+}
+
+/// Languages whose structure map collapses test code into summary rows.
+fn structure_language(path: &Path) -> Option<LangId> {
+    detect_language(path).filter(|lang| {
+        matches!(
+            lang,
+            LangId::Rust
+                | LangId::Python
+                | LangId::Go
+                | LangId::TypeScript
+                | LangId::Tsx
+                | LangId::JavaScript
+        )
+    })
+}
+
+/// Derive [`OutlineParseFacts`] from a parsed file. A file with syntax errors
+/// is skipped by the structure map, so its regions are not collected.
+fn outline_parse_facts(path: &Path, parsed: &ParsedFile) -> OutlineParseFacts {
+    let root = parsed.tree.root_node();
+    let mut test_regions = Vec::new();
+    if let Some(lang) = structure_language(path) {
+        if !root.has_error() {
+            collect_test_regions(root, &parsed.source, lang, &mut test_regions);
+        }
+    }
+    let mut trait_previews = Vec::new();
+    if parsed.lang == LangId::Rust {
+        collect_trait_member_previews(root, &parsed.source, &mut trait_previews);
+    }
+    OutlineParseFacts {
+        test_regions,
+        trait_previews,
+    }
 }
 
 enum TestNode {
@@ -867,17 +953,7 @@ fn outline_structure_entries(
     collapse_tests: bool,
     parsed: Option<&ParsedFile>,
 ) -> Result<Vec<OutlineEntry>, AftError> {
-    let Some(lang) = detect_language(path).filter(|lang| {
-        matches!(
-            lang,
-            LangId::Rust
-                | LangId::Python
-                | LangId::Go
-                | LangId::TypeScript
-                | LangId::Tsx
-                | LangId::JavaScript
-        )
-    }) else {
+    let Some(lang) = structure_language(path) else {
         return Ok(build_outline_tree(symbols));
     };
     if !collapse_tests && lang != LangId::Rust {
@@ -906,6 +982,82 @@ fn outline_structure_entries(
     if collapse_tests {
         collect_test_regions(tree.root_node(), &source, lang, &mut regions);
     }
+    let scanned_modules;
+    let modules = if lang == LangId::Rust {
+        Some(match parsed.and_then(|parsed| parsed.modules.as_deref()) {
+            Some(modules) => modules,
+            None => {
+                scanned_modules = crate::parser::rust_modules(tree.root_node(), source);
+                scanned_modules.as_slice()
+            }
+        })
+    } else {
+        None
+    };
+    Ok(structure_entries_from_regions(
+        path, symbols, regions, modules, parser, ctx, req_id, session_id,
+    ))
+}
+
+/// The multi-file structure map for one file from its cached or freshly
+/// derived [`OutlineParseFacts`], without touching its tree. `modules` is the
+/// file's Rust module layout and must be present for Rust files.
+#[allow(clippy::too_many_arguments)]
+fn structure_entries_from_facts(
+    path: &Path,
+    symbols: &[Symbol],
+    modules: Option<&[RustModule]>,
+    has_error: bool,
+    facts: &OutlineParseFacts,
+    parser: &mut FileParser,
+    ctx: &AppContext,
+    req_id: &str,
+    session_id: &str,
+) -> Result<Vec<OutlineEntry>, AftError> {
+    let Some(lang) = structure_language(path) else {
+        return Ok(build_outline_tree(symbols));
+    };
+    if has_error {
+        return Err(AftError::ParseError {
+            message: format!("syntax errors in {}", path.display()),
+        });
+    }
+    if lang == LangId::Rust && modules.is_none() {
+        return Err(AftError::ParseError {
+            message: format!("module layout missing for {}", path.display()),
+        });
+    }
+    let mut entries = structure_entries_from_regions(
+        path,
+        symbols,
+        facts.test_regions.clone(),
+        modules,
+        parser,
+        ctx,
+        req_id,
+        session_id,
+    );
+    if lang == LangId::Rust {
+        apply_trait_member_previews(&facts.trait_previews, &mut entries);
+    }
+    Ok(entries)
+}
+
+/// Fold `symbols` that fall inside a test region into that region's summary
+/// row, resolve test includes, and build the remaining product outline.
+/// `modules` is the Rust module layout (`None` for other languages).
+#[allow(clippy::too_many_arguments)]
+fn structure_entries_from_regions(
+    path: &Path,
+    symbols: &[Symbol],
+    regions: Vec<TestRegion>,
+    modules: Option<&[RustModule]>,
+    parser: &mut FileParser,
+    ctx: &AppContext,
+    req_id: &str,
+    session_id: &str,
+) -> Vec<OutlineEntry> {
+    let mut regions = regions;
     let mut product_symbols = Vec::new();
     for symbol in symbols {
         if let Some(region) = regions
@@ -992,14 +1144,9 @@ fn outline_structure_entries(
     }
     summaries.extend(standalone);
     summaries.sort_by_key(|summary| (summary.range.start_line, summary.range.start_col));
-    let mut entries = if lang == LangId::Rust {
-        if let Some(modules) = parsed.and_then(|parsed| parsed.modules.as_deref()) {
-            rust_modules_outline(modules, &product_symbols, &summaries, &[])
-        } else {
-            rust_module_outline(tree.root_node(), &source, &product_symbols, &summaries, &[])
-        }
-    } else {
-        build_outline_tree(&product_symbols)
+    let mut entries = match modules {
+        Some(modules) => rust_modules_outline(modules, &product_symbols, &summaries, &[]),
+        None => build_outline_tree(&product_symbols),
     };
     for summary in summaries {
         let description = match summary.unknown_reason {
@@ -1025,7 +1172,7 @@ fn outline_structure_entries(
         };
         insert_summary_entry(&mut entries, entry);
     }
-    Ok(entries)
+    entries
 }
 
 fn test_module_include_label(parent: &Path, base: &Path, included_path: &Path) -> String {
@@ -1054,21 +1201,6 @@ fn insert_summary_entry(entries: &mut Vec<OutlineEntry>, entry: OutlineEntry) {
 /// Module containers are absent from the shared symbol table. Keep them in the
 /// outline so nested module functions never masquerade as file-level APIs, and
 /// impl methods attach to the type in their own module rather than a namesake.
-fn rust_module_outline(
-    root: tree_sitter::Node<'_>,
-    source: &str,
-    symbols: &[Symbol],
-    tests: &[TestSummary],
-    scope: &[String],
-) -> Vec<OutlineEntry> {
-    rust_modules_outline(
-        &crate::parser::rust_modules(root, source),
-        symbols,
-        tests,
-        scope,
-    )
-}
-
 fn rust_modules_outline(
     modules: &[RustModule],
     symbols: &[Symbol],
@@ -2349,6 +2481,100 @@ fn directory_rollup_summary(stats: &OutlineDirectoryStats) -> String {
     }
 }
 
+/// The limits one multi-file structure map renders under.
+struct MultiFileBudget {
+    /// Rendered output budget in bytes.
+    max_bytes: usize,
+    /// Files the caller asked for or the walk found, for the footer's total.
+    total_requested: usize,
+    /// The directory walk stopped early, so the total is a lower bound.
+    walk_incomplete: bool,
+    /// The request's file list was cut to [`OUTLINE_FILE_WALK_CAP`] before
+    /// outlining, so some requested files are never examined.
+    files_capped: bool,
+}
+
+/// Time kept back from the request deadline, so that a batch stopped between
+/// files still has time to render and return its partial result before the
+/// deadline fails the whole call.
+const OUTLINE_BATCH_RETURN_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`outline_batch_deadline_reached`] report the deadline once this
+    /// many files have been examined, so tests can stop a batch part-way
+    /// without depending on timing.
+    static OUTLINE_BATCH_DEADLINE_AFTER_FILES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether a multi-file outline should stop before examining another file
+/// because the request deadline is less than [`OUTLINE_BATCH_RETURN_MARGIN`]
+/// away. Parsing is not deadline-aware, so this check between files keeps a
+/// long batch from starting another file it has no time for; a file already
+/// being parsed can still run past the deadline.
+fn outline_batch_deadline_reached(files_examined: usize) -> bool {
+    #[cfg(test)]
+    if let Some(limit) = OUTLINE_BATCH_DEADLINE_AFTER_FILES.with(std::cell::Cell::get) {
+        return files_examined >= limit;
+    }
+    let _ = files_examined;
+    crate::bounded_io::current().is_some_and(|budget| {
+        std::time::Instant::now() + OUTLINE_BATCH_RETURN_MARGIN >= budget.deadline
+    })
+}
+
+/// The string entries of an outline `files` list, cut at
+/// [`OUTLINE_FILE_WALK_CAP`] (the same cap a directory outline applies to its
+/// walk). Returns whether entries were left out; those count toward the
+/// footer's total but are never probed, validated, read or parsed.
+fn requested_outline_files(files: &[serde_json::Value]) -> (Vec<&str>, bool) {
+    let mut requested = files.iter().filter_map(|file| file.as_str());
+    let kept = requested
+        .by_ref()
+        .take(OUTLINE_FILE_WALK_CAP)
+        .collect::<Vec<_>>();
+    let capped = requested.next().is_some();
+    (kept, capped)
+}
+
+/// The `files` entries an outline request examines: none for a revision,
+/// files-mode or directory outline (those branches never read the list),
+/// otherwise the entries [`requested_outline_files`] keeps. The pre-handler
+/// access probe in [`crate::bounded_io::command`] uses this so that it never
+/// probes an entry the handler skips.
+pub(crate) fn outline_examined_files(req: &RawRequest) -> Vec<&str> {
+    if crate::revision_read::requested_ref(req).is_some()
+        || req
+            .params
+            .get("files")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        || req
+            .params
+            .get("directory")
+            .and_then(|value| value.as_str())
+            .is_some()
+    {
+        return Vec::new();
+    }
+    req.params
+        .get("files")
+        .and_then(|value| value.as_array())
+        .map(|files| requested_outline_files(files).0)
+        .unwrap_or_default()
+}
+
+/// Outline `files` and render their structure map within `max_bytes`.
+///
+/// Files are outlined in the order the map shows them (by display path), and
+/// outlining stops as soon as the rendered output budget is spent: the first
+/// file that does not fit has been read and parsed, but later files are not.
+/// The files not shown still count in `total_requested`, so the footer
+/// reports them as not shown. Outlining
+/// also stops when the request deadline is close (see
+/// [`outline_batch_deadline_reached`]), returning the files shown so far.
+#[allow(clippy::too_many_arguments)]
 fn outline_many_files(
     files: &[String],
     ctx: &AppContext,
@@ -2356,7 +2582,8 @@ fn outline_many_files(
     session_id: &str,
     project_root: Option<&Path>,
     excluded: &HashSet<PathBuf>,
-) -> Result<(Vec<FileOutline>, Vec<SkippedFile>), Response> {
+    budget: MultiFileBudget,
+) -> Result<(RenderedOutline, Vec<SkippedFile>), Response> {
     let paths = files
         .iter()
         .map(|file| ctx.validate_read_path(req_id, session_id, Path::new(file)))
@@ -2366,8 +2593,22 @@ fn outline_many_files(
         .map(Path::to_path_buf)
         .or_else(|| common_outline_path_ancestor(&paths));
 
-    let mut file_outlines: Vec<FileOutline> = Vec::with_capacity(files.len());
-    let mut skipped_files: Vec<SkippedFile> = Vec::new();
+    // Visit files in rendering order (stable, so equal display paths keep
+    // their request order) so that the budget check below can stop early.
+    let mut ordered = files
+        .iter()
+        .zip(paths)
+        .enumerate()
+        .map(|(index, (file, path))| {
+            let rel_path = display_path(&path, file, display_root.as_deref());
+            (index, file, path, rel_path)
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by(|a, b| a.3.cmp(&b.3));
+
+    let mut writer = MultiFileTreeWriter::new(&budget);
+    // Skipped files are reported in request order, keyed by request index.
+    let mut skipped_files: Vec<(usize, SkippedFile)> = Vec::new();
     // One parser for the whole batch, sharing the provider's symbol cache:
     // the syntax check below leaves its tree in this parser's tree cache, and
     // symbol extraction for the same file then reuses that tree instead of
@@ -2381,95 +2622,133 @@ fn outline_many_files(
         });
     let mut fallback_parser = FileParser::new();
 
-    for (file, path) in files.iter().zip(paths) {
+    for (examined, (index, file, path, rel_path)) in ordered.into_iter().enumerate() {
         if is_read_excluded(excluded, &path) {
             continue;
         }
+        if outline_batch_deadline_reached(examined) {
+            writer.stop_at_deadline();
+            break;
+        }
         if crate::bounded_io::metadata(&path).is_err() {
-            skipped_files.push(SkippedFile::new(file, "file_not_found"));
+            skipped_files.push((index, SkippedFile::new(file, "file_not_found")));
             continue;
         }
 
-        let rel_path = display_path(&path, file, display_root.as_deref());
         if let Some(reason) = outline_skip_reason(&path, batch_parser.as_mut()) {
             if let Some(parser) = batch_parser.as_mut() {
                 parser.evict_parse_tree(&path);
             }
-            skipped_files.push(SkippedFile::new(rel_path, reason));
+            skipped_files.push((index, SkippedFile::new(rel_path, reason)));
             continue;
         }
 
-        let parsed = match batch_parser.as_mut() {
-            Some(parser) => match parser.parse_snapshot(&path) {
-                Ok(parsed) => Some(parsed),
-                Err(error) => {
-                    parser.evict_parse_tree(&path);
-                    skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&error)));
-                    continue;
-                }
-            },
-            None => None,
+        let structure = match batch_parser.as_mut() {
+            Some(parser) => {
+                let structure = batch_file_structure(&path, parser, ctx, req_id, session_id);
+                // Extraction and test classification share the validated parse tree.
+                parser.evict_parse_tree(&path);
+                structure
+            }
+            None => {
+                let structure =
+                    fallback_file_structure(&path, &mut fallback_parser, ctx, req_id, session_id);
+                fallback_parser.evict_parse_tree(&path);
+                structure
+            }
         };
-        let symbols = match (batch_parser.as_mut(), parsed.as_ref()) {
-            (Some(parser), Some(parsed)) => parser.extract_symbols_from_snapshot(&path, parsed),
-            _ => crate::parser::list_symbols_shared(ctx.provider(), &path),
-        };
-        match symbols {
-            Ok(symbols) => {
-                let structure = outline_structure_entries(
-                    &path,
-                    &symbols,
-                    batch_parser.as_mut().unwrap_or(&mut fallback_parser),
-                    ctx,
-                    req_id,
-                    session_id,
-                    true,
-                    parsed.as_ref(),
-                );
-                match structure {
-                    Ok(mut entries) => {
-                        if detect_language(&path) == Some(LangId::Rust) {
-                            if let Some(parsed) = &parsed {
-                                add_trait_member_previews(
-                                    parsed.tree.root_node(),
-                                    &parsed.source,
-                                    &mut entries,
-                                );
-                            } else {
-                                let parser = &mut fallback_parser;
-                                if let (Ok(source), Ok((tree, _))) =
-                                    (crate::parser::read_source(&path), parser.parse(&path))
-                                {
-                                    add_trait_member_previews(
-                                        tree.root_node(),
-                                        &source,
-                                        &mut entries,
-                                    );
-                                }
-                            }
-                        }
-                        file_outlines.push(FileOutline {
-                            absolute_path: path.clone(),
-                            path: rel_path,
-                            entries,
-                            language: detect_language(&path),
-                        });
-                    }
-                    Err(error) => {
-                        skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&error)))
-                    }
+        match structure {
+            Ok(entries) => {
+                let outline = FileOutline {
+                    absolute_path: path.clone(),
+                    path: rel_path,
+                    entries,
+                    language: detect_language(&path),
+                };
+                if !writer.push(&outline) {
+                    break;
                 }
             }
-            Err(e) => skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&e))),
+            Err(error) => skipped_files.push((
+                index,
+                SkippedFile::new(rel_path, outline_error_reason(&error)),
+            )),
         }
-        // Extraction and test classification share the validated parse tree.
-        if let Some(parser) = batch_parser.as_mut() {
-            parser.evict_parse_tree(&path);
-        }
-        fallback_parser.evict_parse_tree(&path);
     }
 
-    Ok((file_outlines, skipped_files))
+    skipped_files.sort_by_key(|(index, _)| *index);
+    Ok((
+        writer.finish(),
+        skipped_files
+            .into_iter()
+            .map(|(_, skipped)| skipped)
+            .collect(),
+    ))
+}
+
+/// One file's structure-map entries through the batch parser. A fresh cache
+/// entry with outline facts renders without reading or parsing the file;
+/// otherwise the file is parsed once and the facts are stored for next time.
+fn batch_file_structure(
+    path: &Path,
+    parser: &mut FileParser,
+    ctx: &AppContext,
+    req_id: &str,
+    session_id: &str,
+) -> Result<Vec<OutlineEntry>, AftError> {
+    if let Some(cached) = parser.cached_outline(path) {
+        // A Rust entry whose module layout was dropped cannot render its
+        // modules; parse it again instead.
+        if detect_language(path) != Some(LangId::Rust) || cached.modules.is_some() {
+            return structure_entries_from_facts(
+                path,
+                &cached.symbols,
+                cached.modules.as_deref().map(Vec::as_slice),
+                cached.has_error,
+                &cached.facts,
+                parser,
+                ctx,
+                req_id,
+                session_id,
+            );
+        }
+    }
+    let parsed = parser.parse_snapshot(path)?;
+    let symbols = parser.extract_symbols_from_snapshot(path, &parsed)?;
+    let facts = Arc::new(outline_parse_facts(path, &parsed));
+    parser.store_outline_facts(path, &parsed, Arc::clone(&facts));
+    structure_entries_from_facts(
+        path,
+        &symbols,
+        parsed.modules.as_deref().map(Vec::as_slice),
+        parsed.tree.root_node().has_error(),
+        &facts,
+        parser,
+        ctx,
+        req_id,
+        session_id,
+    )
+}
+
+/// One file's structure-map entries for a provider other than tree-sitter,
+/// which has no shared symbol cache to keep parse facts in.
+fn fallback_file_structure(
+    path: &Path,
+    parser: &mut FileParser,
+    ctx: &AppContext,
+    req_id: &str,
+    session_id: &str,
+) -> Result<Vec<OutlineEntry>, AftError> {
+    let symbols = crate::parser::list_symbols_shared(ctx.provider(), path)?;
+    let mut entries =
+        outline_structure_entries(path, &symbols, parser, ctx, req_id, session_id, true, None)?;
+    if detect_language(path) == Some(LangId::Rust) {
+        if let (Ok(source), Ok((tree, _))) = (crate::parser::read_source(path), parser.parse(path))
+        {
+            add_trait_member_previews(tree.root_node(), &source, &mut entries);
+        }
+    }
+    Ok(entries)
 }
 
 fn common_outline_path_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
@@ -2867,8 +3146,13 @@ fn outline_skip_reason(path: &Path, parser: Option<&mut FileParser>) -> Option<&
     // land in `skipped_files` (not the rendered outline), we still run
     // `validate_syntax()` here. With a batch parser the tree it builds is
     // reused by the symbol extraction that follows, so the file is parsed once.
+    // A fresh symbol-cache entry already records the verdict of the parse its
+    // symbols came from, so a warm file is not parsed at all.
     let validated = match parser {
-        Some(parser) => edit::validate_syntax_with_parser(parser, path),
+        Some(parser) => match parser.cached_has_error(path) {
+            Some(has_error) => Ok(Some(!has_error)),
+            None => edit::validate_syntax_with_parser(parser, path),
+        },
         None => edit::validate_syntax(path),
     };
     match validated {
@@ -3088,28 +3372,22 @@ fn add_trait_member_previews(
     source: &str,
     entries: &mut [OutlineEntry],
 ) {
+    let mut previews = Vec::new();
+    collect_trait_member_previews(node, source, &mut previews);
+    apply_trait_member_previews(&previews, entries);
+}
+
+/// Collect each trait's range and its method rows from the tree,
+/// so they can be cached and attached later without the tree.
+fn collect_trait_member_previews(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    previews: &mut Vec<(Range, Vec<OutlineEntry>)>,
+) {
     if node.kind() == "trait_item" {
-        let range = node_range_with_decorators(&node, source, LangId::Rust);
-        fn find_trait<'a>(
-            entries: &'a mut [OutlineEntry],
-            range: &Range,
-        ) -> Option<&'a mut OutlineEntry> {
-            for entry in entries {
-                if entry.kind == "interface" && &entry.range == range {
-                    return Some(entry);
-                }
-                if entry.kind == "module" && range_contains(&entry.range, range) {
-                    if let Some(found) = find_trait(&mut entry.members, range) {
-                        return Some(found);
-                    }
-                }
-            }
-            None
-        }
-        if let (Some(entry), Some(body)) = (
-            find_trait(entries, &range),
-            node.child_by_field_name("body"),
-        ) {
+        if let Some(body) = node.child_by_field_name("body") {
+            let range = node_range_with_decorators(&node, source, LangId::Rust);
+            let mut methods = Vec::new();
             let mut cursor = body.walk();
             for method in body
                 .named_children(&mut cursor)
@@ -3120,7 +3398,7 @@ fn add_trait_member_previews(
                 };
                 let text = node_text(source, &method);
                 let first = text.lines().next().unwrap_or(text).trim_end();
-                entry.members.push(OutlineEntry {
+                methods.push(OutlineEntry {
                     name: node_text(source, &name).to_string(),
                     kind: "method".into(),
                     range: node_range_with_decorators(&method, source, LangId::Rust),
@@ -3135,12 +3413,43 @@ fn add_trait_member_previews(
                     members: Vec::new(),
                 });
             }
+            previews.push((range, methods));
         }
         return;
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        add_trait_member_previews(child, source, entries);
+        collect_trait_member_previews(child, source, previews);
+    }
+}
+
+/// Append each collected trait's method rows to the outline entry for that
+/// trait. A trait with no entry (for example one inside collapsed test code)
+/// gets nothing.
+fn apply_trait_member_previews(
+    previews: &[(Range, Vec<OutlineEntry>)],
+    entries: &mut [OutlineEntry],
+) {
+    fn find_trait<'a>(
+        entries: &'a mut [OutlineEntry],
+        range: &Range,
+    ) -> Option<&'a mut OutlineEntry> {
+        for entry in entries {
+            if entry.kind == "interface" && &entry.range == range {
+                return Some(entry);
+            }
+            if entry.kind == "module" && range_contains(&entry.range, range) {
+                if let Some(found) = find_trait(&mut entry.members, range) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    for (range, methods) in previews {
+        if let Some(entry) = find_trait(entries, range) {
+            entry.members.extend(methods.iter().cloned());
+        }
     }
 }
 
@@ -3151,13 +3460,16 @@ fn format_single_file_tree(filename: &str, entries: &[OutlineEntry]) -> String {
     output
 }
 
-/// Build a directory tree structure from file paths and render as text.
-///
-/// Groups files by directory hierarchy and renders symbols under each file.
-/// If output exceeds `max_bytes`, truncates with a narrowing hint.
+/// The rendered structure map for a batch of files, built incrementally by
+/// [`MultiFileTreeWriter`] in path order.
 struct RenderedOutline {
     text: String,
+    /// The output byte budget cut the map.
     truncated: bool,
+    /// Files were left unexamined by the file-list cap or the deadline.
+    cut_short: bool,
+    /// Outlining stopped because the request deadline was close.
+    deadline_reached: bool,
     shown: usize,
     footer: String,
     /// The files whose outlines were rendered, as a sorted set like every
@@ -3165,68 +3477,117 @@ struct RenderedOutline {
     content_files: BTreeSet<PathBuf>,
 }
 
-fn outline_structure_footer(shown: usize, total: usize, budget: bool, walk: bool) -> String {
-    use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
-    let mut causes = Vec::new();
-    if walk {
-        causes.push(Reason::Walk);
-    }
-    if budget {
-        causes.push(Reason::Budget);
-    }
-    if causes.is_empty() {
-        return String::new();
-    }
-    let total = if walk {
-        Total::AtLeast(total)
-    } else {
-        Total::Exact(total)
-    };
-    crate::subc_format::render_envelope_trailer(&ListEnvelope::new(
-        shown,
-        total,
-        Unit::Files,
-        causes,
-        &["path"],
-    ))
+/// The list trailer for a structure map: see
+/// [`crate::list_surfaces::outline::build_outline_structure_envelope`].
+fn outline_structure_footer(
+    shown: usize,
+    total: usize,
+    budget: bool,
+    walk: bool,
+    time_limit: bool,
+) -> String {
+    crate::list_surfaces::outline::build_outline_structure_envelope(
+        shown, total, budget, walk, time_limit,
+    )
+    .and_then(|envelope| crate::subc_format::render_envelope_trailer(&envelope))
     .unwrap_or_default()
 }
 
-fn format_multi_file_tree(
-    file_outlines: &[FileOutline],
+/// Renders a directory tree of files and their structure entries, one file
+/// at a time in path order, within an output byte budget. Files are rendered
+/// atomically, so every shown type keeps its preview and exact remainder.
+///
+/// The writer is fed while files are still being outlined, so a batch can
+/// stop reading and parsing as soon as [`MultiFileTreeWriter::push`] reports
+/// that the budget is spent. The files never offered count toward the total
+/// in the footer but are not shown.
+struct MultiFileTreeWriter {
+    output: String,
+    truncated: bool,
+    /// The request's file list was cut before outlining.
+    files_capped: bool,
+    /// Outlining stopped near the request deadline.
+    deadline_reached: bool,
+    files_shown: usize,
+    content_files: BTreeSet<PathBuf>,
+    /// Where each shown file's text starts in `output`, and its path, so a
+    /// longer deadline footer can take back the last file if it must.
+    shown_blocks: Vec<(usize, PathBuf)>,
+    /// Path components of the last shown file, for directory grouping.
+    prev_parts: Vec<String>,
     max_bytes: usize,
     total_requested: usize,
     walk_incomplete: bool,
-) -> RenderedOutline {
-    // Build a tree of directories → files → symbols
-    // Using a simple sorted-path approach with indentation
-    let mut output = String::new();
-    let mut truncated = false;
-    let mut files_shown = 0;
-    let mut content_files = BTreeSet::new();
-    // Reserve the real list trailer, not a guessed number of bytes. Rendering
-    // files atomically keeps every shown type's preview and exact remainder.
-    let trailer_reserve =
-        outline_structure_footer(total_requested, total_requested, true, walk_incomplete).len() + 2;
+    trailer_reserve: usize,
+    /// A rendered file that fits only if no trailer follows it, which is
+    /// known only once no later file is offered.
+    pending: Option<(String, Vec<String>, PathBuf)>,
+}
 
-    // Sort by path for clean directory grouping
-    let mut sorted: Vec<&FileOutline> = file_outlines.iter().collect();
-    sorted.sort_by(|a, b| a.path.cmp(&b.path));
+impl MultiFileTreeWriter {
+    fn new(budget: &MultiFileBudget) -> Self {
+        // Reserve the real list trailer, not a guessed number of bytes.
+        let trailer_reserve = outline_structure_footer(
+            budget.total_requested,
+            budget.total_requested,
+            true,
+            budget.walk_incomplete,
+            false,
+        )
+        .len()
+            + 2;
+        Self {
+            output: String::new(),
+            truncated: false,
+            files_capped: budget.files_capped,
+            deadline_reached: false,
+            files_shown: 0,
+            content_files: BTreeSet::new(),
+            shown_blocks: Vec::new(),
+            prev_parts: Vec::new(),
+            max_bytes: budget.max_bytes,
+            total_requested: budget.total_requested,
+            walk_incomplete: budget.walk_incomplete,
+            trailer_reserve,
+            pending: None,
+        }
+    }
 
-    // Track directory nesting via path components
-    let mut prev_parts: Vec<&str> = Vec::new();
+    /// Files are known to be left unshown whatever the output budget, so a
+    /// footer always follows the last file.
+    fn cut_short(&self) -> bool {
+        self.files_capped || self.deadline_reached
+    }
 
-    for fo in &sorted {
+    /// Record that outlining stopped at the request deadline with files
+    /// still unexamined.
+    fn stop_at_deadline(&mut self) {
+        self.deadline_reached = true;
+    }
+    /// Offer the next file in path order. Returns `false` once the budget is
+    /// spent: this file and every later one would not be shown, so the
+    /// caller stops outlining files.
+    fn push(&mut self, fo: &FileOutline) -> bool {
+        if self.truncated {
+            return false;
+        }
+        if self.pending.take().is_some() {
+            // The held file was not the last one, so it needed room for the
+            // trailer and does not fit.
+            self.truncated = true;
+            return false;
+        }
         let mut file_output = String::new();
         let parts: Vec<&str> = fo.path.split('/').collect();
         let file_name = parts.last().copied().unwrap_or(&fo.path);
         let dir_parts = &parts[..parts.len().saturating_sub(1)];
 
         // Find common prefix with previous path
-        let common = prev_parts
+        let common = self
+            .prev_parts
             .iter()
             .zip(dir_parts.iter())
-            .take_while(|(a, b)| a == b)
+            .take_while(|(a, b)| a.as_str() == **b)
             .count();
 
         // Emit new directory levels
@@ -3249,34 +3610,92 @@ fn format_multi_file_tree(
             fo.language,
         );
 
-        let reserve = if files_shown + 1 == sorted.len() && !walk_incomplete {
-            0
-        } else {
-            trailer_reserve
-        };
-        if output.len() + file_output.len() + reserve > max_bytes {
-            truncated = true;
-            break;
+        let parts = parts.iter().map(|part| part.to_string()).collect();
+        let used = self.output.len() + file_output.len();
+        if used + self.trailer_reserve <= self.max_bytes {
+            self.accept(file_output, parts, fo.absolute_path.clone());
+            return true;
         }
-        output.push_str(&file_output);
-        content_files.insert(fo.absolute_path.clone());
-
-        files_shown += 1;
-        prev_parts = parts.iter().map(|s| *s).collect();
+        if !self.walk_incomplete && !self.cut_short() && used <= self.max_bytes {
+            // Fits only as the last file; keep looking for a later one.
+            self.pending = Some((file_output, parts, fo.absolute_path.clone()));
+            return true;
+        }
+        self.truncated = true;
+        false
     }
 
-    let footer = outline_structure_footer(files_shown, total_requested, truncated, walk_incomplete);
-    if !footer.is_empty() {
-        output.push('\n');
-        output.push_str(&footer);
+    fn accept(&mut self, file_output: String, parts: Vec<String>, path: PathBuf) {
+        self.shown_blocks.push((self.output.len(), path.clone()));
+        self.output.push_str(&file_output);
+        self.content_files.insert(path);
+        self.files_shown += 1;
+        self.prev_parts = parts;
     }
 
-    RenderedOutline {
-        text: output,
-        truncated,
-        shown: files_shown,
-        footer,
-        content_files,
+    /// Remove the last shown file from the output so a longer footer fits.
+    /// Returns `false` when no file is shown.
+    fn take_back_last_file(&mut self) -> bool {
+        let Some((start, path)) = self.shown_blocks.pop() else {
+            return false;
+        };
+        self.output.truncate(start);
+        // A `files` list can name the same file twice. The read manifest must
+        // keep a path while any block still shown in the text came from it,
+        // or a host checking read rules against the manifest would miss it.
+        if !self.shown_blocks.iter().any(|(_, shown)| *shown == path) {
+            self.content_files.remove(&path);
+        }
+        self.files_shown -= 1;
+        self.truncated = true;
+        true
+    }
+
+    fn finish(mut self) -> RenderedOutline {
+        if let Some((file_output, parts, path)) = self.pending.take() {
+            if self.cut_short() {
+                // Stopped at the deadline after this file: the footer follows
+                // it after all, and there is no room for both.
+                self.truncated = true;
+            } else {
+                self.accept(file_output, parts, path);
+            }
+        }
+        // The output budget and the file-list cap are budget stops; the
+        // request deadline is a time-limit stop.
+        let mut footer;
+        loop {
+            footer = outline_structure_footer(
+                self.files_shown,
+                self.total_requested,
+                self.truncated || self.files_capped,
+                self.walk_incomplete,
+                self.deadline_reached,
+            );
+            // Files were admitted with room for the shorter budget footer;
+            // a deadline footer that does not fit takes back the last file.
+            let fits = self.output.len() + footer.len() + 1 <= self.max_bytes;
+            if !self.deadline_reached || footer.is_empty() || fits {
+                break;
+            }
+            if !self.take_back_last_file() {
+                break;
+            }
+        }
+        let mut output = self.output;
+        if !footer.is_empty() {
+            output.push('\n');
+            output.push_str(&footer);
+        }
+        RenderedOutline {
+            text: output,
+            truncated: self.truncated,
+            cut_short: self.files_capped || self.deadline_reached,
+            deadline_reached: self.deadline_reached,
+            shown: self.files_shown,
+            footer,
+            content_files: self.content_files,
+        }
     }
 }
 
@@ -3752,7 +4171,9 @@ mod tests {
             assert_eq!(warm, cold);
             counts.push((reads, parses));
         }
-        assert_eq!(counts, vec![(1, 1); 14]);
+        // A warm multi-file outline renders from the parse facts cached next
+        // to each file's symbols, as a warm single-file outline already did.
+        assert_eq!(counts, [(1, 1), (0, 0)].repeat(7));
         let batch_ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
@@ -3764,7 +4185,7 @@ mod tests {
         let (cold, reads, parses) = navigation_counts(&request, &batch_ctx);
         assert_eq!((reads, parses), (7, 7));
         let (warm, reads, parses) = navigation_counts(&request, &batch_ctx);
-        assert_eq!((reads, parses), (7, 7));
+        assert_eq!((reads, parses), (0, 0));
         assert_eq!(warm, cold);
     }
 
@@ -3866,16 +4287,15 @@ mod tests {
             serde_json::json!({"id":"layout-work", "command":"outline", "files":[files[5]]}),
         )
         .unwrap();
-        for _ in 0..2 {
+        // The first call scans the file root and its nested module once each;
+        // the warm call reuses the cached layout and scans nothing.
+        for expected in [2, 0] {
             let before = crate::parser::work_counters::RUST_MODULE_SCANS.with(|count| count.get());
             let response = handle_outline(&request, &ctx);
             assert!(response.success);
             let scans =
                 crate::parser::work_counters::RUST_MODULE_SCANS.with(|count| count.get()) - before;
-            assert_eq!(
-                scans, 2,
-                "one scan of the file root and one of its nested module"
-            );
+            assert_eq!(scans, expected);
         }
     }
 
@@ -4850,16 +5270,21 @@ mod tests {
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
-        let (outlines, _) = outline_many_files(
+        let (rendered, _) = outline_many_files(
             &files,
             &ctx,
             "budget",
             "budget-session",
             None,
             &HashSet::new(),
+            MultiFileBudget {
+                max_bytes: 550,
+                total_requested: 3,
+                walk_incomplete: false,
+                files_capped: false,
+            },
         )
         .unwrap();
-        let rendered = format_multi_file_tree(&outlines, 550, 3, false);
         assert!(rendered.text.len() <= 550, "{} bytes", rendered.text.len());
         assert_eq!(rendered.shown, 2, "{}", rendered.text);
         assert!(rendered.truncated);
@@ -5037,6 +5462,393 @@ mod tests {
         let skipped = response["skipped_files"].as_array().expect("skipped files");
         assert_eq!(skipped.len(), 1, "{response}");
         assert_eq!(skipped[0]["reason"], "parse_error");
+    }
+
+    /// A warm multi-file outline renders test summaries, module layout and
+    /// trait method previews from the facts cached next to the symbols, with
+    /// no read or parse, and gives the same text as the cold call. A file
+    /// edited since is read and parsed again and shows its new content.
+    #[test]
+    fn multi_file_outline_warm_cache_skips_parse_and_reparses_edited_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rust = temp.path().join("lib.rs");
+        let script = temp.path().join("suite.ts");
+        std::fs::write(
+            &rust,
+            "pub trait Shape {\n    fn area(&self) -> f64;\n    fn name(&self) -> String;\n}\npub mod inner {\n    pub fn helper() {}\n}\npub fn product() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn checks() {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &script,
+            "export function visible() {}\ndescribe(\"suite\", () => {\n  it(\"works\", () => {});\n});\n",
+        )
+        .unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "warm-batch", "command": "outline", "files": [&rust, &script],
+        }))
+        .unwrap();
+
+        let (cold, reads, parses) = navigation_counts(&request, &ctx);
+        assert_eq!((reads, parses), (2, 2), "{cold}");
+        let text = cold["text"].as_str().unwrap();
+        for expected in [
+            ".fn area(&self) -> f64;",
+            "modu inner",
+            "tests: 1 items",
+            "describe \"suite\"",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in {text}");
+        }
+
+        let (warm, reads, parses) = navigation_counts(&request, &ctx);
+        assert_eq!((reads, parses), (0, 0), "warm outline read or parsed");
+        assert_eq!(warm, cold);
+
+        std::fs::write(
+            &rust,
+            "pub trait Shape {\n    fn perimeter(&self) -> f64;\n}\npub fn renamed_product() {}\n",
+        )
+        .unwrap();
+        let (edited, reads, parses) = navigation_counts(&request, &ctx);
+        assert_eq!(
+            (reads, parses),
+            (1, 1),
+            "only the edited file is parsed again"
+        );
+        let text = edited["text"].as_str().unwrap();
+        assert!(
+            text.contains("renamed_product") && text.contains(".fn perimeter"),
+            "{text}"
+        );
+        assert!(!text.contains("area") && !text.contains("tests:"), "{text}");
+
+        let (again, reads, parses) = navigation_counts(&request, &ctx);
+        assert_eq!((reads, parses), (0, 0));
+        assert_eq!(again, edited);
+    }
+
+    /// Once the rendered output budget is spent, the remaining files are not
+    /// read or parsed: they are reported as not shown through `files_shown`
+    /// and the footer. Only the file that overflowed the budget is parsed
+    /// beyond the shown ones.
+    #[test]
+    fn multi_file_outline_stops_parsing_once_output_budget_is_spent() {
+        use crate::parser::work_counters::tree_parses;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().unwrap();
+        // About 21 KB of rendered rows per file: one fits the 30 KB budget.
+        let source = (0..700)
+            .map(|index| format!("export function symbol_{index:04}() {{}}\n"))
+            .collect::<String>();
+        let mut files = Vec::new();
+        for index in 0..10 {
+            let path = root.join(format!("file_{index:02}.ts"));
+            std::fs::write(&path, &source).unwrap();
+            files.push(path);
+        }
+        for params in [
+            serde_json::json!({"files": files}),
+            serde_json::json!({"directory": root}),
+        ] {
+            // A fresh context each time, so no file is warm in the cache.
+            let ctx = AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                crate::config::Config::default(),
+            );
+            let mut args = params;
+            args["id"] = serde_json::json!("budget-stop");
+            args["command"] = serde_json::json!("outline");
+            let request: RawRequest = serde_json::from_value(args).unwrap();
+            let before = tree_parses();
+            let response = handle_outline(&request, &ctx);
+            let parses = tree_parses() - before;
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["files_shown"], 1);
+            assert_eq!(response.data["complete"], false);
+            assert_eq!(response.data["output_truncated"], true);
+            let text = response.data["text"].as_str().unwrap();
+            assert!(text.contains("shown 1 of 10 files (budget)"), "{text}");
+            assert_eq!(parses, 2, "parsed files that could not be shown");
+        }
+    }
+
+    fn small_ts_files(root: &Path, count: usize) -> Vec<PathBuf> {
+        (0..count)
+            .map(|index| {
+                let path = root.join(format!("f{index:03}.ts"));
+                std::fs::write(&path, format!("export function f{index}() {{}}\n")).unwrap();
+                path
+            })
+            .collect()
+    }
+
+    fn files_request(files: &[PathBuf]) -> RawRequest {
+        serde_json::from_value(serde_json::json!({
+            "id": "files-bound", "command": "outline", "files": files,
+        }))
+        .unwrap()
+    }
+
+    /// A `files` list longer than the directory cap is cut to it before any
+    /// path is validated or parsed; the footer counts the rest as not shown.
+    #[test]
+    fn multi_file_outline_caps_the_file_list_at_the_directory_cap() {
+        use crate::parser::work_counters::tree_parses;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let files = small_ts_files(temp.path(), OUTLINE_FILE_WALK_CAP + 5);
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let before = tree_parses();
+        let response = handle_outline(&files_request(&files), &ctx);
+        let parses = tree_parses() - before;
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["files_shown"], OUTLINE_FILE_WALK_CAP);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["output_truncated"], false);
+        let text = response.data["text"].as_str().unwrap();
+        assert!(text.contains("shown 200 of 205 files (budget)"), "{text}");
+        assert!(
+            text.contains("f199.ts") && !text.contains("f200.ts"),
+            "{text}"
+        );
+        assert_eq!(parses, OUTLINE_FILE_WALK_CAP);
+    }
+
+    /// The access probe that runs before the outline handler checks only the
+    /// `files` entries the handler examines: the first 200, or none when a
+    /// directory outline ignores the list.
+    #[test]
+    fn pre_handler_probe_checks_only_the_examined_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let files = small_ts_files(temp.path(), 1_000);
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        for (mut params, expected) in [
+            (serde_json::json!({"files": files}), OUTLINE_FILE_WALK_CAP),
+            (
+                serde_json::json!({"files": files, "directory": temp.path()}),
+                1,
+            ),
+        ] {
+            params["id"] = serde_json::json!("probe-bound");
+            params["command"] = serde_json::json!("outline");
+            let request: RawRequest = serde_json::from_value(params).unwrap();
+            crate::bounded_io::COMMAND_INPUT_PROBES.with(|probes| probes.set(0));
+            let response = handle_outline(&request, &ctx);
+            assert!(response.success, "{response:?}");
+            assert_eq!(
+                crate::bounded_io::COMMAND_INPUT_PROBES.with(std::cell::Cell::get),
+                expected
+            );
+        }
+    }
+
+    /// A batch that reaches the request deadline between files returns the
+    /// files outlined so far as a partial result instead of running on.
+    #[test]
+    fn multi_file_outline_returns_partial_result_at_the_deadline() {
+        use crate::parser::work_counters::tree_parses;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let files = small_ts_files(temp.path(), 10);
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        OUTLINE_BATCH_DEADLINE_AFTER_FILES.with(|limit| limit.set(Some(3)));
+        let before = tree_parses();
+        let response = handle_outline(&files_request(&files), &ctx);
+        let parses = tree_parses() - before;
+        OUTLINE_BATCH_DEADLINE_AFTER_FILES.with(|limit| limit.set(None));
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["files_shown"], 3);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["deadline_reached"], true);
+        let text = response.data["text"].as_str().unwrap();
+        assert!(
+            text.contains("shown 3 of ≥10 files (time limit) · narrow: path"),
+            "{text}"
+        );
+        assert_eq!(
+            response.data["structure_footer"],
+            "shown 3 of ≥10 files (time limit) · narrow: path"
+        );
+        assert!(
+            text.contains("f002.ts") && !text.contains("f003.ts"),
+            "{text}"
+        );
+        assert_eq!(parses, 3);
+    }
+
+    /// The deadline check reads the real request budget: with less than the
+    /// return margin left, the batch stops before outlining any file and
+    /// still answers successfully.
+    #[test]
+    fn multi_file_outline_stops_when_the_request_deadline_is_near() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let files = small_ts_files(temp.path(), 4);
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let budget = crate::bounded_io::Budget::after(std::time::Duration::from_millis(900));
+        let response = crate::bounded_io::with_budget(Some(budget), || {
+            handle_outline(&files_request(&files), &ctx)
+        });
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["files_shown"], 0);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["deadline_reached"], true);
+        let text = response.data["text"].as_str().unwrap();
+        assert!(text.contains("shown 0 of ≥4 files (time limit)"), "{text}");
+    }
+
+    /// A deadline stop reports the time-limit reason, not the budget one,
+    /// and its longer footer still fits the output budget: files were
+    /// admitted with room for the shorter budget footer, so the last one is
+    /// taken back when the time-limit footer would not fit.
+    #[test]
+    fn deadline_footer_reads_time_limit_and_stays_within_the_budget() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let files = small_ts_files(temp.path(), 2)
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let run = |max_bytes: usize| {
+            OUTLINE_BATCH_DEADLINE_AFTER_FILES.with(|limit| limit.set(Some(1)));
+            let (rendered, _) = outline_many_files(
+                &files,
+                &ctx,
+                "deadline-footer",
+                "deadline-session",
+                None,
+                &HashSet::new(),
+                MultiFileBudget {
+                    max_bytes,
+                    total_requested: 2,
+                    walk_incomplete: false,
+                    files_capped: false,
+                },
+            )
+            .unwrap();
+            OUTLINE_BATCH_DEADLINE_AFTER_FILES.with(|limit| limit.set(None));
+            rendered
+        };
+        let roomy = run(30 * 1024);
+        assert_eq!(roomy.shown, 1);
+        assert_eq!(
+            roomy.footer,
+            "shown 1 of ≥2 files (time limit) · narrow: path"
+        );
+        assert!(!roomy.footer.contains("budget"));
+
+        // Room for the first file plus the budget footer the writer reserves,
+        // but not for the longer time-limit footer.
+        let block = roomy.text.len() - 1 - roomy.footer.len();
+        let reserved = outline_structure_footer(2, 2, true, false, false).len() + 2;
+        assert!(roomy.footer.len() + 1 > reserved);
+        let tight = run(block + reserved);
+        assert!(tight.text.len() <= block + reserved, "{}", tight.text);
+        assert_eq!(tight.shown, 0);
+        assert!(tight.content_files.is_empty());
+        assert!(tight.footer.contains("(time limit)"), "{}", tight.footer);
+    }
+
+    /// Run a three-file batch that stops at the deadline after two files,
+    /// with `max_bytes` from `budget(first two blocks)`.
+    fn deadline_after_two(
+        files: &[String],
+        ctx: &AppContext,
+        budget: impl Fn(usize) -> usize,
+    ) -> RenderedOutline {
+        let run = |max_bytes: usize| {
+            OUTLINE_BATCH_DEADLINE_AFTER_FILES.with(|limit| limit.set(Some(2)));
+            let (rendered, _) = outline_many_files(
+                files,
+                ctx,
+                "deadline-manifest",
+                "deadline-session",
+                None,
+                &HashSet::new(),
+                MultiFileBudget {
+                    max_bytes,
+                    total_requested: files.len(),
+                    walk_incomplete: false,
+                    files_capped: false,
+                },
+            )
+            .unwrap();
+            OUTLINE_BATCH_DEADLINE_AFTER_FILES.with(|limit| limit.set(None));
+            rendered
+        };
+        let roomy = run(30 * 1024);
+        assert_eq!(roomy.shown, 2, "{}", roomy.text);
+        run(budget(roomy.text.len() - 1 - roomy.footer.len()))
+    }
+
+    fn manifest_names(rendered: &RenderedOutline) -> Vec<String> {
+        rendered
+            .content_files
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// When the deadline footer takes back the last shown block, the read
+    /// manifest keeps that block's path if another block still shown came
+    /// from the same file (a `files` list can repeat a path), and drops it
+    /// when the dropped block was the file's only one.
+    #[test]
+    fn deadline_take_back_keeps_a_path_still_shown_in_the_manifest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = small_ts_files(temp.path(), 3)
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        // Room for both blocks plus the budget footer the writer reserves,
+        // but not for the longer time-limit footer: the second block goes.
+        let reserved = outline_structure_footer(3, 3, true, false, false).len() + 2;
+        let tight = |blocks: usize| blocks + reserved;
+
+        let repeated = vec![paths[0].clone(), paths[0].clone(), paths[2].clone()];
+        let rendered = deadline_after_two(&repeated, &ctx, tight);
+        assert_eq!(rendered.shown, 1, "{}", rendered.text);
+        assert!(rendered.text.contains("f000.ts"), "{}", rendered.text);
+        assert!(
+            rendered.footer.contains("(time limit)"),
+            "{}",
+            rendered.footer
+        );
+        assert_eq!(
+            manifest_names(&rendered),
+            ["f000.ts"],
+            "the copy still shown must stay in the read manifest"
+        );
+
+        let distinct = paths.clone();
+        let rendered = deadline_after_two(&distinct, &ctx, tight);
+        assert_eq!(rendered.shown, 1, "{}", rendered.text);
+        assert!(!rendered.text.contains("f001.ts"), "{}", rendered.text);
+        assert_eq!(
+            manifest_names(&rendered),
+            ["f000.ts"],
+            "a file whose only block was dropped must leave the manifest"
+        );
     }
 
     fn outline_ignore_fixture(root: &Path) {
@@ -5374,17 +6186,23 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
-        let (outlines, skipped) = outline_many_files(
+        let (rendered, skipped) = outline_many_files(
             &files,
             &ctx,
             "outline-fixture",
             "fixture-session",
             None,
             &HashSet::new(),
+            MultiFileBudget {
+                max_bytes: 30 * 1024,
+                total_requested: files.len(),
+                walk_incomplete: false,
+                files_capped: false,
+            },
         )
         .expect("outline fixture files");
         assert!(skipped.is_empty(), "{skipped:?}");
-        format_multi_file_tree(&outlines, 30 * 1024, files.len(), false).text
+        rendered.text
     }
 
     #[test]

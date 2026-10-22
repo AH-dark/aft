@@ -1132,7 +1132,7 @@ pub(crate) struct ParsedFile {
 }
 
 /// Cached symbol extraction result: mtime at extraction time + symbols.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct CachedSymbols {
     mtime: SystemTime,
     size: u64,
@@ -1142,6 +1142,23 @@ struct CachedSymbols {
     /// released and only if the entry turns out to be fresh.
     symbols: Arc<Vec<Symbol>>,
     modules: Option<Arc<Vec<RustModule>>>,
+    /// Whether the tree these symbols were extracted from had syntax errors.
+    /// `None` when the symbols arrived without a tree (a disk load or a
+    /// prewarm insert). Outline uses it to skip broken files without parsing.
+    has_error: Option<bool>,
+    /// Structure-map facts (test regions, trait method previews) that the
+    /// multi-file outline derived from the same tree. They share this entry's
+    /// freshness key and are dropped with it when the file's content changes.
+    outline_facts: Option<Arc<crate::commands::outline::OutlineParseFacts>>,
+}
+
+/// A fresh cache entry with everything a multi-file outline needs to render
+/// a file without reading or parsing it again.
+pub(crate) struct CachedOutline {
+    pub(crate) symbols: Arc<Vec<Symbol>>,
+    pub(crate) modules: Option<Arc<Vec<RustModule>>>,
+    pub(crate) has_error: bool,
+    pub(crate) facts: Arc<crate::commands::outline::OutlineParseFacts>,
 }
 
 fn content_hash_for_source(source: &str) -> blake3::Hash {
@@ -1304,6 +1321,8 @@ impl DecodedSymbolCache {
                     content_hash: entry.content_hash,
                     symbols: Arc::new(entry.symbols),
                     modules: None,
+                    has_error: None,
+                    outline_facts: None,
                 },
             );
             outcome.loaded += 1;
@@ -1392,9 +1411,18 @@ impl SymbolCache {
         content_hash: blake3::Hash,
         symbols: Vec<Symbol>,
     ) -> bool {
-        self.insert_shared(path, mtime, size, content_hash, Arc::new(symbols), None)
+        self.insert_shared(
+            path,
+            mtime,
+            size,
+            content_hash,
+            Arc::new(symbols),
+            None,
+            None,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_shared(
         &mut self,
         path: PathBuf,
@@ -1403,35 +1431,35 @@ impl SymbolCache {
         content_hash: blake3::Hash,
         symbols: Arc<Vec<Symbol>>,
         modules: Option<Arc<Vec<RustModule>>>,
+        has_error: Option<bool>,
     ) -> bool {
-        let modules = modules.or_else(|| {
-            self.entries
-                .get(&path)
-                .filter(|entry| {
-                    entry.mtime == mtime
-                        && entry.size == size
-                        && entry.content_hash == content_hash
-                        && entry.symbols == symbols
-                })
-                .and_then(|entry| entry.modules.clone())
-        });
+        if let Some(cached) = self.entries.get_mut(&path) {
+            if cached.mtime == mtime
+                && cached.size == size
+                && cached.content_hash == content_hash
+                && cached.symbols == symbols
+            {
+                // Same content: keep what was already derived from it. A
+                // caller without a tree passes `None` and must not erase the
+                // module layout, syntax verdict or outline facts on record.
+                if modules.is_some() {
+                    cached.modules = modules;
+                }
+                if has_error.is_some() {
+                    cached.has_error = has_error;
+                }
+                return false;
+            }
+        }
         let entry = CachedSymbols {
             mtime,
             size,
             content_hash,
             symbols,
             modules,
+            has_error,
+            outline_facts: None,
         };
-        if let Some(cached) = self.entries.get_mut(&path) {
-            if cached.mtime == entry.mtime
-                && cached.size == entry.size
-                && cached.content_hash == entry.content_hash
-                && cached.symbols == entry.symbols
-            {
-                cached.modules = entry.modules;
-                return false;
-            }
-        }
         self.entries.insert(path, entry);
         self.mutation_revision = self.mutation_revision.wrapping_add(1);
         true
@@ -1648,6 +1676,12 @@ impl SymbolCache {
                         .modules
                         .as_deref()
                         .map_or(0, |modules| module_bytes(modules)),
+                )
+                .saturating_add(
+                    cached
+                        .outline_facts
+                        .as_deref()
+                        .map_or(0, |facts| facts.estimated_bytes()),
                 )
         });
         let project_root_bytes = self
@@ -1939,9 +1973,83 @@ impl FileParser {
                 parsed.content_hash,
                 Arc::clone(&symbols),
                 modules,
+                Some(parsed.tree.root_node().has_error()),
             );
         }
         Ok(symbols)
+    }
+
+    /// The syntax verdict recorded with a still-fresh cache entry for `path`:
+    /// `Some(true)` when the file had syntax errors. `None` when there is no
+    /// entry, the entry has no verdict, or the file changed since.
+    pub(crate) fn cached_has_error(&self, path: &Path) -> Option<bool> {
+        let current_mtime = crate::bounded_io::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()?;
+        let cached = self.symbol_cache.read().ok()?.entries.get(path)?.clone();
+        let has_error = cached.has_error?;
+        cached_file_is_fresh(
+            path,
+            cached.mtime,
+            cached.size,
+            cached.content_hash,
+            current_mtime,
+        )
+        .then_some(has_error)
+    }
+
+    /// Everything a multi-file outline stored for `path`, when the entry is
+    /// still fresh and carries outline facts. A miss means the caller parses.
+    pub(crate) fn cached_outline(&self, path: &Path) -> Option<CachedOutline> {
+        let current_mtime = crate::bounded_io::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()?;
+        let cached = self.symbol_cache.read().ok()?.entries.get(path)?.clone();
+        let (Some(has_error), Some(facts)) = (cached.has_error, cached.outline_facts) else {
+            return None;
+        };
+        cached_file_is_fresh(
+            path,
+            cached.mtime,
+            cached.size,
+            cached.content_hash,
+            current_mtime,
+        )
+        .then_some(CachedOutline {
+            symbols: cached.symbols,
+            modules: cached.modules,
+            has_error,
+            facts,
+        })
+    }
+
+    /// Attach outline facts derived from `parsed` to the cache entry for
+    /// `path`, only if that entry still describes the same content. The facts
+    /// are not persisted to disk, so attaching them does not mark the cache
+    /// as needing a write.
+    pub(crate) fn store_outline_facts(
+        &self,
+        path: &Path,
+        parsed: &ParsedFile,
+        facts: Arc<crate::commands::outline::OutlineParseFacts>,
+    ) {
+        let Ok(mut cache) = self.symbol_cache.write() else {
+            return;
+        };
+        if self
+            .symbol_cache_generation
+            .is_some_and(|generation| cache.generation != generation)
+        {
+            return;
+        }
+        if let Some(entry) = cache.entries.get_mut(path) {
+            if entry.mtime == parsed.mtime
+                && entry.size == parsed.size
+                && entry.content_hash == parsed.content_hash
+            {
+                entry.outline_facts = Some(facts);
+            }
+        }
     }
 
     /// Module layout shares the symbol entry's freshness and invalidation lifetime.
@@ -2150,7 +2258,7 @@ impl FileParser {
             let size = source.len() as u64;
             let content_hash = content_hash_for_source(&source);
 
-            let (symbols, modules) = {
+            let (symbols, modules, has_error) = {
                 // Reuse the source we just read instead of letting parse() read the
                 // same file a second time.
                 let (tree, lang) =
@@ -2159,9 +2267,14 @@ impl FileParser {
                     Arc::new(extract_symbols_from_tree(&source, tree, lang)?),
                     (lang == LangId::Rust)
                         .then(|| Arc::new(rust_modules(tree.root_node(), &source))),
+                    Some(tree.root_node().has_error()),
                 )
             };
 
+            // The syntax verdict comes from the same read and tree as the
+            // symbols, on every attempt including the last one that skips the
+            // cache snapshot. insert_shared keeps cached outline facts only
+            // when the entry already describes this same content.
             let mut symbol_cache = self
                 .symbol_cache
                 .write()
@@ -2177,6 +2290,7 @@ impl FileParser {
                         content_hash,
                         Arc::clone(&symbols),
                         modules,
+                        has_error,
                     )
             } else {
                 symbol_cache.insert_shared(
@@ -2186,6 +2300,7 @@ impl FileParser {
                     content_hash,
                     Arc::clone(&symbols),
                     modules,
+                    has_error,
                 )
             };
 
@@ -12777,6 +12892,97 @@ mod audit11_regressions {
         CACHE_REFRESH_TEST_MUTATOR.with(|slot| *slot.borrow_mut() = None);
         assert_eq!(symbols[0].name, "original");
         assert_eq!(calls.get(), 3);
+    }
+
+    /// Outline parse facts share the symbol cache entry's freshness on every
+    /// retry attempt, including the last one that skips the cache snapshot.
+    /// Contention forces that last attempt; when the file also changes under
+    /// it, the fresh symbols must not be paired with the facts of the old
+    /// content, and the next outline must show the new file.
+    #[test]
+    fn final_uncached_attempt_never_pairs_fresh_symbols_with_stale_outline_facts() {
+        for rewrite in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("product.rs");
+            std::fs::write(
+                &file,
+                "pub fn product() {}\n#[cfg(test)]\nmod checks {\n    #[test]\n    fn case() {}\n}\n",
+            )
+            .unwrap();
+            filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+            let cache: SharedSymbolCache = Arc::new(RwLock::new(SymbolCache::new()));
+            let ctx = crate::context::AppContext::new(
+                Box::new(TreeSitterProvider::with_symbol_cache(Arc::clone(&cache))),
+                crate::config::Config::default(),
+            );
+            let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+                "id": "retry-facts", "command": "outline", "files": [&file],
+            }))
+            .unwrap();
+            let outline = || {
+                let response = crate::commands::outline::handle_outline(&request, &ctx);
+                assert!(response.success, "{response:?}");
+                response.data["text"].as_str().unwrap().to_string()
+            };
+            let first = outline();
+            assert!(first.contains("checks:"), "{first}");
+            let mut parser = FileParser::with_symbol_cache(Arc::clone(&cache));
+            assert!(parser.cached_outline(&file).is_some(), "facts were cached");
+
+            // Same content, newer mtime: the snapshot path refreshes metadata,
+            // and the contention below makes every refresh attempt fail.
+            filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(2, 0)).unwrap();
+            let entries = Arc::clone(&cache);
+            let (key, path) = (file.clone(), file.clone());
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let counted = calls.clone();
+            CACHE_REFRESH_TEST_MUTATOR.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let call = counted.get() + 1;
+                    counted.set(call);
+                    entries
+                        .write()
+                        .unwrap()
+                        .entries
+                        .get_mut(&key)
+                        .unwrap()
+                        .mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(call + 2);
+                    if rewrite && call == 3 {
+                        std::fs::write(&path, "pub fn changed() {}\n").unwrap();
+                    }
+                }))
+            });
+            let symbols = parser.extract_symbols(&file).unwrap();
+            CACHE_REFRESH_TEST_MUTATOR.with(|slot| *slot.borrow_mut() = None);
+            assert_eq!(calls.get(), 3, "the last attempt skipped the snapshot");
+
+            let names = symbols
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                parser.cached_has_error(&file),
+                Some(false),
+                "rewrite={rewrite}"
+            );
+            if rewrite {
+                assert_eq!(names, ["changed"]);
+                assert!(
+                    parser.cached_outline(&file).is_none(),
+                    "facts of the old content survived next to the new symbols"
+                );
+                let text = outline();
+                assert!(
+                    text.contains("fn   changed")
+                        && !text.contains("checks")
+                        && !text.contains("fn   product"),
+                    "{text}"
+                );
+            } else {
+                assert!(names.contains(&"product"), "{names:?}");
+                assert_eq!(outline(), first);
+            }
+        }
     }
 
     fn symbols(source: &str, lang: LangId) -> Vec<Symbol> {
