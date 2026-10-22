@@ -8237,10 +8237,38 @@ mod v3_collector_tests {
         }
         assert!(storage.join("blobs/v2").exists(), "views-on never ran");
         assert!(!storage.join("blobs/v3").exists());
-        assert_eq!(
-            fs::read_to_string(storage.join("reader-floor.json")).unwrap(),
-            V0_60_0_FLOOR
-        );
+        // No production path may write a v3 floor key. Every other store in
+        // the floor is either as v0.60.0 left it or at the version this build
+        // writes for it (`PersistedStore::written`, the value its startup
+        // baseline raises to), so version bumps of other stores do not fail
+        // this test while a stray or invented key does.
+        use crate::persisted_format::PersistedStore;
+        let stores = |text: &str| -> BTreeMap<String, u64> {
+            serde_json::from_value(
+                serde_json::from_str::<serde_json::Value>(text).unwrap()["stores"].take(),
+            )
+            .unwrap()
+        };
+        let before = stores(V0_60_0_FLOOR);
+        let floor = fs::read_to_string(storage.join("reader-floor.json")).unwrap();
+        let after = stores(&floor);
+        for v3 in [
+            PersistedStore::ViewsV3Registry,
+            PersistedStore::ViewsV3Store,
+        ] {
+            assert!(!after.contains_key(v3.name()), "v3 floor key: {floor}");
+        }
+        for (name, version) in &after {
+            let store = PersistedStore::from_name(name)
+                .unwrap_or_else(|| panic!("unknown store {name} in the floor: {floor}"));
+            assert!(
+                before.get(name) == Some(version) || u64::from(store.written()) == *version,
+                "{name} at {version} is neither v0.60.0's value nor this build's: {floor}"
+            );
+        }
+        for name in before.keys() {
+            assert!(after.contains_key(name), "{name} left the floor: {floor}");
+        }
     }
 
     #[test]
