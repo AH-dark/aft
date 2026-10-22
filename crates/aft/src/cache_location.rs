@@ -778,9 +778,25 @@ fn pin_storage_root(storage: &Path) -> io::Result<PinnedDir> {
     let resolved = crate::bash_background::persistence::resolve_configured_root(storage)?;
     PinnedDir::repair_open_path(&resolved)
 }
+/// How long preparation waits for a conflicting exclusive hold on a root's
+/// use lock (cache cleanup takes one briefly) before reporting the root busy.
+#[cfg(not(test))]
+const USE_LOCK_WAIT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const USE_LOCK_WAIT: Duration = Duration::from_millis(400);
+
 fn take_shared_pinned(root: PinnedDir) -> io::Result<Arc<CacheLease>> {
     let file = open_use_lock(&root)?;
-    file.try_lock_shared().map_err(storage_lock_error)?;
+    let deadline = std::time::Instant::now() + USE_LOCK_WAIT;
+    loop {
+        match file.try_lock_shared() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(storage_lock_error(error)),
+        }
+    }
     let root_identity = pinned_identity(&root)?;
     Ok(Arc::new(CacheLease {
         _file: file,
@@ -1172,7 +1188,18 @@ pub fn prepare_cache_root(
             let foreign_owner = error
                 .get_ref()
                 .is_some_and(|error| error.is::<ForeignCacheOwner>());
-            config.cache_epoch = if foreign_owner {
+            // A busy use lock (a cleanup holding it past the bounded wait) is
+            // transient: this config reports it, and the next prepare retries.
+            // It is never recorded in the process-wide registry, which would
+            // refuse every later path under the root until a restart.
+            let busy = error.kind() == io::ErrorKind::WouldBlock;
+            config.cache_epoch = if requested.is_none() {
+                // Without `storage.cache_dir` the "cache root" is the durable
+                // storage root itself. The registry only describes separate
+                // cache roots; recording durable storage there would block
+                // backups, bash task records and every other durable write.
+                0
+            } else if foreign_owner || busy {
                 status(&root).1
             } else {
                 set_status(&root, Some(error.to_string()), None)

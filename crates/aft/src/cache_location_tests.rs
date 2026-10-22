@@ -1169,6 +1169,128 @@ fn process_storage_lease_reuses_live_ownership_and_releases_the_last_handle() {
     acquire_cache_cleanup_lease(temp.path()).unwrap();
 }
 
+/// Hold the exclusive side of a root's use lock, as cache cleanup does.
+fn hold_use_lock_exclusively(root: &Path) -> File {
+    fs::create_dir_all(root).unwrap();
+    let holder = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(IN_USE))
+        .unwrap();
+    holder.lock().unwrap();
+    holder
+}
+
+#[test]
+fn cache_location_busy_use_lock_without_cache_dir_never_blocks_durable_writes() {
+    // Without `storage.cache_dir` the use lock sits on durable storage. A
+    // conflict there must report busy and leave durable writes working; once
+    // the lock frees, the next prepare turns caches on, with no restart.
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("storage");
+    let holder = hold_use_lock_exclusively(&storage);
+    let mut config = Config {
+        storage_dir: Some(storage.clone()),
+        ..Default::default()
+    };
+    let warning = prepare_cache_root(&mut config).expect("a held use lock reports busy");
+    assert!(
+        warning.message.contains("storage lease contention"),
+        "{warning:?}"
+    );
+    assert!(cache_unavailable(&config).is_some());
+    drop(holder);
+
+    crate::private_storage::open_root(&storage).expect("durable root refused after busy");
+    crate::private_storage::create_dir_all(storage.join("opencode/backups/session"))
+        .expect("durable backup folder refused after busy");
+    crate::private_storage::write(storage.join("opencode/backups/session/entry"), b"kept")
+        .expect("durable write refused after busy");
+    assert!(prepare_cache_root(&mut config).is_none());
+    assert!(cache_unavailable(&config).is_none());
+}
+
+#[test]
+fn cache_location_use_lock_freed_within_the_bounded_wait_prepares_normally() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("storage");
+    let holder = hold_use_lock_exclusively(&storage);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(60));
+        drop(holder);
+    });
+    let mut config = Config {
+        storage_dir: Some(storage.clone()),
+        ..Default::default()
+    };
+    let warning = prepare_cache_root(&mut config);
+    release.join().unwrap();
+    assert!(warning.is_none(), "{warning:?}");
+    assert!(cache_unavailable(&config).is_none());
+}
+
+#[test]
+fn cache_location_busy_cache_root_recovers_on_the_next_prepare() {
+    let (_temp, storage, artifacts, config) = fixture();
+    let parent = config.cache_dir.clone().unwrap();
+    drop(config);
+    let holder = hold_use_lock_exclusively(&artifacts);
+    let fresh = || Config {
+        storage_dir: Some(storage.clone()),
+        cache_dir: Some(parent.clone()),
+        ..Default::default()
+    };
+    let mut busy = fresh();
+    let warning = prepare_cache_root(&mut busy).expect("a held use lock reports busy");
+    assert!(
+        warning.message.contains("storage lease contention"),
+        "{warning:?}"
+    );
+    assert!(cache_unavailable(&busy).is_some());
+    drop(holder);
+
+    let mut next = fresh();
+    assert!(prepare_cache_root(&mut next).is_none());
+    assert!(cache_unavailable(&next).is_none());
+    crate::private_storage::create_dir_all(artifacts.join("index/after-busy"))
+        .expect("cache write refused after the root recovered");
+    crate::private_storage::create_dir_all(storage.join("opencode/backups/session"))
+        .expect("durable write refused");
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_location_split_root_recovers_when_its_drive_returns() {
+    // An unmounted cache volume is modeled by moving the cache parent away.
+    let (temp, storage, artifacts, config) = fixture();
+    let parent = config.cache_dir.clone().unwrap();
+    drop(config);
+    let away = temp.path().join("unmounted");
+    fs::rename(&parent, &away).unwrap();
+    let fresh = || Config {
+        storage_dir: Some(storage.clone()),
+        cache_dir: Some(parent.clone()),
+        ..Default::default()
+    };
+    let mut missing = fresh();
+    assert!(prepare_cache_root(&mut missing).is_some());
+    assert!(cache_unavailable(&missing).is_some());
+    assert!(crate::private_storage::create_dir_all(artifacts.join("index/while-away")).is_err());
+    assert!(!parent.exists(), "the missing volume was recreated");
+    crate::private_storage::create_dir_all(storage.join("opencode/backups/session"))
+        .expect("durable write refused while the cache volume is away");
+
+    fs::rename(&away, &parent).unwrap();
+    let mut back = fresh();
+    let warning = prepare_cache_root(&mut back);
+    assert!(warning.is_none(), "{warning:?}");
+    assert!(cache_unavailable(&back).is_none());
+    crate::private_storage::create_dir_all(artifacts.join("index/after-return"))
+        .expect("cache write refused after the volume returned");
+}
+
 #[test]
 fn cache_cleanup_upgrade_window_refuses_a_prelease_daemon() {
     let (_temp, storage, artifacts, config) = fixture();
