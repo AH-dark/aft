@@ -177,6 +177,14 @@ cat > "$OC_CONFIG_DIR/tui.json" <<'EOF'
 }
 EOF
 
+# Give OpenCode's config directories ($OC_CONFIG_DIR and the installer's
+# ~/.opencode) the @opencode-ai/plugin install that OpenCode would otherwise
+# run from the npm registry on the first launch, before it loads any plugin.
+# The version comes from the installed OpenCode, and a failed install stops
+# setup here instead of stalling a test launch.
+echo "── Seeding OpenCode config-directory dependencies ──"
+node "$REPO_ROOT/tests/docker/seed-opencode-config-deps.mjs"
+
 # ---- Pre-install locally packed plugin + bridge -----------------------------
 # Install local package artifacts so package metadata and dependency resolution
 # come from this checkout. The Darwin platform package wrapper still comes from

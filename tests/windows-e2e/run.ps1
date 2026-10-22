@@ -378,6 +378,18 @@ $AftConfig = @"
 "@
 Set-Content -Path (Join-Path $ConfigDir "aft.jsonc") -Value $AftConfig
 
+# Give OpenCode's config directories ($ConfigDir, plus ~\.opencode if it
+# exists) the @opencode-ai/plugin install that OpenCode would otherwise run
+# from the npm registry on the first launch, before it loads any plugin. The
+# version comes from the installed OpenCode, and a failed install stops setup
+# here instead of stalling a test launch.
+Write-Host "-- Seeding OpenCode config-directory dependencies --"
+& node (Join-Path $RepoRoot "tests\docker\seed-opencode-config-deps.mjs")
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Failed to seed OpenCode config-directory dependencies (see the message above)" -ForegroundColor Red
+    exit 2
+}
+
 # Inject the locally-built binary into the cache. The aft-bridge resolver's
 # `getCacheDir()` returns `$env:LOCALAPPDATA\aft\bin` on Windows — *not*
 # `$env:USERPROFILE\.cache\aft\bin` — because that's the canonical Windows
@@ -457,11 +469,17 @@ function Run-OpencodeSession {
     try {
         # OpenCode's openai adapter requires SOME api key; aimock ignores it.
         $env:OPENAI_API_KEY = "sk-mock-windows-e2e"
-        # Cold-cache OpenCode forks an npm install of its own default plugin and
-        # joins it under a 5-minute lock before external plugins load (see
-        # tests/docker/test-e2e.sh for the source lines); a slow registry made
-        # that a silent multi-minute stall. AFT needs no host default plugins.
+        # OpenCode's built-in plugins are not needed by AFT. This flag does not
+        # skip the config-directory install described below.
         $env:OPENCODE_DISABLE_DEFAULT_PLUGINS = "true"
+        # Every OpenCode start installs @opencode-ai/plugin into each config
+        # directory without node_modules and loads no external plugin until
+        # that install finishes. The install waits for npm's security audit
+        # request, which can hang for up to 5 minutes when the audit service
+        # stalls, so the cold first launch never loaded AFT within its budget.
+        # This skips only the audit; the install still runs. See
+        # run_opencode_session in tests/docker/test-e2e.sh for the source lines.
+        $env:npm_config_audit = "false"
 
         # On Windows, `npm install -g opencode-ai` deposits THREE shims at
         # %APPDATA%\npm\:

@@ -213,16 +213,27 @@ run_opencode_session() {
     # OPENAI_API_KEY required for OpenCode's openai adapter to make requests.
     # `timeout` is only a safety bound; a healthy scripted session must exit 0.
     #
-    # OPENCODE_DISABLE_DEFAULT_PLUGINS: on a cold cache, OpenCode's config load
-    # forks an `npm install` of its own default plugin (@opencode-ai/plugin) into
-    # .opencode/node_modules and plugin init joins that fiber under a 5-minute
-    # lock before any external plugin loads (bootstrap.ts:34-38, config.ts:452-471,
-    # plugin/index.ts:199, npm.ts:80-113). A slow registry turned that join into a
-    # silent multi-minute stall with no log line and no provider request. AFT
-    # does not need the host's default plugins, so skip the install.
+    # npm_config_audit=false: on every start OpenCode 1.19.x installs
+    # @opencode-ai/plugin into each config directory that has no node_modules
+    # (packages/opencode/src/config/config.ts:452, through Arborist in
+    # packages/core/src/npm.ts:88-116), and plugin init waits for that install
+    # before loading any external plugin, AFT included
+    # (packages/opencode/src/plugin/index.ts:184). Arborist does not finish an
+    # install until npm's security audit request
+    # (POST registry.npmjs.org/-/npm/v1/security/advisories/bulk) answers, and
+    # that request may wait up to npm-registry-fetch's 5-minute timeout. When
+    # the audit service stalled, the first launch printed nothing and never
+    # loaded the plugin within its budget, even though the packages themselves
+    # were installed within seconds. OpenCode reads npm_config_* from its
+    # environment (packages/core/src/npm-config.ts), so this skips only the
+    # audit; the install still runs. The test never uses the audit result.
+    #
+    # OPENCODE_DISABLE_DEFAULT_PLUGINS skips OpenCode's built-in plugins, which
+    # AFT does not need. It does not skip the config-directory install above.
     TMPDIR="$AIMOCK_RUN_DIR" \
     OPENAI_API_KEY=sk-mock-e2e-test \
     OPENCODE_DISABLE_DEFAULT_PLUGINS=true \
+    npm_config_audit=false \
     timeout --signal=KILL "$timeout_secs" opencode run \
         --model "mock/mock-model" \
         "$prompt" \

@@ -91,6 +91,14 @@ RUN echo '{ \
   "plugin": ["@cortexkit/aft-opencode"] \
 }' > /root/.config/opencode/tui.json
 
+# Give OpenCode's config directories (/root/.config/opencode and the installer's
+# /root/.opencode) the @opencode-ai/plugin install that OpenCode would otherwise
+# run from the npm registry on the first launch, before it loads any plugin.
+# The version comes from the installed OpenCode, and a failed install fails
+# this build step instead of stalling a test launch.
+COPY tests/docker/seed-opencode-config-deps.mjs /tmp/seed-opencode-config-deps.mjs
+RUN node /tmp/seed-opencode-config-deps.mjs && rm /tmp/seed-opencode-config-deps.mjs
+
 # Pre-install the locally packed AFT plugin + bridge so package metadata and
 # dependency resolution come from the code under test. The config above points
 # directly at this dist entry; a bare package spec makes OpenCode run npm add
