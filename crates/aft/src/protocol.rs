@@ -468,6 +468,8 @@ pub const DEFAULT_SESSION_ID: &str = "__default__";
 /// dispatch on `command` and pull specific params from the flattened `params`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawRequest {
+    /// Unique while pending on one standalone connection, across all sessions.
+    /// Reusing an ID is allowed after the earlier response has completed.
     pub id: String,
     #[serde(alias = "method")]
     pub command: String,

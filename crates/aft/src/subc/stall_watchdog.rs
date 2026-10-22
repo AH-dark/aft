@@ -240,6 +240,7 @@ pub(super) struct FrameLoopTestHooks {
     pub(super) metrics: Arc<DispatchPathMetrics>,
     pub(super) config: Option<StallWatchdogConfig>,
     pub(super) before_frame: Arc<dyn Fn() + Send + Sync>,
+    pub(super) writer_setup: Option<Arc<dyn Fn(super::WriterSender) + Send + Sync>>,
 }
 
 /// Handle to the watchdog thread. Dropping it stops the thread without
@@ -1011,6 +1012,7 @@ mod tests {
                 metrics: Arc::clone(&metrics),
                 config: Some(config),
                 before_frame,
+                writer_setup: None,
             };
             let (mut daemon, module_stream) = tokio::io::duplex(64 * 1024);
             let executor = Arc::new(crate::executor::Executor::new());

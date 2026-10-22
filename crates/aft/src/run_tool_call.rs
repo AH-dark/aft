@@ -823,7 +823,7 @@ fn raw_request_from_translated(
     ctx: &ToolCallContext,
 ) -> Result<RawRequest, &'static str> {
     if params.contains_key("method") {
-        return Err("duplicate field `command`");
+        return Err("argument `method` is reserved");
     }
 
     if ctx.preview {
@@ -1499,6 +1499,30 @@ mod tests {
         }
 
         #[test]
+        fn reserved_method_diagnostic_names_supplied_argument_and_preserves_error_code() {
+            let app = AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config::default(),
+            );
+            let result = prepare_tool_call(
+                "ping",
+                json!({"method": "agent-supplied-command"}),
+                &crate::subc_format::FormatContext::default(),
+                &context(false),
+                &app,
+                None,
+            );
+            let Err(result) = result else {
+                panic!("reserved argument must not dispatch")
+            };
+            assert_eq!(result.response.data["code"], "invalid_request");
+            assert_eq!(
+                result.response.data["message"],
+                "failed to build request from tool call: argument `method` is reserved"
+            );
+        }
+
+        #[test]
         fn direct_raw_request_preserves_method_alias_rejection() {
             let params = object(json!({"method": "agent-supplied-command"}));
             let ctx = context(false);
@@ -1508,7 +1532,8 @@ mod tests {
             let legacy_error = legacy_raw_request("read".to_string(), params, &ctx)
                 .expect_err("legacy path rejects the duplicate alias");
 
-            assert_eq!(direct_error, legacy_error);
+            assert_eq!(direct_error, "argument `method` is reserved");
+            assert_eq!(legacy_error, "duplicate field `command`");
         }
 
         #[test]

@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::protocol::Response;
-use crate::subc_translate::resolve_path_from_project_root;
 use serde_json::Value;
 
 const MAX_UNCHECKED_FILES_IN_FOOTER: usize = 10;
@@ -132,31 +131,31 @@ fn agent_specified_read_range(arguments: &Value) -> bool {
         || obj.contains_key("limit")
 }
 
-fn outline_mode_for_call(bare_name: &str, arguments: &Value, project_root: &Path) -> OutlineMode {
-    if bare_name != "outline" {
-        return OutlineMode::Text;
-    }
-    let Some(obj) = arguments.as_object() else {
-        return OutlineMode::Text;
-    };
-    if obj
-        .get("files")
-        .and_then(crate::subc_translate::model_boolean)
-        == Some(true)
+fn outline_mode_for_call(bare_name: &str, arguments: &Value, _project_root: &Path) -> OutlineMode {
+    if bare_name == "outline"
+        && arguments
+            .get("files")
+            .and_then(crate::subc_translate::model_boolean)
+            == Some(true)
     {
-        return OutlineMode::Files;
+        OutlineMode::Files
+    } else {
+        OutlineMode::Text
     }
-    let Some(target) = obj.get("target").and_then(Value::as_str) else {
-        return OutlineMode::Text;
-    };
-    if target.starts_with("http://") || target.starts_with("https://") {
-        return OutlineMode::Text;
-    }
-    let resolved = resolve_path_from_project_root(project_root, target);
-    if std::fs::metadata(resolved)
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
+}
+
+fn executed_outline_mode(data: &Value) -> OutlineMode {
+    // files, files_list_envelope, or unchecked_files identify a files-table reply;
+    // discovered=true identifies a directory-discovery reply. Select its renderer
+    // from that completed reply, without consulting request hints or the target.
+    if data.get("files").is_some_and(Value::is_array)
+        || data
+            .get("files_list_envelope")
+            .is_some_and(Value::is_object)
+        || data.get("unchecked_files").is_some_and(Value::is_array)
     {
+        OutlineMode::Files
+    } else if data.get("discovered").and_then(Value::as_bool) == Some(true) {
         OutlineMode::DirectoryJson
     } else {
         OutlineMode::Text
@@ -314,7 +313,7 @@ pub(crate) fn format_response_unbounded(
         "grep" => format_grep(data),
         "glob" => format_glob_response(data),
         "search" => format_search(data),
-        "outline" => format_outline(response, ctx.outline_mode),
+        "outline" => format_outline(response, executed_outline_mode(&response.data)),
         "zoom" => format_zoom(data, ctx),
         "inspect" => format_inspect(response),
         "status" => format_status(data),
@@ -5228,5 +5227,63 @@ mod glob_skip_reason_note_tests {
         .expect("a version-check timeout is actionable");
         assert!(note.contains("formatter_version_check_timeout"), "{note}");
         assert!(!note.contains("unsupported_language"), "{note}");
+    }
+}
+#[cfg(test)]
+mod executed_outline_mode_tests {
+    use super::*;
+
+    #[test]
+    fn outline_format_context_does_not_resolve_or_stat_targets() {
+        let source = include_str!("subc_format.rs");
+        let helper = source
+            .split("fn outline_mode_for_call(")
+            .nth(1)
+            .unwrap()
+            .split("fn callgraph_op_for_call")
+            .next()
+            .unwrap();
+        assert!(!helper.contains("std::fs::metadata"));
+        assert!(!helper.contains("resolve_path_from_project_root"));
+    }
+
+    #[test]
+    fn executed_outline_text_does_not_inherit_a_stale_directory_mode() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        let context = FormatContext::from_tool_call(
+            "outline",
+            &serde_json::json!({"target":"target"}),
+            root.path(),
+        );
+        std::fs::remove_dir(root.path().join("target")).unwrap();
+        std::fs::write(root.path().join("target"), "file now").unwrap();
+        let response = Response::success(
+            "outline",
+            serde_json::json!({"text":"file result", "complete":false}),
+        );
+        assert_eq!(
+            format_response_with_context("outline", &response, &context),
+            "file result"
+        );
+    }
+
+    #[test]
+    fn executed_outline_files_metadata_selects_its_partial_disclosure() {
+        let context = FormatContext::from_tool_call(
+            "outline",
+            &serde_json::json!({"target":"https://example.test/outline"}),
+            Path::new("/absent"),
+        );
+        let response = Response::success(
+            "outline",
+            serde_json::json!({"text":"table", "files":[], "complete":false, "unchecked_files":["src/b.ts"]}),
+        );
+        let rendered = format_response_with_context("outline", &response, &context);
+        assert!(rendered.contains("Partial result"), "{rendered}");
+        assert!(
+            rendered.contains("Unchecked files:\n  src/b.ts"),
+            "{rendered}"
+        );
     }
 }

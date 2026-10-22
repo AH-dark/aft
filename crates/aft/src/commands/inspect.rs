@@ -8069,7 +8069,9 @@ mod deferred_terminal_tests {
             .expect("detached inspect reaches body gate");
 
         let mut registry = crate::response_finalize::PendingResponses::default();
-        registry.register(pending);
+        registry
+            .register(pending)
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
         let shutdown = registry.drain_on_shutdown_with(&ctx);
         assert_eq!(shutdown.len(), 1);
         assert_eq!(

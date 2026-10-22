@@ -730,8 +730,16 @@ pub fn resolve_config_for_harness(
 
     let mut parsed = Vec::with_capacity(tiers.len());
     for tier in tiers {
-        let Some(outcome) = parse_tier(tier) else {
-            continue;
+        let outcome = match parse_tier(tier, harness, &mut warnings) {
+            Ok(outcome) => outcome,
+            Err(errors) => {
+                return ResolveResult {
+                    config: Config::default(),
+                    dropped,
+                    warnings,
+                    errors,
+                }
+            }
         };
         let (raw, translation) = outcome;
         if translation.legacy_input {
@@ -970,11 +978,16 @@ fn first_superseded_note(source: &str, key: &str, message: &str) -> bool {
         .insert(format!("{source}\u{0}{key}\u{0}{message}"))
 }
 
-fn parse_tier(tier: &ConfigTier) -> Option<(RawAftConfig, feature_config::DocumentTranslation)> {
+fn parse_tier(
+    tier: &ConfigTier,
+    harness: Option<&Harness>,
+    warnings: &mut Vec<ConfigWarning>,
+) -> Result<(RawAftConfig, feature_config::DocumentTranslation), Vec<String>> {
     let stripped = strip_jsonc(&tier.doc);
-    let value = serde_json::from_str::<Value>(&stripped).ok()?;
+    let value = serde_json::from_str::<Value>(&stripped)
+        .map_err(|_| vec!["invalid_config_document".to_string()])?;
     let Value::Object(mut map) = value else {
-        return None;
+        return Err(vec!["invalid_config_document".to_string()]);
     };
     // Retired keys are translated on the raw document, before the strict
     // schema sees it, so they never reach `RawAftConfig`. Only the user
@@ -986,20 +999,114 @@ fn parse_tier(tier: &ConfigTier) -> Option<(RawAftConfig, feature_config::Docume
     };
     let translation = feature_config::translate_document(&mut map, document_tier);
 
+    let security_errors = malformed_security_config_errors(&map, harness);
+    if !security_errors.is_empty() {
+        return Err(security_errors);
+    }
+
     let raw = match serde_json::from_value::<RawAftConfig>(Value::Object(map.clone())) {
         Ok(config) => config,
-        Err(_) => parse_config_partially(map),
+        Err(_) => parse_config_partially(map, tier, warnings),
     };
-    Some((raw, translation))
+    Ok((raw, translation))
+}
+
+fn security_config_section(key: &str, harness: Option<&Harness>) -> bool {
+    matches!(
+        key,
+        "restrict_to_project_root"
+            | "url_fetch_allow_private"
+            | "sandbox"
+            | "indexes"
+            | "index"
+            | "remote_exec"
+            | "disabled_tools"
+            | "bash"
+            | "lsp"
+            | "semantic"
+            | "search"
+            | "subc"
+            | "opencode"
+            | "github"
+            | "gh_shim"
+    ) || (key == "auto_update" && !matches!(harness, Some(Harness::Pi)))
+}
+
+fn malformed_security_config_errors(
+    map: &Map<String, Value>,
+    harness: Option<&Harness>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (key, value) in map {
+        if !security_config_section(key, harness) {
+            continue;
+        }
+        let mut field = Map::new();
+        field.insert(key.clone(), value.clone());
+        if value.is_null() || serde_json::from_value::<RawAftConfig>(Value::Object(field)).is_err()
+        {
+            errors.push(format!("invalid_security_config:{key}"));
+        }
+    }
+    if let Some(harness) = harness {
+        let label = harness.wire_label();
+        if let Some(blocks) = map.get("harnesses") {
+            match blocks.as_object() {
+                None => errors.push("invalid_security_config:harnesses".into()),
+                Some(blocks) => {
+                    if let Some(block) = blocks.get(&label) {
+                        if let Some(block) = block.as_object() {
+                            let mut block = block.clone();
+                            block.remove("harnesses");
+                            let invalid: Vec<_> = block
+                                .iter()
+                                .filter_map(|(key, value)| {
+                                    let mut field = Map::new();
+                                    field.insert(key.clone(), value.clone());
+                                    (value.is_null()
+                                        || serde_json::from_value::<RawAftConfig>(Value::Object(
+                                            field,
+                                        ))
+                                        .is_err())
+                                    .then_some(key)
+                                })
+                                .collect();
+                            let invalid_security: Vec<_> = invalid
+                                .iter()
+                                .filter(|key| security_config_section(key, Some(harness)))
+                                .collect();
+                            if !invalid_security.is_empty() {
+                                errors.extend(invalid_security.into_iter().map(|key| {
+                                    format!("invalid_security_config:harnesses.{label}.{key}")
+                                }));
+                            } else if !invalid.is_empty()
+                                && block
+                                    .keys()
+                                    .any(|key| security_config_section(key, Some(harness)))
+                            {
+                                // A strict harness parse would discard the whole block,
+                                // including its otherwise-valid explicit hardening.
+                                errors.push(format!("invalid_security_config:harnesses.{label}"));
+                            }
+                        } else {
+                            errors.push(format!("invalid_security_config:harnesses.{label}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    errors.sort();
+    errors.dedup();
+    errors
 }
 
 /// Return why a tier would be accepted only by the lenient resolver, or
 /// `None` when it passes strict validation.
 ///
-/// [`resolve_config_for_harness`] skips a tier whose text does not parse,
-/// resolves a tier with one bad value by dropping that key to its default,
-/// and ignores an invalid block for the active harness with only a warning.
-/// A connect keeps that behaviour. A live reload must not: a typo would reset
+/// Initial configuration rejects malformed security-sensitive settings and
+/// reports discarded nonsecurity settings. A live reload rejects every schema
+/// error: a typo must not reset
 /// a key (possibly a security key the harness block set) to its default while
 /// the root stays bound, so the reload calls this first and keeps the last
 /// valid configuration instead. Retired keys are translated first, exactly as
@@ -1081,14 +1188,26 @@ fn blocked_bash_env_key(raw: &RawAftConfig) -> Option<&str> {
         .map(String::as_str)
 }
 
-fn parse_config_partially(raw_config: Map<String, Value>) -> RawAftConfig {
+fn parse_config_partially(
+    raw_config: Map<String, Value>,
+    tier: &ConfigTier,
+    warnings: &mut Vec<ConfigWarning>,
+) -> RawAftConfig {
     let mut partial = RawAftConfig::default();
 
     for (key, value) in raw_config {
         let mut one_field = Map::new();
-        one_field.insert(key, value);
+        one_field.insert(key.clone(), value);
         if let Ok(section) = serde_json::from_value::<RawAftConfig>(Value::Object(one_field)) {
             merge_trusted_config(&mut partial, section);
+        } else {
+            warnings.push(ConfigWarning {
+                code: "invalid_config_section",
+                key: "config",
+                tier: tier.tier.clone(),
+                value: "[discarded]".into(),
+                message: format!("Discarded invalid configuration section: {key}"),
+            });
         }
     }
 
@@ -2987,6 +3106,137 @@ mod tests {
     use super::*;
 
     #[test]
+    fn discarded_nonsecurity_sections_are_named_without_rejecting_valid_settings() {
+        let result = resolve_config(&[tier(
+            "user",
+            r#"{"inspect":{"categories":{"diagnostics":"off"}},"format_on_edit":true}"#,
+        )]);
+        assert!(result.errors.is_empty());
+        assert!(result.config.format_on_edit);
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "invalid_config_section"
+                && warning.message == "Discarded invalid configuration section: inspect"));
+    }
+
+    #[test]
+    fn malformed_active_harness_hardening_rejects_but_inactive_blocks_stay_opaque() {
+        let tier = tier(
+            "user",
+            r#"{"harnesses":{"opencode":{"sandbox":{"profile":{"worker":5}}},"pi":{"sandbox":{"profile":{"worker":"strict"}}}}}"#,
+        );
+        let rejected =
+            resolve_config_for_harness(std::slice::from_ref(&tier), Some(&Harness::Opencode));
+        assert_eq!(
+            rejected.errors,
+            ["invalid_security_config:harnesses.opencode.sandbox"]
+        );
+        let accepted = resolve_config_for_harness(&[tier], Some(&Harness::Pi));
+        assert!(accepted.errors.is_empty());
+        assert_eq!(
+            accepted.config.sandbox.profile.worker,
+            crate::config::SandboxMode::Strict
+        );
+    }
+
+    #[test]
+    fn malformed_security_sections_reject_candidate_without_resetting_last_good() {
+        for (key, value) in [
+            ("sandbox", serde_json::json!({"profile": {"worker": 5}})),
+            ("indexes", serde_json::json!({"semantic":"off"})),
+            ("remote_exec", serde_json::json!({"enabled":"off"})),
+            ("disabled_tools", serde_json::json!("aft_write")),
+            ("restrict_to_project_root", serde_json::json!(1)),
+        ] {
+            let tier = ConfigTier {
+                tier: "user".into(),
+                source: "malformed-security.jsonc".into(),
+                doc: serde_json::json!({key:value, "format_on_edit":true}).to_string(),
+            };
+            let mut last_good = Config {
+                restrict_to_project_root: true,
+                ..Config::default()
+            };
+            let before = serde_json::to_value(&last_good).unwrap();
+            let diagnostics = resolve_config_onto_with_diagnostics(&[tier], &mut last_good);
+            assert_eq!(
+                diagnostics.errors,
+                [format!("invalid_security_config:{key}")]
+            );
+            assert_eq!(
+                serde_json::to_value(&last_good).unwrap(),
+                before,
+                "rejected {key} must not reset published hardening"
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_tier_document_does_not_silently_publish_defaults() {
+        let tier = ConfigTier {
+            tier: "user".into(),
+            source: "broken.jsonc".into(),
+            doc: "{".into(),
+        };
+        assert_eq!(resolve_config(&[tier]).errors, ["invalid_config_document"]);
+    }
+
+    #[test]
+    fn malformed_security_root_and_active_harness_sections_fail_closed() {
+        for key in [
+            "restrict_to_project_root",
+            "url_fetch_allow_private",
+            "sandbox",
+            "indexes",
+            "index",
+            "remote_exec",
+            "disabled_tools",
+            "bash",
+            "lsp",
+            "semantic",
+            "search",
+            "subc",
+            "opencode",
+            "github",
+            "gh_shim",
+            "auto_update",
+        ] {
+            let root = tier("user", &serde_json::json!({key: null}).to_string());
+            assert_eq!(
+                resolve_config_for_harness(&[root], Some(&Harness::Opencode)).errors,
+                [format!("invalid_security_config:{key}")]
+            );
+            let active = tier(
+                "project",
+                &serde_json::json!({"harnesses": {"opencode": {key: null}}}).to_string(),
+            );
+            assert_eq!(
+                resolve_config_for_harness(&[active], Some(&Harness::Opencode)).errors,
+                [format!("invalid_security_config:harnesses.opencode.{key}")]
+            );
+        }
+        let mixed = tier(
+            "user",
+            r#"{"harnesses":{"opencode":{"sandbox":{"profile":{"worker":"strict"}},"inspect":false}}}"#,
+        );
+        assert_eq!(
+            resolve_config_for_harness(&[mixed], Some(&Harness::Opencode)).errors,
+            ["invalid_security_config:harnesses.opencode"]
+        );
+        let pi = tier("user", r#"{"auto_update":"opaque"}"#);
+        assert!(resolve_config_for_harness(&[pi], Some(&Harness::Pi))
+            .errors
+            .is_empty());
+        for doc in ["null", "[]", "false", "1"] {
+            assert_eq!(
+                resolve_config(&[tier("project", doc)]).errors,
+                ["invalid_config_document"]
+            );
+        }
+    }
+
+    #[test]
     fn project_merge_moves_owned_semantic_section_without_cloning() {
         let mut base: RawAftConfig = serde_json::from_value(serde_json::json!({
             "semantic": {"model": "owned-user-model"}
@@ -3366,9 +3616,9 @@ mod tests {
 
     /// `bash.worker_wait_max_ms` defaults to 30 minutes, a project may set it
     /// (it only changes how long a worker waits), and a value below the
-    /// one-minute minimum is rejected with a message naming the key instead of
-    /// being clamped: the invalid `bash` block is dropped, the strict check a
-    /// live reload runs refuses the file, and the other sections still apply.
+    /// one-minute minimum is rejected instead of clamped. An invalid bash block
+    /// can discard permission/scope settings, so initial load and live reload
+    /// both refuse the candidate rather than applying neighboring settings.
     #[test]
     fn bash_worker_wait_max_defaults_accepts_project_and_rejects_below_minimum() {
         assert_eq!(
@@ -3397,13 +3647,7 @@ mod tests {
             "{error}"
         );
         let resolved = resolve_config(&[below]);
-        assert_eq!(
-            resolved.config.bash.worker_wait_max_ms,
-            DEFAULT_BASH_WORKER_WAIT_MAX_MS
-        );
-        // The whole invalid `bash` block is dropped, so `compress` stays on.
-        assert!(resolved.config.experimental_bash_compress);
-        assert!(!resolved.config.format_on_edit);
+        assert_eq!(resolved.errors, ["invalid_security_config:bash"]);
 
         let minimum = resolve_config(&[tier(
             "user",
@@ -4587,10 +4831,14 @@ mod tests {
 
     #[test]
     fn config_resolve_bash_foreground_wait_clamps_to_floor() {
-        let Some((raw, _)) = parse_tier(&tier(
-            "user",
-            r#"{ "bash": { "foreground_wait_window_ms": 1, "subagent_background": true } }"#,
-        )) else {
+        let Ok((raw, _)) = parse_tier(
+            &tier(
+                "user",
+                r#"{ "bash": { "foreground_wait_window_ms": 1, "subagent_background": true } }"#,
+            ),
+            None,
+            &mut Vec::new(),
+        ) else {
             panic!("test tier should parse");
         };
         let mut warnings = Vec::new();

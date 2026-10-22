@@ -3244,6 +3244,7 @@ async fn expire_pending_bash_asks(
 async fn handle_bash_elicitation_reply(
     tx: &WriterSender,
     frame: &Frame,
+    authorization_failed: bool,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
@@ -3262,6 +3263,32 @@ async fn handle_bash_elicitation_reply(
     let Some(pending) = pending_bash_asks.remove(&key) else {
         return Ok(());
     };
+
+    // Replies, cancellation, and drain all remove the pending permission entry
+    // before answering; only the first removal can send its tool terminal.
+    // Only results returned through LedgerEdge::ready can set authorization_failed;
+    // consumer-sent elicitation errors still take the ordinary denial path.
+    if authorization_failed {
+        let completion = bash::bash_authorization_failed_completion(
+            pending.route,
+            pending.tool_corr,
+            pending.tool_flags,
+            pending.tool_ver,
+            pending.root,
+            pending.request_id,
+            pending.format_context,
+        );
+        return bash::handle_bash_deferred_completion(
+            tx,
+            completion,
+            routes,
+            live_roots,
+            route_bash_cancels,
+            shutdown,
+            metrics,
+        )
+        .await;
+    }
 
     if frame.header.ty == FrameType::Response && bash_elicitation_reply_is_allow(&frame.body) {
         if routes.contains_key(&key.route) {
@@ -4771,13 +4798,26 @@ where
         watchdog_config,
     );
     let (writer_tx, writer_rx) = mpsc::channel::<WriterFrame>(WRITER_QUEUE_CAPACITY);
-    let writer_task = spawn_writer_task(write, writer_rx, Arc::clone(&dispatch_path_metrics));
+    let (pong_tx, pong_rx) = mpsc::channel::<WriterFrame>(WRITER_QUEUE_CAPACITY);
+    let writer_task = spawn_writer_task(
+        write,
+        writer_rx,
+        pong_rx,
+        Arc::clone(&dispatch_path_metrics),
+    );
     let (ledger_edge, mut ledger_ready_rx) = tool_provider::LedgerEdge::new();
     let (writer_tx, mut ledger_writer_task) = ledger_edge.proxy(
         writer_tx,
         Arc::clone(&executor),
         Arc::clone(&dispatch_path_metrics),
     );
+    #[cfg(test)]
+    if let Some(observer) = watchdog_test
+        .as_ref()
+        .and_then(|hooks| hooks.writer_setup.as_ref())
+    {
+        observer(writer_tx.clone());
+    }
     let control_replies = readiness::PendingControlReplies::default();
     let (negotiated_ver, advertised_ops) = hello_ack.map_or((PROTOCOL_VERSION, vec![]), |ack| {
         (ack.negotiated_ver, ack.subc_ops)
@@ -5237,7 +5277,7 @@ where
                             Ok(pong) => pong,
                             Err(error) => break Err(SubcError::FrameBuild(error)),
                         };
-                        if let Err(error) = send_frame(&writer_tx, &dispatch_path_metrics, pong).await {
+                        if let Err(error) = send_reliable_writer_frame(&pong_tx, &dispatch_path_metrics, pong, "Pong control reply").await {
                             break Err(error);
                         }
                     }
@@ -5295,8 +5335,9 @@ where
                         let frame = decoded.frame;
                         if let Err(error) = handle_bash_elicitation_reply(
                             &writer_tx,
-                            &frame,
-                            &mut pending_bash_asks,
+                             &frame,
+                             ledger_waited && frame.header.ty == FrameType::Error,
+                             &mut pending_bash_asks,
                             &routes,
                             &mut live_roots,
                             &executor,
@@ -6241,6 +6282,7 @@ where
     // live; the writer tasks cannot drain while the handle is alive.
     drop(control);
     drop(writer_tx);
+    drop(pong_tx);
     if tokio::time::timeout(Duration::from_secs(5), &mut ledger_writer_task)
         .await
         .is_err()
@@ -6333,6 +6375,7 @@ fn spawn_stall_watchdog(
 fn spawn_writer_task<W>(
     mut write: W,
     mut rx: mpsc::Receiver<WriterFrame>,
+    mut pong_rx: mpsc::Receiver<WriterFrame>,
     metrics: Arc<DispatchPathMetrics>,
 ) -> JoinHandle<Result<(), subc_transport::FrameIoError>>
 where
@@ -6340,7 +6383,32 @@ where
 {
     tokio::spawn(async move {
         let mut write_buffer = Vec::new();
-        while let Some(mut queued) = rx.recv().await {
+        let mut bulk_open = true;
+        let mut pong_open = true;
+        let mut prefer_pong = true;
+        loop {
+            // Pongs may precede queued tool replies, but never interrupt a frame
+            // already being written. Alternate ready lanes so sustained Pings
+            // cannot starve tool replies.
+            let (queued, control) = if prefer_pong {
+                tokio::select! {
+                    biased;
+                    item = pong_rx.recv(), if pong_open => { pong_open = item.is_some(); (item, true) }
+                    item = rx.recv(), if bulk_open => { bulk_open = item.is_some(); (item, false) }
+                    else => break,
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    item = rx.recv(), if bulk_open => { bulk_open = item.is_some(); (item, false) }
+                    item = pong_rx.recv(), if pong_open => { pong_open = item.is_some(); (item, true) }
+                    else => break,
+                }
+            };
+            let Some(mut queued) = queued else {
+                continue;
+            };
+            prefer_pong = !control;
             let measure = queued.tool_response_trace.is_some();
             let dequeued = measure.then(Instant::now);
             metrics.writer_active.store(true, Ordering::Relaxed);
@@ -21767,5 +21835,264 @@ mod admission_mechanism_tests {
             body.find(".min_by(").unwrap() < body.find("ctx.config().as_ref().clone()").unwrap()
         );
         assert!(!body.contains(".collect::<Vec<_>>()"));
+    }
+}
+
+#[cfg(test)]
+mod pong_priority_tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll, Waker};
+
+    #[derive(Default)]
+    struct Gate {
+        blocked: AtomicBool,
+        waiter: StdMutex<Option<Waker>>,
+        entered: Notify,
+    }
+    impl Gate {
+        fn release(&self) {
+            self.blocked.store(false, Ordering::SeqCst);
+            if let Some(waiter) = self.waiter.lock().unwrap().take() {
+                waiter.wake();
+            }
+        }
+    }
+    struct ReleaseOnDrop(Arc<Gate>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    struct GatedWriter<W> {
+        inner: W,
+        gate: Arc<Gate>,
+    }
+    impl<W: AsyncWrite + Unpin> AsyncWrite for GatedWriter<W> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.gate.blocked.load(Ordering::SeqCst) {
+                *self.gate.waiter.lock().unwrap() = Some(cx.waker().clone());
+                self.gate.entered.notify_one();
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_write(cx, bytes)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn pong_and_bulk_writer_lanes_alternate_and_both_drain_after_close() {
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (bulk_tx, bulk_rx) = mpsc::channel(8);
+        let (pong_tx, pong_rx) = mpsc::channel(8);
+        for index in 0..4 {
+            send_reliable_writer_frame(
+                &bulk_tx,
+                &metrics,
+                Frame::build(
+                    FrameType::Response,
+                    control_flags(),
+                    0,
+                    0,
+                    100 + index,
+                    Vec::new(),
+                )
+                .unwrap(),
+                "bulk fairness",
+            )
+            .await
+            .unwrap();
+            send_reliable_writer_frame(
+                &pong_tx,
+                &metrics,
+                Frame::build(
+                    FrameType::Pong,
+                    control_flags(),
+                    0,
+                    0,
+                    200 + index,
+                    Vec::new(),
+                )
+                .unwrap(),
+                "control fairness",
+            )
+            .await
+            .unwrap();
+        }
+        drop(bulk_tx);
+        drop(pong_tx);
+        let (writer, mut reader) = tokio::io::duplex(1024);
+        let task = spawn_writer_task(writer, bulk_rx, pong_rx, metrics.clone());
+        for index in 0..4 {
+            assert_eq!(
+                read_frame(&mut reader).await.unwrap().unwrap().header.corr,
+                200 + index
+            );
+            assert_eq!(
+                read_frame(&mut reader).await.unwrap().unwrap().header.corr,
+                100 + index
+            );
+        }
+        task.await.unwrap().unwrap();
+        assert_eq!(metrics.writer_queued.load(Ordering::Relaxed), 0);
+        for close_bulk_first in [false, true] {
+            let (bulk_tx, bulk_rx) = mpsc::channel(1);
+            let (pong_tx, pong_rx) = mpsc::channel(1);
+            let sender = if close_bulk_first { &pong_tx } else { &bulk_tx };
+            let ty = if close_bulk_first {
+                FrameType::Pong
+            } else {
+                FrameType::Response
+            };
+            send_reliable_writer_frame(
+                sender,
+                &metrics,
+                Frame::build(ty, control_flags(), 0, 0, 300, Vec::new()).unwrap(),
+                "one surviving lane",
+            )
+            .await
+            .unwrap();
+            drop(bulk_tx);
+            drop(pong_tx);
+            let (writer, mut reader) = tokio::io::duplex(1024);
+            let task = spawn_writer_task(writer, bulk_rx, pong_rx, metrics.clone());
+            assert_eq!(
+                read_frame(&mut reader).await.unwrap().unwrap().header.corr,
+                300
+            );
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(metrics.writer_queued.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn pong_overtakes_saturated_bulk_without_losing_any_terminal() {
+        let storage = tempfile::tempdir().unwrap();
+        let storage_path = storage.path().to_path_buf();
+        let executor = Arc::new(Executor::new());
+        let module_executor = executor.clone();
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let gate = Arc::new(Gate::default());
+        let _release = ReleaseOnDrop(gate.clone());
+        let (setup_tx, mut setup_rx) = mpsc::unbounded_channel();
+        let hooks = stall_watchdog::FrameLoopTestHooks {
+            metrics: metrics.clone(),
+            config: None,
+            before_frame: Arc::new(|| {}),
+            writer_setup: Some(Arc::new(move |writer| {
+                setup_tx.send(writer).unwrap();
+            })),
+        };
+        let (mut daemon, module_stream) = tokio::io::duplex(1024 * 1024);
+        let module_gate = gate.clone();
+        let module = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (read, write) = tokio::io::split(module_stream);
+            runtime.block_on(run_module_loop(
+                read,
+                GatedWriter {
+                    inner: write,
+                    gate: module_gate,
+                },
+                &storage_path.join("connection.json"),
+                App::default_shared(),
+                module_executor,
+                |request, _| Response::success(request.id, json!({})),
+                Some(storage_path.join("user.json")),
+                false,
+                usize::MAX,
+                None,
+                &storage_path,
+                QuiescedLsp::ReapInBackground,
+                None,
+                Some(hooks),
+            ))
+        });
+        let hello = read_frame(&mut daemon).await.unwrap().unwrap();
+        assert_eq!(hello.header.ty, FrameType::Hello);
+        gate.blocked.store(true, Ordering::SeqCst);
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                HELLO_CORR,
+                b"{}".to_vec(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let writer = setup_rx.recv().await.unwrap();
+        let count = 2 * WRITER_QUEUE_CAPACITY + 2;
+        for index in 0..count {
+            let frame = Frame::build(
+                FrameType::Response,
+                control_flags(),
+                0,
+                0,
+                1000 + index as u64,
+                serde_json::to_vec(&json!({"bulk":index})).unwrap(),
+            )
+            .unwrap();
+            send_reliable_writer_frame(&writer, &metrics, frame, "bulk fixture")
+                .await
+                .unwrap();
+            if index == 0 {
+                gate.entered.notified().await;
+            }
+        }
+        assert_eq!(writer.capacity(), 0);
+        let queued = metrics.writer_queued.load(Ordering::Relaxed);
+        write_frame(
+            &mut daemon,
+            &Frame::build(FrameType::Ping, control_flags(), 0, 0, 42, Vec::new()).unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while metrics.writer_queued.load(Ordering::Relaxed) == queued {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("Pong must be admitted while the bulk queues stay full");
+        gate.release();
+        let first = read_frame(&mut daemon).await.unwrap().unwrap();
+        assert_eq!(first.header.corr, 1000);
+        let pong = read_frame(&mut daemon).await.unwrap().unwrap();
+        assert_eq!(pong.header.ty, FrameType::Pong);
+        assert_eq!(pong.header.corr, 42);
+        for index in 1..count {
+            let frame = read_frame(&mut daemon).await.unwrap().unwrap();
+            assert_eq!(frame.header.corr, 1000 + index as u64);
+        }
+        drop(writer);
+        write_frame(
+            &mut daemon,
+            &Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 99, Vec::new()).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(module.join().unwrap().is_ok());
+        assert_eq!(metrics.writer_queued.load(Ordering::Relaxed), 0);
+        assert!(!metrics.writer_active.load(Ordering::Relaxed));
     }
 }

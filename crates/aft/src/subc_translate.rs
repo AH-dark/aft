@@ -2590,15 +2590,18 @@ fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, Tra
                 "'target' must be a non-empty string or array of strings",
             ));
         }
+        let resolved = arr
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let entry = value.as_str().ok_or_else(|| {
+                    invalid_request(format!("outline: target[{index}] must be a string"))
+                })?;
+                let path = resolve_path_from_project_root(project_root, entry);
+                Ok(Value::String(path.to_string_lossy().into_owned()))
+            })
+            .collect::<Result<Vec<Value>, TranslateError>>()?;
         if files_flag {
-            let resolved: Vec<Value> = arr
-                .iter()
-                .filter_map(|v| v.as_str())
-                .map(|entry| {
-                    let p = resolve_path_from_project_root(project_root, entry);
-                    Value::String(p.to_string_lossy().into_owned())
-                })
-                .collect();
             out.insert("target".to_string(), Value::Array(resolved));
             out.insert("files".to_string(), Value::Bool(true));
             return Ok(Translated {
@@ -2606,14 +2609,6 @@ fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, Tra
                 args: out,
             });
         }
-        let resolved: Vec<Value> = arr
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(|entry| {
-                let p = resolve_path_from_project_root(project_root, entry);
-                Value::String(p.to_string_lossy().into_owned())
-            })
-            .collect();
         out.insert("files".to_string(), Value::Array(resolved));
         return Ok(Translated {
             command: "outline".into(),
@@ -5168,6 +5163,37 @@ mod zoom_batch_contract_tests {
             let error = subc_translate("zoom", &args, Path::new("/project")).unwrap_err();
             assert_eq!(error.code, "invalid_request");
             assert!(error.message.contains("'batch' must be a non-empty array"));
+        }
+    }
+}
+#[cfg(test)]
+mod outline_target_validation_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_outline_rejects_every_non_string_target_with_its_index() {
+        for files in [false, true] {
+            for invalid in [
+                serde_json::json!(4),
+                Value::Null,
+                serde_json::json!({"path":"src"}),
+            ] {
+                for index in [0, 1] {
+                    let mut targets = vec![serde_json::json!("src"), serde_json::json!("lib")];
+                    targets[index] = invalid.clone();
+                    let error = subc_translate_owned(
+                        "outline",
+                        serde_json::json!({"target": targets, "files": files}),
+                        Path::new("/project"),
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.code, "invalid_request");
+                    assert_eq!(
+                        error.message,
+                        format!("outline: target[{index}] must be a string")
+                    );
+                }
+            }
         }
     }
 }

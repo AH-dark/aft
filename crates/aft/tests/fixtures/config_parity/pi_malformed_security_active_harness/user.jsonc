@@ -1,0 +1,12 @@
+{
+  "harnesses": {
+    "pi": {
+      "sandbox": {
+        "profile": { "worker": 5 }
+      }
+    },
+    "opencode": {
+      "sandbox": "opaque"
+    }
+  }
+}

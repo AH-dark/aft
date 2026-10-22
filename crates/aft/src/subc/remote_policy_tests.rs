@@ -1427,7 +1427,7 @@ fn exec_remote_catalog_freezes_verbatim_plan_and_carries_rebound_epoch_only() {
 }
 
 #[test]
-fn exec_remote_catalog_validates_vocabulary_and_disables_malformed_routing_only() {
+fn exec_remote_catalog_validates_vocabulary_and_rejects_malformed_routing() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let ctx = context(root.path(), storage.path(), None);
@@ -1483,14 +1483,8 @@ fn exec_remote_catalog_validates_vocabulary_and_disables_malformed_routing_only(
     .enumerate()
     {
         let bind = identity(root.path(), &format!("malformed-{n}"), 7, true);
-        catalog(json!({"preset":"worker","params":malformed}), &bind, &ctx).unwrap();
-        assert!(
-            lookup(&ctx, &RemoteSource::Worker(key(&bind, Some("worker"))))
-                .unwrap()
-                .params
-                .remote_exec
-                .is_none()
-        );
+        catalog(json!({"preset":"worker","params":malformed}), &bind, &ctx).unwrap_err();
+        assert!(lookup(&ctx, &RemoteSource::Worker(key(&bind, Some("worker")))).is_none());
     }
 }
 
@@ -2082,4 +2076,46 @@ fn remote_enabled_catalog_is_rendered_once_after_validation() {
     )
     .is_err());
     assert_eq!(tool_provider::CATALOG_RENDERS.get() - before, 1);
+}
+
+#[test]
+fn malformed_routing_policy_is_refused_before_freeze_and_valid_retry_can_freeze() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    for (index, (field, malformed)) in [
+        ("remote_exec", json!({"remote_exec":{"enabled":"yes"}})),
+        (
+            "remote_exec",
+            json!({"remote_exec":{"enabled":true,"unexpected":1}}),
+        ),
+        ("siblings", json!({"siblings":[4]})),
+        ("siblings", json!({"siblings":["relative/path"]})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let bind = identity(root.path(), &format!("invalid-routing-{index}"), 7, true);
+        let worker_key = key(&bind, Some("worker"));
+        let error =
+            catalog(json!({"preset":"worker", "params":malformed}), &bind, &ctx).unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+        let serialized = serde_json::to_value(&error).unwrap();
+        assert_eq!(serialized["detail"]["field"], format!("params.{field}"));
+        assert!(lookup(&ctx, &RemoteSource::Worker(worker_key.clone())).is_none());
+        catalog(fetch(&plan("broca-worker")), &bind, &ctx).unwrap();
+        let frozen = lookup(&ctx, &RemoteSource::Worker(worker_key.clone())).unwrap();
+        assert!(frozen.params.remote_exec.as_ref().unwrap().enabled);
+        let before = serde_json::to_value(&frozen.params).unwrap();
+        assert!(catalog(json!({"preset":"worker", "params":malformed}), &bind, &ctx).is_err());
+        let after = lookup(&ctx, &RemoteSource::Worker(worker_key)).unwrap();
+        assert_eq!(serde_json::to_value(&after.params).unwrap(), before);
+    }
+    let unscoped = identity(root.path(), "invalid-preflight", 7, false);
+    assert!(catalog(
+        json!({"preset":"worker", "params":{"siblings":[false]}}),
+        &unscoped,
+        &ctx
+    )
+    .is_err());
 }

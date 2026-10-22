@@ -1,0 +1,5 @@
+{
+  "sandbox": {
+    "profile": { "worker": 5 }
+  }
+}

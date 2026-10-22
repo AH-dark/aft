@@ -1082,6 +1082,80 @@ fn read_response_within(
     }
 }
 
+/// Echo requests waiting behind a blocked type checker must leave status reachable.
+/// A duplicate edit must be refused without losing the original edit's terminal reply.
+#[cfg(unix)]
+#[test]
+fn validation_backlog_rejects_overflow_and_duplicate_without_hiding_status() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    let dir = format_test_dir("bounded_validation_backlog");
+    let target = dir.join("target.ts");
+    let started = dir.join("checker-started");
+    let release = dir.join("checker-release");
+    for path in [&target, &started, &release] {
+        let _ = fs::remove_file(path);
+    }
+    fs::write(dir.join("tsconfig.json"), "{}\n").unwrap();
+    let bin_dir = dir.join("node_modules/.bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let stub = bin_dir.join("tsc");
+    fs::write(&stub, format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version 5.0.0'; exit 0; fi\n: > '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nexit 0\n", started.display(), release.display())).unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    warm_executable(&stub, &["--version"]);
+    let _release_guard = ReleaseOnDrop(release.clone());
+    let mut aft = AftProcess::spawn();
+    let configured = aft.send(&json!({"id":"cfg-bounded","command":"configure","harness":"opencode","project_root":dir,"config":user_config(json!({"validate_on_edit":"full","checker":{"typescript":"tsc"}}))}).to_string());
+    assert_eq!(configured["success"], true);
+    aft.send_silent(&json!({"id":"blocked-edit","command":"write","file":target,"content":"const original = 1;\n"}).to_string());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !started.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "checker must enter the release gate"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for number in 0..33 {
+        aft.send_silent(&json!({"id":format!("held-{number}"),"command":"echo","message":format!("held-{number}")}).to_string());
+    }
+    aft.send_silent(
+        &json!({"id":"blocked-edit","command":"write","file":target,"content":"must not execute"})
+            .to_string(),
+    );
+    aft.send_silent(&json!({"id":"status-with-full-backlog","command":"status"}).to_string());
+    let overflow = read_response_within(&mut aft, "held-32", Duration::from_secs(5))
+        .0
+        .expect("held overflow must be refused while validation remains gated");
+    assert_eq!(overflow["code"], "request_queue_full");
+    let duplicate = read_response_within(&mut aft, "blocked-edit", Duration::from_secs(5))
+        .0
+        .expect("duplicate must be refused before it is held");
+    assert_eq!(duplicate["code"], "duplicate_request_id");
+    let status = read_response_within(&mut aft, "status-with-full-backlog", Duration::from_secs(5))
+        .0
+        .expect("status must remain reachable after overflow");
+    assert_eq!(status["success"], true);
+    assert!(!release.exists());
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "const original = 1;\n"
+    );
+    fs::write(&release, "released").unwrap();
+    let original = read_response_within(&mut aft, "blocked-edit", Duration::from_secs(30))
+        .0
+        .expect("original must retain its terminal owner");
+    assert_eq!(original["success"], true);
+    for number in 0..32 {
+        let id = format!("held-{number}");
+        let response = read_response_within(&mut aft, &id, Duration::from_secs(30))
+            .0
+            .expect("held request must replay");
+        assert_eq!(response["message"], id);
+    }
+    assert!(aft.shutdown().success());
+}
+
 /// Issue #334: with `validate_on_edit: "full"`, a standalone bridge ran the
 /// type checker on its only request thread, so `status` (5s passive budget)
 /// and `bash_drain_completions` (15s) queued behind every edit and timed out.

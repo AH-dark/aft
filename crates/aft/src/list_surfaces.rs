@@ -307,6 +307,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "standalone_input.rs",
+        enclosing_item: "read_bounded_line, room, push",
+        location_or_primitive: "MAX_LINE_BYTES / MAX_RETAINED_BYTES / MAX_RETAINED_ITEMS / MAX_HELD_BYTES / MAX_HELD_ITEMS",
+        reason: "transport admission and allocation bounds, not result-list cuts; oversized frames and excess held requests receive explicit errors, retained input keeps its budget charge across queue moves",
+    },
+    ExclusionEntry {
         file: "cli/sandbox_launch/landlock_backend.rs",
         enclosing_item: "session_task_read_paths",
         location_or_primitive: "tasks.truncate(MAX_SESSION_READ_TASKS)",
@@ -599,6 +605,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "sweep_records",
         location_or_primitive: "RECORD_SCAN_LIMIT, MAX_RECORDS",
         reason: "background disk-cache maintenance, not an agent-visible list; the scan counts directory entries inside the iterator loop and logs examined, removed and completion counts; a bounded scan refuses a new record until it can certify the 64-record cap",
+    },
+    ExclusionEntry {
+        file: "subc/tool_provider.rs",
+        enclosing_item: "uncertain_settlement_frame",
+        location_or_primitive: "SETTLEMENT_RESULT_EXCERPT_BYTES",
+        reason: "bounded diagnostic byte excerpt of an already formatted terminal, not a result-list cutoff; original_result_truncated explicitly discloses omitted bytes and no replay guarantee is claimed",
     },
     ExclusionEntry {
         file: "logging.rs",
