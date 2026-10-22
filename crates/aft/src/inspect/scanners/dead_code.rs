@@ -4495,12 +4495,16 @@ fn rust_function_body_calls(
     // (`$m!(..)`) can name any local macro, and which one is decided only by
     // the arguments at each expansion. The scanner cannot resolve that, so
     // every template call in this body stays live: a function wrongly reported
-    // dead costs more than a dead one that goes unreported.
+    // dead costs more than a dead one that goes unreported. A template whose
+    // token tree cannot be read (its node is not found, or tree-sitter could
+    // not parse it cleanly) may hide such an invocation, so it is treated the
+    // same way and keeps the calls live.
     let unresolved_invocation = facts.bodies.iter().any(|body| {
         invoked.contains(&body.name)
-            && source
-                .get(body.byte_start..body.byte_end)
-                .is_some_and(rust_template_invokes_metavariable_macro)
+            && rust_template_token_tree(function, body.byte_start - 1, body.byte_end + 1)
+                .is_none_or(|tree| {
+                    tree.has_error() || rust_token_tree_invokes_metavariable_macro(tree)
+                })
     });
     if unresolved_invocation {
         return calls;
@@ -4513,34 +4517,64 @@ fn rust_function_body_calls(
         .collect()
 }
 
-/// Whether template text contains what looks like an invocation of a macro
-/// named by a metavariable, as in `$callback!(..)`: a `$`-prefixed ASCII
-/// identifier followed by optional whitespace and `!` (not `!=`). This is a
-/// text scan, so a match inside a comment or string literal also counts; that
-/// only keeps more calls live.
-fn rust_template_invokes_metavariable_macro(template: &str) -> bool {
-    let bytes = template.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'$' {
-            index += 1;
+/// The `token_tree` node spanning exactly `start..end`, including its
+/// delimiters. Templates nested in another template are token trees of the
+/// outer one, so they are found the same way.
+fn rust_template_token_tree(
+    root: tree_sitter::Node<'_>,
+    start: usize,
+    end: usize,
+) -> Option<tree_sitter::Node<'_>> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let range = node.byte_range();
+        if range.start > start || range.end < end {
             continue;
         }
-        index += 1;
-        let name_start = index;
-        while index < bytes.len() && (bytes[index] == b'_' || bytes[index].is_ascii_alphanumeric())
-        {
-            index += 1;
+        if node.kind() == "token_tree" && range.start == start && range.end == end {
+            return Some(node);
         }
-        if index == name_start {
-            continue;
-        }
-        let mut next = index;
-        while next < bytes.len() && bytes[next].is_ascii_whitespace() {
-            next += 1;
-        }
-        if bytes.get(next) == Some(&b'!') && bytes.get(next + 1) != Some(&b'=') {
-            return true;
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    None
+}
+
+/// Whether a template token tree, at any depth, invokes a macro named by a
+/// metavariable: a `$name` token followed by `!`, with comments and whitespace
+/// allowed in between, as in `$callback /* note */ !(..)`.
+fn rust_token_tree_invokes_metavariable_macro(token_tree: tree_sitter::Node<'_>) -> bool {
+    let mut stack = vec![token_tree];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        // Comments are tree-sitter extras; dropping them lets the `!` after a
+        // comment sit next to the metavariable it follows.
+        let tokens = node
+            .children(&mut cursor)
+            .filter(|child| !child.is_extra())
+            .collect::<Vec<_>>();
+        for (index, token) in tokens.iter().enumerate() {
+            if token.child_count() > 0 {
+                stack.push(*token);
+            }
+            if token.kind() != "metavariable" {
+                continue;
+            }
+            // The grammar's metavariable token covers only an ASCII name, so a
+            // name like `$mé` continues as identifier tokens that start exactly
+            // where the previous token ends.
+            let mut next = index + 1;
+            let mut name_end = token.end_byte();
+            while let Some(part) = tokens
+                .get(next)
+                .filter(|part| part.kind() == "identifier" && part.start_byte() == name_end)
+            {
+                name_end = part.end_byte();
+                next += 1;
+            }
+            if tokens.get(next).is_some_and(|bang| bang.kind() == "!") {
+                return true;
+            }
         }
     }
     false
@@ -9110,14 +9144,90 @@ pub(crate) fn unused() {}
         );
     }
 
+    fn metavariable_macro_fixture_scan(apply: &str) -> Value {
+        stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            &format!(
+                r#"
+fn main() {{
+    macro_rules! target {{ () => {{ helper() }}; }}
+    {apply}
+    apply!(target);
+}}
+pub(crate) fn helper() {{}}
+pub(crate) fn unused() {{}}
+"#
+            ),
+        )])
+    }
+
+    #[test]
+    fn review_metavariable_macro_invocation_after_block_comment_keeps_callee_live() {
+        let aggregate = metavariable_macro_fixture_scan(
+            "macro_rules! apply { ($m:ident) => { $m /* expand */ !() }; }",
+        );
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/main.rs::unused"],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn review_metavariable_macro_invocation_after_line_comment_keeps_callee_live() {
+        let aggregate = metavariable_macro_fixture_scan(
+            "macro_rules! apply { ($m:ident) => { $m // x\n !() }; }",
+        );
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/main.rs::unused"],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn review_unicode_metavariable_macro_invocation_keeps_callee_live() {
+        let aggregate =
+            metavariable_macro_fixture_scan("macro_rules! apply { ($mé:ident) => { $mé!() }; }");
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/main.rs::unused"],
+            "{aggregate:#}"
+        );
+    }
+
     #[test]
     fn rust_template_metavariable_macro_invocation_is_detected() {
-        assert!(rust_template_invokes_metavariable_macro(" $m!() "));
-        assert!(rust_template_invokes_metavariable_macro("$cb ! { x }"));
-        assert!(!rust_template_invokes_metavariable_macro("$a != $b"));
-        assert!(!rust_template_invokes_metavariable_macro("run($f)"));
-        assert!(!rust_template_invokes_metavariable_macro("$ !"));
+        let mut analyzer = DeadCodeFileAnalyzer::default();
+        // Returns (parse error in the template, metavariable invocation found).
+        let mut check = |template: &str| {
+            let source = format!("macro_rules! t {{ () => {{ {template} }}; }}");
+            let tree = analyzer.parse_source(LangId::Rust, &source).unwrap();
+            let mut stack = vec![tree.root_node()];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "macro_rule" {
+                    let right = node.child_by_field_name("right").unwrap();
+                    return (
+                        right.has_error(),
+                        rust_token_tree_invokes_metavariable_macro(right),
+                    );
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.children(&mut cursor));
+            }
+            panic!("no macro rule in {source}");
+        };
+        assert_eq!(check("$m!()"), (false, true));
+        assert_eq!(check("$cb ! { x }"), (false, true));
+        assert_eq!(check("{ inner($f); $m!() }"), (false, true));
+        assert_eq!(check("$a != $b"), (false, false));
+        assert_eq!(check("run($f)"), (false, false));
+        assert_eq!(check("$m; done!()"), (false, false));
+        // A bare `$` does not parse; the caller keeps such a template's calls
+        // live instead of trusting the token scan.
+        assert!(check("$ !").0);
     }
+
     #[test]
     fn used_test_file_exports_are_not_tallied_as_excluded_dead_findings() {
         let (_temp, root, _) = canonical_fixture(&[("tests/helper.rs", "pub fn called() {}\n")]);
