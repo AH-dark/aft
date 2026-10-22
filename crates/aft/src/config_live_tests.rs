@@ -1273,131 +1273,24 @@ fn legacy_project_config_events_trigger_reload_with_an_existing_project_watcher(
 /// test whose `TempDir` removal listed directories while a parent folder's
 /// config watch stopped hung that way.
 ///
-/// Writer threads keep changing the watched directory so reads complete all
-/// the time; lister threads keep opening synchronous handles on a quiet
-/// directory; one thread keeps starting and stopping the watch. Every thread
-/// must keep making progress.
+/// `assert_watch_restarts_never_stall_file_io` keeps changing the watched
+/// directory so reads complete all the time and keeps opening synchronous
+/// handles on a quiet directory, while this test starts and stops the watch.
 #[cfg(windows)]
 #[test]
 fn stopping_a_config_directory_watch_never_stalls_other_file_io() {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-    const WRITERS: usize = 2;
-    const LISTERS: usize = 4;
-    const RUN_FOR: Duration = Duration::from_secs(45);
-    const STALL_LIMIT: Duration = Duration::from_secs(15);
-
-    let temp = tempfile::tempdir().expect("temp dir");
-    let watched = temp.path().join("watched");
-    let quiet = temp.path().join("quiet");
-    std::fs::create_dir_all(&watched).expect("watched dir");
-    std::fs::create_dir_all(&quiet).expect("quiet dir");
-    for index in 0..300 {
-        std::fs::write(quiet.join(format!("entry-{index:03}.txt")), "x").expect("quiet entry");
-    }
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut workers = Vec::new();
-    let mut progress = Vec::new();
-    let mut spawn = |name: String, work: Box<dyn Fn(u64) + Send>| {
-        let counter = Arc::new(AtomicU64::new(0));
-        progress.push((name, Arc::clone(&counter)));
-        let stop = Arc::clone(&stop);
-        workers.push(std::thread::spawn(move || {
-            let mut round = 0;
-            while !stop.load(Ordering::Acquire) {
-                work(round);
-                round += 1;
-                counter.store(round, Ordering::Release);
-            }
-        }));
-    };
-    for writer in 0..WRITERS {
-        let watched = watched.clone();
-        spawn(
-            format!("writer {writer}"),
-            Box::new(move |round| {
-                let file = watched.join(format!("writer-{writer}-{}.txt", round % 8));
-                let _ = std::fs::write(&file, "x");
-                let _ = std::fs::remove_file(&file);
-            }),
-        );
-    }
-    for lister in 0..LISTERS {
-        let quiet = quiet.clone();
-        spawn(
-            format!("lister {lister}"),
-            Box::new(move |_| {
-                if let Ok(entries) = std::fs::read_dir(&quiet) {
-                    let _ = entries.count();
-                }
-            }),
-        );
-    }
-    {
-        let watched = watched.clone();
-        let counters = Arc::new(crate::context::WatcherCounters::default());
-        spawn(
-            "watch start/stop".to_string(),
-            Box::new(move |_| {
-                let (tx, rx) = mpsc::channel();
-                let mut watcher =
-                    new_config_directory_watcher(tx, Arc::clone(&counters)).expect("watcher");
-                watcher
-                    .watch(&watched, notify::RecursiveMode::NonRecursive)
-                    .expect("watch");
-                let _ = rx.recv_timeout(Duration::from_millis(2));
-                let _ = watcher.unwatch(&watched);
-            }),
-        );
-    }
-
-    // Every worker stays under the no-progress limit until it has finished,
-    // including after the stop signal: a worker stuck in the last moments of
-    // the run must fail the test, not leave it waiting on a join forever.
-    let started = Instant::now();
-    let mut seen = vec![(0u64, Instant::now()); progress.len()];
-    loop {
-        std::thread::sleep(Duration::from_millis(100));
-        if started.elapsed() >= RUN_FOR {
-            stop.store(true, Ordering::Release);
-        }
-        let mut running = 0;
-        for (((name, counter), (last, moved_at)), worker) in
-            progress.iter().zip(seen.iter_mut()).zip(&workers)
-        {
-            if worker.is_finished() {
-                continue;
-            }
-            running += 1;
-            let now = counter.load(Ordering::Acquire);
-            if now != *last {
-                *last = now;
-                *moved_at = Instant::now();
-            } else if moved_at.elapsed() > STALL_LIMIT {
-                let stopping = stop.swap(true, Ordering::AcqRel);
-                panic!(
-                    "{name} made no progress for {STALL_LIMIT:?} (stuck after {now} rounds{}) \
-                     while config directory watches started and stopped",
-                    if stopping {
-                        ", after the stop signal"
-                    } else {
-                        ""
-                    }
-                );
-            }
-        }
-        if stop.load(Ordering::Acquire) && running == 0 {
-            break;
-        }
-    }
-    // All workers have finished, so these joins return at once.
-    for worker in workers {
-        worker.join().expect("worker thread");
-    }
-    let cycles = progress
-        .last()
-        .expect("watch cycler")
-        .1
-        .load(Ordering::Acquire);
-    assert!(cycles > 100, "only {cycles} watch start/stop cycles ran");
+    let counters = Arc::new(crate::context::WatcherCounters::default());
+    crate::watcher_backend::assert_watch_restarts_never_stall_file_io(
+        "config directory",
+        move |watched| {
+            let (tx, rx) = mpsc::channel();
+            let mut watcher =
+                new_config_directory_watcher(tx, Arc::clone(&counters)).expect("watcher");
+            watcher
+                .watch(watched, notify::RecursiveMode::NonRecursive)
+                .expect("watch");
+            let _ = rx.recv_timeout(Duration::from_millis(2));
+            let _ = watcher.unwatch(watched);
+        },
+    );
 }

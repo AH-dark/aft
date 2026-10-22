@@ -92,6 +92,15 @@ test-group = 'subc'
 filter = 'test(/^subc_storm_test::/)'
 test-group = 'storm'
 
+# The Windows watch stop/start stress tests keep several threads writing,
+# deleting and listing files for 45 seconds each. Run each one with the whole
+# thread pool to itself, so that load does not slow down timing-sensitive tests
+# running beside it, and the two do not run together either. Every profile
+# that inherits from default, including gate (the CI lib shards), applies this.
+[[profile.default.overrides]]
+filter = 'test(/^(callgraph_store::refresh_worker_tests::stopping_a_readiness_watch|config_live::tests::stopping_a_config_directory_watch)_never_stalls_other_file_io$/)'
+threads-required = 'num-test-threads'
+
 # Unit targets need a hard per-test bound because they previously ran as one
 # libtest process: one nonterminating worker hid the test name until CI killed
 # the entire job. Four status periods retain useful slow-test diagnostics while

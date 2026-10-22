@@ -263,12 +263,15 @@ impl DirectoryWatcher {
         let directory = path.to_path_buf();
         // These watches see only one directory's entries, so a much smaller
         // buffer than the project watch's suffices; the network limit is
-        // the largest size every filesystem accepts.
-        let buffer_size = WINDOWS_BUFFER_SIZE.min(WINDOWS_NETWORK_BUFFER_SIZE);
+        // the largest size every filesystem accepts. Test builds use the
+        // same size: the tiny test value of `WINDOWS_BUFFER_SIZE` exists to
+        // force overflows in the project watch, and here it would turn one
+        // SQLite commit's few events into an overflow rescan, which the
+        // callgraph readiness watch does not treat as a readiness hint.
         self.watcher = Some(ProjectWatcher::start(
             directory.clone(),
             vec![(directory, None, false)],
-            buffer_size,
+            WINDOWS_NETWORK_BUFFER_SIZE,
             self.sender.clone(),
             // No ignore rules apply here, so the generation never moves, and
             // the counters stay private: they must not overwrite the project

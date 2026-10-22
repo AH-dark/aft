@@ -2305,11 +2305,93 @@ fn refresh_lease_release_event(event: &notify::Event, lease: &Path) -> bool {
     named_release || sibling_change
 }
 
+/// The watcher a readiness watch keeps on a callgraph directory. Windows uses
+/// AFT's own directory watcher: notify's Windows watcher can leave a read
+/// re-armed on a closed handle when a watch stops, and that read can then
+/// block another thread's file I/O forever (see the Windows
+/// `DirectoryWatcher`). macOS and Linux keep notify's watcher.
+#[cfg(not(windows))]
+type ReadinessWatcher = notify::RecommendedWatcher;
+#[cfg(windows)]
+type ReadinessWatcher = ForwardingDirectoryWatcher;
+
+/// Watches `dir`, without its subdirectories, and hands every event to
+/// `handler` until the returned watcher is dropped.
+fn watch_readiness_directory<F>(dir: &Path, handler: F) -> notify::Result<ReadinessWatcher>
+where
+    F: FnMut(notify::Result<notify::Event>) + Send + 'static,
+{
+    #[cfg(not(windows))]
+    {
+        use notify::{RecursiveMode, Watcher};
+        let mut watcher = notify::recommended_watcher(handler)?;
+        watcher.watch(dir, RecursiveMode::NonRecursive)?;
+        Ok(watcher)
+    }
+    #[cfg(windows)]
+    {
+        ForwardingDirectoryWatcher::start(dir, handler)
+    }
+}
+
+/// A Windows `DirectoryWatcher` whose events go to a callback rather than a
+/// channel. `DirectoryWatcher` only sends to a channel, so a thread of its
+/// own drains that channel into the callback, as notify's watcher thread
+/// called it directly.
+#[cfg(windows)]
+struct ForwardingDirectoryWatcher {
+    watcher: Option<crate::watcher_backend::DirectoryWatcher>,
+    forwarder: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl ForwardingDirectoryWatcher {
+    fn start<F>(dir: &Path, mut handler: F) -> notify::Result<Self>
+    where
+        F: FnMut(notify::Result<notify::Event>) + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The counters are private to this watch: it must not overwrite the
+        // project watcher's backend state for the same root.
+        let mut watcher = crate::watcher_backend::DirectoryWatcher::new(
+            tx,
+            Arc::new(crate::context::WatcherCounters::default()),
+        );
+        watcher.watch(dir, notify::RecursiveMode::NonRecursive)?;
+        let forwarder = std::thread::Builder::new()
+            .name("aft-readiness-watch".to_string())
+            .spawn(move || {
+                for event in rx {
+                    handler(event);
+                }
+            })
+            .map_err(notify::Error::io)?;
+        Ok(Self {
+            watcher: Some(watcher),
+            forwarder: Some(forwarder),
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ForwardingDirectoryWatcher {
+    fn drop(&mut self) {
+        // Stopping the watch drops every sender of the forwarder's channel,
+        // so the forwarder finishes the events already sent and returns. It
+        // may lock the refresh queue on the way, so this must never run with
+        // that lock held.
+        drop(self.watcher.take());
+        if let Some(forwarder) = self.forwarder.take() {
+            let _ = forwarder.join();
+        }
+    }
+}
+
 fn refresh_readiness_watch(
     shared: &Arc<RefreshWorkerShared>,
     root: &RefreshRoot,
-) -> notify::Result<notify::RecommendedWatcher> {
-    use notify::{EventKind, RecursiveMode, Watcher};
+) -> notify::Result<ReadinessWatcher> {
+    use notify::EventKind;
     #[cfg(test)]
     if refresh_worker_test_seam(&root.project_root).fail_watch {
         return Err(notify::Error::generic(
@@ -2323,7 +2405,7 @@ fn refresh_readiness_watch(
     let project_key = project_key_for_store(&root.callgraph_dir, &root.project_root)
         .map_err(|error| notify::Error::generic(&error.to_string()))?;
     let pointer = pointer_path(&watch_dir, &project_key);
-    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+    watch_readiness_directory(&watch_dir, move |event: notify::Result<notify::Event>| {
         let Ok(event) = event else { return };
         let lease_released = refresh_lease_release_event(&event, &lease);
         #[cfg(test)]
@@ -2343,9 +2425,7 @@ fn refresh_readiness_watch(
                 shared.wake.notify_all();
             }
         }
-    })?;
-    watcher.watch(&watch_dir, RecursiveMode::NonRecursive)?;
-    Ok(watcher)
+    })
 }
 
 pub(crate) fn callgraph_refresh_status(project_root: &Path) -> serde_json::Value {
@@ -23178,6 +23258,26 @@ mod refresh_worker_tests {
                 .name,
             "new_leaf"
         );
+    }
+
+    /// Stopping a readiness watch must never stall another thread's file
+    /// I/O. The watch sits on the callgraph directory, which store writers
+    /// change all the time, and it stops whenever the waiting batch settles.
+    /// On notify's Windows watcher a stop that met a just-completed read
+    /// could leave that read re-armed on a handle value Windows had already
+    /// given to another thread, which then waited on it forever.
+    #[cfg(windows)]
+    #[test]
+    fn stopping_a_readiness_watch_never_stalls_other_file_io() {
+        crate::watcher_backend::assert_watch_restarts_never_stall_file_io("readiness", |watched| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let watcher = watch_readiness_directory(watched, move |event| {
+                let _ = tx.send(event);
+            })
+            .expect("readiness watch");
+            let _ = rx.recv_timeout(std::time::Duration::from_millis(2));
+            drop(watcher);
+        });
     }
 
     #[test]
