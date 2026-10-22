@@ -3,6 +3,7 @@ import {
   BASH_HOST_FALLBACK_REFUSAL,
   BASH_RUNON_DESCRIPTION,
   BASH_RUNON_GUIDANCE,
+  BashOutputPageDecoder,
   type BridgeRequestOptions,
   bashHostFallbackAskPattern,
   classifyBashHostFallbackError,
@@ -1458,6 +1459,8 @@ async function waitForBashStatus(
     ...extra,
   });
   let spillCursor: OutputCursor = { output: 0, stderr: 0 };
+  // One decoder per stream, so a character split across two pages decodes whole.
+  const decoders = { output: new BashOutputPageDecoder(), stderr: new BashOutputPageDecoder() };
   const scanState: OutputScanState = {
     output: { text: "", baseOffset: 0 },
     stderr: { text: "", baseOffset: 0 },
@@ -1524,7 +1527,7 @@ async function waitForBashStatus(
       const terminal = isTerminalStatus(data.status);
 
       if (waitFor) {
-        const scan = await readNewTaskOutput(data, spillCursor);
+        const scan = await readNewTaskOutput(data, spillCursor, decoders);
         if (scan) {
           spillCursor = scan.nextCursor;
           // Independent buffers prevent a stdout suffix and stderr prefix from
@@ -1610,6 +1613,7 @@ async function waitForBashStatus(
 async function readNewTaskOutput(
   data: Record<string, unknown>,
   cursor: OutputCursor,
+  decoders: Record<OutputStream, BashOutputPageDecoder>,
 ): Promise<{ chunks: OutputScanChunk[]; nextCursor: OutputCursor } | undefined> {
   const stdoutBytes =
     typeof data.output_chunk_base64 === "string"
@@ -1619,21 +1623,25 @@ async function readNewTaskOutput(
     typeof data.stderr_chunk_base64 === "string"
       ? Buffer.from(data.stderr_chunk_base64, "base64")
       : Buffer.alloc(0);
-  if (stdoutBytes.length + stderrBytes.length === 0) return undefined;
+  // A stream really ends only when its task has exited and no captured
+  // bytes remain; only then may a held-back partial character be flushed.
+  const terminal = isTerminalStatus(data.status);
+  const stdout = decoders.output.decode(
+    stdoutBytes,
+    cursor.output,
+    terminal && data.output_has_more !== true,
+  );
+  const stderr = decoders.stderr.decode(
+    stderrBytes,
+    cursor.stderr,
+    terminal && data.stderr_has_more !== true,
+  );
   const chunks: OutputScanChunk[] = [];
-  if (stdoutBytes.length > 0) {
-    chunks.push({
-      stream: "output",
-      text: stdoutBytes.toString("utf8"),
-      baseOffset: cursor.output,
-    });
+  if (stdout.text.length > 0) {
+    chunks.push({ stream: "output", text: stdout.text, baseOffset: stdout.baseOffset });
   }
-  if (stderrBytes.length > 0) {
-    chunks.push({
-      stream: "stderr",
-      text: stderrBytes.toString("utf8"),
-      baseOffset: cursor.stderr,
-    });
+  if (stderr.text.length > 0) {
+    chunks.push({ stream: "stderr", text: stderr.text, baseOffset: stderr.baseOffset });
   }
   return {
     chunks,

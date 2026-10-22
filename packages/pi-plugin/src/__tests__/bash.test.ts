@@ -2127,6 +2127,14 @@ describe("bash tool adapter", () => {
     expect(offsets).toEqual([0, 65536]);
   });
 
+  test("watch matches a literal whose UTF-8 character crosses a 64 KiB page edge", async () => {
+    // "€" is three bytes; it starts one byte before the first page ends.
+    const stdout = Buffer.concat([Buffer.alloc(64 * 1024 - 1, "x"), Buffer.from("€-READY\n")]);
+    const { bridge } = pagedExitedBridge(stdout);
+    const text = await watchPaged(bridge, { task_id: "bash-paged-utf8", pattern: "€-READY" });
+    expect(text).toContain('matched "€-READY" in stdout at offset 65535');
+  });
+
   test("watch that runs out of time mid-drain says the scan is incomplete", async () => {
     const real = { now: watchClock.now, sleep: watchClock.sleep };
     let now = 0;
