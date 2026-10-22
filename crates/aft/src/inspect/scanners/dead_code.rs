@@ -30,7 +30,7 @@ use crate::parser::{detect_language, grammar_for, LangId};
 
 use super::DEFAULT_EXPORT_MARKER_KIND;
 
-pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 10;
+pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 11;
 #[cfg(test)]
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
 const MACRO_TOKEN_LIVENESS_PROVENANCE: &str = "macro_token_liveness";
@@ -1586,6 +1586,32 @@ fn materialize_dead_code_contributions(
                 .map(|facts| (contribution.file.clone(), facts.items.clone()))
         })
         .collect::<BTreeMap<_, _>>();
+    // Rust type declarations, by the same (file, identity) nodes the edges
+    // use: the short export symbol plus the module-qualified name of each
+    // declaration with that name.
+    let items_by_file = &rust_items_by_file;
+    let rust_type_declarations = parsed
+        .iter()
+        .filter(|contribution| language_for_file(&contribution.file) == "rust")
+        .flat_map(|contribution| {
+            contribution
+                .exports
+                .iter()
+                .filter(|export| export.is_type_like || is_type_like_kind(&export.kind))
+                .flat_map(move |export| {
+                    let qualified = items_by_file
+                        .get(&contribution.file)
+                        .into_iter()
+                        .flatten()
+                        .filter(|item| item.owner.is_none() && item.name == export.symbol)
+                        .map(rust_qualified_item_name);
+                    std::iter::once(export.symbol.clone())
+                        .chain(qualified)
+                        .map(|symbol| (contribution.file.clone(), symbol))
+                        .collect::<Vec<_>>()
+                })
+        })
+        .collect::<BTreeSet<_>>();
     let rust_imports_by_file = parsed
         .iter()
         .filter(|contribution| !contribution.rust_imports.is_empty())
@@ -1685,33 +1711,20 @@ fn materialize_dead_code_contributions(
                     &default_export_symbols_by_file,
                 ));
             }
-            // A function call found in source (inside macro tokens, and in
-            // every function body) takes the test status of its own line,
-            // exactly like the stored callgraph edges above, so a call made
-            // only by test code never counts as production usage. References
-            // to types (struct literals, unit and tuple struct values) and to
-            // methods carry no test status: production code uses those through
-            // type positions, plain values and dispatch, which are not call
-            // edges, so labelling only their test uses would wrongly mark
-            // production-used types and methods test-only.
-            let source_call_test_origin = |reference: &MacroTokenRefContribution| {
-                (reference.shape == RUST_MACRO_REF_SHAPE_CALL
-                    && !rust_macro_name_is_upper_camel(&reference.name))
-                .then(|| contribution.location_is_test_code(&test_module_files, reference.line))
-            };
-            // Function values named in source (for example a function passed
-            // as an argument or chosen in a branch) always take the test status
-            // of their line.
-            let value_test_origin = |reference: &MacroTokenRefContribution| {
-                Some(contribution.location_is_test_code(&test_module_files, reference.line))
-            };
+            // References found in source (inside macro tokens, function
+            // bodies and function values) take the test status of their own
+            // line, exactly like the stored callgraph edges above, so a call
+            // made only by test code never counts as production usage. Edges
+            // to type declarations drop that status again below.
+            let source_test_origin =
+                |line: u32| contribution.location_is_test_code(&test_module_files, line);
             internal_calls.extend(resolve_macro_token_liveness_edges(
                 project_root,
                 &contribution.file,
                 &contribution.macro_token_refs,
                 &contribution.rust_imports,
                 &exported_symbols_by_file,
-                &source_call_test_origin,
+                &source_test_origin,
             ));
             if let Some(facts) = &contribution.rust_api {
                 internal_calls.extend(resolve_macro_token_liveness_edges(
@@ -1720,7 +1733,7 @@ fn materialize_dead_code_contributions(
                     &facts.initializer_references,
                     &contribution.rust_imports,
                     &exported_symbols_by_file,
-                    &value_test_origin,
+                    &source_test_origin,
                 ));
                 // The parser does not expose private statics as symbols, so
                 // their calls arrive with a top-level owner. Give each static
@@ -1749,6 +1762,14 @@ fn materialize_dead_code_contributions(
                         None,
                         (call.file == contribution.file).then_some(call.caller_symbol.as_str()),
                     );
+                }
+                // An edge to a struct, enum or other type declaration carries no
+                // test status: production code uses types through type
+                // positions and plain values, which are not edges, so a test
+                // label on an edge alone would mark production-used types
+                // test-only. Edges to functions and methods keep their status.
+                if rust_type_declarations.contains(&(call.file.clone(), call.symbol.clone())) {
+                    call.test_origin = None;
                 }
             }
             sort_dedup_internal_calls(&mut internal_calls);
@@ -3290,14 +3311,14 @@ fn rust_unresolved_path_call_edges(
 }
 
 /// Liveness edges for source references found outside the stored callgraph,
-/// each labelled with `test_origin(reference)`.
+/// each labelled with the test status `test_origin` gives its line.
 fn resolve_macro_token_liveness_edges(
     _project_root: &Path,
     caller_file: &str,
     refs: &[MacroTokenRefContribution],
     rust_imports: &[RawImportContribution],
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
-    test_origin: &dyn Fn(&MacroTokenRefContribution) -> Option<bool>,
+    test_origin: &dyn Fn(u32) -> bool,
 ) -> Vec<InternalCall> {
     let mut calls = Vec::new();
     for reference in refs {
@@ -3315,7 +3336,7 @@ fn resolve_macro_token_liveness_edges(
             symbol,
             line: reference.line,
             provenance: MACRO_TOKEN_LIVENESS_PROVENANCE.to_string(),
-            test_origin: test_origin(reference),
+            test_origin: Some(test_origin(reference.line)),
         });
     }
     sort_dedup_internal_calls(&mut calls);
@@ -3817,10 +3838,11 @@ fn rust_raw_import_contributions(
         .collect()
 }
 
-/// Line ranges compiled only for tests: `#[cfg(test)]` modules, functions and
-/// impls, plus `#[cfg(test)]` statements, blocks and nested items inside a
-/// function body. Calls on these lines are test usage, and declarations on
-/// them are test code.
+/// Line ranges compiled only for tests: `#[cfg(test)]` items (modules,
+/// functions, impls, types, traits, constants and statics), plus
+/// `#[cfg(test)]` statements, blocks and nested items inside a function body.
+/// Calls on these lines are test usage, and declarations on them are test
+/// code.
 fn rust_cfg_test_ranges(source: &str, root: tree_sitter::Node) -> Vec<RustCfgTestRange> {
     let mut ranges = Vec::new();
     let mut stack = vec![root];
@@ -3830,9 +3852,20 @@ fn rust_cfg_test_ranges(source: &str, root: tree_sitter::Node) -> Vec<RustCfgTes
                 node.kind(),
                 "attribute_item" | "inner_attribute_item" | "line_comment" | "block_comment"
             );
-        if (in_function_body || matches!(node.kind(), "mod_item" | "function_item" | "impl_item"))
-            && rust_node_has_cfg_test_attribute(source, node)
-        {
+        let item = matches!(
+            node.kind(),
+            "mod_item"
+                | "function_item"
+                | "impl_item"
+                | "struct_item"
+                | "enum_item"
+                | "union_item"
+                | "trait_item"
+                | "type_item"
+                | "const_item"
+                | "static_item"
+        );
+        if (in_function_body || item) && rust_node_has_cfg_test_attribute(source, node) {
             ranges.push(RustCfgTestRange {
                 // Symbol ranges include preceding attributes, not just the fn
                 // token. Include them so declaration and call classification
@@ -8046,6 +8079,60 @@ pub(crate) fn deserialize_author() {}
             vec!["deserialize_author:19", "planted_dead:17"],
             "{aggregate:#}"
         );
+    }
+
+    /// Test status of a source reference follows the declaration it reaches,
+    /// never the spelling of its name: a function stays test usage even with
+    /// an upper-case name, and a tuple struct built in a test assertion stays
+    /// production-used even with a lower-case name.
+    #[test]
+    fn review_source_reference_test_status_follows_declaration_kind() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() { let _keep: Option<counter> = None; }
+#[allow(non_snake_case)]
+pub(crate) fn Probe() -> bool { true }
+#[allow(non_camel_case_types)]
+pub(crate) struct counter(pub u32);
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() { assert!(super::Probe()); assert_eq!(super::counter(1).0, 1); }
+}
+"#,
+        )]);
+        assert!(headline_symbols(&aggregate).is_empty(), "{aggregate:#}");
+        assert_eq!(
+            test_only_symbols(&aggregate),
+            vec!["src/main.rs::Probe"],
+            "{aggregate:#}"
+        );
+    }
+
+    /// A type declared under `#[cfg(test)]` is test code, like a
+    /// `#[cfg(test)]` function: it is neither product dead code nor a
+    /// test-only product row.
+    #[test]
+    fn review_cfg_test_type_declaration_is_test_code() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() {}
+#[cfg(test)]
+pub(crate) struct Gate(u32);
+#[cfg(test)]
+pub(crate) fn gate_for_test() -> Gate { Gate(1) }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() { let _ = super::gate_for_test(); }
+}
+"#,
+        )]);
+        assert!(headline_symbols(&aggregate).is_empty(), "{aggregate:#}");
+        assert!(test_only_symbols(&aggregate).is_empty(), "{aggregate:#}");
+        assert_eq!(aggregate["excluded_test_count"], 2, "{aggregate:#}");
     }
 
     #[test]
