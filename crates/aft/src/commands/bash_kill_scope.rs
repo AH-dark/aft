@@ -61,6 +61,10 @@ pub(crate) fn handle_bash_kill_scope_with_saved_tasks(
         Some(root) => BgTaskRegistry::recover_saved_scope_tasks(root, &params.scope, registries),
         None => (Vec::new(), Vec::new()),
     };
+    #[cfg(all(test, unix))]
+    if let Some(root) = saved_storage_root {
+        saved_recovery_gate::pass(root);
+    }
     let all_registries = registries
         .iter()
         .map(|registry| (registry, false))
@@ -96,7 +100,9 @@ pub(crate) fn handle_bash_kill_scope_with_saved_tasks(
             }
         }
     }
-    // Recovered remote tasks have no worker yet. Start them only now that
+    // Remote tasks these registries restored themselves have no worker yet.
+    // (A task a project's replay restored first keeps that project's worker,
+    // which reads the same cancellation state.) Start them only now that
     // their pause is recorded: each worker then cancels a job the runner
     // already holds, or withholds a resubmission or local fallback, and
     // records that outcome, which the loop below waits for.
@@ -131,3 +137,46 @@ pub(crate) fn handle_bash_kill_scope_with_saved_tasks(
 #[cfg(all(test, unix))]
 #[path = "bash_kill_scope_tests.rs"]
 mod tests;
+
+/// Lets a test hold `bash.kill_scope` after it recovered a storage root's
+/// saved tasks and before it pauses them, so another restore of the same
+/// tasks (a project binding) can land in exactly that window.
+#[cfg(all(test, unix))]
+pub(crate) mod saved_recovery_gate {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{mpsc, Mutex, OnceLock};
+
+    type Gate = (tokio::sync::oneshot::Sender<()>, mpsc::Receiver<()>);
+
+    fn gates() -> &'static Mutex<HashMap<PathBuf, Gate>> {
+        static GATES: OnceLock<Mutex<HashMap<PathBuf, Gate>>> = OnceLock::new();
+        GATES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn key(root: &Path) -> PathBuf {
+        std::fs::canonicalize(root).unwrap_or_else(|_| root.into())
+    }
+
+    /// Hold the next `bash.kill_scope` for saved tasks under `root` once.
+    /// The receiver fires when it is held; sending on (or dropping) the
+    /// sender lets it go on.
+    pub(crate) fn arm(root: &Path) -> (tokio::sync::oneshot::Receiver<()>, mpsc::Sender<()>) {
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = mpsc::channel();
+        assert!(gates()
+            .lock()
+            .unwrap()
+            .insert(key(root), (reached_tx, release_rx))
+            .is_none());
+        (reached, release)
+    }
+
+    pub(super) fn pass(root: &Path) {
+        let armed = gates().lock().unwrap().remove(&key(root));
+        if let Some((reached, release)) = armed {
+            let _ = reached.send(());
+            let _ = release.recv();
+        }
+    }
+}
