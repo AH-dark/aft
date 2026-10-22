@@ -1112,6 +1112,53 @@ impl BackupStore {
         self.run_waiting_maintenance("undo")
     }
 
+    /// Maintenance before a snapshot records an entry for `key`. Usually the
+    /// nonblocking pass: a busy namespace defers layout work to a later
+    /// operation. A default-session snapshot of a file that still has history
+    /// in the root or flat legacy layout is different: recording it first would
+    /// create the stack the migration moves that history into, and the
+    /// migration then leaves the older entries behind where no undo finds them.
+    /// So that snapshot runs the migration first, waiting for the namespace as
+    /// a restore does. It fails if the namespace stays busy or the flat
+    /// migration cannot run; other root-repair failures are logged and do not
+    /// stop the snapshot.
+    ///
+    /// Running the migration first is simpler than merging the legacy entries
+    /// into an existing stack afterwards, which would mean renumbering backup
+    /// files, reordering entries and their database rows across two stacks.
+    fn run_snapshot_maintenance(&mut self, session: &str, key: &Path) -> Result<(), AftError> {
+        if session != crate::protocol::DEFAULT_SESSION_ID || !self.has_unmigrated_history(key) {
+            self.run_process_maintenance_once();
+            return Ok(());
+        }
+        if let Some(storage_dir) = self.storage_dir.clone() {
+            // Rerun the migration even if this process already ran it once:
+            // this file's legacy entry shows it has not covered everything.
+            BACKUP_MIGRATION_KEYS
+                .lock()
+                .unwrap()
+                .remove(&(storage_dir, self.effective_storage_harness()));
+        }
+        self.run_waiting_maintenance("recording a backup")
+    }
+
+    /// Whether `key` still has a legacy flat entry, either in the harness
+    /// backup directory awaiting the flat migration or in the root backup
+    /// directory awaiting root repair.
+    fn has_unmigrated_history(&self, key: &Path) -> bool {
+        let hash = Self::path_hash(key);
+        let harness_entry = self.backups_dir().map(|dir| dir.join(&hash));
+        let root_entry = self
+            .storage_dir
+            .as_ref()
+            .filter(|_| self.effective_storage_harness().is_some())
+            .map(|dir| dir.join("backups").join(&hash));
+        [harness_entry, root_entry]
+            .into_iter()
+            .flatten()
+            .any(|dir| is_legacy_flat_backup_entry(&dir))
+    }
+
     /// [`Self::run_restore_maintenance`] with the operation it runs before
     /// named in the error.
     fn run_waiting_maintenance(&mut self, before: &str) -> Result<(), AftError> {
@@ -1224,8 +1271,8 @@ impl BackupStore {
         if !self.prepare_snapshot(session, path, op_id, false)? {
             return Ok(None);
         }
-        self.run_process_maintenance_once();
         let key = canonicalize_key(path);
+        self.run_snapshot_maintenance(session, &key)?;
         let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
         // Hydrate any prior on-disk history before appending, so a snapshot
         // taken on a fresh store (post-restart) extends the existing stack and
@@ -1254,8 +1301,8 @@ impl BackupStore {
         if !self.prepare_snapshot(session, path, op_id, false)? {
             return Ok(None);
         }
-        self.run_process_maintenance_once();
         let key = canonicalize_key(path);
+        self.run_snapshot_maintenance(session, &key)?;
         let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
         self.ensure_stack_hydrated_locked(session, &key)?;
         let (id, order) = self.next_id_and_order();
@@ -1279,8 +1326,8 @@ impl BackupStore {
         if !self.prepare_snapshot(session, path, Some(op_id), true)? {
             return Ok(None);
         }
-        self.run_process_maintenance_once();
         let key = canonicalize_key(path);
+        self.run_snapshot_maintenance(session, &key)?;
         let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
         self.ensure_stack_hydrated_locked(session, &key)?;
         let created_dirs = path.parent().map(missing_parent_dirs).unwrap_or_default();
@@ -1384,8 +1431,8 @@ impl BackupStore {
         if !self.prepare_snapshot(session, path, Some(op_id), false)? {
             return Ok(None);
         }
-        self.run_process_maintenance_once();
         let key = canonicalize_key(path);
+        self.run_snapshot_maintenance(session, &key)?;
         let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
         self.ensure_stack_hydrated_locked(session, &key)?;
         let (id, order) = self.next_id_and_order();
@@ -8500,6 +8547,42 @@ mod tests {
             elapsed >= budget - NAMESPACE_WAIT_REPLY_MARGIN - Duration::from_millis(100),
             "the undo waits until the budget less the reply margin, took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn default_session_snapshot_keeps_unmigrated_history_reachable_by_undo() {
+        let storage = tempfile::tempdir().unwrap();
+        let (mut store, path, key, _root_entry) = legacy_root_history_fixture(storage.path());
+
+        // The namespace is busy when the first default-session snapshot of the
+        // file arrives, so the legacy entry for it has not been migrated yet.
+        // The snapshot must not start a fresh stack in front of that entry:
+        // the migration would then find the target taken and leave the older
+        // history where no undo looks for it.
+        let holder = NamespaceHolderAfterRepair::install(storage.path());
+        let release = holder.release.clone();
+        set_before_namespace_wait_hook_for_tests(storage.path(), move || {
+            let _ = release.send(());
+        });
+        store
+            .snapshot(DEFAULT_SESSION_ID, &path, "edit after upgrade")
+            .unwrap();
+        holder.release_and_join();
+
+        store.restore_latest(DEFAULT_SESSION_ID, &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "current content");
+        let older = store.restore_latest(DEFAULT_SESSION_ID, &path);
+        assert!(
+            older.is_ok(),
+            "legacy history must stay reachable below the new snapshot: {older:?}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original content");
+        assert!(!storage
+            .path()
+            .join("opencode/backups")
+            .join(BackupStore::path_hash(&key))
+            .exists());
+        assert!(store.history(DEFAULT_SESSION_ID, &path).is_empty());
     }
 
     #[test]
