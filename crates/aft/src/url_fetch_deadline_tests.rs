@@ -751,3 +751,64 @@ fn a_stalled_cache_check_returns_the_remembered_failure_within_the_budget_and_is
     );
     stall.release();
 }
+
+/// A read failure the way reqwest's blocking body reader reports its own
+/// timeouts: an `io::Error` of kind `Other`, not `TimedOut`.
+const REQWEST_STYLE_TIMEOUT: io::ErrorKind = io::ErrorKind::Other;
+
+#[test]
+fn a_generic_read_error_after_the_fetch_deadline_is_a_body_timeout() {
+    // The deadline has already passed when the failed read is reported, as
+    // when reqwest's whole-request timer fires before this side's own wait.
+    let deadline = FetchDeadline {
+        at: Instant::now(),
+        allowed: Duration::from_millis(2_000),
+        set_by_call: true,
+    };
+    let error = body_read_failure(
+        &deadline,
+        "http://example.test/doc.md",
+        REQWEST_STYLE_TIMEOUT,
+        "error decoding response body: operation timed out",
+        Duration::from_millis(1_990),
+    );
+    assert_eq!(error.code(), "url_fetch_timeout", "{error}");
+    assert_eq!(error.phase(), Some(FetchPhase::Body), "{error}");
+}
+
+#[test]
+fn a_generic_read_error_after_the_chunk_stall_limit_is_a_body_timeout() {
+    let deadline = FetchDeadline {
+        at: Instant::now() + Duration::from_secs(5),
+        allowed: URL_FETCH_CEILING,
+        set_by_call: false,
+    };
+    let error = body_read_failure(
+        &deadline,
+        "http://example.test/doc.md",
+        REQWEST_STYLE_TIMEOUT,
+        "error decoding response body: operation timed out",
+        BODY_CHUNK_TIMEOUT,
+    );
+    assert_eq!(error.code(), "url_fetch_timeout", "{error}");
+    assert_eq!(error.phase(), Some(FetchPhase::Body), "{error}");
+    assert!(error.to_string().contains("Body read stalled"), "{error}");
+}
+
+#[test]
+fn a_generic_read_error_before_any_limit_is_a_read_failure() {
+    let deadline = FetchDeadline {
+        at: Instant::now() + Duration::from_secs(5),
+        allowed: URL_FETCH_CEILING,
+        set_by_call: false,
+    };
+    let error = body_read_failure(
+        &deadline,
+        "http://example.test/doc.md",
+        REQWEST_STYLE_TIMEOUT,
+        "connection reset by peer",
+        Duration::from_millis(10),
+    );
+    assert_eq!(error.code(), "url_fetch_failed", "{error}");
+    assert_eq!(error.phase(), None, "{error}");
+}

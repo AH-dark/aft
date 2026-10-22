@@ -1976,15 +1976,25 @@ fn element_attr_value<'a>(element: &'a Element<'_>, name: &str) -> Option<&'a st
 enum BodyReadEvent {
     Chunk(Vec<u8>),
     Done,
-    Error(io::ErrorKind, String),
+    /// A read failed after waiting this long for data.
+    Error(io::ErrorKind, String, Duration),
 }
 
 /// Read at most [`MAX_RESPONSE_BYTES`] (plus one lookahead byte) of the body.
 /// Two limits stop a slow body: no data for [`BODY_CHUNK_TIMEOUT`], and the
 /// fetch deadline, which also stops a server that sends a little data just
 /// often enough to avoid the stall limit.
+///
+/// Whether a failed read was a timeout is decided mainly by time: reqwest
+/// reports both its per-read limit and its whole-request limit as an
+/// `io::Error` of kind `Other` (its blocking `Read` impl wraps the timeout
+/// with `into_io`), and which of those timers or this function's own wait
+/// fires first differs between platforms. So a failed read is a body-phase
+/// timeout when the fetch deadline has passed, when the read had waited at
+/// least [`BODY_CHUNK_TIMEOUT`] for data, or when its kind is `TimedOut` or
+/// `WouldBlock`.
 fn read_response_body(
-    response: HttpResponse,
+    response: impl Read + Send + 'static,
     url: &str,
     deadline: &FetchDeadline,
 ) -> Result<(Vec<u8>, bool), UrlFetchError> {
@@ -1997,6 +2007,7 @@ fn read_response_body(
         let mut response = response.take(MAX_RESPONSE_BYTES + 1);
         let mut buffer = [0u8; 16 * 1024];
         loop {
+            let read_started = Instant::now();
             match response.read(&mut buffer) {
                 Ok(0) => {
                     let _ = tx.send(BodyReadEvent::Done);
@@ -2010,7 +2021,8 @@ fn read_response_body(
                 Err(error) => {
                     let kind = error.kind();
                     let message = error.to_string();
-                    let _ = tx.send(BodyReadEvent::Error(kind, message));
+                    let waited = read_started.elapsed();
+                    let _ = tx.send(BodyReadEvent::Error(kind, message, waited));
                     break;
                 }
             }
@@ -2041,13 +2053,8 @@ fn read_response_body(
                 }
             }
             Ok(BodyReadEvent::Done) => return Ok((chunks, false)),
-            Ok(BodyReadEvent::Error(kind, _message)) if is_body_stall_kind(kind) => {
-                return Err(slow_body_error());
-            }
-            Ok(BodyReadEvent::Error(_, message)) => {
-                return Err(UrlFetchError::new(format!(
-                    "Failed to read response body for {url}: {message}"
-                )));
+            Ok(BodyReadEvent::Error(kind, message, waited)) => {
+                return Err(body_read_failure(deadline, url, kind, &message, waited));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => return Err(slow_body_error()),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -2057,6 +2064,26 @@ fn read_response_body(
             }
         }
     }
+}
+
+/// How a failed body read is reported. It is a body-phase timeout when the
+/// fetch deadline has passed or the read had waited at least
+/// [`BODY_CHUNK_TIMEOUT`], whatever its kind (see [`read_response_body`]);
+/// the kinds `TimedOut` and `WouldBlock` also count as a body stall.
+fn body_read_failure(
+    deadline: &FetchDeadline,
+    url: &str,
+    kind: io::ErrorKind,
+    message: &str,
+    waited: Duration,
+) -> UrlFetchError {
+    if deadline.expired() {
+        return deadline.timeout_error(FetchPhase::Body, url);
+    }
+    if waited >= BODY_CHUNK_TIMEOUT || is_body_stall_kind(kind) {
+        return body_stall_error(url);
+    }
+    UrlFetchError::new(format!("Failed to read response body for {url}: {message}"))
 }
 
 fn body_stall_error(url: &str) -> UrlFetchError {
