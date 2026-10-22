@@ -4408,13 +4408,7 @@ fn rust_macro_token_refs(source: &str, root: tree_sitter::Node) -> Vec<MacroToke
     }
     for (caller_symbol, variants) in functions {
         for node in variants {
-            for (full, _, line, _, _) in crate::calls::extract_calls_full(
-                source,
-                node,
-                node.start_byte(),
-                node.end_byte(),
-                LangId::Rust,
-            ) {
+            for (full, _, line, _, _) in rust_function_body_calls(source, node) {
                 if full.contains('.') || full.ends_with('!') {
                     continue;
                 }
@@ -4433,6 +4427,123 @@ fn rust_macro_token_refs(source: &str, root: tree_sitter::Node) -> Vec<MacroToke
         }
     }
     refs.into_iter().collect()
+}
+
+/// Calls that run when this Rust function body runs.
+///
+/// A call written in a `macro_rules!` template that is defined inside the body
+/// runs only where that macro is expanded, not where it is defined. Such a
+/// call therefore counts only when the body invokes the macro (`name!(..)`),
+/// directly or through another local macro whose template is itself expanded.
+/// A local macro that nothing invokes contributes no calls. An invocation in a
+/// nested `fn` item counts for the enclosing body, as the stored call graph
+/// also attributes a nested item's calls to the function around it.
+fn rust_function_body_calls(
+    source: &str,
+    function: tree_sitter::Node,
+) -> Vec<crate::calls::CallTuple> {
+    let (calls, facts) = crate::calls::extract_rust_calls_with_macro_facts(
+        source,
+        function,
+        function.start_byte(),
+        function.end_byte(),
+    );
+    if facts.bodies.is_empty() {
+        return calls;
+    }
+
+    // Templates can nest; the innermost one holding a call owns it.
+    let owner = |start: usize, end: usize| {
+        facts
+            .bodies
+            .iter()
+            .filter(|body| body.byte_start <= start && end <= body.byte_end)
+            .min_by_key(|body| body.byte_end - body.byte_start)
+            .map(|body| body.name.as_str())
+    };
+
+    let mut direct_invocations = Vec::new();
+    let mut template_invocations: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for (full, _, _, start, end) in &calls {
+        let Some(path) = full.strip_suffix('!') else {
+            continue;
+        };
+        // A path-qualified invocation (`self::m!`) is matched by its last
+        // segment: a same-named macro elsewhere may make an unused local
+        // macro look invoked, which only keeps its calls live.
+        let name = path.rsplit("::").next().unwrap_or(path).trim().to_string();
+        match owner(*start, *end) {
+            Some(macro_name) => template_invocations
+                .entry(macro_name)
+                .or_default()
+                .push(name),
+            None => direct_invocations.push(name),
+        }
+    }
+
+    let mut invoked = BTreeSet::new();
+    let mut pending = direct_invocations;
+    while let Some(name) = pending.pop() {
+        if !invoked.insert(name.clone()) {
+            continue;
+        }
+        if let Some(nested) = template_invocations.get(name.as_str()) {
+            pending.extend(nested.iter().cloned());
+        }
+    }
+    // An expanded template that invokes a macro through a metavariable
+    // (`$m!(..)`) can name any local macro, and which one is decided only by
+    // the arguments at each expansion. The scanner cannot resolve that, so
+    // every template call in this body stays live: a function wrongly reported
+    // dead costs more than a dead one that goes unreported.
+    let unresolved_invocation = facts.bodies.iter().any(|body| {
+        invoked.contains(&body.name)
+            && source
+                .get(body.byte_start..body.byte_end)
+                .is_some_and(rust_template_invokes_metavariable_macro)
+    });
+    if unresolved_invocation {
+        return calls;
+    }
+    calls
+        .into_iter()
+        .filter(|(_, _, _, start, end)| {
+            owner(*start, *end).is_none_or(|macro_name| invoked.contains(macro_name))
+        })
+        .collect()
+}
+
+/// Whether template text contains what looks like an invocation of a macro
+/// named by a metavariable, as in `$callback!(..)`: a `$`-prefixed ASCII
+/// identifier followed by optional whitespace and `!` (not `!=`). This is a
+/// text scan, so a match inside a comment or string literal also counts; that
+/// only keeps more calls live.
+fn rust_template_invokes_metavariable_macro(template: &str) -> bool {
+    let bytes = template.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'$' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let name_start = index;
+        while index < bytes.len() && (bytes[index] == b'_' || bytes[index].is_ascii_alphanumeric())
+        {
+            index += 1;
+        }
+        if index == name_start {
+            continue;
+        }
+        let mut next = index;
+        while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+            next += 1;
+        }
+        if bytes.get(next) == Some(&b'!') && bytes.get(next + 1) != Some(&b'=') {
+            return true;
+        }
+    }
+    false
 }
 
 fn collect_rust_macro_token_refs(
@@ -8901,6 +9012,112 @@ fn read_with() { wrapper!(guard::is_live()); }
         );
     }
 
+    #[test]
+    fn review_local_macro_never_invoked_does_not_keep_template_callee_live() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            "fn main() { macro_rules! unused { () => { helper() }; } }\npub(crate) fn helper() {}\n",
+        )]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/main.rs::helper"],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn review_local_macro_invoked_in_body_keeps_template_callee_live() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            "fn main() { macro_rules! used { () => { helper() }; } used!(); }\npub(crate) fn helper() {}\npub(crate) fn unused() {}\n",
+        )]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/main.rs::unused"],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn review_callback_passed_through_invoked_local_macro_stays_live() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() {
+    macro_rules! with_callback { ($f:expr) => { run($f) }; }
+    with_callback!(callback);
+}
+pub(crate) fn run(f: fn()) { f() }
+pub(crate) fn callback() {}
+pub(crate) fn unused() {}
+"#,
+        )]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/main.rs::unused"],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn review_local_macro_invoked_only_from_dead_function_leaves_callee_dead() {
+        // `main` defines a same-named macro but never invokes it; only the
+        // unreachable `dead` expands `m!`, so `helper` and its callee stay dead.
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() { macro_rules! m { () => { helper() }; } }
+pub(crate) fn dead() { macro_rules! m { () => { helper() }; } m!(); }
+pub(crate) fn helper() { leaf(); }
+pub(crate) fn leaf() {}
+"#,
+        )]);
+        let mut headline = headline_symbols(&aggregate);
+        headline.sort();
+        assert_eq!(
+            headline,
+            vec![
+                "src/main.rs::dead",
+                "src/main.rs::helper",
+                "src/main.rs::leaf"
+            ],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn review_local_macro_expanded_through_another_template_keeps_callee_live() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() {
+    macro_rules! inner { () => { chained() }; }
+    macro_rules! outer { () => { inner!() }; }
+    macro_rules! target { () => { by_metavariable() }; }
+    macro_rules! apply { ($m:ident) => { $m!() }; }
+    outer!();
+    apply!(target);
+}
+pub(crate) fn chained() {}
+pub(crate) fn by_metavariable() {}
+pub(crate) fn unused() {}
+"#,
+        )]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/main.rs::unused"],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn rust_template_metavariable_macro_invocation_is_detected() {
+        assert!(rust_template_invokes_metavariable_macro(" $m!() "));
+        assert!(rust_template_invokes_metavariable_macro("$cb ! { x }"));
+        assert!(!rust_template_invokes_metavariable_macro("$a != $b"));
+        assert!(!rust_template_invokes_metavariable_macro("run($f)"));
+        assert!(!rust_template_invokes_metavariable_macro("$ !"));
+    }
     #[test]
     fn used_test_file_exports_are_not_tallied_as_excluded_dead_findings() {
         let (_temp, root, _) = canonical_fixture(&[("tests/helper.rs", "pub fn called() {}\n")]);
