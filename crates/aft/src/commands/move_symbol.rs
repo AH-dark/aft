@@ -2144,7 +2144,15 @@ fn build_add_moved_import_edit(
 
     let group = imports::classify_group(lang, &new_import_path);
     let (insert_offset, needs_blank_before, needs_blank_after) =
-        imports::find_insertion_point(content, block, group, &new_import_path, false);
+        imports::find_insertion_point_with_prologue(
+            content,
+            tree,
+            lang,
+            block,
+            group,
+            &new_import_path,
+            false,
+        );
     let import_line = if matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
         let mut clauses = block
             .imports
@@ -2176,15 +2184,13 @@ fn build_add_moved_import_edit(
         imports::generate_import_line(lang, &new_import_path, &names, default_import, false)
     };
 
-    let mut insert_text = String::new();
-    if needs_blank_before {
-        insert_text.push('\n');
-    }
-    insert_text.push_str(&import_line);
-    insert_text.push('\n');
-    if needs_blank_after {
-        insert_text.push('\n');
-    }
+    let insert_text = imports::import_insertion_text(
+        content,
+        insert_offset,
+        &import_line,
+        needs_blank_before,
+        needs_blank_after,
+    );
 
     Some((insert_offset..insert_offset, insert_text))
 }
