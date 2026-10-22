@@ -1208,6 +1208,10 @@ fn a_silent_relay_reports_outcome_unknown_after_the_configured_budget() {
         repo: "cortexkit/aft".to_string(),
         agent_id: "alfonso-aft".to_string(),
     };
+    // The safe bindings read can finish, then a loaded runner can pause before
+    // the bot write. Its wait must not decide whether this write gets sent.
+    TEST_EXCHANGE_REPLY_DELAY.with(|delay| delay.set(Duration::from_millis(450)));
+    USE_TEST_EXCHANGE_CLOCK.with(|clock| clock.set(true));
     let status = dispatch_r3_with_relay_at(
         &args,
         classification,
@@ -1226,6 +1230,8 @@ fn a_silent_relay_reports_outcome_unknown_after_the_configured_budget() {
         },
         &harness._temp.path().join("storage"),
     );
+    USE_TEST_EXCHANGE_CLOCK.with(|clock| clock.set(false));
+    TEST_EXCHANGE_REPLY_DELAY.with(|delay| delay.set(Duration::ZERO));
     assert_eq!(status, OUTCOME_UNKNOWN_EXIT_STATUS);
     assert_eq!(harness.daemon.bot_requests().len(), 1, "never resent");
     let probe = super::super::read_last_probe(&harness.paths).expect("last probe");
