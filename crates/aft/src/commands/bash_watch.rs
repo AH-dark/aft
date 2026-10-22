@@ -38,6 +38,9 @@ pub(crate) const DEFAULT_PRIMARY_WATCH_TIMEOUT_MS: u64 = 30_000;
 pub(crate) const MAX_WATCH_TIMEOUT_MS: u64 = 1_800_000;
 /// How much recent output a regex watch keeps for matching across reads.
 const REGEX_SCAN_WINDOW_BYTES: usize = 64 * 1024;
+/// Bytes kept before a trimmed regex window as context only. `^`, `\b` and
+/// `\B` look back one character, and a UTF-8 character is at most 4 bytes.
+const REGEX_SCAN_CONTEXT_BYTES: usize = 4;
 /// Added to an exited task's no-match result when a regex scan had to drop
 /// older output from its window, so the non-match is not a complete answer.
 /// Literal patterns never set it: their kept tail is exact.
@@ -138,6 +141,10 @@ struct StreamScan {
     /// A regex scan cut older bytes out of its window, so a match longer
     /// than the window could have been missed.
     dropped: bool,
+    /// Leading buffer bytes that are context from before a trimmed window.
+    /// The search starts after them, so the trimmed start never looks like
+    /// the start of the output to `^`, `\b` or `\B`.
+    search_from: usize,
 }
 
 fn parse_params(req: &RawRequest) -> Result<BashWatchParams, String> {
@@ -581,7 +588,7 @@ impl WatchJob {
                 scan.buffer.extend_from_slice(&bytes);
             }
             scan.deferred = false;
-            if let Some(found) = pattern.regex().find(&scan.buffer) {
+            if let Some(found) = pattern.regex().find_at(&scan.buffer, scan.search_from) {
                 // A page ends where the read stopped, not where the output
                 // ends. A regex match that reaches the end of the buffer may
                 // depend on what follows ($, \z, \b, a greedy repeat), so while
@@ -601,9 +608,16 @@ impl WatchJob {
             }
             let cut = pattern.keep_from(scan.buffer.len());
             if cut > 0 {
-                scan.buffer.drain(..cut);
-                scan.base += cut as u64;
-                scan.dropped |= matches!(pattern, WaitPattern::Regex(_));
+                let regex = matches!(pattern, WaitPattern::Regex(_));
+                let context = if regex {
+                    cut.min(REGEX_SCAN_CONTEXT_BYTES)
+                } else {
+                    0
+                };
+                scan.buffer.drain(..cut - context);
+                scan.base += (cut - context) as u64;
+                scan.search_from = context;
+                scan.dropped |= regex;
             }
         }
         None
@@ -1076,6 +1090,56 @@ mod tests {
         // A real word boundary just past the page edge is still found.
         let output = across_first_page(b" READY", b" now\n");
         let waited = watch_exited_output(&output, r"\bREADY\b");
+        assert_eq!(
+            waited.matched,
+            Some(("READY".into(), (PAGE - 5) as u64, Some("stdout")))
+        );
+    }
+
+    /// Three pages: `before` ends the first 64 KiB page, the second page
+    /// starts with `head` and is padded to a full page, and `tail` is on the
+    /// third page. After the second page is scanned the window is trimmed to
+    /// start exactly at `head`.
+    fn trimmed_start_output(before: u8, head: &[u8], tail: &[u8]) -> Vec<u8> {
+        let mut output = vec![b'x'; PAGE - 1];
+        output.push(before);
+        output.extend_from_slice(head);
+        output.extend(std::iter::repeat_n(b'y', PAGE - head.len()));
+        output.extend_from_slice(tail);
+        output
+    }
+
+    #[test]
+    fn approved_line_anchor_at_a_trimmed_window_start_sees_the_real_preceding_byte() {
+        let pattern = r"^READY[\s\S]*tail";
+        let output = trimmed_start_output(b'x', b"READY", b"tail\n");
+        let waited = watch_exited_output(&output, pattern);
+        assert!(
+            waited.matched.is_none(),
+            "^ matched at a trimmed start that follows 'x': {:?}",
+            waited.matched
+        );
+        let output = trimmed_start_output(b'\n', b"READY", b"tail\n");
+        let waited = watch_exited_output(&output, pattern);
+        assert_eq!(waited.matched.map(|found| found.1), Some(PAGE as u64));
+    }
+
+    #[test]
+    fn approved_word_boundary_at_a_trimmed_window_start_sees_the_real_preceding_byte() {
+        let pattern = r"\bREADY[\s\S]*tail";
+        let output = trimmed_start_output(b'x', b"READY", b"tail\n");
+        let waited = watch_exited_output(&output, pattern);
+        assert!(waited.matched.is_none(), "{:?}", waited.matched);
+        let output = trimmed_start_output(b' ', b"READY", b"tail\n");
+        let waited = watch_exited_output(&output, pattern);
+        assert_eq!(waited.matched.map(|found| found.1), Some(PAGE as u64));
+    }
+
+    #[test]
+    fn approved_end_anchor_held_at_a_page_edge_is_found_when_the_next_page_starts_a_line() {
+        let mut output = across_first_page(b"READY", b"\n");
+        output.extend(std::iter::repeat_n(b'z', PAGE - 1));
+        let waited = watch_exited_output(&output, "READY$");
         assert_eq!(
             waited.matched,
             Some(("READY".into(), (PAGE - 5) as u64, Some("stdout")))
