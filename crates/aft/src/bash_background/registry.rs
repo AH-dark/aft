@@ -1005,6 +1005,12 @@ pub(crate) struct RegistryInner {
     /// delete time, keyed by task id. See `scratch_retention`.
     retained_scratch: Mutex<HashMap<String, scratch_retention::RetainedScratch>>,
     revoked_scopes: Mutex<HashSet<(String, String, u64)>>,
+    /// While `Some`, restored unfinished remote tasks are not handed to a
+    /// remote worker; their ids are collected here instead. Used by
+    /// `recover_saved_scope_tasks`, whose caller must record the owner's
+    /// pause before any restored command can reach the runner again, and
+    /// then starts the workers with `start_held_remote_workers`.
+    held_remote_workers: Mutex<Option<Vec<String>>>,
     pub(crate) completions: Mutex<VecDeque<BgCompletion>>,
     pub(crate) progress_sender: SharedProgressSender,
     watchdog_started: AtomicBool,
@@ -1487,6 +1493,7 @@ impl BgTaskRegistry {
                 watchdog_tasks: Mutex::new(HashMap::new()),
                 retained_scratch: Mutex::new(HashMap::new()),
                 revoked_scopes: Mutex::new(HashSet::new()),
+                held_remote_workers: Mutex::new(None),
                 completions: Mutex::new(VecDeque::new()),
                 progress_sender,
                 watchdog_started: AtomicBool::new(false),
@@ -5618,7 +5625,9 @@ impl BgTaskRegistry {
         if metadata.remote.is_some() && !metadata.is_terminal() {
             let task_id = metadata.task_id.clone();
             self.insert_rehydrated_task(metadata, paths, true)?;
-            self.resume_remote_task(&task_id)?;
+            if !self.hold_remote_worker(&task_id) {
+                self.resume_remote_task(&task_id)?;
+            }
             return Ok(());
         }
         let (marker, process_alive) = if matches!(
@@ -9183,7 +9192,13 @@ impl BgTaskRegistry {
     /// to that registry. Every other unfinished record stamped with this exact
     /// scope is restored through the same rules a replay applies, into a
     /// private registry per storage directory. The caller pauses the scope in
-    /// the returned registries and then detaches them.
+    /// the returned registries, then calls `start_held_remote_workers` on each,
+    /// and finally detaches them.
+    ///
+    /// Restored remote tasks get no worker here. A worker started now could
+    /// act before the caller records the pause: a saved draining retry that is
+    /// already due would send `exec.run` again, and a refused job would start
+    /// its local fallback, which is the very command the owner meant to stop.
     ///
     /// The storage root's own task directory (the layout before harness
     /// namespaces) and every harness directory beneath it are searched.
@@ -9208,6 +9223,11 @@ impl BgTaskRegistry {
         let mut errors = Vec::new();
         for storage_dir in storage_dirs {
             let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+            *registry
+                .inner
+                .held_remote_workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Vec::new());
             for metadata in saved_scope_task_records(&storage_dir, scope) {
                 if live
                     .iter()
@@ -9236,6 +9256,69 @@ impl BgTaskRegistry {
             }
         }
         (recovered, errors)
+    }
+
+    /// Keep a restored remote task without a worker while this registry
+    /// holds them (see `recover_saved_scope_tasks`). Returns false when the
+    /// worker should start now.
+    #[cfg(unix)]
+    fn hold_remote_worker(&self, task_id: &str) -> bool {
+        match self
+            .inner
+            .held_remote_workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            Some(held) => {
+                held.push(task_id.to_string());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Start the remote workers that recovery held back, once the owner's
+    /// pause has been recorded. Each such worker then finds the pause and
+    /// settles it (cancelling a runner job, or withholding a resubmission or
+    /// local fallback) without running anything.
+    ///
+    /// A held task with no recorded cancellation (its pause failed part way)
+    /// is left without a worker. Its saved record stays unfinished, so the
+    /// replay of its project resumes it later, as it would have without this
+    /// call; starting it here would run a command of a scope its owner is
+    /// stopping.
+    pub(crate) fn start_held_remote_workers(&self) {
+        let held = self
+            .inner
+            .held_remote_workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
+        #[cfg(unix)]
+        for task_id in held {
+            let cancel_recorded = self.task(&task_id).is_some_and(|task| {
+                task.lock_state().is_ok_and(|state| {
+                    state
+                        .metadata
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.cancel_requested)
+                })
+            });
+            if !cancel_recorded {
+                log::warn!(
+                    "saved remote task {task_id} was not paused; left for its project's replay"
+                );
+                continue;
+            }
+            if let Err(error) = self.resume_remote_task(&task_id) {
+                log::warn!("saved remote task {task_id}: worker could not start: {error}");
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = held;
     }
 
     pub(crate) fn wait_owner_pause_cancel(

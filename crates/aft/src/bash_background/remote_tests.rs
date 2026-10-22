@@ -6752,6 +6752,205 @@ async fn bash_kill_scope_settles_when_restored_draining_retry_cannot_reconnect()
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
 }
 
+/// Start a command of `scope` that ignores SIGTERM, saved under `storage` as
+/// the module saves its tasks, then let its registry go without stopping it,
+/// as a module restart does. `bash.kill_scope` stops local tasks before
+/// remote ones, and stopping this one takes the whole termination grace
+/// period. A remote worker that recovery started before the pause therefore
+/// has that long to act on its own. Returns the task id and the command's
+/// process id.
+async fn start_saved_term_ignoring_task(
+    storage: &Path,
+    scope: &subc_protocol::scope::ScopeStamp,
+) -> (String, u32) {
+    let previous = registry();
+    let pid_file = storage.join("term-ignoring-pid");
+    let task = super::super::with_scope_spawn(Some(scope.clone()), || {
+        previous.spawn_with_shell_in_slot(
+            SpawnPlan::Unsandboxed,
+            &format!(
+                "trap '' TERM; echo $$ > '{}'; while :; do /bin/sleep 0.05; done",
+                pid_file.display()
+            ),
+            crate::bash_background::BashShell::Bash,
+            resolve_posix_shell(),
+            "local-session".into(),
+            storage.into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            storage.into(),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(storage.into()),
+        )
+    })
+    .unwrap();
+    let pid = wait_for("the saved local command must start", || {
+        fs::read_to_string(&pid_file)
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()
+    })
+    .await;
+    previous.detach();
+    (task, pid)
+}
+
+/// Run the owner's `bash.kill_scope` as the module's frame loop does after a
+/// restart: no live registry holds the scope's tasks, which are found in
+/// their saved records under `storage`.
+async fn kill_scope_with_saved_tasks(
+    storage: &Path,
+    scope: &subc_protocol::scope::ScopeStamp,
+) -> crate::protocol::Response {
+    let storage = storage.to_path_buf();
+    let scope = scope.clone();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            crate::commands::bash_kill_scope::handle_bash_kill_scope_with_saved_tasks(
+                serde_json::json!({"scope": scope}),
+                Some(&scope.owner),
+                &[],
+                Some(&storage),
+            )
+        }),
+    )
+    .await
+    .expect("bash.kill_scope must reply")
+    .unwrap()
+}
+
+/// The reply names both stopped tasks, the remote one settled as sent, and
+/// the saved local command is gone.
+async fn assert_saved_pause_reply(
+    reply: &crate::protocol::Response,
+    remote_task: &str,
+    local_task: &str,
+    local_pid: u32,
+) {
+    assert!(reply.success, "{reply:?}");
+    let killed = reply.data["killed"].as_array().unwrap();
+    assert_eq!(killed.len(), 2, "{reply:?}");
+    let remote = killed
+        .iter()
+        .find(|entry| entry["task_id"] == remote_task)
+        .unwrap_or_else(|| panic!("{reply:?}"));
+    assert_eq!(remote["from_saved_record"], true, "{reply:?}");
+    // The pause was recorded before any worker ran, so the worker withheld
+    // the command (or cancelled the runner job) and reported it as sent.
+    assert_eq!(remote["remote"]["cancel"], "sent", "{reply:?}");
+    let local = killed
+        .iter()
+        .find(|entry| entry["task_id"] == local_task)
+        .unwrap_or_else(|| panic!("{reply:?}"));
+    assert!(local["remote"].is_null(), "{reply:?}");
+    wait_for("the saved local command must be stopped", || {
+        (!crate::bash_background::process::is_process_alive(local_pid)).then_some(())
+    })
+    .await;
+}
+
+fn assert_saved_paused(json: &Path) {
+    let saved = read_task(json).unwrap();
+    assert_eq!(saved.status, BgTaskStatus::Killed, "{saved:?}");
+    assert_eq!(saved.status_reason.as_deref(), Some("paused_by_owner"));
+    assert!(!saved.local_fallback_started, "{saved:?}");
+    assert_eq!(
+        saved.remote.unwrap().owner_pause_cancel.as_deref(),
+        Some("sent")
+    );
+}
+
+/// After a module restart, the owner pauses a worker whose saved draining
+/// retry is already due. Recovering that saved task for the pause must not
+/// let it resubmit: the resubmitted command is the one the owner is stopping.
+/// The scope's saved local command keeps the pause busy long enough for a
+/// worker started during recovery to reach the runner.
+#[tokio::test]
+async fn bash_kill_scope_never_resubmits_a_due_saved_draining_retry() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+        Script::Draining {
+            refusals: u32::MAX,
+            retry_after_ms: Some(200),
+        },
+        "exec-remote/v1",
+        2,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    let scope = owner_scope("saved-draining-retry");
+    let original = registry();
+    let task_id =
+        start_scoped_runon_retry(&original, dir.path(), daemon.connection.clone(), &scope);
+    clock.expect_event(DrainingClockEvent::Stopped).await;
+    let json = original.task(&task_id).unwrap().paths.json.clone();
+    original.detach();
+    let (local_task, local_pid) = start_saved_term_ignoring_task(dir.path(), &scope).await;
+    // The retry is due by the time the owner pauses the restarted module.
+    clock.advance(200);
+    let reply = kill_scope_with_saved_tasks(dir.path(), &scope).await;
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        1,
+        "the paused draining retry was resubmitted: {reply:?}"
+    );
+    assert_saved_pause_reply(&reply, &task_id, &local_task, local_pid).await;
+    assert_saved_paused(&json);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
+/// After a module restart, the owner pauses a worker whose saved remote job
+/// the runner refused, which a restored worker runs locally instead. Covers
+/// a refusal the worker learns when it reattaches and one saved before the
+/// restart. Recovering that saved task for the pause must not start the
+/// local run.
+#[tokio::test]
+async fn bash_kill_scope_never_starts_a_saved_tasks_local_fallback() {
+    for saved_refusal in [false, true] {
+        let daemon = daemon(Script::AttachRefused, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("local-fallback-ran");
+        let (original, task_id, paths) = persist_accepted_with_snapshot(
+            dir.path(),
+            daemon.connection.clone(),
+            &format!("printf x >> '{}'", marker.display()),
+        );
+        let scope = owner_scope("saved-local-fallback");
+        let mut saved = read_task(&paths.json).unwrap();
+        saved.scope = Some(scope.clone());
+        if saved_refusal {
+            saved.remote.as_mut().unwrap().terminal = Some(TerminalRecord::new(
+                id(),
+                Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::Unknown("future_refusal".into()),
+                },
+                1,
+                0,
+                0,
+            ));
+        }
+        write_task(&paths.json, &saved).unwrap();
+        original.detach();
+        let (local_task, local_pid) = start_saved_term_ignoring_task(dir.path(), &scope).await;
+        let reply = kill_scope_with_saved_tasks(dir.path(), &scope).await;
+        assert!(
+            !marker.exists(),
+            "saved_refusal={saved_refusal}: the paused task ran locally: {reply:?}"
+        );
+        assert_saved_pause_reply(&reply, &task_id, &local_task, local_pid).await;
+        assert_saved_paused(&paths.json);
+        assert!(!marker.exists(), "saved_refusal={saved_refusal}");
+    }
+}
+
 #[tokio::test]
 async fn head_blocking_runon_uses_configured_cap_while_queued() {
     let daemon = daemon(Script::GatedStages { position: 9 }, "exec-remote/v1").await;
