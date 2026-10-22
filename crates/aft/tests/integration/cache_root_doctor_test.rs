@@ -163,12 +163,15 @@ fn process_snapshot_fixture(temp: &Path, snapshot: &str) -> std::ffi::OsString {
     let bin = temp.join("process-snapshot-bin");
     fs::create_dir(&bin).unwrap();
     let ps = bin.join("ps");
-    // Exercise the normal scan subprocess without consulting the host's daemons.
-    // A real scan lists the scanning aft process itself (the script's parent),
-    // and a scan that does not is refused as incomplete, so list it first.
+    // Exercise the normal scan subprocesses without consulting the host's
+    // daemons. The scan asks `ps` twice, for executables (`pid=,comm=`) and
+    // for command lines (`pid=,args=`); the snapshot is given as command
+    // lines whose first word is the executable. A real scan lists the
+    // scanning aft process itself (the script's parent), and a scan that does
+    // not is refused as incomplete, so it is listed first.
     fs::write(
         &ps,
-        "#!/bin/sh\necho \"$PPID /opt/aft fix-config\"\nexec /bin/cat \"$0.snapshot\"\n",
+        "#!/bin/sh\ncase \"$2\" in\n*comm=*) echo \"$PPID /opt/aft\"; exec /usr/bin/awk '{print $1, $2}' \"$0.snapshot\" ;;\n*) echo \"$PPID /opt/aft fix-config\"; exec /bin/cat \"$0.snapshot\" ;;\nesac\n",
     )
     .unwrap();
     fs::write(bin.join("ps.snapshot"), snapshot).unwrap();
