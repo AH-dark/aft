@@ -3640,7 +3640,12 @@ impl MultiFileTreeWriter {
             return false;
         };
         self.output.truncate(start);
-        self.content_files.remove(&path);
+        // A `files` list can name the same file twice. The read manifest must
+        // keep a path while any block still shown in the text came from it,
+        // or a host checking read rules against the manifest would miss it.
+        if !self.shown_blocks.iter().any(|(_, shown)| *shown == path) {
+            self.content_files.remove(&path);
+        }
         self.files_shown -= 1;
         self.truncated = true;
         true
@@ -5758,6 +5763,92 @@ mod tests {
         assert_eq!(tight.shown, 0);
         assert!(tight.content_files.is_empty());
         assert!(tight.footer.contains("(time limit)"), "{}", tight.footer);
+    }
+
+    /// Run a three-file batch that stops at the deadline after two files,
+    /// with `max_bytes` from `budget(first two blocks)`.
+    fn deadline_after_two(
+        files: &[String],
+        ctx: &AppContext,
+        budget: impl Fn(usize) -> usize,
+    ) -> RenderedOutline {
+        let run = |max_bytes: usize| {
+            OUTLINE_BATCH_DEADLINE_AFTER_FILES.with(|limit| limit.set(Some(2)));
+            let (rendered, _) = outline_many_files(
+                files,
+                ctx,
+                "deadline-manifest",
+                "deadline-session",
+                None,
+                &HashSet::new(),
+                MultiFileBudget {
+                    max_bytes,
+                    total_requested: files.len(),
+                    walk_incomplete: false,
+                    files_capped: false,
+                },
+            )
+            .unwrap();
+            OUTLINE_BATCH_DEADLINE_AFTER_FILES.with(|limit| limit.set(None));
+            rendered
+        };
+        let roomy = run(30 * 1024);
+        assert_eq!(roomy.shown, 2, "{}", roomy.text);
+        run(budget(roomy.text.len() - 1 - roomy.footer.len()))
+    }
+
+    fn manifest_names(rendered: &RenderedOutline) -> Vec<String> {
+        rendered
+            .content_files
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// When the deadline footer takes back the last shown block, the read
+    /// manifest keeps that block's path if another block still shown came
+    /// from the same file (a `files` list can repeat a path), and drops it
+    /// when the dropped block was the file's only one.
+    #[test]
+    fn deadline_take_back_keeps_a_path_still_shown_in_the_manifest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = small_ts_files(temp.path(), 3)
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        // Room for both blocks plus the budget footer the writer reserves,
+        // but not for the longer time-limit footer: the second block goes.
+        let reserved = outline_structure_footer(3, 3, true, false, false).len() + 2;
+        let tight = |blocks: usize| blocks + reserved;
+
+        let repeated = vec![paths[0].clone(), paths[0].clone(), paths[2].clone()];
+        let rendered = deadline_after_two(&repeated, &ctx, tight);
+        assert_eq!(rendered.shown, 1, "{}", rendered.text);
+        assert!(rendered.text.contains("f000.ts"), "{}", rendered.text);
+        assert!(
+            rendered.footer.contains("(time limit)"),
+            "{}",
+            rendered.footer
+        );
+        assert_eq!(
+            manifest_names(&rendered),
+            ["f000.ts"],
+            "the copy still shown must stay in the read manifest"
+        );
+
+        let distinct = paths.clone();
+        let rendered = deadline_after_two(&distinct, &ctx, tight);
+        assert_eq!(rendered.shown, 1, "{}", rendered.text);
+        assert!(!rendered.text.contains("f001.ts"), "{}", rendered.text);
+        assert_eq!(
+            manifest_names(&rendered),
+            ["f000.ts"],
+            "a file whose only block was dropped must leave the manifest"
+        );
     }
 
     fn outline_ignore_fixture(root: &Path) {
