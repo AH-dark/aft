@@ -568,6 +568,13 @@ pub struct RemoteRefusal {
     pub message: String,
 }
 
+#[derive(Clone)]
+pub(crate) struct RunonLaunchState {
+    pub accepted: bool,
+    pub progress: remote::RemoteProgress,
+    pub terminal: Option<BgTaskSnapshot>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BgTaskSnapshot {
     #[serde(flatten)]
@@ -1119,6 +1126,10 @@ pub(crate) struct BgTask {
     /// The remote worker has observed a stream record or settled a submission
     /// failure. Kept in memory: launch callers need this only in this process.
     pub(crate) remote_launch_ready: AtomicBool,
+    /// Launch-only projection, published while state is locked but read without
+    /// that lock. Reply deadlines must not confuse a queued state read with a
+    /// runner that has not accepted the job.
+    runon_launch_state: Mutex<Option<RunonLaunchState>>,
     /// Cache construction is serialized independently of task state: renderers
     /// can read artifacts and invoke callbacks without holding the state lock.
     terminal_render: Mutex<()>,
@@ -2372,6 +2383,16 @@ impl BgTaskRegistry {
         Some(remote.accepted)
     }
 
+    pub(crate) fn runon_launch_state(
+        &self,
+        task_id: &str,
+        session: &str,
+    ) -> Option<RunonLaunchState> {
+        let task = self.task_for_session(task_id, session)?;
+        let launch = task.runon_launch_state.lock().ok()?.clone();
+        launch
+    }
+
     pub(crate) fn is_remote_task(&self, task_id: &str, session: &str) -> bool {
         self.task_for_session(task_id, session)
             .is_some_and(|t| t.lock_state().is_ok_and(|s| s.metadata.remote.is_some()))
@@ -2416,6 +2437,8 @@ impl BgTaskRegistry {
             if !state.metadata.status.is_terminal() || state.kill_in_flight {
                 return Ok(());
             }
+            #[cfg(unix)]
+            task.publish_runon_launch_state(&state);
             if state.metadata.mode != BgMode::Pipes || state.descendant_sampling_started {
                 false
             } else {
@@ -3867,6 +3890,7 @@ impl BgTaskRegistry {
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
+            runon_launch_state: Mutex::new(None),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -4224,6 +4248,7 @@ impl BgTaskRegistry {
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
+            runon_launch_state: Mutex::new(None),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -4478,6 +4503,7 @@ impl BgTaskRegistry {
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
+            runon_launch_state: Mutex::new(None),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -9246,6 +9272,7 @@ impl BgTaskRegistry {
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
+            runon_launch_state: Mutex::new(None),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -12518,6 +12545,23 @@ impl BgTask {
             .lock_state()
             .unwrap_or_else(|poison| poison.into_inner());
         self.snapshot_locked(&state, preview_bytes)
+    }
+
+    #[cfg(unix)]
+    fn publish_runon_launch_state(&self, state: &BgTaskState) {
+        let Some(remote) = state.metadata.remote.as_ref().filter(|r| r.explicit_runon) else {
+            return;
+        };
+        let launch = RunonLaunchState {
+            accepted: remote.accepted,
+            progress: remote::RemoteProgress::of(remote),
+            // Before Accepted there is no command output; an accepted refusal
+            // also never started. Accepted results keep the launch task handle.
+            terminal: (state.metadata.is_terminal()
+                && (!remote.accepted || remote::remote_refusal(&state.metadata).is_some()))
+            .then(|| self.snapshot_locked(state, 0)),
+        };
+        *self.runon_launch_state.lock().unwrap() = Some(launch);
     }
 
     fn snapshot_locked(&self, state: &BgTaskState, preview_bytes: usize) -> BgTaskSnapshot {

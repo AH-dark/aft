@@ -728,8 +728,9 @@ fn settled_runon_launch_reply(
                 _ => None,
             };
         }
-        return background_runon
-            .then(|| accepted_runon_launch_reply(registry, task_id, session, response));
+        return background_runon.then(|| {
+            accepted_runon_launch_reply(registry.remote_progress(task_id, session), response)
+        });
     }
     // Without Accepted, a task that already ended (refused, failed, outcome
     // unknown, killed) reports that saved outcome; only a live task says
@@ -740,14 +741,12 @@ fn settled_runon_launch_reply(
 }
 
 fn accepted_runon_launch_reply(
-    registry: &crate::bash_background::BgTaskRegistry,
-    task_id: &str,
-    session: &str,
+    progress: Option<crate::bash_background::registry::remote::RemoteProgress>,
     response: &Response,
 ) -> Response {
     let mut reply = copy_response(response);
     reply.data["status"] = json!("running");
-    if let Some(progress) = registry.remote_progress(task_id, session) {
+    if let Some(progress) = progress {
         let phase = progress.phase.tag();
         reply.data["phase"] = json!(phase);
         reply.data["remote_phase"] = json!(phase);
@@ -777,15 +776,45 @@ fn accepted_runon_launch_reply(
     reply
 }
 
-/// The launch reply when the capture wait ends (deadline or module drain)
-/// without having seen the worker settle. Reads saved state off the frame
-/// runtime and decides it with [`settled_runon_launch_reply`], so a wait that
-/// saw the worker settle and one that did not give the same answer for the
-/// same saved state. `Accepted` can land between the last poll and this read:
-/// an accepted background task gets a refreshed task handle, while a foreground
-/// task keeps its normal wait path. A refusal after acceptance is returned as
-/// an error; without `Accepted`, a saved terminal outcome is returned or a live
-/// task says `starting` with the capture warning.
+/// A deadline cannot wait for the blocking pool or task/artifact locks. Remote
+/// commits publish this small in-memory projection before releasing task state,
+/// so a delayed read never turns a saved Accepted or refusal into `starting`.
+fn cached_runon_launch_reply(
+    registry: &crate::bash_background::BgTaskRegistry,
+    task_id: &str,
+    session: &str,
+    response: &Response,
+    background_runon: bool,
+) -> Option<Response> {
+    if let Some(launch) = registry.runon_launch_state(task_id, session) {
+        if let Some(terminal) = launch.terminal {
+            let now = Instant::now();
+            if let crate::commands::bash_orchestrate::BashStep::Done(reply) =
+                crate::commands::bash_orchestrate::decide_bash_step(
+                    terminal,
+                    now,
+                    false,
+                    false,
+                    now,
+                    &response.id,
+                )
+            {
+                return Some(reply);
+            }
+        }
+        if launch.accepted {
+            return background_runon
+                .then(|| accepted_runon_launch_reply(Some(launch.progress), response));
+        }
+    }
+    Some(with_capture_warning(response))
+}
+
+/// The launch reply when a deadline or module drain ends the capture wait.
+/// Read the published launch state without waiting for task locks or the
+/// blocking pool: accepted foreground calls keep their normal wait path,
+/// accepted background calls get a refreshed task handle, and saved refusals
+/// remain errors.
 async fn unsettled_runon_launch_reply(
     registry: crate::bash_background::BgTaskRegistry,
     task_id: String,
@@ -793,12 +822,7 @@ async fn unsettled_runon_launch_reply(
     response: &Response,
     background_runon: bool,
 ) -> Option<Response> {
-    let pending = copy_response(response);
-    tokio::task::spawn_blocking(move || {
-        settled_runon_launch_reply(&registry, &task_id, &session, &pending, background_runon)
-    })
-    .await
-    .unwrap_or_else(|_| Some(with_capture_warning(response)))
+    cached_runon_launch_reply(&registry, &task_id, &session, response, background_runon)
 }
 
 /// The least time one capture-state read gets, even when the capture deadline
@@ -877,6 +901,9 @@ async fn await_runon_launch_reply(
     let deadline = deadline?;
     let task_id = response.data.get("task_id")?.as_str()?.to_owned();
     let capture = async {
+        if background_runon {
+            return cached_runon_launch_reply(&registry, &task_id, session, response, true);
+        }
         loop {
             let observed_registry = registry.clone();
             let observed_task = task_id.clone();
@@ -919,7 +946,15 @@ async fn await_runon_launch_reply(
                 }
                 // The state read itself overran the deadline and its grace;
                 // reading it again could block the reply just as long.
-                Err(_) => return Some(with_capture_warning(response)),
+                Err(_) => {
+                    return cached_runon_launch_reply(
+                        &registry,
+                        &task_id,
+                        session,
+                        response,
+                        background_runon,
+                    )
+                }
                 _ => {
                     return unsettled_runon_launch_reply(
                         registry.clone(),
@@ -937,7 +972,7 @@ async fn await_runon_launch_reply(
         biased;
         _ = claim.module_loop_claimed() => None,
         _ = cancel.cancelled() => None,
-        _ = async { tokio::time::sleep_until(reply_deadline.unwrap().into()).await }, if reply_deadline.is_some() => Some(with_capture_warning(response)),
+        _ = async { tokio::time::sleep_until(reply_deadline.unwrap().into()).await }, if reply_deadline.is_some() => cached_runon_launch_reply(&registry, &task_id, session, response, background_runon),
         _ = async {
             while !cancel.drain.is_active() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4672,10 +4707,23 @@ mod grant_path_tests {
     }
 
     #[cfg(unix)]
+    fn capture_cancel() -> BashWaitCancel {
+        BashWaitCancel {
+            run_scope: None,
+            scope: None,
+            late_results: false,
+            ledger_carrier: None,
+            connection: PersistentCancelSignal::new(),
+            route: PersistentCancelSignal::new(),
+            drain: drain::ModuleDrainWindow::default(),
+        }
+    }
+
+    #[cfg(unix)]
     #[derive(Clone, Copy)]
     enum ReplyDecided {
         AfterAcceptance,
-        MayPrecedeAcceptance,
+        BeforeAcceptance,
     }
 
     #[cfg(unix)]
@@ -4713,62 +4761,26 @@ mod grant_path_tests {
                     "{case}: {response:?}"
                 );
             }
-            ReplyDecided::MayPrecedeAcceptance => match response.data["status"].as_str() {
-                Some("starting") => {
-                    assert_eq!(
-                        response.data["remote_phase"], "submitting",
-                        "{case}: {response:?}"
-                    );
-                    assert!(
-                        text.contains(REMOTE_ADMISSION_PENDING_NOTE),
-                        "{case}: pending reply must warn against rerunning: {text}"
-                    );
-                    assert!(
-                        text.contains(REMOTE_INPUT_CAPTURE_WARNING),
-                        "{case}: pending reply must identify unconfirmed input capture: {text}"
-                    );
-                }
-                Some("running") => {
-                    assert!(
-                        !text.contains(REMOTE_INPUT_CAPTURE_WARNING),
-                        "{case}: {text}"
-                    );
-                    assert!(
-                        !response.data.to_string().contains("hasn't confirmed"),
-                        "{case}: {response:?}"
-                    );
-                }
-                status => panic!(
-                    "{case}: expected a starting or running launch reply, got {status:?}: {response:?}"
-                ),
-            },
-        }
-    }
-
-    #[cfg(unix)]
-    async fn wait_for_capture_submission(
-        daemon: &crate::exec_remote::wire_tests::Daemon,
-        rx: &mut mpsc::Receiver<BashDeferredCompletion>,
-    ) {
-        let submitted = tokio::time::timeout(Duration::from_secs(10), async {
-            while !daemon
-                .log
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(_, body)| body["method"] == "exec.run")
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            ReplyDecided::BeforeAcceptance => {
+                assert_eq!(response.data["status"], "starting", "{case}: {response:?}");
+                assert_eq!(
+                    response.data["remote_phase"], "submitting",
+                    "{case}: {response:?}"
+                );
+                assert!(
+                    response.data["remote_job_id"].is_null(),
+                    "{case}: {response:?}"
+                );
+                assert!(
+                    text.contains(REMOTE_ADMISSION_PENDING_NOTE),
+                    "{case}: {text}"
+                );
+                assert!(
+                    text.contains(REMOTE_INPUT_CAPTURE_WARNING),
+                    "{case}: {text}"
+                );
             }
-        })
-        .await;
-        assert!(
-            submitted.is_ok(),
-            "fake executor must receive the run request; early reply: {:?}",
-            rx.try_recv()
-                .ok()
-                .map(|done| format!("{:?}", done.response_for_test()))
-        );
+        }
     }
 
     #[cfg(unix)]
@@ -4777,15 +4789,25 @@ mod grant_path_tests {
         use crate::exec_remote::wire_tests::Script;
         let (daemon, _dir, root, executor, ctx) =
             capture_fixture(Script::DrainingGatedAcceptance).await;
-        let mut rx = capture_call(
+        let timing = BashTimingForTest::new(Instant::now());
+        let (mut rx, registered_task) = held_capture_call(
             &executor,
             &root,
-            json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000}),
+            json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":600_000}),
+            timing.clone(),
+            capture_cancel(),
+        )
+        .await;
+        daemon.wait_for_requests("exec.run", 2).await;
+        assert_eq!(
+            ctx.bash_background()
+                .runon_inputs_captured(&registered_task, "deadline-session"),
+            Some(false)
         );
-        wait_for_capture_submission(&daemon, &mut rx).await;
-        let launch = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        BashTimingForTest::release(&timing.result);
+        let launch = tokio::time::timeout(Duration::from_secs(60), rx.recv())
             .await
-            .expect("the background launch must not wait for the retry to be accepted")
+            .expect("the gated retry must not hold the launch reply")
             .unwrap();
         let response = launch.response_for_test();
         let task_id = response.data["task_id"].as_str().unwrap().to_owned();
@@ -4794,21 +4816,7 @@ mod grant_path_tests {
             .text_for_test()
             .unwrap()
             .contains(REMOTE_INPUT_CAPTURE_WARNING));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while daemon
-                .log
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(_, body)| body["method"] == "exec.run")
-                .count()
-                < 2
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("runner must receive the retry");
+        assert_eq!(task_id, registered_task);
         assert!(rx.try_recv().is_err(), "the call has one launch reply");
         daemon.acceptance_gate.notify_one();
         wait_for_task_state(&ctx, "retry accepted", |registry| {
@@ -4835,7 +4843,7 @@ mod grant_path_tests {
             &root,
             json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000}),
         );
-        wait_for_capture_submission(&daemon, &mut rx).await;
+        daemon.wait_for_requests("exec.run", 1).await;
         let launch = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("the background task id must be returned before the draining retry")
@@ -4918,18 +4926,21 @@ mod grant_path_tests {
     async fn runon_capture_blocking_wait_keeps_its_own_limit() {
         use crate::exec_remote::wire_tests::Script;
         for mode in ["wait", "block_to_completion"] {
-            let (daemon, _dir, root, executor, _ctx) =
+            let (daemon, _dir, root, executor, ctx) =
                 capture_fixture(Script::GatedAcceptance).await;
+            // Bound the caller's wait, not the remote command's lifetime: a busy
+            // host must not end the registered task before the runner receives it.
+            ctx.update_config(|config| config.bash.worker_wait_max_ms = 700);
             let mut timing = BashTimingForTest::new(Instant::now());
             Arc::get_mut(&mut timing).unwrap().capture_wait = Some(Duration::from_millis(150));
             let started = Instant::now();
-            let mut args = json!({"command":"uname -s", "runon":"linux", "timeout":700});
+            let mut args = json!({"command":"uname -s", "runon":"linux", "timeout":600_000});
             args[mode] = json!(true);
-            let mut rx = with_bash_timing_for_test(Some(timing), || {
-                deadline_test_call(&executor, &root, remote_runon_stub, args)
-            });
-            wait_for_capture_submission(&daemon, &mut rx).await;
-            let done = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            let (mut rx, task_id) =
+                held_capture_call(&executor, &root, args, timing.clone(), capture_cancel()).await;
+            daemon.wait_for_requests("exec.run", 1).await;
+            BashTimingForTest::release(&timing.result);
+            let done = tokio::time::timeout(Duration::from_secs(60), rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -4941,7 +4952,9 @@ mod grant_path_tests {
                 .text_for_test()
                 .unwrap()
                 .contains(REMOTE_INPUT_CAPTURE_WARNING));
-            assert!(done.response_for_test().data["task_id"].as_str().is_some());
+            assert_eq!(done.response_for_test().data["task_id"], task_id);
+            assert_eq!(done.response_for_test().data["remote_phase"], "submitting");
+            assert!(!ctx.bash_background().is_task_terminal(&task_id));
             daemon.acceptance_gate.notify_one();
         }
     }
@@ -4956,7 +4969,7 @@ mod grant_path_tests {
             &root,
             json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000}),
         );
-        wait_for_capture_submission(&daemon, &mut rx).await;
+        daemon.wait_for_requests("exec.run", 1).await;
         let launch = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("background runon must reply before Accepted")
@@ -5034,7 +5047,7 @@ mod grant_path_tests {
                     cancel.clone(),
                 )
             });
-        wait_for_capture_submission(&daemon, &mut rx).await;
+        daemon.wait_for_requests("exec.run", 1).await;
         let route = RouteChannel {
             channel: 1,
             epoch: 1,
@@ -5344,7 +5357,7 @@ mod grant_path_tests {
                     cancel.clone(),
                 )
             });
-            wait_for_capture_submission(&daemon, &mut rx).await;
+            daemon.wait_for_requests("exec.run", 1).await;
             tokio::time::timeout(
                 Duration::from_secs(60),
                 timing.capture_registered.notified(),
@@ -5473,7 +5486,7 @@ mod grant_path_tests {
             &root,
             json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":600_000}),
         );
-        wait_for_capture_submission(&daemon, &mut rx).await;
+        daemon.wait_for_requests("exec.run", 1).await;
         let done = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("background launch must answer before the runner accepts")
@@ -5621,14 +5634,32 @@ mod grant_path_tests {
     #[tokio::test]
     async fn runon_capture_refusal_preserves_existing_error() {
         use crate::exec_remote::wire_tests::Script;
-        let (daemon, _dir, root, executor, _ctx) = capture_fixture(Script::KnownRefused).await;
-        let mut rx = capture_call(
+        let (_daemon, _dir, root, executor, ctx) = capture_fixture(Script::KnownRefused).await;
+        let timing = BashTimingForTest::new(Instant::now());
+        let (mut rx, task_id) = held_capture_call(
             &executor,
             &root,
-            json!({"command":"uname -s", "runon":"linux", "timeout":10000}),
+            json!({"command":"uname -s", "runon":"linux", "timeout":600_000}),
+            timing.clone(),
+            capture_cancel(),
+        )
+        .await;
+        wait_for_task_state(&ctx, "refusal saved before reply", |registry| {
+            registry
+                .runon_launch_state(&task_id, "deadline-session")
+                .is_some_and(|launch| {
+                    launch
+                        .terminal
+                        .is_some_and(|snapshot| snapshot.remote_refusal.is_some())
+                })
+        })
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "dispatch holds the reply until refusal is saved"
         );
-        wait_for_capture_submission(&daemon, &mut rx).await;
-        let done = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        BashTimingForTest::release(&timing.result);
+        let done = tokio::time::timeout(Duration::from_secs(60), rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -5655,7 +5686,7 @@ mod grant_path_tests {
                 &root,
                 json!({"command":"uname -s", "runon":"linux", "background":background, "timeout":10000}),
             );
-            wait_for_capture_submission(&daemon, &mut rx).await;
+            daemon.wait_for_requests("exec.run", 1).await;
             let done = tokio::time::timeout(Duration::from_secs(10), rx.recv())
                 .await
                 .expect("the launch must answer without waiting for the capture deadline")
@@ -5716,7 +5747,7 @@ mod grant_path_tests {
             &root,
             json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000}),
         );
-        wait_for_capture_submission(&daemon, &mut rx).await;
+        daemon.wait_for_requests("exec.run", 1).await;
         let launched = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
             .unwrap()
@@ -5940,11 +5971,101 @@ mod grant_path_tests {
         );
     }
 
+    /// A saturated blocking pool must not turn an already accepted launch back
+    /// into a pending launch. The dispatch stays held while the reply is chosen.
+    #[cfg(unix)]
+    #[test]
+    fn runon_capture_accepted_reply_does_not_queue_for_blocking_pool() {
+        assert_capture_reply_without_blocking_pool(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runon_capture_refused_reply_does_not_queue_for_blocking_pool() {
+        assert_capture_reply_without_blocking_pool(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_capture_reply_without_blocking_pool(refused: bool) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                use crate::exec_remote::wire_tests::Script;
+                for (background, expire_read) in [(true, false), (false, false), (false, true)] {
+                    let script = if refused { Script::AcceptedThenRefused } else { Script::Plain };
+                    let (_daemon, _dir, root, executor, ctx) = capture_fixture(script).await;
+                    let timing = BashTimingForTest::new(Instant::now());
+                    let cancel = BashWaitCancel {
+                        run_scope: None,
+                        scope: None,
+                        late_results: false,
+                        ledger_carrier: None,
+                        connection: PersistentCancelSignal::new(),
+                        route: PersistentCancelSignal::new(),
+                        drain: drain::ModuleDrainWindow::default(),
+                    };
+                    let (mut rx, task_id) = held_capture_call(
+                        &executor,
+                        &root,
+                        json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000}),
+                        timing.clone(),
+                        cancel.clone(),
+                    )
+                    .await;
+                    wait_for_task_state(&ctx, "Accepted and terminal", |registry| {
+                        registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
+                            && registry.is_task_terminal(&task_id)
+                    })
+                    .await;
+
+                    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    let blocker = tokio::task::spawn_blocking(move || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+                    });
+                    entered_rx.await.unwrap();
+                    let task = ctx.bash_background().task_for_test(&task_id).unwrap();
+                    let state = task.state.lock().unwrap();
+                    let pending = with_capture_warning(&Response::success(
+                        "queued-observation", json!({"task_id":task_id, "status":"running"}),
+                    ));
+                    let reply = await_runon_launch_reply(
+                        ctx.bash_background().clone(), "deadline-session", &pending,
+                        Some(if expire_read { Instant::now() - Duration::from_secs(2) } else { Instant::now() + Duration::from_secs(60) }), &cancel,
+                        &drain::BashCallClaim::default(), false,
+                        (!background && !expire_read).then(Instant::now), background,
+                    ).await;
+                    drop(state);
+                    release_tx.send(()).unwrap();
+                    blocker.await.unwrap();
+                    BashTimingForTest::release(&timing.result);
+                    let _ = tokio::time::timeout(Duration::from_secs(60), rx.recv()).await.unwrap();
+                    if !background && !refused {
+                        assert!(reply.is_none(), "accepted foreground calls keep waiting: {reply:?}");
+                        continue;
+                    }
+                    let reply = reply.unwrap();
+                    if refused {
+                        assert!(!reply.success, "a saved refusal must win: {reply:?}");
+                        assert_eq!(reply.data["code"], "remote_unavailable");
+                    } else {
+                        assert_eq!(reply.data["status"], "running", "accepted launch: {reply:?}");
+                        assert!(reply.data["remote_job_id"].is_string(), "{reply:?}");
+                        assert_ne!(reply.data["remote_phase"], "submitting", "{reply:?}");
+                    }
+                    assert!(!reply.data.to_string().contains(REMOTE_INPUT_CAPTURE_WARNING), "{reply:?}");
+                }
+            });
+    }
+
     /// This test checks launch replies after the input-capture wait ends once
-    /// the runner has accepted the job. Module-drain replies are decided only after
-    /// acceptance is observed; a capture deadline may instead return a pending reply
-    /// before the runner accepts the job. A completed job still returns its task
-    /// handle, not the finished result.
+    /// the runner has accepted the job. Hold dispatch and startup handoff until
+    /// acceptance is observed, except for the explicitly gated pending case.
+    /// A completed job still returns its task handle, not the finished result.
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_wait_ended_after_accepted_keeps_launch_reply() {
@@ -6033,7 +6154,7 @@ mod grant_path_tests {
                     .await;
                     BashTimingForTest::release(&timing.result);
                     // The reply was selected before acceptance, so its starting status is accurate.
-                    assert_launch_reply(&done, &task_id, &case, ReplyDecided::MayPrecedeAcceptance);
+                    assert_launch_reply(&done, &task_id, &case, ReplyDecided::BeforeAcceptance);
                     assert_eq!(done.response_for_test().data["status"], "starting");
                     continue;
                 }
@@ -6051,13 +6172,9 @@ mod grant_path_tests {
                     .await
                     .expect("the released launch must answer")
                     .unwrap();
-                if drain_ends_wait {
-                    // Acceptance was observed before the module drain decided the reply.
-                    assert_launch_reply(&done, &task_id, &case, ReplyDecided::AfterAcceptance);
-                } else {
-                    // The capture deadline can decide the reply before Accepted is observed.
-                    assert_launch_reply(&done, &task_id, &case, ReplyDecided::MayPrecedeAcceptance);
-                }
+                // Only the accepted cases reach this assertion. Their startup
+                // timer and dispatch stayed held until Accepted was observed.
+                assert_launch_reply(&done, &task_id, &case, ReplyDecided::AfterAcceptance);
                 if !finished {
                     daemon.output_gate.notify_one();
                     wait_for_task_state(&ctx, "completed", |registry| {
@@ -6158,15 +6275,18 @@ mod grant_path_tests {
             started,
             Some(started + Duration::from_secs(2)),
         );
-        let mut rx = deadline_test_call_owned(
-            &executor,
-            &root,
-            remote_runon_stub,
-            json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000}),
-            budget,
-            false,
-        );
-        wait_for_capture_submission(&daemon, &mut rx).await;
+        let mut rx = with_bash_timing_for_test(Some(BashTimingForTest::new(started)), || {
+            deadline_test_call_owned(
+                &executor,
+                &root,
+                remote_runon_stub,
+                json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":600_000}),
+                budget,
+                false,
+            )
+        });
+        // The launch reply does not depend on the runner receiving exec.run.
+        // Measure its real client budget without first waiting for that event.
         let done = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
             .unwrap()
@@ -6197,7 +6317,7 @@ mod grant_path_tests {
             &root,
             json!({"command":"uname -s", "runon":"linux", "timeout":500}),
         );
-        wait_for_capture_submission(&daemon, &mut rx).await;
+        daemon.wait_for_requests("exec.run", 1).await;
         let done = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
             .unwrap()

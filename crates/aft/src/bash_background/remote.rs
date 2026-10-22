@@ -1156,6 +1156,7 @@ impl TaskSink {
         } else {
             self.output_progress = OutputProgress::of(state.metadata.remote.as_ref().unwrap());
             self.last_progress_persist = self.progress_now();
+            self.task.publish_runon_launch_state(&state);
         }
         result
     }
@@ -2851,6 +2852,7 @@ impl BgTaskRegistry {
             });
             task.mark_terminal_now();
             let _ = self.persist_task_locked(task, &state.metadata, &mut db);
+            task.publish_runon_launch_state(&state);
             task.kill_settled.notify_all();
             (session_id, job_id, status_label)
         };
