@@ -800,7 +800,7 @@ fn leave_room_for_one_copy(storage: &Path, payload_len: u64) -> u64 {
 fn a_repeated_copy_reserves_only_a_touch_and_reuses_the_committed_row() {
     let _guard = serial();
     let root = tempdir().unwrap();
-    // Larger than the touch-sized reservation, so the two can be told apart.
+    // Covers the row, as every touch does, but is not a full copy's request.
     let payload = vec![6u8; 4 * 1024 * 1024];
     let (_store, key) = v1_source(root.path(), &payload);
     let held = leave_room_for_one_copy(root.path(), payload.len() as u64);
@@ -829,11 +829,14 @@ fn a_repeated_copy_reserves_only_a_touch_and_reuses_the_committed_row() {
     assert_eq!(flushed.len(), 1, "{flushed:?}");
     let (reserved, present) = flushed[0];
     assert!(present);
+    // The touch may rewrite the whole row into the WAL, so its reservation
+    // covers the row; it stays below a full copy's request, which no longer
+    // fits the budget.
+    let row = payload.len() as u64;
+    let touch = reserved - held;
     assert!(
-        reserved - held < payload.len() as u64,
-        "the reuse attempt reserved {} bytes for a {} byte row",
-        reserved - held,
-        payload.len()
+        touch >= row && touch < 2 * row + (1 << 20),
+        "the reuse attempt reserved {touch} bytes for a {row} byte row"
     );
     assert_eq!(
         LedgerReader::open_existing(root.path(), FAMILY)
@@ -883,7 +886,10 @@ fn a_row_that_vanishes_before_its_touch_is_copied_under_a_full_reservation() {
         !after_touch,
         "a row was inserted under the touch-sized reservation"
     );
-    assert!(touch_reserved < payload.len() as u64, "{flushed:?}");
+    assert!(
+        touch_reserved >= payload.len() as u64 && touch_reserved < 2 * payload.len() as u64,
+        "{flushed:?}"
+    );
     let (full_reserved, after_copy) = flushed[1];
     assert!(after_copy);
     assert!(full_reserved >= 2 * payload.len() as u64, "{flushed:?}");

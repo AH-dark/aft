@@ -31,9 +31,12 @@ use std::time::Instant;
 
 /// The longest a copier waits for a live v2 sweep lease to clear.
 pub const SWEEP_LEASE_WAIT: Duration = Duration::from_secs(120);
-/// The reservation for an attempt that only touches an equal v3 row: room
-/// for the updated pages in the plane and registry WAL frames.
-const TOUCH_REQUEST: u64 = 1 << 20;
+/// Added to the row's length for an attempt that only touches an equal v3
+/// row: room for the index entry, the registry's WAL frames and page slack.
+/// The row length itself is reserved because `ref_epoch` shares a record
+/// with the payload, so SQLite may rewrite the whole record, overflow pages
+/// included, into the WAL to change it.
+const TOUCH_MARGIN: u64 = 1 << 20;
 const LEASE_RETRY: Duration = Duration::from_millis(20);
 static PIN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -100,9 +103,13 @@ pub fn copy_on_first_use(
     // is gone by the time the closure runs, that attempt writes nothing and
     // the full copy below runs under its own full-size reservation.
     if destination_holds(storage, family, &key, length, &digest)?
-        && publish(storage, family, TOUCH_REQUEST, observer, |publication| {
-            publication.touch_row(&key, &digest)
-        })?
+        && publish(
+            storage,
+            family,
+            length.saturating_add(TOUCH_MARGIN),
+            observer,
+            |publication| publication.touch_row(&key, &digest),
+        )?
     {
         drop(pin);
         return Ok(CopyOutcome::Reused);
