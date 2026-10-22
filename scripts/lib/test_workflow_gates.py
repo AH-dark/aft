@@ -836,5 +836,117 @@ class ArtifactRetryTests(unittest.TestCase):
                     self.assertEqual([step["with"].get("overwrite") for step in attempts[1:]], ["true", "true"])
 
 
+# Time a job must keep after its inner caps for a retrying artifact transfer:
+# the retry actions pause 60 s + 120 s and make up to three attempts.
+RETRY_MARGIN_MINUTES = 5.0
+
+# The word `timeout` followed by a duration, as the coreutils command is
+# written (a `--timeout` flag does not match), with its options. `-k`/`-s`
+# take their value as a separate word. This is a text match, not a shell
+# parse, so a quoted "timeout 5m" would also count.
+_SHELL_TIMEOUT = re.compile(
+    r"(?<![-\w])timeout\s+"
+    r"((?:(?:-k|-s|--kill-after|--signal)\s+\S+\s+|-\S+\s+)*)"
+    r"(\d+(?:\.\d+)?)([smhd]?)(?=\s)"
+)
+_KILL_AFTER = re.compile(r"(?:--kill-after=|-k\s+)(\d+(?:\.\d+)?)([smhd]?)")
+_MINUTES_PER_UNIT = {"": 1 / 60, "s": 1 / 60, "m": 1.0, "h": 60.0, "d": 1440.0}
+
+
+def step_cap_minutes(step: dict) -> float:
+    """A step's declared cap in minutes. The `timeout` commands found in its
+    script are summed (they run one after another), each with any
+    --kill-after grace added; when the step also sets `timeout-minutes`, the
+    smaller of the two applies. 0 means the step declares no cap."""
+    step_limit = float(step["timeout-minutes"]) if "timeout-minutes" in step else 0.0
+    shell_limit = 0.0
+    run = step.get("run")
+    if isinstance(run, str):
+        for options, number, unit in _SHELL_TIMEOUT.findall(run):
+            shell_limit += float(number) * _MINUTES_PER_UNIT[unit]
+            kill = _KILL_AFTER.search(options)
+            if kill:
+                shell_limit += float(kill.group(1)) * _MINUTES_PER_UNIT[kill.group(2)]
+    if step_limit and shell_limit:
+        return min(step_limit, shell_limit)
+    return step_limit or shell_limit
+
+
+def expanded_steps(steps: list) -> list[dict]:
+    """A job's steps with local composite actions replaced by their own steps,
+    except the retry actions, which stay as single steps to be found."""
+    expanded: list[dict] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        uses = str(step.get("uses") or "")
+        target = _local_target(uses)
+        if uses in RETRY_ACTIONS or target is None or target.name != "action.yml":
+            expanded.append(step)
+            continue
+        runs = workflow_gates.parse_workflow(str(target)).get("runs") or {}
+        expanded.extend(expanded_steps(runs.get("steps") or []))
+    return expanded
+
+
+def retry_job_budgets() -> list[tuple[str, str, float, float]]:
+    """(file, job, job timeout, inner caps before the job's last retrying
+    artifact step) for every job that uses a retry action, in tests.yml and
+    the reusable workflows it calls."""
+    files = sorted({
+        relative for relative, _, _ in required_check_steps()
+        if relative.startswith(".github/workflows/")
+    })
+    budgets = []
+    for relative in files:
+        jobs = workflow_gates.parse_workflow(str(REPO_ROOT / relative)).get("jobs") or {}
+        for job_id, job in jobs.items():
+            if not isinstance(job, dict):
+                continue
+            steps = expanded_steps(job.get("steps") or [])
+            retries = [i for i, step in enumerate(steps) if step.get("uses") in RETRY_ACTIONS]
+            if not retries:
+                continue
+            caps = sum(step_cap_minutes(step) for step in steps[: retries[-1]])
+            # GitHub's default job timeout is 360 minutes.
+            timeout = float(job.get("timeout-minutes", 360))
+            budgets.append((relative, job_id, timeout, caps))
+    return budgets
+
+
+class ArtifactRetryTimeBudgetTests(unittest.TestCase):
+    """A job that hits its own timeout is cancelled before its later steps run,
+    so a retrying upload placed after a capped test step must still fit inside
+    the job's timeout when that step uses its whole cap."""
+
+    def test_jobs_with_retrying_transfers_leave_time_beyond_their_inner_caps(self) -> None:
+        short = [
+            f"{relative} job {job_id}: timeout-minutes {timeout:g} < inner caps "
+            f"{caps:g} + {RETRY_MARGIN_MINUTES:g}"
+            for relative, job_id, timeout, caps in retry_job_budgets()
+            if timeout < caps + RETRY_MARGIN_MINUTES
+        ]
+        self.assertEqual(short, [], "raise these jobs' timeout-minutes; do not shrink their test caps")
+
+    def test_budget_scan_sees_the_capped_opencode2_matrix(self) -> None:
+        budgets = {(relative, job_id): caps for relative, job_id, _, caps in retry_job_budgets()}
+        self.assertGreaterEqual(len(budgets), 15)
+        self.assertAlmostEqual(budgets[(".github/workflows/_e2e-suite.yml", "e2e-opencode2-linux")], 22.5)
+        # The integration-shard action's download is found through the composite.
+        self.assertIn((".github/workflows/_unit-suite.yml", "unit-macos-nextest"), budgets)
+
+    def test_step_caps_read_timeout_commands_and_step_limits(self) -> None:
+        for step, minutes in (
+            ({"run": "timeout --signal=TERM --kill-after=30s 22m bash run.sh"}, 22.5),
+            ({"run": "timeout -k 60 10m make\ntimeout 90 make check"}, 12.5),
+            ({"run": "time bun test --timeout 30000 src/"}, 0.0),
+            ({"run": "timeout 1h make", "timeout-minutes": "15"}, 15.0),
+            ({"timeout-minutes": "7"}, 7.0),
+            ({"uses": "actions/checkout@v5"}, 0.0),
+        ):
+            with self.subTest(step=step):
+                self.assertAlmostEqual(step_cap_minutes(step), minutes)
+
+
 if __name__ == "__main__":
     unittest.main()

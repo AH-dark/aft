@@ -188,16 +188,23 @@ jobs:
           if-no-files-found: warn
 
   # ---------------------------------------------------------------------------
-  # OpenCode 2 Linux Docker e2e — the 25-minute budget applies to this job,
-  # excluding the shared binary producer it depends on. The same local runner
-  # builds the image and executes every applicable matrix row.
+  # OpenCode 2 Linux Docker e2e. The same local runner builds the image and
+  # executes every applicable matrix row, under the 22-minute cap on the
+  # "Run OpenCode 2 matrix" step. The job allows 32 minutes, 10 beyond that
+  # cap, so a matrix that uses its whole cap still leaves time to pack and
+  # upload its forensics. Those 10 minutes cover finding the check run (up to
+  # 2 minutes) plus one retrying artifact transfer waiting out an
+  # artifact-service outage (about 5 minutes); an outage that hits both the
+  # binary download before the matrix and the upload after it can still run
+  # out the job. The shared binary producer this job depends on is not
+  # counted.
   # ---------------------------------------------------------------------------
   e2e-opencode2-linux:
     name: OpenCode 2 (Linux Docker)
     if: ${{ github.event_name != 'pull_request' }}
     needs: e2e-linux-binary
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
+    timeout-minutes: 32
     permissions:
       actions: read
       contents: read
