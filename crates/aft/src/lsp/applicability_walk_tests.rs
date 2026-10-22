@@ -1,5 +1,5 @@
 use super::*;
-use crate::lsp::applicability_cache::ApplicabilityCache;
+use crate::lsp::applicability_cache::{ApplicabilityCache, MAX_CACHED_SNAPSHOTS};
 use crate::lsp::roots::RootPathMode;
 
 fn config(root: &Path) -> Config {
@@ -305,6 +305,58 @@ fn applicability_walk_fifty_content_batches_do_zero_full_walks() {
     assert_eq!(metrics.retained_content_batches, 50);
     assert_eq!(metrics.warm_validations, 50);
     assert!(metrics.invalidations.is_empty());
+}
+
+#[test]
+fn applicability_walk_cache_cap_keeps_recently_used_snapshots() {
+    let warm = tempfile::tempdir().unwrap();
+    let warm_root = warm.path().canonicalize().unwrap();
+    std::fs::write(warm_root.join("main.py"), "").unwrap();
+    let warm_config = config(&warm_root);
+    let other = tempfile::tempdir().unwrap();
+    let other_root = other.path().canonicalize().unwrap();
+    // Each configuration is its own cache key for the same root.
+    let other_config = |n: usize| {
+        let mut config = config(&other_root);
+        config.disabled_lsp.insert(format!("custom-{n}"));
+        config
+    };
+    let cache = ApplicabilityCache::default();
+    let walk = |root: &Path, config: &Config| {
+        cache
+            .walk(
+                root,
+                config,
+                Instant::now() + Duration::from_secs(10),
+                || Ok(scan(root, config)),
+            )
+            .unwrap();
+    };
+    walk(&warm_root, &warm_config);
+    // Fill the cache to capacity with idle snapshots of other keys.
+    for n in 0..MAX_CACHED_SNAPSHOTS - 1 {
+        walk(&other_root, &other_config(n));
+    }
+    // At capacity, a lookup must still find its own warm snapshot.
+    walk(&warm_root, &warm_config);
+    // A new key at capacity makes room by dropping the least recently used
+    // idle snapshot, not one a caller has just used.
+    walk(&other_root, &other_config(MAX_CACHED_SNAPSHOTS - 1));
+    walk(&warm_root, &warm_config);
+    let warm_metrics = cache.metrics(&warm_root);
+    assert_eq!(
+        warm_metrics.full_walks, 1,
+        "a recently used snapshot must survive the cache cap: {warm_metrics:?}"
+    );
+    assert_eq!(warm_metrics.hits, 2);
+
+    // The cap still bounds the cache: the oldest key was the one dropped,
+    // and a key used since then is still warm.
+    let other_walks = cache.metrics(&other_root).full_walks;
+    walk(&other_root, &other_config(0));
+    assert_eq!(cache.metrics(&other_root).full_walks, other_walks + 1);
+    walk(&other_root, &other_config(MAX_CACHED_SNAPSHOTS - 2));
+    assert_eq!(cache.metrics(&other_root).full_walks, other_walks + 1);
 }
 
 #[test]
