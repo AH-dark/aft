@@ -669,6 +669,34 @@ fn download_to_cache(
     Ok(content_file)
 }
 
+/// The fresh cached copy of `url` under `storage_dir`, if there is one. Reads
+/// only: it creates no folder, writes nothing and downloads nothing. The cache
+/// check is bounded by the call's deadline like a remembered failure's (a
+/// stalled cache drive counts as a miss), and a cached copy passes the same
+/// scheme and private-address checks as a download before it is served.
+pub fn cached_url_document(
+    url: &str,
+    storage_dir: &Path,
+    options: &UrlFetchOptions,
+) -> Result<Option<PathBuf>, UrlFetchError> {
+    let parsed = Url::parse(url).map_err(|_| UrlFetchError::new(format!("Invalid URL: {url}")))?;
+    let deadline = FetchDeadline::for_current_call();
+    let fetch_url = rewrite_url_for_fetch(&parsed);
+    let hash = hash_url(url);
+    let check = CacheCheckInput {
+        storage_dir: storage_dir.to_path_buf(),
+        meta_file: meta_path(storage_dir, &hash),
+        hash,
+        url: fetch_url.clone(),
+    };
+    let key = FailureKey::new(storage_dir, url, options.allow_private);
+    let Some(cached) = bounded_cache_check(&key, check, cache_check_deadline())? else {
+        return Ok(None);
+    };
+    validate_public_url(&fetch_url, options, &deadline, &ApprovedHosts::default())?;
+    Ok(Some(cached))
+}
+
 /// What a cleanup sweep learned from one metadata file, kept so the next sweep
 /// can skip re-reading it. `len` and `modified` identify the file version the
 /// fetch time was read from: the cache rewrites metadata only through a rename

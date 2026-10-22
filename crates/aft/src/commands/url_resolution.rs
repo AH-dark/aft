@@ -32,23 +32,42 @@ fn resolve_with_fetch(
                 .get("allow_private")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(true);
-        return fetch(
-            file,
-            &storage_dir,
-            UrlFetchOptions {
-                allow_private,
-                ..Default::default()
-            },
-        )
-        .map(|path| {
-            // The download stopped early enough to leave time for reading the
-            // document back. Those reads must not use the reply margin too: a
-            // stalled read then fails while the reply still reaches the caller
-            // before the call's deadline.
-            crate::bounded_io::keep_reply_margin(URL_REPLY_MARGIN);
-            path
-        })
-        .map_err(|error| url_fetch_error_response(&req.id, &error));
+        let options = UrlFetchOptions {
+            allow_private,
+            ..Default::default()
+        };
+        // While the cache location is unavailable (its volume is missing, or
+        // the user config that names it is unreadable), `cache_dir()` falls
+        // back to durable storage, which caches must not fill. Serve a fresh
+        // copy already cached there, and refuse to download anything new.
+        let fetched = match ctx.cache_unavailable_reason() {
+            Some(reason) => {
+                match crate::url_fetch::cached_url_document(file, &storage_dir, &options) {
+                    Ok(Some(cached)) => Ok(cached),
+                    Ok(None) => {
+                        return Err(Response::error(
+                            &req.id,
+                            crate::root_cache::CACHE_DIR_UNAVAILABLE,
+                            format!(
+                                "URL download refused while the cache location is unavailable: {reason}"
+                            ),
+                        ))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            None => fetch(file, &storage_dir, options),
+        };
+        return fetched
+            .map(|path| {
+                // The download stopped early enough to leave time for reading the
+                // document back. Those reads must not use the reply margin too: a
+                // stalled read then fails while the reply still reaches the caller
+                // before the call's deadline.
+                crate::bounded_io::keep_reply_margin(URL_REPLY_MARGIN);
+                path
+            })
+            .map_err(|error| url_fetch_error_response(&req.id, &error));
     }
     ctx.validate_read_path(&req.id, req.session(), Path::new(file))
 }
@@ -81,6 +100,86 @@ fn url_fetch_error_response(id: &str, error: &UrlFetchError) -> Response {
 #[cfg(test)]
 mod url_tests {
     use super::*;
+
+    /// A context whose cache location is unknown because the user config was
+    /// unreadable; `cache_dir()` then names the durable storage root.
+    fn cache_unavailable_ctx(storage: &Path) -> AppContext {
+        AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.to_path_buf()),
+                cache_config_unknown: Some("user config is not valid JSONC".into()),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn outline_request(url: &str) -> RawRequest {
+        serde_json::from_value(serde_json::json!({
+            "id": "cache-off-url",
+            "command": "outline",
+            "file": url,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn url_download_is_refused_without_writing_while_the_cache_location_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = cache_unavailable_ctx(&storage);
+        assert!(ctx.cache_unavailable_reason().is_some());
+        // An address literal keeps the check off the network.
+        let url = "https://93.184.216.34/docs.md";
+        let refused = resolve_with_fetch(&outline_request(url), &ctx, url, |_, _, _| {
+            panic!("a download started while the cache location is unavailable")
+        })
+        .expect_err("a fresh download must be refused");
+        assert_eq!(
+            refused.data["code"],
+            crate::root_cache::CACHE_DIR_UNAVAILABLE
+        );
+        let message = refused.data["message"].as_str().unwrap();
+        assert!(message.contains("cache_dir_config_unknown"), "{message}");
+        assert_eq!(ctx.cache_dir(), storage);
+        assert!(
+            !storage.join("url_cache").exists(),
+            "the refusal wrote a URL cache under durable storage"
+        );
+    }
+
+    #[test]
+    fn url_already_cached_still_serves_while_the_cache_location_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = cache_unavailable_ctx(&storage);
+        let url = "https://93.184.216.34/docs.md";
+        let cache = ctx.cache_dir();
+        let content = crate::url_fetch::cache_content_path_for_url(&cache, url, ".md");
+        std::fs::create_dir_all(content.parent().unwrap()).unwrap();
+        std::fs::write(&content, "# cached").unwrap();
+        let fetched_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        std::fs::write(
+            crate::url_fetch::cache_meta_path_for_url(&cache, url),
+            serde_json::json!({
+                "url": url,
+                "contentType": "text/markdown",
+                "extension": ".md",
+                "fetchedAt": fetched_at,
+                "downloaded_bytes": 8,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let served = resolve_with_fetch(&outline_request(url), &ctx, url, |_, _, _| {
+            panic!("a download started while the cache location is unavailable")
+        })
+        .expect("the cached copy must still serve");
+        assert_eq!(served, content);
+    }
 
     #[test]
     fn private_fetch_permission_cannot_widen_trusted_ceiling() {
