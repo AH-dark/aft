@@ -1273,6 +1273,10 @@ fn dispatch_config_probe_for_test(ctx: &AppContext) {
 }
 
 fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    aft::access_policy::with_native_route(req, ctx, dispatch_on_route)
+}
+
+fn dispatch_on_route(req: RawRequest, ctx: &AppContext) -> Response {
     if req.worker_session() {
         ctx.lsp().disable_rust_cargo_for_worker();
     }
@@ -1529,7 +1533,9 @@ fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOu
     let disconnected_request_id = request_id.clone();
     let (tx, rx) = mpsc::sync_channel(1);
     let admitted_config = ctx.config();
+    let ask_route = aft::access_policy::capture_ask_route();
     thread::spawn(move || {
+        let _ask_route = ask_route.install();
         let _cancellation = aft::executor::install_job_cancellation(worker_cancellation);
         let _config_pin = ctx.pin_config_to(admitted_config);
         let command = req.command.clone();
@@ -1621,6 +1627,22 @@ fn handle_cancel_request(req: &RawRequest, pending: &mut PendingResponses) -> Re
 }
 
 fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
+    let mut deferred = None;
+    let response = aft::access_policy::with_native_route(req, ctx, |req, _| {
+        match dispatch_outcome_on_route(req, ctx) {
+            DispatchOutcome::Immediate(response) => response,
+            DispatchOutcome::Deferred(pending) => {
+                deferred = Some(pending);
+                Response::success("native-deferred", serde_json::json!({}))
+            }
+        }
+    });
+    deferred
+        .map(DispatchOutcome::Deferred)
+        .unwrap_or(DispatchOutcome::Immediate(response))
+}
+
+fn dispatch_outcome_on_route(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
     if req.worker_session() {
         ctx.lsp().disable_rust_cargo_for_worker();
     }
@@ -1757,7 +1779,9 @@ fn dispatch_with_offloaded_validation(req: RawRequest, ctx: Arc<AppContext>) -> 
     let (tx, rx) = mpsc::channel::<OffloadedEditEvent>();
     let started_tx = tx.clone();
     let admitted_config = ctx.config();
+    let ask_route = aft::access_policy::capture_ask_route();
     thread::spawn(move || {
+        let _ask_route = ask_route.install();
         let _wake = CompletionWake(Some(wake_standalone_loop_for_deferred_response));
         let tx = tx;
         let _config_pin = ctx.pin_config_to(admitted_config);

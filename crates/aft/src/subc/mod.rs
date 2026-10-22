@@ -210,6 +210,7 @@ mod drain;
 mod flow_read;
 mod health;
 mod perf_sweep;
+mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
 mod manifest;
@@ -5281,6 +5282,9 @@ where
                         }
                     }
                     FrameType::Response | FrameType::Error if frame.header.channel != 0 => {
+                        if standalone::reply(&writer_tx, &frame) {
+                            continue;
+                        }
                         let decoded = DecodedFrame {frame, phase_trace, parsed_body, confinement, launch_restore};
                         let decoded = if !ledger_waited {
                             match ledger_edge.authorize(decoded, &pending_bash_asks, &executor) {
@@ -8363,6 +8367,27 @@ async fn submit_provider_read(
     Ok(())
 }
 
+/// The I/O budget one plain tool-call run gets.
+fn plain_run_io_budget(corr: u64) -> Duration {
+    #[cfg(test)]
+    if let Some(budget) = PLAIN_RUN_IO_BUDGET_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&corr)
+    {
+        return *budget;
+    }
+    let _ = corr;
+    Duration::from_secs(25)
+}
+
+/// Per-call (by correlation id) I/O budgets for tests that need a run's
+/// budget to run out quickly.
+#[cfg(test)]
+pub(super) static PLAIN_RUN_IO_BUDGET_FOR_TEST: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<u64, Duration>>,
+> = std::sync::LazyLock::new(Default::default);
+
 /// Everything one plain (non-deferred) tool-call run needs, kept so a call
 /// held for a consent answer can run again with the approved capabilities.
 #[derive(Clone)]
@@ -8377,6 +8402,10 @@ struct PlainToolRun {
     request_id: String,
     ledger_key: Option<crate::db::call_ledger::Key>,
     io_budget: crate::bounded_io::Budget,
+    /// When the caller stops waiting for this call's reply. A call held for an
+    /// approval can wait past `io_budget`, so a rerun gets a fresh I/O budget
+    /// that ends no later than this.
+    reply_deadline: Instant,
 }
 
 impl PlainToolRun {
@@ -8393,7 +8422,7 @@ impl PlainToolRun {
         Box::new(move |ctx| {
             let PlainToolRun {
                 bare_name,
-                arguments,
+                mut arguments,
                 format_context,
                 tool_call_context,
                 dispatch,
@@ -8402,7 +8431,22 @@ impl PlainToolRun {
                 request_id: request_id_for_force,
                 ledger_key,
                 io_budget,
+                reply_deadline: _,
             } = run_spec;
+            if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
+                ctx.mark_standalone_plugin_host();
+            }
+            if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
+                if let Some(args) = arguments.as_object_mut() {
+                    args.remove("permissions_granted");
+                }
+            }
+            let plugin_approval = match &ask_route {
+                crate::access_policy::AskRoute::Plugin { scope, once } => {
+                    Some((scope.clone(), once.clone()))
+                }
+                _ => None,
+            };
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             phase_trace.mark_job_admitted();
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
@@ -8448,7 +8492,26 @@ impl PlainToolRun {
                         })
                     });
                     match outcome {
-                        ToolCallOutcome::Unary(result) => {
+                        ToolCallOutcome::Unary(mut result) => {
+                            if tool_call_context.preview
+                                || result.response.data["code"] == "permission_required"
+                                || matches!(
+                                    bare_name.as_str(),
+                                    "hashline_preflight" | "undo_preview" | "checkpoint_paths"
+                                )
+                            {
+                                if let Some((scope, once)) = &plugin_approval {
+                                    if !once.is_empty() {
+                                        result.response =
+                                            crate::access_policy::finish_plugin_response(
+                                                scope,
+                                                once,
+                                                true,
+                                                result.response,
+                                            );
+                                    }
+                                }
+                            }
                             if let Some(db) = ctx.db().filter(|_| {
                                 result.response.data["code"] != "path_outside_confined_root"
                             }) {
@@ -8524,9 +8587,25 @@ async fn hold_for_consent(
     active_tool_calls: &ActiveToolCalls,
     connection_cancel: &PersistentCancelSignal,
     module_drain: &drain::ModuleDrainWindow,
+    writer: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    ver: u8,
+    flags: Flags,
 ) -> Option<(Response, String)> {
+    // A consumer answering a reverse elicitation can take longer than the
+    // first run's I/O budget; its wait is bounded by the reply deadline
+    // instead. A Cingulate hold keeps its existing bound.
+    let elicitation = matches!(
+        access_grants::ask_route(&plain_run.identity),
+        crate::access_policy::AskRoute::Elicitation { .. }
+    );
+    let reply_deadline = if elicitation {
+        plain_run.reply_deadline
+    } else {
+        plain_run.io_budget.deadline
+    };
     let held = consent::HeldCall {
-        reply_deadline: plain_run.io_budget.deadline,
+        reply_deadline,
         identity: plain_run.identity.clone(),
         tool: plain_run.bare_name.clone(),
         arguments: plain_run.arguments.clone(),
@@ -8540,7 +8619,18 @@ async fn hold_for_consent(
     };
     let rerun = |ask_route| {
         let (done_tx, done_rx) = oneshot::channel::<ToolCallCompletion>();
-        let job = plain_run.job(ask_route, PhaseTrace::new(Instant::now()), done_tx);
+        // The approved run gets its own I/O budget: the first run's may have
+        // been spent waiting for the answer. It still ends by the deadline the
+        // held call answers within.
+        let mut approved_run = plain_run.clone();
+        approved_run.io_budget = crate::bounded_io::Budget::after(
+            reply_deadline
+                .saturating_duration_since(Instant::now())
+                .min(plain_run_io_budget(corr)),
+        );
+        #[cfg(test)]
+        standalone::note_rerun_budget_for_test(approved_run.io_budget.deadline);
+        let job = approved_run.job(ask_route, PhaseTrace::new(Instant::now()), done_tx);
         let rx = resubmit_active_tool_call(
             executor,
             active_tool_calls,
@@ -8568,7 +8658,13 @@ async fn hold_for_consent(
             (response, text)
         }
     };
-    match consent::run_with_consent(held, (response, text), rerun).await {
+    let result = if elicitation {
+        standalone::run_with_elicitation(held, (response, text), rerun, writer, metrics, ver, flags)
+            .await
+    } else {
+        consent::run_with_consent(held, (response, text), rerun).await
+    };
+    match result {
         Some((response, text)) => {
             let text = text.unwrap_or_else(|| {
                 crate::subc_format::format_response_with_context(
@@ -8839,6 +8935,19 @@ async fn handle_tool_call(
         if let Err(error) = tool_provider::admit_call_mode(&call.name, &identity.call_mode) {
             return send_provider_error(tx, metrics, frame, error).await;
         }
+        // Plugin approvals are host transport metadata, not model-facing tool
+        // arguments. Keep the served schema closed and never accept these IDs
+        // as authority on an untrusted or stamped route.
+        let plugin_grants = if matches!(
+            access_grants::ask_route(&identity),
+            crate::access_policy::AskRoute::Plugin { .. }
+        ) {
+            call.arguments
+                .as_object_mut()
+                .and_then(|args| args.remove("permissions_granted"))
+        } else {
+            None
+        };
         let role = match tool_provider::admit_on_route(
             &call,
             identity.scope.is_some(),
@@ -8853,6 +8962,12 @@ async fn handle_tool_call(
             Err(error) => return send_provider_error(tx, metrics, frame, error).await,
         };
         let mut arguments = call.arguments;
+        if let Some(grants) = plugin_grants {
+            arguments
+                .as_object_mut()
+                .unwrap()
+                .insert("permissions_granted".into(), grants);
+        }
         if matches!(call.name.as_str(), "bash" | "powershell") {
             let args = arguments
                 .as_object_mut()
@@ -9383,8 +9498,9 @@ async fn handle_tool_call(
 
         let _grant_scope =
             crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(&identity)));
-        let _ask_route =
-            crate::access_policy::ask_route_guard(Some(access_grants::ask_route(&identity)));
+        let _ask_route = crate::access_policy::ask_route_guard(Some(
+            access_grants::ask_route_for_call(&identity, &bare_name, &arguments),
+        ));
         bash::submit_deferred_bash(
             executor,
             bash_deferred_tx,
@@ -9478,6 +9594,7 @@ async fn handle_tool_call(
         let consent_run = matches!(
             access_grants::ask_route(&identity),
             crate::access_policy::AskRoute::Consent { .. }
+                | crate::access_policy::AskRoute::Elicitation { .. }
         )
         .then(|| PlainToolRun {
             bare_name: bare_name.clone(),
@@ -9489,7 +9606,8 @@ async fn handle_tool_call(
             bind_trust,
             request_id: request_id.clone(),
             ledger_key: ledger_key.clone(),
-            io_budget: crate::bounded_io::Budget::after(Duration::from_secs(25)),
+            io_budget: crate::bounded_io::Budget::after(plain_run_io_budget(frame.header.corr)),
+            reply_deadline: reply_budget.deadline,
         });
         let (setup_tx, setup_rx) = oneshot::channel::<DeferredSetupOutcome>();
         let completion_wake = deferred_response_tx.wake.clone();
@@ -9505,9 +9623,27 @@ async fn handle_tool_call(
             let _grant_scope = crate::access_policy::scope_guard(Some(
                 access_grants::policy_scope_key(&identity_for_run),
             ));
-            let _ask_route = crate::access_policy::ask_route_guard(Some(access_grants::ask_route(
-                &identity_for_run,
-            )));
+            let _ask_route =
+                crate::access_policy::ask_route_guard(Some(access_grants::ask_route_for_call(
+                    &identity_for_run,
+                    &bare_name_for_run,
+                    &arguments,
+                )));
+            if matches!(
+                crate::access_policy::current_ask_route(),
+                crate::access_policy::AskRoute::Plugin { .. }
+            ) {
+                ctx.mark_standalone_plugin_host();
+            }
+            let mut arguments = arguments;
+            if matches!(
+                access_grants::ask_route(&identity_for_run),
+                crate::access_policy::AskRoute::Plugin { .. }
+            ) {
+                if let Some(args) = arguments.as_object_mut() {
+                    args.remove("permissions_granted");
+                }
+            }
             phase_trace.mark_job_admitted();
             // Admission for this deferred tool call: pin the config so the
             // preflight and the deferred worker share one snapshot.
@@ -9656,7 +9792,7 @@ async fn handle_tool_call(
                     });
                 }
             }
-            response
+            crate::access_policy::finish_current_plugin_response(response)
         });
         let deferred_setup_guard =
             PendingDeferredSetupGuard::new(Arc::clone(pending_deferred_setups));
@@ -9742,6 +9878,10 @@ async fn handle_tool_call(
                             &active_tool_calls,
                             &consent_connection_cancel,
                             &consent_drain,
+                            &completion_tx,
+                            &completion_metrics,
+                            ver,
+                            flags,
                         )
                         .await
                         {
@@ -9856,10 +9996,11 @@ async fn handle_tool_call(
         bind_trust,
         request_id: request_id.clone(),
         ledger_key,
-        io_budget: crate::bounded_io::Budget::after(Duration::from_secs(25)),
+        io_budget: crate::bounded_io::Budget::after(plain_run_io_budget(frame.header.corr)),
+        reply_deadline: reply_budget.deadline,
     };
     let job = plain_run.job(
-        access_grants::ask_route(&identity),
+        access_grants::ask_route_for_call(&identity, &plain_run.bare_name, &plain_run.arguments),
         phase_trace,
         tool_call_tx,
     );
@@ -9904,10 +10045,8 @@ async fn handle_tool_call(
                 None,
             ),
         };
-        // A call from a stamped Alfonso worker (see `access_grants::ask_route`)
-        // that needs permission for a path outside its worktree is held here
-        // while Cingulate asks the worker's head agent, then runs again or
-        // ends with a named refusal.
+        // Resolve the refused path before dispatching again. Attested Alfonso
+        // scopes use the consent service; other callers use their own UI.
         let (response, text, phase_trace) = if consent::requested_ask(&response).is_some() {
             match hold_for_consent(
                 &plain_run,
@@ -9920,6 +10059,10 @@ async fn handle_tool_call(
                 &active_tool_calls,
                 &consent_connection_cancel,
                 &consent_drain,
+                &completion_tx,
+                &completion_metrics,
+                ver,
+                flags,
             )
             .await
             {

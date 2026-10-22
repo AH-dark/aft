@@ -63,6 +63,8 @@ import {
   optionalInt,
   resolveSessionId,
   textResult,
+  withHostPermissionGrants,
+  withOutsidePermissionOperation,
 } from "./_shared.js";
 import { asString, collapsibleResult, type RenderResultOptionsLike } from "./render-helpers.js";
 
@@ -554,16 +556,14 @@ async function callBashWithPermissionLoop(
   options?: BridgeRequestOptions,
   bridgeCommand = "bash",
 ): Promise<Record<string, unknown>> {
-  const granted = Array.isArray(params.permissions_granted)
-    ? params.permissions_granted.filter((value): value is string => typeof value === "string")
-    : [];
+  const granted: string[] = [];
 
   for (let round = 0; round < 8; round++) {
     try {
       return await callBashBridge(
         bridge,
         bridgeCommand,
-        { ...params, ...(granted.length > 0 ? { permissions_granted: granted } : {}) },
+        withHostPermissionGrants(params, granted),
         extCtx,
         options,
       );
@@ -863,45 +863,52 @@ export function registerBashTool(
       let usedHostFallback = false;
       let response: Record<string, unknown>;
       try {
-        response = await callBashWithPermissionLoop(
-          bridge,
-          {
-            command: bridgeCommand,
-            timeout,
-            workdir: spawnContext.cwd ?? params.workdir,
-            env: spawnContext.env,
-            description: params.description,
-            background: effectiveBackground,
-            notify_on_completion: effectiveBackground,
-            compressed,
-            pty: requestedPty,
-            pty_rows: ptyRows,
-            pty_cols: ptyCols,
-            foreground_orchestrate: true,
-            block_to_completion: blockToCompletion,
-            wait: requestedWait,
-            sandbox: params.sandbox,
-            ...(isPowerShell ? { shell: "powershell" } : {}),
-            ...(params.runon !== undefined ? { runon: params.runon } : {}),
-          },
-          extCtx,
-          {
-            transportTimeoutMs: orchestratedTransportTimeoutMs(
-              blockToCompletion,
-              requestedWait,
-              timeout,
-              foregroundWaitMs,
-              workerWaitMaxMs,
-              params.runon !== undefined,
+        // Pi registers this tool directly as well as through the funnel, so
+        // bind the call's own cancellation signal here: an outside-access
+        // prompt for this call stops on it.
+        response = await withOutsidePermissionOperation(
+          () =>
+            callBashWithPermissionLoop(
+              bridge,
+              {
+                command: bridgeCommand,
+                timeout,
+                workdir: spawnContext.cwd ?? params.workdir,
+                env: spawnContext.env,
+                description: params.description,
+                background: effectiveBackground,
+                notify_on_completion: effectiveBackground,
+                compressed,
+                pty: requestedPty,
+                pty_rows: ptyRows,
+                pty_cols: ptyCols,
+                foreground_orchestrate: true,
+                block_to_completion: blockToCompletion,
+                wait: requestedWait,
+                sandbox: params.sandbox,
+                ...(isPowerShell ? { shell: "powershell" } : {}),
+                ...(params.runon !== undefined ? { runon: params.runon } : {}),
+              },
+              extCtx,
+              {
+                transportTimeoutMs: orchestratedTransportTimeoutMs(
+                  blockToCompletion,
+                  requestedWait,
+                  timeout,
+                  foregroundWaitMs,
+                  workerWaitMaxMs,
+                  params.runon !== undefined,
+                ),
+                onProgress: ({ text }) => {
+                  streamed = appendBashStreamTail(streamed, text);
+                  // Stream truncated output to avoid overwhelming the UI
+                  const displayText = truncateToVisualLines(streamed, 100);
+                  onUpdate?.(bashResult(displayText, { streaming: true }));
+                },
+              },
+              isPowerShell ? "powershell" : "bash",
             ),
-            onProgress: ({ text }) => {
-              streamed = appendBashStreamTail(streamed, text);
-              // Stream truncated output to avoid overwhelming the UI
-              const displayText = truncateToVisualLines(streamed, 100);
-              onUpdate?.(bashResult(displayText, { streaming: true }));
-            },
-          },
-          isPowerShell ? "powershell" : "bash",
+          signal,
         );
       } catch (error) {
         const fallbackCause = classifyBashHostFallbackError(error);

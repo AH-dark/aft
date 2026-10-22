@@ -482,6 +482,12 @@ fn handle_zoom_targets(
                                 include_callgraph,
                                 &mut memo,
                             );
+                            // An access ask must reach the host unchanged so it
+                            // can ask and retry; inside one batch entry nobody
+                            // would see it.
+                            if crate::access_policy::is_access_request(&response) {
+                                return response;
+                            }
                             entries.push(serde_json::json!({
                                 "targetLabel": target_label,
                                 "name": name,
@@ -490,6 +496,9 @@ fn handle_zoom_targets(
                         }
                     }
                     Err(response) => {
+                        if crate::access_policy::is_access_request(&response) {
+                            return response;
+                        }
                         // A forbidden historical read refuses the call, rather
                         // than being presented as a missing symbol in the batch.
                         if revision.is_some()
@@ -673,6 +682,12 @@ fn finalize_zoom_read_data(
                         manifest_paths,
                     ) {
                         Ok(inner_files) => files.extend(inner_files),
+                        // A followed source file that needs an access ask
+                        // ends the whole zoom with that ask, so the host can
+                        // ask and retry instead of seeing a refused entry.
+                        Err(refusal) if crate::access_policy::is_access_request(&refusal) => {
+                            return Err(refusal);
+                        }
                         Err(refusal) => {
                             *inner = serialize_zoom_target_response(req, refusal);
                             refused = true;

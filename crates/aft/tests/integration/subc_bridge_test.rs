@@ -2879,6 +2879,16 @@ fn subc_bridge_untrusted_bash_elicitation_allow_round_trip() {
 }
 
 #[test]
+fn subc_bridge_untrusted_in_process_outside_elicitation_round_trip() {
+    run_subc_bridge_test(
+        "subc_bridge_untrusted_in_process_outside_elicitation_round_trip",
+        Duration::from_secs(45),
+        drive_in_process_outside_elicitation_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_untrusted_bash_elicitation_deny_and_malformed_fail_closed() {
     run_subc_bridge_test(
         "subc_bridge_untrusted_bash_elicitation_deny_and_malformed_fail_closed",
@@ -11300,6 +11310,39 @@ async fn drive_bash_elicitation_allow_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+async fn drive_in_process_outside_elicitation_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_untrusted_elicitation_route(&mut stream, 1, 101, &root1).await;
+    let target = root1.parent().unwrap().join("outside-elicitation.txt");
+    std::fs::write(&target, "outside content after approval").unwrap();
+    for (corr, decision) in [(102, "allow"), (103, "deny")] {
+        send_tool_call(&mut stream, 1, corr, "read", json!({"path":target})).await;
+        let ask = read_frame_timeout(&mut stream, "outside read elicitation").await;
+        assert_eq!(ask.header.ty, FrameType::Request);
+        let body: Value = serde_json::from_slice(&ask.body).unwrap();
+        assert_eq!(body["method"], "elicitation/create");
+        assert_eq!(body["params"]["_meta"]["aft"]["tool"], "read");
+        send_bash_elicitation_reply(
+            &mut stream,
+            1,
+            ask.header.corr,
+            json!({"decision":decision}),
+        )
+        .await;
+        let result = read_frame_timeout(&mut stream, "outside read terminal response").await;
+        assert_eq!(result.header.ty, FrameType::Response);
+        assert_eq!(result.header.corr, corr);
+        assert_eq!(tool_result_is_error(&result), decision == "deny");
+        assert_eq!(
+            tool_result_text(&result).contains("outside content after approval"),
+            decision == "allow"
+        );
+    }
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_bash_elicitation_deny_and_malformed_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
@@ -11714,15 +11757,21 @@ async fn drive_principal_trust_enforcement_daemon(input: FakeDaemonInput) {
         "trusted direct out-of-root write",
     )
     .await;
+    // A trusted Direct principal that is not an OpenCode or Pi plugin has no
+    // prompt to answer an outside-access ask, and it is not an untrusted
+    // elicitation consumer either, so the ask lowers to deny with the path
+    // error. The anti-spoof claim still holds: the claimed mcp:* harness does
+    // not make it untrusted, as the bash call below shows.
     assert!(
-        !tool_result_is_error(&trusted_write),
-        "trusted direct out-of-root write should succeed: {:?}",
+        tool_result_is_error(&trusted_write),
+        "trusted direct out-of-root write has no ask channel and is refused"
+    );
+    assert!(
+        tool_result_text(&trusted_write).contains("outside the project root"),
+        "trusted direct out-of-root write should keep the path error: {:?}",
         tool_result_text(&trusted_write)
     );
-    assert_eq!(
-        std::fs::read_to_string(&trusted_outside).expect("trusted outside write exists"),
-        "trusted outside\n"
-    );
+    assert!(!trusted_outside.exists());
     send_tool_call(
         &mut stream,
         1,

@@ -270,6 +270,24 @@ mod incident_tests {
     }
 
     #[test]
+    fn pinned_unlink_refuses_a_path_that_names_no_entry() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path());
+        let req = delete_request(Path::new(".."));
+        match unlink_pinned(&req, &ctx, Path::new("..")) {
+            Err(UnlinkError::Refused(response)) => {
+                assert_eq!(
+                    response.data["code"], "invalid_request",
+                    "{:?}",
+                    response.data
+                )
+            }
+            Err(UnlinkError::Io(error)) => panic!("expected a refusal, got {error}"),
+            Ok(()) => panic!("expected a refusal, nothing should be removed"),
+        }
+    }
+
+    #[test]
     fn external_delete_admission_rejects_ancestors_mixed_batches_and_parent_links() {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("project");
@@ -310,6 +328,20 @@ mod incident_tests {
 /// call) is refused with `recursive_delete_backup_too_large` before anything
 /// is deleted.
 ///
+/// # What a delete authorizes
+///
+/// AFT authorizes objects, not pathnames at the instant of unlink. Each
+/// target is authorized at its real location, then bound to the object found
+/// there: on Unix through a held parent directory whose device and inode are
+/// rechecked (and, for a tree, every entry's recorded device and inode); on
+/// Windows through a handle to the entry itself. The delete then acts only on
+/// that object. Deleting the authorized object is acceptable even if it was
+/// renamed after the last check, because no operating system offers
+/// race-free pathname containment at unlink time. Deleting an object that was
+/// never authorized is not: anything that is no longer the authorized object
+/// is refused (`path_changed`), and a partly deleted tree reports what
+/// remains.
+///
 /// Returns single-file: `{ file, deleted, backup_id? }`
 /// Returns directory:   `{ file, deleted, is_directory, files_deleted, backup_ids }`
 /// Returns batch:       `{ complete, deleted: [...], skipped_files: [...] }`
@@ -349,9 +381,8 @@ fn handle_delete_file_with_skip(
         .or_else(|| req.params.get("files"))
         .and_then(Value::as_array)
     {
-        // Decide the entire batch before any backup or unlink. A denied_floor
-        // response aborts without changing files; existing path_outside_root and
-        // ordinary target failures retain their per-file reporting.
+        // Authorization failures abort the entire batch before backup or unlink.
+        // In particular, asks must stay top-level so hosts can approve and retry.
         let mut decisions = files
             .iter()
             .map(|value| {
@@ -360,14 +391,18 @@ fn handle_delete_file_with_skip(
                     .map(|file| ctx.validate_write_location(&req.id, Path::new(file)))
             })
             .collect::<Vec<_>>();
-        if let Some(index) = decisions.iter().position(|decision| {
-            matches!(decision, Some(Err(response)) if response.data["code"] == "denied_floor")
-        }) {
-            return decisions[index].take().expect("floor target has a decision").unwrap_err();
+        if let Some(index) = decisions
+            .iter()
+            .position(|decision| matches!(decision, Some(Err(_))))
+        {
+            return decisions[index]
+                .take()
+                .expect("refused target has a decision")
+                .unwrap_err();
         }
         let mut deleted = Vec::new();
         let mut skipped = Vec::new();
-        for (value, decision) in files.iter().zip(decisions) {
+        for (index, (value, decision)) in files.iter().zip(decisions).enumerate() {
             let Some(file) = value.as_str() else {
                 skipped.push(serde_json::json!({"file": value, "reason": "not a string"}));
                 continue;
@@ -376,11 +411,28 @@ fn handle_delete_file_with_skip(
                 Ok(_) => {
                     delete_one_or_dir(req, ctx, file, recursive, &op_id, &mut budget, forced_skip)
                 }
-                Err(response) => Err(response),
+                Err(response) => Err(DeleteError::Refused(response)),
             };
             match result {
                 Ok(result) => deleted.push(result),
-                Err(resp) => skipped.push(serde_json::json!({
+                // A member that fails authorization when it is checked again
+                // right before its delete (the filesystem or its approval
+                // changed after the batch was admitted) stops the batch. The
+                // refusal stays the top-level response, so a host can still
+                // answer an ask and retry, and it reports what was already
+                // deleted and what was never attempted.
+                Err(DeleteError::Refused(mut resp)) => {
+                    let not_attempted: Vec<&Value> = files.iter().skip(index + 1).collect();
+                    if let Some(data) = resp.data.as_object_mut() {
+                        data.insert("complete".into(), Value::Bool(false));
+                        data.insert("refused_file".into(), serde_json::json!(file));
+                        data.insert("deleted".into(), serde_json::json!(deleted));
+                        data.insert("skipped_files".into(), serde_json::json!(skipped));
+                        data.insert("not_attempted".into(), serde_json::json!(not_attempted));
+                    }
+                    return resp;
+                }
+                Err(DeleteError::Failed(resp)) => skipped.push(serde_json::json!({
                     "file": file,
                     "reason": resp.data.get("message").and_then(|v| v.as_str()).unwrap_or("delete failed"),
                     "details": resp.data,
@@ -444,14 +496,33 @@ fn handle_delete_file_with_skip(
 
     match delete_one_or_dir(req, ctx, file, recursive, &op_id, &mut budget, forced_skip) {
         Ok(result) => Response::success(&req.id, result),
-        Err(resp) => resp,
+        Err(DeleteError::Refused(resp) | DeleteError::Failed(resp)) => resp,
+    }
+}
+
+/// Why one delete target was not deleted. Batch mode treats the two
+/// differently: a failure is listed in `skipped_files` and the batch goes on,
+/// a refusal stops the batch and becomes its top-level response.
+enum DeleteError {
+    /// Authorization refused the target (an ask, a floor, a root boundary), or
+    /// the directory holding it was no longer the one that was authorized.
+    Refused(Response),
+    /// Any other reason the target was not deleted (cancellation, a missing
+    /// file, an I/O error); it can happen before or after authorization.
+    Failed(Response),
+}
+
+impl From<Response> for DeleteError {
+    fn from(response: Response) -> Self {
+        DeleteError::Failed(response)
     }
 }
 
 /// Delete a single path (file or directory). Returns the per-target result
-/// payload on success (shape varies for file vs directory), or a ready-made
-/// error `Response` on failure for the caller to either propagate (single
-/// mode) or aggregate into `skipped_files` (batch mode).
+/// payload on success (shape varies for file vs directory), or why it was not
+/// deleted: a refusal, or a ready-made failure `Response` for the caller to
+/// either propagate (single mode) or aggregate into `skipped_files` (batch
+/// mode).
 fn delete_one_or_dir(
     req: &RawRequest,
     ctx: &AppContext,
@@ -460,18 +531,19 @@ fn delete_one_or_dir(
     op_id: &str,
     budget: &mut RecursiveDeleteBackupBudget,
     forced_skip: Option<crate::backup::BackupSkippedReason>,
-) -> Result<serde_json::Value, Response> {
+) -> Result<serde_json::Value, DeleteError> {
     if crate::executor::current_job_cancelled() {
         return Err(Response::error_with_data(
             req.id.clone(),
             "request_cancelled",
             "delete_file: request cancelled before deleting this target",
             serde_json::json!({"file": file, "complete": false, "files_deleted": 0, "remaining_root": file}),
-        ));
+        )
+        .into());
     }
     let path = match ctx.validate_write_location(&req.id, Path::new(file)) {
         Ok(path) => path,
-        Err(resp) => return Err(resp),
+        Err(resp) => return Err(DeleteError::Refused(resp)),
     };
 
     // Inspect the entry itself, never what a symlink points at: a link must be
@@ -483,14 +555,16 @@ fn delete_one_or_dir(
                 &req.id,
                 "file_not_found",
                 format!("delete_file: file not found: {}", file),
-            ));
+            )
+            .into());
         }
         Err(e) => {
             return Err(Response::error(
                 &req.id,
                 "io_error",
                 format!("delete_file: failed to inspect '{}': {}", file, e),
-            ));
+            )
+            .into());
         }
     };
     let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
@@ -516,7 +590,8 @@ fn delete_one_or_dir(
                     file,
                     unsupported_symlink_reason(kind)
                 ),
-            ));
+            )
+            .into());
         }
     }
 
@@ -529,7 +604,7 @@ fn delete_one_or_dir(
                     "delete_file: '{}' is a directory. Pass recursive: true to delete it with all contents.",
                     file
                 ),
-            ));
+            ).into());
         }
         return delete_directory(req, ctx, &path, file, op_id, budget, no_backup);
     }
@@ -589,24 +664,23 @@ fn delete_one_or_dir(
                         file,
                         unsupported_kind_reason(kind)
                     ),
-                ));
+                )
+                .into());
             }
         }
     }
     .map_err(|e| Response::error(&req.id, e.code(), e.to_string()))?;
 
-    // `remove_file` unlinks a symlink itself, never its target.
-    if let Err(e) = std::fs::remove_file(&path) {
+    // The entry itself is unlinked, never a symlink's target. On Unix that
+    // happens relative to the directory that was authorized for it; on other
+    // platforms it is removed by path after authorization.
+    if let Err(error) = unlink_pinned(req, ctx, &path) {
         // A failed remove leaves this file unchanged. Discard its snapshot so
         // the failed request does not become a phantom undo operation.
         ctx.backup()
             .lock()
             .discard_latest_operation_entry_for_path(req.session(), op_id, &path);
-        return Err(Response::error(
-            &req.id,
-            "io_error",
-            format!("delete_file: failed to delete: {}", e),
-        ));
+        return Err(error.into_delete_error(req));
     }
 
     ctx.lsp_notify_watched_config_file(path.as_path(), FileChangeType::DELETED);
@@ -777,15 +851,11 @@ fn delete_entry_without_backup(
     file: &str,
     op_id: &str,
     reason: crate::backup::BackupSkippedReason,
-) -> Result<serde_json::Value, Response> {
-    // `remove_file` unlinks a symlink itself, never its target.
-    std::fs::remove_file(path).map_err(|e| {
-        Response::error(
-            &req.id,
-            "io_error",
-            format!("delete_file: failed to delete: {}", e),
-        )
-    })?;
+) -> Result<serde_json::Value, DeleteError> {
+    // The entry itself is unlinked, never a symlink's target. On Unix that
+    // happens relative to the directory that was authorized for it; on other
+    // platforms it is removed by path after authorization.
+    unlink_pinned(req, ctx, path).map_err(|error| error.into_delete_error(req))?;
     ctx.backup()
         .lock()
         .record_skipped_without_snapshot(req.session(), path, op_id, reason);
@@ -798,6 +868,248 @@ fn delete_entry_without_backup(
     });
     edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), op_id, Some(path));
     Ok(result)
+}
+
+/// Why [`unlink_pinned`] did not remove an entry.
+enum UnlinkError {
+    /// The directory holding the entry is no longer where it was authorized,
+    /// or its actual location is not authorized. Nothing was removed.
+    Refused(Response),
+    /// The unlink itself failed.
+    Io(std::io::Error),
+}
+
+impl UnlinkError {
+    fn into_delete_error(self, req: &RawRequest) -> DeleteError {
+        match self {
+            UnlinkError::Refused(response) => DeleteError::Refused(response),
+            UnlinkError::Io(error) => DeleteError::Failed(Response::error(
+                &req.id,
+                "io_error",
+                format!("delete_file: failed to delete: {error}"),
+            )),
+        }
+    }
+}
+
+/// Points inside [`unlink_pinned`] where a test can change the filesystem.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnlinkStage {
+    /// After the caller's authorization, before the parent directory (Unix)
+    /// or the entry itself (Windows) is opened.
+    BeforePin,
+    /// After the opened directory or entry was located, before that location
+    /// is authorized.
+    BeforeAuthorize,
+    /// After that location is authorized, before the open directory or entry
+    /// is checked against it again.
+    AfterAuthorize,
+    /// After every check, right before the entry is removed.
+    BeforeUnlink,
+}
+
+#[cfg(test)]
+type UnlinkSeam = Box<dyn FnMut(UnlinkStage)>;
+
+#[cfg(test)]
+thread_local! {
+    static UNLINK_SEAM: std::cell::RefCell<Option<UnlinkSeam>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `seam` at each [`UnlinkStage`] of this thread's single-entry deletes
+/// until the returned guard is dropped.
+#[cfg(test)]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+pub(crate) fn install_unlink_seam_for_test(seam: UnlinkSeam) -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            UNLINK_SEAM.with(|current| {
+                current.borrow_mut().take();
+            });
+        }
+    }
+    UNLINK_SEAM.with(|current| *current.borrow_mut() = Some(seam));
+    Reset
+}
+
+#[cfg(test)]
+pub(crate) fn unlink_seam(stage: UnlinkStage) {
+    UNLINK_SEAM.with(|current| {
+        if let Some(seam) = current.borrow_mut().as_mut() {
+            seam(stage);
+        }
+    });
+}
+
+/// A path that ends in `..` or is a filesystem root names no single entry
+/// inside a directory, so there is nothing a pinned unlink can bind to.
+#[cfg(any(unix, windows))]
+fn no_entry_name(req: &RawRequest, path: &Path) -> UnlinkError {
+    UnlinkError::Refused(Response::error(
+        &req.id,
+        "invalid_request",
+        format!(
+            "delete_file: '{}' does not name an entry inside a directory",
+            path.display()
+        ),
+    ))
+}
+
+/// Remove one non-directory entry (a file, symlink or socket; a symlink itself,
+/// never its target) at an authorized `path`.
+///
+/// A plain `remove_file(path)` walks the whole path again, so if a directory
+/// on it were swapped (for example renamed away and replaced by a symlink to
+/// somewhere else) after authorization, the unlink would land in a different
+/// directory. Instead the parent directory is opened and held, its actual
+/// location is authorized for this entry, the held directory is checked to
+/// still be the one the policy judged, and the entry is unlinked relative to
+/// that open directory. Swaps after that check cannot move the unlink.
+#[cfg(unix)]
+fn unlink_pinned(req: &RawRequest, ctx: &AppContext, path: &Path) -> Result<(), UnlinkError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(name) = path.file_name() else {
+        return Err(no_entry_name(req, path));
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    #[cfg(test)]
+    unlink_seam(UnlinkStage::BeforePin);
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(parent)
+        .map_err(UnlinkError::Io)?;
+    let changed = || {
+        UnlinkError::Refused(Response::error(
+            &req.id,
+            "path_changed",
+            format!(
+                "delete_file: the directory holding '{}' changed while it was being deleted; nothing was deleted",
+                path.display()
+            ),
+        ))
+    };
+    // Find where the open directory is now: resolve the parent path and
+    // accept it only if it is the same directory (device and inode) as the
+    // one held open.
+    let pinned = directory.metadata().map_err(UnlinkError::Io)?;
+    let located = std::fs::canonicalize(parent).map_err(|_| changed())?;
+    let current = std::fs::metadata(&located).map_err(|_| changed())?;
+    if current.dev() != pinned.dev() || current.ino() != pinned.ino() {
+        return Err(changed());
+    }
+    #[cfg(test)]
+    unlink_seam(UnlinkStage::BeforeAuthorize);
+    // Authorize the entry at that location. The policy resolves the path
+    // again, so a swap after the check above could make it judge a different
+    // directory than the one held open.
+    let (_, judged) = ctx
+        .authorize_write_location(&req.id, &located.join(name))
+        .map_err(UnlinkError::Refused)?;
+    #[cfg(test)]
+    unlink_seam(UnlinkStage::AfterAuthorize);
+    // So check again: the directory the policy judged must be the located
+    // one, and that path must still lead to the directory held open. Only
+    // then is the open directory known to be an authorized location.
+    let judged_parent = judged.parent().map(Path::to_path_buf);
+    let relocated = std::fs::metadata(&located).map_err(|_| changed())?;
+    if judged_parent.as_deref() != Some(located.as_path())
+        || relocated.dev() != pinned.dev()
+        || relocated.ino() != pinned.ino()
+    {
+        return Err(changed());
+    }
+    #[cfg(test)]
+    unlink_seam(UnlinkStage::BeforeUnlink);
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|error| {
+        UnlinkError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+    })?;
+    // SAFETY: `directory` is an open descriptor for the whole call and `name`
+    // is a NUL-terminated single path component.
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(UnlinkError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Remove one non-directory entry at an authorized `path` through a handle to
+/// the entry itself, so no later path walk can redirect the delete.
+///
+/// The entry is opened without following a final symlink or junction
+/// (`FILE_FLAG_OPEN_REPARSE_POINT`), with `DELETE` access. Where the open
+/// entry really is comes from `GetFinalPathNameByHandleW`. That location is
+/// authorized, the handle is checked to still sit at the location the policy
+/// judged, and the delete is set on the handle with
+/// `SetFileInformationByHandle` (POSIX semantics where the volume supports
+/// them, otherwise delete-on-close). A mismatch refuses with `path_changed`.
+#[cfg(windows)]
+fn unlink_pinned(req: &RawRequest, ctx: &AppContext, path: &Path) -> Result<(), UnlinkError> {
+    use crate::commands::delete_tree::win::{dispose, location, open_entry};
+    let changed = || {
+        UnlinkError::Refused(Response::error(
+            &req.id,
+            "path_changed",
+            format!(
+                "delete_file: '{}' changed while it was being deleted; nothing was deleted",
+                path.display()
+            ),
+        ))
+    };
+    if path.file_name().is_none() {
+        return Err(no_entry_name(req, path));
+    }
+    #[cfg(test)]
+    unlink_seam(UnlinkStage::BeforePin);
+    let entry = open_entry(path).map_err(UnlinkError::Io)?;
+    // A single-entry delete never removes a directory; one that appeared at
+    // this path since the caller looked is a different entry. A junction or
+    // directory symlink is a link entry, not a directory, and is removed
+    // itself.
+    if entry.metadata().map_err(UnlinkError::Io)?.is_dir() {
+        return Err(changed());
+    }
+    let located = location(&entry).map_err(|_| changed())?;
+    #[cfg(test)]
+    unlink_seam(UnlinkStage::BeforeAuthorize);
+    let (_, judged) = ctx
+        .authorize_write_location(&req.id, &located)
+        .map_err(UnlinkError::Refused)?;
+    #[cfg(test)]
+    unlink_seam(UnlinkStage::AfterAuthorize);
+    // The handle must still be at the location the policy judged.
+    if crate::inspect::job::normalize_path(&judged) != located
+        || location(&entry).ok().as_deref() != Some(located.as_path())
+    {
+        return Err(changed());
+    }
+    #[cfg(test)]
+    unlink_seam(UnlinkStage::BeforeUnlink);
+    dispose(&entry).map_err(UnlinkError::Io)?;
+    drop(entry);
+    Ok(())
+}
+
+/// Targets that are neither Unix nor Windows have no way to delete through a
+/// handle bound to the authorized entry, so a single-entry delete is refused
+/// rather than done by path.
+#[cfg(not(any(unix, windows)))]
+fn unlink_pinned(req: &RawRequest, _ctx: &AppContext, path: &Path) -> Result<(), UnlinkError> {
+    Err(UnlinkError::Refused(Response::error(
+        &req.id,
+        "delete_unsupported",
+        format!(
+            "delete_file: '{}' cannot be deleted safely on this platform",
+            path.display()
+        ),
+    )))
 }
 
 #[cfg(unix)]
@@ -840,7 +1152,7 @@ fn delete_directory(
     op_id: &str,
     budget: &mut RecursiveDeleteBackupBudget,
     no_backup: Option<crate::backup::BackupSkippedReason>,
-) -> Result<serde_json::Value, Response> {
+) -> Result<serde_json::Value, DeleteError> {
     // A vanished mounted child can make std::fs::ReadDir::drop panic after
     // closedir returns ENXIO, aborting the daemon. Capture the root device
     // before walking so the walk never crosses it.
@@ -863,7 +1175,7 @@ fn delete_directory(
     let manifest = match walk_tree(path, &boundary, budget) {
         Ok(manifest) => manifest,
         Err(CollectError::OverBudget(exceeded)) => {
-            return Err(over_budget_response(req, original, exceeded, budget));
+            return Err(over_budget_response(req, original, exceeded, budget).into());
         }
         Err(CollectError::Io(e)) => {
             return Err(Response::error(
@@ -877,7 +1189,8 @@ fn delete_directory(
                     "delete_file: failed to walk directory '{}': {}",
                     original, e
                 ),
-            ));
+            )
+            .into());
         }
     };
     if !manifest.unsupported.is_empty() {
@@ -890,7 +1203,8 @@ fn delete_directory(
             &req.id,
             "unsupported_directory_contents",
             unsupported_contents_message(&manifest),
-        ));
+        )
+        .into());
     }
 
     let file_plan = plan_file_backups(&manifest);
@@ -908,7 +1222,7 @@ fn delete_directory(
                 "request_cancelled",
                 "delete_file: request cancelled during backup; nothing deleted",
                 serde_json::json!({"complete": false, "files_deleted": 0, "remaining_root": original}),
-            ));
+            ).into());
         }
         let entry_path = entry.path.as_path();
         let display = entry_path.display().to_string();
@@ -964,7 +1278,8 @@ fn delete_directory(
                         "delete_file: backup failed for '{}' inside '{}': {}",
                         display, original, e
                     ),
-                ));
+                )
+                .into());
             }
         }
     }
@@ -972,7 +1287,17 @@ fn delete_directory(
     #[cfg(debug_assertions)]
     inject_entry_for_tests(path);
 
-    if let Err(stopped) = delete_recorded_tree(&manifest) {
+    let mut authorize = |root: &Path| {
+        ctx.authorize_write_location(&req.id, root)
+            .map(|(_, judged)| judged)
+    };
+    if let Err(mut stopped) = delete_recorded_tree(&manifest, &req.id, &mut authorize) {
+        if let Some(refusal) = stopped.refusal.take() {
+            // The root could not be bound to an authorized location, so
+            // nothing was deleted and no backup belongs in undo history.
+            discard_delete_backups(ctx, req.session(), op_id, &backed_up_paths);
+            return Err(DeleteError::Refused(refusal));
+        }
         // Keep backups for entries that are gone, so undo can bring them back,
         // and discard those for entries still present, so undo does not
         // overwrite them with an older copy.
@@ -996,7 +1321,7 @@ fn delete_directory(
         );
         return Err(Response::error_with_data(
             req.id.clone(),
-            if stopped.cancelled { "request_cancelled" } else { "io_error" },
+            if stopped.cancelled { "request_cancelled" } else if stopped.changed { "path_changed" } else { "io_error" },
             format!(
                 "delete_file: stopped deleting '{}' partway: could not remove '{}': {}. Entries already removed can be restored with undo; '{}' and whatever still holds it were left in place.",
                 original,
@@ -1013,7 +1338,7 @@ fn delete_directory(
                 "remaining_root": original,
                 "stopped_at": stopped.path.display().to_string(),
             }),
-        ));
+        ).into());
     }
 
     budget.files_left = budget.files_left.saturating_sub(manifest.entries_counted);
@@ -1086,11 +1411,15 @@ fn delete_directory_without_backups(
     op_id: &str,
     boundary: &crate::walk_boundary::DeviceBoundary,
     reason: crate::backup::BackupSkippedReason,
-) -> Result<serde_json::Value, Response> {
+) -> Result<serde_json::Value, DeleteError> {
     let mut manifest = TreeManifest::default();
+    let identity = std::fs::symlink_metadata(path)
+        .ok()
+        .and_then(|metadata| crate::commands::delete_tree::recorded_identity(&metadata));
     manifest.entries.push(TreeEntry {
         path: path.to_path_buf(),
         kind: NodeKind::Directory,
+        identity,
     });
     let mut mounts = Vec::new();
     let mut visits = 0;
@@ -1115,13 +1444,26 @@ fn delete_directory_without_backups(
             &req.id,
             "unsupported_directory_contents",
             other_filesystem_message(&mounts),
-        ));
+        )
+        .into());
     }
 
     // Reuse preflight instead of enumerating the tree again in remove_dir_all.
     // Descriptor-relative removal never follows links and can stop between
     // entries, including for an explicit Cancel after some unlinks succeeded.
-    let stopped = delete_recorded_tree(&manifest).err();
+    let mut authorize = |root: &Path| {
+        ctx.authorize_write_location(&req.id, root)
+            .map(|(_, judged)| judged)
+    };
+    let mut stopped = delete_recorded_tree(&manifest, &req.id, &mut authorize).err();
+    if let Some(refusal) = stopped
+        .as_mut()
+        .and_then(|stopped| std::mem::take(&mut stopped.refusal))
+    {
+        // The root could not be bound to an authorized location: nothing was
+        // deleted.
+        return Err(DeleteError::Refused(refusal));
+    }
     ctx.backup()
         .lock()
         .record_skipped_without_snapshot(req.session(), path, op_id, reason);
@@ -1154,7 +1496,7 @@ fn delete_directory_without_backups(
             stopped.reason
         );
         return Err(Response::error_with_data(req.id.clone(),
-            if stopped.cancelled { "request_cancelled" } else { "io_error" },
+            if stopped.cancelled { "request_cancelled" } else if stopped.changed { "path_changed" } else { "io_error" },
             format!("delete_file: stopped deleting '{original}' at '{}': {}. Removed {} file(s) and {} directories; {} recorded entries remain at '{original}'. No undo is available.",
                 stopped.path.display(), stopped.reason, stopped.files_deleted, stopped.directories_deleted,
                 manifest.entries.len() - stopped.files_deleted - stopped.directories_deleted),
@@ -1165,7 +1507,7 @@ fn delete_directory_without_backups(
                 "remaining_entries": manifest.entries.len() - stopped.files_deleted - stopped.directories_deleted,
                 "remaining_root": original, "stopped_at": stopped.path,
                 "backup_skipped_reason": reason.as_str(),
-            })));
+            })).into());
     }
 
     let mut result = serde_json::json!({
@@ -1201,12 +1543,16 @@ fn collect_for_unbacked_delete(
         #[cfg(test)]
         DELETE_OPERATIONS.with(|ops| ops.borrow_mut().entries += 1);
         let path = entry.path();
-        // `DirEntry::file_type` does not follow symlinks.
+        // Neither `DirEntry::file_type` nor `DirEntry::metadata` follows
+        // symlinks. The identity lets the delete refuse an entry that was
+        // replaced after this walk instead of unlinking it by name.
+        let identity = crate::commands::delete_tree::recorded_identity(&entry.metadata()?);
         if entry.file_type()?.is_dir() {
             if boundary.should_descend(&path)? {
                 manifest.entries.push(TreeEntry {
                     path: path.clone(),
                     kind: NodeKind::Directory,
+                    identity,
                 });
                 collect_for_unbacked_delete(&path, boundary, manifest, mounts, visits)?;
             } else {
@@ -1216,6 +1562,7 @@ fn collect_for_unbacked_delete(
             manifest.entries.push(TreeEntry {
                 path,
                 kind: NodeKind::Unbacked,
+                identity,
             });
         }
     }

@@ -144,6 +144,7 @@ mod query_shape_test;
 mod r_test;
 mod read_freshness_test;
 mod refresh_watcher_path_status_test;
+mod relative_path_root_test;
 mod rename_delete_migration_test;
 mod repeat_breaker_test;
 mod request_watcher_pending_test;

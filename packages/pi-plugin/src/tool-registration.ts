@@ -6,7 +6,10 @@ import type { AftConfig } from "./config.js";
 import { resolveBashConfig, resolvedDisabledTools } from "./config.js";
 import { detectPiHarness, type PiHarness } from "./harness.js";
 import { withOmpInternalUrls } from "./omp-internal-urls.js";
-import { prepareToolDefinitionForRegistration } from "./tools/_shared.js";
+import {
+  prepareToolDefinitionForRegistration,
+  withOutsidePermissionOperation,
+} from "./tools/_shared.js";
 import { registerAstTools } from "./tools/ast.js";
 import { registerBashCompanionTools, registerBashTool } from "./tools/bash.js";
 import { registerConflictsTool } from "./tools/conflicts.js";
@@ -235,7 +238,15 @@ export function bindToolRegistrationFunnel(
       effectiveHarness,
       presentation,
     );
-    originalRegisterTool(prepared as ToolDefinition<TParams, TDetails, TState>);
+    originalRegisterTool({
+      ...prepared,
+      execute(toolCallId, params, signal, onUpdate, context) {
+        return withOutsidePermissionOperation(
+          () => prepared.execute(toolCallId, params, signal, onUpdate, context),
+          signal,
+        );
+      },
+    } as ToolDefinition<TParams, TDetails, TState>);
   };
 
   return new Proxy(pi, {

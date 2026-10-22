@@ -42,7 +42,7 @@ pub(crate) fn is_system_temp_path(path: &Path) -> bool {
     })
 }
 
-fn system_temp_roots() -> Vec<PathBuf> {
+pub(crate) fn system_temp_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     roots.push(std::env::temp_dir());
 

@@ -271,8 +271,17 @@ fn access_policy_legacy_outcomes_are_byte_identical() {
                             serde_json::to_vec(&expected).unwrap()
                         );
                     } else {
+                        // Unrestricted, an absolute path keeps its spelling
+                        // and a relative one is rooted where the tools resolve
+                        // it: the project root, or the working directory when
+                        // none is configured.
                         let expected = if configured_root.is_some() && restrict {
                             root_path.join("missing.txt")
+                        } else if path.is_relative() {
+                            configured_root
+                                .clone()
+                                .unwrap_or_else(|| std::env::current_dir().unwrap())
+                                .join(path)
                         } else {
                             path.to_path_buf()
                         };
@@ -1318,7 +1327,9 @@ fn assert_scratch_read_unregistered_path(path: &Path, project_root: &Path) {
     let validated = ctx
         .validate_read_path("policy-test", "policy-session", path)
         .unwrap();
-    assert_eq!(validated, path);
+    // A relative path names a file under the project root, and the validator
+    // returns that rooted location so the read touches the checked file.
+    assert_eq!(validated, project_root.join(path));
     let expected = b"unregistered scratch\n";
     assert_eq!(crate::bounded_io::read(&validated, None).unwrap(), expected);
     assert_eq!(crate::project_content::read(&validated).unwrap(), expected);
@@ -1339,7 +1350,10 @@ fn scratch_read_relative_unregistered_path_succeeds() {
     std::fs::create_dir(&scratch).unwrap();
     let file = scratch.join("a.txt");
     std::fs::write(&file, "unregistered scratch\n").unwrap();
-    assert_scratch_read_unregistered_path(file.strip_prefix(&cwd).unwrap(), directory.path());
+    assert_scratch_read_unregistered_path(
+        file.strip_prefix(directory.path()).unwrap(),
+        directory.path(),
+    );
 }
 
 #[cfg(unix)]
@@ -1354,7 +1368,10 @@ fn scratch_read_relative_symlinked_prefix_succeeds() {
     let alias = directory.path().join("alias");
     std::os::unix::fs::symlink(&real, &alias).unwrap();
     let file = alias.join(".sandbox-tmp-unregistered/a.txt");
-    assert_scratch_read_unregistered_path(file.strip_prefix(&cwd).unwrap(), directory.path());
+    assert_scratch_read_unregistered_path(
+        file.strip_prefix(directory.path()).unwrap(),
+        directory.path(),
+    );
     assert_scratch_read_unregistered_path(&file, directory.path());
 }
 

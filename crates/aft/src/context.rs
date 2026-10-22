@@ -3011,6 +3011,76 @@ fn path_error_response(
     )
 }
 
+/// The main checkout of the linked Git worktree at `worktree`, when its
+/// linkage checks out, in the policy's spelling (canonical, no Windows
+/// verbatim prefix). Otherwise `None`, and the main checkout gets no
+/// exemption.
+///
+/// A `.git` file is only a claim. The link is accepted when the worktree's
+/// `.git` file names a directory directly under `<common>/worktrees/`, that
+/// directory's `gitdir` file points back at this worktree's `.git` file, and
+/// its `commondir` file resolves to `common`, the common Git directory, whose
+/// own name is `.git`. The main checkout is the directory holding `common`.
+fn verified_linked_main_root(worktree: &Path, common: &Path) -> Option<PathBuf> {
+    let resolve = |base: &Path, spelled: &str| {
+        let spelled = Path::new(spelled.trim());
+        let path = if spelled.is_absolute() {
+            spelled.to_path_buf()
+        } else {
+            base.join(spelled)
+        };
+        std::fs::canonicalize(path).ok()
+    };
+    let common = std::fs::canonicalize(common).ok()?;
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    let worktree = std::fs::canonicalize(worktree).ok()?;
+    let dot_git = worktree.join(".git");
+    if !std::fs::symlink_metadata(&dot_git).ok()?.is_file() {
+        return None;
+    }
+    let claim = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = resolve(&worktree, claim.trim().strip_prefix("gitdir:")?)?;
+    if gitdir.parent()? != common.join("worktrees") {
+        return None;
+    }
+    let back = resolve(
+        &gitdir,
+        &std::fs::read_to_string(gitdir.join("gitdir")).ok()?,
+    )?;
+    if back != std::fs::canonicalize(&dot_git).ok()? {
+        return None;
+    }
+    let commondir = resolve(
+        &gitdir,
+        &std::fs::read_to_string(gitdir.join("commondir")).ok()?,
+    )?;
+    if commondir != common {
+        return None;
+    }
+    Some(crate::inspect::job::normalize_path(common.parent()?))
+}
+
+/// Whether `location` (absolute, with at least its parent resolved) is an
+/// entry inside scratch that a task of `session` still owns.
+/// A final symlink is never owned: the registry's check resolves the whole
+/// path, which would judge the link's target rather than the link entry a
+/// delete, move or replace acts on. A missing target is judged by its nearest
+/// existing ancestor, which is already resolved because the parent is.
+fn session_owned_scratch_location(
+    registry: &BgTaskRegistry,
+    session: &str,
+    location: &Path,
+) -> bool {
+    let candidate = match std::fs::symlink_metadata(location) {
+        Ok(metadata) if metadata.file_type().is_symlink() => return false,
+        Ok(_) => Some(location),
+        Err(_) => location.ancestors().skip(1).find(|parent| parent.exists()),
+    };
+    candidate.is_some_and(|candidate| registry.is_session_owned_scratch_path(session, candidate))
+}
+
 /// A GitHub address (`issue://…`, `pr://…`) is never a filesystem path. The
 /// handlers that serve GitHub resources route those spellings before path
 /// validation, so one arriving here was meant for GitHub and handed to a file
@@ -3881,6 +3951,10 @@ pub struct AppContext {
     canonical_cache_root: parking_lot::Mutex<Option<PathBuf>>,
     is_worktree_bridge: parking_lot::Mutex<bool>,
     git_common_dir: parking_lot::Mutex<Option<PathBuf>>,
+    /// The main checkout of this linked worktree, in the policy's spelling,
+    /// verified and frozen when the cache role is set (see
+    /// [`verified_linked_main_root`]).
+    linked_main_root: parking_lot::Mutex<Option<PathBuf>>,
     shared_artifacts_read_only: AtomicBool,
     /// Standalone NDJSON requests may borrow a finite CLI snapshot after the
     /// writer has exited; daemon-bound routes keep their live freshness owner.
@@ -4094,6 +4168,8 @@ pub struct AppContext {
     /// so tool calls can skip the aft.db read and its lock. See
     /// [`PolicyConfinementMemo`].
     policy_confinement: parking_lot::Mutex<PolicyConfinementMemo>,
+    standalone_approval_route: Arc<()>,
+    standalone_plugin_host: AtomicBool,
     #[cfg(test)]
     database_open_attempts: AtomicU64,
     /// The pending aft.db open request, the configure epoch it belongs to, and
@@ -4710,6 +4786,7 @@ impl AppContext {
             canonical_cache_root: parking_lot::Mutex::new(None),
             is_worktree_bridge: parking_lot::Mutex::new(false),
             git_common_dir: parking_lot::Mutex::new(None),
+            linked_main_root: parking_lot::Mutex::new(None),
             shared_artifacts_read_only: AtomicBool::new(false),
             daemonless_query_mode: AtomicBool::new(false),
             rerank_slot: Default::default(),
@@ -4826,6 +4903,8 @@ impl AppContext {
             database_runtime_changed: tokio::sync::Notify::new(),
             database_runtime_failure: parking_lot::Mutex::new(DatabaseRuntimeFailure::default()),
             policy_confinement: parking_lot::Mutex::new(PolicyConfinementMemo::default()),
+            standalone_approval_route: Arc::new(()),
+            standalone_plugin_host: AtomicBool::new(false),
             #[cfg(test)]
             database_open_attempts: AtomicU64::new(0),
             database_open: parking_lot::Mutex::new(Default::default()),
@@ -8404,6 +8483,10 @@ impl AppContext {
 
     pub fn set_cache_role(&self, is_worktree_bridge: bool, git_common_dir: Option<PathBuf>) {
         *self.is_worktree_bridge.lock() = is_worktree_bridge;
+        *self.linked_main_root.lock() = match (&git_common_dir, &self.config().project_root) {
+            (Some(common), Some(root)) => verified_linked_main_root(root, common),
+            _ => None,
+        };
         *self.git_common_dir.lock() = git_common_dir;
         // The configure-time worktree probe already applies the test seam, so
         // automatic Tier-2 scheduling follows the same effective root role as
@@ -13848,6 +13931,19 @@ impl AppContext {
         req_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        self.authorize_write_location(req_id, path)
+            .map(|(location, _)| location)
+    }
+
+    /// [`AppContext::validate_write_location`], also returning the identity
+    /// the access policy judged: the canonical parent plus the final
+    /// component as spelled. A caller that holds the parent directory open
+    /// can check that the directory it holds is the one that was judged.
+    pub(crate) fn authorize_write_location(
+        &self,
+        req_id: &str,
+        path: &Path,
+    ) -> Result<(PathBuf, PathBuf), crate::protocol::Response> {
         // Only mutations validate write locations (see `MutationScope`).
         let _io = crate::bounded_io::enter_mutation();
         reject_github_address(req_id, path)?;
@@ -13863,12 +13959,20 @@ impl AppContext {
             path_for_resolution,
         }) = self.path_restriction_context(req_id, path)?
         else {
-            self.check_path_access(req_id, path, path, None, None, true)?;
-            return Ok(path.to_path_buf());
+            // Root restriction is off, so the caller's spelling is kept, but a
+            // relative spelling is rooted at the project root (or the working
+            // directory when none is configured): that location
+            // is what gets checked, and the handler must touch the same one
+            // rather than resolve the spelling against the daemon's cwd.
+            let rooted = self.resolve_relative_path(path);
+            let identity = self.check_path_access(req_id, path, &rooted, None, None, true)?;
+            return Ok((rooted, identity));
         };
         let normalized = normalize_path(&path_for_resolution);
         let Some(file_name) = normalized.file_name() else {
-            return self.validate_path(req_id, path);
+            let location = self.validate_path(req_id, path)?;
+            let identity = crate::access_policy::policy_path(&location);
+            return Ok((location, identity));
         };
         let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
         let id = req_id.to_string();
@@ -13891,8 +13995,8 @@ impl AppContext {
         })??;
         let resolved = normalize_path(&resolved_parent.join(file_name));
 
-        self.check_path_access(req_id, path, &resolved, None, None, true)?;
-        Ok(resolved)
+        let identity = self.check_path_access(req_id, path, &resolved, None, None, true)?;
+        Ok((resolved, identity))
     }
 
     /// Validate a read path. Registered bash output and a task's recorded
@@ -13981,14 +14085,20 @@ impl AppContext {
             path_for_resolution,
         }) = self.path_restriction_context(req_id, path)?
         else {
+            // Root restriction is off, so the caller's spelling is kept, but a
+            // relative spelling is rooted at the project root (or the working
+            // directory when none is configured): that location
+            // is what gets checked, and the handler must read the same one
+            // rather than resolve the spelling against the daemon's cwd.
+            let rooted = self.resolve_relative_path(path);
             // Scratch readers use the canonical spelling checked by policy so
             // aliases such as /tmp on macOS cannot evade the opened-handle fence.
             if let Some(session) = artifact_session_id {
                 if self
                     .bash_background
-                    .is_session_owned_scratch_path(session, path)
+                    .is_session_owned_scratch_path(session, &rooted)
                 {
-                    let resolved = crate::bounded_io::canonicalize(path).map_err(|error| {
+                    let resolved = crate::bounded_io::canonicalize(&rooted).map_err(|error| {
                         crate::protocol::Response::error(req_id, "read_blocked", error.to_string())
                     })?;
                     self.check_path_access(
@@ -14002,9 +14112,15 @@ impl AppContext {
                     return Ok(resolved);
                 }
             }
-            // Root restriction is disabled, so retain ordinary callers' spelling.
-            self.check_path_access(req_id, path, path, artifact_session_id, search_tool, false)?;
-            return Ok(path.to_path_buf());
+            self.check_path_access(
+                req_id,
+                path,
+                &rooted,
+                artifact_session_id,
+                search_tool,
+                false,
+            )?;
+            return Ok(rooted);
         };
 
         // Resolve the path (follow symlinks, normalize ..). If canonicalization
@@ -14153,17 +14269,36 @@ impl AppContext {
     ) -> Result<crate::access_policy::AccessPolicy, crate::protocol::Response> {
         use crate::access_policy::{AccessDecision, AccessDenial, AccessPolicy};
         let config = self.config();
+        let standalone = matches!(
+            crate::access_policy::current_ask_route(),
+            crate::access_policy::AskRoute::Plugin { .. }
+        );
         let roots = config
             .project_root
             .as_ref()
             .map(|root| vec![self.resolved_path_restriction_root(root)])
             .unwrap_or_default();
+        let force_restrict = self.request_force_restrict(req_id);
+        let mut main_roots = Vec::new();
+        if standalone && !config.restrict_to_project_root && !force_restrict {
+            // Frozen when the cache role was set, after the linkage between
+            // this worktree and its main checkout was verified. It is never
+            // resolved again here, so a later symlink or junction swap of the
+            // main checkout's path cannot move it.
+            if let Some(main) = self.linked_main_root.lock().clone() {
+                if !roots
+                    .iter()
+                    .any(|root| crate::inspect::job::normalize_path(root) == main)
+                {
+                    main_roots.push(main);
+                }
+            }
+        }
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from)
             .unwrap_or_default();
         let storage = self.storage_dir();
-        let force_restrict = self.request_force_restrict(req_id);
         let (grants, mode, worker) = if let Some(scope) = crate::access_policy::current_scope() {
             match self.db() {
                 Some(db) => {
@@ -14204,11 +14339,31 @@ impl AppContext {
         } else {
             (Vec::new(), Default::default(), false)
         };
+        let elicitation = matches!(
+            crate::access_policy::current_ask_route(),
+            crate::access_policy::AskRoute::Elicitation { .. }
+        );
+        // A known plugin host whose thread lost its route keeps the temp
+        // guards too. Without them an in-root path under a system temp
+        // directory would skip the database, hard-link and foreign-scratch
+        // refusals that the admitted route applies.
+        let guarded = standalone || self.missing_plugin_route();
+        let temp_override = crate::access_policy::temp::roots_override();
         let build = move || {
             let mut policy = AccessPolicy::from_config(&config, &storage, roots, &home);
+            policy.standalone_main_roots = main_roots;
+            if guarded {
+                policy.standalone_temp_guard_roots =
+                    crate::access_policy::temp::guard_roots(temp_override.as_deref());
+                policy.standalone_managed_temp_roots = crate::access_policy::temp::managed_roots();
+            }
             policy.install_scope_grants(grants, worker);
             policy.mode = mode;
-            if force_restrict {
+            if standalone && !config.restrict_to_project_root && !force_restrict {
+                policy.standalone_temp_roots =
+                    crate::access_policy::temp::allowed_roots(temp_override.as_deref());
+            }
+            if force_restrict && !elicitation {
                 policy.outside = AccessDecision::Deny(AccessDenial::OutsideRoots);
             }
             policy
@@ -14334,10 +14489,34 @@ impl AppContext {
         Ok(())
     }
 
+    pub(crate) fn mark_standalone_plugin_host(&self) {
+        self.standalone_plugin_host.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn missing_plugin_route(&self) -> bool {
+        matches!(
+            crate::access_policy::current_ask_route(),
+            crate::access_policy::AskRoute::Lowered
+        ) && (self.standalone_plugin_host.load(Ordering::Acquire)
+            || matches!(
+                self.config().harness,
+                Some(crate::harness::Harness::Opencode | crate::harness::Harness::Pi)
+            ))
+    }
+
+    pub(crate) fn standalone_approval_scope(
+        &self,
+        session: &str,
+    ) -> crate::access_policy::plugin::Scope {
+        crate::access_policy::plugin::Scope::new(&self.standalone_approval_route, session)
+    }
+
     /// Resolve an `ask` decision for the call on this thread. A lowered route
-    /// treats the ask as allow. A consent route allows only what an
-    /// `allow_once` answer approved for this dispatch; anything else refuses
-    /// with the internal ask code, carrying the capability to request.
+    /// treats the ask as allow. Plugins echo exact engine ask IDs; consent
+    /// (`allow_once`) and reverse-elicitation routes allow only what was
+    /// approved for this dispatch; anything else refuses with the internal ask
+    /// code, carrying the capability to request. No UI means a path denial,
+    /// not an implicit approval.
     fn answer_ask(
         &self,
         req_id: &str,
@@ -14348,31 +14527,63 @@ impl AppContext {
         #[cfg(test)]
         confinement::note_ask();
         use crate::access_policy::{AskRoute, GrantKind};
-        let once = match crate::access_policy::current_ask_route() {
+        let route = crate::access_policy::current_ask_route();
+        match &route {
             AskRoute::Lowered => return Ok(()),
             AskRoute::Unavailable => {
                 return Err(crate::protocol::Response::error_with_data(
-                    req_id,
-                    crate::access_policy::PERMISSION_ASK_UNAVAILABLE,
-                    format!(
-                        "{} access to '{}' needs permission, and a codemode program can't ask for it",
-                        match operation {
-                            crate::access_policy::AccessOperation::Read => "read",
-                            crate::access_policy::AccessOperation::Write => "write",
-                        },
-                        original.display()
-                    ),
-                    serde_json::json!({
-                        "permission": operation,
-                        "resource": identity,
-                    }),
+                    req_id, crate::access_policy::PERMISSION_ASK_UNAVAILABLE,
+                    format!("{} access to '{}' needs permission, and a codemode program can't ask for it",
+                        match operation { crate::access_policy::AccessOperation::Read => "read", crate::access_policy::AccessOperation::Write => "write" }, original.display()),
+                    serde_json::json!({"permission":operation,"resource":identity}),
                 ));
             }
-            AskRoute::Consent { once, .. } => once,
-        };
-        if once.iter().any(|grant| grant.covers(operation, identity)) {
-            return Ok(());
+            AskRoute::Deny => {
+                let root = self.config().project_root.clone().unwrap_or_default();
+                return Err(path_error_response(req_id, original, &root));
+            }
+            _ => {}
         }
+        // A directory is asked for as a subtree so one answer covers what the
+        // tool reads beneath it. The probe stays on the bounded helper when
+        // one is active, like every other path probe on the request path.
+        let probe = identity.to_path_buf();
+        let is_dir = if crate::bounded_io::current().is_some() {
+            crate::bounded_io::run(&probe, None, |path| match std::fs::metadata(path) {
+                Ok(metadata) => Ok(metadata.is_dir()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            })
+            .map_err(|error| {
+                crate::protocol::Response::error(
+                    req_id,
+                    crate::bounded_io::timeout_code(&error),
+                    error.to_string(),
+                )
+            })?
+        } else {
+            probe.is_dir()
+        };
+        let kind = if is_dir {
+            GrantKind::Subtree
+        } else {
+            GrantKind::File
+        };
+        let grant = crate::access_policy::AccessGrant {
+            path: identity.to_path_buf(),
+            kind,
+            operation,
+        };
+        if let AskRoute::Consent { once, .. } | AskRoute::Elicitation { once } = &route {
+            if once
+                .iter()
+                .any(|approved| approved.covers_kind(operation, identity, kind))
+            {
+                return Ok(());
+            }
+        }
+        // A worker naming the head's path for a file its own checkout has is
+        // pointed at its checkout instead of being asked about the head's.
         if let Some(suggestion) = self.checkout_path_suggestion(original) {
             return Err(crate::protocol::Response::error(
                 req_id,
@@ -14384,20 +14595,44 @@ impl AppContext {
                 ),
             ));
         }
-        // A directory is asked for as a subtree so one answer covers what the
-        // tool reads beneath it. The probe stays on the bounded helper when
-        // one is active, like every other path probe on the request path.
-        let probe = identity.to_path_buf();
-        let is_dir = if crate::bounded_io::current().is_some() {
-            crate::bounded_io::run(&probe, None, |path| Ok(path.is_dir())).unwrap_or(false)
-        } else {
-            probe.is_dir()
-        };
-        let kind = if is_dir {
-            GrantKind::Subtree
-        } else {
-            GrantKind::File
-        };
+
+        if let AskRoute::Plugin { scope, once } = route {
+            // A file approval must not become a tree approval if the target
+            // changed into a directory while the host prompt was open.
+            if once
+                .iter()
+                .any(|approved| approved.covers_kind(operation, identity, kind))
+            {
+                return Ok(());
+            }
+            let id = crate::access_policy::plugin::issue(&scope, &grant);
+            let pattern = if is_dir {
+                identity.join("*")
+            } else {
+                identity.parent().unwrap_or(identity).join("*")
+            };
+            let mut ask = serde_json::json!({
+                "kind": "external_directory", "patterns": [pattern], "always": [pattern],
+                "grant_id": id, "path": identity, "operation": operation,
+                "parentDir": if is_dir { identity } else { identity.parent().unwrap_or(identity) },
+            });
+            // The host sent an approval for this exact operation and path,
+            // but its token had expired (the prompt stayed open too long).
+            // Saying so lets the host ask again instead of treating the
+            // repeated ask as an approval the engine refused.
+            if scope.presented_expired(&grant) {
+                ask["reason"] = serde_json::json!("approval_expired");
+            }
+            return Err(crate::protocol::Response::error_with_data(
+                req_id,
+                crate::protocol::ERROR_PERMISSION_REQUIRED,
+                format!(
+                    "path '{}' needs outside-access permission",
+                    original.display()
+                ),
+                serde_json::json!({"asks": [ask]}),
+            ));
+        }
         Err(crate::protocol::Response::error_with_data(
             req_id,
             crate::access_policy::ACCESS_ASK_REQUIRED,
@@ -14406,15 +14641,14 @@ impl AppContext {
                 original.display()
             ),
             serde_json::json!({
-                "ask": crate::access_policy::AccessGrant {
-                    path: identity.to_path_buf(),
-                    kind,
-                    operation,
-                },
+                "ask": grant,
             }),
         ))
     }
 
+    /// Authorize `resolved` (the location for `original`) and return the
+    /// identity the policy judged: the canonical path, or for a write
+    /// location its canonical parent plus the final component as spelled.
     fn check_path_access(
         &self,
         req_id: &str,
@@ -14423,11 +14657,22 @@ impl AppContext {
         artifact_session: Option<&str>,
         search_tool: Option<WorkerSearchTool>,
         preserve_final: bool,
-    ) -> Result<(), crate::protocol::Response> {
+    ) -> Result<PathBuf, crate::protocol::Response> {
         use crate::access_policy::{policy_path, AccessDecision, AccessDenial, AccessOperation};
         if let Some(response) = self.worker_root_search_refusal(req_id, original, search_tool) {
             return Err(response);
         }
+        // A relative path names a file under the project root, which is where
+        // the tools resolve it. Judge that location, not one under the
+        // daemon's working directory: when root restriction is off the path
+        // arrives here exactly as the caller spelled it.
+        let rooted;
+        let resolved = if resolved.is_relative() {
+            rooted = self.resolve_relative_path(resolved);
+            rooted.as_path()
+        } else {
+            resolved
+        };
         let operation = if artifact_session.is_some() {
             AccessOperation::Read
         } else {
@@ -14484,12 +14729,61 @@ impl AppContext {
                     .is_readable_task_path(session, &identity)
         });
         self.check_unrestored_path(req_id, &identity, artifact_session, preserve_final)?;
-        let policy = self.access_policy(req_id)?;
+        let mut policy = self.access_policy(req_id)?;
+        // A lost thread-local route must not turn a known plugin host into the
+        // legacy CLI allow path, even if that root's config has no harness yet.
+        // It is reported after the policy decision so a path the policy denies
+        // anyway (outside a restricted root, under a floor) keeps that answer.
+        let route_missing = self.missing_plugin_route()
+            && !policy.roots.iter().any(|root| identity.starts_with(root));
+        if let crate::access_policy::AskRoute::Plugin { scope, .. } =
+            crate::access_policy::current_ask_route()
+        {
+            let registry = self.bash_background.clone();
+            let session = scope.session().to_owned();
+            // Ownership is judged on the entry the tool names. A read opens
+            // the fully resolved target, so `identity` is that entry. A write
+            // is judged on the requested spelling with its parent resolved
+            // and its final component kept as spelled, the same identity the
+            // write-location check uses. An outside entry that is a symlink
+            // into the session's scratch is therefore a different entry and
+            // never owned: deleting, replacing or writing through it still
+            // asks, because those act on (or through) the outside link.
+            let spelled = (artifact_session.is_none() && !preserve_final)
+                .then(|| self.resolve_relative_path(original));
+            let location_identity = identity.clone();
+            policy.standalone_owned_scratch = crate::bounded_io::run(&identity, None, move |_| {
+                let location = match spelled {
+                    Some(spelled) => match (spelled.parent(), spelled.file_name()) {
+                        (Some(parent), Some(name)) => policy_path(parent).join(name),
+                        _ => policy_path(&spelled),
+                    },
+                    None => location_identity,
+                };
+                Ok(session_owned_scratch_location(
+                    &registry, &session, &location,
+                ))
+            })
+            .map_err(|error| {
+                crate::protocol::Response::error(
+                    req_id,
+                    crate::bounded_io::timeout_code(&error),
+                    error.to_string(),
+                )
+            })?;
+        }
         let decision = if preserve_final {
             policy.decide_tree_write(&identity)
         } else {
             policy.decide(operation, &identity, owned_artifact)
         };
+        if route_missing && !matches!(decision, AccessDecision::Deny(_)) {
+            return Err(crate::protocol::Response::error(
+                req_id,
+                "access_route_missing",
+                "plugin filesystem access requires its admitted permission route",
+            ));
+        }
         // Preserve the existing path_outside_root response when root restriction
         // already denied this path. The protected path is still rejected; changing
         // the error spelling must never turn a floor denial into a consent request.
@@ -14508,7 +14802,9 @@ impl AppContext {
             }
         }
         match decision {
-            AccessDecision::Allow => crate::bounded_io::probe_access(req_id, &identity),
+            AccessDecision::Allow => {
+                crate::bounded_io::probe_access(req_id, &identity).map(|()| identity)
+            }
             AccessDecision::Ask => {
                 let operation = if preserve_final {
                     AccessOperation::Write
@@ -14536,7 +14832,7 @@ impl AppContext {
                     }
                 }
                 self.answer_ask(req_id, original, &identity, operation)?;
-                crate::bounded_io::probe_access(req_id, &identity)
+                crate::bounded_io::probe_access(req_id, &identity).map(|()| identity)
             }
             AccessDecision::Deny(AccessDenial::ReadOnly) => Err(crate::protocol::Response::error(
                 req_id,
@@ -14546,6 +14842,16 @@ impl AppContext {
                     original.display()
                 ),
             )),
+            AccessDecision::Deny(AccessDenial::UnsafeTemp) => {
+                Err(crate::protocol::Response::error(
+                    req_id,
+                    "unsafe_temp_path",
+                    format!(
+                        "temporary path '{}' is not safe or not owned by this session",
+                        original.display()
+                    ),
+                ))
+            }
             AccessDecision::Deny(AccessDenial::Floor) => Err(crate::protocol::Response::error(
                 req_id,
                 "denied_floor",
@@ -15808,6 +16114,115 @@ mod force_restrict_tests {
     use crate::language::StubProvider;
     use tempfile::TempDir;
 
+    /// Lay out `main` as a repository and `linked` as one of its worktrees,
+    /// the way `git worktree add` does: the worktree's `.git` file names
+    /// `main/.git/worktrees/<name>`, which points back at that file and names
+    /// its common directory.
+    fn link_worktree(main: &Path, linked: &Path) {
+        let name = linked.file_name().unwrap();
+        let admin = main.join(".git").join("worktrees").join(name);
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::create_dir_all(linked).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", linked.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+    }
+
+    fn plugin_route(owner: &Arc<()>) -> crate::access_policy::AskRouteGuard {
+        crate::access_policy::ask_route_guard(Some(crate::access_policy::AskRoute::Plugin {
+            scope: crate::access_policy::plugin::Scope::new(owner, "session"),
+            once: Vec::new(),
+        }))
+    }
+
+    /// The main checkout is readable without an ask, but writing there asks:
+    /// it is not one of the route's roots.
+    #[test]
+    fn standalone_main_checkout_is_read_only() {
+        let project = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let main = project.path().join("main");
+        let linked = project.path().join("linked");
+        link_worktree(&main, &linked);
+        let target = main.join("source.rs");
+        std::fs::write(&target, "fn main_checkout() {}\n").unwrap();
+        let ctx = test_context(Some(linked), false);
+        ctx.set_cache_role(true, Some(main.join(".git")));
+        let owner = Arc::new(());
+        let _route = plugin_route(&owner);
+        assert!(ctx.validate_read_path("read", "session", &target).is_ok());
+        assert_eq!(
+            ctx.validate_path("write", &target).unwrap_err().data["code"],
+            "permission_required"
+        );
+    }
+
+    /// A `.git` file is only a claim. One that names a real repository which
+    /// does not list this directory as its worktree gives that repository no
+    /// exemption.
+    #[test]
+    fn standalone_forged_worktree_link_gets_no_main_checkout_exemption() {
+        let project = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let other = project.path().join("other");
+        let real = project.path().join("real-worktree");
+        link_worktree(&other, &real);
+        let forged = project.path().join("forged");
+        std::fs::create_dir(&forged).unwrap();
+        std::fs::write(
+            forged.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                other.join(".git/worktrees/real-worktree").display()
+            ),
+        )
+        .unwrap();
+        let secret = other.join("secret.rs");
+        std::fs::write(&secret, "fn other_repository() {}\n").unwrap();
+        let ctx = test_context(Some(forged), false);
+        ctx.set_cache_role(true, Some(other.join(".git")));
+        let owner = Arc::new(());
+        let _route = plugin_route(&owner);
+        assert_eq!(
+            ctx.validate_read_path("forged", "session", &secret)
+                .unwrap_err()
+                .data["code"],
+            "permission_required"
+        );
+    }
+
+    /// The main checkout is frozen when the role is set. Replacing its path
+    /// with a symlink to somewhere else afterwards grants nothing there.
+    #[cfg(unix)]
+    #[test]
+    fn standalone_main_checkout_swapped_for_a_symlink_grants_nothing() {
+        let project = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let main = project.path().join("main");
+        let linked = project.path().join("linked");
+        link_worktree(&main, &linked);
+        let ctx = test_context(Some(linked), false);
+        ctx.set_cache_role(true, Some(main.join(".git")));
+        let elsewhere = project.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("secret.rs"), "fn elsewhere() {}\n").unwrap();
+        std::fs::rename(&main, project.path().join("main-moved")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &main).unwrap();
+        let owner = Arc::new(());
+        let _route = plugin_route(&owner);
+        assert_eq!(
+            ctx.validate_read_path("swapped", "session", &main.join("secret.rs"))
+                .unwrap_err()
+                .data["code"],
+            "permission_required"
+        );
+    }
+
     fn test_context(project_root: Option<PathBuf>, restrict_to_project_root: bool) -> AppContext {
         AppContext::new(
             Box::new(StubProvider),
@@ -15817,6 +16232,167 @@ mod force_restrict_tests {
                 ..Config::default()
             },
         )
+    }
+
+    #[test]
+    fn standalone_linked_worktree_keeps_main_checkout_without_prompting() {
+        use crate::access_policy::{ask_route_guard, AskRoute};
+        let project = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let main = project.path().join("main");
+        let linked = project.path().join("linked");
+        let unrelated = project.path().join("unrelated.txt");
+        link_worktree(&main, &linked);
+        let target = main.join("source.rs");
+        std::fs::write(&target, "fn main_checkout() {}\n").unwrap();
+        std::fs::write(&unrelated, "not the main checkout").unwrap();
+        let ctx = test_context(Some(linked), false);
+        ctx.set_cache_role(true, Some(main.join(".git")));
+        let owner = Arc::new(());
+        let scope = crate::access_policy::plugin::Scope::new(&owner, "session");
+        let _route = ask_route_guard(Some(AskRoute::Plugin {
+            scope,
+            once: Vec::new(),
+        }));
+        assert!(ctx.validate_read_path("main", "session", &target).is_ok());
+        let task_temp = project.path().join("task-temp");
+        std::fs::create_dir(&task_temp).unwrap();
+        let shell = ctx
+            .access_policy("shell")
+            .unwrap()
+            .compile_shell(task_temp, Vec::new(), Vec::new())
+            .unwrap();
+        let main_identity = crate::access_policy::policy_path(&main);
+        assert!(!shell
+            .write_allow_roots()
+            .iter()
+            .any(|root| main_identity.starts_with(root)));
+        assert!(!shell
+            .data_policy
+            .write_allow
+            .iter()
+            .any(|root| main_identity.starts_with(root)));
+        let forced = ctx.with_force_restrict("forced", || {
+            ctx.validate_read_path("forced", "session", &target)
+        });
+        assert_eq!(forced.unwrap_err().data["code"], "path_outside_root");
+        assert_eq!(
+            ctx.validate_read_path("other", "session", &unrelated)
+                .unwrap_err()
+                .data["code"],
+            "permission_required"
+        );
+        ctx.update_config(|config| config.restrict_to_project_root = true);
+        assert_eq!(
+            ctx.validate_read_path("restricted", "session", &target)
+                .unwrap_err()
+                .data["code"],
+            "path_outside_root"
+        );
+    }
+
+    #[test]
+    fn standalone_native_plugin_dispatch_never_uses_lowered() {
+        use crate::access_policy::{current_ask_route, with_native_route, AskRoute};
+        let root = TempDir::new().unwrap();
+        let outside = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let target = outside.path().join("file.txt");
+        std::fs::write(&target, "protected").unwrap();
+        for harness in [
+            crate::harness::Harness::Opencode,
+            crate::harness::Harness::Pi,
+        ] {
+            let ctx = test_context(Some(root.path().into()), false);
+            ctx.update_config(|config| config.harness = Some(harness));
+            let request = crate::protocol::RawRequest {
+                id: "native".into(),
+                command: "read".into(),
+                session_id: Some("session".into()),
+                lsp_hints: None,
+                params: serde_json::json!({"path":target}),
+            };
+            let result = with_native_route(request, &ctx, |req, ctx| {
+                assert!(matches!(current_ask_route(), AskRoute::Plugin { .. }));
+                ctx.validate_read_path(&req.id, req.session(), &target)
+                    .unwrap_err()
+            });
+            assert_eq!(result.data["code"], "permission_required");
+        }
+    }
+
+    #[test]
+    fn standalone_plugin_ids_do_not_widen_operation_target_or_floor() {
+        use crate::access_policy::{ask_route_guard, AskRoute};
+        let root = TempDir::new().unwrap();
+        let outside = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let target = outside.path().join("file.txt");
+        std::fs::write(&target, "unchanged").unwrap();
+        let ctx = test_context(Some(root.path().into()), false);
+        let owner = Arc::new(());
+        let scope = crate::access_policy::plugin::Scope::new(&owner, "session");
+        let _route = ask_route_guard(Some(AskRoute::Plugin {
+            scope: scope.clone(),
+            once: Vec::new(),
+        }));
+        let read = ctx
+            .validate_read_path("read", "session", &target)
+            .unwrap_err();
+        assert_eq!(read.data["code"], "permission_required");
+        let read_id = read.data["asks"][0]["grant_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let _route = ask_route_guard(Some(AskRoute::Plugin {
+            scope: scope.clone(),
+            once: crate::access_policy::plugin::claim(&mut scope.clone(), &[read_id]),
+        }));
+        assert!(ctx.validate_read_path("read", "session", &target).is_ok());
+        let write = ctx.validate_path("write", &target).unwrap_err();
+        assert_eq!(write.data["code"], "permission_required");
+        assert_eq!(
+            ctx.validate_read_path("other", "session", &outside.path().join("sibling"))
+                .unwrap_err()
+                .data["code"],
+            "permission_required"
+        );
+        let write_id = write.data["asks"][0]["grant_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let write_grants = crate::access_policy::plugin::claim(&mut scope.clone(), &[write_id]);
+        let _route = ask_route_guard(Some(AskRoute::Plugin {
+            scope: scope.clone(),
+            once: write_grants.clone(),
+        }));
+        assert!(ctx.validate_path("write", &target).is_ok());
+        let changing = outside.path().join("changing");
+        std::fs::write(&changing, "file before approval").unwrap();
+        let ask = ctx
+            .validate_read_path("kind", "session", &changing)
+            .unwrap_err();
+        let token = ask.data["asks"][0]["grant_id"].as_str().unwrap().to_owned();
+        std::fs::remove_file(&changing).unwrap();
+        std::fs::create_dir(&changing).unwrap();
+        let _route = ask_route_guard(Some(AskRoute::Plugin {
+            scope: scope.clone(),
+            once: crate::access_policy::plugin::claim(&mut scope.clone(), &[token]),
+        }));
+        assert_eq!(
+            ctx.validate_read_path("kind", "session", &changing)
+                .unwrap_err()
+                .data["code"],
+            "permission_required"
+        );
+        let _route = ask_route_guard(Some(AskRoute::Plugin {
+            scope: scope.clone(),
+            once: write_grants,
+        }));
+        assert!(ctx.validate_path("matching-grant", &target).is_ok());
+        ctx.update_config(|config| config.sandbox.read_deny.push(target.clone()));
+        assert_eq!(
+            ctx.validate_path("floor", &target).unwrap_err().data["code"],
+            "denied_floor"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "unchanged");
     }
 
     #[test]

@@ -11,7 +11,8 @@ use crate::hashline::integration::{
     render_mutation_response, render_rejection_response, MutationRenderInput, TransportKind,
 };
 use crate::hashline::syntax::{
-    parse_hashline_patch, resolve_patch_sections, Baseline, HashlineRejection, Operation,
+    parse_hashline_patch, resolve_patch_sections_with_error as resolve_patch_sections, Baseline,
+    HashlineRejection, Operation,
 };
 use crate::hashline::transaction::{
     run_transaction, ExecuteContext, MvDestinationInput, TransactionSectionInput,
@@ -22,6 +23,18 @@ struct OwnedMvDestination {
     canonical_path: PathBuf,
     requested_path: String,
     baseline_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+enum EditFailure {
+    Rejection(HashlineRejection),
+    Access(Response),
+}
+
+impl From<HashlineRejection> for EditFailure {
+    fn from(rejection: HashlineRejection) -> Self {
+        Self::Rejection(rejection)
+    }
 }
 
 pub fn handle_preflight(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -75,7 +88,7 @@ pub fn handle_edit(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let result = guard.with_binding_mut(|binding| {
+    let result = guard.with_binding_mut(|binding| -> Result<_, EditFailure> {
         let resolved = resolve_patch_sections(binding.snapshots_mut(), &patch, |requested| {
             resolve_write_path(req, ctx, &root, requested)
         })?;
@@ -209,7 +222,8 @@ pub fn handle_edit(req: &RawRequest, ctx: &AppContext) -> Response {
             }
             response_from_payload(&req.id, payload)
         }
-        Err(rejection) => rejection_response(req, &rejection, ctx),
+        Err(EditFailure::Rejection(rejection)) => rejection_response(req, &rejection, ctx),
+        Err(EditFailure::Access(response)) => response,
     }
 }
 
@@ -231,36 +245,26 @@ fn resolve_write_path(
     ctx: &AppContext,
     project_root: &Path,
     requested: &str,
-) -> Result<PathBuf, HashlineRejection> {
+) -> Result<PathBuf, EditFailure> {
     // Checked on the raw spelling: once joined onto the project root below,
     // `issue://7` no longer looks like a GitHub address.
     if crate::commands::github_comments::is_github_resource_path(requested) {
         return Err(HashlineRejection::untaggable_path(
             crate::commands::github_comments::github_resource_not_file_message("edit", requested),
-        ));
+        )
+        .into());
     }
     let path = crate::subc_translate::resolve_path_from_project_root(project_root, requested);
     // Hashline handles are keyed by the symlink-resolved file identity. Following
     // the final component here keeps two requested spellings of one existing file
     // in the same verification and transaction unit while still validating the
     // resolved target against the project boundary.
-    let validated = ctx.validate_path(&req.id, &path).map_err(|response| {
-        let message = response
-            .data
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("path is not write-eligible");
-        HashlineRejection::untaggable_path(message)
-    })?;
+    let validated = ctx
+        .validate_path(&req.id, &path)
+        .map_err(EditFailure::Access)?;
     let canonical = std::fs::canonicalize(&validated).unwrap_or(validated);
-    ctx.validate_path(&req.id, &canonical).map_err(|response| {
-        let message = response
-            .data
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("path is not write-eligible");
-        HashlineRejection::untaggable_path(message)
-    })
+    ctx.validate_path(&req.id, &canonical)
+        .map_err(EditFailure::Access)
 }
 
 fn transport_kind(ctx: &AppContext) -> TransportKind {

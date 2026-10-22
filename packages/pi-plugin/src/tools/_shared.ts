@@ -2,6 +2,7 @@
  * Shared helpers used by every Pi tool wrapper.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync } from "node:fs";
 import type {
   AftProjectTransport,
@@ -220,6 +221,191 @@ export class BridgeError extends Error {
   }
 }
 
+const hostPermissionGrants = new WeakMap<object, readonly string[]>();
+/** State private to one host `execute` call: preview continuations, and the
+ * call's own cancellation signal. */
+interface PermissionOperation {
+  continuations: Map<string, string[]>;
+  signal?: AbortSignal;
+}
+const permissionOperations = new AsyncLocalStorage<PermissionOperation>();
+
+/** Run one host `execute` call. `signal` is the call's own cancellation
+ * signal (the one Pi passes to `execute`); an outside-access prompt for the
+ * call stops on it as well as on the extension context's signal. */
+export function withOutsidePermissionOperation<T>(run: () => T, signal?: AbortSignal): T {
+  return permissionOperations.run({ continuations: new Map(), signal }, run);
+}
+
+/** Every signal that cancels this call: the extension context's and the
+ * signal passed to the running tool's `execute`. */
+function cancellationSignals(extCtx: ExtensionContext | undefined): AbortSignal[] {
+  const signals = [extCtx?.signal, permissionOperations.getStore()?.signal];
+  return signals.filter(
+    (signal, index): signal is AbortSignal =>
+      signal !== undefined && signals.indexOf(signal) === index,
+  );
+}
+
+function throwIfCancelled(signals: AbortSignal[]): void {
+  for (const signal of signals) signal.throwIfAborted();
+}
+
+function permissionOperation(tool: string, args: Record<string, unknown>): string {
+  if (["hashline_preflight", "hashline_edit", "edit", "edit_symbol"].includes(tool)) return "edit";
+  if (["undo_preview", "undo"].includes(tool)) return "safety:undo";
+  if (["checkpoint_paths", "restore_checkpoint"].includes(tool)) return "safety:restore";
+  if (tool === "checkpoint") return "safety:checkpoint";
+  if (tool === "safety") return `safety:${String(args.op ?? "")}`;
+  return (
+    ({ read_file: "read", write_file: "write", delete_file: "delete" } as Record<string, string>)[
+      tool
+    ] ?? tool
+  );
+}
+
+export function withHostPermissionGrants(args: Record<string, unknown>, grants: readonly string[]) {
+  const { permissions_granted: _untrusted, ...clean } = args;
+  hostPermissionGrants.set(clean, [...grants]);
+  return clean;
+}
+
+/** Hard ceiling on sends for one call. The engine reports one refused outside
+ * path per attempt, so a batch needs one round per distinct outside path plus
+ * the final run; this is far above any real batch. */
+export const MAX_OUTSIDE_PERMISSION_ROUNDS = 256;
+
+/** How many times one operation and path may be asked again because the
+ * user's approval arrived after its token expired. */
+export const MAX_EXPIRED_REASKS_PER_PATH = 2;
+
+/**
+ * Whether a person can answer an outside-access prompt in this session. Pi
+ * reports dialog-capable UI in RPC mode too, but there the prompt goes to the
+ * RPC client, which may never answer it, so only Pi's own terminal UI counts.
+ * Pi releases without `mode` keep the `hasUI` answer.
+ */
+export function canPromptForOutsideAccess(
+  extCtx: Pick<ExtensionContext, "hasUI" | "ui"> & { mode?: string },
+): boolean {
+  if (!extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") return false;
+  return extCtx.mode === undefined || extCtx.mode === "tui";
+}
+
+/** The engine owns containment; Pi only presents its exact outside-path asks. */
+export async function withOutsidePermissions<T extends Record<string, unknown>>(
+  args: Record<string, unknown>,
+  extCtx: ExtensionContext | undefined,
+  send: (args: Record<string, unknown>) => Promise<T>,
+  preview = false,
+  operation = "",
+  sessionId = "",
+): Promise<T> {
+  const { permissions_granted: _untrusted, ...clean } = args;
+  const inherited = hostPermissionGrants.get(args) ?? [];
+  const continuations = permissionOperations.getStore()?.continuations;
+  const signals = cancellationSignals(extCtx);
+  const key = JSON.stringify([sessionId, permissionOperation(operation, clean)]);
+  let granted = [...(continuations?.get(key) ?? [])];
+  continuations?.delete(key);
+  // What this call has approved so far, by operation and path. A batch keeps
+  // retrying while each round approves something new; the engine asking
+  // again for something already approved means retrying cannot finish.
+  const approvedThisCall = new Set<string>();
+  // Re-asks the engine marked `approval_expired`, per operation and path:
+  // the user said yes after the token expired, so asking again is progress.
+  const expiredReasks = new Map<string, number>();
+  for (let round = 0; ; round++) {
+    // Before every send, including an approved retry: a call cancelled
+    // while it waited for an answer must not run.
+    throwIfCancelled(signals);
+    if (round >= MAX_OUTSIDE_PERMISSION_ROUNDS)
+      throw new BridgeError(
+        `outside-access permission retry stopped after ${MAX_OUTSIDE_PERMISSION_ROUNDS} rounds`,
+        "outside_permission_stalled",
+      );
+    const approvals = [...inherited, ...granted];
+    const response = await send(
+      approvals.length ? { ...clean, permissions_granted: approvals } : clean,
+    );
+    granted = Array.isArray(response.permissions_continuation)
+      ? response.permissions_continuation.filter(
+          (id): id is string => typeof id === "string" && id.startsWith("outside:"),
+        )
+      : [];
+    delete response.permissions_continuation;
+    if (response.success !== false || response.code !== "permission_required") {
+      if (preview && response.success !== false && granted.length) continuations?.set(key, granted);
+      return response;
+    }
+    const asks = response.asks as
+      | Array<{
+          kind: string;
+          grant_id?: string;
+          path?: string;
+          operation?: string;
+          reason?: string;
+        }>
+      | undefined;
+    if (
+      !asks?.length ||
+      !asks.every(
+        (ask) => ask.kind === "external_directory" && ask.grant_id?.startsWith("outside:"),
+      )
+    ) {
+      if (granted.length) continuations?.set(key, granted);
+      return response;
+    }
+    if (!extCtx || !canPromptForOutsideAccess(extCtx)) {
+      // Deny at once rather than wait for an answer nobody can give. The
+      // message names no path, so it says nothing about what exists there.
+      throw new BridgeError(
+        "Permission denied: outside access needs approval, but this Pi session has no screen to show a prompt on, so none was possible.",
+        "permission_denied",
+      );
+    }
+    // The same operation on the same path is the same request. An ask that
+    // names no path can only be told apart by its own grant ID.
+    const askKey = (ask: (typeof asks)[number]) =>
+      ask.path === undefined
+        ? JSON.stringify(["grant", ask.grant_id])
+        : JSON.stringify([ask.operation ?? "", ask.path]);
+    for (const ask of asks) {
+      const key = askKey(ask);
+      if (!approvedThisCall.has(key)) continue;
+      const where = ask.path ?? "an outside path";
+      // An approval the engine refuses for any other reason cannot finish.
+      if (ask.reason !== "approval_expired")
+        throw new BridgeError(
+          `outside access to ${where} was refused again after it was approved`,
+          "outside_permission_stalled",
+        );
+      const reasked = expiredReasks.get(key) ?? 0;
+      if (reasked >= MAX_EXPIRED_REASKS_PER_PATH)
+        throw new BridgeError(
+          `outside access to ${where} kept expiring before it was approved`,
+          "outside_permission_stalled",
+        );
+      expiredReasks.set(key, reasked + 1);
+    }
+    for (const ask of asks) {
+      throwIfCancelled(signals);
+      const approved = await extCtx.ui.confirm(
+        "Allow outside access?",
+        `${ask.operation ?? "access"}: ${ask.path ?? ""}`,
+        { signal: signals.length > 1 ? AbortSignal.any(signals) : signals[0] },
+      );
+      // An answer that arrives after cancellation is ignored.
+      throwIfCancelled(signals);
+      if (!approved)
+        throw new BridgeError("Permission denied: outside access was denied.", "permission_denied");
+      approvedThisCall.add(askKey(ask));
+      const id = ask.grant_id;
+      if (id && !granted.includes(id)) granted.push(id);
+    }
+  }
+}
+
 /**
  * Call a bridge command and throw a BridgeError on failure.
  * Every tool handler should guard with `if (response.success === false)`
@@ -237,6 +423,8 @@ export async function callBridge(
 ): Promise<Record<string, unknown>> {
   const timeoutMs = timeoutForCommand(command);
   const merged: Record<string, unknown> = { ...params };
+  const trustedGrants = hostPermissionGrants.get(params);
+  if (trustedGrants) hostPermissionGrants.set(merged, trustedGrants);
   const sessionId = extCtx ? resolveSessionId(extCtx) : undefined;
   if (sessionId) {
     merged.session_id = sessionId;
@@ -255,10 +443,18 @@ export async function callBridge(
   try {
     const pool = bridgePools.get(bridge);
     if (pool) await forwardPendingBashWaitDetach(pool, bridge, sessionId, command === "bash");
-    response = await bridge.send(
-      command,
+    response = await withOutsidePermissions(
       merged,
-      Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
+      extCtx,
+      (approved) =>
+        bridge.send(
+          command,
+          approved,
+          Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
+        ),
+      ["undo_preview", "checkpoint_paths", "hashline_preflight"].includes(command),
+      command,
+      sessionId,
     );
   } catch (error) {
     // Host fallback and gate-off propagation both require the untouched bridge
@@ -325,11 +521,20 @@ export async function callToolCallForSession(
   try {
     const pool = bridgePools.get(bridge);
     if (pool) await forwardPendingBashWaitDetach(pool, bridge, sessionId, name === "bash");
-    response = await bridge.toolCall(
-      sessionId,
-      name,
+    response = await withOutsidePermissions(
       rawArgs,
-      Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
+      extCtx,
+      (approved) =>
+        bridge.toolCall(
+          sessionId,
+          name,
+          approved,
+          Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
+        ),
+      options?.preview === true ||
+        ["undo_preview", "checkpoint_paths", "hashline_preflight"].includes(name),
+      name,
+      sessionId,
     );
   } catch (error) {
     const noFallbackOption =

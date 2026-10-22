@@ -176,7 +176,18 @@ export function runSafetySuite(
 
       try {
         await writeFile(externalFile, "v1\n", "utf8");
-        await agentCall(h, "write", { filePath: externalFile, content: "v2\n" });
+        // The engine owns OpenCode's outside-access decision: a direct bridge
+        // write outside the project first returns the two-phase ask, and the
+        // retry carries the approved grant ids, as the plugin's loop does.
+        const ask = await agentCall(h, "write", { filePath: externalFile, content: "v2\n" });
+        expect(ask.code).toBe("permission_required");
+        const grants = (ask.asks as Array<{ grant_id?: string }>).map((entry) => entry.grant_id);
+        const write = await agentCall(h, "write", {
+          filePath: externalFile,
+          content: "v2\n",
+          permissions_granted: grants,
+        });
+        expect(write.success).toBe(true);
 
         let asks: AskCall[] = [];
         const undo = toolResultText(

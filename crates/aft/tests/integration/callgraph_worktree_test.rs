@@ -349,7 +349,10 @@ fn query_file(ctx: &AppContext, file: &Path, operation: &str, caller: &str) -> R
         "toSymbol": "target",
         "expression": "value"
     }));
-    match operation {
+    // Dispatch the way the native server does for this OpenCode-configured
+    // root: under the engine's plugin route. Without it the engine treats the
+    // call as a plugin request that lost its route and refuses outside paths.
+    aft::access_policy::with_native_route(req, ctx, |req, ctx| match operation {
         "callers" => aft::commands::callers::handle_callers(&req, ctx),
         "impact" => aft::commands::impact::handle_impact(&req, ctx),
         "call_tree" => aft::commands::call_tree::handle_call_tree(&req, ctx),
@@ -357,7 +360,7 @@ fn query_file(ctx: &AppContext, file: &Path, operation: &str, caller: &str) -> R
         "trace_to_symbol" => aft::commands::trace_to_symbol::handle_trace_to_symbol(&req, ctx),
         "trace_data" => aft::commands::trace_data::handle_trace_data(&req, ctx),
         _ => unreachable!(),
-    }
+    })
 }
 
 #[test]

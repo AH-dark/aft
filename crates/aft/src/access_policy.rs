@@ -145,13 +145,19 @@ fn no_symlink_below(root: &Path, path: &Path) -> bool {
 /// Who answers an `ask` decision for the call running on this thread.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum AskRoute {
-    /// `ask` is treated as allow. Standalone calls and stamped Alfonso heads
-    /// use this route: standalone calls have no Cingulate to ask, and a head
-    /// has no full-access setting yet to opt out of blocking on every outside
-    /// path. Restricted configurations turn outside paths into deny, so they
-    /// never reach an `ask`.
+    /// CLI/library callers without a host retain their configured legacy access.
+    /// Subc and native OpenCode/Pi entry points install an explicit route.
     #[default]
     Lowered,
+    /// A trusted plugin presents engine-generated asks and echoes approved IDs.
+    Plugin {
+        scope: plugin::Scope,
+        once: Vec<AccessGrant>,
+    },
+    /// An untrusted consumer may approve capabilities only over reverse calls.
+    Elicitation { once: Vec<AccessGrant> },
+    /// No permission UI is available on this route.
+    Deny,
     /// A stamped Alfonso worker: an `ask` refuses with `access_ask_required`
     /// so the subc layer can put the question to Cingulate. `once` holds the
     /// capabilities an `allow_once` answer approved for this one dispatch.
@@ -171,9 +177,181 @@ pub(crate) enum AskRoute {
 /// Refusal for a codemode call that would need a permission ask.
 pub(crate) const PERMISSION_ASK_UNAVAILABLE: &str = "permission_ask_unavailable";
 
+#[path = "access_policy_plugin.rs"]
+pub(crate) mod plugin;
+
+#[path = "access_policy_temp.rs"]
+pub(crate) mod temp;
+
+pub struct CapturedAskRoute(AskRoute);
+pub struct InstalledAskRoute {
+    _guard: AskRouteGuard,
+}
+
+pub fn capture_ask_route() -> CapturedAskRoute {
+    CapturedAskRoute(current_ask_route())
+}
+
+impl CapturedAskRoute {
+    pub fn install(self) -> InstalledAskRoute {
+        InstalledAskRoute {
+            _guard: ask_route_guard(Some(self.0)),
+        }
+    }
+}
+
+/// Legacy stdin transports have no daemon bind identity. Their private process
+/// context and configured harness supply a route; nested subc dispatch keeps
+/// the authenticated route already installed by the daemon boundary.
+pub fn with_native_route(
+    mut request: crate::protocol::RawRequest,
+    ctx: &crate::context::AppContext,
+    run: impl FnOnce(
+        crate::protocol::RawRequest,
+        &crate::context::AppContext,
+    ) -> crate::protocol::Response,
+) -> crate::protocol::Response {
+    let preview = request
+        .params
+        .get("preview")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || ["hashline_preflight", "undo_preview", "checkpoint_paths"]
+            .contains(&request.command.as_str());
+    match current_ask_route() {
+        AskRoute::Plugin { scope, once } => {
+            ctx.mark_standalone_plugin_host();
+            strip_native_approval_metadata(&mut request);
+            return finish_plugin_response(&scope, &once, preview, run(request, ctx));
+        }
+        AskRoute::Lowered => {}
+        _ => return run(request, ctx),
+    }
+    let plugin = matches!(
+        ctx.config().harness,
+        Some(crate::harness::Harness::Opencode | crate::harness::Harness::Pi)
+    );
+    if !plugin {
+        return run(request, ctx);
+    }
+    ctx.mark_standalone_plugin_host();
+    let args = request
+        .params
+        .get("arguments")
+        .or_else(|| request.params.get("args"))
+        .unwrap_or(&request.params);
+    let tool = native_tool_name(&request);
+    let mut scope = ctx
+        .standalone_approval_scope(request.session())
+        .for_tool(tool, args);
+    let ids: Vec<String> = args
+        .get("permissions_granted")
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let once = plugin::claim(&mut scope, &ids);
+    strip_native_approval_metadata(&mut request);
+    let _route = ask_route_guard(Some(AskRoute::Plugin {
+        scope: scope.clone(),
+        once: once.clone(),
+    }));
+    finish_plugin_response(&scope, &once, preview, run(request, ctx))
+}
+
+/// The tool a native request runs: the nested `name` of a `tool_call`,
+/// otherwise the command itself.
+fn native_tool_name(request: &crate::protocol::RawRequest) -> &str {
+    if request.command == "tool_call" {
+        request
+            .params
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    } else {
+        &request.command
+    }
+}
+
+/// Remove `permissions_granted` before a plugin host's native request runs,
+/// after its outside-access tokens were claimed.
+///
+/// On the native wire `permissions_granted` only ever holds the host's own
+/// approvals: both plugins drop the agent's `permissions_granted` from the
+/// tool arguments before adding the approvals they granted
+/// (`withHostPermissionGrants` and `withOutsidePermissions` in
+/// `packages/opencode-plugin/src/tools/outside-permissions.ts` and
+/// `packages/pi-plugin/src/tools/_shared.ts`, each destructuring the field
+/// away as `_untrusted`). A shell reads its approved command patterns and
+/// escalation grants from that field, so it is kept when the tool that
+/// runs is bash or powershell, called directly or nested in a `tool_call`.
+/// Every other tool has no use for it, so it is removed and a forged value
+/// can never reach a handler.
+fn strip_native_approval_metadata(request: &mut crate::protocol::RawRequest) {
+    if matches!(native_tool_name(request), "bash" | "powershell") {
+        return;
+    }
+    let params = &mut request.params;
+    let arguments = if params.get("arguments").is_some() {
+        params.get_mut("arguments")
+    } else if params.get("args").is_some() {
+        params.get_mut("args")
+    } else {
+        Some(params)
+    };
+    if let Some(args) = arguments.and_then(serde_json::Value::as_object_mut) {
+        args.remove("permissions_granted");
+    }
+}
+
+pub(crate) fn finish_plugin_response(
+    scope: &plugin::Scope,
+    once: &[AccessGrant],
+    preview: bool,
+    mut response: crate::protocol::Response,
+) -> crate::protocol::Response {
+    if !once.is_empty()
+        && (preview || response.data["code"] == "permission_required")
+        && response.data.get("permissions_continuation").is_none()
+    {
+        response.data["permissions_continuation"] =
+            serde_json::json!(plugin::continuation(scope, once));
+    }
+    response
+}
+
+pub(crate) fn finish_current_plugin_response(
+    response: crate::protocol::Response,
+) -> crate::protocol::Response {
+    match current_ask_route() {
+        AskRoute::Plugin { scope, once } => finish_plugin_response(&scope, &once, false, response),
+        _ => response,
+    }
+}
+
 /// Internal refusal code for an `ask` that must go to Cingulate. The subc
 /// layer turns it into a held call; it never reaches the agent as-is.
 pub(crate) const ACCESS_ASK_REQUIRED: &str = "access_ask_required";
+
+/// Whether `response` asks for access instead of failing: a plugin host's
+/// outside-access ask (`permission_required` with the `asks` the host prompts
+/// with, then retries) or a worker call held for consent through Cingulate
+/// (`access_ask_required`). A handler that folds errors into a phase failure
+/// or a batch entry must return such a response unchanged, or nobody can be
+/// asked and the call can never run.
+pub(crate) fn is_access_request(response: &crate::protocol::Response) -> bool {
+    matches!(
+        response
+            .data
+            .get("code")
+            .and_then(serde_json::Value::as_str),
+        Some(crate::protocol::ERROR_PERMISSION_REQUIRED | ACCESS_ASK_REQUIRED)
+    )
+}
 
 thread_local! {
     static ASK_ROUTE: std::cell::RefCell<Option<AskRoute>> = const { std::cell::RefCell::new(None) };
@@ -203,6 +381,14 @@ pub(crate) fn current_ask_route() -> AskRoute {
 }
 
 impl AccessGrant {
+    pub(crate) fn covers_kind(
+        &self,
+        operation: AccessOperation,
+        path: &Path,
+        kind: GrantKind,
+    ) -> bool {
+        self.covers(operation, path) && (self.kind == GrantKind::Subtree || kind == GrantKind::File)
+    }
     /// Whether this capability lets `operation` touch `path`. Write implies
     /// read, and a subtree matches by whole path component.
     pub fn covers(&self, operation: AccessOperation, path: &Path) -> bool {
@@ -233,6 +419,7 @@ pub enum AccessDenial {
     Floor,
     OutsideRoots,
     ReadOnly,
+    UnsafeTemp,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -346,6 +533,13 @@ pub struct AccessPolicy {
     /// floor and fall back to the ordinary outside-root rules, so a head can
     /// review a worker's files. The rest of the store stays denied.
     pub private_store_carveouts: Vec<PathBuf>,
+    /// Standalone scratch allowances; never override floors or hard restriction.
+    pub standalone_temp_roots: Vec<PathBuf>,
+    pub standalone_temp_guard_roots: Vec<PathBuf>,
+    pub standalone_managed_temp_roots: Vec<PathBuf>,
+    pub standalone_owned_scratch: bool,
+    /// Native host compatibility roots, not additional shell write roots.
+    pub standalone_main_roots: Vec<PathBuf>,
 }
 
 impl AccessPolicy {
@@ -477,6 +671,11 @@ impl AccessPolicy {
                 .map(|path| policy_path(&path)),
         );
         Self {
+            standalone_temp_roots: Vec::new(),
+            standalone_temp_guard_roots: Vec::new(),
+            standalone_managed_temp_roots: Vec::new(),
+            standalone_owned_scratch: false,
+            standalone_main_roots: Vec::new(),
             mode: ApprovalMode::Ask,
             private_stores: SandboxDataPolicy {
                 deny,
@@ -545,11 +744,45 @@ impl AccessPolicy {
             AccessOperation::Read => &self.private_stores.read_allow,
             AccessOperation::Write => &self.private_stores.write_allow,
         };
+        if !self.standalone_temp_guard_roots.is_empty() {
+            let managed = self
+                .standalone_managed_temp_roots
+                .iter()
+                .any(|root| path.starts_with(root))
+                || crate::task_temp_reads::is_scratch(path);
+            if managed && !self.standalone_owned_scratch {
+                return AccessDecision::Deny(AccessDenial::UnsafeTemp);
+            }
+            if self
+                .standalone_temp_guard_roots
+                .iter()
+                .any(|root| path.starts_with(root))
+                && !crate::bounded_io::run(path, None, |path| Ok(temp::safe_file(&path)))
+                    .unwrap_or(false)
+            {
+                return AccessDecision::Deny(AccessDenial::UnsafeTemp);
+            }
+        }
         let inside = self.roots.iter().any(|root| path.starts_with(root));
         if self.mode == ApprovalMode::ReadOnly && operation == AccessOperation::Write && !inside {
             return AccessDecision::Deny(AccessDenial::ReadOnly);
         }
+        // A linked worktree's verified main checkout is readable without an
+        // ask, but it is not one of the route's roots: writes there ask like
+        // any other write outside every root.
+        let main_checkout_read = operation == AccessOperation::Read
+            && self
+                .standalone_main_roots
+                .iter()
+                .any(|root| path.starts_with(root));
         if inside
+            || main_checkout_read
+            || self.standalone_owned_scratch
+            || (self.outside == AccessDecision::Ask
+                && self
+                    .standalone_temp_roots
+                    .iter()
+                    .any(|root| path.starts_with(root)))
             || exceptions.iter().any(|root| path.starts_with(root))
             || (operation == AccessOperation::Read && owned_artifact)
             || self
@@ -655,6 +888,35 @@ impl AccessPolicy {
             .is_some()
         {
             return AccessDecision::Deny(AccessDenial::Floor);
+        }
+        if !self.standalone_temp_guard_roots.is_empty() {
+            if self
+                .standalone_temp_guard_roots
+                .iter()
+                .chain(&self.standalone_temp_roots)
+                .any(|root| path == root)
+                || self
+                    .standalone_managed_temp_roots
+                    .iter()
+                    .any(|root| root.starts_with(path) && !self.standalone_owned_scratch)
+            {
+                return AccessDecision::Deny(AccessDenial::UnsafeTemp);
+            }
+            if self
+                .standalone_temp_guard_roots
+                .iter()
+                .any(|root| path.starts_with(root))
+            {
+                let managed = self.standalone_managed_temp_roots.clone();
+                let owned = self.standalone_owned_scratch;
+                if !crate::bounded_io::run(path, None, move |path| {
+                    Ok(temp::safe_tree(&path, &managed, owned))
+                })
+                .unwrap_or(false)
+                {
+                    return AccessDecision::Deny(AccessDenial::UnsafeTemp);
+                }
+            }
         }
         self.decide(AccessOperation::Write, path, false)
     }
@@ -1450,3 +1712,7 @@ mod tests {
 #[cfg(test)]
 #[path = "access_policy_worker_rust_tests.rs"]
 mod worker_rust_tests;
+
+#[cfg(test)]
+#[path = "access_policy_audit2_tests.rs"]
+mod audit2_tests;

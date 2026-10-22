@@ -25,6 +25,7 @@ import { safetyTools } from "../tools/safety.js";
 import { searchTools } from "../tools/search.js";
 import { semanticTools } from "../tools/semantic.js";
 import type { PluginContext } from "../types.js";
+import { engineOutsideAsk } from "./helpers/engine-outside-ask.js";
 
 type BridgeResponse = Record<string, unknown>;
 type SendCall = { command: string; params: Record<string, unknown>; options?: ToolCallOptions };
@@ -110,10 +111,17 @@ function createHarness(
     params: Record<string, unknown>,
     options?: ToolCallOptions,
   ) => Promise<BridgeResponse> | BridgeResponse = () => ({ success: true, text: "ok" }),
+  outside?: { path: string; directory?: boolean },
 ) {
   const calls: SendCall[] = [];
+  const permissionReply = (command: string, args: Record<string, unknown>) =>
+    outside && !["bash_artifact_owned", "undo_preview", "checkpoint_paths"].includes(command)
+      ? engineOutsideAsk(outside.path, args, outside.directory)
+      : undefined;
   const bridge = {
     send: async (command: string, params: Record<string, unknown> = {}) => {
+      const permission = permissionReply(command, params);
+      if (permission) return permission;
       calls.push({ command, params });
       return await sendImpl(command, params);
     },
@@ -123,13 +131,24 @@ function createHarness(
       rawArgs: Record<string, unknown> = {},
       options?: ToolCallOptions,
     ) => {
+      const permission = permissionReply(name, rawArgs);
+      if (permission) return permission;
       calls.push({
         command: name,
         params: rawArgs,
         ...(options?.preview ? { options: { preview: true } } : {}),
       });
       const response = await sendImpl(name, rawArgs, options);
-      return { text: "ok", content_files: [], ...response };
+      return {
+        text: "ok",
+        content_files: [],
+        ...response,
+        ...(options?.preview &&
+        response.success !== false &&
+        Array.isArray(rawArgs.permissions_granted)
+          ? { permissions_continuation: rawArgs.permissions_granted }
+          : {}),
+      };
     },
   };
   const pool = { getBridge: () => bridge } as unknown as BridgePool;
@@ -648,30 +667,28 @@ describe("permission audit regressions", () => {
 
   test("external_directory rule denial names the root without leaking the ruleset", async () => {
     const { project, external } = await makeProjectAndExternalDirs();
-    const { calls, tools } = createHarness(hoistedTools);
-    const raw = await tools.read.execute(
-      { filePath: path.join(external, "read.ts") },
-      createSdkContext(
-        project,
-        recordingAsk([], {
-          permission: "external_directory",
-          error: new DeniedError({
-            ruleset: [{ permission: "*", action: "deny", pattern: "*" }],
+    const { calls, tools } = createHarness(hoistedTools, undefined, {
+      path: path.join(external, "read.ts"),
+    });
+    await expect(
+      tools.read.execute(
+        { filePath: path.join(external, "read.ts") },
+        createSdkContext(
+          project,
+          recordingAsk([], {
+            permission: "external_directory",
+            error: new DeniedError({
+              ruleset: [{ permission: "*", action: "deny", pattern: "*" }],
+            }),
           }),
-        }),
-        "permission-audit-external-directory-rule-session",
+          "permission-audit-external-directory-rule-session",
+        ),
       ),
-    );
-    const denied = parsePermissionDenied(String(raw));
-
-    expect(denied.message).toBe(
+    ).rejects.toThrow(
       `permission_denied: external_directory for ${external} is denied by this session's ` +
         "permission rules (not a user choice)",
     );
-    expect(String(raw)).not.toContain('"action":"deny"');
-    // Only the read-only artifact ownership query reached Rust; the read itself
-    // was never dispatched.
-    expect(calls.map((call) => call.command)).toEqual(["bash_artifact_owned"]);
+    expect(calls).toHaveLength(0);
   });
 
   test("aft_search external path hard-blocks under restrict_to_project_root", async () => {
@@ -844,7 +861,7 @@ describe("permission audit regressions", () => {
     expect(externalAsks).toHaveLength(0);
   });
 
-  test("external_directory ask fires for an in-root symlink to an outside target", async () => {
+  test("symlink outside-access decisions are delegated to the engine", async () => {
     const { project, external } = await makeCanonicalizationDirs();
     const linkPath = path.join(project, "link-outside");
     const target = path.join(linkPath, "secret.txt");
@@ -853,7 +870,7 @@ describe("permission audit regressions", () => {
 
     const externalAsks = await externalAskCallsFor(project, target);
 
-    expectExternalAsk(externalAsks);
+    expect(externalAsks).toHaveLength(0);
   });
 
   test("external_directory ask is skipped for an in-root symlink to an in-root target", async () => {
@@ -868,24 +885,24 @@ describe("permission audit regressions", () => {
     expect(externalAsks).toHaveLength(0);
   });
 
-  test("external_directory ask fires for a nonexistent write under a symlinked-outside parent", async () => {
+  test("new paths beneath outside symlinks are delegated to the engine", async () => {
     const { project, external } = await makeCanonicalizationDirs();
     const linkPath = path.join(project, "link-outside");
     await createDirectoryLink(external, linkPath);
 
     const externalAsks = await externalAskCallsFor(project, path.join(linkPath, "new-file.txt"));
 
-    expectExternalAsk(externalAsks);
+    expect(externalAsks).toHaveLength(0);
   });
 
-  test("external_directory ask fires for a plain outside-root path", async () => {
+  test("plain outside-root path decisions are delegated to the engine", async () => {
     const { project, external } = await makeCanonicalizationDirs();
     const target = path.join(external, "plain.txt");
     await writeFile(target, "outside\n");
 
     const externalAsks = await externalAskCallsFor(project, target);
 
-    expectExternalAsk(externalAsks);
+    expect(externalAsks).toHaveLength(0);
   });
 
   test("external_directory ask is skipped for system temp paths", async () => {
@@ -923,14 +940,16 @@ describe("permission audit regressions", () => {
     const { project, external } = await makeProjectAndExternalDirs();
     const askCalls: AskCall[] = [];
     const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
-    const { tools } = createHarness(hoistedTools, () => ({ success: true, text: "ok" }));
+    const { tools } = createHarness(hoistedTools, () => ({ success: true, text: "ok" }), {
+      path: path.join(external, "read.ts"),
+    });
 
     await tools.read.execute({ filePath: path.join(external, "read.ts") }, sdkCtx);
 
     expectExternalAsk(askCalls.filter((call) => call.permission === "external_directory"));
   });
 
-  test("external_directory ask expands ~/ before containment", async () => {
+  test("tilde path decisions are delegated without a plugin prompt", async () => {
     const { project } = await makeCanonicalizationDirs();
 
     const externalAsks = await externalAskCallsFor(
@@ -938,23 +957,17 @@ describe("permission audit regressions", () => {
       "~/aft-permission-home-target-for-test.txt",
     );
 
-    expectExternalAsk(externalAsks);
-    const filepath = externalAsks[0]?.metadata?.filepath;
-    expect(typeof filepath).toBe("string");
-    expect((filepath as string).startsWith(path.join(project, "~"))).toBe(false);
-    expect(filepath).toContain("aft-permission-home-target-for-test.txt");
+    expect(externalAsks).toHaveLength(0);
   });
 
-  windowsTest("containsPath rejects Windows cross-drive targets as external", async () => {
+  windowsTest("cross-drive permission decisions are delegated to the engine", async () => {
     const askCalls: AskCall[] = [];
     const context = createSdkContext("C:\\repo", recordingAsk(askCalls));
     const ctx = createPluginContext({ getBridge: () => ({}) } as unknown as BridgePool);
 
     await assertExternalDirectoryPermission(ctx, context, "D:\\secret\\file.ts");
 
-    expect(askCalls).toHaveLength(1);
-    expect(askCalls[0]?.permission).toBe("external_directory");
-    expect(askCalls[0]?.patterns?.[0]).toContain("D:");
+    expect(askCalls).toHaveLength(0);
   });
 
   test("restrict_to_project_root blocks external paths without bubbling an ask", async () => {
@@ -1096,7 +1109,7 @@ describe("permission audit regressions", () => {
     expect(askCalls).toHaveLength(0);
   });
 
-  test("restrict false (default) still bubbles the external_directory ask", async () => {
+  test("restrict false delegates the external_directory decision to the engine", async () => {
     const { project, external } = await makeProjectAndExternalDirs();
     const askCalls: AskCall[] = [];
     const context = createSdkContext(project, recordingAsk(askCalls));
@@ -1109,10 +1122,8 @@ describe("permission audit regressions", () => {
       path.join(external, "ok.txt"),
     );
 
-    // Grant path: ask bubbled, no denial.
     expect(denial).toBeUndefined();
-    expect(askCalls).toHaveLength(1);
-    expect(askCalls[0]?.permission).toBe("external_directory");
+    expect(askCalls).toHaveLength(0);
   });
 
   windowsTest(
@@ -1160,7 +1171,9 @@ describe("permission audit regressions", () => {
     const { project, external } = await makeProjectAndExternalDirs();
     const askCalls: AskCall[] = [];
     const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
-    const { calls, tools } = createHarness(safetyTools, () => ({ success: true, name: "snap" }));
+    const { calls, tools } = createHarness(safetyTools, () => ({ success: true, name: "snap" }), {
+      path: path.join(external, "a.ts"),
+    });
 
     const raw = (await tools.aft_safety.execute(
       {
@@ -1223,10 +1236,8 @@ describe("permission audit regressions", () => {
       sdkCtx,
     )) as string;
 
-    const expectedApprovedPath = path.resolve(project, "../outside.ts");
-    const externalAsk = askCalls.find((call) => call.permission === "external_directory");
     expect(raw).toBe("ok");
-    expect(externalAsk?.metadata?.filepath).toBe(expectedApprovedPath);
+    expect(askCalls.filter((call) => call.permission === "external_directory")).toEqual([]);
     expect(calls[0]).toMatchObject({
       command: "safety",
       params: { op: "checkpoint", name: "snap", files: ["../outside.ts"] },
@@ -1234,21 +1245,23 @@ describe("permission audit regressions", () => {
     expect(bridgeRoots[0]).toBe(project);
   });
 
-  test("aft_safety checkpoint external denial returns the permissionDeniedResponse envelope", async () => {
+  test("aft_safety checkpoint rejects an engine outside-access ask before mutation", async () => {
     const { project, external } = await makeProjectAndExternalDirs();
     const askCalls: AskCall[] = [];
     const sdkCtx = createSdkContext(
       project,
       recordingAsk(askCalls, { permission: "external_directory", message: "external denied" }),
     );
-    const { calls, tools } = createHarness(safetyTools);
+    const { calls, tools } = createHarness(safetyTools, undefined, {
+      path: path.join(external, "a.ts"),
+    });
 
-    const raw = (await tools.aft_safety.execute(
-      { op: "checkpoint", name: "snap", files: [path.join(external, "a.ts")] },
-      sdkCtx,
-    )) as string;
-
-    expect(parsePermissionDenied(raw).message).toBe("external denied");
+    await expect(
+      tools.aft_safety.execute(
+        { op: "checkpoint", name: "snap", files: [path.join(external, "a.ts")] },
+        sdkCtx,
+      ),
+    ).rejects.toThrow("external denied");
     expect(askCalls[0]?.permission).toBe("external_directory");
     expect(calls).toHaveLength(0);
   });
@@ -1342,10 +1355,13 @@ describe("permission audit regressions", () => {
     const askCalls: AskCall[] = [];
     const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
     const externalFile = path.join(external, "undo.ts");
-    const { calls, tools } = createHarness(safetyTools, (command) =>
-      command === "undo_preview"
-        ? { success: true, paths: [externalFile, externalFile] }
-        : { success: true, operation: true },
+    const { calls, tools } = createHarness(
+      safetyTools,
+      (command) =>
+        command === "undo_preview"
+          ? { success: true, paths: [externalFile, externalFile] }
+          : { success: true, operation: true },
+      { path: externalFile },
     );
 
     const raw = (await tools.aft_safety.execute({ op: "undo" }, sdkCtx)) as string;
@@ -1376,10 +1392,13 @@ describe("permission audit regressions", () => {
     const askCalls: AskCall[] = [];
     const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
     const externalFile = path.join(external, "restore.ts");
-    const { calls, tools } = createHarness(safetyTools, (command) =>
-      command === "checkpoint_paths"
-        ? { success: true, paths: [externalFile] }
-        : { success: true, name: "snap" },
+    const { calls, tools } = createHarness(
+      safetyTools,
+      (command) =>
+        command === "checkpoint_paths"
+          ? { success: true, paths: [externalFile] }
+          : { success: true, name: "snap" },
+      { path: externalFile },
     );
 
     const raw = (await tools.aft_safety.execute({ op: "restore", name: "snap" }, sdkCtx)) as string;
@@ -1512,7 +1531,9 @@ describe("permission audit regressions", () => {
     const askCalls: AskCall[] = [];
     const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
     const externalFile = path.join(external, "single.ts");
-    const { calls, tools } = createHarness(safetyTools, () => ({ success: true, name: "snap" }));
+    const { calls, tools } = createHarness(safetyTools, () => ({ success: true, name: "snap" }), {
+      path: externalFile,
+    });
 
     const raw = (await tools.aft_safety.execute(
       { op: "checkpoint", name: "snap", filePath: externalFile },
@@ -1525,43 +1546,49 @@ describe("permission audit regressions", () => {
     expect(calls[0]?.params).toMatchObject({ op: "checkpoint", filePath: externalFile });
   });
 
-  test("ast_grep_search denies external paths before bridge execution", async () => {
+  test("ast_grep_search rejects an engine outside-access ask before protected execution", async () => {
     const { project, external } = await makeProjectAndExternalDirs();
     const sdkCtx = createSdkContext(
       project,
       recordingAsk([], { permission: "external_directory", message: "external denied" }),
     );
-    const { calls, tools } = createHarness(astTools);
+    const { calls, tools } = createHarness(astTools, undefined, {
+      path: external,
+      directory: true,
+    });
 
-    const raw = (await tools.ast_grep_search.execute(
-      { pattern: "console.log($MSG)", lang: "javascript", paths: [external] },
-      sdkCtx,
-    )) as string;
-
-    expect(parsePermissionDenied(raw).message).toBe("external denied");
-    expect(calls.map((call) => call.command)).toEqual(["bash_artifact_owned"]);
+    await expect(
+      tools.ast_grep_search.execute(
+        { pattern: "console.log($MSG)", lang: "javascript", paths: [external] },
+        sdkCtx,
+      ),
+    ).rejects.toThrow("external denied");
+    expect(calls).toHaveLength(0);
   });
 
-  test("ast_grep_replace dry-run denies external paths before bridge execution", async () => {
+  test("ast_grep_replace dry-run rejects an engine outside-access ask", async () => {
     const { project, external } = await makeProjectAndExternalDirs();
     const sdkCtx = createSdkContext(
       project,
       recordingAsk([], { permission: "external_directory", message: "external denied" }),
     );
-    const { calls, tools } = createHarness(astTools);
+    const { calls, tools } = createHarness(astTools, undefined, {
+      path: external,
+      directory: true,
+    });
 
-    const raw = (await tools.ast_grep_replace.execute(
-      {
-        pattern: "console.log($MSG)",
-        rewrite: "logger.info($MSG)",
-        lang: "javascript",
-        paths: [external],
-        dryRun: true,
-      },
-      sdkCtx,
-    )) as string;
-
-    expect(parsePermissionDenied(raw).message).toBe("external denied");
+    await expect(
+      tools.ast_grep_replace.execute(
+        {
+          pattern: "console.log($MSG)",
+          rewrite: "logger.info($MSG)",
+          lang: "javascript",
+          paths: [external],
+          dryRun: true,
+        },
+        sdkCtx,
+      ),
+    ).rejects.toThrow("external denied");
     expect(calls).toHaveLength(0);
   });
 
@@ -1569,7 +1596,10 @@ describe("permission audit regressions", () => {
     const { project, external } = await makeProjectAndExternalDirs();
     const askCalls: AskCall[] = [];
     const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
-    const { tools } = createHarness(searchTools, () => ({ success: true, text: "ok" }));
+    const { tools } = createHarness(searchTools, () => ({ success: true, text: "ok" }), {
+      path: external,
+      directory: true,
+    });
 
     await tools.grep.execute({ pattern: "TODO", path: external }, sdkCtx);
 
@@ -1702,6 +1732,19 @@ describe("session-owned bash artifact reads", () => {
           if (fail) throw new Error("bridge closed");
           return { success: true, owned: ownedPaths.has(String(params.path)) };
         }
+        const rawTarget =
+          params.filePath ??
+          params.path ??
+          params.target ??
+          params.scope ??
+          (params.paths as unknown[] | undefined)?.[0] ??
+          // Zoom sends only a batch of { target, ... } entries.
+          (params.batch as Array<{ target?: unknown }> | undefined)?.[0]?.target;
+        const target = String(Array.isArray(rawTarget) ? rawTarget[0] : rawTarget);
+        if (fail || command === "write" || !ownedPaths.has(target)) {
+          const ask = engineOutsideAsk(target, params);
+          if (ask) return ask;
+        }
         return { success: true, text: "task output", content_files: [] };
       },
     );
@@ -1748,16 +1791,9 @@ describe("session-owned bash artifact reads", () => {
       expect(observations).toEqual(
         Object.fromEntries(readers.map((reader) => [reader.name, scenario === "own" ? 0 : 1])),
       );
-      if (scenario === "own") {
-        expect(queries).toEqual(
-          Object.fromEntries(
-            readers.map((reader) => [
-              reader.name,
-              { path: artifact, session_id: "permission-audit-test" },
-            ]),
-          ),
-        );
-      }
+      expect(queries).toEqual(
+        Object.fromEntries(readers.map((reader) => [reader.name, undefined])),
+      );
     });
   }
 
@@ -1812,10 +1848,7 @@ describe("session-owned bash artifact reads", () => {
           expect(asks.filter((ask) => ask.permission === "external_directory")).toHaveLength(
             owned ? 0 : 1,
           );
-          expect(calls.find((call) => call.command === "bash_artifact_owned")?.params).toEqual({
-            path: target,
-            session_id: "permission-audit-test",
-          });
+          expect(calls.find((call) => call.command === "bash_artifact_owned")).toBeUndefined();
         }
       });
     }
@@ -1845,10 +1878,7 @@ describe("session-owned bash artifact reads", () => {
 
     expect(askCalls.filter((call) => call.permission === "external_directory")).toEqual([]);
     const ownership = calls.find((call) => call.command === "bash_artifact_owned");
-    expect(ownership?.params).toEqual({
-      path: artifact,
-      session_id: "permission-audit-test",
-    });
+    expect(ownership).toBeUndefined();
     expect(calls.map((call) => call.command)).toContain("read");
   });
 
@@ -1867,7 +1897,7 @@ describe("session-owned bash artifact reads", () => {
     expectExternalAsk(askCalls.filter((call) => call.permission === "external_directory"));
   });
 
-  test("an unanswered ownership query fails closed to the prompt", async () => {
+  test("an engine ask without established ownership is still presented", async () => {
     const { project, artifact } = await artifactFixture();
     const askCalls: AskCall[] = [];
     const { tools } = ownershipHarness(new Set([artifact]), true);
@@ -1880,7 +1910,7 @@ describe("session-owned bash artifact reads", () => {
     expectExternalAsk(askCalls.filter((call) => call.permission === "external_directory"));
   });
 
-  test("non-read tools never consult ownership and still prompt for an owned artifact", async () => {
+  test("write preview and apply share one engine approval without a plugin ownership query", async () => {
     const { project, artifact } = await artifactFixture();
     const askCalls: AskCall[] = [];
     const { calls, tools } = ownershipHarness(new Set([artifact]));
@@ -1890,7 +1920,7 @@ describe("session-owned bash artifact reads", () => {
       createSdkContext(project, recordingAsk(askCalls)),
     );
 
-    expectExternalAsk(askCalls.filter((call) => call.permission === "external_directory"));
+    expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
     expect(calls.map((call) => call.command)).not.toContain("bash_artifact_owned");
   });
 });

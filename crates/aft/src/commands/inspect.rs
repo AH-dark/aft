@@ -547,10 +547,14 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
     let snapshot = match inspect_preflight(req, ctx) {
         Ok(snapshot) => snapshot,
         Err(response) => {
-            if matches!(
-                response.data.get("code").and_then(Value::as_str),
-                Some("path_not_found" | "path_outside_root" | "root_too_broad")
-            ) {
+            // An access ask goes back unchanged so the host or the consent
+            // flow can ask and retry; a phase failure would end the call.
+            if crate::access_policy::is_access_request(&response)
+                || matches!(
+                    response.data.get("code").and_then(Value::as_str),
+                    Some("path_not_found" | "path_outside_root" | "root_too_broad")
+                )
+            {
                 return response;
             }
             let detail = response
@@ -863,7 +867,9 @@ fn handle_inspect_payload(
         let (tx, rx) = std::sync::mpsc::channel();
         let cancellation = crate::executor::current_job_cancellation();
         let grant_scope = crate::access_policy::current_scope();
+        let ask_route = crate::access_policy::capture_ask_route();
         std::thread::spawn(move || {
+            let _ask_route = ask_route.install();
             let _grant_scope = crate::access_policy::scope_guard(grant_scope);
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
             let outcome = if use_checkout_view {
@@ -1324,6 +1330,11 @@ pub(crate) fn handle_inspect_deferred_with_reply_deadline(
     }
     let snapshot = match inspect_preflight(req, &ctx) {
         Ok(snapshot) => snapshot,
+        // An access ask goes back unchanged so the host or the consent flow
+        // can ask and retry; a phase failure would end the call.
+        Err(response) if crate::access_policy::is_access_request(&response) => {
+            return deferred_response(request_id, response);
+        }
         Err(response) => {
             let detail = response
                 .data

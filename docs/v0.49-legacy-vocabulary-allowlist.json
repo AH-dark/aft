@@ -8681,6 +8681,171 @@
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/src/subc/consent_tests.rs",
+      "line": 996,
+      "column": 28,
+      "token": "filePath",
+      "text": "arguments: json!({\"filePath\":outside}),",
+      "location": "line 996, column 28",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc/consent_tests.rs",
+      "line": 1743,
+      "column": 32,
+      "token": "filePath",
+      "text": "arguments: json!({\"filePath\":path}),",
+      "location": "line 1743, column 32",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "line": 2909,
+      "column": 59,
+      "token": "filePath",
+      "text": "let mut args = serde_json::json!({ \"op\": op, \"filePath\": \"src/main.ts\" });",
+      "location": "line 2909, column 59",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/tests/integration/subc_translate_test.rs",
+      "line": 650,
+      "column": 14,
+      "token": "filePath",
+      "text": "\"filePath\": \"src/import-target.ts\",",
+      "location": "line 650, column 14",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/tests/integration/subc_translate_test.rs",
+      "line": 689,
+      "column": 36,
+      "token": "filePath",
+      "text": "json!({ \"op\": \"organize\", \"filePath\": \"src/import-target.ts\" }),",
+      "location": "line 689, column 36",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/tests/integration/subc_translate_test.rs",
+      "line": 668,
+      "column": 14,
+      "token": "filePath",
+      "text": "\"filePath\": \"src/import-target.ts\",",
+      "location": "line 668, column 14",
+      "ordinal": 2,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/commands/apply_patch.rs",
+      "line": 1072,
+      "column": 25,
+      "token": "filePath",
+      "text": "json!({\"filePath\": \"edge.ts\", \"relativePath\": \"edge.ts\", \"type\": \"update\", \"patch\": \"Index: edge.ts\\n===================================================================\\n--- edge.ts\\n+++ edge.ts\\n@@ -1 +1 @@\\n-original\\n+é\\n\", \"additions\": 1, \"deletions\": 1})",
+      "location": "line 1072, column 25",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/confinement.rs",
+      "line": 92,
+      "column": 22,
+      "token": "filePath",
+      "text": "for key in [\"path\", \"filePath\", \"target\", \"directory\", \"files\", \"url\"] {",
+      "location": "line 92, column 22",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "The read preflight validates both canonical and legacy path keys before dispatch; this spelling is internal confinement logic, not a new agent argument."
+    },
+    {
+      "path": "crates/aft/src/subc/confine_tests.rs",
+      "line": 134,
+      "column": 27,
+      "token": "filePath",
+      "text": "\"read\" => json!({\"filePath\": input}),",
+      "location": "line 134, column 27",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "The confinement test helper builds an existing legacy read call to exercise boundary enforcement; this spelling is test input, not a new agent argument."
+    },
+    {
+      "path": "crates/aft/src/subc/consent_tests.rs",
+      "line": 2055,
+      "column": 22,
+      "token": "filePath",
+      "text": "\"filePath\": target, \"permissions_granted\": [grant]",
+      "location": "line 2055, column 22",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "The approved retry exercises read's existing served V1 filePath wire, not a new agent-facing argument."
+    },
+    {
+      "path": "crates/aft/src/subc/consent_tests.rs",
+      "line": 2104,
+      "column": 21,
+      "token": "filePath",
+      "text": "json!({\"filePath\": target}),",
+      "location": "line 2104, column 21",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "The reverse-elicitation request exercises read's existing served V1 filePath wire, not a new agent-facing argument."
+    },
+    {
+      "path": "crates/aft/src/subc/consent_tests.rs",
+      "line": 2149,
+      "column": 21,
+      "token": "filePath",
+      "text": "json!({\"filePath\": target}),",
+      "location": "line 2149, column 21",
+      "ordinal": 2,
+      "class": "rust-compatibility",
+      "reason": "The later call proves single-use approval using read's existing served V1 filePath wire."
+    },
+    {
+      "path": "crates/aft/src/subc/consent_tests.rs",
+      "line": 2174,
+      "column": 21,
+      "token": "filePath",
+      "text": "json!({\"filePath\": f.head_root.join(\"shared.txt\")}),",
+      "location": "line 2174, column 21",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "The denial fixture exercises read's existing served V1 filePath wire without authorizing outside content."
+    },
+    {
+      "path": "packages/pi-plugin/src/tools/safety.ts",
+      "line": 248,
+      "column": 15,
+      "token": "filePath",
+      "text": "if (filePath) previewReq.file = filePath;",
+      "location": "line 248, column 15",
+      "ordinal": 3,
+      "class": "compatibility-boundary",
+      "reason": "The checkpoint-restore preview carries the same file scope as the restore; the spelling is the existing resolved-path variable at the raw-input compatibility boundary."
+    },
+    {
+      "path": "packages/pi-plugin/src/tools/safety.ts",
+      "line": 248,
+      "column": 43,
+      "token": "filePath",
+      "text": "if (filePath) previewReq.file = filePath;",
+      "location": "line 248, column 43",
+      "ordinal": 4,
+      "class": "compatibility-boundary",
+      "reason": "The checkpoint-restore preview carries the same file scope as the restore; the spelling is the existing resolved-path variable at the raw-input compatibility boundary."
     }
   ]
 }

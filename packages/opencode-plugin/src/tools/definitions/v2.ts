@@ -290,6 +290,7 @@ function runtimeFor(
   return {
     hostVersion: 2,
     sessionID: context.sessionID,
+    id: context.id,
     messageID: context.messageID,
     agent: context.agent,
     directory,

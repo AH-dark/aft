@@ -1,0 +1,377 @@
+import { describe, expect, mock, test } from "bun:test";
+import type { AftProjectTransport } from "@cortexkit/aft-bridge";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { bindToolRegistrationFunnel } from "../tool-registration.js";
+import { callBridge, callToolCallForSession, withOutsidePermissions } from "../tools/_shared.js";
+import type { PluginContext } from "../types.js";
+
+const ask = (id: string) => ({
+  success: false,
+  code: "permission_required",
+  text: "outside access needed",
+  asks: [
+    {
+      kind: "external_directory",
+      grant_id: `outside:${id}`,
+      path: `/outside/${id}`,
+      operation: "read",
+    },
+  ],
+});
+const context = (confirm: (...args: unknown[]) => Promise<boolean>, signal?: AbortSignal) =>
+  ({ hasUI: true, ui: { confirm }, signal }) as unknown as ExtensionContext;
+
+describe("engine outside-access asks", () => {
+  test("registered Pi operation carries undo preview approval through apply", async () => {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const answer = (name: string, args: Record<string, unknown>) => {
+      calls.push({ name, args: structuredClone(args) });
+      const grants = args.permissions_granted as string[] | undefined;
+      if (name === "undo_preview")
+        return grants?.includes("outside:preview")
+          ? { success: true, text: "preview", permissions_continuation: ["outside:apply"] }
+          : ask("preview");
+      return grants?.includes("outside:apply") || grants?.includes("outside:apply-new")
+        ? { success: true, text: "applied" }
+        : ask("apply-new");
+    };
+    const bridge = {
+      send: async (name: string, args: Record<string, unknown>) => answer(name, args),
+      toolCall: async (_session: unknown, name: string, args: Record<string, unknown>) =>
+        answer(name, args),
+    } as unknown as AftProjectTransport;
+    const prompt = mock(async () => true);
+    const extCtx = {
+      ...context(prompt),
+      sessionManager: { getSessionId: () => "captured" },
+    } as unknown as ExtensionContext;
+    let registered: ToolDefinition | undefined;
+    const pi = bindToolRegistrationFunnel(
+      {
+        registerTool: (tool: ToolDefinition) => {
+          registered = tool;
+        },
+      } as unknown as ExtensionAPI,
+      { config: {} } as unknown as PluginContext,
+      "pi",
+    );
+    pi.registerTool({
+      name: "test_undo",
+      label: "undo",
+      description: "fixture",
+      parameters: Type.Object({}),
+      execute: async (_id, _params, _signal, _update, ctx) => {
+        await callBridge(bridge, "undo_preview", { file: "/outside/a" }, ctx);
+        const result = await callToolCallForSession(
+          bridge,
+          "safety",
+          { op: "undo", path: "/outside/a" },
+          "captured",
+          ctx,
+        );
+        return { content: [{ type: "text" as const, text: result.text }], details: {} };
+      },
+    });
+    if (!registered) throw new Error("tool not registered");
+    await registered.execute("logical-call", {}, new AbortController().signal, undefined, extCtx);
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(calls.find((call) => call.name === "safety")?.args.permissions_granted).toEqual([
+      "outside:apply",
+    ]);
+  });
+  test("path tool dispatch prompts and retries in the captured session", async () => {
+    const calls: unknown[][] = [];
+    const prompt = mock(async () => true);
+    const bridge = {
+      toolCall: async (...args: unknown[]) => {
+        calls.push([args[0], args[1], structuredClone(args[2])]);
+        return calls.length === 1
+          ? ask("1")
+          : calls.length === 2
+            ? { ...ask("2"), permissions_continuation: ["outside:renewed-1"] }
+            : { success: true, text: "allowed" };
+      },
+    } as unknown as AftProjectTransport;
+    const result = await callToolCallForSession(
+      bridge,
+      "read",
+      { path: "/outside/file" },
+      "captured",
+      context(prompt),
+    );
+    expect(result.text).toBe("allowed");
+    expect(prompt).toHaveBeenCalledTimes(2);
+    expect(calls.map((call) => call[0])).toEqual(["captured", "captured", "captured"]);
+    expect(calls[2]?.[2]).toMatchObject({
+      permissions_granted: ["outside:renewed-1", "outside:2"],
+    });
+  });
+
+  test("rawArgs cannot seed forged or replayed permission tokens", async () => {
+    const calls: Record<string, unknown>[] = [];
+    const prompt = mock(async () => true);
+    const bridge = {
+      toolCall: async (_session: unknown, _name: string, args: Record<string, unknown>) => {
+        calls.push(structuredClone(args));
+        return calls.length === 1 ? ask("issued") : { success: true, text: "allowed" };
+      },
+    } as unknown as AftProjectTransport;
+    await callToolCallForSession(
+      bridge,
+      "read",
+      {
+        path: "/outside/a",
+        permissions_granted: [
+          'outside:{"path":"/outside/a","kind":"file","mode":"read"}',
+          "outside:old-issued-token",
+        ],
+      },
+      "captured",
+      context(prompt),
+    );
+    expect(calls[0]).not.toHaveProperty("permissions_granted");
+    expect(calls[1]?.permissions_granted).toEqual(["outside:issued"]);
+    expect(prompt).toHaveBeenCalledTimes(1);
+  });
+
+  test("a refusal or missing UI never sends approved IDs", async () => {
+    const send = mock(async () => ask("no"));
+    await expect(
+      withOutsidePermissions(
+        {},
+        context(async () => false),
+        send,
+      ),
+    ).rejects.toMatchObject({ code: "permission_denied" });
+    expect(send).toHaveBeenCalledTimes(1);
+    await expect(withOutsidePermissions({}, undefined, send)).rejects.toMatchObject({
+      code: "permission_denied",
+    });
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  test("a session without Pi's own screen is denied at once, without a prompt", async () => {
+    for (const mode of ["rpc", "json", "print"]) {
+      const send = mock(async () => ask(mode));
+      const confirm = mock(async () => true);
+      const extCtx = { ...context(confirm), mode } as unknown as ExtensionContext;
+      const error = await withOutsidePermissions({}, extCtx, send).catch((e: unknown) => e);
+      expect(error).toMatchObject({ code: "permission_denied" });
+      const message = (error as Error).message;
+      expect(message).toContain("none was possible");
+      // The denial names no path, so it cannot tell the agent what exists.
+      expect(message).not.toContain("/outside/");
+      expect(confirm).not.toHaveBeenCalled();
+      expect(send).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  test("Pi's terminal UI still prompts for outside access", async () => {
+    let sends = 0;
+    const send = async () => (++sends === 1 ? ask("tui") : { success: true, text: "allowed" });
+    const confirm = mock(async () => true);
+    const extCtx = { ...context(confirm), mode: "tui" } as unknown as ExtensionContext;
+    const result = await withOutsidePermissions({}, extCtx, send);
+    expect(result.success).toBe(true);
+    expect(confirm).toHaveBeenCalledTimes(1);
+  });
+
+  test("cancellation during confirmation never sends the approved retry", async () => {
+    const abort = new AbortController();
+    const send = mock(async () => ask("cancelled"));
+    await expect(
+      withOutsidePermissions(
+        {},
+        context(async () => {
+          abort.abort();
+          return true;
+        }, abort.signal),
+        send,
+      ),
+    ).rejects.toThrow();
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  test("cancelling the tool call while a confirmation is pending stops the approved write", async () => {
+    // The extension context has no signal of its own: only the signal Pi
+    // passes to this call's execute can cancel it.
+    const sends: Array<Record<string, unknown>> = [];
+    const bridge = {
+      toolCall: async (_session: unknown, _name: string, args: Record<string, unknown>) => {
+        sends.push(structuredClone(args));
+        return sends.length === 1 ? ask("write") : { success: true, text: "written" };
+      },
+    } as unknown as AftProjectTransport;
+    const call = new AbortController();
+    const extCtx = context(async () => {
+      call.abort();
+      return true;
+    });
+    let registered: ToolDefinition | undefined;
+    const pi = bindToolRegistrationFunnel(
+      {
+        registerTool: (tool: ToolDefinition) => {
+          registered = tool;
+        },
+      } as unknown as ExtensionAPI,
+      { config: {} } as unknown as PluginContext,
+      "pi",
+    );
+    pi.registerTool({
+      name: "test_write",
+      label: "write",
+      description: "fixture",
+      parameters: Type.Object({}),
+      execute: async (_id, _params, _signal, _update, ctx) => {
+        const result = await callToolCallForSession(
+          bridge,
+          "write",
+          { path: "/outside/file", content: "late" },
+          "captured",
+          ctx,
+        );
+        return { content: [{ type: "text" as const, text: result.text }], details: {} };
+      },
+    });
+    if (!registered) throw new Error("tool not registered");
+    const outcome = registered.execute("call", {}, call.signal, undefined, extCtx);
+    await expect(outcome).rejects.toThrow(/abort/i);
+    expect(sends).toHaveLength(1);
+    expect(sends[0]).not.toHaveProperty("permissions_granted");
+  });
+});
+
+/**
+ * A scripted engine for a batch touching `count` distinct outside files: like
+ * the real engine it reports only the first refused file per attempt, and
+ * renews the approvals it was sent.
+ */
+function batchEngine(count: number, refuseAgain = false) {
+  const sends: Array<Record<string, unknown>> = [];
+  const send = async (args: Record<string, unknown>) => {
+    sends.push(structuredClone(args));
+    const granted = (args.permissions_granted as string[] | undefined) ?? [];
+    for (let file = 0; file < count; file++) {
+      const id = `outside:file-${file}`;
+      if (refuseAgain || !granted.includes(id))
+        return {
+          success: false,
+          code: "permission_required",
+          permissions_continuation: granted,
+          asks: [
+            {
+              kind: "external_directory",
+              grant_id: id,
+              path: `/outside/file-${file}`,
+              operation: "write",
+            },
+          ],
+        } as Record<string, unknown>;
+    }
+    return { success: true, text: `wrote ${count} files` } as Record<string, unknown>;
+  };
+  return { send, sends };
+}
+
+describe("outside-access batches", () => {
+  test("a 32-file outside batch with every ask approved completes", async () => {
+    const engine = batchEngine(32);
+    const confirm = mock(async () => true);
+    const result = await withOutsidePermissions({}, context(confirm), engine.send);
+    expect(result.success).toBe(true);
+    expect(confirm).toHaveBeenCalledTimes(32);
+    expect(engine.sends).toHaveLength(33);
+  });
+
+  test("a batch stops at the first denied path", async () => {
+    const engine = batchEngine(32);
+    let prompts = 0;
+    await expect(
+      withOutsidePermissions(
+        {},
+        context(async () => ++prompts !== 6),
+        engine.send,
+      ),
+    ).rejects.toMatchObject({ code: "permission_denied" });
+    expect(prompts).toBe(6);
+    expect(engine.sends).toHaveLength(6);
+  });
+
+  test("an approved path refused again stops with a typed error instead of asking forever", async () => {
+    const engine = batchEngine(1, true);
+    const confirm = mock(async () => true);
+    await expect(withOutsidePermissions({}, context(confirm), engine.send)).rejects.toMatchObject({
+      code: "outside_permission_stalled",
+    });
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(engine.sends).toHaveLength(2);
+  });
+});
+
+/**
+ * A scripted engine for one outside path whose first `expiries` approvals
+ * arrive after their token expired: each such retry is asked again, marked
+ * `approval_expired`, as the engine does.
+ */
+function expiringEngine(expiries: number, reason: string | null = "approval_expired") {
+  const sends: Array<Record<string, unknown>> = [];
+  let issued = 0;
+  const send = async (args: Record<string, unknown>) => {
+    sends.push(structuredClone(args));
+    const granted = (args.permissions_granted as string[] | undefined) ?? [];
+    const latest = `outside:late-${issued}`;
+    if (granted.includes(latest) && issued >= expiries)
+      return { success: true, text: "written" } as Record<string, unknown>;
+    const presented = granted.includes(latest);
+    if (presented) issued++;
+    return {
+      success: false,
+      code: "permission_required",
+      asks: [
+        {
+          kind: "external_directory",
+          grant_id: `outside:late-${issued}`,
+          path: "/outside/late",
+          operation: "write",
+          ...(presented && reason ? { reason } : {}),
+        },
+      ],
+    } as Record<string, unknown>;
+  };
+  return { send, sends };
+}
+
+describe("outside-access approvals that expire", () => {
+  test("an approval that arrives after its token expired is asked once more", async () => {
+    const engine = expiringEngine(1);
+    const confirm = mock(async () => true);
+    const result = await withOutsidePermissions({}, context(confirm), engine.send);
+    expect(result.success).toBe(true);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(engine.sends).toHaveLength(3);
+  });
+
+  test("an approval refused again without expiry still stalls", async () => {
+    const engine = expiringEngine(1, null);
+    const confirm = mock(async () => true);
+    await expect(withOutsidePermissions({}, context(confirm), engine.send)).rejects.toMatchObject({
+      code: "outside_permission_stalled",
+    });
+    expect(confirm).toHaveBeenCalledTimes(1);
+  });
+
+  test("a path that keeps expiring stops at the re-ask limit", async () => {
+    const engine = expiringEngine(10);
+    const confirm = mock(async () => true);
+    await expect(withOutsidePermissions({}, context(confirm), engine.send)).rejects.toMatchObject({
+      code: "outside_permission_stalled",
+    });
+    expect(confirm).toHaveBeenCalledTimes(3);
+    expect(engine.sends).toHaveLength(4);
+  });
+});

@@ -262,12 +262,12 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
           }
         }
         if (params.op === "restore" && params.name) {
-          const preview = await callBridge(
-            bridge,
-            "checkpoint_paths",
-            { name: params.name },
-            extCtx,
-          );
+          // Preview only what this restore will write, so the user is asked
+          // about exactly those files and not the rest of the checkpoint.
+          const previewReq: Record<string, unknown> = { name: params.name };
+          if (filePath) previewReq.file = filePath;
+          if (files) previewReq.files = files;
+          const preview = await callBridge(bridge, "checkpoint_paths", previewReq, extCtx);
           for (const file of new Set(responsePaths(preview))) {
             await assertExternalDirectoryPermission(extCtx, file, {
               restrictToProjectRoot,

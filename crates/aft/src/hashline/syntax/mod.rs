@@ -1148,10 +1148,22 @@ pub struct ResolvedOperation {
 pub fn resolve_patch_sections<F>(
     store: &mut SnapshotStore,
     patch: &Patch,
-    mut canonicalize: F,
+    canonicalize: F,
 ) -> Result<Vec<ResolvedPatchSection>, HashlineRejection>
 where
     F: FnMut(&str) -> Result<PathBuf, HashlineRejection>,
+{
+    resolve_patch_sections_with_error(store, patch, canonicalize)
+}
+
+pub fn resolve_patch_sections_with_error<F, E>(
+    store: &mut SnapshotStore,
+    patch: &Patch,
+    mut canonicalize: F,
+) -> Result<Vec<ResolvedPatchSection>, E>
+where
+    F: FnMut(&str) -> Result<PathBuf, E>,
+    E: From<HashlineRejection>,
 {
     let mut views: BTreeMap<PathBuf, Snapshot> = BTreeMap::new();
     let mut resolved = Vec::with_capacity(patch.sections.len());
@@ -1163,7 +1175,7 @@ where
                 return Err(HashlineRejection::resolution(
                     HashlineRejectionCode::AmbiguousTag,
                     "sections for one canonical path selected different retained verification evidence",
-                ));
+                ).into());
             }
         } else {
             views.insert(canonical_path.clone(), snapshot.clone());

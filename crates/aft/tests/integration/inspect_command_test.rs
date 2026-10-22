@@ -307,6 +307,26 @@ fn inspect_tool_call(ctx: &AppContext, payload: Value) -> Value {
         .expect("inspect tool_call response serializes")
 }
 
+/// Run an inspect the way the native server dispatches it for this
+/// OpenCode-configured root: under the engine's plugin route. Called without
+/// that route, the engine treats the call as a plugin request that lost its
+/// route and refuses outside paths with `access_route_missing`.
+fn inspect_as_opencode(
+    ctx: &AppContext,
+    payload: Value,
+    run: impl Fn(&AppContext, Value) -> Value,
+) -> Value {
+    aft::access_policy::with_native_route(request(payload.clone()), ctx, |_, ctx| {
+        let value = run(ctx, payload.clone());
+        aft::protocol::Response {
+            id: "inspect".into(),
+            success: value["success"] == true,
+            data: value,
+        }
+    })
+    .data
+}
+
 fn configure_fake_scope_lsp(ctx: &AppContext) {
     ctx.lsp()
         .override_binary(ServerKind::Rust, fake_server_path());
@@ -4482,6 +4502,35 @@ fn scoped_diagnostics_inspect(ctx: &AppContext, id: &str, scope: &str) -> Value 
     )
 }
 
+/// [`inspect`] for a scope outside the project, dispatched as an OpenCode
+/// host's request is. These fixtures live in the system temp directory, which
+/// the engine lets an OpenCode session read without asking (as the plugin did
+/// before the outside-access decision moved into the engine).
+fn inspect_outside(ctx: &AppContext, payload: Value) -> Value {
+    inspect_as_opencode(ctx, payload, inspect)
+}
+
+/// [`inspect_tool_call`] for a scope outside the project, dispatched as in
+/// [`inspect_outside`].
+fn inspect_tool_call_outside(ctx: &AppContext, payload: Value) -> Value {
+    inspect_as_opencode(ctx, payload, inspect_tool_call)
+}
+
+/// [`scoped_diagnostics_inspect`] for a scope outside the project, dispatched
+/// as in [`inspect_outside`].
+fn scoped_diagnostics_inspect_outside(ctx: &AppContext, id: &str, scope: &str) -> Value {
+    inspect_tool_call_outside(
+        ctx,
+        json!({
+            "id": id,
+            "command": "inspect",
+            "scope": scope,
+            "sections": "diagnostics",
+            "topK": 20,
+        }),
+    )
+}
+
 #[cfg(unix)]
 #[test]
 fn rust_inspect_runs_cargo_with_checks_off_and_reuses_saved_record() {
@@ -5488,7 +5537,7 @@ fn scoped_diagnostics_external_directory_without_workspace_marker_counts_uncheck
         write_file(&external_root, "second.ts", "export const second = 2;\n"),
     ];
     let ctx = configured_context(&root);
-    let response = inspect(
+    let response = inspect_outside(
         &ctx,
         json!({
             "id": "inspect-outside-rootless-directory",
@@ -5537,7 +5586,7 @@ fn scoped_diagnostics_external_directory_counts_reported_files_and_keeps_rows() 
     );
     publish_external_typescript_report(&ctx, &external_root, &clean, Vec::new());
 
-    let response = inspect(
+    let response = inspect_outside(
         &ctx,
         json!({
             "id": "inspect-outside-directory-reports",
@@ -5578,7 +5627,7 @@ fn scoped_diagnostics_external_directory_names_unreported_file_gap() {
     let ctx = configured_context(&root);
     publish_external_typescript_report(&ctx, &external_root, &reported, Vec::new());
 
-    let response = inspect(
+    let response = inspect_outside(
         &ctx,
         json!({
             "id": "inspect-outside-directory-unreported",
@@ -5622,7 +5671,7 @@ fn scoped_diagnostics_external_directory_and_file_are_counted_once() {
     );
     publish_external_typescript_report(&ctx, &external_root, &clean, Vec::new());
 
-    let response = inspect(
+    let response = inspect_outside(
         &ctx,
         json!({
             "id": "inspect-outside-directory-overlap",
@@ -5657,7 +5706,7 @@ fn scoped_diagnostics_external_biome_workspace_counts_json_with_authoritative_re
     );
     publish_external_typescript_report(&ctx, &external_root, &clean, Vec::new());
     let inspect_workspace = |id: &str| {
-        inspect(
+        inspect_outside(
             &ctx,
             json!({
                 "id": id, "command": "inspect", "sections": ["diagnostics"], "scope": external_root,
@@ -5714,7 +5763,7 @@ fn scoped_diagnostics_outside_project_root_report_error_or_named_gap() {
     configure_fake_rust_and_typescript_lsp(&ctx);
 
     let response =
-        scoped_diagnostics_inspect(&ctx, "inspect-outside-error", file.to_str().unwrap());
+        scoped_diagnostics_inspect_outside(&ctx, "inspect-outside-error", file.to_str().unwrap());
     assert_eq!(response["success"], true, "{response:#}");
     assert_eq!(
         response["summary"]["diagnostics"]["errors"], 1,
@@ -5759,7 +5808,7 @@ fn scoped_diagnostics_outside_project_root_unreported_is_named_gap() {
     open_with_lsp(&ctx, &reported, "export const ok = 1;\n");
     // Read the warm store without opening the scoped file: the server is live
     // for this workspace but has never checked this particular file.
-    let response = inspect(
+    let response = inspect_outside(
         &ctx,
         json!({
             "id": "inspect-outside-unreported", "command": "inspect",
@@ -5795,7 +5844,7 @@ fn scoped_diagnostics_mixed_inside_and_outside_project_root() {
     let unreported = write_file(&external_root, "unreported.ts", "export const other = 1;\n");
     let ctx = configured_context(&root);
     configure_fake_rust_and_typescript_lsp(&ctx);
-    let response = inspect_tool_call(
+    let response = inspect_tool_call_outside(
         &ctx,
         json!({
             "id": "inspect-mixed-errors", "command": "inspect", "sections": ["diagnostics"],
@@ -5827,7 +5876,7 @@ fn scoped_diagnostics_mixed_inside_and_outside_project_root() {
         &inside,
         "export const broken: number = \"not a number\";\n",
     );
-    let partial = inspect(
+    let partial = inspect_outside(
         &ctx,
         json!({
             "id": "inspect-mixed-gap", "command": "inspect", "sections": ["diagnostics"],
@@ -5864,8 +5913,11 @@ fn scoped_diagnostics_outside_project_root_without_producer_is_named_gap() {
     let file = write_file(&external_root, "unknown.aft-unknown", "not checked\n");
     let file = crate::helpers::canonicalize_like_product(&file);
     let ctx = configured_context(&root);
-    let response =
-        scoped_diagnostics_inspect(&ctx, "inspect-outside-no-producer", file.to_str().unwrap());
+    let response = scoped_diagnostics_inspect_outside(
+        &ctx,
+        "inspect-outside-no-producer",
+        file.to_str().unwrap(),
+    );
     assert_eq!(response["success"], true, "{response:#}");
     assert_eq!(response["complete"], false, "{response:#}");
     assert_eq!(response["scope_files"], 1, "{response:#}");
@@ -5899,7 +5951,7 @@ fn scoped_diagnostics_outside_project_root_excluded_by_tsconfig_is_named_gap() {
     write_file(&external_root, "included.ts", "export const ok = 1;\n");
     let ctx = configured_context(&root);
     configure_fake_rust_and_typescript_lsp(&ctx);
-    let response = inspect(
+    let response = inspect_outside(
         &ctx,
         json!({
             "id": "inspect-outside-excluded", "command": "inspect",
@@ -5943,7 +5995,11 @@ fn scoped_typescript_sync_excluded_external_file_is_not_requested() {
         .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC", "categories");
     ctx.lsp()
         .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC_LOG", log.to_str().unwrap());
-    let response = scoped_diagnostics_inspect(&ctx, "ts-sync-excluded", excluded.to_str().unwrap());
+    // The external root is outside the project, so the inspect is dispatched
+    // the way an OpenCode host's request is; without a host route the engine
+    // refuses outside paths before TypeScript is ever involved.
+    let response =
+        scoped_diagnostics_inspect_outside(&ctx, "ts-sync-excluded", excluded.to_str().unwrap());
     assert_eq!(response["complete"], false, "{response:#}");
     assert_eq!(response["scope_files"], 1, "{response:#}");
     assert_eq!(
@@ -5973,7 +6029,7 @@ fn scoped_typescript_sync_excluded_external_file_is_not_requested() {
     // An included file exercises the same logger and successful server replies,
     // so an empty excluded-file log cannot pass because logging was disconnected.
     let included_response =
-        scoped_diagnostics_inspect(&ctx, "ts-sync-included", included.to_str().unwrap());
+        scoped_diagnostics_inspect_outside(&ctx, "ts-sync-included", included.to_str().unwrap());
     assert_eq!(
         included_response["summary"]["diagnostics"]["errors"], 1,
         "{included_response:#}"

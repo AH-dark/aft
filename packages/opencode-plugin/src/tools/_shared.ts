@@ -37,7 +37,7 @@ import {
   timeoutForCommand,
   WORKER_SESSION_FIELD,
 } from "@cortexkit/aft-bridge";
-import { tool } from "@opencode-ai/plugin";
+import { type ToolContext, tool } from "@opencode-ai/plugin";
 
 import { forwardPendingBashWaitDetach } from "../bash-wait-detach.js";
 import { ingestBgCompletions } from "../bg-notifications.js";
@@ -45,6 +45,7 @@ import { getSessionDirectory, getSessionDirectoryCached } from "../shared/sessio
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import { markBridgeEnd, markBridgeStart } from "../tool-perf.js";
 import type { PluginContext } from "../types.js";
+import { inheritHostPermissionGrants, withOutsidePermissions } from "./outside-permissions.js";
 
 const z = tool.schema;
 
@@ -119,6 +120,7 @@ export interface ToolRuntime {
   directoryIsSessionRoot?: boolean;
   /** Effect-owned cancellation is explicit so V1 ToolContext signals remain unchanged. */
   effectAbort?: AbortSignal;
+  ask?: ToolContext["ask"];
 }
 
 /**
@@ -298,6 +300,7 @@ export async function callBridge(
   ]);
 
   const merged: Record<string, unknown> = { ...params };
+  inheritHostPermissionGrants(params, merged);
   if (runtime.sessionID) {
     merged.session_id = runtime.sessionID;
   }
@@ -323,9 +326,16 @@ export async function callBridge(
     const root = asCanonicalRootPath(checkedProjectRoot(ctx, runtime));
     await forwardPendingBashWaitDetach(ctx.pool, root, runtime.sessionID, command === "bash");
     const opts = Object.keys(sendOptions).length > 0 ? sendOptions : undefined;
-    response = ctx.pool.sendForCanonicalRoot
-      ? await ctx.pool.sendForCanonicalRoot(root, command, merged, opts)
-      : await ctx.pool.getBridge(root).send(command, merged, opts);
+    response = await withOutsidePermissions(
+      runtime,
+      merged,
+      async (approved) =>
+        ctx.pool.sendForCanonicalRoot
+          ? await ctx.pool.sendForCanonicalRoot(root, command, approved, opts)
+          : await ctx.pool.getBridge(root).send(command, approved, opts),
+      ["undo_preview", "checkpoint_paths", "hashline_preflight"].includes(command),
+      command,
+    );
   } catch (error) {
     // The break-glass gate must receive the original transport failure. In
     // particular, do not append recovery text before gate-off callers rethrow it.
@@ -380,9 +390,17 @@ export async function callToolCall(
     const root = asCanonicalRootPath(checkedProjectRoot(ctx, runtime));
     await forwardPendingBashWaitDetach(ctx.pool, root, runtime.sessionID, name === "bash");
     const opts = Object.keys(sendOptions).length > 0 ? sendOptions : undefined;
-    response = ctx.pool.toolCallForCanonicalRoot
-      ? await ctx.pool.toolCallForCanonicalRoot(root, runtime.sessionID, name, rawArgs, opts)
-      : await ctx.pool.getBridge(root).toolCall(runtime.sessionID, name, rawArgs, opts);
+    response = await withOutsidePermissions(
+      runtime,
+      rawArgs,
+      async (approved) =>
+        ctx.pool.toolCallForCanonicalRoot
+          ? await ctx.pool.toolCallForCanonicalRoot(root, runtime.sessionID, name, approved, opts)
+          : await ctx.pool.getBridge(root).toolCall(runtime.sessionID, name, approved, opts),
+      options?.preview === true ||
+        ["undo_preview", "checkpoint_paths", "hashline_preflight"].includes(name),
+      name,
+    );
   } catch (error) {
     const noFallbackOption =
       name === "bash"

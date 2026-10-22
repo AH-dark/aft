@@ -9,6 +9,7 @@ import { Effect } from "effect";
 import { projectV2Tool } from "../tools/definitions/v2.js";
 import { searchTools, splitIncludeArg } from "../tools/search.js";
 import type { PluginContext } from "../types.js";
+import { engineOutsideAsk } from "./helpers/engine-outside-ask.js";
 import { noopAsk } from "./test-helpers";
 
 let projectRoot: string;
@@ -293,10 +294,14 @@ describe("searchTools", () => {
       fs.mkdirSync(inside, { recursive: true });
       fs.mkdirSync(external, { recursive: true });
       const askCalls: AskCall[] = [];
-      const { toolCallCalls, tools } = createMockSearchHarness({ disabled_tools: [] }, () => ({
-        success: true,
-        text: "ok",
-      }));
+      const { toolCallCalls, tools } = createMockSearchHarness(
+        { disabled_tools: [] },
+        (_command, args) =>
+          engineOutsideAsk(external, args, true) ?? {
+            success: true,
+            text: "ok",
+          },
+      );
 
       await tools.grep.execute(
         { pattern: "TODO", path: `${inside} ${external}` },
@@ -324,28 +329,29 @@ describe("searchTools", () => {
       const askCalls: AskCall[] = [];
       const { sendCalls, toolCallCalls, tools } = createMockSearchHarness(
         { disabled_tools: [] },
-        () => ({
-          success: true,
-          text: "",
-          files: [],
-        }),
+        (_command, args) =>
+          engineOutsideAsk(external, args, true) ?? {
+            success: true,
+            text: "",
+            files: [],
+          },
       );
 
-      const raw = await tools.glob.execute(
-        { pattern: "**/*.ts", path: `${inside} ${external}` },
-        createMockSdkContext(
-          project,
-          recordingAsk(askCalls, {
-            permission: "external_directory",
-            message: "external denied",
-          }),
+      await expect(
+        tools.glob.execute(
+          { pattern: "**/*.ts", path: `${inside} ${external}` },
+          createMockSdkContext(
+            project,
+            recordingAsk(askCalls, {
+              permission: "external_directory",
+              message: "external denied",
+            }),
+          ),
         ),
-      );
-
-      expect(JSON.parse(raw).message).toBe("external denied");
+      ).rejects.toThrow("external denied");
       expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
-      expect(sendCalls.map((call) => call.command)).toEqual(["bash_artifact_owned"]);
-      expect(toolCallCalls).toHaveLength(0);
+      expect(sendCalls).toEqual([]);
+      expect(toolCallCalls).toHaveLength(1);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }

@@ -107,7 +107,12 @@ describe("aft_safety adapter", () => {
     });
 
     expect(calls[0].command).toBe("checkpoint_paths");
-    expect(calls[0].params).toMatchObject({ name: "before-edit" });
+    // The preview carries the same scope as the restore, so only the files
+    // being restored are checked and prompted for.
+    expect(calls[0].params).toMatchObject({
+      name: "before-edit",
+      files: ["src/a.ts", "src/b.ts"],
+    });
     expect(calls[1]).toMatchObject({
       command: "tool_call",
       params: {

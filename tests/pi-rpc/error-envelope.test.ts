@@ -37,6 +37,7 @@ async function withPiTool(
   opts: {
     message: string;
     setup?: (env: PiIsolatedEnv) => Promise<void>;
+    onClient?: (client: RpcClient) => void;
     afterTool?: (env: PiIsolatedEnv, toolEnd: Record<string, unknown>) => Promise<void>;
   },
 ) {
@@ -57,6 +58,7 @@ async function withPiTool(
       workdir: env.workdir,
     });
     client = spawned.client;
+    opts.onClient?.(client);
     expect(spawned.child.pid).toBeGreaterThan(0);
     expect((await client.sendCommand({ type: "prompt", message: opts.message })).success).toBe(
       true,
@@ -76,12 +78,45 @@ async function withPiTool(
 
 describe("tool error envelopes (real Pi RPC)", () => {
   test("read missing file returns an error envelope", async () => {
+    // The file is inside the project, so no outside-access approval is
+    // involved and the read reaches the not-found error.
     const toolEnd = await withPiTool(
-      { name: "read", arguments: { path: "/does/not/exist" } },
-      { message: "Read /does/not/exist." },
+      { name: "read", arguments: { path: "missing.txt" } },
+      { message: "Read missing.txt." },
     );
     expect(toolEnd.isError).toBe(true);
     expect(resultText(toolEnd).toLowerCase()).toMatch(/not.*found|enoent/);
+  }, 120_000);
+
+  test("read outside the project is denied at once when no prompt is possible", async () => {
+    // Pi's RPC mode has no screen of its own, so outside access that needs
+    // approval is refused immediately instead of waiting for an answer.
+    let startedAt = 0;
+    let endedAt = 0;
+    let confirmRequested = false;
+    const toolEnd = await withPiTool(
+      { name: "read", arguments: { path: "/does/not/exist" } },
+      {
+        message: "Read /does/not/exist.",
+        onClient: (client) => {
+          client.onEvent((event) => {
+            if (event.toolName !== "read") return;
+            if (event.type === "tool_execution_start") startedAt = Date.now();
+            if (event.type === "tool_execution_end") endedAt = Date.now();
+          });
+          client.onExtensionUIRequest((request) => {
+            if (request.method === "confirm") confirmRequested = true;
+          });
+        },
+      },
+    );
+    expect(toolEnd.isError).toBe(true);
+    expect(resultText(toolEnd)).toContain("none was possible");
+    // The refusal does not say whether the path exists.
+    expect(resultText(toolEnd).toLowerCase()).not.toMatch(/not.*found|enoent/);
+    expect(confirmRequested).toBe(false);
+    expect(startedAt).toBeGreaterThan(0);
+    expect(endedAt - startedAt).toBeLessThan(5_000);
   }, 120_000);
 
   test("edit with no matching oldString errors and leaves file unchanged", async () => {

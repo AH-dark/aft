@@ -13,6 +13,7 @@ import {
 } from "../configure-warnings.js";
 import { searchTools } from "../tools/search.js";
 import type { PluginContext } from "../types.js";
+import { engineOutsideAsk } from "./helpers/engine-outside-ask.js";
 
 const bridge = {
   send: async (command: string, params: Record<string, unknown>) => {
@@ -211,7 +212,8 @@ describe("Lane G plugin orchestration regressions", () => {
       pool: {
         getBridge: () => ({
           send: async () => ({ success: true, files: [] }),
-          toolCall: async () => ({ success: true, text: "", files: [] }),
+          toolCall: async (_session: unknown, _name: string, args: Record<string, unknown>) =>
+            engineOutsideAsk(outsideFile, args) ?? { success: true, text: "", files: [] },
         }),
       },
     } as unknown as PluginContext;

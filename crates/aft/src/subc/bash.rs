@@ -1154,6 +1154,9 @@ pub(super) fn submit_deferred_bash(
             return;
         }
     };
+    if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
+        spawn_ctx.mark_standalone_plugin_host();
+    }
     // Capture unavailable grants on the executor, where database reads belong,
     // and annotate only the reply being delivered, not each foreground poll.
     let notice_snapshot = Arc::new(parking_lot::Mutex::new(Vec::new()));

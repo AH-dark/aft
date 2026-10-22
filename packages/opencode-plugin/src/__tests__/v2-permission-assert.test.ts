@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
+
 import { resolve } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
+import { prepareCanonicalPathArguments } from "@cortexkit/aft-bridge";
 import { Error as ToolError } from "@opencode/plugin/promise/tool";
 import { Cause, Effect } from "effect";
 
@@ -16,6 +18,7 @@ import { classifyPermissionError } from "../tools/permissions.js";
 import { readingTools } from "../tools/reading.js";
 import { searchTools } from "../tools/search.js";
 import type { PluginContext } from "../types.js";
+import { engineOutsideAsk } from "./helpers/engine-outside-ask.js";
 import { permissionHost, type V2PermissionRule } from "./v2-permission-host.js";
 
 const request = {
@@ -51,7 +54,11 @@ function fixture(options: Parameters<typeof permissionHost>[0] = {}) {
 }
 
 function pluginContext(
-  bridgeResponse: (name: string, preview: boolean) => Record<string, unknown>,
+  bridgeResponse: (
+    name: string,
+    preview: boolean,
+    args: Record<string, unknown>,
+  ) => Record<string, unknown>,
   bridgeSend?: (command: string, params: Record<string, unknown>) => Record<string, unknown>,
 ): PluginContext {
   const bridge = {
@@ -62,9 +69,9 @@ function pluginContext(
     toolCall: async (
       _sessionID: string | undefined,
       name: string,
-      _args: Record<string, unknown>,
+      args: Record<string, unknown>,
       options?: { preview?: boolean },
-    ) => ({ content_files: [], ...bridgeResponse(name, options?.preview === true) }),
+    ) => ({ content_files: [], ...bridgeResponse(name, options?.preview === true, args) }),
   };
   return {
     pool: { getBridge: () => bridge } as unknown as BridgePool,
@@ -105,7 +112,22 @@ function artifactReadTool(
 ) {
   const ownershipQueries: Record<string, unknown>[] = [];
   const plugin = pluginContext(
-    () => ({ success: true, text: "task output" }),
+    (tool, _preview, args) => {
+      const rawTarget =
+        prepareCanonicalPathArguments(tool, args).path ??
+        args.path ??
+        args.target ??
+        args.scope ??
+        (args.paths as unknown[] | undefined)?.[0] ??
+        // Zoom sends only a batch of { target, ... } entries.
+        (args.batch as Array<{ target?: unknown }> | undefined)?.[0]?.target;
+      const target = String(Array.isArray(rawTarget) ? rawTarget[0] : rawTarget);
+      if (!owned || tool === "write" || target !== artifact) {
+        const ask = engineOutsideAsk(target, args);
+        if (ask) return ask;
+      }
+      return { success: true, text: "task output" };
+    },
     (command, params) => {
       if (command !== "bash_artifact_owned") throw new Error(`unexpected ${command}`);
       ownershipQueries.push(params);
@@ -136,6 +158,80 @@ function artifactReadTool(
 }
 
 describe("OpenCode 2 in-process permission assertion", () => {
+  for (const decision of ["allow", "ask", "deny", "hook-deny"] as const) {
+    test(`engine outside asks use host assert with exact patterns: ${decision}`, async () => {
+      const target = "/aft-v2-engine-fixture/narrow/file.ts";
+      const patterns = ["/aft-v2-engine-fixture/narrow/*", "/aft-v2-engine-fixture/other/*"];
+      const always = ["/aft-v2-engine-fixture/approved/*"];
+      const { host, calls, prompts } = fixture({
+        agentRules: [
+          { action: "*", resource: "*", effect: "allow" },
+          {
+            action: "external_directory",
+            resource: "*",
+            effect: decision === "hook-deny" ? "allow" : decision,
+          },
+        ],
+        evaluate:
+          decision === "hook-deny"
+            ? (input, effect) => (input.action === "external_directory" ? "deny" : effect)
+            : undefined,
+      });
+      const bridgeCalls: Record<string, unknown>[] = [];
+      const definitions = hoistedTools(
+        pluginContext((_name, _preview, args) => {
+          bridgeCalls.push(structuredClone(args));
+          if (
+            !(args.permissions_granted as string[] | undefined)?.includes("outside:engine-wire")
+          ) {
+            return {
+              success: false,
+              code: "permission_required",
+              text: "outside permission needed",
+              asks: [
+                {
+                  kind: "external_directory",
+                  grant_id: "outside:engine-wire",
+                  path: target,
+                  parentDir: "/aft-v2-engine-fixture/narrow",
+                  patterns,
+                  always,
+                },
+              ],
+            };
+          }
+          return { success: true, text: "approved contents" };
+        }),
+      );
+      const read = projectV2Tool(
+        "read",
+        definitions.read!,
+        { directory: process.cwd() },
+        hoistedV2ToolConsumers(host),
+      );
+      if (decision === "deny" || decision === "hook-deny") {
+        await expect(executeProjected(read, { path: target })).rejects.toThrow(
+          "Permission denied: external_directory",
+        );
+        expect(bridgeCalls).toHaveLength(1);
+      } else {
+        await executeProjected(read, { path: target });
+        expect(bridgeCalls).toHaveLength(2);
+        expect(bridgeCalls[1]?.permissions_granted).toEqual(["outside:engine-wire"]);
+      }
+      expect(calls.map((call) => call.action)).toEqual(["read", "external_directory"]);
+      expect(calls[1]).toMatchObject({
+        action: "external_directory",
+        resources: patterns,
+        save: always,
+        source: { type: "tool", messageID: "msg_test", id: "call_test" },
+      });
+      expect(prompts.map((call) => call.action)).toEqual(
+        decision === "ask" ? ["external_directory"] : [],
+      );
+    });
+  }
+
   test("ask awaits assert and preserves edit diff and source mapping", async () => {
     const { host, calls } = fixture();
     let finish!: () => void;
@@ -228,7 +324,7 @@ describe("OpenCode 2 in-process permission assertion", () => {
     await executeProjected(read, { path: artifact });
 
     expect(calls.map((call) => (call as { action: string }).action)).toEqual(["read"]);
-    expect(ownershipQueries).toEqual([{ path: artifact, session_id: "ses_test" }]);
+    expect(ownershipQueries).toEqual([]);
   });
 
   test("an artifact this session does not own evaluates external_directory and read", async () => {
@@ -237,8 +333,8 @@ describe("OpenCode 2 in-process permission assertion", () => {
     await executeProjected(read, { path: artifact });
 
     expect(calls.map((call) => (call as { action: string }).action)).toEqual([
-      "external_directory",
       "read",
+      "external_directory",
     ]);
   });
 
@@ -285,7 +381,7 @@ describe("OpenCode 2 in-process permission assertion", () => {
         for (const reader of [{ name: "read", args: (p: string) => ({ path: p }) }, ...readers]) {
           const { read, calls, ownershipQueries } = artifactReadTool(owned, reader.name, target);
           await executeProjected(read, reader.args(target));
-          expect(ownershipQueries).toEqual([{ path: target, session_id: "ses_test" }]);
+          expect(ownershipQueries).toEqual([]);
           expect(
             calls.filter((call) => (call as { action: string }).action === "external_directory"),
           ).toHaveLength(owned ? 0 : 1);

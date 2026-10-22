@@ -14,6 +14,7 @@ import { inspectTools } from "../tools/inspect.js";
 import { navigationTools } from "../tools/navigation.js";
 import { readingTools } from "../tools/reading.js";
 import type { PluginContext } from "../types.js";
+import { engineOutsideAsk } from "./helpers/engine-outside-ask.js";
 import { permissionHost } from "./v2-permission-host.js";
 
 const context = {
@@ -246,18 +247,23 @@ test("zoom refuses when a manifest source file is outside the project and extern
   // Only a read-rule denial lets zoom re-render without the file. Any other
   // refusal of a manifest source refuses the whole zoom, and OpenCode 2 must see
   // it as a thrown tool error: returned denial text would read as a successful zoom.
+  // The engine validates every followed source file (re-exports included), so
+  // an outside source reaches the plugin as an outside-access ask, not as
+  // content; the host's external_directory denial ends the call there.
   const source = resolve(process.cwd(), "../external-reexport-source.ts");
   const { execute, dispatched } = readers(
     (input, effect) => (input.action === "external_directory" ? "deny" : effect),
-    () => ({
-      success: true,
-      text: "SOURCE_BODY_MUST_NOT_ESCAPE",
-      content_files: [resolve(process.cwd(), "allowed.ts"), source],
-    }),
+    (args) =>
+      engineOutsideAsk(source, args) ?? {
+        success: true,
+        text: "SOURCE_BODY_MUST_NOT_ESCAPE",
+        content_files: [resolve(process.cwd(), "allowed.ts"), source],
+      },
   );
   await expect(execute("aft_zoom", { path: "allowed.ts", symbols: "allowed" })).rejects.toThrow(
     "external_directory",
   );
+  // The denial is not retried as a new ask and the approved run never happens.
   expect(dispatched).toHaveLength(1);
 });
 

@@ -411,6 +411,22 @@ impl AftProcess {
     }
 
     fn spawn_inner_without(envs: &[(&str, &std::ffi::OsStr)], removed: &[&str]) -> Self {
+        Self::spawn_inner_in(envs, removed, None)
+    }
+
+    /// Spawn the aft binary with `cwd` as its working directory, so a test can
+    /// tell paths resolved against the project root from ones resolved
+    /// against the daemon's own working directory.
+    #[allow(dead_code)] // Only some integration binaries move the daemon's cwd.
+    pub fn spawn_in_dir(cwd: &Path) -> Self {
+        Self::spawn_inner_in(&[], &[], Some(cwd))
+    }
+
+    fn spawn_inner_in(
+        envs: &[(&str, &std::ffi::OsStr)],
+        removed: &[&str],
+        cwd: Option<&Path>,
+    ) -> Self {
         let binary = aft_binary::aft_binary();
         let diag_enabled =
             std::env::var_os("AFT_TEST_DIAG").as_deref() == Some(std::ffi::OsStr::new("1"));
@@ -501,6 +517,9 @@ impl AftProcess {
         }
         for key in removed {
             command.env_remove(key);
+        }
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
         }
         assert_child_storage_isolated(&command);
 

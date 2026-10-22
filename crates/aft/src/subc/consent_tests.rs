@@ -357,7 +357,10 @@ struct Fixture {
 }
 
 fn fixture(fake: Arc<FakeCingulate>) -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
+    fixture_in(fake, tempfile::tempdir().unwrap())
+}
+
+fn fixture_in(fake: Arc<FakeCingulate>, dir: tempfile::TempDir) -> Fixture {
     let head_root = crate::access_policy::policy_path(&dir.path().join("head"));
     let worker_root = crate::access_policy::policy_path(&dir.path().join("worker"));
     std::fs::create_dir_all(&head_root).unwrap();
@@ -520,27 +523,56 @@ impl Fixture {
         corr: u64,
         dispatch: DispatchFn,
     ) -> mpsc::Receiver<WriterFrame> {
+        self.send_tool_with_writer(identity, name, arguments, corr, dispatch)
+            .await
+            .1
+    }
+
+    async fn send_tool_with_writer(
+        &self,
+        identity: &RouteIdentity,
+        name: &str,
+        arguments: Value,
+        corr: u64,
+        dispatch: DispatchFn,
+    ) -> (WriterSender, mpsc::Receiver<WriterFrame>) {
+        self.send_tool_options(identity, name, arguments, corr, dispatch, false)
+            .await
+    }
+
+    async fn send_tool_options(
+        &self,
+        identity: &RouteIdentity,
+        name: &str,
+        arguments: Value,
+        corr: u64,
+        dispatch: DispatchFn,
+        preview: bool,
+    ) -> (WriterSender, mpsc::Receiver<WriterFrame>) {
         if self.executor.actor_context(&identity.root).is_none() {
             self.executor
                 .register_actor(identity.root.clone(), Arc::clone(&self.ctx));
         }
         let routes = HashMap::from([(route_key(41, 1), identity.clone())]);
+        let mut body = json!({
+            "name": name,
+            "preset": if identity.scope.as_ref().is_some_and(|s| s.kind == subc_protocol::scope::ScopeKind::Head) { "head" } else { "worker" },
+            "arguments": arguments,
+        });
+        if preview {
+            body["preview"] = json!(true);
+        }
         let frame = Frame::build(
             FrameType::Request,
             control_flags(),
             41,
             1,
             corr,
-            serde_json::to_vec(&json!({
-                "name": name,
-                "preset": if identity.scope.as_ref().is_some_and(|s| s.kind == subc_protocol::scope::ScopeKind::Head) { "head" } else { "worker" },
-                "arguments": arguments,
-            }))
-            .unwrap(),
+            serde_json::to_vec(&body).unwrap(),
         )
         .unwrap();
         let (writer, replies) = mpsc::channel(8);
-        let (bash_tx, _bash_rx) = mpsc::channel(8);
+        let (bash_tx, mut bash_rx) = mpsc::channel(8);
         let (touch_tx, _touch_rx) = mpsc::channel(8);
         let (entries, _deferred_rx) = mpsc::unbounded_channel();
         let deferred_tx = DeferredResponseSender {
@@ -562,6 +594,10 @@ impl Fixture {
             Err(decoded) => decoded,
         };
         let frame = decoded.frame;
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let shutdown = Arc::new(Notify::new());
+        let mut live_roots = HashMap::new();
+        let mut route_bash_cancels = HashMap::new();
         handle_tool_call(
             &writer,
             &frame,
@@ -571,16 +607,16 @@ impl Fixture {
             &routes,
             &HashMap::new(),
             &ReclaimedRoutes::default(),
-            &mut HashMap::new(),
+            &mut live_roots,
             &self.executor,
             &self.active,
             &Arc::new(PendingDeferredSetups::default()),
-            &Arc::new(Notify::new()),
+            &shutdown,
             &self.connection_cancel,
             &bash_tx,
             &touch_tx,
-            &Arc::new(DispatchPathMetrics::new()),
-            &mut HashMap::new(),
+            &metrics,
+            &mut route_bash_cancels,
             &mut HashMap::new(),
             &mut 1,
             &mut HashMap::new(),
@@ -596,7 +632,23 @@ impl Fixture {
         )
         .await
         .unwrap();
-        replies
+        let bash_writer = writer.clone();
+        tokio::spawn(async move {
+            while let Some(completion) = bash_rx.recv().await {
+                bash::handle_bash_deferred_completion(
+                    &bash_writer,
+                    completion,
+                    &routes,
+                    &mut live_roots,
+                    &mut route_bash_cancels,
+                    &shutdown,
+                    &metrics,
+                )
+                .await
+                .unwrap();
+            }
+        });
+        (writer, replies)
     }
 
     fn asks(&self) -> Vec<asks::AskRecord> {
@@ -648,7 +700,6 @@ fn text(reply: &Value) -> String {
         .unwrap_or_default()
 }
 
-#[cfg(unix)]
 async fn wait_for(mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !done() {
@@ -2064,6 +2115,616 @@ async fn consent_floor_path_is_denied_without_asking() {
     assert!(f.fake.calls("consent.request").is_empty());
 }
 
+#[tokio::test]
+async fn standalone_plugins_receive_in_process_two_phase_ask_without_cingulate() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture_in(
+        FakeCingulate::up(),
+        tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap(),
+    );
+    let target = f.head_root.join("shared.txt");
+    for (harness, role) in [
+        ("opencode", tool_provider::RouteRole::Legacy),
+        ("pi", tool_provider::RouteRole::Legacy),
+        ("opencode", tool_provider::RouteRole::ToolProviderV1),
+        ("pi", tool_provider::RouteRole::ToolProviderV1),
+    ] {
+        let mut route = identity(&f.worker.project_root, None);
+        let inner = Arc::get_mut(&mut route.0).unwrap();
+        inner.harness = harness.into();
+        inner.role = role;
+        let reply = f.read(&route, &target, 17).await;
+        assert_eq!(code(&reply), "permission_required", "{harness}: {reply}");
+        assert!(!text(&reply).contains("head-owned contents"));
+        let response = &reply["structuredContent"];
+        let grant = response["asks"][0]["grant_id"].as_str().unwrap();
+        let mut replies = f
+            .send_tool(
+                &route,
+                "read",
+                json!({
+                    "filePath": target, "permissions_granted": [grant]
+                }),
+                18,
+                read_dispatch,
+            )
+            .await;
+        let frame = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let allowed: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert!(text(&allowed).contains("head-owned contents"), "{allowed}");
+        assert!(f.fake.calls("consent.request").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn standalone_plugin_exemptions_skip_outside_asks_for_both_protocol_versions() {
+    use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
+    use crate::bash_background::BgTaskStatus;
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture_in(
+        FakeCingulate::up(),
+        tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap(),
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch_file = scratch.path().join("scratch.txt");
+    std::fs::write(&scratch_file, "scratch contents").unwrap();
+    let storage = f.ctx.storage_dir();
+    let paths = task_paths(&storage, "standalone", "bash-5a57a11e01234567").unwrap();
+    let mut task = PersistedTask::starting(
+        "bash-5a57a11e01234567".into(),
+        "standalone".into(),
+        "fixture".into(),
+        f.worker.project_root.clone(),
+        Some(f.worker.project_root.clone()),
+        None,
+        false,
+        false,
+    );
+    task.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    write_task(&paths.json, &task).unwrap();
+    std::fs::write(&paths.stdout, "owned task output").unwrap();
+    std::fs::write(&paths.stderr, "").unwrap();
+    std::fs::write(&paths.exit, "0\n").unwrap();
+    f.ctx
+        .bash_background()
+        .replay_session(&storage, "standalone")
+        .unwrap();
+    assert!(!crate::bash_permissions::is_system_temp_path(&paths.stdout));
+    for role in [
+        tool_provider::RouteRole::Legacy,
+        tool_provider::RouteRole::ToolProviderV1,
+    ] {
+        let mut route = identity(&f.worker.project_root, None);
+        let inner = Arc::get_mut(&mut route.0).unwrap();
+        inner.harness = "opencode".into();
+        inner.role = role;
+        for (corr, target, contents) in [
+            (71, &scratch_file, "scratch contents"),
+            (72, &paths.stdout, "owned task output"),
+        ] {
+            let reply = f.read(&route, target, corr).await;
+            assert_eq!(reply["isError"], false, "{reply}");
+            assert!(text(&reply).contains(contents), "{reply}");
+            assert_ne!(code(&reply), "permission_required");
+        }
+    }
+    assert!(f.fake.calls("consent.request").is_empty());
+}
+
+async fn standalone_reply(replies: &mut mpsc::Receiver<WriterFrame>) -> Value {
+    let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    serde_json::from_slice(&reply.body).unwrap()
+}
+
+#[tokio::test]
+async fn standalone_plugin_tokens_reject_forgery_replay_and_different_capabilities() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture_in(
+        FakeCingulate::up(),
+        tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap(),
+    );
+    let target = f.head_root.join("shared.txt");
+    let other = f.head_root.join("other.txt");
+    std::fs::write(&other, "other protected contents").unwrap();
+    for harness in ["opencode", "pi"] {
+        let mut route = identity(&f.worker.project_root, None);
+        let inner = Arc::get_mut(&mut route.0).unwrap();
+        inner.harness = harness.into();
+        inner.role = tool_provider::RouteRole::Legacy;
+        let forged = format!(
+            "outside:{}",
+            serde_json::to_string(&AccessGrant {
+                path: target.clone(),
+                kind: GrantKind::File,
+                operation: AccessOperation::Read
+            })
+            .unwrap()
+        );
+        let (_, mut replies) = f
+            .send_tool_with_writer(
+                &route,
+                "read",
+                json!({"path":target,"permissions_granted":[forged.clone()]}),
+                81,
+                read_dispatch,
+            )
+            .await;
+        let ask = standalone_reply(&mut replies).await;
+        assert_eq!(code(&ask), "permission_required", "{harness}: {ask}");
+        let token = ask["structuredContent"]["asks"][0]["grant_id"]
+            .as_str()
+            .unwrap();
+        assert_ne!(
+            token, forged,
+            "issued authority must not be the predictable grant encoding"
+        );
+        let (_, mut replies) = f
+            .send_tool_with_writer(
+                &route,
+                "read",
+                json!({"path":other,"permissions_granted":[token]}),
+                82,
+                read_dispatch,
+            )
+            .await;
+        assert_eq!(
+            code(&standalone_reply(&mut replies).await),
+            "permission_required"
+        );
+        let ask = f.read(&route, &target, 83).await;
+        let token = ask["structuredContent"]["asks"][0]["grant_id"]
+            .as_str()
+            .unwrap();
+        let (_, mut replies) = f
+            .send_tool_with_writer(
+                &route,
+                "read",
+                json!({"path":target,"permissions_granted":[token]}),
+                84,
+                read_dispatch,
+            )
+            .await;
+        assert!(text(&standalone_reply(&mut replies).await).contains("head-owned contents"));
+        let (_, mut replies) = f
+            .send_tool_with_writer(
+                &route,
+                "read",
+                json!({"path":target,"permissions_granted":[token]}),
+                85,
+                read_dispatch,
+            )
+            .await;
+        assert_eq!(
+            code(&standalone_reply(&mut replies).await),
+            "permission_required"
+        );
+        #[cfg(unix)]
+        {
+            let ask = f.read(&route, &target, 88).await;
+            let token = ask["structuredContent"]["asks"][0]["grant_id"]
+                .as_str()
+                .unwrap();
+            let (_, mut replies) = f
+                .send_tool_with_writer(
+                    &route,
+                    "write",
+                    json!({"path":target,"content":"not approved","permissions_granted":[token]}),
+                    89,
+                    scope_dispatch,
+                )
+                .await;
+            assert_eq!(
+                code(&standalone_reply(&mut replies).await),
+                "permission_required"
+            );
+            assert!(std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("head-owned contents"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn standalone_deferred_bash_carries_claimed_plugin_route() {
+    fn routed_bash(request: RawRequest, ctx: &AppContext) -> Response {
+        let target = Path::new(request.params["command"].as_str().unwrap());
+        if let Err(response) = ctx.validate_read_path(&request.id, request.session(), target) {
+            return response;
+        }
+        Response::success(
+            &request.id,
+            json!({"output":std::fs::read_to_string(target).unwrap(), "exit_code":0}),
+        )
+    }
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture_in(
+        FakeCingulate::up(),
+        tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap(),
+    );
+    let target = f.head_root.join("shared.txt");
+    let mut route = identity(&f.worker.project_root, None);
+    Arc::get_mut(&mut route.0).unwrap().harness = "opencode".into();
+    let read_ask = f.read(&route, &target, 96).await;
+    let read_token = read_ask["structuredContent"]["asks"][0]["grant_id"]
+        .as_str()
+        .unwrap();
+    let (_, mut replies) = f
+        .send_tool_with_writer(
+            &route,
+            "bash",
+            json!({"command":target,"permissions_granted":[read_token]}),
+            97,
+            routed_bash,
+        )
+        .await;
+    let ask = standalone_reply(&mut replies).await;
+    assert_eq!(
+        code(&ask),
+        "permission_required",
+        "a read-tool token must not authorize bash: {ask}"
+    );
+    let token = ask["structuredContent"]["asks"][0]["grant_id"]
+        .as_str()
+        .unwrap();
+    let (_, mut replies) = f
+        .send_tool_with_writer(
+            &route,
+            "bash",
+            json!({"command":target,"permissions_granted":[token]}),
+            98,
+            routed_bash,
+        )
+        .await;
+    let reply = standalone_reply(&mut replies).await;
+    assert_eq!(reply["isError"], false, "{reply}");
+    assert!(text(&reply).contains("head-owned contents"), "{reply}");
+}
+
+#[tokio::test]
+async fn standalone_untrusted_arguments_cannot_replace_a_consumer_approval() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture_in(
+        FakeCingulate::up(),
+        tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap(),
+    );
+    let target = f.head_root.join("shared.txt");
+    let mut plugin = identity(&f.worker.project_root, None);
+    Arc::get_mut(&mut plugin.0).unwrap().harness = "opencode".into();
+    let ask = f.read(&plugin, &target, 86).await;
+    let issued = ask["structuredContent"]["asks"][0]["grant_id"]
+        .as_str()
+        .unwrap();
+    let mut route = identity(&f.worker.project_root, None);
+    let inner = Arc::get_mut(&mut route.0).unwrap();
+    inner.trust = BindTrust::Untrusted;
+    inner.consumer_elicitation_capable = true;
+    inner.role = tool_provider::RouteRole::Legacy;
+    let (writer, mut replies) = f
+        .send_tool_with_writer(
+            &route,
+            "read",
+            json!({"path":target,"permissions_granted":[issued]}),
+            87,
+            read_dispatch,
+        )
+        .await;
+    let reverse = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reverse.header.ty,
+        FrameType::Request,
+        "tool arguments cannot stand in for elicitation"
+    );
+    let answer = Frame::build_with_version(
+        reverse.header.ver,
+        FrameType::Response,
+        reverse.header.flags,
+        41,
+        1,
+        reverse.header.corr,
+        serde_json::to_vec(&json!({"decision":"deny"})).unwrap(),
+    )
+    .unwrap();
+    assert!(standalone::reply(&writer, &answer));
+    let denied = standalone_reply(&mut replies).await;
+    assert_eq!(denied["isError"], true);
+    assert!(!text(&denied).contains("head-owned contents"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn standalone_plugin_preview_renews_approval_once_for_apply() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture_in(
+        FakeCingulate::up(),
+        tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap(),
+    );
+    let target = f.head_root.join("shared.txt");
+    let mut route = identity(&f.worker.project_root, None);
+    let inner = Arc::get_mut(&mut route.0).unwrap();
+    inner.harness = "opencode".into();
+    inner.role = tool_provider::RouteRole::Legacy;
+    let args = json!({"path":target, "content":"approved mutation"});
+    let (_, mut replies) = f
+        .send_tool_options(&route, "write", args.clone(), 91, scope_dispatch, true)
+        .await;
+    let ask = standalone_reply(&mut replies).await;
+    let token = ask["structuredContent"]["asks"][0]["grant_id"]
+        .as_str()
+        .unwrap();
+    let mut approved = args.clone();
+    approved["permissions_granted"] = json!([token]);
+    let (_, mut replies) = f
+        .send_tool_options(&route, "write", approved, 92, scope_dispatch, true)
+        .await;
+    let preview = standalone_reply(&mut replies).await;
+    assert_eq!(preview["isError"], false, "{preview}");
+    assert!(std::fs::read_to_string(&target)
+        .unwrap()
+        .contains("head-owned contents"));
+    let renewal = preview["structuredContent"]["permissions_continuation"][0]
+        .as_str()
+        .unwrap();
+    assert_ne!(renewal, token);
+    let mut apply = args;
+    apply["permissions_granted"] = json!([renewal]);
+    let (_, mut replies) = f
+        .send_tool_options(&route, "write", apply.clone(), 93, scope_dispatch, false)
+        .await;
+    let result = standalone_reply(&mut replies).await;
+    assert_eq!(result["isError"], false, "{result}");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "approved mutation"
+    );
+    let (_, mut replies) = f
+        .send_tool_options(&route, "write", apply, 94, scope_dispatch, false)
+        .await;
+    assert_eq!(
+        code(&standalone_reply(&mut replies).await),
+        "permission_required"
+    );
+}
+
+#[tokio::test]
+async fn standalone_reverse_allow_rechecks_cancellation_before_rerun() {
+    static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn counted_read(request: RawRequest, ctx: &AppContext) -> Response {
+        RUNS.fetch_add(1, Ordering::SeqCst);
+        read_dispatch(request, ctx)
+    }
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    RUNS.store(0, Ordering::SeqCst);
+    let f = fixture(FakeCingulate::up());
+    let mut route = identity(&f.worker.project_root, None);
+    let inner = Arc::get_mut(&mut route.0).unwrap();
+    inner.trust = BindTrust::Untrusted;
+    inner.consumer_elicitation_capable = true;
+    inner.role = tool_provider::RouteRole::Legacy;
+    let (writer, mut replies) = f
+        .send_tool_with_writer(
+            &route,
+            "read",
+            json!({"path":f.head_root.join("shared.txt")}),
+            95,
+            counted_read,
+        )
+        .await;
+    let ask = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let cancel = f.connection_cancel.clone();
+    standalone::before_rerun_for_test(Some(Box::new(move || cancel.cancel())));
+    let answer = Frame::build_with_version(
+        ask.header.ver,
+        FrameType::Response,
+        ask.header.flags,
+        41,
+        1,
+        ask.header.corr,
+        serde_json::to_vec(&json!({"decision":"allow"})).unwrap(),
+    )
+    .unwrap();
+    assert!(standalone::reply(&writer, &answer));
+    wait_for(|| !active_tool_call_is_registered(&f.active, route_key(41, 1), 95)).await;
+    assert_eq!(
+        RUNS.load(Ordering::SeqCst),
+        1,
+        "an allow must not dispatch after cancellation"
+    );
+}
+
+#[tokio::test]
+async fn standalone_no_ui_denies_without_cingulate() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let target = f.head_root.join("shared.txt");
+    for trust in [BindTrust::FirstParty, BindTrust::Untrusted] {
+        let mut route = identity(&f.worker.project_root, None);
+        Arc::get_mut(&mut route.0).unwrap().trust = trust;
+        let reply = f.read(&route, &target, 19).await;
+        if trust == BindTrust::FirstParty {
+            assert_eq!(code(&reply), "path_outside_root", "{reply}");
+        } else {
+            assert_eq!(reply["isError"], true, "{reply}");
+            assert!(text(&reply).contains("outside the project root"));
+        }
+        assert!(!text(&reply).contains("head-owned contents"));
+    }
+    assert!(f.fake.calls("consent.request").is_empty());
+}
+
+#[tokio::test]
+async fn audit2_plugin_token_cannot_cross_routes_or_sessions() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture_in(
+        FakeCingulate::up(),
+        tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap(),
+    );
+    let target = f.head_root.join("shared.txt");
+    let mut a = identity(&f.worker.project_root, None);
+    let inner = Arc::get_mut(&mut a.0).unwrap();
+    inner.harness = "opencode".into();
+    inner.role = tool_provider::RouteRole::Legacy;
+    let ask = f.read(&a, &target, 181).await;
+    assert_eq!(code(&ask), "permission_required");
+    let token = ask["structuredContent"]["asks"][0]["grant_id"]
+        .as_str()
+        .unwrap();
+    let mut b = identity(&f.worker.project_root, None);
+    let inner = Arc::get_mut(&mut b.0).unwrap();
+    inner.harness = "opencode".into();
+    inner.session = "session-B".into();
+    inner.role = tool_provider::RouteRole::Legacy;
+    if let AuthenticatedPrincipal::RouteBind { session_id, .. } = &mut inner.spawn_principal {
+        *session_id = "session-B".into();
+    }
+    let (_, mut replies) = f
+        .send_tool_with_writer(
+            &b,
+            "read",
+            json!({"path":target,"permissions_granted":[token]}),
+            182,
+            read_dispatch,
+        )
+        .await;
+    let response = standalone_reply(&mut replies).await;
+    assert_eq!(code(&response), "permission_required", "{response}");
+    let (_, mut replies) = f
+        .send_tool_with_writer(
+            &a,
+            "read",
+            json!({"path":target,"permissions_granted":[token]}),
+            183,
+            read_dispatch,
+        )
+        .await;
+    assert!(text(&standalone_reply(&mut replies).await).contains("head-owned contents"));
+}
+
+#[tokio::test]
+async fn standalone_untrusted_reverse_asks_then_reads_once_without_cingulate() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let target = f.head_root.join("shared.txt");
+    let mut route = identity(&f.worker.project_root, None);
+    let inner = Arc::get_mut(&mut route.0).unwrap();
+    inner.trust = BindTrust::Untrusted;
+    inner.consumer_elicitation_capable = true;
+    let (writer, mut replies) = f
+        .send_tool_with_writer(
+            &route,
+            "read",
+            json!({"filePath": target}),
+            20,
+            read_dispatch,
+        )
+        .await;
+    let ask = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ask.header.ty, FrameType::Request);
+    let body: Value = serde_json::from_slice(&ask.body).unwrap();
+    assert_eq!(body["method"], BASH_ELICITATION_CREATE_METHOD);
+    assert_eq!(body["params"]["_meta"]["aft"]["tool"], "read");
+    let answer = Frame::build_with_version(
+        ask.header.ver,
+        FrameType::Response,
+        ask.header.flags,
+        41,
+        1,
+        ask.header.corr,
+        serde_json::to_vec(&json!({"decision":"allow"})).unwrap(),
+    )
+    .unwrap();
+    let (other, _other_rx) = mpsc::channel(8);
+    assert!(
+        !standalone::reply(&other, &answer),
+        "another connection cannot approve"
+    );
+    assert!(standalone::reply(&writer, &answer));
+    assert!(
+        !standalone::reply(&writer, &answer),
+        "the approval is single use"
+    );
+    let result = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.header.ty, FrameType::Response);
+    let result: Value = serde_json::from_slice(&result.body).unwrap();
+    assert!(text(&result).contains("head-owned contents"), "{result}");
+    assert!(f.fake.calls("consent.request").is_empty());
+    let (_writer, mut again) = f
+        .send_tool_with_writer(
+            &route,
+            "read",
+            json!({"filePath": target}),
+            21,
+            read_dispatch,
+        )
+        .await;
+    let ask = tokio::time::timeout(Duration::from_secs(10), again.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ask.header.ty, FrameType::Request, "a later call asks again");
+    f.connection_cancel.cancel();
+}
+
+#[tokio::test]
+async fn standalone_untrusted_reverse_denial_keeps_path_error() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let mut route = identity(&f.worker.project_root, None);
+    let inner = Arc::get_mut(&mut route.0).unwrap();
+    inner.trust = BindTrust::Untrusted;
+    inner.consumer_elicitation_capable = true;
+    let (writer, mut replies) = f
+        .send_tool_with_writer(
+            &route,
+            "read",
+            json!({"filePath": f.head_root.join("shared.txt")}),
+            22,
+            read_dispatch,
+        )
+        .await;
+    let ask = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let answer = Frame::build_with_version(
+        ask.header.ver,
+        FrameType::Response,
+        ask.header.flags,
+        41,
+        1,
+        ask.header.corr,
+        serde_json::to_vec(&json!({"decision":"deny"})).unwrap(),
+    )
+    .unwrap();
+    assert!(standalone::reply(&writer, &answer));
+    let result = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let result: Value = serde_json::from_slice(&result.body).unwrap();
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(text(&result).contains("outside-path access was not approved"));
+    assert!(!text(&result).contains("head-owned contents"));
+    assert!(f.fake.calls("consent.request").is_empty());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn consent_cingulate_down_returns_access_unavailable_never_a_host_prompt() {
@@ -2408,7 +3069,7 @@ fn consent_routes_asks_by_stamp() {
         (&foreign, false),
     ] {
         assert_eq!(
-            access_grants::ask_route(identity) != AskRoute::Lowered,
+            matches!(access_grants::ask_route(identity), AskRoute::Consent { .. }),
             asks
         );
     }
@@ -2778,6 +3439,89 @@ async fn consent_route_close_reaches_the_approved_rerun() {
     note_route_closed(route_key(41, 1));
     wait_for(|| RERUN_CANCELLED.load(Ordering::SeqCst)).await;
     wait_for(|| f.asks().is_empty()).await;
+}
+
+#[cfg(unix)]
+static ELICITED_RERUN_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+static ELICITED_RERUN_DONE: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+static ELICITED_RERUN_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Writes normally, except that a write approved by reverse elicitation (one
+/// carrying `once` approvals) first waits up to five seconds for its job to
+/// be cancelled. It records whether it was, and writes only if it was not.
+#[cfg(unix)]
+fn blocking_elicited_write(request: RawRequest, ctx: &AppContext) -> Response {
+    if let AskRoute::Elicitation { once } = crate::access_policy::current_ask_route() {
+        if !once.is_empty() {
+            ELICITED_RERUN_STARTED.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !crate::executor::current_job_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let cancelled = crate::executor::current_job_cancelled();
+            ELICITED_RERUN_CANCELLED.store(cancelled, Ordering::SeqCst);
+            let response = if cancelled {
+                Response::error(&request.id, "request_cancelled", "rerun stopped")
+            } else {
+                crate::commands::write::handle_write(&request, ctx)
+            };
+            ELICITED_RERUN_DONE.store(true, Ordering::SeqCst);
+            return response;
+        }
+    }
+    crate::commands::write::handle_write(&request, ctx)
+}
+
+/// An untrusted consumer that approves an outside write by reverse
+/// elicitation and then closes its route while the approved write is running
+/// gets the write stopped: the job is cancelled, the file is unchanged, and
+/// the call is no longer tracked for a later reply.
+#[cfg(unix)]
+#[tokio::test]
+async fn standalone_route_close_cancels_the_approved_rerun() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    ELICITED_RERUN_STARTED.store(false, Ordering::SeqCst);
+    ELICITED_RERUN_DONE.store(false, Ordering::SeqCst);
+    ELICITED_RERUN_CANCELLED.store(false, Ordering::SeqCst);
+    let f = fixture(FakeCingulate::up());
+    let corr = 9_100_003;
+    let target = f.head_root.join("shared.txt");
+    let before = std::fs::read_to_string(&target).unwrap();
+    let mut route = identity(&f.worker.project_root, None);
+    let inner = Arc::get_mut(&mut route.0).unwrap();
+    inner.trust = BindTrust::Untrusted;
+    inner.consumer_elicitation_capable = true;
+    inner.role = tool_provider::RouteRole::Legacy;
+    let (writer, mut replies) = f
+        .send_tool_with_writer(
+            &route,
+            "write",
+            json!({"path": target, "content": "approved outside write"}),
+            corr,
+            blocking_elicited_write,
+        )
+        .await;
+    let ask = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(standalone::reply(&writer, &allow_frame(&ask)));
+    wait_for(|| ELICITED_RERUN_STARTED.load(Ordering::SeqCst)).await;
+    note_route_closed(route_key(41, 1));
+    wait_for(|| ELICITED_RERUN_DONE.load(Ordering::SeqCst)).await;
+    assert!(
+        ELICITED_RERUN_CANCELLED.load(Ordering::SeqCst),
+        "closing the route must cancel the approved write"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        before,
+        "the approved write must not land after the route closed"
+    );
+    wait_for(|| !active_tool_call_is_registered(&f.active, route_key(41, 1), corr)).await;
+    f.connection_cancel.cancel();
 }
 
 #[cfg(unix)]
@@ -3842,4 +4586,157 @@ async fn consent_stamped_head_search_of_filesystem_root_keeps_todays_behavior() 
 
     assert_eq!(reply["structuredContent"]["success"], true, "{reply}");
     assert!(f.fake.calls("consent.request").is_empty());
+}
+
+/// Removes per-call test overrides when a test ends.
+struct CallOverrides(u64);
+impl Drop for CallOverrides {
+    fn drop(&mut self) {
+        crate::subc::PLAIN_RUN_IO_BUDGET_FOR_TEST
+            .lock()
+            .unwrap()
+            .remove(&self.0);
+        standalone::APPROVAL_WAIT_FOR_TEST
+            .lock()
+            .unwrap()
+            .remove(&self.0);
+    }
+}
+
+fn allow_frame(ask: &WriterFrame) -> Frame {
+    Frame::build_with_version(
+        ask.header.ver,
+        FrameType::Response,
+        ask.header.flags,
+        41,
+        1,
+        ask.header.corr,
+        serde_json::to_vec(&json!({"decision":"allow"})).unwrap(),
+    )
+    .unwrap()
+}
+
+/// A consumer that answers after the first run's I/O budget has run out, but
+/// well within the caller's reply deadline, gets the approved work done: the
+/// approved run has its own, renewed I/O budget.
+#[tokio::test]
+async fn standalone_late_approval_reruns_with_a_renewed_io_budget() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let corr = 9_100_001;
+    let _overrides = CallOverrides(corr);
+    crate::subc::PLAIN_RUN_IO_BUDGET_FOR_TEST
+        .lock()
+        .unwrap()
+        .insert(corr, Duration::from_millis(1_500));
+    let mut route = identity(&f.worker.project_root, None);
+    let inner = Arc::get_mut(&mut route.0).unwrap();
+    inner.trust = BindTrust::Untrusted;
+    inner.consumer_elicitation_capable = true;
+    inner.role = tool_provider::RouteRole::Legacy;
+    let (writer, mut replies) = f
+        .send_tool_with_writer(
+            &route,
+            "read",
+            json!({"path": f.head_root.join("shared.txt")}),
+            corr,
+            read_dispatch,
+        )
+        .await;
+    let ask = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    // Answer only after the first run's whole I/O budget has passed.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    let approved_at = Instant::now();
+    assert!(standalone::reply(&writer, &allow_frame(&ask)));
+    let result = standalone_reply(&mut replies).await;
+    assert_eq!(result["isError"], false, "{result}");
+    assert!(text(&result).contains("head-owned contents"), "{result}");
+    let renewed = *standalone::RERUN_BUDGETS_FOR_TEST
+        .lock()
+        .unwrap()
+        .last()
+        .expect("the approved run was given a budget");
+    assert!(
+        renewed > approved_at,
+        "the approved run's budget was renewed"
+    );
+    f.connection_cancel.cancel();
+}
+
+/// When the consumer does not answer within the time the reply budget allows,
+/// the call ends with the typed `access_pending` outcome a consent hold gives,
+/// nothing runs, and a late answer is not accepted.
+#[tokio::test]
+async fn standalone_unanswered_approval_ends_with_access_pending() {
+    static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn counted_read(request: RawRequest, ctx: &AppContext) -> Response {
+        RUNS.fetch_add(1, Ordering::SeqCst);
+        read_dispatch(request, ctx)
+    }
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    RUNS.store(0, Ordering::SeqCst);
+    let f = fixture(FakeCingulate::up());
+    let corr = 9_100_002;
+    let _overrides = CallOverrides(corr);
+    standalone::APPROVAL_WAIT_FOR_TEST
+        .lock()
+        .unwrap()
+        .insert(corr, Duration::from_millis(300));
+    let mut route = identity(&f.worker.project_root, None);
+    let inner = Arc::get_mut(&mut route.0).unwrap();
+    inner.trust = BindTrust::Untrusted;
+    inner.consumer_elicitation_capable = true;
+    inner.role = tool_provider::RouteRole::Legacy;
+    let (writer, mut replies) = f
+        .send_tool_with_writer(
+            &route,
+            "read",
+            json!({"path": f.head_root.join("shared.txt")}),
+            corr,
+            counted_read,
+        )
+        .await;
+    let ask = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let result = standalone_reply(&mut replies).await;
+    // Untrusted consumers receive errors as text; the outcome is the typed
+    // pending answer, not the denial's path error.
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(
+        text(&result).contains("was not answered in time"),
+        "{result}"
+    );
+    assert!(
+        !text(&result).contains("outside the project root"),
+        "{result}"
+    );
+    assert!(!standalone::reply(&writer, &allow_frame(&ask)));
+    assert_eq!(RUNS.load(Ordering::SeqCst), 1, "nothing ran after the ask");
+    f.connection_cancel.cancel();
+}
+
+/// The approval wait never runs into the time the approved run needs.
+#[test]
+fn standalone_approval_deadline_leaves_the_rerun_margin() {
+    let now = Instant::now();
+    let far = now + Duration::from_secs(600);
+    assert_eq!(
+        standalone::approval_deadline(now, far, Duration::from_secs(60)),
+        now + Duration::from_secs(60)
+    );
+    let near = now + Duration::from_secs(20);
+    assert_eq!(
+        standalone::approval_deadline(now, near, Duration::from_secs(60)),
+        near - RERUN_MARGIN
+    );
+    let past = now + Duration::from_secs(1);
+    assert_eq!(
+        standalone::approval_deadline(now, past, Duration::from_secs(60)),
+        now
+    );
 }

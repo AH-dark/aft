@@ -311,7 +311,11 @@ pub(crate) fn handle_deferred_with_budget(
     let worker_cancellation = cancellation.clone();
     let (tx, rx) = crate::response_finalize::pending_response_channel();
     let thread_id = id.clone();
+    let ask_route = crate::access_policy::capture_ask_route();
+    let grant_scope = crate::access_policy::current_scope();
     std::thread::spawn(move || {
+        let _ask_route = ask_route.install();
+        let _grant_scope = crate::access_policy::scope_guard(grant_scope);
         crate::sandbox_spawn::with_authenticated_principal(principal, || {
             // Configure acknowledges the route before its replay tail finishes.
             // Resolve the durable record before starting the wait, off executor
