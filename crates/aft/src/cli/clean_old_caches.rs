@@ -105,11 +105,18 @@ mod tests {
         let _process_snapshot = {
             use std::os::unix::fs::PermissionsExt;
             // Fake `ps` to report no running daemons for this real-volume deletion
-            // test; a separate test verifies the upgrade-window refusal.
+            // test; a separate test verifies the upgrade-window refusal. The scan
+            // asks `ps` for executables (`pid=,comm=`) and for command lines
+            // (`pid=,args=`), and refuses a listing that leaves out the scanning
+            // process, so both answers list it: the script's parent.
             let bin = temp.path().join("bin");
             std::fs::create_dir(&bin).unwrap();
             let ps = bin.join("ps");
-            std::fs::write(&ps, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::write(
+                &ps,
+                "#!/bin/sh\ncase \"$2\" in\n*comm=*) echo \"$PPID /opt/aft-cli-test\" ;;\n*) echo \"$PPID /opt/aft-cli-test --ignored\" ;;\nesac\n",
+            )
+            .unwrap();
             std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o700)).unwrap();
             struct RestorePath(Option<OsString>);
             impl Drop for RestorePath {
