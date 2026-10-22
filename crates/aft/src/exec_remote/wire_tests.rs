@@ -64,6 +64,29 @@ pub(crate) fn queue_owner_detail(holder: Uuid) -> String {
     )
 }
 
+/// ck-motor's terminal record for a job refused because its signer was briefly
+/// unavailable, byte for byte as the runner sends it.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) const SIGNER_REFUSAL_VECTOR: &str = r#"{"bundle_bytes":0,"job_id":"01a16152-22ae-71e6-9735-1905454c9804","outcome":{"reason":"runner_authentication_failed","type":"refused_before_start"},"queue_wait_ms":0,"ran":"none","refusal_detail":"runner_sign_unavailable","retry_after_ms":2000,"tree_hash":null,"type":"terminal","wall_ms":0,"workspace_changes":null}"#;
+
+/// [`SIGNER_REFUSAL_VECTOR`] with another refusal detail and retry hint. The
+/// runner omits the hint field (it never sends null) when it gives none.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn signer_refusal(detail: &str, retry_after_ms: Option<u64>) -> TerminalRecord {
+    let mut value: Value = serde_json::from_str(SIGNER_REFUSAL_VECTOR).unwrap();
+    value["refusal_detail"] = json!(detail);
+    match retry_after_ms {
+        Some(ms) => value["retry_after_ms"] = json!(ms),
+        None => {
+            value.as_object_mut().unwrap().remove("retry_after_ms");
+        }
+    }
+    match serde_json::from_value(value).unwrap() {
+        StreamRecord::Terminal(terminal) => terminal,
+        other => panic!("expected a terminal record, got {other:?}"),
+    }
+}
+
 // Most scripts drive the Unix-only remote bash tests.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy)]
@@ -83,6 +106,22 @@ pub(crate) enum Script {
     DiskFull {
         refusals: u32,
         retry_after_ms: Option<u64>,
+    },
+    /// Refuse the first `refusals` runs with [`signer_refusal`] for this detail
+    /// and hint, sending no `Accepted`; later runs are accepted and exit 0.
+    SignerRefused {
+        refusals: u32,
+        detail: &'static str,
+        retry_after_ms: Option<u64>,
+    },
+    /// Refuse the first run as draining with hint `draining_after_ms`, the
+    /// next `signer_refusals` runs with [`signer_refusal`] for
+    /// `runner_sign_unavailable` with hint `signer_after_ms`, then accept
+    /// later runs, which exit 0. No refusal sends `Accepted`.
+    DrainingThenSigner {
+        signer_refusals: u32,
+        draining_after_ms: u64,
+        signer_after_ms: u64,
     },
     FutureOutcome,
     Expired,
@@ -272,7 +311,8 @@ pub(crate) async fn daemon_with_capabilities(
                         "exec.run" | "exec.attach" => {
                             let attaching = body["method"] == "exec.attach";
                             if !attaching { runs += 1; }
-                            let draining = matches!(script, Script::Draining { refusals, .. } | Script::DiskFull { refusals, .. } if runs <= refusals)
+                            let draining = matches!(script, Script::Draining { refusals, .. } | Script::DiskFull { refusals, .. } | Script::SignerRefused { refusals, .. } if runs <= refusals)
+                                || matches!(script, Script::DrainingThenSigner { signer_refusals, .. } if runs <= 1 + signer_refusals)
                                 || matches!(script, Script::DrainingGatedAcceptance) && runs == 1;
                             if attaching && matches!(script, Script::AttachDisconnected) {
                                 // Drop the route and listener; later attach calls and connects fail.
@@ -364,6 +404,17 @@ pub(crate) async fn daemon_with_capabilities(
                                         if let Script::Draining { retry_after_ms, .. } | Script::DiskFull { retry_after_ms, .. } = script {
                                             terminal.retry_after_ms = retry_after_ms;
                                             terminal.refusal_detail = Some("maintenance".into());
+                                        }
+                                    }
+                                    if let (true, Script::SignerRefused { detail, retry_after_ms, .. }) = (draining, script) {
+                                        terminal = signer_refusal(detail, retry_after_ms);
+                                    }
+                                    if let (true, Script::DrainingThenSigner { draining_after_ms, signer_after_ms, .. }) = (draining, script) {
+                                        if runs == 1 {
+                                            terminal.retry_after_ms = Some(draining_after_ms);
+                                            terminal.refusal_detail = Some("maintenance".into());
+                                        } else {
+                                            terminal = signer_refusal("runner_sign_unavailable", Some(signer_after_ms));
                                         }
                                     }
                                     if cancelled && !matches!(script, Script::PersistentTerminalGap | Script::TransientTerminalGap | Script::TerminalGapOnce) { terminal = terminal.with_killed(Killed::Cancel); }

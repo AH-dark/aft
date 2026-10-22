@@ -6526,3 +6526,381 @@ async fn optional_worker_broker_remote_local_fallback_without_service_runs() {
     assert!(!temp.join(".gh-read-capability").exists());
     assert!(!temp.with_file_name("000000000001.gh-read.sock").exists());
 }
+
+fn hinted_retry_budgets() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static BUDGETS: std::sync::OnceLock<Mutex<HashMap<PathBuf, u64>>> = std::sync::OnceLock::new();
+    BUDGETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(super) fn hinted_retry_budget_ms(root: &Path) -> Option<u64> {
+    hinted_retry_budgets()
+        .lock()
+        .unwrap()
+        .get(&test_clock_key(root))
+        .copied()
+}
+
+/// Shorten the time a job submitted under `root` has for the runner to admit
+/// it, which bounds how long AFT keeps resubmitting after hinted refusals.
+fn shorten_hinted_retry_budget(root: &Path, ms: u64) {
+    hinted_retry_budgets()
+        .lock()
+        .unwrap()
+        .insert(test_clock_key(root), ms);
+}
+
+/// The worker asked the paused clock for no sleep since the last one a test
+/// consumed.
+fn assert_no_retry_sleep(clock: &mut PausedDrainingClock) {
+    if let Ok(event) = clock.events.try_recv() {
+        panic!("no retry wait was expected, got {event:?}");
+    }
+}
+
+const SIGNER_REFUSED: &str = "runner_authentication_failed (runner_sign_unavailable)";
+
+#[test]
+fn hinted_retry_needs_the_named_refusal_ran_none_and_a_hint() {
+    use crate::exec_remote::wire_tests::signer_refusal;
+    assert_eq!(
+        hinted_retry_after_ms(&signer_refusal("runner_sign_unavailable", Some(2000))),
+        Some(2000)
+    );
+    assert_eq!(
+        hinted_retry_after_ms(&signer_refusal("runner_sign_invalid_response", Some(5))),
+        Some(5)
+    );
+    // A refusal that needs an operator is never resubmitted, even with a hint.
+    assert_eq!(
+        hinted_retry_after_ms(&signer_refusal("runner_sign_missing", Some(2000))),
+        None
+    );
+    assert_eq!(
+        hinted_retry_after_ms(&signer_refusal("runner_sign_unavailable", None)),
+        None
+    );
+    // Only `ran: "none"` proves the command did not start.
+    for ran in [
+        None,
+        Some(Ran::Remote),
+        Some(Ran::Unknown("elsewhere".into())),
+    ] {
+        let mut record = signer_refusal("runner_sign_unavailable", Some(2000));
+        record.ran = ran.clone();
+        assert_eq!(hinted_retry_after_ms(&record), None, "{ran:?}");
+    }
+    // Other hinted refusals keep their own handling.
+    for reason in [RefusalReason::RunnerDraining, RefusalReason::RunnerDiskFull] {
+        let mut record = signer_refusal("runner_sign_unavailable", Some(2000));
+        record.outcome = Outcome::RefusedBeforeStart { reason };
+        assert_eq!(hinted_retry_after_ms(&record), None);
+    }
+}
+
+#[tokio::test]
+async fn runon_signer_refusal_is_resubmitted_after_its_hint_and_only_success_is_seen() {
+    use crate::exec_remote::wire_tests::{signer_refusal, SIGNER_REFUSAL_VECTOR};
+    // The fake runner sends ck-motor's record exactly, losing no field.
+    assert_eq!(
+        serde_json::to_value(StreamRecord::Terminal(signer_refusal(
+            "runner_sign_unavailable",
+            Some(2000)
+        )))
+        .unwrap(),
+        serde_json::from_str::<serde_json::Value>(SIGNER_REFUSAL_VECTOR).unwrap()
+    );
+    let daemon = daemon(
+        Script::SignerRefused {
+            refusals: 1,
+            detail: "runner_sign_unavailable",
+            retry_after_ms: Some(2000),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let first = clock.now();
+    clock.expect_sleep(first, first + 2000).await;
+    let waiting = registry.observed_status(&task, "session", 8192).unwrap();
+    assert!(!waiting.info.status.is_terminal(), "{waiting:?}");
+    assert!(waiting.remote_refusal.is_none(), "{waiting:?}");
+    assert_eq!(
+        registry.runon_launch_pending(&task, "session"),
+        Some(true),
+        "a foreground launch keeps waiting while the retry is pending"
+    );
+    assert_eq!(exec_runs(&daemon).len(), 1);
+    clock.advance(2000);
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    assert!(done.remote_refusal.is_none(), "{done:?}");
+    for hidden in ["runner_authentication_failed", "refused", "local-proof"] {
+        assert!(!done.output_preview.contains(hidden), "{done:?}");
+    }
+    let requests = exec_runs(&daemon);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1], "the same request is sent again");
+    assert_no_retry_sleep(&mut clock);
+}
+
+#[tokio::test]
+async fn runon_signer_hint_longer_than_the_admission_time_left_surfaces_the_refusal() {
+    let daemon = daemon(
+        Script::SignerRefused {
+            refusals: u32::MAX,
+            detail: "runner_sign_unavailable",
+            retry_after_ms: Some(2000),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    // Room for one 2 s wait, counted from the first submission; the second
+    // refusal's hint is longer than the 1 s then left.
+    shorten_hinted_retry_budget(dir.path(), 3000);
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let first = clock.now();
+    clock.expect_sleep(first, first + 2000).await;
+    clock.advance(2000);
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    assert_runon_refusal(&refusal_response(done), SIGNER_REFUSED);
+    assert_eq!(exec_runs(&daemon).len(), 2);
+    assert_eq!(clock.now(), first + 2000);
+    assert_no_retry_sleep(&mut clock);
+}
+
+#[tokio::test]
+async fn runon_operator_needed_signer_refusal_surfaces_at_once() {
+    let daemon = daemon(
+        Script::SignerRefused {
+            refusals: u32::MAX,
+            detail: "runner_sign_missing",
+            retry_after_ms: None,
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    assert_runon_refusal(
+        &refusal_response(done),
+        "runner_authentication_failed (runner_sign_missing)",
+    );
+    assert_eq!(exec_runs(&daemon).len(), 1);
+    assert_no_retry_sleep(&mut clock);
+}
+
+#[tokio::test]
+async fn runon_signer_retries_stop_after_five_resubmissions() {
+    let daemon = daemon(
+        Script::SignerRefused {
+            refusals: u32::MAX,
+            detail: "runner_sign_unavailable",
+            retry_after_ms: Some(100),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let first = clock.now();
+    for resubmission in 0..5 {
+        let from = first + resubmission * 100;
+        clock.expect_sleep(from, from + 100).await;
+        clock.advance(100);
+    }
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    assert_runon_refusal(&refusal_response(done), SIGNER_REFUSED);
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        6,
+        "one submission plus five resubmissions"
+    );
+    assert_no_retry_sleep(&mut clock);
+}
+
+#[tokio::test]
+async fn runon_kill_during_a_signer_retry_wait_ends_the_task_without_resubmitting() {
+    let daemon = daemon(
+        Script::SignerRefused {
+            refusals: u32::MAX,
+            detail: "runner_sign_unavailable",
+            retry_after_ms: Some(2000),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task_id = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let first = clock.now();
+    clock.expect_sleep(first, first + 2000).await;
+    let killing = registry.clone();
+    let killed_id = task_id.clone();
+    // With the retry clock frozen, a terminal kill proves cancellation woke
+    // the worker; the wall-clock timeout only guards against a deadlock.
+    let killed = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || killing.kill(&killed_id, "session")),
+    )
+    .await
+    .expect("kill must interrupt the retry wait without advancing the clock")
+    .unwrap()
+    .unwrap();
+    assert_eq!(killed.info.status, BgTaskStatus::Killed);
+    assert_eq!(clock.now(), first);
+    clock.advance(2000);
+    // Give a worker that wrongly kept waiting the chance to resubmit.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        1,
+        "kill must veto any new exec.run"
+    );
+}
+
+/// A draining resubmission is a fresh submission: a signer refusal with a
+/// hint on it is resubmitted too, within an admission time counted from that
+/// resubmission. The shortened budget is spent long before the draining wait
+/// ends, so counting from the first submission would surface the refusal.
+#[tokio::test]
+async fn runon_signer_retry_follows_a_live_draining_resubmission() {
+    let daemon = daemon(
+        Script::DrainingThenSigner {
+            signer_refusals: 1,
+            draining_after_ms: 500,
+            signer_after_ms: 100,
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_hinted_retry_budget(dir.path(), 150);
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let first = clock.now();
+    clock.expect_sleep(first, first + 500).await;
+    clock.advance(500);
+    clock.expect_sleep(first + 500, first + 600).await;
+    assert_eq!(exec_runs(&daemon).len(), 2);
+    clock.advance(100);
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    assert!(done.remote_refusal.is_none(), "{done:?}");
+    let requests = exec_runs(&daemon);
+    assert_eq!(requests.len(), 3);
+    assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_no_retry_sleep(&mut clock);
+}
+
+/// The same after a restart: the saved draining refusal is resumed by a new
+/// daemon, whose draining resubmission meets a hinted signer refusal.
+#[tokio::test]
+async fn runon_signer_retry_follows_a_draining_resubmission_resumed_after_restart() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+        Script::DrainingThenSigner {
+            signer_refusals: 1,
+            draining_after_ms: 200,
+            signer_after_ms: 100,
+        },
+        "exec-remote/v1",
+        2,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_hinted_retry_budget(dir.path(), 150);
+    let mut clock = PausedDrainingClock::new(dir.path());
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    let original = registry();
+    let task = start_runon_retry(&original, dir.path(), daemon.connection.clone());
+    clock.expect_event(DrainingClockEvent::Stopped).await;
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let first = clock.now();
+    clock.expect_sleep(first, first + 200).await;
+    clock.advance(200);
+    clock.expect_sleep(first + 200, first + 300).await;
+    assert_eq!(exec_runs(&daemon).len(), 2);
+    clock.advance(100);
+    let done = terminal(&restarted, &task).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    assert!(done.remote_refusal.is_none(), "{done:?}");
+    let requests = exec_runs(&daemon);
+    assert_eq!(requests.len(), 3);
+    assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_no_retry_sleep(&mut clock);
+}
+
+/// A retry wait that ends after the job's admission time has run out sends
+/// nothing: the clock moves past the deadline while the worker waits.
+#[tokio::test]
+async fn runon_signer_retry_that_wakes_after_the_deadline_surfaces_the_refusal() {
+    let daemon = daemon(
+        Script::SignerRefused {
+            refusals: u32::MAX,
+            detail: "runner_sign_unavailable",
+            retry_after_ms: Some(2000),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_hinted_retry_budget(dir.path(), 3000);
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let first = clock.now();
+    clock.expect_sleep(first, first + 2000).await;
+    // The worker wakes 5 s after the first submission, 2 s past its deadline.
+    clock.advance(5000);
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    assert_runon_refusal(&refusal_response(done), SIGNER_REFUSED);
+    assert_eq!(exec_runs(&daemon).len(), 1, "no request after the deadline");
+    assert_no_retry_sleep(&mut clock);
+}
+
+/// A zero hint on a job whose admission time is already used up sends
+/// nothing either, although it needs no wait at all.
+#[tokio::test]
+async fn runon_signer_zero_hint_after_the_deadline_surfaces_the_refusal() {
+    let daemon = daemon(
+        Script::SignerRefused {
+            refusals: u32::MAX,
+            detail: "runner_sign_unavailable",
+            retry_after_ms: Some(0),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    // No admission time at all: the deadline is the first submission itself.
+    shorten_hinted_retry_budget(dir.path(), 0);
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    assert_runon_refusal(&refusal_response(done), SIGNER_REFUSED);
+    assert_eq!(exec_runs(&daemon).len(), 1, "no request after the deadline");
+    assert_no_retry_sleep(&mut clock);
+}

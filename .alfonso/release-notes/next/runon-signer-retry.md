@@ -1,0 +1,1 @@
+- A `runon` command refused because the build server's signer was briefly unavailable is now resubmitted automatically after the server's retry hint, instead of failing.
