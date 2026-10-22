@@ -152,23 +152,23 @@ pub(crate) fn kill_process_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
-/// Build the command used by formatter and checker subprocesses.
-fn external_tool_command(command: &str, args: &[&str]) -> Result<Command, FormatError> {
-    #[cfg(windows)]
-    if crate::windows_command::is_batch_file(Path::new(command)) {
-        return crate::windows_command::batch_command(
-            Path::new(command),
-            args.iter().map(|arg| std::ffi::OsStr::new(*arg)),
-        )
-        .map_err(|error| FormatError::Failed {
+/// Build a formatter, checker, or version-probe command under the request's
+/// resolved shell policy, without deriving a second policy from configuration.
+fn external_tool_command(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    command: &str,
+    args: &[&str],
+) -> Result<Command, FormatError> {
+    let args = args
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+    tool_policy
+        .command(std::ffi::OsStr::new(command), &args)
+        .map_err(|stderr| FormatError::Failed {
             tool: command.to_string(),
-            stderr: error.to_string(),
-        });
-    }
-
-    let mut cmd = crate::effective_path::new_command(command).build();
-    cmd.args(args);
-    Ok(cmd)
+            stderr,
+        })
 }
 
 /// Spawn a subprocess and wait for completion with timeout protection.
@@ -178,12 +178,13 @@ fn external_tool_command(command: &str, args: &[&str]) -> Result<Command, Format
 /// and waits for it to exit. Returns `FormatError::NotFound` when the binary
 /// isn't on PATH.
 pub fn run_external_tool(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     command: &str,
     args: &[&str],
     working_dir: Option<&Path>,
     timeout_secs: u32,
 ) -> Result<ExternalToolResult, FormatError> {
-    let mut cmd = external_tool_command(command, args)?;
+    let mut cmd = external_tool_command(tool_policy, command, args)?;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     if let Some(dir) = working_dir {
@@ -684,9 +685,12 @@ pub(crate) fn tool_available_for_missing_warning(tool: &str, project_root: Optio
     resolve_tool_uncached(tool, project_root).is_some()
 }
 
-fn ruff_format_available(project_root: Option<&Path>) -> RuffAvailability {
+fn ruff_format_available(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    project_root: Option<&Path>,
+) -> RuffAvailability {
     ruff_format_availability_with_probe(project_root, || {
-        ruff_format_available_uncached(project_root)
+        ruff_format_available_uncached(tool_policy, project_root)
     })
 }
 
@@ -712,12 +716,15 @@ fn ruff_format_availability_with_probe(
     result
 }
 
-fn ruff_format_available_uncached(project_root: Option<&Path>) -> RuffAvailability {
+fn ruff_format_available_uncached(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    project_root: Option<&Path>,
+) -> RuffAvailability {
     let command = match resolve_tool("ruff", project_root) {
         Some(command) => command,
         None => return RuffAvailability::Unavailable,
     };
-    let version_command = match external_tool_command(&command, &["--version"]) {
+    let version_command = match external_tool_command(tool_policy, &command, &["--version"]) {
         Ok(command) => command,
         Err(_) => return RuffAvailability::Unavailable,
     };
@@ -1649,7 +1656,11 @@ fn formatter_excluded_path(stderr: &str) -> bool {
 /// - `"timeout"` — formatter exceeded `formatter_timeout_secs`
 /// - `"error"` — formatter exited non-zero with an unrecognized error
 ///   (likely a real bug in the user's input or the formatter itself)
-pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
+pub fn auto_format(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    path: &Path,
+    config: &Config,
+) -> (bool, Option<String>) {
     // Check if formatting is disabled via plugin config
     if !config.format_on_edit {
         return (false, Some("no_formatter_configured".to_string()));
@@ -1695,7 +1706,7 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
     // configure or warm-time availability detection. The availability cache
     // makes a burst of formats probe once for this project generation.
     if formatter_tool == "ruff" {
-        match ruff_format_available(config.project_root.as_deref()) {
+        match ruff_format_available(tool_policy, config.project_root.as_deref()) {
             RuffAvailability::Available => {}
             RuffAvailability::Unavailable => {
                 crate::slog_warn!(
@@ -1724,7 +1735,13 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
     // process CWD differs from the project root.
     let working_dir = config.project_root.as_deref();
 
-    match run_external_tool(&cmd, &arg_refs, working_dir, config.formatter_timeout_secs) {
+    match run_external_tool(
+        tool_policy,
+        &cmd,
+        &arg_refs,
+        working_dir,
+        config.formatter_timeout_secs,
+    ) {
         Ok(_) => {
             crate::slog_info!("format: {} ({})", path.display(), cmd);
             (true, None)
@@ -1781,12 +1798,13 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
 /// Returns `FormatError::NotFound` when the binary isn't on PATH, and
 /// `FormatError::Timeout` if the deadline is exceeded.
 pub fn run_external_tool_capture(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     command: &str,
     args: &[&str],
     working_dir: Option<&Path>,
     timeout_secs: u32,
 ) -> Result<ExternalToolResult, FormatError> {
-    let mut cmd = external_tool_command(command, args)?;
+    let mut cmd = external_tool_command(tool_policy, command, args)?;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     if let Some(dir) = working_dir {
@@ -1914,7 +1932,11 @@ struct CheckerBatch {
 /// Run each resolved checker once against the final project state. The root is
 /// the configured project root, just as in single-file validation; detection is
 /// deliberately delayed so edits to checker configuration are also visible.
-pub(crate) fn validate_full_batch(paths: &[PathBuf], config: &Config) -> BatchValidation {
+pub(crate) fn validate_full_batch(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    paths: &[PathBuf],
+    config: &Config,
+) -> BatchValidation {
     let mut validation = BatchValidation {
         files: Vec::new(),
         checkers: Vec::new(),
@@ -2032,6 +2054,7 @@ pub(crate) fn validate_full_batch(paths: &[PathBuf], config: &Config) -> BatchVa
         }
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let result = run_external_tool_capture(
+            tool_policy,
             &batch.command,
             &arg_refs,
             batch.root.as_deref(),
@@ -2718,7 +2741,11 @@ fn short_output_tail(output: &str) -> Option<String> {
 ///
 /// Skip reasons: `"unsupported_language"`, `"no_checker_configured"`,
 /// `"checker_not_installed"`, `"timeout"`, `"error"`
-pub fn validate_full(path: &Path, config: &Config) -> (Vec<ValidationError>, Option<String>) {
+pub fn validate_full(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    path: &Path,
+    config: &Config,
+) -> (Vec<ValidationError>, Option<String>) {
     let lang = match detect_language(path) {
         Some(l) => l,
         None => {
@@ -2762,6 +2789,7 @@ pub fn validate_full(path: &Path, config: &Config) -> (Vec<ValidationError>, Opt
     let working_dir = config.project_root.as_deref();
 
     match run_external_tool_capture(
+        tool_policy,
         &cmd,
         &arg_refs,
         working_dir,
@@ -2818,6 +2846,65 @@ pub fn validate_full(path: &Path, config: &Config) -> (Vec<ValidationError>, Opt
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn formatter_checker_and_ruff_probe_refuse_without_running_project_code() {
+        use crate::sandbox_spawn::{SpawnPlan, ToolLaunchPolicy};
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("node_modules/.bin");
+        fs::create_dir_all(&bin).unwrap();
+        let marker = root.path().join("ran");
+        for tool in ["biome", "ruff"] {
+            let path = bin.join(tool);
+            fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\n: > '{}'\nprintf 'ruff 0.1.2\\n'\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(root.path().join("biome.json"), "{}").unwrap();
+        let path = root.path().join("test.js");
+        fs::write(&path, "let answer = 1;\n").unwrap();
+        let config = Config {
+            format_on_edit: true,
+            project_root: Some(root.path().to_path_buf()),
+            ..Config::default()
+        };
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config.clone(),
+        );
+        let policy = crate::sandbox_spawn::with_spawn_plan_for_test(
+            SpawnPlan::refused_for_test("sandbox_unavailable"),
+            || ToolLaunchPolicy::resolve(&ctx),
+        );
+        assert_eq!(
+            auto_format(&policy, &path, &config),
+            (false, Some("error".into()))
+        );
+        assert_eq!(
+            validate_full(&policy, &path, &config).1.as_deref(),
+            Some("error")
+        );
+        let batch = validate_full_batch(&policy, &[path], &config);
+        assert_eq!(batch.files[0].skipped_reason.as_deref(), Some("error"));
+        assert_eq!(
+            ruff_format_available_uncached(&policy, config.project_root.as_deref()),
+            RuffAvailability::Unavailable
+        );
+        assert!(
+            !marker.exists(),
+            "a refused launch must not run any project tool"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn ruff_availability_does_not_accept_a_probe_after_its_deadline() {
@@ -2910,7 +2997,11 @@ mod tests {
             ..Config::default()
         };
 
-        let (formatted, reason) = auto_format(&path, &config);
+        let (formatted, reason) = auto_format(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            &config,
+        );
         assert!(!formatted);
         assert_eq!(reason.as_deref(), Some("formatter_version_check_timeout"));
     }
@@ -3009,7 +3100,11 @@ mod tests {
             counting_checker(dir.path(), "pyright", "", 0);
             let paths = ["one.ts", "two.ts", "one.ts", "one.py", "two.py"]
                 .map(|path| dir.path().join(path));
-            let validation = validate_full_batch(&paths, &config);
+            let validation = validate_full_batch(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &paths,
+                &config,
+            );
             assert_eq!(validation.files.len(), 4);
             assert!(validation
                 .files
@@ -3054,7 +3149,11 @@ mod tests {
                     ..Config::default()
                 };
                 let paths = ["one/main.go", "two/main.go"].map(|path| dir.path().join(path));
-                let validation = validate_full_batch(&paths, &config);
+                let validation = validate_full_batch(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                    &paths,
+                    &config,
+                );
                 assert!(validation
                     .files
                     .iter()
@@ -3084,7 +3183,11 @@ mod tests {
             ..Config::default()
         };
         let paths = ["one.ts", "two.ts", "notes.txt", "one.py"].map(|path| dir.path().join(path));
-        let validation = validate_full_batch(&paths, &config);
+        let validation = validate_full_batch(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &paths,
+            &config,
+        );
         for path in &paths[..2] {
             let mut entry = serde_json::json!({});
             validation.append_to(path, &mut entry);
@@ -3116,7 +3219,11 @@ mod tests {
             checker: [("typescript".to_string(), "tsc".to_string())].into(),
             ..Config::default()
         };
-        let validation = validate_full_batch(&paths, &config);
+        let validation = validate_full_batch(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &paths,
+            &config,
+        );
         assert_eq!(validation.files[0].errors.len(), 1);
         assert_eq!(validation.files[0].errors[0].file, "one.ts");
         assert!(validation.files[1].errors.is_empty());
@@ -3176,7 +3283,14 @@ mod tests {
     fn run_external_tool_wakes_when_the_tool_exits() {
         let before = FULL_POLL_SLEEPS.with(|count| count.get());
         for _ in 0..5 {
-            let result = run_external_tool("sh", &["-c", "echo done"], None, 30).unwrap();
+            let result = run_external_tool(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                "sh",
+                &["-c", "echo done"],
+                None,
+                30,
+            )
+            .unwrap();
             assert_eq!(result.stdout.trim(), "done");
         }
         assert_eq!(FULL_POLL_SLEEPS.with(|count| count.get()) - before, 0);
@@ -3187,15 +3301,27 @@ mod tests {
     #[test]
     fn run_external_tool_waits_for_exit_after_pipes_close() {
         let started = Instant::now();
-        let result =
-            run_external_tool("sh", &["-c", "exec >&- 2>&-; sleep 0.3; exit 0"], None, 30).unwrap();
+        let result = run_external_tool(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            "sh",
+            &["-c", "exec >&- 2>&-; sleep 0.3; exit 0"],
+            None,
+            30,
+        )
+        .unwrap();
         assert_eq!(result.exit_code, 0);
         assert!(started.elapsed() >= Duration::from_millis(300));
     }
 
     #[test]
     fn run_external_tool_not_found() {
-        let result = run_external_tool("__nonexistent_tool_xyz__", &[], None, 5);
+        let result = run_external_tool(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            "__nonexistent_tool_xyz__",
+            &[],
+            None,
+            5,
+        );
         assert!(result.is_err());
         match result.unwrap_err() {
             FormatError::NotFound { tool } => {
@@ -3214,7 +3340,13 @@ mod tests {
     fn external_tools_spawn_without_fork() {
         let workdir = tempfile::tempdir().unwrap();
         let (result, forks) = crate::effective_path::fork_counter::forks_during(|| {
-            run_external_tool("/bin/sh", &["-c", "pwd"], Some(workdir.path()), 30)
+            run_external_tool(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                "/bin/sh",
+                &["-c", "pwd"],
+                Some(workdir.path()),
+                30,
+            )
         });
         let result = result.unwrap();
         let expected = std::fs::canonicalize(workdir.path()).unwrap();
@@ -3226,7 +3358,13 @@ mod tests {
         assert_eq!(forks, 0, "run_external_tool used fork+exec");
 
         let (result, forks) = crate::effective_path::fork_counter::forks_during(|| {
-            run_external_tool_capture("/bin/sh", &["-c", "exit 3"], Some(workdir.path()), 30)
+            run_external_tool_capture(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                "/bin/sh",
+                &["-c", "exit 3"],
+                Some(workdir.path()),
+                30,
+            )
         });
         assert_eq!(result.unwrap().exit_code, 3);
         assert_eq!(forks, 0, "run_external_tool_capture used fork+exec");
@@ -3323,7 +3461,13 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let pid_file = workdir.path().join("grandchild.pid");
         let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
-        let result = run_external_tool("/bin/sh", &["-c", &script], None, 1);
+        let result = run_external_tool(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            "/bin/sh",
+            &["-c", &script],
+            None,
+            1,
+        );
         assert!(
             matches!(result, Err(FormatError::Timeout { .. })),
             "{result:?}"
@@ -3373,7 +3517,13 @@ mod tests {
         } else {
             ("sleep", &["60"])
         };
-        let result = run_external_tool(tool, args, None, 1);
+        let result = run_external_tool(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            tool,
+            args,
+            None,
+            1,
+        );
         assert!(result.is_err());
         match result.unwrap_err() {
             FormatError::Timeout { tool, timeout_secs } => {
@@ -3392,7 +3542,13 @@ mod tests {
         } else {
             ("echo", &["hello"])
         };
-        let result = run_external_tool(tool, args, None, 5);
+        let result = run_external_tool(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            tool,
+            args,
+            None,
+            5,
+        );
         assert!(result.is_ok());
         let res = result.unwrap();
         assert_eq!(res.exit_code, 0);
@@ -3406,8 +3562,14 @@ mod tests {
         let shim = temp.path().join("formatter shim.cmd");
         std::fs::write(&shim, "@echo off\r\necho %~1\r\n").unwrap();
 
-        let result =
-            run_external_tool(shim.to_str().unwrap(), &["--stdin-filepath"], None, 5).unwrap();
+        let result = run_external_tool(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            shim.to_str().unwrap(),
+            &["--stdin-filepath"],
+            None,
+            5,
+        )
+        .unwrap();
 
         assert_eq!(result.stdout.trim(), "--stdin-filepath");
     }
@@ -3417,6 +3579,7 @@ mod tests {
     fn format_helper_handles_large_stderr_without_deadlock() {
         let start = Instant::now();
         let result = run_external_tool_capture(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
             "sh",
             &[
                 "-c",
@@ -3444,7 +3607,13 @@ mod tests {
         } else {
             ("false", &[])
         };
-        let result = run_external_tool(tool, args, None, 5);
+        let result = run_external_tool(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            tool,
+            args,
+            None,
+            5,
+        );
         assert!(result.is_err());
         match result.unwrap_err() {
             FormatError::Failed { tool, .. } => {
@@ -3466,7 +3635,11 @@ mod tests {
             format_on_edit: true,
             ..Config::default()
         };
-        let (formatted, reason) = auto_format(&path, &config);
+        let (formatted, reason) = auto_format(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            &config,
+        );
         assert!(!formatted);
         assert_eq!(reason.as_deref(), Some("unsupported_language"));
     }
@@ -3715,7 +3888,11 @@ mod tests {
             formatter_timeout_secs: 120,
             ..Config::default()
         };
-        let (formatted, reason) = auto_format(&path, &config);
+        let (formatted, reason) = auto_format(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            &config,
+        );
         // Name the skip reason on failure: this has failed on loaded Windows
         // runners with no way to tell a rustfmt timeout from a resolve miss.
         assert!(
@@ -3878,7 +4055,11 @@ mod tests {
         fs::write(&path, "hello").unwrap();
 
         let config = Config::default();
-        let (errors, reason) = validate_full(&path, &config);
+        let (errors, reason) = validate_full(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            &config,
+        );
         assert!(errors.is_empty());
         assert_eq!(reason.as_deref(), Some("unsupported_language"));
     }
@@ -4019,7 +4200,11 @@ mod tests {
             .checker
             .insert("typescript".to_string(), "tsgo".to_string());
 
-        let (errors, reason) = validate_full(&path, &config);
+        let (errors, reason) = validate_full(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            &config,
+        );
         assert_eq!(reason, None);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].line, 1);
@@ -4035,14 +4220,26 @@ mod tests {
         } else {
             ("false", &[])
         };
-        let result = run_external_tool_capture(tool, args, None, 5);
+        let result = run_external_tool_capture(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            tool,
+            args,
+            None,
+            5,
+        );
         assert!(result.is_ok(), "capture should not error on non-zero exit");
         assert_eq!(result.unwrap().exit_code, 1);
     }
 
     #[test]
     fn run_external_tool_capture_not_found() {
-        let result = run_external_tool_capture("__nonexistent_xyz__", &[], None, 5);
+        let result = run_external_tool_capture(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            "__nonexistent_xyz__",
+            &[],
+            None,
+            5,
+        );
         assert!(result.is_err());
         match result.unwrap_err() {
             FormatError::NotFound { tool } => assert_eq!(tool, "__nonexistent_xyz__"),
@@ -4319,7 +4516,10 @@ C:\repo\other.go:1:1: other file
         };
 
         assert_eq!(
-            ruff_format_available(config.project_root.as_deref()),
+            ruff_format_available(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                config.project_root.as_deref()
+            ),
             RuffAvailability::Unavailable
         );
         let (cmd, args) = detect_type_checker(&path, LangId::Python, &config).unwrap();

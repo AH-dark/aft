@@ -91,7 +91,8 @@ impl WindowsShell {
     /// Returns owned strings so callers can pass temporary wrapper paths.
     pub(crate) fn pty_wrapper_args(&self, wrapper_path: &Path) -> Vec<String> {
         match self {
-            WindowsShell::Cmd => vec!["/c".into(), wrapper_path.display().to_string()],
+            // Disable registry AutoRun before cmd reads and executes the wrapper.
+            WindowsShell::Cmd => vec!["/D".into(), "/c".into(), wrapper_path.display().to_string()],
             WindowsShell::Pwsh | WindowsShell::Powershell => vec![
                 "-NoProfile".into(),
                 "-NonInteractive".into(),
@@ -875,7 +876,11 @@ mod tests {
         let wrapper = PathBuf::from(r"C:\tmp\task.bat");
         assert_eq!(
             WindowsShell::Cmd.pty_wrapper_args(&wrapper),
-            vec!["/c".to_string(), wrapper.display().to_string()]
+            vec![
+                "/D".to_string(),
+                "/c".to_string(),
+                wrapper.display().to_string()
+            ]
         );
         assert_eq!(
             WindowsShell::Pwsh.pty_wrapper_args(&wrapper),
@@ -889,6 +894,19 @@ mod tests {
         assert_eq!(
             WindowsShell::Posix(PathBuf::from(r"C:\Git\bin\bash.exe")).pty_wrapper_args(&wrapper),
             vec![wrapper.display().to_string()]
+        );
+    }
+
+    #[test]
+    fn pty_cmd_wrapper_disables_autorun_before_the_wrapper() {
+        let wrapper = PathBuf::from(r"C:\tmp\task.bat");
+        assert_eq!(
+            WindowsShell::Cmd.pty_wrapper_args(&wrapper),
+            vec![
+                "/D".to_string(),
+                "/c".to_string(),
+                wrapper.display().to_string()
+            ]
         );
     }
 

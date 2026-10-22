@@ -131,10 +131,11 @@ fn scan_with_read_exemption(
 
     let mut asks = Vec::new();
     let mut seen = HashSet::new();
-    let mut scan_cwd = cwd.clone();
+    // Unknown directory changes must not resolve later paths against a stale base.
+    let mut scan_cwd = Some(cwd.clone());
     // Directories pushed by `pushd` earlier in this command line. The shell's
     // own stack from before the command is unknown, so a `popd` past these
-    // entries leaves the tracked directory unchanged.
+    // entries leaves the directory unknown.
     let mut directory_stack = Vec::new();
     for node in command_nodes {
         let parts = command_parts(command, node);
@@ -146,13 +147,21 @@ fn scan_with_read_exemption(
         let head = tokens[0].as_str();
 
         if CWD_COMMANDS.contains(&head) {
-            collect_redirection_targets(command, node, &scan_cwd, |target| match target {
-                RedirectTarget::Path { path, input_only } => {
-                    let exemption = if input_only { read_exemption } else { None };
-                    push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
-                }
-                RedirectTarget::Dynamic => {}
-            });
+            collect_redirection_targets(
+                command,
+                node,
+                scan_cwd.as_deref(),
+                |target| match target {
+                    RedirectTarget::Path { path, input_only } => {
+                        let exemption = if input_only { read_exemption } else { None };
+                        push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
+                    }
+                    RedirectTarget::RelativeToUnknown(text) => {
+                        push_unknown_base_path(&mut asks, &mut seen, text);
+                    }
+                    RedirectTarget::Dynamic => {}
+                },
+            );
             let home = std::env::var_os("HOME").map(PathBuf::from);
             track_cwd_change(
                 head,
@@ -171,9 +180,12 @@ fn scan_with_read_exemption(
                 None
             };
             for arg in path_args(&parts) {
-                match path_arg_target(arg, &scan_cwd) {
+                match path_arg_target(arg, scan_cwd.as_deref()) {
                     PathArgTarget::Path(path) => {
                         push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
+                    }
+                    PathArgTarget::RelativeToUnknown(text) => {
+                        push_unknown_base_path(&mut asks, &mut seen, text);
                     }
                     // A dynamic target (e.g. `rm "$DEST/file"`) can't be
                     // resolved to a concrete directory. Matching native
@@ -188,12 +200,15 @@ fn scan_with_read_exemption(
             }
         }
 
-        collect_redirection_targets(command, node, &scan_cwd, |target| match target {
+        collect_redirection_targets(command, node, scan_cwd.as_deref(), |target| match target {
             RedirectTarget::Path { path, input_only } => {
                 // Only a plain `<` input redirect reads its target; `>`, `>>`,
                 // `&>`, `<>` and friends can create or truncate it.
                 let exemption = if input_only { read_exemption } else { None };
                 push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
+            }
+            RedirectTarget::RelativeToUnknown(text) => {
+                push_unknown_base_path(&mut asks, &mut seen, text);
             }
             // Dynamic redirect target (e.g. `echo hi > "$FOO/bar"`): no
             // external_directory ask, same rationale as dynamic path args
@@ -828,11 +843,13 @@ enum RedirectTarget {
         path: PathBuf,
         input_only: bool,
     },
+    RelativeToUnknown(String),
     Dynamic,
 }
 
 enum PathArgTarget {
     Path(PathBuf),
+    RelativeToUnknown(String),
     Dynamic,
     None,
 }
@@ -840,34 +857,48 @@ enum PathArgTarget {
 fn collect_redirection_targets(
     source: &str,
     command: Node<'_>,
-    cwd: &Path,
+    cwd: Option<&Path>,
     mut on_target: impl FnMut(RedirectTarget),
 ) {
     // In tree-sitter-bash, redirects on `echo hi > /tmp/out` are siblings of
     // the `command` node, wrapped inside `redirected_statement`. Walking
-    // `command.children` would miss them. Walk from the parent
-    // (`redirected_statement`) when present, otherwise fall back to walking
-    // `command` itself in case a future grammar version inlines redirections
-    // under `command`.
-    let walk_root = match command.parent() {
-        Some(parent) if parent.kind() == "redirected_statement" => parent,
-        _ => command,
-    };
-    let mut cursor = walk_root.walk();
-    for child in walk_root.children(&mut cursor) {
-        // Skip the inner `command` node itself — its children are arguments,
-        // not redirections, and re-walking them is just wasted work.
-        if child.id() == command.id() {
-            continue;
+    // `command.children` would miss them. Lists and pipelines can also carry
+    // this wrapper: only their last command owns the trailing redirect, in
+    // the directory in effect for that command.
+    let mut body = command;
+    while let Some(parent) = body.parent() {
+        match parent.kind() {
+            "redirected_statement" => {
+                let mut cursor = parent.walk();
+                for child in parent.children(&mut cursor) {
+                    if child.id() != body.id() {
+                        collect_redirection_targets_from_node(source, child, cwd, &mut on_target);
+                    }
+                }
+                return;
+            }
+            "list" | "pipeline" if is_last_named_child(parent, body) => body = parent,
+            _ => break,
         }
+    }
+    let mut cursor = command.walk();
+    for child in command.children(&mut cursor) {
         collect_redirection_targets_from_node(source, child, cwd, &mut on_target);
     }
+}
+
+fn is_last_named_child(parent: Node<'_>, child: Node<'_>) -> bool {
+    parent
+        .named_child_count()
+        .checked_sub(1)
+        .and_then(|last| parent.named_child(last as u32))
+        .is_some_and(|last| last.id() == child.id())
 }
 
 fn collect_redirection_targets_from_node(
     source: &str,
     node: Node<'_>,
-    cwd: &Path,
+    cwd: Option<&Path>,
     on_target: &mut impl FnMut(RedirectTarget),
 ) {
     // tree-sitter-bash 0.25.x emits `file_redirect` and `heredoc_redirect`
@@ -900,6 +931,9 @@ fn collect_redirection_targets_from_node(
                     PathArgTarget::Path(path) => {
                         on_target(RedirectTarget::Path { path, input_only })
                     }
+                    PathArgTarget::RelativeToUnknown(text) => {
+                        on_target(RedirectTarget::RelativeToUnknown(text));
+                    }
                     PathArgTarget::Dynamic => on_target(RedirectTarget::Dynamic),
                     PathArgTarget::None => {}
                 }
@@ -921,55 +955,47 @@ fn is_dynamic_node(node: Node<'_>) -> bool {
     )
 }
 
-/// Follow the literal forms of `cd`, `pushd` and `popd` so later relative
-/// paths resolve where the shell will actually be. Forms whose target is not
-/// known here (`cd -`, a dynamic directory, stack rotation with `+N`/`-N`)
-/// leave the tracked directory unchanged.
+/// Follow directory changes, marking an unknowable destination as unknown
+/// until an absolute literal change (or bare `cd` to HOME) restores the base.
 fn track_cwd_change(
     head: &str,
     parts: &[Part],
     home: Option<&Path>,
-    scan_cwd: &mut PathBuf,
-    directory_stack: &mut Vec<PathBuf>,
+    scan_cwd: &mut Option<PathBuf>,
+    directory_stack: &mut Vec<Option<PathBuf>>,
 ) {
     let args = parts.iter().skip(1).map(|part| part.text.as_str());
     let options_only = args.clone().all(|arg| arg.starts_with('-') && arg != "-");
+    let target = |cwd: &Option<PathBuf>| {
+        path_args(parts)
+            .next()
+            .and_then(|arg| arg_path(arg, cwd.as_deref()))
+    };
     match head {
         "cd" => {
-            if options_only {
+            *scan_cwd = if options_only {
                 // A bare `cd` goes to the home directory.
-                if let Some(home) = home {
-                    *scan_cwd = resolve_existing(home);
-                }
-            } else if !args.clone().any(|arg| arg == "-") {
-                if let Some(path) = path_args(parts)
-                    .next()
-                    .and_then(|arg| arg_path(arg, scan_cwd))
-                {
-                    *scan_cwd = path;
-                }
-            }
+                home.map(resolve_existing)
+            } else if args.clone().any(|arg| arg == "-") {
+                None
+            } else {
+                target(scan_cwd)
+            };
         }
         "pushd" => {
-            if args
-                .clone()
-                .any(|arg| arg.starts_with('+') || arg.starts_with('-'))
-            {
-                return;
-            }
-            if let Some(path) = path_args(parts)
-                .next()
-                .and_then(|arg| arg_path(arg, scan_cwd))
-            {
-                directory_stack.push(std::mem::replace(scan_cwd, path));
-            }
+            let rotates = options_only
+                || args
+                    .clone()
+                    .any(|arg| arg.starts_with('+') || arg.starts_with('-'));
+            let next = if rotates { None } else { target(scan_cwd) };
+            directory_stack.push(std::mem::replace(scan_cwd, next));
         }
         "popd" => {
-            if options_only {
-                if let Some(previous) = directory_stack.pop() {
-                    *scan_cwd = previous;
-                }
-            }
+            *scan_cwd = if options_only {
+                directory_stack.pop().flatten()
+            } else {
+                None
+            };
         }
         _ => {}
     }
@@ -986,17 +1012,25 @@ fn path_args(parts: &[Part]) -> impl Iterator<Item = &str> {
     })
 }
 
-fn arg_path(arg: &str, cwd: &Path) -> Option<PathBuf> {
+fn arg_path(arg: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     match path_arg_target(arg, cwd) {
         PathArgTarget::Path(path) => Some(path),
-        PathArgTarget::Dynamic | PathArgTarget::None => None,
+        PathArgTarget::RelativeToUnknown(_) | PathArgTarget::Dynamic | PathArgTarget::None => None,
     }
 }
 
-fn path_arg_target(arg: &str, cwd: &Path) -> PathArgTarget {
+fn path_arg_target(arg: &str, cwd: Option<&Path>) -> PathArgTarget {
     let text = home(&unquote(arg), cwd);
     if dynamic(&text) {
         return PathArgTarget::Dynamic;
+    }
+
+    if cwd.is_none()
+        && !text.is_empty()
+        && !Path::new(&text).is_absolute()
+        && !is_device_file(&text)
+    {
+        return PathArgTarget::RelativeToUnknown(text);
     }
 
     let Some(text) = glob_prefix(&text) else {
@@ -1018,7 +1052,10 @@ fn path_arg_target(arg: &str, cwd: &Path) -> PathArgTarget {
     let resolved = if path.is_absolute() {
         path
     } else {
-        cwd.join(path)
+        match cwd {
+            Some(cwd) => cwd.join(path),
+            None => return PathArgTarget::None,
+        }
     };
     PathArgTarget::Path(resolve_existing(&resolved))
 }
@@ -1040,7 +1077,7 @@ fn unquote(text: &str) -> String {
     out
 }
 
-fn home(text: &str, cwd: &Path) -> String {
+fn home(text: &str, cwd: Option<&Path>) -> String {
     if text == "~" {
         return std::env::var("HOME").unwrap_or_else(|_| text.to_string());
     }
@@ -1050,11 +1087,15 @@ fn home(text: &str, cwd: &Path) -> String {
         }
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    let pwd = cwd.to_string_lossy();
-    text.replace("$HOME", &home)
-        .replace("${HOME}", &home)
-        .replace("$PWD", pwd.as_ref())
-        .replace("${PWD}", pwd.as_ref())
+    let text = text.replace("$HOME", &home).replace("${HOME}", &home);
+    match cwd {
+        Some(cwd) => {
+            let pwd = cwd.to_string_lossy();
+            text.replace("$PWD", pwd.as_ref())
+                .replace("${PWD}", pwd.as_ref())
+        }
+        None => text,
+    }
 }
 
 fn glob_prefix(text: &str) -> Option<&str> {
@@ -1175,6 +1216,19 @@ fn push_external_path(
     );
 }
 
+// An unknown base cannot safely grant this relative name in every directory.
+fn push_unknown_base_path(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, text: String) {
+    push_ask(
+        asks,
+        seen,
+        PermissionAsk {
+            kind: PermissionKind::ExternalDirectory,
+            patterns: vec![text],
+            always: Vec::new(),
+        },
+    );
+}
+
 fn push_ask(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, ask: PermissionAsk) {
     let key = format!("{:?}:{:?}:{:?}", ask.kind, ask.patterns, ask.always);
     if seen.insert(key) {
@@ -1218,6 +1272,14 @@ mod tests {
         top_level_directory_targets(command, cwd)
             .into_iter()
             .map(|target| target.path)
+            .collect()
+    }
+
+    fn external_ask_shapes(command: &str, project: &Path) -> Vec<(Vec<String>, Vec<String>)> {
+        scan_with_project_root(command, project, project)
+            .into_iter()
+            .filter(|ask| matches!(ask.kind, PermissionKind::ExternalDirectory))
+            .map(|ask| (ask.patterns, ask.always))
             .collect()
     }
 
@@ -1358,6 +1420,27 @@ mod tests {
                 directory_paths(&command, &cwd),
                 vec![cwd.clone(), cwd.join("nested")],
                 "{prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_paths_after_an_unknown_directory_change_ask() {
+        let project = tempfile::tempdir().unwrap();
+        for (command, path) in [
+            ("cd \"$TARGET\" && rm -rf build", "build"),
+            ("cd - && rm notes.txt", "notes.txt"),
+            ("popd && rm notes.txt", "notes.txt"),
+            ("pushd +1 && rm notes.txt", "notes.txt"),
+            ("pushd && rm notes.txt", "notes.txt"),
+            ("cd \"$TARGET\" && cd sub && rm notes.txt", "notes.txt"),
+            ("cd \"$TARGET\" && echo hi > out.txt", "out.txt"),
+            ("cd \"$TARGET\"; cat 'quoted name'/file", "quoted name/file"),
+        ] {
+            assert_eq!(
+                external_ask_shapes(command, project.path()),
+                vec![(vec![path.to_string()], Vec::new())],
+                "{command}"
             );
         }
     }
@@ -1684,6 +1767,67 @@ mod tests {
             vec![sibling.canonicalize().unwrap().join("missing")]
         );
     }
+
+    #[test]
+    fn unknown_directory_never_produces_a_blanket_ask() {
+        let project = tempfile::tempdir().unwrap();
+        assert!(external_ask_shapes("cd \"$TARGET\" && rm \"$NAME\"", project.path()).is_empty());
+        assert!(
+            external_ask_shapes("cd \"$TARGET\" && make 2>&1 > /dev/null", project.path())
+                .is_empty()
+        );
+        let asks = external_ask_shapes("cd \"$TARGET\" && rm -rf build '*/*.txt'", project.path());
+        assert_eq!(
+            asks,
+            vec![
+                (vec!["build".into()], vec![]),
+                (vec!["*/*.txt".into()], vec![])
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_absolute_directory_change_ends_the_unknown_state() {
+        let project = tempfile::tempdir().unwrap();
+        let usr = vec![(vec!["/usr/*".to_string()], vec!["/usr/*".to_string()])];
+        assert_eq!(
+            external_ask_shapes(
+                "cd \"$TARGET\" && cd /usr && rm aft-scan-probe",
+                project.path()
+            ),
+            usr
+        );
+        assert_eq!(
+            external_ask_shapes("cd \"$TARGET\" && rm /usr/aft-scan-probe", project.path()),
+            usr
+        );
+        let inside = project.path().display().to_string();
+        assert!(external_ask_shapes(
+            &format!("cd \"$TARGET\" && cd '{inside}' && rm notes.txt"),
+            project.path()
+        )
+        .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trailing_redirect_after_a_list_belongs_to_the_last_command() {
+        let project = tempfile::tempdir().unwrap();
+        let usr = vec![(vec!["/usr/*".to_string()], vec!["/usr/*".to_string()])];
+        for command in [
+            "cd /usr && echo hi > out.txt",
+            "true && echo hi > /usr/aft-scan-probe",
+            "echo hi | cat > /usr/aft-scan-probe",
+        ] {
+            assert_eq!(
+                external_ask_shapes(command, project.path()),
+                usr,
+                "{command}"
+            );
+        }
+        assert!(external_ask_shapes("echo hi > out.txt && cd /usr", project.path()).is_empty());
+    }
     use crate::bash_permissions::normalize_path;
 
     #[cfg(windows)]
@@ -1766,14 +1910,14 @@ mod tests {
         let scan_cwd = temp.path().join("project").join("subdir");
         std::fs::create_dir_all(&scan_cwd).unwrap();
 
-        let path = arg_path("$PWD/output.log", &scan_cwd).unwrap();
+        let path = arg_path("$PWD/output.log", Some(&scan_cwd)).unwrap();
 
         assert_eq!(path, normalize_path(&scan_cwd.join("output.log")));
     }
 
     #[test]
     fn dynamic_file_arg_is_reported_as_dynamic_target() {
-        let target = path_arg_target(r#""$DEST/file""#, Path::new("/tmp"));
+        let target = path_arg_target(r#""$DEST/file""#, Some(Path::new("/tmp")));
 
         assert!(matches!(target, PathArgTarget::Dynamic));
     }
@@ -1784,7 +1928,7 @@ mod tests {
         let scan_cwd = temp.path().join("outside");
         std::fs::create_dir_all(&scan_cwd).unwrap();
 
-        let path = arg_path("./file.log", &scan_cwd).unwrap();
+        let path = arg_path("./file.log", Some(&scan_cwd)).unwrap();
 
         assert_eq!(path, normalize_path(&scan_cwd.join("file.log")));
     }
@@ -1795,14 +1939,17 @@ mod tests {
         // to a real block device. The scanner fails closed on the latter.
         for arg in ["/dev/fd/0", "/dev/fd/2", "/dev/fd/255"] {
             assert!(
-                matches!(path_arg_target(arg, Path::new("/tmp")), PathArgTarget::None),
+                matches!(
+                    path_arg_target(arg, Some(Path::new("/tmp"))),
+                    PathArgTarget::None
+                ),
                 "expected {arg} to be skipped as a device path"
             );
         }
         for arg in ["/dev/fd/../sda", "/dev/fd/", "/dev/fd/2x", "/dev/fd/2/x"] {
             assert!(
                 matches!(
-                    path_arg_target(arg, Path::new("/tmp")),
+                    path_arg_target(arg, Some(Path::new("/tmp"))),
                     PathArgTarget::Path(_)
                 ),
                 "expected {arg} to be treated as a regular path (fail closed)"
@@ -1816,7 +1963,7 @@ mod tests {
         // pipe inode under CI), so the device check must run on the raw
         // path — after canonicalize it no longer matches the allowlist.
         for arg in ["/dev/stderr", "/dev/stdin", "/dev/stdout", "/dev/fd/2"] {
-            let target = path_arg_target(arg, Path::new("/tmp"));
+            let target = path_arg_target(arg, Some(Path::new("/tmp")));
             assert!(
                 matches!(target, PathArgTarget::None),
                 "expected {arg} to be skipped as a device path"
@@ -1945,7 +2092,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
-        let mut scan_cwd = temp.path().to_path_buf();
+        let mut scan_cwd = Some(temp.path().to_path_buf());
         let mut stack = Vec::new();
         let parts = |words: &[&str]| {
             words
@@ -1962,8 +2109,7 @@ mod tests {
             &mut scan_cwd,
             &mut stack,
         );
-        assert_eq!(scan_cwd, resolve_existing(&home));
-        let before = scan_cwd.clone();
+        assert_eq!(scan_cwd, Some(resolve_existing(&home)));
         track_cwd_change(
             "cd",
             &parts(&["cd", "-"]),
@@ -1971,7 +2117,7 @@ mod tests {
             &mut scan_cwd,
             &mut stack,
         );
-        assert_eq!(scan_cwd, before, "cd - goes to an unknown directory");
+        assert_eq!(scan_cwd, None, "cd - goes to an unknown directory");
     }
 
     #[test]

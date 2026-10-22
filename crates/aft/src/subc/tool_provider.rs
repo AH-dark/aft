@@ -5789,6 +5789,129 @@ mod route_tests {
         (project, storage, ctx, identity)
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_edit_carries_worker_and_untrusted_tool_policy_without_jailing_shared_services()
+    {
+        use crate::config::SandboxMode;
+        let _guard = EXCHANGE_LOCK.lock().await;
+        fn command_mode(policy: &crate::sandbox_spawn::ToolLaunchPolicy) -> String {
+            let command = policy
+                .command(std::ffi::OsStr::new("formatter-probe"), &[])
+                .unwrap();
+            if command.get_args().next() == Some(std::ffi::OsStr::new("sandbox-launch")) {
+                let profile: crate::sandbox_profile::SandboxProfile =
+                    serde_json::from_str(command.get_args().nth(2).unwrap().to_str().unwrap())
+                        .unwrap();
+                profile.mode.to_string()
+            } else {
+                "off".into()
+            }
+        }
+        fn observe(request: RawRequest, ctx: &AppContext) -> Response {
+            let policy = crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
+            let mode = command_mode(&policy);
+            // LSP startup and other shared services see the original scopes,
+            // not the formatter's per-call principal or worker jail.
+            assert!(!crate::sandbox_spawn::worker_jail_active());
+            assert_eq!(
+                crate::sandbox_spawn::current_authenticated_principal(),
+                AuthenticatedPrincipal::FirstParty
+            );
+            Response::success(request.id, json!({"tool_mode": mode}))
+        }
+        for (worker_mode, untrusted) in [
+            (SandboxMode::Off, false),
+            (SandboxMode::Relaxed, false),
+            (SandboxMode::Strict, false),
+            (SandboxMode::Relaxed, true),
+        ] {
+            let (_project, storage, ctx, mut identity) = worker_route(
+                RouteRole::ToolProviderV1,
+                subc_protocol::call_mode::CallMode::Classic,
+            );
+            ctx.update_config(|config| {
+                config.sandbox.profile.head = if worker_mode == SandboxMode::Off {
+                    SandboxMode::Strict
+                } else {
+                    SandboxMode::Off
+                };
+                config.sandbox.profile.worker = worker_mode;
+            });
+            let data = Arc::get_mut(&mut identity.0).unwrap();
+            let mut scope = stamp("worker");
+            scope.owner = Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            };
+            data.scope = Some(scope);
+            if untrusted {
+                data.trust = BindTrust::Untrusted;
+                if let AuthenticatedPrincipal::RouteBind { trust, .. } = &mut data.spawn_principal {
+                    *trust = PrincipalTrust::Untrusted;
+                }
+            }
+            assert!(super::super::access_grants::alfonso_worker(&identity));
+            let expected = if untrusted {
+                SandboxMode::Strict
+            } else {
+                worker_mode
+            };
+            let run = PlainToolRun {
+                bare_name: "write".into(),
+                arguments: json!({"filePath": "pin.rs", "content": "pub fn edited() {}\n"}),
+                format_context: Default::default(),
+                tool_call_context: ToolCallContext {
+                    project_root: identity.project_root.clone(),
+                    session_id: Some(identity.session.clone()),
+                    request_id: "tool-policy-dispatch".into(),
+                    diagnostics_on_edit: false,
+                    preview: false,
+                    edit_slot_survives: None,
+                    report_registration_downgrade: false,
+                    standard_edit_grammar: true,
+                    disabled_tools: None,
+                    worker_session: true,
+                    host_tool_names: None,
+                },
+                dispatch: observe,
+                bind_trust: identity.trust,
+                identity,
+                request_id: "tool-policy-dispatch".into(),
+                ledger_key: None,
+                io_budget: crate::bounded_io::Budget::after(Duration::from_secs(30)),
+                reply_deadline: Instant::now() + Duration::from_secs(30),
+            };
+            let (done, completion) = oneshot::channel();
+            let job = run.job(
+                crate::access_policy::AskRoute::Lowered,
+                PhaseTrace::new(Instant::now()),
+                done,
+            );
+            let reads = usize::from(
+                expected == SandboxMode::Strict
+                    || (expected == SandboxMode::Relaxed && !cfg!(target_os = "linux")),
+            );
+            let response = crate::worker_jail_canary::with_test_preparation_home(
+                storage.path(),
+                reads,
+                || job(&ctx),
+            );
+            completion.await.unwrap();
+            assert_eq!(
+                response.data["tool_mode"],
+                expected.to_string(),
+                "{}",
+                response.data
+            );
+            // A later standalone/head request must not inherit the worker policy.
+            let head = crate::sandbox_spawn::ToolLaunchPolicy::for_request(&ctx);
+            assert_eq!(
+                command_mode(&head),
+                ctx.config().sandbox.profile.head.to_string()
+            );
+        }
+    }
+
     /// Fetch the worker catalog with `confine: "root"`, which saves the fence.
     async fn confine_route(
         identity: &RouteIdentity,

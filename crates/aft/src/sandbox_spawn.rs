@@ -5,9 +5,7 @@
 //! detached pipes or PTY. Foreground orchestration uses the detached registry
 //! too, so it does not create a third process-creation path.
 //!
-//! AFT also starts processes for its own implementation. Those are outside this
-//! seam because they do not execute an agent command: external formatters,
-//! linters, and type checkers in `format`; LSP servers and Windows LSP cleanup in
+//! Other implementation processes remain outside this seam: LSP servers and Windows LSP cleanup in
 //! `lsp::client` and `lsp::child_registry`; git probes in `search_index`,
 //! `readonly_artifacts`, `commands::configure`, and `commands::conflicts`; login
 //! shell PATH discovery in `effective_path`; and Windows process liveness or
@@ -16,6 +14,8 @@
 //! in-process and creates no child. Keeping this inventory here makes the
 //! agent-command boundary explicit without accidentally applying agent policy to
 //! AFT's internal tooling.
+//! Formatters, their version probes, and checkers do execute project code, so
+//! [`ToolLaunchPolicy`] carries the session shell's launch policy to those tools.
 
 use std::cell::RefCell;
 #[cfg(any(test, target_os = "linux"))]
@@ -206,6 +206,7 @@ pub enum SandboxTaskKind {
     BashForeground,
     BashBackground,
     BashPty,
+    ExternalTool,
 }
 
 #[cfg(unix)]
@@ -5648,6 +5649,150 @@ fn command_argv_for_plan(
     }
 }
 
+/// A request's resolved shell policy for project-controlled formatters and
+/// checkers. The owner keeps the private task directory alive across all of
+/// the request's tools, then removes it even on refusal or an early return.
+pub struct ToolLaunchPolicy {
+    plan: SpawnPlan,
+    environment: HashMap<String, String>,
+    task: Option<crate::bash_background::persistence::ResolvedTask>,
+}
+
+thread_local! {
+    static CURRENT_TOOL_POLICY: RefCell<Option<std::rc::Rc<ToolLaunchPolicy>>> = const { RefCell::new(None) };
+}
+
+impl Drop for ToolLaunchPolicy {
+    fn drop(&mut self) {
+        self.plan.cleanup_unspawned();
+        if let Some(task) = &self.task {
+            let _ = crate::bash_background::persistence::delete_resolved_task(task);
+        }
+    }
+}
+
+impl ToolLaunchPolicy {
+    /// Direct tools carry only their formatter policy across dispatch. General
+    /// sandbox scopes must not cover dispatch: it can start shared LSP servers.
+    pub(crate) fn with_current<R>(policy: Option<std::rc::Rc<Self>>, run: impl FnOnce() -> R) -> R {
+        struct Restore(Option<std::rc::Rc<ToolLaunchPolicy>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT_TOOL_POLICY.with(|slot| {
+                    slot.replace(self.0.take());
+                });
+            }
+        }
+        let previous = CURRENT_TOOL_POLICY.with(|slot| slot.replace(policy));
+        let _restore = Restore(previous);
+        run()
+    }
+
+    pub(crate) fn for_request(ctx: &AppContext) -> std::rc::Rc<Self> {
+        CURRENT_TOOL_POLICY
+            .with(|slot| slot.borrow().clone())
+            .unwrap_or_else(|| std::rc::Rc::new(Self::resolve(ctx)))
+    }
+
+    pub(crate) fn for_session(
+        ctx: &AppContext,
+        principal: AuthenticatedPrincipal,
+        worker: bool,
+    ) -> std::rc::Rc<Self> {
+        std::rc::Rc::new(with_authenticated_principal(principal, || {
+            with_worker_jail(worker, || Self::resolve(ctx))
+        }))
+    }
+
+    pub(crate) fn resolve(ctx: &AppContext) -> Self {
+        let principal = current_authenticated_principal();
+        let mode = effective_sandbox_mode(ctx, &principal);
+        let mut environment = HashMap::new();
+        apply_worker_jail_environment(&mut environment, mode);
+        let mut policy = Self {
+            plan: SpawnPlan::Unsandboxed,
+            environment,
+            task: None,
+        };
+        let needs_layout = cfg!(unix) && (mode != SandboxMode::Off || worker_jail_active());
+        if needs_layout {
+            let session = crate::log_ctx::current_session().unwrap_or_else(|| "aft-tools".into());
+            match crate::bash_background::persistence::allocate_task_layout(
+                &ctx.storage_dir(),
+                &session,
+            ) {
+                Ok(task) => policy.task = Some(task),
+                Err(error) => {
+                    policy.plan = SpawnPlan::Refused {
+                        code: "sandbox_unavailable",
+                        message: format!("failed to allocate a private tool directory: {error}"),
+                        mismatch_class: None,
+                    };
+                    return policy;
+                }
+            }
+        }
+        let io_dir = policy
+            .task
+            .as_ref()
+            .map(|task| task.paths.io_dir.as_path())
+            .unwrap_or(Path::new(""));
+        policy.plan = resolve_sandbox_spawn(
+            ctx,
+            &principal,
+            RequestedSandboxTier::Native,
+            SandboxTaskKind::ExternalTool,
+            io_dir,
+            None,
+        );
+        policy
+    }
+
+    pub(crate) fn command(&self, program: &OsStr, args: &[OsString]) -> Result<Command, String> {
+        // Host grants bind one approved shell command, never an edit's tools.
+        if matches!(self.plan.policy(), SpawnPlan::Host { .. }) {
+            return Err(
+                "sandbox_unavailable: host escalation cannot run a formatter or checker".into(),
+            );
+        }
+        if let SpawnPlan::Refused { code, message, .. } = self.plan.policy() {
+            return Err(format!("{code}: {message}"));
+        }
+        let (program, args, _profile_handle) =
+            command_argv_for_plan(&self.plan, program, args, Path::new(""), None)?;
+        #[cfg(windows)]
+        let mut command = if crate::windows_command::is_batch_file(Path::new(&program)) {
+            crate::windows_command::batch_command(Path::new(&program), &args)
+                .map_err(|error| error.to_string())?
+        } else {
+            let mut command = crate::effective_path::new_command(program).build();
+            command.args(args);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = crate::effective_path::new_command(program).build();
+            command.args(args);
+            command
+        };
+        apply_sandbox_environment(&self.plan, &mut command, &self.environment);
+        #[cfg(unix)]
+        if !matches!(self.plan.policy(), SpawnPlan::Unsandboxed) {
+            disclaim_command_for_plan(&self.plan, &mut command, &self.environment)?;
+        }
+        Ok(command)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unconfined_for_test() -> Self {
+        Self {
+            plan: SpawnPlan::Unsandboxed,
+            environment: HashMap::new(),
+            task: None,
+        }
+    }
+}
+
 /// Auxiliary read-only CLI lookups inherit the command's exact launch policy,
 /// rather than resolving a new principal or silently falling back to the host.
 #[cfg(unix)]
@@ -8273,6 +8418,249 @@ mod policy_tests {
         assert_eq!(
             platform_sandbox_plan(SandboxMode::Relaxed, RequestedSandboxTier::Native, true),
             None
+        );
+    }
+
+    #[cfg(unix)]
+    fn normalized_tool_profile(profile: &SandboxProfile) -> serde_json::Value {
+        fn normalize(value: &mut serde_json::Value, temp: &str) {
+            match value {
+                serde_json::Value::String(text) => *text = text.replace(temp, "<private-temp>"),
+                serde_json::Value::Array(values) => {
+                    values.iter_mut().for_each(|value| normalize(value, temp))
+                }
+                serde_json::Value::Object(values) => {
+                    values.values_mut().for_each(|value| normalize(value, temp))
+                }
+                _ => {}
+            }
+        }
+        let mut value = serde_json::to_value(profile).unwrap();
+        normalize(&mut value, &profile.temp_dir.to_string_lossy());
+        value
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_policy_matches_session_shell_for_every_role_and_untrusted_bind() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let account = root.path().join("account");
+        std::fs::create_dir(&account).unwrap();
+        let ctx = context(project.clone());
+        ctx.update_config(|config| config.storage_dir = Some(root.path().join("store")));
+        let untrusted = AuthenticatedPrincipal::RouteBind {
+            trust: PrincipalTrust::Untrusted,
+            route_channel: 7,
+            route_epoch: 1,
+            project_root: project,
+            harness: "mcp:test".into(),
+            session_id: "tool-policy".into(),
+            principal_id: Some("unverified".into()),
+        };
+        for jailed in [false, true] {
+            for mode in [SandboxMode::Off, SandboxMode::Relaxed, SandboxMode::Strict] {
+                for principal in [AuthenticatedPrincipal::FirstParty, untrusted.clone()] {
+                    ctx.update_config(|config| {
+                        config.sandbox.profile.head =
+                            if jailed { SandboxMode::Strict } else { mode };
+                        config.sandbox.profile.worker =
+                            if jailed { mode } else { SandboxMode::Off };
+                    });
+                    let reads = if principal_requires_strict(&principal)
+                        || mode == SandboxMode::Strict
+                        || (mode == SandboxMode::Relaxed && (!jailed || !cfg!(target_os = "linux")))
+                    {
+                        2
+                    } else {
+                        0
+                    };
+                    crate::worker_jail_canary::with_test_preparation_home(&account, reads, || {
+                        with_authenticated_principal(principal.clone(), || {
+                            with_worker_jail(jailed, || {
+                                let policy = ToolLaunchPolicy::resolve(&ctx);
+                                let io = policy
+                                    .task
+                                    .as_ref()
+                                    .map(|task| task.paths.io_dir.as_path())
+                                    .unwrap_or(Path::new(""));
+                                let shell = resolve_sandbox_spawn(
+                                    &ctx,
+                                    &principal,
+                                    RequestedSandboxTier::Native,
+                                    SandboxTaskKind::BashForeground,
+                                    io,
+                                    None,
+                                );
+                                match (&policy.plan, &shell) {
+                                    (SpawnPlan::Unsandboxed, SpawnPlan::Unsandboxed) => {
+                                        assert_eq!(mode, SandboxMode::Off);
+                                        assert!(!jailed);
+                                        assert!(!principal_requires_strict(&principal));
+                                    }
+                                    (
+                                        SpawnPlan::Launcher { profile: tool, .. },
+                                        SpawnPlan::Launcher { profile: bash, .. },
+                                    ) => {
+                                        let expected = if principal_requires_strict(&principal) {
+                                            SandboxMode::Strict
+                                        } else {
+                                            mode
+                                        };
+                                        assert_eq!(tool.mode, expected);
+                                        assert_eq!(
+                                            normalized_tool_profile(tool),
+                                            normalized_tool_profile(bash)
+                                        );
+                                    }
+                                    other => panic!(
+                                    "tool and shell must resolve the same launch policy: {other:?}"
+                                ),
+                                }
+                                shell.cleanup_unspawned();
+                            })
+                        })
+                    });
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_policy_filters_environment_and_cleans_private_task_directory() {
+        assert!(
+            std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+            "cargo must supply the daemon-only environment canary"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let ctx = context(project);
+        ctx.update_config(|config| config.storage_dir = Some(root.path().join("store")));
+        let launcher = root.path().join("launcher");
+        std::fs::write(&launcher, "#!/bin/sh\nshift 4\nexec \"$@\"\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut policy = ToolLaunchPolicy::resolve(&ctx);
+        let temp = match &mut policy.plan {
+            SpawnPlan::Launcher {
+                profile,
+                launcher_path,
+            } => {
+                *launcher_path = launcher;
+                profile.temp_dir.clone()
+            }
+            other => panic!("strict tools need a launcher: {other:?}"),
+        };
+        let io = policy.task.as_ref().unwrap().paths.io_dir.clone();
+        for capture in [false, true] {
+            let result = if capture {
+                crate::format::run_external_tool_capture(
+                    &policy,
+                    "/bin/sh",
+                    &["-c", "env; exit 3"],
+                    None,
+                    10,
+                )
+            } else {
+                crate::format::run_external_tool(&policy, "/bin/sh", &["-c", "env"], None, 10)
+            }
+            .unwrap();
+            assert_eq!(result.exit_code, if capture { 3 } else { 0 });
+            assert!(
+                !result
+                    .stdout
+                    .lines()
+                    .any(|line| line.starts_with("CARGO_MANIFEST_DIR=")),
+                "{}",
+                result.stdout
+            );
+            assert!(
+                result
+                    .stdout
+                    .lines()
+                    .any(|line| line == format!("TMPDIR={}", temp.display())),
+                "{}",
+                result.stdout
+            );
+        }
+        assert!(io.exists() && temp.exists());
+        drop(policy);
+        assert!(!io.exists() && !temp.exists());
+    }
+
+    #[test]
+    fn tool_policy_refuses_host_escalation() {
+        let mut policy = ToolLaunchPolicy::unconfined_for_test();
+        policy.plan = SpawnPlan::Host {
+            shell_path: PathBuf::from("sh"),
+            environment: BTreeMap::new(),
+        };
+        assert!(policy
+            .command(OsStr::new("formatter"), &[])
+            .unwrap_err()
+            .contains("host escalation"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_policy_keeps_session_grants_that_config_alone_cannot_recover() {
+        use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+        use crate::db::access_grants::{self, ScopeKey};
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let store = root.path().join("store");
+        let write = root.path().join("approved-write");
+        let read = root.path().join("approved-read");
+        for path in [&project, &store, &write, &read] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let ctx = context(project);
+        ctx.update_config(|config| config.storage_dir = Some(store.clone()));
+        let scope = ScopeKey {
+            owner: "reserved:prefrontal-core".into(),
+            scope_ref: "tool-policy".into(),
+            epoch: 1,
+        };
+        let conn = crate::db::open(&store.join("aft.db")).unwrap();
+        access_grants::register_scope(&conn, &scope, None, &ctx.config()).unwrap();
+        for (path, operation) in [
+            (&write, AccessOperation::Write),
+            (&read, AccessOperation::Read),
+        ] {
+            access_grants::insert(
+                &conn,
+                &scope,
+                &AccessGrant {
+                    path: path.clone(),
+                    operation,
+                    kind: GrantKind::Subtree,
+                },
+            )
+            .unwrap();
+        }
+        ctx.set_db(Arc::new(std::sync::Mutex::new(conn)));
+        let policy =
+            crate::access_policy::with_scope(Some(scope), || ToolLaunchPolicy::resolve(&ctx));
+        let SpawnPlan::Launcher { profile, .. } = &policy.plan else {
+            panic!(
+                "a scoped strict tool must get its shell profile: {:?}",
+                policy.plan
+            );
+        };
+        assert!(
+            profile
+                .writable_roots
+                .contains(&write.canonicalize().unwrap()),
+            "{:?}",
+            profile.writable_roots
+        );
+        assert!(
+            profile.read_allow.contains(&read.canonicalize().unwrap()),
+            "{:?}",
+            profile.read_allow
         );
     }
 

@@ -160,8 +160,10 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Write, format, and validate via shared pipeline
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
     let written = if let (Some(observation), Some(original)) = (observation.as_ref(), original) {
         edit::write_format_validate_observed(
+            tool_policy,
             path.as_path(),
             content,
             &ctx.config(),
@@ -170,7 +172,13 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
             observation,
         )
     } else {
-        edit::write_format_validate(path.as_path(), content, &ctx.config(), &req.params)
+        edit::write_format_validate(
+            tool_policy,
+            path.as_path(),
+            content,
+            &ctx.config(),
+            &req.params,
+        )
     };
     let mut write_result = match written {
         Ok(r) => r,

@@ -332,6 +332,7 @@ fn restore_pre_write_state(path: &Path, existed: bool, original: Option<&str>) {
 }
 
 fn write_patched_file(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     req: &RawRequest,
     ctx: &AppContext,
     path: &Path,
@@ -367,9 +368,9 @@ fn write_patched_file(
     // it is never rolled back, and its final content is syntax-checked once
     // after every hunk has run (see `created_file_syntax_checks`).
     let written = if created_in_call {
-        edit::write_format_deferred_created(path, content, &ctx.config(), params)
+        edit::write_format_deferred_created(tool_policy, path, content, &ctx.config(), params)
     } else {
-        edit::write_format_validate_deferred(path, content, &ctx.config(), params)
+        edit::write_format_validate_deferred(tool_policy, path, content, &ctx.config(), params)
     };
     let mut write_result = match written {
         Ok(result) => result,
@@ -652,6 +653,7 @@ fn failure_paths(failures: &[Value]) -> String {
 }
 
 fn apply_add(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     req: &RawRequest,
     ctx: &AppContext,
     resolved: &ResolvedHunk,
@@ -670,6 +672,7 @@ fn apply_add(
 
     let after = ensure_trailing_newline(contents);
     let written = write_patched_file(
+        tool_policy,
         req,
         ctx,
         &resolved.source.abs,
@@ -727,6 +730,7 @@ fn apply_delete(
 /// destination, or the source when there is no move) did not exist before
 /// this patch started.
 fn apply_update(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     req: &RawRequest,
     ctx: &AppContext,
     resolved: &ResolvedHunk,
@@ -742,6 +746,7 @@ fn apply_update(
 
     if let Some(dest) = &resolved.move_dest {
         apply_move_update(
+            tool_policy,
             req,
             ctx,
             resolved,
@@ -755,6 +760,7 @@ fn apply_update(
         )
     } else {
         let written = write_patched_file(
+            tool_policy,
             req,
             ctx,
             &resolved.source.abs,
@@ -779,6 +785,7 @@ fn apply_update(
 }
 
 fn apply_move_update(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     req: &RawRequest,
     ctx: &AppContext,
     resolved: &ResolvedHunk,
@@ -801,6 +808,7 @@ fn apply_move_update(
     };
 
     let written = match write_patched_file(
+        tool_policy,
         req,
         ctx,
         &dest.abs,
@@ -954,6 +962,7 @@ mod audit_regressions {
             };
             let mut backed = HashSet::new();
             assert!(apply_move_update(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                 &request,
                 &ctx,
                 &resolved,
@@ -1103,6 +1112,8 @@ fn metadata_files(
 }
 
 fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) -> Response {
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
+
     let op_id = crate::backup::new_op_id();
     let mut backed_paths = HashSet::new();
     let mut output_lines = Vec::new();
@@ -1120,6 +1131,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
         match &resolved_hunk.hunk {
             Hunk::Add { path, contents } => {
                 match apply_add(
+                    tool_policy,
                     req,
                     ctx,
                     resolved_hunk,
@@ -1165,6 +1177,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
                     None => created.contains_key(&resolved_hunk.source.abs),
                 };
                 match apply_update(
+                    tool_policy,
                     req,
                     ctx,
                     resolved_hunk,
@@ -1229,7 +1242,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
             .map(|hunk| hunk.display_path.clone())
             .collect();
         if let Some(validation) =
-            edit::validate_written_files(&paths, &ctx.config(), command_params(req))
+            edit::validate_written_files(tool_policy, &paths, &ctx.config(), command_params(req))
         {
             for file in &mut files {
                 let path = file

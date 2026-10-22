@@ -375,6 +375,7 @@ mod tests {
             }),
             || {
                 write_format_validate(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                     &path,
                     source,
                     &Config {
@@ -423,15 +424,27 @@ mod tests {
                 assert_eq!(validate_syntax_str(TUPLE, &path), Some(false));
                 assert_eq!(validate_syntax_str(BROKEN, &path), Some(false));
 
-                let first =
-                    write_format_validate(&path, TUPLE, &config, &serde_json::json!({})).unwrap();
+                let first = write_format_validate(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                    &path,
+                    TUPLE,
+                    &config,
+                    &serde_json::json!({}),
+                )
+                .unwrap();
                 assert!(!first.rolled_back);
                 assert_eq!(first.syntax_valid, Some(true));
                 assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
                 assert_eq!(*calls.borrow(), [TUPLE]);
 
-                let mut second =
-                    write_format_validate(&path, BROKEN, &config, &serde_json::json!({})).unwrap();
+                let mut second = write_format_validate(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                    &path,
+                    BROKEN,
+                    &config,
+                    &serde_json::json!({}),
+                )
+                .unwrap();
                 assert!(second.rolled_back);
                 assert_eq!(second.syntax_valid, Some(false));
                 assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
@@ -478,6 +491,7 @@ mod tests {
                     let path = temp.path().join("broken.swift");
                     std::fs::write(&path, BROKEN).unwrap();
                     let result = write_format_validate(
+                        &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                         &path,
                         &updated,
                         &Config {
@@ -569,6 +583,7 @@ mod tests {
                     let path = temp.path().join("tuple.swift");
                     std::fs::write(&path, TUPLE).unwrap();
                     let result = write_format_validate(
+                        &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                         &path,
                         &updated,
                         &Config {
@@ -611,6 +626,7 @@ mod tests {
                     let path = temp.path().join("new.swift");
                     assert_eq!(validate_syntax_str(TUPLE, &path), Some(false));
                     let result = write_format_validate(
+                        &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                         &path,
                         TUPLE,
                         &Config {
@@ -981,6 +997,7 @@ mod tests {
                 let updated = "let value = 2\n";
                 assert_eq!(validate_syntax_str(updated, &path), Some(true));
                 let result = write_format_validate(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                     &path,
                     updated,
                     &Config {
@@ -1042,6 +1059,7 @@ mod tests {
                 let path = temp.path().join("bad.ts");
                 std::fs::write(&path, "const value = 1;\n").unwrap();
                 let result = write_format_validate(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                     &path,
                     "function {",
                     &Config {
@@ -1138,13 +1156,25 @@ mod tests {
                 format_on_edit: false,
                 ..Config::default()
             };
-            let first =
-                write_format_validate(&path, TUPLE, &config, &serde_json::json!({})).unwrap();
+            let first = write_format_validate(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &path,
+                TUPLE,
+                &config,
+                &serde_json::json!({}),
+            )
+            .unwrap();
             assert!(!first.rolled_back);
             assert_eq!(first.syntax_valid, Some(true));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
-            let second =
-                write_format_validate(&path, BROKEN, &config, &serde_json::json!({})).unwrap();
+            let second = write_format_validate(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &path,
+                BROKEN,
+                &config,
+                &serde_json::json!({}),
+            )
+            .unwrap();
             assert!(second.rolled_back);
             assert_eq!(second.syntax_valid, Some(false));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
@@ -1179,6 +1209,7 @@ mod tests {
         let path = temp.path().join("tuple.swift");
         std::fs::write(&path, ORIGINAL).unwrap();
         let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
             &path,
             TUPLE,
             &Config {
@@ -1200,6 +1231,7 @@ mod tests {
             let path = temp.path().join("broken.swift");
             std::fs::write(&path, ORIGINAL).unwrap();
             let result = write_format_validate(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                 &path,
                 BROKEN,
                 &Config {
@@ -1338,6 +1370,7 @@ mod tests {
             }),
             || {
                 write_format_validate(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                     &path,
                     &TUPLE.repeat(4_096),
                     &Config {
