@@ -422,6 +422,57 @@ pub enum AccessDenial {
     UnsafeTemp,
 }
 
+/// What a route does with a path outside every one of its roots.
+///
+/// The user-facing spelling is the `restrict_to_project_root` setting:
+/// [`OutsideRoots::from_config`] is the one place the engine reads it, and
+/// every check that used to test the setting asks this rule instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OutsideRoots {
+    /// An outside path takes the route's ask path. This is the default.
+    #[default]
+    Ask,
+    /// An outside path that no floor, grant or other explicit allowance
+    /// already decided is refused with `path_outside_root` instead of asked.
+    /// Checks that follow symlinks resolve them before comparing with the
+    /// root, so a link cannot lead out of it; write-location checks keep the
+    /// final component and judge the link itself. The standalone exemptions
+    /// (a linked worktree's main checkout, system temp scratch) do not apply.
+    Deny,
+}
+
+impl OutsideRoots {
+    /// The configured rule: `restrict_to_project_root: true` is
+    /// "outside roots: deny"; absent or `false` is "outside roots: ask".
+    pub fn from_config(config: &Config) -> Self {
+        if config.restrict_to_project_root {
+            Self::Deny
+        } else {
+            Self::Ask
+        }
+    }
+
+    /// The rule for one request: an untrusted route may force deny for its
+    /// own requests even when the configured rule asks.
+    pub fn for_request(config: &Config, forced: bool) -> Self {
+        if forced {
+            Self::Deny
+        } else {
+            Self::from_config(config)
+        }
+    }
+
+    /// The policy decision for an outside path. Without a project root
+    /// there is no root to be outside of, so a configured deny has nothing
+    /// to refuse and outside paths keep the ask path.
+    fn decision(self, has_project_root: bool) -> AccessDecision {
+        match self {
+            Self::Deny if has_project_root => AccessDecision::Deny(AccessDenial::OutsideRoots),
+            _ => AccessDecision::Ask,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApprovalMode {
@@ -685,11 +736,7 @@ impl AccessPolicy {
                 session_task_read_dir: None,
             },
             roots,
-            outside: if config.restrict_to_project_root && config.project_root.is_some() {
-                AccessDecision::Deny(AccessDenial::OutsideRoots)
-            } else {
-                AccessDecision::Ask
-            },
+            outside: OutsideRoots::from_config(config).decision(config.project_root.is_some()),
             absolute_floor,
             floor_rules,
             shell_write_floor,

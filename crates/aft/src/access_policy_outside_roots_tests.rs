@@ -3,13 +3,18 @@
 //! before the rule existed keeps every outcome it had: the same allowed path,
 //! the same refusal code and the same refusal text, for reads, mutations and
 //! preserved-final-component writes, on every ask route, with and without the
-//! per-request restriction untrusted routes force.
+//! per-request restriction an untrusted subc consumer's calls force onto
+//! themselves (`AppContext::force_restrict_guard`).
 //!
 //! The expected outcomes live in `fixtures/outside_roots_legacy_outcomes.txt`.
 //! They were recorded from the engine as it decided before the setting was
 //! read through the policy rule, so a difference is a behaviour change for an
 //! existing configuration, not a fixture to refresh.
 
+// The outcome table is Unix-only: it includes symlink probes and Unix path
+// spellings. On other targets only the rule test runs, so the table helpers
+// are unused there.
+#![cfg_attr(not(unix), allow(dead_code))]
 use super::*;
 use crate::config::Config;
 use crate::config_resolve::{resolve_config, ConfigTier};
@@ -66,8 +71,8 @@ impl Fixture {
         self.dir.path().canonicalize().unwrap()
     }
 
-    /// Resolve an existing user document exactly as a bind does, then point
-    /// it at this fixture.
+    /// Resolve a user `aft.jsonc` document through the real config resolver,
+    /// then point the resulting context at this fixture.
     fn context(&self, doc: &str, project_root: bool) -> AppContext {
         let resolved = resolve_config(&[ConfigTier {
             tier: "user".into(),
@@ -277,6 +282,46 @@ fn outside_roots_setting_on_denies_every_path_outside_the_root() {
         let link_itself = key.contains(" symlink-file-escape write-location");
         if key.starts_with("root=set") && leaves_root && !link_itself {
             assert!(on.starts_with("err path_outside_root: "), "{key}: {on}");
+        }
+    }
+}
+
+/// The configured rule each existing document resolves to, and the decision
+/// the policy built from it gives a path outside its root.
+#[test]
+fn outside_roots_existing_configs_resolve_to_the_policy_rule() {
+    let f = Fixture::new();
+    let outside = f.outside.join("outside.txt");
+    for ((label, doc), rule) in
+        EXISTING_CONFIGS
+            .iter()
+            .zip([OutsideRoots::Ask, OutsideRoots::Ask, OutsideRoots::Deny])
+    {
+        for project_root in [true, false] {
+            let ctx = f.context(doc, project_root);
+            let config = ctx.config();
+            assert_eq!(OutsideRoots::from_config(&config), rule, "{label}");
+            assert_eq!(
+                OutsideRoots::for_request(&config, true),
+                OutsideRoots::Deny,
+                "{label}: a forced request denies whatever is configured"
+            );
+            let policy = AccessPolicy::from_config(
+                &config,
+                &f.base().join("store"),
+                vec![f.root.clone()],
+                &f.base().join("home"),
+            );
+            let expected = if rule == OutsideRoots::Deny && project_root {
+                AccessDecision::Deny(AccessDenial::OutsideRoots)
+            } else {
+                AccessDecision::Ask
+            };
+            assert_eq!(
+                policy.decide(AccessOperation::Read, &outside, false),
+                expected,
+                "{label} root={project_root}"
+            );
         }
     }
 }
