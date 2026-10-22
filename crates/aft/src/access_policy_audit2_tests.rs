@@ -1807,3 +1807,153 @@ fn audit9_ask_after_an_expired_approval_says_so() {
     );
     assert_eq!(again.data["asks"][0]["reason"], "approval_expired");
 }
+
+/// Runs `inspect` through one of its entry points, deferred or not, and
+/// returns the final response.
+fn run_inspect(ctx: &std::sync::Arc<AppContext>, req: &RawRequest, deferred: bool) -> Response {
+    if !deferred {
+        return crate::commands::inspect::handle_inspect_tool_call(req, ctx);
+    }
+    let mut pending =
+        match crate::commands::inspect::handle_inspect_deferred(req, std::sync::Arc::clone(ctx)) {
+            crate::response_finalize::DispatchOutcome::Deferred(pending) => pending,
+            crate::response_finalize::DispatchOutcome::Immediate(response) => return response,
+        };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if let Some(response) = (pending.poll)(ctx) {
+            return response;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "deferred inspect did not answer"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A plugin host inspecting a file outside the project gets the engine's
+/// outside-access ask back unchanged (code and asks), on the direct and the
+/// deferred inspect entry points. Retried with the approval, the inspect runs.
+#[test]
+fn audit10_outside_inspect_asks_then_runs_with_the_approval() {
+    let f = Fixture::new();
+    let mut config = Config {
+        project_root: Some(f.root.clone()),
+        storage_dir: Some(f._dir.path().join("inspect-store")),
+        ..Config::default()
+    };
+    config.backup.enabled = Some(false);
+    let ctx = std::sync::Arc::new(AppContext::new(
+        Box::new(crate::language::StubProvider),
+        config,
+    ));
+    ctx.set_harness(crate::harness::Harness::Opencode);
+    let target = f.outside.join("probe.rs");
+    std::fs::write(&target, "// TODO: outside\nfn main() {}\n").unwrap();
+    let scope = plugin::Scope::new(&f.owner, "audit-session").for_tool("inspect", &Value::Null);
+    for deferred in [false, true] {
+        let req = request(
+            "inspect",
+            json!({"scope": target, "sections": "todos", "topK": 5}),
+        );
+        let asked = {
+            let _route = ask_route_guard(Some(AskRoute::Plugin {
+                scope: scope.clone(),
+                once: Vec::new(),
+            }));
+            run_inspect(&ctx, &req, deferred)
+        };
+        assert_eq!(
+            asked.data["code"], "permission_required",
+            "deferred={deferred}: {:?}",
+            asked.data
+        );
+        assert_eq!(
+            asked.data["asks"][0]["kind"], "external_directory",
+            "{:?}",
+            asked.data
+        );
+        assert_eq!(asked.data["asks"][0]["operation"], "read");
+        let token = asked.data["asks"][0]["grant_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut approved = scope.clone();
+        let once = plugin::claim(&mut approved, &[token]);
+        assert!(!once.is_empty());
+        let ran = {
+            let _route = ask_route_guard(Some(AskRoute::Plugin {
+                scope: approved,
+                once,
+            }));
+            run_inspect(&ctx, &req, deferred)
+        };
+        assert!(ran.success, "deferred={deferred}: {:?}", ran.data);
+        assert!(
+            ran.data.get("code").is_none(),
+            "deferred={deferred}: {:?}",
+            ran.data
+        );
+    }
+}
+
+/// A zoom batch whose entry names a file outside the project returns the
+/// engine's outside-access ask as the whole reply, not as one refused entry
+/// inside a successful batch, so the host can ask. Retried with the
+/// approval, every entry answers.
+#[test]
+fn audit11_outside_zoom_batch_entry_asks_then_answers_with_the_approval() {
+    let f = Fixture::new();
+    let mut config = Config {
+        project_root: Some(f.root.clone()),
+        storage_dir: Some(f._dir.path().join("zoom-store")),
+        ..Config::default()
+    };
+    config.backup.enabled = Some(false);
+    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let inside = f.root.join("inside.rs");
+    let outside = f.outside.join("outside.rs");
+    std::fs::write(&inside, "pub fn inside_fn() {}\n").unwrap();
+    std::fs::write(&outside, "pub fn outside_fn() {}\n").unwrap();
+    let scope = plugin::Scope::new(&f.owner, "audit-session").for_tool("zoom", &Value::Null);
+    let req = request(
+        "zoom",
+        json!({"targets": [
+            {"file": inside, "symbols": "inside_fn"},
+            {"file": outside, "symbols": "outside_fn"},
+        ]}),
+    );
+    let asked = {
+        let _route = ask_route_guard(Some(AskRoute::Plugin {
+            scope: scope.clone(),
+            once: Vec::new(),
+        }));
+        crate::commands::zoom::handle_zoom(&req, &ctx)
+    };
+    assert_eq!(
+        asked.data["code"], "permission_required",
+        "{:?}",
+        asked.data
+    );
+    assert_eq!(asked.data["asks"][0]["operation"], "read");
+    let token = asked.data["asks"][0]["grant_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut approved = scope.clone();
+    let once = plugin::claim(&mut approved, &[token]);
+    assert!(!once.is_empty());
+    let answered = {
+        let _route = ask_route_guard(Some(AskRoute::Plugin {
+            scope: approved,
+            once,
+        }));
+        crate::commands::zoom::handle_zoom(&req, &ctx)
+    };
+    assert!(answered.success, "{:?}", answered.data);
+    let text = answered.data.to_string();
+    assert!(text.contains("inside_fn"), "{text}");
+    assert!(text.contains("outside_fn"), "{text}");
+    assert!(!text.contains("permission_required"), "{text}");
+}

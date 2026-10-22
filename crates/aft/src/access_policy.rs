@@ -337,6 +337,22 @@ pub(crate) fn finish_current_plugin_response(
 /// layer turns it into a held call; it never reaches the agent as-is.
 pub(crate) const ACCESS_ASK_REQUIRED: &str = "access_ask_required";
 
+/// Whether `response` asks for access instead of failing: a plugin host's
+/// outside-access ask (`permission_required` with the `asks` the host prompts
+/// with, then retries) or a worker call held for consent through Cingulate
+/// (`access_ask_required`). A handler that folds errors into a phase failure
+/// or a batch entry must return such a response unchanged, or nobody can be
+/// asked and the call can never run.
+pub(crate) fn is_access_request(response: &crate::protocol::Response) -> bool {
+    matches!(
+        response
+            .data
+            .get("code")
+            .and_then(serde_json::Value::as_str),
+        Some(crate::protocol::ERROR_PERMISSION_REQUIRED | ACCESS_ASK_REQUIRED)
+    )
+}
+
 thread_local! {
     static ASK_ROUTE: std::cell::RefCell<Option<AskRoute>> = const { std::cell::RefCell::new(None) };
 }
