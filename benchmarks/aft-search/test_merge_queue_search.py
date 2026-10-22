@@ -281,6 +281,53 @@ class GhLookupRetryTests(unittest.TestCase):
         self.assertEqual(self.call_count(), 2)
         self.assertEqual(delays, [2])
 
+    def test_timeout_retries_then_succeeds(self) -> None:
+        expected = {"number": 23}
+        timeout = merge_queue_search.subprocess.TimeoutExpired("gh api", 30)
+        success = merge_queue_search.subprocess.CompletedProcess(
+            args=["gh", "api"], returncode=0, stdout=json.dumps(expected), stderr=""
+        )
+        delays: list[float] = []
+
+        with patch.object(
+            merge_queue_search.subprocess, "run", side_effect=[timeout, success]
+        ) as run:
+            result = merge_queue_search.lookup_queue_ref_pr(
+                "cortexkit/aft", 23, sleep=delays.append
+            )
+
+        self.assertEqual(result, expected)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(delays, [2])
+
+    def test_timeout_exhaustion_reports_attempts_and_decodes_stderr(self) -> None:
+        timeouts = [
+            merge_queue_search.subprocess.TimeoutExpired("gh api", 30, stderr=None),
+            merge_queue_search.subprocess.TimeoutExpired(
+                "gh api", 30, stderr=b"partial\xff"
+            ),
+            merge_queue_search.subprocess.TimeoutExpired(
+                "gh api", 30, stderr=b"partial\xff"
+            ),
+        ]
+        delays: list[float] = []
+
+        with patch.object(
+            merge_queue_search.subprocess, "run", side_effect=timeouts
+        ) as run:
+            with self.assertRaisesRegex(
+                merge_queue_search.InputFault,
+                r"queue_pr_lookup_failed:23:retries_exhausted:attempts=3:"
+                r"gh api timed out after 30 seconds",
+            ) as error:
+                merge_queue_search.lookup_queue_ref_pr(
+                    "cortexkit/aft", 23, sleep=delays.append
+                )
+
+        self.assertIn("partial\ufffd", str(error.exception))
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(delays, [2, 5])
+
 
 if __name__ == "__main__":
     unittest.main()
