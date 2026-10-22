@@ -1374,6 +1374,17 @@ fn transient_retries_stop_inside_the_relay_budget_with_a_named_refusal() {
 /// A retried attempt only gets what is left of the relay budget, so a silent
 /// reply to it is reported as an unknown outcome (87) at the budget, not a
 /// fresh full budget after the retry sleep.
+///
+/// Whether the retry fits in the budget is decided on the exchange's clock,
+/// so the exchange runs on a [`TestExchangeClock`] against the real consumer:
+/// the first, answered attempt takes no time on it, the retry sleep takes its
+/// 2000 ms and the silent retry the time the consumer really waited for it.
+/// The first reply is held for 1100 ms, as a loaded runner can delay it. On
+/// the real clock that leaves no room for the sleep inside the 3000 ms
+/// budget, and the exchange rightly ends with plexus's named refusal (86)
+/// instead. The numbers leave the first attempt 1900 ms before its own
+/// timeout and the exchange 1000 ms of real time between its start and its
+/// first clock reading.
 #[test]
 fn a_silent_retry_is_an_unknown_outcome_at_the_relay_budget() {
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-budget-silent", "call-bs", "/p");
@@ -1386,20 +1397,23 @@ fn a_silent_retry_is_an_unknown_outcome_at_the_relay_budget() {
         let mut attempts = handler_attempts.lock().unwrap();
         *attempts += 1;
         if *attempts == 1 {
+            std::thread::sleep(Duration::from_millis(1_100));
             plexus_refused("nonce_in_flight")
         } else {
             Value::Null
         }
     });
     let harness = harness(handler);
-    let budget = Duration::from_millis(1_000);
+    let budget = Duration::from_millis(3_000);
     ATTEMPT_DEADLINES.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    USE_TEST_EXCHANGE_CLOCK.with(|clock| clock.set(true));
     let (status, _elapsed) = dispatch_timed(
         &harness,
         live.value(),
-        [Duration::from_millis(400); 2],
+        [Duration::from_millis(2_000); 2],
         budget,
     );
+    USE_TEST_EXCHANGE_CLOCK.with(|clock| clock.set(false));
     assert_eq!(status, OUTCOME_UNKNOWN_EXIT_STATUS);
     // Setup and scheduling do not consume the exchange budget. Observe the
     // actual CallOptions passed to the consumer: resetting the timeout for the
@@ -1413,7 +1427,7 @@ fn a_silent_retry_is_an_unknown_outcome_at_the_relay_budget() {
         "the silent retry is never resent"
     );
     let probe = super::super::read_last_probe(&harness.paths).expect("last probe");
-    assert_eq!(probe.elapsed_ms, 1_000);
+    assert_eq!(probe.elapsed_ms, 3_000);
 }
 
 fn v16_manifest() -> Manifest {
