@@ -26,9 +26,14 @@ pub const PLANE_APPLICATION_ID: i64 = 0x41465450;
 pub const NAMESPACE_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
 const TIMEOUT_MS: i64 = 5_000;
 mod connections;
+mod copy;
 mod initialization;
 #[cfg(test)]
 mod read_audit;
+#[cfg(test)]
+mod replay;
+#[doc(hidden)]
+pub use copy::{copy_on_first_use, CopyOutcome, CopySource, SWEEP_LEASE_WAIT};
 
 const META: &str = "CREATE TABLE format_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), format_version INTEGER NOT NULL, schema_version INTEGER NOT NULL, layout_tag INTEGER NOT NULL, schema_text TEXT NOT NULL);";
 const REGISTRY_SCHEMA: &str = "
@@ -337,7 +342,9 @@ fn open_db(path: &Path, kind: Kind, create: bool, readonly: bool) -> Result<Iden
         OpenFlags::SQLITE_OPEN_READ_WRITE
     };
     #[cfg(test)]
-    let mut c = if read_audit::enabled() {
+    let mut c = if replay::enabled() {
+        IdentityConnection::new(replay::open(path, flags)?, "views-v3")
+    } else if read_audit::enabled() {
         IdentityConnection::new(read_audit::open(path, flags)?, "views-v3")
     } else {
         IdentityConnection::open_with_flags(path, flags, "views-v3")?
@@ -887,7 +894,17 @@ impl Publication<'_, '_> {
         self.planes.last().expect("inserted plane").1.connection()
     }
     pub fn put(&mut self, key: &FamilyKey, payload: &[u8], payload_schema: u32) -> Result<()> {
+        self.put_row(key, payload, payload_schema).map(|_| ())
+    }
+    /// Inserts the row, or touches an equal existing one. `true` means inserted.
+    fn put_row(&mut self, key: &FamilyKey, payload: &[u8], payload_schema: u32) -> Result<bool> {
         let mut c = self.plane(key.plane())?;
+        #[cfg(test)]
+        if replay::unflushed_closure() {
+            // Red control for the power-loss replay only: plane commits stop
+            // syncing, so nothing but the closure flush could make them durable.
+            c.pragma_update(None, "synchronous", 0)?;
+        }
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let digest = blake3::hash(payload);
         let existing: Option<Vec<u8>> = tx
@@ -912,9 +929,13 @@ impl Publication<'_, '_> {
         if written {
             self.payload_bytes = self.payload_bytes.saturating_add(payload.len() as u64);
         }
-        Ok(())
+        Ok(written)
     }
     fn flush(&self) -> Result<()> {
+        #[cfg(test)]
+        if replay::unflushed_closure() {
+            return Ok(());
+        }
         for (_, database) in &self.planes {
             checkpoint(&**database.connection()?)?;
         }
@@ -959,6 +980,10 @@ impl PlaneReader {
     }
 }
 
+#[cfg(test)]
+mod copy_tests;
+#[cfg(test)]
+mod replay_tests;
 #[cfg(test)]
 mod source_guard;
 #[cfg(test)]

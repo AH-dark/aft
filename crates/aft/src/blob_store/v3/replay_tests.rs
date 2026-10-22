@@ -1,0 +1,244 @@
+//! Power-loss replay of the copy closure: v3 plane-row insert or touch,
+//! `ClosureFlushed`, then the ledger transaction from `reserved` to
+//! `committed`. Each case first runs the closure to count its mutating file
+//! calls, then cuts power before each one in turn (and once after the end),
+//! restores every file to its last synced state and reopens the stores.
+//!
+//! The invariant after every cut: the ledger has no row for the attempt, or
+//! shows it `reserved` or `released` (claiming no rows), or shows it
+//! `committed` with every copied row passing `get` with a matching digest.
+
+#![cfg(unix)]
+
+use super::replay;
+use super::tests::serial;
+use super::*;
+use crate::views::registry::{FamilyRegistry, ViewRegistration};
+use tempfile::{tempdir, TempDir};
+
+const FAMILY: &str = "0123456789abcdef";
+const HOLDER: &str = "holder";
+
+struct Fixture {
+    _root: TempDir,
+    storage: PathBuf,
+    _registration: ViewRegistration,
+    key: FamilyKey,
+    payload: Vec<u8>,
+    /// The last reservation id written before the replayed attempt.
+    seeded: i64,
+}
+
+/// A v2 source row and a v3 family whose registry and plane store already
+/// exist, all closed, so the replayed closure creates only WAL files.
+/// `reuse` seeds v3 with the same row, making the closure a touch.
+fn fixture(reuse: bool) -> Fixture {
+    let root = tempdir().unwrap();
+    let storage = root.path().to_path_buf();
+    let registry = FamilyRegistry::open(&storage, FAMILY).unwrap();
+    let checkout = storage.join("checkout");
+    fs::create_dir_all(&checkout).unwrap();
+    let registration = registry.register_view(HOLDER, &checkout).unwrap();
+    let payload = vec![0x5a; 64 * 1024];
+    let key = FamilyKey::new(FamilyPlane::Semantic, *blake3::hash(&payload).as_bytes());
+    registration
+        .open_store(FamilyPlane::Semantic)
+        .unwrap()
+        .put_or_touch(&key, &payload)
+        .unwrap();
+    let (seed_key, seed_payload) = if reuse {
+        (key, payload.clone())
+    } else {
+        (
+            FamilyKey::new(FamilyPlane::Semantic, [1; 32]),
+            b"seed".to_vec(),
+        )
+    };
+    publish(&storage, FAMILY, 1 << 20, None, |p| {
+        p.put(&seed_key, &seed_payload, 1)
+    })
+    .unwrap();
+    let seeded = last_reservation(&storage);
+    Fixture {
+        _root: root,
+        storage,
+        _registration: registration,
+        key,
+        payload,
+        seeded,
+    }
+}
+
+fn last_reservation(storage: &Path) -> i64 {
+    LedgerReader::open_existing(storage, FAMILY)
+        .unwrap()
+        .database
+        .connection()
+        .unwrap()
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM reservations", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+fn copy(fixture: &Fixture) -> Result<CopyOutcome> {
+    copy_on_first_use(
+        &fixture.storage,
+        CopySource::V2 {
+            family: FAMILY,
+            key: fixture.key,
+        },
+        HOLDER,
+        None,
+    )
+}
+
+fn replayed(fixture: &Fixture, crash_at: Option<u64>) -> replay::Report {
+    replay::begin(crash_at);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| copy(fixture)));
+    replay::finish()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Seen {
+    /// No ledger row for the attempt.
+    Absent,
+    /// `reserved` or `released`: no copied row is claimed.
+    Unclaimed,
+    /// `committed`, and the copied row reads back with a matching digest.
+    Committed,
+    /// `committed` while a copied row is missing or fails its digest.
+    Torn,
+}
+
+fn observe(fixture: &Fixture) -> Seen {
+    let state: Option<String> = LedgerReader::open_existing(&fixture.storage, FAMILY)
+        .expect("the registry reopens after the power cut")
+        .database
+        .connection()
+        .unwrap()
+        .query_row(
+            "SELECT state FROM reservations WHERE id > ?1",
+            [fixture.seeded],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap();
+    match state.as_deref() {
+        None => Seen::Absent,
+        Some("reserved" | "released") => Seen::Unclaimed,
+        Some("committed") => {
+            let row = PlaneReader::open_existing(&fixture.storage, FAMILY, FamilyPlane::Semantic)
+                .and_then(|plane| plane.get(&fixture.key));
+            if matches!(row, Ok(Some(ref bytes)) if *bytes == fixture.payload) {
+                Seen::Committed
+            } else {
+                Seen::Torn
+            }
+        }
+        Some(other) => panic!("unknown reservation state {other}"),
+    }
+}
+
+/// Runs `prepare` on a fresh fixture, then the replayed copy, for a run
+/// with no cut and for a cut before each mutating call. Returns the uncut
+/// run's report with its canonical storage root, and what each cut left.
+fn enumerate(reuse: bool, prepare: impl Fn(&Fixture)) -> (replay::Report, PathBuf, Vec<Seen>) {
+    let (whole, storage) = {
+        let fixture = fixture(reuse);
+        prepare(&fixture);
+        let report = replayed(&fixture, None);
+        assert!(!report.crashed);
+        (report, fs::canonicalize(&fixture.storage).unwrap())
+    };
+    assert!(whole.ops > 0, "the closure made no file call to cut");
+    let seen = (1..=whole.ops + 1)
+        .map(|cut| {
+            let fixture = fixture(reuse);
+            prepare(&fixture);
+            let report = replayed(&fixture, Some(cut));
+            assert_eq!(report.crashed, cut <= whole.ops, "cut {cut}");
+            observe(&fixture)
+        })
+        .collect::<Vec<_>>();
+    eprintln!(
+        "replay reuse={reuse}: {} file calls, {} cuts, dir syncs {:?}, outcomes by cut {seen:?}",
+        whole.ops,
+        seen.len(),
+        whole.dir_syncs
+    );
+    (whole, storage, seen)
+}
+
+fn assert_never_torn(seen: &[Seen]) {
+    let torn: Vec<usize> = seen
+        .iter()
+        .enumerate()
+        .filter(|(_, seen)| **seen == Seen::Torn)
+        .map(|(cut, _)| cut + 1)
+        .collect();
+    assert!(torn.is_empty(), "torn closures at cuts {torn:?}: {seen:?}");
+    assert!(seen.contains(&Seen::Committed), "{seen:?}");
+    assert!(
+        seen.iter()
+            .any(|seen| matches!(seen, Seen::Absent | Seen::Unclaimed)),
+        "{seen:?}"
+    );
+}
+
+#[test]
+fn replayed_copying_closure_is_whole_or_absent_after_any_power_cut() {
+    let _guard = serial();
+    let (_, _, seen) = enumerate(false, |_| {});
+    assert_never_torn(&seen);
+}
+
+#[test]
+fn replayed_reuse_only_closure_is_whole_or_absent_after_any_power_cut() {
+    let _guard = serial();
+    let (_, _, seen) = enumerate(true, |_| {});
+    assert_never_torn(&seen);
+}
+
+/// A first copy whose strict floor re-sync fails runs no closure. Its retry
+/// finds the floor already covering v3, syncs the storage root again (a
+/// `DirectorySync` event) and replays like any other copy.
+#[test]
+fn replayed_retry_after_a_failed_floor_directory_sync_is_whole_or_absent() {
+    let _guard = serial();
+    let fail_floor_sync = |fixture: &Fixture| {
+        crate::durability::FAIL_DIRECTORY_SYNC
+            .with(|slot| *slot.borrow_mut() = Some(fixture.storage.clone()));
+        let error = copy(fixture).unwrap_err();
+        crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| slot.borrow_mut().take());
+        assert!(matches!(error, Error::Io(_)), "{error}");
+        assert_eq!(last_reservation(&fixture.storage), fixture.seeded);
+        assert_eq!(
+            PlaneReader::open_existing(&fixture.storage, FAMILY, FamilyPlane::Semantic)
+                .unwrap()
+                .get(&fixture.key)
+                .unwrap(),
+            None
+        );
+    };
+    let (whole, storage, seen) = enumerate(false, fail_floor_sync);
+    assert!(
+        whole.dir_syncs.contains(&storage),
+        "the covered retry recorded no storage-root DirectorySync: {:?}",
+        whole.dir_syncs
+    );
+    assert_never_torn(&seen);
+}
+
+/// Red control: with the plane commits unsynced and no closure flush before
+/// `ClosureFlushed`, some power cut leaves the ledger committed while the
+/// copied row is gone.
+#[test]
+fn red_control_without_the_closure_flush_a_power_cut_tears_the_copy() {
+    let _guard = serial();
+    replay::set_unflushed_closure(true);
+    let result = std::panic::catch_unwind(|| enumerate(false, |_| {}));
+    replay::set_unflushed_closure(false);
+    let (_, _, seen) = result.unwrap();
+    assert!(seen.contains(&Seen::Torn), "{seen:?}");
+}

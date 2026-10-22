@@ -23,9 +23,14 @@ fn native_sqlite_file_sets_have_no_out_of_band_content_access() {
         ),
         ("connections.rs", include_str!("connections.rs"), false),
         ("read_audit.rs", include_str!("read_audit.rs"), false),
+        ("copy.rs", include_str!("copy.rs"), false),
+        ("replay.rs", include_str!("replay.rs"), false),
         // The process harness reads only its JSON/ready files and reader-floor
         // JSON as text. It must never read or copy SQLite file-set bytes.
         ("tests.rs", include_str!("tests.rs"), true),
+        // Copy tests also read Rust sources as text to find callers.
+        ("copy_tests.rs", include_str!("copy_tests.rs"), true),
+        ("replay_tests.rs", include_str!("replay_tests.rs"), false),
     ] {
         assert!(
             !forbidden(source, text_controls),
@@ -39,6 +44,10 @@ fn native_sqlite_file_sets_have_no_out_of_band_content_access() {
                 "connections",
                 "initialization",
                 "read_audit",
+                "replay",
+                "copy",
+                "copy_tests",
+                "replay_tests",
                 "tests",
                 "source_guard"
             ]

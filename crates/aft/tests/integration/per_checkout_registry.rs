@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use aft::blob_store::v2::{
     ContentHash, FamilyKey, FamilyPlane, FamilyStoreReader, TrigramKey, TrigramPolicy,
 };
+use aft::blob_store::v3;
 use aft::gc::family::{sweep_family, FamilySweepPolicy, SweepObserver, SweepStep};
 use aft::pins::{protect_then_touch, AssemblyPin, LivePin};
 use aft::views::contracts::{DurabilityObserver, DurabilityStep};
@@ -755,6 +756,31 @@ fn per_checkout_child() {
             publish(&registration, &files, Some(&observer));
             panic!("the pause point {step} was never reached");
         }
+        "v3-copy" => {
+            let scope = std::env::var("PER_CHECKOUT_SCOPE").unwrap();
+            let step = std::env::var("PER_CHECKOUT_STEP").unwrap();
+            let key = FamilyKey::new(
+                FamilyPlane::Trigram,
+                aft::blob_store::v2::parse_hex32(&std::env::var("PER_CHECKOUT_KEY").unwrap())
+                    .unwrap(),
+            );
+            v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
+            let observer = ParkAt {
+                step: DurabilityStep::parse(&step).unwrap(),
+                ready,
+            };
+            v3::copy_on_first_use(
+                &storage,
+                v3::CopySource::V2 {
+                    family: FAMILY,
+                    key,
+                },
+                &scope,
+                Some(&observer),
+            )
+            .unwrap();
+            panic!("the v3 copy never reached {step}");
+        }
         other => panic!("unknown scenario {other}"),
     }
 }
@@ -1032,6 +1058,186 @@ fn a_publisher_killed_at_any_durability_boundary_leaves_protected_bytes_readable
     }
 }
 
+/// Every `.sqlite` file under `blobs/v3/`.
+fn v3_stores(storage: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "sqlite") {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&storage.join("blobs/v3"), &mut found);
+    found
+}
+
+fn floor_stores(storage: &Path) -> serde_json::Map<String, serde_json::Value> {
+    let floor: serde_json::Value =
+        serde_json::from_slice(&fs::read(storage.join("reader-floor.json")).unwrap()).unwrap();
+    floor["stores"].as_object().unwrap().clone()
+}
+
+/// Kill a v3 copy-on-first-use at each v3-only boundary, then restart the
+/// copy in this process. The v2 source survives the kill (the dead copier's
+/// pin is still there) and the restart never lowers the reader floor.
+#[cfg(unix)]
+#[test]
+fn a_v3_copy_killed_at_either_v3_boundary_keeps_its_source_and_restarts() {
+    for step in DurabilityStep::V3_ONLY {
+        let storage = tempdir().unwrap();
+        let root = storage.path().join("root-a");
+        fs::create_dir_all(&root).unwrap();
+        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        let view = registry.register_view("scope-a", &root).unwrap();
+        let key = put_garbage(&view, b"payload copied into v3");
+        let payload = trigram_store(storage.path()).get(&key).unwrap().unwrap();
+        let control = tempdir().unwrap();
+        let ready = control.path().join("ready");
+        let mut child = spawn_child(
+            "v3-copy",
+            &[
+                ("PER_CHECKOUT_STORAGE", storage.path()),
+                ("PER_CHECKOUT_READY", &ready),
+            ],
+            &[
+                ("PER_CHECKOUT_SCOPE", "scope-a"),
+                ("PER_CHECKOUT_STEP", step.as_str()),
+                ("PER_CHECKOUT_KEY", &key.to_hex()),
+            ],
+        );
+        wait_for_file(&mut child, &ready);
+        kill(&mut child);
+
+        // At either boundary the floor already names both v3 stores and the
+        // source is still stored.
+        let floor = floor_stores(storage.path());
+        for name in ["views_v3_registry", "views_v3_store"] {
+            assert!(floor.contains_key(name), "{step:?}: floor {floor:?}");
+        }
+        assert!(trigram_store(storage.path()).contains(&key).unwrap());
+        let restarted = match step {
+            // Expected after V3FloorRaised: no v3 store exists yet, so the
+            // restart inserts the row.
+            DurabilityStep::V3FloorRaised => {
+                assert_eq!(v3_stores(storage.path()), Vec::<PathBuf>::new());
+                v3::CopyOutcome::Copied
+            }
+            // Expected after ClosureFlushed: the row is in the plane store
+            // and the dead child's reservation is still outstanding, so the
+            // restart only touches the row and releases that reservation.
+            DurabilityStep::ClosureFlushed => {
+                let ledger = v3::LedgerReader::open_existing(storage.path(), FAMILY).unwrap();
+                assert!(ledger.accounting().unwrap().reserved_bytes > 0);
+                drop(ledger);
+                assert_eq!(
+                    v3::PlaneReader::open_existing(storage.path(), FAMILY, FamilyPlane::Trigram)
+                        .unwrap()
+                        .get(&key)
+                        .unwrap(),
+                    Some(payload.clone())
+                );
+                v3::CopyOutcome::Reused
+            }
+            other => panic!("{other:?} is not a v3-only boundary"),
+        };
+
+        v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
+        let outcome = v3::copy_on_first_use(
+            storage.path(),
+            v3::CopySource::V2 {
+                family: FAMILY,
+                key,
+            },
+            "scope-a",
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome, restarted, "{step:?}");
+        let after = floor_stores(storage.path());
+        for (name, version) in &floor {
+            assert!(
+                after[name].as_u64() >= version.as_u64(),
+                "{step:?}: the restart lowered {name}: {floor:?} -> {after:?}"
+            );
+        }
+        assert_eq!(
+            v3::LedgerReader::open_existing(storage.path(), FAMILY)
+                .unwrap()
+                .accounting()
+                .unwrap()
+                .reserved_bytes,
+            0,
+            "{step:?}"
+        );
+
+        // The next sweep reclaims the dead copier's pin and collects the
+        // unreferenced source; the v3 copy stays readable.
+        let report = sweep_family(&registry, None, COLLECT_ALL, None).unwrap();
+        assert!(report.reclaimed_pins >= 1, "{step:?}: {report:?}");
+        assert!(!trigram_store(storage.path()).contains(&key).unwrap());
+        assert_eq!(
+            v3::PlaneReader::open_existing(storage.path(), FAMILY, FamilyPlane::Trigram)
+                .unwrap()
+                .get(&key)
+                .unwrap(),
+            Some(payload)
+        );
+    }
+}
+
+struct Recorder(std::cell::RefCell<Vec<DurabilityStep>>);
+
+impl DurabilityObserver for Recorder {
+    fn reached(&self, step: DurabilityStep) {
+        self.0.borrow_mut().push(step);
+    }
+}
+
+fn sqlite_schema(path: &Path) -> Vec<(String, String, String, Option<String>)> {
+    rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap()
+        .prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// v2 publications cross only the v2 boundaries and keep the v2 store schema.
+#[test]
+fn a_v2_publication_crosses_no_v3_boundary_and_keeps_its_schema() {
+    let storage = tempdir().unwrap();
+    let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+    let view = registry
+        .register_view("scope-a", &storage.path().join("root-a"))
+        .unwrap();
+    publish(&view, &[("a.txt", b"first")], None);
+    let store =
+        aft::blob_store::v2::plane_path(storage.path(), FAMILY, FamilyPlane::Trigram).unwrap();
+    let before = sqlite_schema(&store);
+    let recorder = Recorder(std::cell::RefCell::new(Vec::new()));
+    publish(&view, &[("a.txt", b"second")], Some(&recorder));
+    let steps = recorder.0.into_inner();
+    assert!(steps.contains(&DurabilityStep::PointerSynced), "{steps:?}");
+    assert!(
+        steps
+            .iter()
+            .all(|step| !DurabilityStep::V3_ONLY.contains(step)),
+        "{steps:?}"
+    );
+    assert_eq!(sqlite_schema(&store), before);
+    assert!(!storage.path().join("blobs/v3").exists());
+}
 /// A publisher that exits normally leaves a published generation a new
 /// process reads and keeps through sweeps.
 #[test]
