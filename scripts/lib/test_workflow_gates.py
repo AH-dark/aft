@@ -159,6 +159,7 @@ class LightPREventGateTests(unittest.TestCase):
                 self.assertNotIn("strategy", jobs[context])
                 self.assertIn(jobs[context]["if"], (
                     "${{ github.event_name != 'pull_request' }}",
+                    "${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}",
                     "${{ always() && github.event_name != 'pull_request' }}",
                 ))
 
@@ -260,6 +261,54 @@ class CISpeedWorkflowTests(unittest.TestCase):
             with self.subTest(branch=branch):
                 self.assertTrue(workflow_gates.push_matches(workflow, branch))
         self.assertNotIn("paths", workflow_gates.on_section(workflow)["push"])
+
+
+class RustPRAdvisoryWorkflowTests(unittest.TestCase):
+    def test_advisory_platform_shards_reuse_the_suite_and_are_never_required(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        advisory = workflow_gates.parse_workflow(str(root / ".github/workflows/rust-pr-advisory.yml"))
+        suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
+        required = (root / ".github/required-checks.txt").read_text().splitlines()
+
+        pull_request = advisory["on"]["pull_request"]
+        self.assertEqual(pull_request["branches"], ["main"])
+        self.assertEqual(set(pull_request["paths"]), {
+            "crates/**", "Cargo.toml", "Cargo.lock", "rust-toolchain*",
+            ".github/workflows/_unit-suite.yml",
+        })
+        self.assertEqual(advisory["concurrency"]["group"], "rust-pr-advisory-${{ github.event.pull_request.number }}")
+        self.assertEqual(str(advisory["concurrency"]["cancel-in-progress"]).lower(), "true")
+
+        caller = advisory["jobs"]["platform-rust-tests"]
+        self.assertEqual(caller["name"], "Rust PR advisory")
+        self.assertEqual(caller["uses"], "./.github/workflows/_unit-suite.yml")
+        self.assertEqual(str(caller["with"]["pr_platform_advisory"]).lower(), "true")
+        self.assertNotIn("if", caller)
+        self.assertFalse(any(caller["name"] in name for name in required))
+        suite_input = suite["on"]["workflow_call"]["inputs"]["pr_platform_advisory"]
+        self.assertEqual(str(suite_input["required"]).lower(), "false")
+        self.assertEqual(str(suite_input["default"]).lower(), "false")
+
+        platform_jobs = (
+            "unit-macos-nextest-archive", "unit-macos-libtest-archive", "unit-macos-bin-archive",
+            "unit-macos-nextest", "unit-macos-nextest-2", "unit-macos-nextest-3",
+            "unit-macos-libtest-shard", "unit-windows-nextest-archive", "unit-windows-libtest-shard",
+            "unit-windows-cargo", "unit-windows-cargo-2", "unit-windows-cargo-3",
+        )
+        for job_id in platform_jobs:
+            with self.subTest(job=job_id):
+                self.assertEqual(
+                    suite["jobs"][job_id]["if"],
+                    "${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}",
+                )
+        self.assertEqual(
+            suite["jobs"]["unit-macos-watcher"]["if"],
+            "${{ github.event_name != 'pull_request' }}",
+        )
+        self.assertEqual(
+            suite["jobs"]["unit-windows-watcher"]["if"],
+            "${{ github.event_name != 'pull_request' }}",
+        )
 
 
 class WindowsUnitWorkflowTests(unittest.TestCase):

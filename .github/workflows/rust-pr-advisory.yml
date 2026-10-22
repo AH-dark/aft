@@ -1,0 +1,25 @@
+name: Rust PR advisory
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain*"
+      - ".github/workflows/_unit-suite.yml"
+
+# A new push to the same PR replaces its advisory platform-test run. Because
+# this workflow is not a required check, cancelling an older run does not block
+# a PR from merging through the merge queue.
+concurrency:
+  group: rust-pr-advisory-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  platform-rust-tests:
+    name: Rust PR advisory
+    uses: ./.github/workflows/_unit-suite.yml
+    with:
+      pr_platform_advisory: true
