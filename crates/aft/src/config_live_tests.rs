@@ -1351,25 +1351,46 @@ fn stopping_a_config_directory_watch_never_stalls_other_file_io() {
         );
     }
 
+    // Every worker stays under the no-progress limit until it has finished,
+    // including after the stop signal: a worker stuck in the last moments of
+    // the run must fail the test, not leave it waiting on a join forever.
     let started = Instant::now();
     let mut seen = vec![(0u64, Instant::now()); progress.len()];
-    while started.elapsed() < RUN_FOR {
+    loop {
         std::thread::sleep(Duration::from_millis(100));
-        for ((name, counter), (last, moved_at)) in progress.iter().zip(seen.iter_mut()) {
+        if started.elapsed() >= RUN_FOR {
+            stop.store(true, Ordering::Release);
+        }
+        let mut running = 0;
+        for (((name, counter), (last, moved_at)), worker) in
+            progress.iter().zip(seen.iter_mut()).zip(&workers)
+        {
+            if worker.is_finished() {
+                continue;
+            }
+            running += 1;
             let now = counter.load(Ordering::Acquire);
             if now != *last {
                 *last = now;
                 *moved_at = Instant::now();
             } else if moved_at.elapsed() > STALL_LIMIT {
-                stop.store(true, Ordering::Release);
+                let stopping = stop.swap(true, Ordering::AcqRel);
                 panic!(
-                    "{name} made no progress for {STALL_LIMIT:?} (stuck after {now} rounds) \
-                     while config directory watches started and stopped"
+                    "{name} made no progress for {STALL_LIMIT:?} (stuck after {now} rounds{}) \
+                     while config directory watches started and stopped",
+                    if stopping {
+                        ", after the stop signal"
+                    } else {
+                        ""
+                    }
                 );
             }
         }
+        if stop.load(Ordering::Acquire) && running == 0 {
+            break;
+        }
     }
-    stop.store(true, Ordering::Release);
+    // All workers have finished, so these joins return at once.
     for worker in workers {
         worker.join().expect("worker thread");
     }

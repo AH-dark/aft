@@ -1471,6 +1471,7 @@ fn slow_discovery_never_delays_the_bind() {
         panic!("the bind did not return within {DEADLINE:?} while discovery was held")
     });
     let bind = started.elapsed();
+    // The result has arrived, so the binder thread is only returning.
     binder.join().unwrap();
     assert!(configured.success, "{configured:?}");
     eprintln!(
