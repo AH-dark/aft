@@ -952,52 +952,67 @@ read_required_check_results() {
   local sha="$1"
   CHECK_RUN_RESULTS="$(gh_query_or_refuse "check runs for required contexts on $sha" "$OPERATOR_GH" \
     api --paginate "repos/$repo_slug/commits/$sha/check-runs?per_page=100" \
-    --jq '.check_runs[] | [(.name // ""), (.status // ""), (.conclusion // "")] | @tsv')" || return "$?"
+    --jq '.check_runs[] | [(.name // ""), (.status // ""), (.conclusion // ""), (.created_at // "")] | @tsv')" || return "$?"
   COMMIT_STATUS_RESULTS="$(gh_query_or_refuse "commit statuses for required contexts on $sha" "$OPERATOR_GH" \
     api --paginate "repos/$repo_slug/commits/$sha/status?per_page=100" \
-    --jq '.statuses[] | [(.context // ""), (.state // "")] | @tsv')" || return "$?"
+    --jq '.statuses[] | [(.context // ""), (.state // ""), (.created_at // "")] | @tsv')" || return "$?"
+}
+
+# The same context can be reported by multiple runs on one sha. Use the newest
+# result, and prefer pending or failure over success when timestamps tie.
+LATEST_REQUIRED_TIME=""
+LATEST_REQUIRED_STATE=""
+record_latest_required_state() {
+  local candidate_time="$1" candidate_state="$2"
+  if [ -z "$LATEST_REQUIRED_STATE" ] || [[ "$candidate_time" > "$LATEST_REQUIRED_TIME" ]]; then
+    LATEST_REQUIRED_TIME="$candidate_time"
+    LATEST_REQUIRED_STATE="$candidate_state"
+  elif [ "$candidate_time" = "$LATEST_REQUIRED_TIME" ]; then
+    case "$LATEST_REQUIRED_STATE:$candidate_state" in
+      success:pending|success:failed|pending:failed)
+        LATEST_REQUIRED_STATE="$candidate_state"
+        ;;
+    esac
+  fi
 }
 
 classify_required_check_results() {
-  local context result_name result_status result_conclusion
-  local context_failed context_pending context_success
+  local context result_name result_status result_conclusion result_created_at result_state
   REQUIRED_MISSING=()
   REQUIRED_PENDING=()
   REQUIRED_FAILED=()
   REQUIRED_SUCCESS=()
   for context in "${REQUIRED_CONTEXTS[@]}"; do
-    context_failed=0
-    context_pending=0
-    context_success=0
-    while IFS=$'\t' read -r result_name result_status result_conclusion; do
+    LATEST_REQUIRED_TIME=""
+    LATEST_REQUIRED_STATE=""
+    while IFS=$'\t' read -r result_name result_status result_conclusion result_created_at; do
       [ "$result_name" = "$context" ] || continue
       if [ "$result_status" = "completed" ]; then
         if [ "$result_conclusion" = "success" ]; then
-          context_success=1
+          result_state="success"
         else
-          context_failed=1
+          result_state="failed"
         fi
       else
-        context_pending=1
+        result_state="pending"
       fi
+      record_latest_required_state "$result_created_at" "$result_state"
     done <<< "$CHECK_RUN_RESULTS"
-    while IFS=$'\t' read -r result_name result_status; do
+    while IFS=$'\t' read -r result_name result_status result_created_at; do
       [ "$result_name" = "$context" ] || continue
       case "$result_status" in
-        success) context_success=1 ;;
-        failure|error) context_failed=1 ;;
-        *) context_pending=1 ;;
+        success) result_state="success" ;;
+        failure|error) result_state="failed" ;;
+        *) result_state="pending" ;;
       esac
+      record_latest_required_state "$result_created_at" "$result_state"
     done <<< "$COMMIT_STATUS_RESULTS"
-    if [ "$context_failed" -eq 1 ]; then
-      REQUIRED_FAILED+=("$context")
-    elif [ "$context_pending" -eq 1 ]; then
-      REQUIRED_PENDING+=("$context")
-    elif [ "$context_success" -eq 1 ]; then
-      REQUIRED_SUCCESS+=("$context")
-    else
-      REQUIRED_MISSING+=("$context")
-    fi
+    case "$LATEST_REQUIRED_STATE" in
+      failed) REQUIRED_FAILED+=("$context") ;;
+      pending) REQUIRED_PENDING+=("$context") ;;
+      success) REQUIRED_SUCCESS+=("$context") ;;
+      *) REQUIRED_MISSING+=("$context") ;;
+    esac
   done
 }
 

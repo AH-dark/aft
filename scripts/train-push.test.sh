@@ -1314,10 +1314,10 @@ test_required_check_waits_for_every_context() {
   sha="$(git -C "$dir/work" rev-parse HEAD)"
   printf 'linux\nwindows\n' > "$dir/ci-state/required_contexts"
   printf '1\n' > "$dir/ci-state/required_initial_polls"
-  printf 'linux\tin_progress\t\n' > "$dir/ci-state/required_check_runs.initial"
-  printf 'windows\tpending\n' > "$dir/ci-state/required_statuses.initial"
-  printf 'linux\tcompleted\tsuccess\n' > "$dir/ci-state/required_check_runs.final"
-  printf 'windows\tsuccess\n' > "$dir/ci-state/required_statuses.final"
+  printf 'linux\tin_progress\t\t2026-01-01T00:00:00Z\n' > "$dir/ci-state/required_check_runs.initial"
+  printf 'windows\tpending\t2026-01-01T00:00:00Z\n' > "$dir/ci-state/required_statuses.initial"
+  printf 'linux\tcompleted\tsuccess\t2026-01-02T00:00:00Z\n' > "$dir/ci-state/required_check_runs.final"
+  printf 'windows\tsuccess\t2026-01-02T00:00:00Z\n' > "$dir/ci-state/required_statuses.final"
 
   run_train "$dir" required-check-wait
   polls="$(cat "$dir/ci-state/required_check_polls" 2>/dev/null || echo 0)"
@@ -1341,10 +1341,10 @@ test_required_check_waits_on_land_recovery() {
   git -C "$dir/work" push -q origin "HEAD:refs/heads/train/required-check-land"
   printf 'linux\nwindows\n' > "$dir/ci-state/required_contexts"
   printf '1\n' > "$dir/ci-state/required_initial_polls"
-  printf 'linux\tin_progress\t\n' > "$dir/ci-state/required_check_runs.initial"
-  printf 'windows\tpending\n' > "$dir/ci-state/required_statuses.initial"
-  printf 'linux\tcompleted\tsuccess\n' > "$dir/ci-state/required_check_runs.final"
-  printf 'windows\tsuccess\n' > "$dir/ci-state/required_statuses.final"
+  printf 'linux\tin_progress\t\t2026-01-01T00:00:00Z\n' > "$dir/ci-state/required_check_runs.initial"
+  printf 'windows\tpending\t2026-01-01T00:00:00Z\n' > "$dir/ci-state/required_statuses.initial"
+  printf 'linux\tcompleted\tsuccess\t2026-01-02T00:00:00Z\n' > "$dir/ci-state/required_check_runs.final"
+  printf 'windows\tsuccess\t2026-01-02T00:00:00Z\n' > "$dir/ci-state/required_statuses.final"
 
   run_train "$dir" required-check-land --land
   polls="$(cat "$dir/ci-state/required_check_polls" 2>/dev/null || echo 0)"
@@ -1363,7 +1363,7 @@ test_required_check_failure_is_red() {
   base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
   add_train_commit "$dir/work" required-check-failure
   printf 'linux\nwindows\n' > "$dir/ci-state/required_contexts"
-  printf 'linux\tcompleted\tcancelled\nwindows\tcompleted\tsuccess\n' \
+  printf 'linux\tcompleted\tcancelled\t2026-01-02T00:00:00Z\nwindows\tcompleted\tsuccess\t2026-01-02T00:00:00Z\n' \
     > "$dir/ci-state/required_check_runs.final"
   run_train "$dir" required-check-failure
   if [ "$LAST_RC" -eq 4 ] && [[ "$LAST_OUT" == *'failed: linux'* ]] &&
@@ -1374,13 +1374,29 @@ test_required_check_failure_is_red() {
   fi
 }
 
+test_required_check_uses_latest_run_state() {
+  local dir sha
+  dir="$(new_fixture required-check-latest)"
+  add_train_commit "$dir/work" required-check-latest
+  sha="$(git -C "$dir/work" rev-parse HEAD)"
+  printf 'linux\n' > "$dir/ci-state/required_contexts"
+  printf 'linux\tcompleted\tfailure\t2026-01-01T00:00:00Z\nlinux\tcompleted\tsuccess\t2026-01-02T00:00:00Z\n' \
+    > "$dir/ci-state/required_check_runs.final"
+  run_train "$dir" required-check-latest
+  if [ "$LAST_RC" -eq 0 ] && [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$sha" ]; then
+    ok 'a newer successful run supersedes an older failure for the same context'
+  else
+    fail "a newer successful run supersedes an older failure for the same context (rc=$LAST_RC)"
+  fi
+}
+
 test_required_check_missing_times_out() {
   local dir base polls
   dir="$(new_fixture required-check-missing)"
   base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
   add_train_commit "$dir/work" required-check-missing
   printf 'linux\nwindows\n' > "$dir/ci-state/required_contexts"
-  printf 'linux\tcompleted\tsuccess\n' > "$dir/ci-state/required_check_runs.final"
+  printf 'linux\tcompleted\tsuccess\t2026-01-02T00:00:00Z\n' > "$dir/ci-state/required_check_runs.final"
   TRAIN_PUSH_TEST_REQUIRED_CHECK_ATTEMPTS=2 run_train "$dir" required-check-missing
   polls="$(cat "$dir/ci-state/required_check_polls" 2>/dev/null || echo 0)"
   if [ "$LAST_RC" -eq 4 ] && [[ "$LAST_OUT" == *'missing: windows'* ]] &&
@@ -1427,6 +1443,7 @@ run_stack_tests() {
   test_required_check_waits_for_every_context
   test_required_check_waits_on_land_recovery
   test_required_check_failure_is_red
+  test_required_check_uses_latest_run_state
   test_required_check_missing_times_out
   test_protection_unreadable_falls_back
 }
@@ -1575,6 +1592,7 @@ case "${TRAIN_PUSH_TEST_CASE:-}" in
   required-check-wait) test_required_check_waits_for_every_context ;;
   required-check-land) test_required_check_waits_on_land_recovery ;;
   required-check-failure) test_required_check_failure_is_red ;;
+  required-check-latest) test_required_check_uses_latest_run_state ;;
   required-check-missing) test_required_check_missing_times_out ;;
   protection-unreadable) test_protection_unreadable_falls_back ;;
   skew-log-fallback) test_skew_log_query_fallback ;;
@@ -2752,14 +2770,14 @@ dir="$(new_fixture protected)"
 add_train_commit "$dir/work" "protected"
 protected_sha="$(git -C "$dir/work" rev-parse HEAD)"
 printf 'Unit\n' > "$dir/ci-state/required_contexts"
-printf 'Unit\tsuccess\n' > "$dir/ci-state/required_statuses.final"
+printf 'Unit\tsuccess\t2026-01-01T00:00:00Z\n' > "$dir/ci-state/required_statuses.final"
 cat > "$dir/origin.git/hooks/pre-receive" <<HOOK
 #!/bin/sh
 # Stand in for GitHub branch protection: the default branch only accepts a sha
 # that already carries a check.
 while read -r _old _new ref; do
   if [ "\$ref" = "refs/heads/$DEFAULT_BRANCH" ]; then
-    printf 'Unit\tpending\\n' > "\$TRAIN_PUSH_TEST_STATE/required_statuses.final"
+    printf 'Unit\tpending\t2026-01-02T00:00:00Z\\n' > "\$TRAIN_PUSH_TEST_STATE/required_statuses.final"
     echo 'error: GH006: Protected branch update failed for refs/heads/$DEFAULT_BRANCH.' >&2
     echo 'error: Required status check Unit is expected.' >&2
     exit 1
