@@ -152,6 +152,16 @@ export interface PiConfig {
    * - "host_default": leaves tool presentation to host defaults (on OMP, tools mount under xd://).
    */
   tool_presentation?: PiToolPresentation;
+  /**
+   * Plain Pi only: ask before an AFT tool reaches a path outside the project.
+   * Default true. On, Pi's own terminal UI asks; print, JSON and RPC sessions
+   * are never asked (no answer is waited for) and allow it without asking. Off, outside
+   * access is allowed without asking everywhere. Credentials, AFT's data
+   * folder, `sandbox.read_deny` and `restrict_to_project_root: true` refuse
+   * either way. Does not apply on OMP, where OMP's approval mode decides.
+   * A project config may turn it on, never off.
+   */
+  external_access_ask?: boolean;
 }
 
 export interface IndexRootConfig {
@@ -1011,6 +1021,12 @@ const GitConfigSchema = z.object({
   co_author: GitCoAuthorSchema.optional(),
 });
 
+/** Pi and OMP harness settings; see `PiConfig`. */
+const PiConfigSchema = z.object({
+  tool_presentation: z.enum(["top_level", "host_default"]).optional(),
+  external_access_ask: z.boolean().optional(),
+});
+
 const InspectConfigSchema = z.object({
   enabled: z.boolean().optional(),
   diagnostics_timeout_ms: z
@@ -1134,6 +1150,7 @@ const AftConfigFieldsSchema = z.object({
   gh_shim: GhShimConfigSchema.optional(),
   remote_exec: RemoteExecConfigSchema.optional(),
   git: GitConfigSchema.optional(),
+  pi: PiConfigSchema.optional(),
 });
 
 const HarnessOverrideSchema = z.preprocess((value) => {
@@ -1892,9 +1909,15 @@ function mergeProjectBackupConfig(
   return { ...base, max_file_size: project.max_file_size };
 }
 
+/**
+ * A project may set `pi.tool_presentation`, and may turn `pi.external_access_ask`
+ * on but never off: a repository must not silence a protection the user has.
+ */
 function mergePiConfig(base?: PiConfig, override?: PiConfig): PiConfig | undefined {
   if (!base && !override) return undefined;
-  return { ...base, ...override };
+  const project = { ...override };
+  if (project.external_access_ask === false) delete project.external_access_ask;
+  return { ...base, ...project };
 }
 
 function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[] {
@@ -1918,6 +1941,7 @@ function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[]
     stripped.push("bash.env");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
+  if (override.pi?.external_access_ask === false) stripped.push("pi.external_access_ask");
 
   if (override.github !== undefined) stripped.push("github");
   if (override.gh_shim !== undefined) stripped.push("gh_shim");

@@ -8,14 +8,18 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { discoverAndLoadExtensions, ExtensionRunner } from "@earendil-works/pi-coding-agent";
 import { type TSchema, Type } from "typebox";
 import type { AftConfig } from "../config.js";
+import { registerPiConfigErrorState } from "../config-error-state.js";
 import {
   detectPiHarness,
   resetRecordedExtensionApi,
   setHarnessOverrideForTesting,
 } from "../harness.js";
+import { OMP_TOOL_TIERS } from "../omp-approval.js";
 import {
   bindToolRegistrationFunnel,
+  registerLatePowershellTool,
   registerPiToolSurface,
+  reregisterBashTool,
   resolvePiToolSurface,
 } from "../tool-registration.js";
 import {
@@ -175,26 +179,82 @@ describe("Full surface registration funnel", () => {
   }
 
   test("OMP top_level registers every surface tool with loadMode essential and folded description", () => {
-    const { tools } = registerWithHarness("omp", {
+    const config: AftConfig = {
       disabled_tools: [],
       bash: true,
       pi: { tool_presentation: "top_level" },
+    };
+    const { api, tools } = makeMockApi();
+    // Shaped like OMP's ExtensionAPI, so a registration that detects the host
+    // itself (as the late session_start one does) sees OMP.
+    Object.assign(api, { arktype: {} });
+    const ctx = makePluginContext(makeMockBridge(() => ({ success: true, text: "ok" })).bridge, {
+      config,
     });
+    registerPiToolSurface(api, ctx, resolvePiToolSurface(config), "omp");
+    // What index.ts does at session_start once Pi reveals PowerShell.
+    expect(tools.has("powershell")).toBe(false);
+    registerLatePowershellTool(api, ctx, false);
+    expect(tools.has("powershell")).toBe(true);
 
     expect(tools.size).toBeGreaterThan(0);
     for (const [name, tool] of tools) {
-      const toolWithLoadMode = tool as unknown as { loadMode?: string };
-      expect(toolWithLoadMode.loadMode).toBe(
+      const registered = tool as unknown as {
+        loadMode?: string;
+        approval?: (args: unknown) => unknown;
+      };
+      expect(registered.loadMode).toBe(
         "essential",
         `Tool ${name} must carry loadMode: "essential" on OMP under top_level presentation`,
       );
+      expect(typeof registered.approval).toBe("function");
+      expect(registered.approval?.({})).toBe(OMP_TOOL_TIERS[name]);
     }
+    expect((tools.get("powershell") as unknown as { approval: () => unknown }).approval()).toBe(
+      "exec",
+    );
 
     // Check bash tool description has folded guidance
     const bashTool = tools.get("bash");
     expect(bashTool).toBeDefined();
     expect(bashTool?.description).toContain("Run shell commands (timeout in milliseconds");
     expect(bashTool?.description).toContain("- DO NOT use bash for code search or exploration");
+  });
+
+  test("OMP keeps loadMode essential and the exec tier on bash re-registered by a live config reload", () => {
+    const config: AftConfig = { disabled_tools: [], bash: true };
+    const { api, tools } = makeMockApi();
+    Object.assign(api, { arktype: {} });
+    const ctx = makePluginContext(makeMockBridge(() => ({ success: true, text: "ok" })).bridge, {
+      config,
+    });
+    registerPiToolSurface(api, ctx, resolvePiToolSurface(config), "omp");
+    const first = tools.get("bash");
+    // What index.ts does when a reload flips bash.runon_enabled.
+    reregisterBashTool(api, ctx, false);
+    const replaced = tools.get("bash") as unknown as {
+      loadMode?: string;
+      approval?: (args: unknown) => unknown;
+    };
+    expect(replaced).not.toBe(first);
+    expect(replaced.loadMode).toBe("essential");
+    expect(replaced.approval?.({ command: "ls" })).toBe("exec");
+  });
+
+  test("OMP config-error-state tools still go through the funnel", () => {
+    const config: AftConfig = { disabled_tools: [], bash: true };
+    const { api, tools } = makeMockApi();
+    Object.assign(api, { arktype: {}, on: () => {} });
+    registerPiConfigErrorState(api, config, "broken config");
+    expect(tools.size).toBeGreaterThan(0);
+    for (const [name, tool] of tools) {
+      const registered = tool as unknown as {
+        loadMode?: string;
+        approval?: (args: unknown) => unknown;
+      };
+      expect(registered.loadMode).toBe("essential", name);
+      expect(registered.approval?.({})).toBe(OMP_TOOL_TIERS[name]);
+    }
   });
 
   test("OMP host_default leaves loadMode undefined on all tools", () => {

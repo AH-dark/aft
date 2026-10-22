@@ -92,7 +92,9 @@ All keys are optional. Example:
     // "top_level" (default) | "host_default"
     // On OMP, "top_level" registers tools with loadMode: "essential" so they appear
     // directly in the model tools array. "host_default" mounts tools under xd://.
-    "tool_presentation": "top_level"
+    "tool_presentation": "top_level",
+    // Plain Pi: ask before an outside-project access (default true; only user config can turn it off; print/JSON/RPC sessions never ask; on OMP, OMP's tools.approvalMode decides and outside-path calls report the "exec" tier).
+    "external_access_ask": true
   },
 
   "formatter": {

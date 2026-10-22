@@ -134,6 +134,11 @@ export async function resolvePiBootstrapConfig(
  * A view of `pi` whose `registerTool` swaps each tool's `execute` for one that
  * throws `message`. Pi turns a thrown error into an error tool result, so the
  * call is marked failed rather than returning the text as a success.
+ *
+ * It sits beneath the registration funnel, not beside it:
+ * `registerPiToolSurface` binds the funnel over this view, so each tool arrives
+ * here already prepared for the host (on OMP, `loadMode` and its approval
+ * tier) and only `execute` is replaced.
  */
 function failingRegistrations(pi: ExtensionAPI, message: string): ExtensionAPI {
   const registerTool = ((tool: Parameters<ExtensionAPI["registerTool"]>[0]) => {

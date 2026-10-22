@@ -257,6 +257,18 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   // hostile repository cannot weaken your file boundary.
   "restrict_to_project_root": false,
 
+  "pi": {
+    // Plain Pi: ask in Pi's own terminal UI before an AFT tool reaches a path
+    // outside the project. Default: true. Off, outside access is allowed
+    // without asking. Print, JSON and RPC sessions have no screen to ask on
+    // and never ask. Credentials, AFT's data folder, `sandbox.read_deny` and
+    // `restrict_to_project_root: true` refuse either way. Only user config can
+    // turn it off; a project config may only turn it on. Not used on OMP,
+    // where OMP's own `tools.approvalMode` decides: AFT reports a call that
+    // names an outside path as the "exec" tier there.
+    "external_access_ask": true
+  },
+
   // OpenCode plugin only. When true, the auto-update hook installs newer
   // @cortexkit/aft-opencode versions automatically when your OpenCode plugin
   // entry is unpinned (no version, or a `latest` tag). When false, the hook still

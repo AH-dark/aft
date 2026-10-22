@@ -611,6 +611,8 @@ export type PiToolPresentation = z.infer<typeof PiToolPresentationEnum>;
 export const PiConfigSchema = z.object({
   /** Tool presentation mode for Pi/OMP harnesses. */
   tool_presentation: PiToolPresentationEnum.optional(),
+  /** Plain Pi only: ask before outside-project access. Projects may only turn it on. */
+  external_access_ask: z.boolean().optional(),
 });
 export type PiConfig = z.infer<typeof PiConfigSchema>;
 
@@ -1825,9 +1827,16 @@ function mergeProjectBackupConfig(
   return { ...base, max_file_size: project.max_file_size };
 }
 
+/**
+ * A project may set `pi.tool_presentation`, and may turn `pi.external_access_ask`
+ * on but never off. The Pi plugin applies the same rule; OpenCode only keeps
+ * the shared file's meaning the same.
+ */
 function mergePiConfig(base?: PiConfig, override?: PiConfig): PiConfig | undefined {
   if (!base && !override) return undefined;
-  return { ...base, ...override };
+  const project = { ...override };
+  if (project.external_access_ask === false) delete project.external_access_ask;
+  return { ...base, ...project };
 }
 
 function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[] {
@@ -1852,6 +1861,7 @@ function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[]
     stripped.push("bash.env");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
+  if (override.pi?.external_access_ask === false) stripped.push("pi.external_access_ask");
 
   if (override.github !== undefined) stripped.push("github");
   if (override.gh_shim !== undefined) stripped.push("gh_shim");

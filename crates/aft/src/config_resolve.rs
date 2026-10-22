@@ -602,11 +602,14 @@ pub struct RawGit {
 #[serde(default)]
 pub struct RawPi {
     pub tool_presentation: Option<RawPiToolPresentation>,
+    /// Plain Pi asks before outside-project access (default on). A project
+    /// tier may turn it on, never off; see `merge_pi_config`.
+    pub external_access_ask: Option<bool>,
 }
 
 impl RawPi {
     fn is_empty(&self) -> bool {
-        self.tool_presentation.is_none()
+        self.tool_presentation.is_none() && self.external_access_ask.is_none()
     }
 }
 
@@ -1767,6 +1770,10 @@ fn merge_worktree_config(
     (!worktree.is_empty()).then_some(worktree)
 }
 
+/// Merge a project tier's `pi` block. `external_access_ask: false` is ignored
+/// there: a repository must not silence a protection the user has, so a
+/// project may only turn the outside-access prompt on. `record_project_drops`
+/// reports the ignored value.
 fn merge_pi_config(base: Option<RawPi>, override_pi: Option<RawPi>) -> Option<RawPi> {
     let Some(override_pi) = override_pi else {
         return base;
@@ -1774,6 +1781,10 @@ fn merge_pi_config(base: Option<RawPi>, override_pi: Option<RawPi>) -> Option<Ra
 
     let mut pi = base.unwrap_or_default();
     pi.tool_presentation = override_pi.tool_presentation.or(pi.tool_presentation);
+    pi.external_access_ask = override_pi
+        .external_access_ask
+        .filter(|ask| *ask)
+        .or(pi.external_access_ask);
     (!pi.is_empty()).then_some(pi)
 }
 
@@ -1888,6 +1899,18 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     }
     if raw.subc.is_some() {
         push_drop(dropped, "subc", tier, USER_ONLY_REASON);
+    }
+    if raw
+        .pi
+        .as_ref()
+        .is_some_and(|pi| pi.external_access_ask == Some(false))
+    {
+        push_drop(
+            dropped,
+            "pi.external_access_ask",
+            tier,
+            "security: a project config may only turn the outside-access prompt on",
+        );
     }
 
     if raw
@@ -4824,5 +4847,38 @@ mod tests {
             result.config.formatter.get("rust").map(String::as_str),
             Some("rustfmt")
         );
+    }
+
+    fn external_access_ask(user: Option<bool>, project: Option<bool>) -> Option<bool> {
+        let block = |value: Option<bool>| {
+            value.map(|ask| RawPi {
+                external_access_ask: Some(ask),
+                ..RawPi::default()
+            })
+        };
+        merge_pi_config(block(user), block(project)).and_then(|pi| pi.external_access_ask)
+    }
+
+    /// A repository must not silence the outside-access prompt for the user:
+    /// a project may turn it on, never off.
+    #[test]
+    fn project_tier_may_only_turn_the_outside_access_prompt_on() {
+        assert_eq!(external_access_ask(Some(true), Some(false)), Some(true));
+        assert_eq!(external_access_ask(None, Some(false)), None);
+        assert_eq!(external_access_ask(Some(false), Some(true)), Some(true));
+        assert_eq!(external_access_ask(Some(false), None), Some(false));
+
+        let result = resolve_config(&[
+            tier("user", r#"{ "pi": { "external_access_ask": true } }"#),
+            tier("project", r#"{ "pi": { "external_access_ask": false } }"#),
+        ]);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(drop_keys(&result), vec!["pi.external_access_ask"]);
+
+        let result = resolve_config(&[
+            tier("user", r#"{ "pi": { "external_access_ask": false } }"#),
+            tier("project", r#"{ "pi": { "external_access_ask": true } }"#),
+        ]);
+        assert!(drop_keys(&result).is_empty(), "{:?}", result.dropped);
     }
 }

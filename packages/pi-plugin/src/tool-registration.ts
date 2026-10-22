@@ -7,7 +7,9 @@ import { resolveBashConfig, resolvedDisabledTools } from "./config.js";
 import { detectPiHarness, type PiHarness } from "./harness.js";
 import { withOmpInternalUrls } from "./omp-internal-urls.js";
 import {
+  outsideAccessPolicyFor,
   prepareToolDefinitionForRegistration,
+  recordSessionCwd,
   withOutsidePermissionOperation,
 } from "./tools/_shared.js";
 import { registerAstTools } from "./tools/ast.js";
@@ -241,9 +243,12 @@ export function bindToolRegistrationFunnel(
     originalRegisterTool({
       ...prepared,
       execute(toolCallId, params, signal, onUpdate, context) {
+        recordSessionCwd((context as { cwd?: unknown } | undefined)?.cwd);
         return withOutsidePermissionOperation(
           () => prepared.execute(toolCallId, params, signal, onUpdate, context),
           signal,
+          // Read per call: a live config reload replaces `ctx.config`.
+          outsideAccessPolicyFor(ctx, effectiveHarness),
         );
       },
     } as ToolDefinition<TParams, TDetails, TState>);
@@ -290,6 +295,38 @@ export function registerPiToolSurface(
   if (surface.safety) registerSafetyTool(boundPi, ctx);
   if (surface.astSearch || surface.astReplace) registerAstTools(boundPi, ctx, surface);
   if (surface.delete || surface.move) registerFsTools(boundPi, ctx, surface);
+}
+
+/**
+ * Register the `powershell` slot after session start, when a modern Pi first
+ * reveals that its optional built-in PowerShell tool is active. It goes through
+ * the same registration funnel as the first pass, so on OMP it carries
+ * `loadMode` and its approval tier like every other AFT tool.
+ */
+export function registerLatePowershellTool(
+  pi: ExtensionAPI,
+  ctx: PluginContext,
+  semantic: boolean,
+  harness?: PiHarness,
+): void {
+  const boundPi = bindToolRegistrationFunnel(pi, ctx, harness);
+  registerBashTool(boundPi, ctx, semantic, "powershell", false, "powershell");
+}
+
+/**
+ * Replace the `bash` slot when a live config reload flips
+ * `bash.runon_enabled`: Pi copies a tool's schema into its registry, so the
+ * slot is registered again with the new schema. Through the funnel, so on OMP
+ * the replacement keeps `loadMode` and its approval tier.
+ */
+export function reregisterBashTool(
+  pi: ExtensionAPI,
+  ctx: PluginContext,
+  semantic: boolean,
+  harness?: PiHarness,
+): void {
+  const boundPi = bindToolRegistrationFunnel(pi, ctx, harness);
+  registerBashTool(boundPi, ctx, semantic, "bash", false, "bash");
 }
 
 /** Replace Pi's captured revision-read schemas without changing the loaded tool set. */

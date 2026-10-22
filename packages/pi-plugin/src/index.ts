@@ -105,11 +105,12 @@ import {
   piHashlineDowngrade,
   piHashlineEffective,
   refreshPiRevisionReadTools,
+  registerLatePowershellTool,
   registerPiToolSurface,
+  reregisterBashTool,
   resolvePiToolSurface,
 } from "./tool-registration.js";
-import { resolveSessionId } from "./tools/_shared.js";
-import { registerBashTool } from "./tools/bash.js";
+import { recordSessionCwd, resolveSessionId } from "./tools/_shared.js";
 import type { PluginContext } from "./types.js";
 import { registerWorkflowHints } from "./workflow-hints.js";
 
@@ -628,7 +629,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       if (remoteGateChanged && surface.hoistBash) {
         // Pi copies schema metadata into its registry, so replace the bash
         // slot when this live safety switch changes, not just its executor.
-        registerBashTool(pi, ctx, surface.semantic, "bash", false, "bash");
+        reregisterBashTool(pi, ctx, surface.semantic);
       }
     },
     notify: (message) => deliverConfigMigrationWarnings([message]),
@@ -949,6 +950,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     ) => void
   )("session_start", (_event, extCtx) => {
     const sessionID = extCtx ? resolveSessionId(extCtx as ExtensionContext) : undefined;
+    recordSessionCwd((extCtx as ExtensionContext | undefined)?.cwd);
     observeFreshSessionStart(
       pool,
       (extCtx as ExtensionContext | undefined)?.cwd ?? projectRoot,
@@ -962,7 +964,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     if (!liveSurface.hoistPowershell) return;
     // Companions were registered by name in the first pass, independently of
     // which shell tools exist, so only the PowerShell slot is added here.
-    registerBashTool(pi, ctx, liveSurface.semantic, "powershell", false, "powershell");
+    registerLatePowershellTool(pi, ctx, liveSurface.semantic);
     powershellRegistered = true;
   });
 
