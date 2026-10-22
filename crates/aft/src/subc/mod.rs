@@ -7553,7 +7553,7 @@ async fn handle_management_request(
     executor: &Arc<Executor>,
     live_roots: &HashMap<ProjectRootId, RootMeta>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
-    health_rollup_cache: &HealthRollupCache,
+    health_rollup_cache: &Arc<HealthRollupCache>,
     metrics: &Arc<DispatchPathMetrics>,
 ) -> Result<(), SubcError> {
     let decoded = serde_json::from_slice::<Value>(&frame.body).ok();
@@ -7584,16 +7584,19 @@ async fn handle_management_request(
             spawn_backups_purge(tx, frame, shared_app, executor, metrics, params);
             return Ok(());
         }
-        crate::commands::memory_census::MEMORY_CENSUS_OPERATION => Response::success(
-            "management-memory-census",
-            memory_census_with_lifecycle(
-                health_rollup_cache,
+        crate::commands::memory_census::MEMORY_CENSUS_OPERATION => {
+            spawn_memory_census(
+                tx,
+                frame,
+                decoded.as_ref(),
                 shared_app,
                 executor,
-                live_roots,
-                root_channels,
-            ),
-        ),
+                census_route_rows(live_roots, root_channels),
+                health_rollup_cache,
+                metrics,
+            );
+            return Ok(());
+        }
         crate::commands::writes_census::WRITES_CENSUS_OPERATION => {
             let params = decoded
                 .as_ref()
@@ -7729,21 +7732,82 @@ async fn handle_management_request(
     send_management_response(tx, frame, operation, result, metrics).await
 }
 
-fn memory_census_with_lifecycle(
-    health_rollup_cache: &HealthRollupCache,
-    shared_app: &App,
-    executor: &Executor,
+/// What a `memory.census` reply adds to each live root's row from the
+/// connection's own state, copied when the request arrives so the reply can
+/// be built off the frame loop.
+struct CensusRouteRow {
+    root_id: ProjectRootId,
+    bound_routes: usize,
+    last_touched: Instant,
+}
+
+fn census_route_rows(
     live_roots: &HashMap<ProjectRootId, RootMeta>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+) -> Vec<CensusRouteRow> {
+    live_roots
+        .iter()
+        .map(|(root_id, meta)| CensusRouteRow {
+            root_id: root_id.clone(),
+            bound_routes: root_channels.get(root_id).map_or(0, HashSet::len),
+            last_touched: meta.last_touched,
+        })
+        .collect()
+}
+
+/// Answer `memory.census` from a task: the reply may wait for the rollup
+/// thread to measure a current census (see `health::fresh_memory_census`),
+/// and the frame loop must not wait with it.
+#[allow(clippy::too_many_arguments)]
+fn spawn_memory_census(
+    tx: &WriterSender,
+    frame: &Frame,
+    body: Option<&Value>,
+    shared_app: &Arc<App>,
+    executor: &Arc<Executor>,
+    route_rows: Vec<CensusRouteRow>,
+    health_rollup_cache: &Arc<HealthRollupCache>,
+    metrics: &Arc<DispatchPathMetrics>,
+) {
+    let deadline = health::memory_census_deadline(body, Instant::now());
+    let tx = tx.clone();
+    let frame = frame.clone();
+    let shared_app = Arc::clone(shared_app);
+    let executor = Arc::clone(executor);
+    let cache = Arc::clone(health_rollup_cache);
+    let metrics = Arc::clone(metrics);
+    tokio::spawn(async move {
+        let _response_task = ResponseTaskGuard::new(&metrics);
+        let census = health::fresh_memory_census(&cache, deadline).await;
+        let census = with_census_route_rows(census, &shared_app, &executor, &route_rows);
+        if let Err(error) = send_management_response(
+            &tx,
+            &frame,
+            crate::commands::memory_census::MEMORY_CENSUS_OPERATION,
+            Response::success("management-memory-census", census),
+            &metrics,
+        )
+        .await
+        {
+            log::warn!("memory.census: could not queue the reply: {error}");
+        }
+    });
+}
+
+fn with_census_route_rows(
+    mut census: Value,
+    shared_app: &App,
+    executor: &Executor,
+    route_rows: &[CensusRouteRow],
 ) -> Value {
-    let mut census = health_rollup_cache.memory_census();
     if let Some(rows) = census.get_mut("roots").and_then(Value::as_object_mut) {
         let lifecycle = shared_app.lifecycle_census_snapshot();
-        for (root_id, meta) in live_roots {
+        for route_row in route_rows {
+            let root_id = &route_row.root_id;
             let root = root_id.as_path().display().to_string();
-            let bound_routes = root_channels.get(root_id).map_or(0, HashSet::len);
+            let bound_routes = route_row.bound_routes;
             let age_ms = Instant::now()
-                .saturating_duration_since(meta.last_touched)
+                .saturating_duration_since(route_row.last_touched)
                 .as_millis()
                 .min(u128::from(u64::MAX)) as u64;
             // A busy scheduler reports the default TTL for this census row.

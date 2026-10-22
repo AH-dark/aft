@@ -1699,9 +1699,18 @@ const HEALTH_ALLOCATOR_MAX_AGE_MS: u64 = 30_000;
 /// no `memory.census` read asked for a new one. Measuring it renders an
 /// uncapped row for every actor root, and only `memory.census` reads it; the
 /// compact memory figures in the health reply are measured on every rollup.
-/// A read always asks the next rollup for a fresh census, so a client that
-/// polls sees figures one rollup old, and the census reports its own age.
+/// A read asks the next rollup for a fresh census, and a read that finds the
+/// census older than one rollup interval wakes the rollup and waits for it
+/// (see [`fresh_memory_census`]), so readers get figures at most one rollup
+/// old.
 const HEALTH_MEMORY_CENSUS_INTERVAL_MS: u64 = 30_000;
+/// How long a `memory.census` request may take when its body names no
+/// `deadline_ms`: the default call timeout of the subc client the census
+/// clients use.
+const MEMORY_CENSUS_DEFAULT_BUDGET: Duration = Duration::from_secs(30);
+/// Time kept back from a `memory.census` request's budget for adding the
+/// route fields, encoding and writing the reply after waiting for a census.
+const MEMORY_CENSUS_REPLY_MARGIN: Duration = Duration::from_secs(1);
 
 fn encoded_health_metrics_len(metrics: &serde_json::Map<String, Value>) -> usize {
     #[cfg(test)]
@@ -1861,6 +1870,10 @@ struct HealthDiagnosticRollup {
     /// the rollup that measured it is published, which stamps it with the
     /// publication time.
     memory_census_at_ms: Option<u64>,
+    /// The census requests (see `HealthRollupCache::census_requests`) that
+    /// `memory_census` answers: every request numbered up to this one was
+    /// made before the rollup that measured it started.
+    memory_census_answers: u64,
     /// Per-step timing of the rollup that produced this snapshot.
     #[cfg(test)]
     tick: Value,
@@ -1918,6 +1931,7 @@ impl HealthDiagnosticRollup {
             metrics,
             memory_census: Arc::new(placeholder_memory_census()),
             memory_census_at_ms: None,
+            memory_census_answers: 0,
             #[cfg(test)]
             tick: Value::Null,
         }
@@ -1979,9 +1993,19 @@ pub(super) struct HealthRollupCache {
     #[cfg(test)]
     retention_count_reads: AtomicU64,
     census_rows: std::sync::Mutex<crate::commands::memory_census::CensusRootRows>,
-    /// Set by every `memory.census` read and taken by the next rollup, which
-    /// then measures a fresh census instead of carrying the last one.
-    census_requested: AtomicBool,
+    /// How many `memory.census` reads have asked for a fresh census. A
+    /// rollup that measures the census answers every request counted when it
+    /// started (`HealthDiagnosticRollup::memory_census_answers`); while a
+    /// request is unanswered, the next rollup measures instead of carrying.
+    census_requests: AtomicU64,
+    /// `memory.census` reads waiting for a rollup to answer them. While any
+    /// wait, a bind-completion wake ends the rollup thread's quiet period too.
+    census_waiters: AtomicUsize,
+    /// The running rollup thread's wake channel, so a census read can start a
+    /// rollup at once. Cleared when the worker shuts down.
+    census_wake: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<RollupWake>>>,
+    /// The generation of each publication, for census reads waiting on one.
+    publications: tokio::sync::watch::Sender<u64>,
     /// Full memory censuses measured by rollups.
     #[cfg(test)]
     census_builds: AtomicU64,
@@ -2007,7 +2031,10 @@ impl HealthRollupCache {
             #[cfg(test)]
             retention_count_reads: AtomicU64::new(0),
             census_rows: std::sync::Mutex::new(Default::default()),
-            census_requested: AtomicBool::new(false),
+            census_requests: AtomicU64::new(0),
+            census_waiters: AtomicUsize::new(0),
+            census_wake: std::sync::Mutex::new(None),
+            publications: tokio::sync::watch::Sender::new(0),
             #[cfg(test)]
             census_builds: AtomicU64::new(0),
         }
@@ -2129,6 +2156,8 @@ impl HealthRollupCache {
             *snapshot = rollup;
             self.published_generation
                 .store(generation, Ordering::Release);
+            drop(snapshot);
+            self.publications.send_replace(generation);
         } else {
             // Mark the census being served now as stale, without touching it.
             self.stale_through_generation.fetch_max(
@@ -2287,17 +2316,36 @@ impl HealthRollupCache {
         self.refreshes.load(Ordering::Acquire)
     }
 
+    /// Count a `memory.census` read that wants current figures, so the next
+    /// rollup measures the census. Returns the request's number; a census
+    /// whose `memory_census_answers` reaches it was measured after the read.
+    fn request_census(&self) -> u64 {
+        self.census_requests.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Ask the next rollup for a fresh census and return the census served
+    /// now, without waiting for one. [`fresh_memory_census`] waits.
+    #[cfg(test)]
     pub(super) fn memory_census(&self) -> Value {
-        // A reader wants current figures: have the next rollup measure them.
-        self.census_requested.store(true, Ordering::Release);
+        self.request_census();
         let (snapshot, _) = self.snapshot();
+        self.render_memory_census(&snapshot)
+    }
+
+    /// How old the census in `snapshot` is, on the cache clock; `None` before
+    /// the first census.
+    fn census_age_ms(&self, snapshot: &HealthDiagnosticRollup) -> Option<u64> {
+        snapshot
+            .memory_census_at_ms
+            .map(|measured| self.now_ms().saturating_sub(measured))
+    }
+
+    fn render_memory_census(&self, snapshot: &HealthDiagnosticRollup) -> Value {
         let mut census = Value::clone(&snapshot.memory_census);
         // The census can be older than the rollup serving it. Its age, and
         // the ages of the measurements inside it, count from when it was
         // measured.
-        let census_age_ms = snapshot
-            .memory_census_at_ms
-            .map(|measured| self.now_ms().saturating_sub(measured));
+        let census_age_ms = self.census_age_ms(snapshot);
         if let Some(tick) = census
             .get_mut("health_rollup_tick")
             .and_then(Value::as_object_mut)
@@ -2326,37 +2374,70 @@ impl HealthRollupCache {
         census
     }
 
-    /// The published census, if the next rollup may carry it forward instead
+    /// Whether the next rollup may carry the published census forward instead
     /// of measuring a new one: it covers exactly the roots in `actor_entries`,
-    /// no read has asked for a fresh census since it was measured, and it is
-    /// younger than [`HEALTH_MEMORY_CENSUS_INTERVAL_MS`]. Takes a pending read
-    /// request, because the rollup that asks this then measures the census.
+    /// every census request made so far was made before the rollup that
+    /// measured it, and it is younger than
+    /// [`HEALTH_MEMORY_CENSUS_INTERVAL_MS`]. Returns the request count read
+    /// now, which a census measured by this rollup answers, and the census to
+    /// carry with its measurement time and answered count.
     fn reusable_memory_census(
         &self,
         actor_entries: &[(ProjectRootId, Arc<AppContext>)],
-    ) -> Option<(Arc<Value>, u64)> {
-        let requested = self.census_requested.swap(false, Ordering::AcqRel);
+    ) -> (u64, Option<CarriedCensus>) {
+        let requests = self.census_requests.load(Ordering::Acquire);
         let published = Arc::clone(
             &self
                 .snapshot
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        let measured_at_ms = published.memory_census_at_ms?;
-        if requested
+        let Some(measured_at_ms) = published.memory_census_at_ms else {
+            return (requests, None);
+        };
+        if requests > published.memory_census_answers
             || published.generation == 0
             || self.now_ms().saturating_sub(measured_at_ms) >= HEALTH_MEMORY_CENSUS_INTERVAL_MS
         {
-            return None;
+            return (requests, None);
         }
         // A root that was bound or dropped since must show in the census at
         // once, not after the interval.
-        let rows = published.memory_census.get("roots")?.as_object()?;
+        let Some(rows) = published
+            .memory_census
+            .get("roots")
+            .and_then(Value::as_object)
+        else {
+            return (requests, None);
+        };
         let same_roots = rows.len() == actor_entries.len()
             && actor_entries
                 .iter()
                 .all(|(root_id, _)| rows.contains_key(&root_id.as_path().display().to_string()));
-        same_roots.then(|| (Arc::clone(&published.memory_census), measured_at_ms))
+        let carried = same_roots.then(|| CarriedCensus {
+            census: Arc::clone(&published.memory_census),
+            measured_at_ms,
+            answers: published.memory_census_answers,
+        });
+        (requests, carried)
+    }
+
+    /// Start a rollup now for a census read that is waiting, if the rollup
+    /// thread runs. A full wake channel already holds a wake, and the thread
+    /// ends its quiet period on any wake while a census read waits.
+    fn wake_for_census(&self) {
+        if let Some(wake) = self
+            .census_wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = wake.try_send(RollupWake::Census);
+        }
+    }
+
+    fn census_read_waiting(&self) -> bool {
+        self.census_waiters.load(Ordering::Acquire) > 0
     }
 
     #[cfg(test)]
@@ -2365,13 +2446,96 @@ impl HealthRollupCache {
     }
 }
 
+/// A published census a rollup carries forward instead of measuring.
+struct CarriedCensus {
+    census: Arc<Value>,
+    measured_at_ms: u64,
+    answers: u64,
+}
+
+/// Counts a census read as waiting for as long as it is alive.
+struct CensusWaiter<'a>(&'a HealthRollupCache);
+
+impl<'a> CensusWaiter<'a> {
+    fn new(cache: &'a HealthRollupCache) -> Self {
+        cache.census_waiters.fetch_add(1, Ordering::AcqRel);
+        Self(cache)
+    }
+}
+
+impl Drop for CensusWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.census_waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The memory census for a `memory.census` read, at most one rollup old when
+/// the rollup thread can provide one in time.
+///
+/// A census measured within the last rollup interval is returned at once.
+/// An older one (or none yet) wakes the rollup thread for an immediate
+/// rollup and waits until a census measured after this read started is
+/// published, but no later than `deadline` less
+/// [`MEMORY_CENSUS_REPLY_MARGIN`]. If none arrives in time, the census served
+/// then is returned with its age, as any census is.
+pub(super) async fn fresh_memory_census(cache: &HealthRollupCache, deadline: Instant) -> Value {
+    let ticket = cache.request_census();
+    let answered = |snapshot: &HealthDiagnosticRollup| snapshot.memory_census_answers >= ticket;
+    let published = || {
+        Arc::clone(
+            &cache
+                .snapshot
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    };
+    let snapshot = published();
+    let current = cache
+        .census_age_ms(&snapshot)
+        .is_some_and(|age| age <= duration_millis_u64(HEALTH_ROLLUP_TTL));
+    if current || answered(&snapshot) {
+        return cache.render_memory_census(&snapshot);
+    }
+    let Some(wait_until) = deadline.checked_sub(MEMORY_CENSUS_REPLY_MARGIN) else {
+        return cache.render_memory_census(&snapshot);
+    };
+    let _waiter = CensusWaiter::new(cache);
+    // Subscribe before waking, so a publication between the wake and the
+    // first wait is still seen.
+    let mut publications = cache.publications.subscribe();
+    cache.wake_for_census();
+    loop {
+        let snapshot = published();
+        if answered(&snapshot) {
+            return cache.render_memory_census(&snapshot);
+        }
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(wait_until),
+            publications.changed(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            // Out of time, or the cache is going away: serve what is there.
+            Ok(Err(_)) | Err(_) => return cache.render_memory_census(&published()),
+        }
+    }
+}
+
+/// When a `memory.census` request must be answered by: its `deadline_ms`, or
+/// [`MEMORY_CENSUS_DEFAULT_BUDGET`] after `received_at` when it names none.
+pub(super) fn memory_census_deadline(body: Option<&Value>, received_at: Instant) -> Instant {
+    body.and_then(client_deadline)
+        .unwrap_or_else(|| received_at + MEMORY_CENSUS_DEFAULT_BUDGET)
+}
+
 /// Owned test rendezvous for publishing a rollup after configure has committed.
 /// A probe-backed worker refreshes only on explicit requests, so a later periodic
 /// census cannot replace the acknowledged snapshot before the wire assertion.
 #[doc(hidden)]
 #[derive(Clone, Default)]
 pub struct SubcTestHealthRollupProbe {
-    wake: Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<bool>>>>,
+    wake: Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<RollupWake>>>>,
     requests: Arc<std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
 }
 
@@ -2390,14 +2554,25 @@ impl SubcTestHealthRollupProbe {
             .unwrap()
             .as_ref()
             .expect("health worker started")
-            .send(true)
+            .send(RollupWake::Refresh)
             .expect("health worker running");
         rx
     }
 }
 
+/// A message to the rollup thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RollupWake {
+    /// Something changed (a bind completed); refresh after the quiet period.
+    Refresh,
+    /// A `memory.census` read waits for a census; refresh now.
+    Census,
+    Stop,
+}
+
 pub(super) struct HealthRollupWorker {
-    wake_tx: std::sync::mpsc::SyncSender<bool>,
+    wake_tx: std::sync::mpsc::SyncSender<RollupWake>,
+    cache: Arc<HealthRollupCache>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -2410,15 +2585,21 @@ impl HealthRollupWorker {
     ) -> Self {
         let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
         *probe.wake.lock().unwrap() = Some(wake_tx.clone());
+        let worker_cache = Arc::clone(&cache);
         let join = std::thread::Builder::new()
             .name("aft-health-rollup".to_string())
             .spawn(move || {
-                while let Ok(true) = wake_rx.recv() {
+                // Census wakes are not registered for this worker: it refreshes
+                // only for probe requests, and a census read waits out its bound.
+                while let Ok(wake) = wake_rx.recv() {
+                    if wake == RollupWake::Stop {
+                        break;
+                    }
                     let requests = std::mem::take(&mut *probe.requests.lock().unwrap());
                     if requests.is_empty() {
                         continue;
                     }
-                    cache.refresh_for_test(&executor, &shared_app);
+                    worker_cache.refresh_for_test(&executor, &shared_app);
                     // Tickets are taken before assembly, not after publication:
                     // a request arriving mid-census needs a subsequent rollup.
                     for request in requests {
@@ -2429,6 +2610,7 @@ impl HealthRollupWorker {
             .expect("spawn test health rollup worker");
         Self {
             wake_tx,
+            cache,
             join: Some(join),
         }
     }
@@ -2448,13 +2630,19 @@ impl HealthRollupWorker {
         interval: Duration,
     ) -> Self {
         let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
+        *cache
+            .census_wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(wake_tx.clone());
+        let worker_cache = Arc::clone(&cache);
         let join = std::thread::Builder::new()
             .name("aft-health-rollup".to_string())
             .spawn(move || 'worker: loop {
-                cache.refresh(&executor, &shared_app);
+                worker_cache.refresh(&executor, &shared_app);
                 // Bind completions can arrive during a rollup. A queued request
                 // must not start another full census immediately; the interval
-                // is a minimum quiet period after each completed refresh.
+                // is a minimum quiet period after each completed refresh. A
+                // census read that waits is the exception: it is answered now.
                 let next_refresh = Instant::now() + interval;
                 loop {
                     let remaining = next_refresh.saturating_duration_since(Instant::now());
@@ -2462,23 +2650,27 @@ impl HealthRollupWorker {
                         break;
                     }
                     match wake_rx.recv_timeout(remaining) {
-                        Ok(true) => continue,
+                        Ok(RollupWake::Census) => break,
+                        // The one-slot channel may have held a bind wake when
+                        // the census read tried to send its own.
+                        Ok(RollupWake::Refresh) if worker_cache.census_read_waiting() => break,
+                        Ok(RollupWake::Refresh) => continue,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                        Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            break 'worker
-                        }
+                        Ok(RollupWake::Stop)
+                        | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'worker,
                     }
                 }
             })
             .expect("spawn health rollup worker");
         Self {
             wake_tx,
+            cache,
             join: Some(join),
         }
     }
 
     pub(super) fn request_refresh(&self) {
-        let _ = self.wake_tx.try_send(true);
+        let _ = self.wake_tx.try_send(RollupWake::Refresh);
     }
 
     /// Stop the worker. The wait is capped: the worker may be in the middle of
@@ -2488,8 +2680,19 @@ impl HealthRollupWorker {
     /// worker at its next wait even if the stop message does not fit in the
     /// one-slot channel, so a worker that outlives the cap still stops.
     pub(super) fn shutdown(self) {
-        let Self { wake_tx, join } = self;
-        let _ = wake_tx.try_send(false);
+        let Self {
+            wake_tx,
+            cache,
+            join,
+        } = self;
+        // The cache's copy of the sender would keep the channel open; take it
+        // first so dropping ours disconnects the worker.
+        cache
+            .census_wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let _ = wake_tx.try_send(RollupWake::Stop);
         drop(wake_tx);
         let Some(join) = join else {
             return;
@@ -2801,7 +3004,7 @@ fn build_health_diagnostic_rollup_from_actors(
         .collect::<Vec<_>>();
     // Decided before the roots are visited: a carried census needs no
     // per-root census rows.
-    let reused_census = cache.reusable_memory_census(&actor_entries);
+    let (census_requests, reused_census) = cache.reusable_memory_census(&actor_entries);
     let measure_census = reused_census.is_none();
     let standing_entries = standing_health_entries(&actor_entries);
     rollup_mark!(timer, "standing roots / database open");
@@ -3211,14 +3414,19 @@ fn build_health_diagnostic_rollup_from_actors(
     // Keep detailed timing outside the size-budgeted health reply: adding it
     // there would displace root diagnostics. The uncapped census retains the
     // timing of the rollup that measured it.
-    let (memory_census, memory_census_at_ms) = match (measured_census, reused_census) {
-        (Some(mut memory_census), _) => {
-            memory_census["health_rollup_tick"] = tick.clone();
-            (Arc::new(memory_census), None)
-        }
-        (None, Some((memory_census, measured_at_ms))) => (memory_census, Some(measured_at_ms)),
-        (None, None) => unreachable!("a census is measured whenever none is reused"),
-    };
+    let (memory_census, memory_census_at_ms, memory_census_answers) =
+        match (measured_census, reused_census) {
+            (Some(mut memory_census), _) => {
+                memory_census["health_rollup_tick"] = tick.clone();
+                (Arc::new(memory_census), None, census_requests)
+            }
+            (None, Some(carried)) => (
+                carried.census,
+                Some(carried.measured_at_ms),
+                carried.answers,
+            ),
+            (None, None) => unreachable!("a census is measured whenever none is reused"),
+        };
     HealthDiagnosticRollup {
         status: if busy_roots > 0 || standing_refusals > 0 {
             HealthStatus::Degraded
@@ -3232,6 +3440,7 @@ fn build_health_diagnostic_rollup_from_actors(
         metrics,
         memory_census,
         memory_census_at_ms,
+        memory_census_answers,
         #[cfg(test)]
         tick,
     }
@@ -6058,6 +6267,98 @@ mod tests {
         // it reaches the interval.
         assert_eq!(refresh_at(44_999), 0);
         assert_eq!(refresh_at(45_000), 1, "the census outlived its interval");
+    }
+
+    fn census_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("census test runtime")
+    }
+
+    /// After a quiet period longer than the census interval, the served
+    /// census is old. The first read must not get it: it starts a rollup and
+    /// receives a census measured after the read began.
+    #[test]
+    fn a_census_read_after_a_quiet_period_gets_a_census_measured_after_it() {
+        let (_dir, root) = test_root("census-after-quiet");
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), test_ctx()));
+        let cache = Arc::new(HealthRollupCache::new());
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        // No periodic rollup within the test: only a census read can start one.
+        let worker = HealthRollupWorker::start_with_interval(
+            Arc::clone(&cache),
+            Arc::clone(&executor),
+            crate::context::App::default_shared(),
+            Duration::from_secs(3_600),
+        );
+        let published = Instant::now() + Duration::from_secs(10);
+        while cache.snapshot().0.generation == 0 {
+            assert!(
+                Instant::now() < published,
+                "the first rollup never published"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let builds_before = cache.census_builds_for_test();
+        cache.clock_ms.store(31_000, Ordering::Relaxed);
+        let started = Instant::now();
+        let census = census_runtime().block_on(fresh_memory_census(
+            &cache,
+            started + MEMORY_CENSUS_REPLY_MARGIN + Duration::from_secs(5),
+        ));
+        worker.shutdown();
+        assert_eq!(
+            census["health_rollup_tick"]["age_ms"], 0,
+            "the read was served the census from before the quiet period"
+        );
+        assert_eq!(cache.census_builds_for_test() - builds_before, 1);
+        assert!(census["roots"]
+            .get(root.as_path().display().to_string().as_str())
+            .is_some());
+    }
+
+    /// A rollup thread that never publishes must not hold the reply past its
+    /// budget: the read returns the old census, with its age, within the
+    /// bound.
+    #[test]
+    fn a_census_read_returns_the_old_census_when_no_rollup_publishes_in_time() {
+        let (_dir, root) = test_root("census-no-publish");
+        let executor = Executor::new();
+        assert!(executor.register_actor(root, test_ctx()));
+        let cache = HealthRollupCache::new();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        cache.refresh_for_test(&executor, &crate::context::App::default_shared());
+        // A wake channel nobody reads, as a stuck rollup thread leaves it.
+        let (wake_tx, _wake_rx) = std::sync::mpsc::sync_channel(1);
+        *cache.census_wake.lock().unwrap() = Some(wake_tx);
+        cache.clock_ms.store(31_000, Ordering::Relaxed);
+        let runtime = census_runtime();
+
+        let wait = Duration::from_millis(300);
+        let started = Instant::now();
+        let census = runtime.block_on(fresh_memory_census(
+            &cache,
+            started + MEMORY_CENSUS_REPLY_MARGIN + wait,
+        ));
+        let elapsed = started.elapsed();
+        assert_eq!(census["health_rollup_tick"]["age_ms"], 31_000);
+        assert!(
+            elapsed >= wait,
+            "the read did not wait for a rollup: {elapsed:?}"
+        );
+        assert!(
+            elapsed < wait + Duration::from_secs(2),
+            "the read outlived its bound: {elapsed:?}"
+        );
+
+        // A request whose budget is already inside the reply margin is
+        // answered at once.
+        let started = Instant::now();
+        let census = runtime.block_on(fresh_memory_census(&cache, started));
+        assert_eq!(census["health_rollup_tick"]["age_ms"], 31_000);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// Reads add files to a root's symbol cache far more often than edits

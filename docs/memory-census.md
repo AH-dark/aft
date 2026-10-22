@@ -82,15 +82,6 @@ than replacing it with an empty one; the accompanying `health.check` metrics
 describe its freshness with `stale`, `stale_reason`, `generated_at_ms`, and
 `age_ms` (see [health freshness](ops/aft-health-sentinel.md#census-freshness-and-unknown-values)).
 
-The health worker measures this census when a `memory.census` read has asked
-for it since the last one, when a root was bound or dropped, or once it is 30
-seconds old; between those it serves the census it last measured. Every read
-asks the next rollup (at most one 3-second interval later) for a fresh one, so
-a client that polls sees figures one rollup old, while the first read after a
-quiet period can see figures up to 30 seconds old. `health_rollup_tick.age_ms`
-is the age of the served census, and each root's `memory_measured_age_ms` and
-`process.allocator_observation_age_ms` include it.
-
 `semantic_worker_bytes` is the private index payload
 owned by semantic refresh threads for that root and is **already included** in
 `planes.semantic` and the attributed totals. It sums overlapping retiring and
