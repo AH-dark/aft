@@ -19,6 +19,7 @@ import {
   type BinaryBridge,
   BridgeTransportTimeoutError,
   BridgeTransportUnavailableError,
+  watchClock,
 } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
@@ -2075,6 +2076,79 @@ describe("bash tool adapter", () => {
       expect(result.details.waited).toMatchObject({ reason: "matched", match_offset: 0 });
     } finally {
       await rm(join(outputPath, ".."), { recursive: true, force: true });
+    }
+  });
+
+  /** A bridge that serves an exited task's stdout the way bash_status pages
+   * it: at most 64 KiB per call from the requested offset, with
+   * output_has_more. */
+  function pagedExitedBridge(stdout: Buffer, onPage?: () => void) {
+    const offsets: unknown[] = [];
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown> = {}) => {
+        if (command !== "bash_status") return { success: true };
+        onPage?.();
+        offsets.push(params.output_offset);
+        const offset = Number(params.output_offset ?? 0);
+        const page = stdout.subarray(offset, offset + 64 * 1024);
+        const next = offset + page.length;
+        return {
+          success: true,
+          status: "completed",
+          exit_code: 0,
+          mode: "pipes",
+          output_chunk_base64: page.toString("base64"),
+          output_next_offset: next,
+          output_has_more: next < stdout.length,
+          stderr_chunk_base64: "",
+          stderr_next_offset: 0,
+          stderr_has_more: false,
+        };
+      },
+    } as unknown as BinaryBridge;
+    return { bridge, offsets };
+  }
+
+  async function watchPaged(bridge: BinaryBridge, params: Record<string, unknown>) {
+    const tools = new Map<string, MockToolDef>();
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    return toolText(
+      await tools.get("bash_watch")!.execute("call", params, undefined, undefined, {
+        cwd: projectRoot,
+      }),
+    );
+  }
+
+  test("watch drains an exited task's pages and finds a match after 64 KiB", async () => {
+    const stdout = Buffer.concat([Buffer.alloc(64 * 1024, "x"), Buffer.from("READY\n")]);
+    const { bridge, offsets } = pagedExitedBridge(stdout);
+    const text = await watchPaged(bridge, { task_id: "bash-paged-exit", pattern: "READY" });
+    expect(text).toContain('matched "READY" in stdout at offset 65536');
+    expect(offsets).toEqual([0, 65536]);
+  });
+
+  test("watch that runs out of time mid-drain says the scan is incomplete", async () => {
+    const real = { now: watchClock.now, sleep: watchClock.sleep };
+    let now = 0;
+    watchClock.now = () => now;
+    watchClock.sleep = async () => {};
+    try {
+      // Each page read takes 600 ms of the 1 s watch, so the drain cannot finish.
+      const { bridge } = pagedExitedBridge(Buffer.alloc(3 * 64 * 1024, "x"), () => {
+        now += 600;
+      });
+      const text = await watchPaged(bridge, {
+        task_id: "bash-paged-expired",
+        pattern: "NEVER",
+        timeout_ms: 1_000,
+      });
+      expect(text).toContain("The task already exited; the pattern scan is incomplete.");
+      expect(text).not.toContain("still running");
+      expect(text).not.toContain("without match");
+      expect(text).not.toContain("task exited (");
+    } finally {
+      watchClock.now = real.now;
+      watchClock.sleep = real.sleep;
     }
   });
 

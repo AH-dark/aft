@@ -1933,6 +1933,71 @@ describe("bash_status tool", () => {
     }
   });
 
+  /** Serves an exited task's stdout the way bash_status pages it: at most
+   * 64 KiB per call from the requested offset, with output_has_more. */
+  function pagedExitedTask(stdout: Buffer, onPage?: () => void) {
+    return (cmd: string, params: Record<string, unknown>): BridgeResponse => {
+      if (cmd !== "bash_status") return { success: true };
+      onPage?.();
+      const offset = Number(params.output_offset ?? 0);
+      const page = stdout.subarray(offset, offset + 64 * 1024);
+      const next = offset + page.length;
+      return {
+        success: true,
+        status: "completed",
+        exit_code: 0,
+        mode: "pipes",
+        output_chunk_base64: page.toString("base64"),
+        output_next_offset: next,
+        output_has_more: next < stdout.length,
+        stderr_chunk_base64: "",
+        stderr_next_offset: 0,
+        stderr_has_more: false,
+      };
+    };
+  }
+
+  test("watch drains an exited task's pages and finds a match after 64 KiB", async () => {
+    const stdout = Buffer.concat([Buffer.alloc(64 * 1024, "x"), Buffer.from("READY\n")]);
+    const { watchTool, calls } = makeCtx(pagedExitedTask(stdout));
+    const result = await watchTool.execute(
+      { taskId: "bash-paged-exit", pattern: "READY" },
+      createMockSdkContext(),
+    );
+    expect(result).toContain('matched "READY" in stdout at offset 65536');
+    const offsets = calls
+      .filter((call) => call.cmd === "bash_status")
+      .map((call) => call.params.output_offset);
+    expect(offsets).toEqual([0, 65536]);
+  });
+
+  test("watch that runs out of time mid-drain says the scan is incomplete", async () => {
+    const real = { now: watchClock.now, sleep: watchClock.sleep };
+    let now = 0;
+    watchClock.now = () => now;
+    watchClock.sleep = async () => {};
+    try {
+      const stdout = Buffer.alloc(3 * 64 * 1024, "x");
+      // Each page read takes 600 ms of the 1 s watch, so the drain cannot finish.
+      const { watchTool } = makeCtx(
+        pagedExitedTask(stdout, () => {
+          now += 600;
+        }),
+      );
+      const result = await watchTool.execute(
+        { taskId: "bash-paged-expired", pattern: "NEVER", timeoutMs: 1_000 },
+        createMockSdkContext(),
+      );
+      expect(result).toContain("The task already exited; the pattern scan is incomplete.");
+      expect(result).not.toContain("still running");
+      expect(result).not.toContain("without match");
+      expect(result).not.toContain("task exited (");
+    } finally {
+      watchClock.now = real.now;
+      watchClock.sleep = real.sleep;
+    }
+  });
+
   test("bash_watch on PIPED bash with pattern reads output_path and matches", async () => {
     const outputPath = await spill("one\ntwo\nthree\n");
     try {

@@ -20,6 +20,7 @@ import {
   resolveWatchTimeoutMs,
   runBashHostFallback,
   runningTaskStatusHint,
+  TERMINAL_SCAN_INCOMPLETE_TEXT,
   taskKillDeadlineText,
   taskKillDeadlineWithinHandoffMargin,
   WATCH_SYNC_DEFAULTS_DESCRIPTION,
@@ -1568,7 +1569,11 @@ async function waitForBashStatus(
         }
       }
 
-      if (terminal) {
+      // An exited task can still have captured output past this page. Scan
+      // it all, within the watch's deadline, before reporting the exit.
+      const outputPending =
+        !!waitFor && (data.output_has_more === true || data.stderr_has_more === true);
+      if (terminal && !outputPending) {
         if (waitForExit) {
           sawTerminal = true;
           consumeBgCompletion(sessionId, taskId);
@@ -1594,6 +1599,7 @@ async function waitForBashStatus(
       if (watchClock.now() >= deadline && !waitPastDeadline) {
         return withWaited(data, waited("timeout"));
       }
+      if (outputPending) continue;
       await pause(waitPastDeadline);
     }
   } finally {
@@ -1795,6 +1801,11 @@ function formatWaitSummary(
   if (waited.reason === "matched") {
     const stream = waited.match_stream ? ` in ${waited.match_stream}` : "";
     return `${waitedText}; matched ${JSON.stringify(waited.match ?? "")}${stream} at offset ${waited.match_offset ?? 0}.`;
+  }
+  if (waited.reason === "timeout" && isTerminalStatus(details.status)) {
+    // The task exited, but the watch ran out of time before it scanned all
+    // of the captured output: neither "still running" nor "no match" is true.
+    return `${waitedText}; ${TERMINAL_SCAN_INCOMPLETE_TEXT}`;
   }
   if (waited.reason === "timeout" && watchRole.role === "worker") {
     // A watch deadline is not a failure of the command, and a delegated

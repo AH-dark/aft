@@ -63,6 +63,7 @@ export {
   bashHostFallbackAskPattern,
   runBashHostFallback,
 } from "./bash-host-fallback.js";
+export { TERMINAL_SCAN_INCOMPLETE_TEXT } from "./bash-output-page.js";
 // --- binary identity (no-exec cache trust) ---
 export type { BinaryIdentity, BinaryIdentityCheck } from "./binary-identity.js";
 export {
