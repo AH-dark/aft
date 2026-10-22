@@ -198,7 +198,6 @@ fn legacy_callgraph_restart_reuses_the_published_generation() {
 }
 
 #[test]
-#[ignore = "fails today (#746): a restart reuses the store but never compares it with edits made while no engine ran"]
 fn legacy_callgraph_restart_after_an_offline_edit_reuses_the_generation() {
     let fixture = tempfile::tempdir().unwrap();
     let root = project(fixture.path(), 3);

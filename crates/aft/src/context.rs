@@ -9534,7 +9534,7 @@ impl AppContext {
     }
 
     /// Ask for the store to be compared with the disk, because watcher events
-    /// for this root were lost. Only a callgraph writer can apply the result;
+    /// for this root were lost or no engine was watching. Only a callgraph writer can apply the result;
     /// a read-only root follows the owner's published store.
     pub(crate) fn request_callgraph_reconcile(&self, reason: &str) {
         if self.callgraph_writer() && self.config().indexes.callgraph {
@@ -10469,6 +10469,7 @@ impl AppContext {
                     operation_generation,
                     &project_root,
                     &callgraph_dir,
+                    false,
                 );
             }
         }
@@ -10482,6 +10483,7 @@ impl AppContext {
                             operation_generation,
                             &project_root,
                             &callgraph_dir,
+                            true,
                         );
                     }
                     Ok(None) => {
@@ -10693,6 +10695,7 @@ impl AppContext {
         operation_generation: u64,
         project_root: &Path,
         callgraph_dir: &Path,
+        reconcile_reused: bool,
     ) -> CallgraphStoreAccess {
         let store = Arc::new(store);
         let installed = self.run_if_subc_bound_generation(operation_generation, || {
@@ -10706,6 +10709,18 @@ impl AppContext {
         let Some(store) = installed else {
             return CallgraphStoreAccess::Unavailable;
         };
+        if reconcile_reused && operation_generation > 0 {
+            // A reused generation predates this engine's watcher. Compare it
+            // off-thread so offline edits are refreshed without a cold build
+            // or delaying configure's bind reply.
+            self.request_callgraph_reconcile("startup");
+            self.start_pending_callgraph_reconcile();
+            if self.callgraph_reconcile.pending_reason().is_some()
+                || self.callgraph_catch_up.outstanding()
+            {
+                return CallgraphStoreAccess::Building;
+            }
+        }
         self.clear_callgraph_store_build_denied();
         self.schedule_legacy_callgraph_migration_if_needed(
             store.as_ref(),
