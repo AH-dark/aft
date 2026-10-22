@@ -48,7 +48,16 @@ def resolve_git_descriptor(descriptor: dict, changed: list[str], base: str, head
 
 
 PR_LOOKUP_BACKOFF_SECONDS = (5, 10, 15, 30)
-PR_API_RETRY_BACKOFF_SECONDS = (2, 5)
+# GitHub's commit-to-PR endpoint returns intermittent HTTP 5xx replies; one
+# measurement saw 2 failures in 8 calls. Six attempts with 67 seconds of total
+# backoff make an exhausted lookup unlikely. Even if every attempt also hits the
+# 30-second gh timeout, one lookup ends within about 4 minutes, far below the
+# search-quality job's timeout.
+PR_API_RETRY_BACKOFF_SECONDS = (2, 5, 10, 20, 30)
+# The member lookup requests a single page of this size. A commit is never
+# realistically associated with this many PRs, so a full page is refused rather
+# than silently treated as the complete answer.
+PR_LOOKUP_PAGE_SIZE = 100
 GH_API_TIMEOUT_SECONDS = 30
 
 
@@ -56,7 +65,9 @@ def _transient_gh_error(stderr: str) -> bool:
     definite_status = r"\bHTTP(?:/\d(?:\.\d)?)?\s+(?:401|403|404)\b"
     if re.search(definite_status, stderr, re.IGNORECASE):
         return False
-    if re.search(r"\b5\d\d\b", stderr):
+    # gh reports a failed request as, for example, "gh: Bad Gateway (HTTP 502)".
+    # A server-side 5xx is GitHub's fault and worth retrying.
+    if re.search(r"\bHTTP(?:/\d(?:\.\d)?)?\s+5\d\d\b", stderr, re.IGNORECASE):
         return True
     json_parse_error = (
         r"\b(?:unexpected end of JSON input|unexpected EOF|invalid JSON|"
@@ -119,15 +130,25 @@ def _gh_api_json(command: list[str], lookup_key: str, *, sleep=None) -> Any:
 
 
 def lookup_member_prs(repository: str, head: str, *, sleep=None) -> list[dict]:
-    pages = _gh_api_json(
+    # One page, without --paginate/--slurp: with those flags gh hides an HTTP
+    # 500 behind "unexpected end of JSON input", so the real status never
+    # reaches stderr for the transient-error check.
+    prs = _gh_api_json(
         [
-            "gh", "api", "--paginate", "--slurp",
-            f"repos/{repository}/commits/{head}/pulls?per_page=100",
+            "gh", "api",
+            f"repos/{repository}/commits/{head}/pulls?per_page={PR_LOOKUP_PAGE_SIZE}",
         ],
         head,
         sleep=sleep,
     )
-    return [pr for page in pages for pr in page]
+    if not isinstance(prs, list):
+        raise InputFault(f"queue_pr_lookup_failed:{head}:reply_not_a_list")
+    if len(prs) >= PR_LOOKUP_PAGE_SIZE:
+        raise InputFault(
+            f"queue_pr_lookup_failed:{head}:page_full:count={len(prs)}:"
+            "more associated PRs than one page can hold"
+        )
+    return prs
 
 
 def lookup_queue_ref_pr(repository: str, number: int, *, sleep=None) -> dict:

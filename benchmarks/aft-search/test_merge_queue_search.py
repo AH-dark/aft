@@ -201,7 +201,7 @@ class GhLookupRetryTests(unittest.TestCase):
     def test_empty_member_reply_retries_until_valid_json(self) -> None:
         expected = [{"number": 23}]
         self.configure_responses(
-            [{"stdout": ""}, {"stdout": json.dumps([expected])}]
+            [{"stdout": ""}, {"stdout": json.dumps(expected)}]
         )
         delays: list[float] = []
 
@@ -214,19 +214,19 @@ class GhLookupRetryTests(unittest.TestCase):
         self.assertEqual(delays, [2])
 
     def test_empty_queue_ref_replies_exhaust_retries(self) -> None:
-        self.configure_responses([{"stdout": ""}] * 3)
+        self.configure_responses([{"stdout": ""}] * 6)
         delays: list[float] = []
 
         with self.assertRaisesRegex(
             merge_queue_search.InputFault,
-            r"queue_pr_lookup_failed:23:retries_exhausted:attempts=3:",
+            r"queue_pr_lookup_failed:23:retries_exhausted:attempts=6:",
         ):
             merge_queue_search.lookup_queue_ref_pr(
                 "cortexkit/aft", 23, sleep=delays.append
             )
 
-        self.assertEqual(self.call_count(), 3)
-        self.assertEqual(delays, [2, 5])
+        self.assertEqual(self.call_count(), 6)
+        self.assertEqual(delays, [2, 5, 10, 20, 30])
 
     def test_http_404_is_not_retried(self) -> None:
         self.configure_responses(
@@ -303,12 +303,11 @@ class GhLookupRetryTests(unittest.TestCase):
     def test_timeout_exhaustion_reports_attempts_and_decodes_stderr(self) -> None:
         timeouts = [
             merge_queue_search.subprocess.TimeoutExpired("gh api", 30, stderr=None),
+        ] + [
             merge_queue_search.subprocess.TimeoutExpired(
                 "gh api", 30, stderr=b"partial\xff"
-            ),
-            merge_queue_search.subprocess.TimeoutExpired(
-                "gh api", 30, stderr=b"partial\xff"
-            ),
+            )
+            for _ in range(5)
         ]
         delays: list[float] = []
 
@@ -317,7 +316,7 @@ class GhLookupRetryTests(unittest.TestCase):
         ) as run:
             with self.assertRaisesRegex(
                 merge_queue_search.InputFault,
-                r"queue_pr_lookup_failed:23:retries_exhausted:attempts=3:"
+                r"queue_pr_lookup_failed:23:retries_exhausted:attempts=6:"
                 r"gh api timed out after 30 seconds",
             ) as error:
                 merge_queue_search.lookup_queue_ref_pr(
@@ -325,8 +324,108 @@ class GhLookupRetryTests(unittest.TestCase):
                 )
 
         self.assertIn("partial\ufffd", str(error.exception))
-        self.assertEqual(run.call_count, 3)
-        self.assertEqual(delays, [2, 5])
+        self.assertEqual(run.call_count, 6)
+        self.assertEqual(delays, [2, 5, 10, 20, 30])
+
+    def test_member_lookup_http_500_retries_and_succeeds(self) -> None:
+        expected = [{"number": 23}]
+        self.configure_responses(
+            [
+                {"returncode": 1, "stderr": "gh: Internal Server Error (HTTP 500)"},
+                {"stdout": json.dumps(expected)},
+            ]
+        )
+        delays: list[float] = []
+
+        result = merge_queue_search.lookup_member_prs(
+            "cortexkit/aft", "a" * 40, sleep=delays.append
+        )
+
+        self.assertEqual(result, expected)
+        self.assertEqual(self.call_count(), 2)
+        self.assertEqual(delays, [2])
+
+    def test_member_lookup_persistent_5xx_exhausts_after_six_attempts(self) -> None:
+        self.configure_responses(
+            [
+                {"returncode": 1, "stderr": "gh: Bad Gateway (HTTP 502)"},
+                {"returncode": 1, "stderr": "gh: Service Unavailable (HTTP 503)"},
+                {"returncode": 1, "stderr": "gh: Gateway Timeout (HTTP 504)"},
+                {"returncode": 1, "stderr": "gh: Internal Server Error (HTTP 500)"},
+            ]
+        )
+        delays: list[float] = []
+
+        with self.assertRaisesRegex(
+            merge_queue_search.InputFault,
+            r"queue_pr_lookup_failed:a{40}:retries_exhausted:attempts=6:"
+            r"gh: Internal Server Error \(HTTP 500\)$",
+        ):
+            merge_queue_search.lookup_member_prs(
+                "cortexkit/aft", "a" * 40, sleep=delays.append
+            )
+
+        self.assertEqual(self.call_count(), 6)
+        self.assertEqual(delays, [2, 5, 10, 20, 30])
+
+    def test_member_lookup_http_401_and_403_are_not_retried(self) -> None:
+        for stderr in (
+            "gh: Bad credentials (HTTP 401)",
+            "gh: Resource not accessible by integration (HTTP 403)",
+        ):
+            with self.subTest(stderr=stderr):
+                self.calls_path.unlink(missing_ok=True)
+                self.configure_responses([{"returncode": 1, "stderr": stderr}])
+                delays: list[float] = []
+
+                with self.assertRaises(merge_queue_search.InputFault) as error:
+                    merge_queue_search.lookup_member_prs(
+                        "cortexkit/aft", "a" * 40, sleep=delays.append
+                    )
+
+                self.assertNotIn("retries_exhausted", str(error.exception))
+                self.assertEqual(self.call_count(), 1)
+                self.assertEqual(delays, [])
+
+    def test_member_lookup_requests_one_page_without_pagination(self) -> None:
+        self.configure_responses([{"stdout": "[]"}])
+
+        merge_queue_search.lookup_member_prs(
+            "cortexkit/aft", "a" * 40, sleep=lambda _seconds: None
+        )
+
+        calls = [json.loads(line) for line in self.calls_path.read_text().splitlines()]
+        self.assertEqual(
+            calls,
+            [["api", f"repos/cortexkit/aft/commits/{'a' * 40}/pulls?per_page=100"]],
+        )
+        self.assertNotIn("--paginate", calls[0])
+        self.assertNotIn("--slurp", calls[0])
+
+    def test_member_lookup_refuses_a_full_page(self) -> None:
+        self.configure_responses(
+            [{"stdout": json.dumps([{"number": n} for n in range(100)])}]
+        )
+
+        with self.assertRaisesRegex(
+            merge_queue_search.InputFault,
+            r"queue_pr_lookup_failed:a{40}:page_full:count=100:",
+        ):
+            merge_queue_search.lookup_member_prs(
+                "cortexkit/aft", "a" * 40, sleep=lambda _seconds: None
+            )
+
+        self.assertEqual(self.call_count(), 1)
+
+    def test_member_lookup_accepts_ninety_nine_results(self) -> None:
+        expected = [{"number": n} for n in range(99)]
+        self.configure_responses([{"stdout": json.dumps(expected)}])
+
+        result = merge_queue_search.lookup_member_prs(
+            "cortexkit/aft", "a" * 40, sleep=lambda _seconds: None
+        )
+
+        self.assertEqual(result, expected)
 
 
 if __name__ == "__main__":
