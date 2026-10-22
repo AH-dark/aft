@@ -1587,30 +1587,61 @@ fn materialize_dead_code_contributions(
         })
         .collect::<BTreeMap<_, _>>();
     let rust_modules = RustModuleIndex::new(&parsed);
-    // Rust type declarations, by the same (file, identity) nodes the edges
-    // use: the short export symbol plus the module-qualified name of each
-    // declaration with that name.
+    // Rust type declarations, keyed by (file, symbol) like the edge targets:
+    // the module-qualified name of each type export's own declaration, plus
+    // the short export symbol when every item of the file with that name is
+    // such a declaration. A same-named function in another module
+    // (`callbacks::Probe` beside `types::Probe`) is not the type.
     let items_by_file = &rust_items_by_file;
     let rust_type_declarations = parsed
         .iter()
         .filter(|contribution| language_for_file(&contribution.file) == "rust")
         .flat_map(|contribution| {
-            contribution
+            let items = items_by_file
+                .get(&contribution.file)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let type_exports = contribution
                 .exports
                 .iter()
                 .filter(|export| export.is_type_like || is_type_like_kind(&export.kind))
-                .flat_map(move |export| {
-                    let qualified = items_by_file
-                        .get(&contribution.file)
-                        .into_iter()
-                        .flatten()
-                        .filter(|item| item.owner.is_none() && item.name == export.symbol)
-                        .map(rust_qualified_item_name);
-                    std::iter::once(export.symbol.clone())
-                        .chain(qualified)
-                        .map(|symbol| (contribution.file.clone(), symbol))
-                        .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            // An export's line can sit on attributes or doc comments before
+            // the item, so its declaration is the first same-named item outside
+            // any impl (`owner` is `None`) starting at or after that line. An
+            // export with no such item keeps every same-named declaration, as
+            // it cannot be told apart.
+            let declared = type_exports
+                .iter()
+                .flat_map(|export| {
+                    let same_named = items
+                        .iter()
+                        .filter(|item| item.owner.is_none() && item.name == export.symbol);
+                    match same_named
+                        .clone()
+                        .filter(|item| item.line >= export.line)
+                        .min_by_key(|item| item.line)
+                    {
+                        Some(item) => vec![rust_qualified_item_name(item)],
+                        None => same_named.map(rust_qualified_item_name).collect(),
+                    }
                 })
+                .collect::<BTreeSet<_>>();
+            let short = type_exports
+                .iter()
+                .filter(|export| {
+                    items
+                        .iter()
+                        .filter(|item| item.owner.is_none() && item.name == export.symbol)
+                        .all(|item| declared.contains(&rust_qualified_item_name(item)))
+                })
+                .map(|export| export.symbol.clone())
+                .collect::<Vec<_>>();
+            declared
+                .into_iter()
+                .chain(short)
+                .map(|symbol| (contribution.file.clone(), symbol))
+                .collect::<Vec<_>>()
         })
         .collect::<BTreeSet<_>>();
     let rust_imports_by_file = parsed
@@ -8652,6 +8683,37 @@ mod types {
             Some("production")
         );
         assert_eq!(node("Config::production", Some(3)), None);
+    }
+
+    /// A function sharing a type's name in another module is not that type:
+    /// a test call to `callbacks::Probe()` keeps its test status, so the
+    /// function is test-only, while the type used by production is not.
+    #[test]
+    fn review_same_named_function_in_other_module_is_not_the_type_declaration() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() { let _keep: Option<types::Probe> = None; }
+mod types {
+    pub(crate) struct Probe;
+}
+mod callbacks {
+    #[allow(non_snake_case)]
+    pub(crate) fn Probe() -> bool { true }
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() { assert!(super::callbacks::Probe()); }
+}
+"#,
+        )]);
+        assert!(headline_symbols(&aggregate).is_empty(), "{aggregate:#}");
+        assert_eq!(
+            test_only_symbols(&aggregate),
+            vec!["src/main.rs::Probe"],
+            "{aggregate:#}"
+        );
     }
 
     /// `super::` inside an inline module names the enclosing module first:
