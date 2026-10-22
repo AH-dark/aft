@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::db::TrackedConnection;
 use rusqlite::Connection;
@@ -1093,19 +1094,28 @@ impl BackupStore {
     pub fn run_process_maintenance_once(&mut self) {
         // A busy namespace only defers the layout work here; the next backup
         // operation retries it.
-        let _ = self.run_process_maintenance(false);
+        let _ = self.run_process_maintenance(None);
     }
 
     /// Maintenance for restores. A restore reads history from the current
     /// layout, so it must not defer layout work just because another holder has
-    /// the backup namespace: it waits for the namespace, then runs root repair
-    /// and the flat migration, before reading history. Otherwise an undo could
+    /// the backup namespace: it waits for the namespace, for at most the
+    /// request's remaining budget less a reply margin (or a fixed cap outside a
+    /// request), then attempts root repair and runs the flat migration when
+    /// they are pending, before reading history. Otherwise an undo could
     /// report no history for a file whose history still sits in the root or
-    /// flat legacy layout. A flat migration that still cannot run is an error.
+    /// flat legacy layout. A namespace still
+    /// busy at the deadline, or a flat migration that cannot run, is an error.
     /// Root-repair failures other than a busy namespace (conflicts, active
     /// sessions, I/O errors) are logged by the repair and do not stop the restore.
     fn run_restore_maintenance(&mut self) -> Result<(), AftError> {
-        self.run_process_maintenance(true)
+        self.run_waiting_maintenance("undo")
+    }
+
+    /// [`Self::run_restore_maintenance`] with the operation it runs before
+    /// named in the error.
+    fn run_waiting_maintenance(&mut self, before: &str) -> Result<(), AftError> {
+        self.run_process_maintenance(Some(namespace_wait_deadline()))
             .map_err(|message| AftError::IoError {
                 path: self
                     .storage_dir
@@ -1113,21 +1123,21 @@ impl BackupStore {
                     .map(|dir| dir.display().to_string())
                     .unwrap_or_default(),
                 message: format!(
-                    "legacy backup history could not be moved into the current layout before undo: {message}"
+                    "legacy backup history could not be moved into the current layout before {before}: {message}"
                 ),
             })
     }
 
     /// Shared body of [`Self::run_process_maintenance_once`] and
-    /// [`Self::run_restore_maintenance`]. With `wait_for_namespace`, root repair
-    /// and flat migration block on a busy namespace instead of deferring. The
-    /// error names why the flat migration did not run; without waiting, a busy
-    /// namespace is one such reason.
-    fn run_process_maintenance(&mut self, wait_for_namespace: bool) -> Result<(), String> {
+    /// [`Self::run_restore_maintenance`]. With `wait_until`, root repair and
+    /// flat migration wait for a busy namespace until that deadline instead of
+    /// deferring at once, and a namespace still busy at the deadline is an
+    /// error. The error names why the layout work did not run.
+    fn run_process_maintenance(&mut self, wait_until: Option<Instant>) -> Result<(), String> {
         let Some(storage_dir) = self.storage_dir.clone() else {
             return Ok(());
         };
-        let repair = self.repair_root_backups(wait_for_namespace);
+        let repair = self.repair_root_backups(wait_until);
         let key = (storage_dir, self.effective_storage_harness());
         let first_maintenance = BACKUP_MAINTENANCE_KEYS.lock().unwrap().insert(key.clone());
         if first_maintenance {
@@ -1146,12 +1156,19 @@ impl BackupStore {
         if first_migration || repair.moved > 0 {
             #[cfg(test)]
             run_migration_after_repair_hook_for_tests(&key.0);
-            migration = self.migrate_legacy_layout(wait_for_namespace);
+            migration = self.migrate_legacy_layout(wait_until);
         }
         if first_maintenance {
             self.tighten_permissions_if_needed();
         }
-        migration
+        if repair.namespace_busy {
+            // Root history that repair could not move is invisible to the
+            // current layout, so a caller that waited must not proceed as if
+            // the layout were current.
+            migration.and(Err("the backup namespace is busy".to_string()))
+        } else {
+            migration
+        }
     }
 
     /// Protect existing history at its directory boundary without walking file
@@ -3236,13 +3253,13 @@ impl BackupStore {
 
     #[cfg(test)]
     fn repair_root_backups_if_needed(&self) -> LegacyBackupRepairReport {
-        self.repair_root_backups(false)
+        self.repair_root_backups(None)
     }
 
     /// Move root backups into the harness backup directory under the exclusive
-    /// backup namespace. Without `wait_for_namespace`, a busy namespace defers the
-    /// repair to a later backup operation.
-    fn repair_root_backups(&self, wait_for_namespace: bool) -> LegacyBackupRepairReport {
+    /// backup namespace. A busy namespace defers the repair to a later backup
+    /// operation, at once without `wait_until`, or once that deadline passes.
+    fn repair_root_backups(&self, wait_until: Option<Instant>) -> LegacyBackupRepairReport {
         let mut report = LegacyBackupRepairReport::default();
         let (Some(storage_dir), Some(harness)) =
             (&self.storage_dir, self.effective_storage_harness())
@@ -3254,10 +3271,12 @@ impl BackupStore {
             return report;
         }
         let target_root = storage_dir.join(harness).join("backups");
-        let _namespace = match backup_namespace_gate(storage_dir, wait_for_namespace) {
+        let _namespace = match backup_namespace_gate(storage_dir, wait_until) {
             Ok(Some(gate)) => gate,
             Ok(None) => {
                 report.protected += 1;
+                report.leftovers += 1;
+                report.namespace_busy = true;
                 report.leftovers += 1;
                 crate::slog_warn!("legacy backup repair deferred: namespace is busy; retry on the next backup operation");
                 return report;
@@ -3540,9 +3559,10 @@ impl BackupStore {
     /// path plus a non-zero entry count. Session directories and move staging names
     /// do not satisfy that finished-entry shape.
     ///
-    /// Without `wait_for_namespace`, a busy namespace defers the migration to a
-    /// later maintenance pass. The error says why the migration did not run.
-    fn migrate_legacy_layout(&mut self, wait_for_namespace: bool) -> Result<(), String> {
+    /// A busy namespace defers the migration to a later maintenance pass, at
+    /// once without `wait_until`, or once that deadline passes. The error says
+    /// why the migration did not run.
+    fn migrate_legacy_layout(&mut self, wait_until: Option<Instant>) -> Result<(), String> {
         let Some(storage_dir) = self.storage_dir.clone() else {
             return Ok(());
         };
@@ -3551,7 +3571,7 @@ impl BackupStore {
             // migration-complete key stays unset, so a later pass still checks.
             return Ok(());
         }
-        let _namespace = match backup_namespace_gate(&storage_dir, wait_for_namespace) {
+        let _namespace = match backup_namespace_gate(&storage_dir, wait_until) {
             Ok(Some(gate)) => gate,
             Ok(None) => {
                 crate::slog_warn!(
@@ -6011,6 +6031,8 @@ struct LegacyBackupRepairReport {
     protected: usize,
     failed: usize,
     leftovers: usize,
+    /// Repair did not run because another holder had the backup namespace.
+    namespace_busy: bool,
 }
 
 #[cfg(test)]
@@ -6041,23 +6063,66 @@ fn backup_namespace_admission(storage: &Path) -> std::io::Result<std::fs::File> 
     Ok(file)
 }
 
-fn backup_namespace_gate(storage: &Path, wait: bool) -> std::io::Result<Option<std::fs::File>> {
+/// Longest a restore waits for a busy backup namespace when it runs outside a
+/// request budget.
+const NAMESPACE_WAIT_CAP: Duration = Duration::from_secs(5);
+/// Part of a request's remaining budget kept for answering after a namespace
+/// wait, so a wait that times out still leaves time to report why.
+const NAMESPACE_WAIT_REPLY_MARGIN: Duration = Duration::from_millis(500);
+
+/// Deadline for a waiting namespace acquisition: the current request's
+/// deadline less the reply margin, or [`NAMESPACE_WAIT_CAP`] from now when no
+/// request budget is in effect.
+fn namespace_wait_deadline() -> Instant {
+    let now = Instant::now();
+    match crate::bounded_io::current() {
+        Some(budget) => budget
+            .deadline
+            .checked_sub(NAMESPACE_WAIT_REPLY_MARGIN)
+            .map_or(now, |deadline| deadline.max(now)),
+        None => now + NAMESPACE_WAIT_CAP,
+    }
+}
+
+/// Take the backup namespace exclusively. A busy namespace returns `None` at
+/// once without `wait_until`; with it, acquisition is retried until that
+/// deadline. `flock` has no timed wait, hence the polling.
+fn backup_namespace_gate(
+    storage: &Path,
+    wait_until: Option<Instant>,
+) -> std::io::Result<Option<std::fs::File>> {
     let file = backup_namespace_file(storage)?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) if wait => {
+    let mut pause = Duration::from_millis(2);
+    let mut announced = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+        let Some(deadline) = wait_until else {
+            return Ok(None);
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            crate::slog_warn!(
+                "backup namespace {} stayed busy past the wait deadline",
+                storage.display()
+            );
+            return Ok(None);
+        }
+        if !announced {
+            announced = true;
             crate::slog_warn!(
                 "backup namespace {} is busy; waiting for it before moving legacy backup history",
                 storage.display()
             );
             #[cfg(test)]
             run_before_namespace_wait_hook_for_tests(storage);
-            file.lock()?;
         }
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        std::thread::sleep(pause.min(deadline - now));
+        pause = (pause * 2).min(Duration::from_millis(50));
     }
-    Ok(Some(file))
 }
 
 fn session_gc_gate(session_dir: &Path, wait: bool) -> std::io::Result<Option<std::fs::File>> {
@@ -6339,7 +6404,7 @@ mod tests {
             *slot.borrow_mut() = Some(Box::new(move |root| {
                 hook_observed.set(true);
                 assert!(
-                    backup_namespace_gate(root, false).unwrap().is_none(),
+                    backup_namespace_gate(root, None).unwrap().is_none(),
                     "stack admission did not exclude namespace repair"
                 );
             }));
@@ -8105,7 +8170,7 @@ mod tests {
         let lock_slot = Arc::clone(&held_namespace_lock);
         let storage_path = storage.path().to_path_buf();
         set_migration_after_repair_hook_for_tests(storage.path(), move || {
-            let lock = backup_namespace_gate(&storage_path, false)
+            let lock = backup_namespace_gate(&storage_path, None)
                 .unwrap()
                 .expect("repair releases its namespace lock before migration");
             *lock_slot.lock().unwrap() = Some(lock);
@@ -8268,16 +8333,14 @@ mod tests {
         assert!(store.history(DEFAULT_SESSION_ID, &path).is_empty());
     }
 
-    #[test]
-    fn default_session_undo_waits_for_migration_deferred_by_busy_namespace() {
-        let storage = tempfile::tempdir().unwrap();
-        let path = storage.path().join("restored.txt");
+    /// A file with one legacy backup entry in the root `backups/` directory,
+    /// still waiting for root repair and the flat migration, plus a store
+    /// bound to the Opencode harness of that storage directory.
+    fn legacy_root_history_fixture(storage: &Path) -> (BackupStore, PathBuf, PathBuf, PathBuf) {
+        let path = storage.join("restored.txt");
         fs::write(&path, "current content").unwrap();
         let key = canonicalize_key(&path);
-        let root_entry = storage
-            .path()
-            .join("backups")
-            .join(BackupStore::path_hash(&key));
+        let root_entry = storage.join("backups").join(BackupStore::path_hash(&key));
         fs::create_dir_all(&root_entry).unwrap();
         fs::write(root_entry.join("0.bak"), "original content").unwrap();
         fs::write(
@@ -8289,50 +8352,76 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-
         let mut store = BackupStore::new();
         store.set_storage_dir_for_harness(
-            storage.path().to_path_buf(),
+            storage.to_path_buf(),
             crate::harness::Harness::Opencode,
             72,
         );
+        (store, path, key, root_entry)
+    }
 
-        // Another holder takes the namespace between root repair and the flat
-        // migration, as a concurrent backup operation (or a child process that
-        // inherited a namespace descriptor) can. The holder lets go once the
-        // undo is about to block on it, so the undo must wait rather than read
-        // the default session before its legacy history has moved there. An
-        // undo that never waits finds the namespace held until the holder's
-        // deadline, and then must still fail the assertions below.
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let holder = Arc::new(Mutex::new(None));
-        let holder_slot = Arc::clone(&holder);
-        let storage_path = storage.path().to_path_buf();
-        set_migration_after_repair_hook_for_tests(storage.path(), move || {
-            // Block rather than try: a child process another thread spawned
-            // can briefly hold a copy of repair's namespace descriptor.
-            let lock = backup_namespace_file(&storage_path).unwrap();
-            lock.lock().unwrap();
-            *holder_slot.lock().unwrap() = Some(std::thread::spawn(move || {
-                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
-                drop(lock);
-            }));
-        });
+    /// Another holder of the backup namespace, taken between root repair and
+    /// the flat migration, as a concurrent backup operation (or a child process
+    /// that inherited a namespace descriptor) can. It lets go when `release`
+    /// is sent, or after a 10 s backstop so a test that never releases it
+    /// cannot hang the suite.
+    struct NamespaceHolderAfterRepair {
+        release: std::sync::mpsc::Sender<()>,
+        thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    }
+
+    impl NamespaceHolderAfterRepair {
+        fn install(storage: &Path) -> Self {
+            let (release, release_rx) = std::sync::mpsc::channel::<()>();
+            let thread = Arc::new(Mutex::new(None));
+            let thread_slot = Arc::clone(&thread);
+            let storage_path = storage.to_path_buf();
+            set_migration_after_repair_hook_for_tests(storage, move || {
+                // Block rather than try: a child process another thread spawned
+                // can briefly hold a copy of repair's namespace descriptor.
+                let lock = backup_namespace_file(&storage_path).unwrap();
+                lock.lock().unwrap();
+                *thread_slot.lock().unwrap() = Some(std::thread::spawn(move || {
+                    let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+                    drop(lock);
+                }));
+            });
+            Self { release, thread }
+        }
+
+        fn release_and_join(self) {
+            let _ = self.release.send(());
+            self.thread
+                .lock()
+                .unwrap()
+                .take()
+                .expect("maintenance ran the migration hook")
+                .join()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn default_session_undo_waits_for_migration_deferred_by_busy_namespace() {
+        let storage = tempfile::tempdir().unwrap();
+        let (mut store, path, key, root_entry) = legacy_root_history_fixture(storage.path());
+
+        // The holder lets go once the undo is about to wait for it, so the undo
+        // must wait rather than read the default session before its legacy
+        // history has moved there. An undo that never waits finds the namespace
+        // held until the holder's backstop, and then must still fail below.
+        let holder = NamespaceHolderAfterRepair::install(storage.path());
         let undo_waited = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let waited = Arc::clone(&undo_waited);
+        let release = holder.release.clone();
         set_before_namespace_wait_hook_for_tests(storage.path(), move || {
             waited.store(true, Ordering::SeqCst);
-            let _ = release_tx.send(());
+            let _ = release.send(());
         });
 
         let restored = store.restore_latest(DEFAULT_SESSION_ID, &path);
-        holder
-            .lock()
-            .unwrap()
-            .take()
-            .expect("maintenance ran the migration hook")
-            .join()
-            .unwrap();
+        holder.release_and_join();
         assert!(
             restored.is_ok(),
             "default-session undo must see legacy history: {restored:?}"
@@ -8349,6 +8438,68 @@ mod tests {
             .join(BackupStore::path_hash(&key))
             .exists());
         assert!(store.history(DEFAULT_SESSION_ID, &path).is_empty());
+    }
+
+    /// Run an undo while the namespace holder never lets go (until its 10 s
+    /// backstop), and return the undo's result and how long it took.
+    fn undo_against_held_namespace(
+        budget: Option<crate::bounded_io::Budget>,
+    ) -> (Result<(BackupEntry, Option<String>), AftError>, Duration) {
+        let storage = tempfile::tempdir().unwrap();
+        let (mut store, path, _key, root_entry) = legacy_root_history_fixture(storage.path());
+        let holder = NamespaceHolderAfterRepair::install(storage.path());
+        let started = Instant::now();
+        let restored = crate::bounded_io::with_budget(budget, || {
+            store.restore_latest(DEFAULT_SESSION_ID, &path)
+        });
+        let elapsed = started.elapsed();
+        holder.release_and_join();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "current content");
+        assert!(
+            !root_entry.exists(),
+            "root repair ran before the namespace was taken"
+        );
+        (restored, elapsed)
+    }
+
+    fn assert_busy_namespace_undo_error(
+        restored: &Result<(BackupEntry, Option<String>), AftError>,
+    ) {
+        match restored {
+            Err(AftError::IoError { message, .. }) => assert!(
+                message.contains(
+                    "legacy backup history could not be moved into the current layout before undo: the backup namespace is busy"
+                ),
+                "unexpected undo error: {message}"
+            ),
+            other => panic!("undo must report the busy namespace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_session_undo_stops_waiting_for_busy_namespace_at_fixed_cap() {
+        let (restored, elapsed) = undo_against_held_namespace(None);
+        assert_busy_namespace_undo_error(&restored);
+        assert!(
+            elapsed >= NAMESPACE_WAIT_CAP && elapsed < NAMESPACE_WAIT_CAP + Duration::from_secs(3),
+            "outside a request the undo waits for the fixed cap, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn default_session_undo_stops_waiting_for_busy_namespace_within_request_budget() {
+        let budget = Duration::from_millis(1_500);
+        let (restored, elapsed) =
+            undo_against_held_namespace(Some(crate::bounded_io::Budget::after(budget)));
+        assert_busy_namespace_undo_error(&restored);
+        assert!(
+            elapsed < budget,
+            "the undo must answer within the request budget, took {elapsed:?}"
+        );
+        assert!(
+            elapsed >= budget - NAMESPACE_WAIT_REPLY_MARGIN - Duration::from_millis(100),
+            "the undo waits until the budget less the reply margin, took {elapsed:?}"
+        );
     }
 
     #[test]
