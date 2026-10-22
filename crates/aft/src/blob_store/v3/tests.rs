@@ -4,7 +4,7 @@ use tempfile::tempdir;
 
 const A: &str = "0123456789abcdef";
 const B: &str = "fedcba9876543210";
-fn serial() -> MutexGuard<'static, ()> {
+pub(super) fn serial() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let guard = LOCK
         .get_or_init(|| Mutex::new(()))
@@ -23,7 +23,7 @@ fn seed(storage: &Path, family: &str) {
     .unwrap();
 }
 #[cfg(unix)]
-fn inventory(path: &Path) -> u64 {
+pub(super) fn inventory(path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     fs::read_dir(path)
         .unwrap()

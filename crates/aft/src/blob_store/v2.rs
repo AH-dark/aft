@@ -1391,6 +1391,51 @@ impl FamilyStoreReader {
         usage(&self.inner)
     }
 
+    /// The stored payload length and digest of `key`, read on the store's own
+    /// connection without reading the payload. A v3 copy sizes its
+    /// reservation with them and checks for an equal v3 row.
+    pub(super) fn copy_source_identity(
+        &self,
+        key: &FamilyKey,
+    ) -> StoreResult<Option<(u64, Vec<u8>)>> {
+        self.ensure_copy_plane(key)?;
+        Ok(lock(&self.inner.connection)
+            .query_row(
+                "SELECT length(payload), payload_digest FROM blob_payloads WHERE full_key = ?1",
+                params![key.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// The stored payload, digest and `payload_schema` of `key`, unverified,
+    /// on the store's own connection. A v3 copy verifies the digest itself and
+    /// keeps the stored schema rather than this plane's current one.
+    pub(super) fn copy_source_row(
+        &self,
+        key: &FamilyKey,
+    ) -> StoreResult<Option<(Vec<u8>, Vec<u8>, i64)>> {
+        self.ensure_copy_plane(key)?;
+        Ok(lock(&self.inner.connection)
+            .query_row(
+                "SELECT payload, payload_digest, payload_schema FROM blob_payloads WHERE full_key = ?1",
+                params![key.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    fn ensure_copy_plane(&self, key: &FamilyKey) -> StoreResult<()> {
+        if key.plane() == self.inner.plane {
+            Ok(())
+        } else {
+            Err(StoreError::PlaneMismatch {
+                store: self.inner.plane,
+                key: key.plane(),
+            })
+        }
+    }
+
     /// Bytes of the store's database file that hold no data: its free pages,
     /// plus any tail of the main file past the database's last page, which
     /// returning free pages leaves in place until a checkpoint cuts it off.
