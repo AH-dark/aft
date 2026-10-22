@@ -1318,9 +1318,10 @@ fn decode_result_envelope_for_request(
             // `queue_full`, `engine_crashed` and quarantined lanes this way,
             // and may add codes. The two warm-up codes are named only so a
             // query can say the model is warming up.
-            _ if error.get("class").and_then(Value::as_str) == Some("transient") => Err(
-                SynapseEmbeddingError::LanePaused(transient_refusal(code, message, error, request)),
-            ),
+            _ if error.get("class").and_then(Value::as_str) == Some("transient") => {
+                Err(transient_refusal(code, message, error, request)
+                    .map_or_else(|mismatch| mismatch, SynapseEmbeddingError::LanePaused))
+            }
             _ => Err(SynapseEmbeddingError::DaemonUnavailable(format!(
                 "{code}: {message}"
             ))),
@@ -1334,14 +1335,38 @@ fn decode_result_envelope_for_request(
 /// hint. A missing, malformed or out-of-range hint (outside
 /// [`MIN_TRANSIENT_RETRY_MS`]..=[`MAX_LANE_PAUSE_MS`]) is dropped, so the
 /// waiting worker uses its normal backoff instead; it never makes the refusal
-/// permanent. Both `details` fields are optional.
+/// permanent. Both `details` fields are optional, but when the reply names
+/// its lane (or that lane's fingerprint) it must be the requested model's, as
+/// for `lane_paused`: another lane's refusal is a fingerprint mismatch, never
+/// a pause of this lane.
 fn transient_refusal(
     code: &str,
     message: &str,
     error: &Value,
     request: Option<&Value>,
-) -> LanePause {
+) -> Result<LanePause, SynapseEmbeddingError> {
     let details = &error["details"];
+    // Only embedding requests name a model and pinned fingerprint; a
+    // `models.list` refusal has nothing to compare.
+    if let Some(model) = request.and_then(|request| request["model"].as_str()) {
+        let pinned = request
+            .and_then(|request| request["required_fingerprint"].as_str())
+            .unwrap_or_default();
+        let lane_id = details.get("lane_id");
+        let fingerprint = details.get("fingerprint");
+        if lane_id.is_some_and(|value| value.as_str() != Some(model))
+            || fingerprint.is_some_and(|value| value.as_str() != Some(pinned))
+        {
+            return Err(SynapseEmbeddingError::FingerprintMismatch {
+                expected: format!("{model}:{pinned}"),
+                served: format!(
+                    "{}:{}",
+                    lane_id.unwrap_or(&Value::Null),
+                    fingerprint.unwrap_or(&Value::Null)
+                ),
+            });
+        }
+    }
     let retry_after_ms = error["retry_after_ms"]
         .as_u64()
         .filter(|ms| (MIN_TRANSIENT_RETRY_MS..=MAX_LANE_PAUSE_MS).contains(ms));
@@ -1349,7 +1374,7 @@ fn transient_refusal(
         .as_str()
         .or_else(|| request.and_then(|request| request["model"].as_str()))
         .unwrap_or_default();
-    LanePause {
+    Ok(LanePause {
         lane_id: lane_id.to_owned(),
         fingerprint: request
             .and_then(|request| request["required_fingerprint"].as_str())
@@ -1367,7 +1392,7 @@ fn transient_refusal(
             .as_bool()
             .unwrap_or(true),
         record_id: 0,
-    }
+    })
 }
 
 fn parse_models_list(raw: &[u8]) -> Result<Vec<SynapseModelMetadata>, SynapseEmbeddingError> {
@@ -1908,6 +1933,45 @@ mod tests {
             }}}));
             assert_eq!(pause.retry_after_ms, Some(hint));
         }
+    }
+
+    #[test]
+    fn transient_reply_for_another_lane_does_not_pause_this_one() {
+        use super::pause_test_support::*;
+        let mut reply: Value = serde_json::from_str(SHAPE_COMPILING_REPLY).unwrap();
+        reply["result"]["error"]["details"]["lane_id"] = json!("another-lane");
+        assert!(matches!(
+            decode_refusal(&reply),
+            SynapseEmbeddingError::FingerprintMismatch { .. }
+        ));
+        let mut pinned_elsewhere = reply.clone();
+        pinned_elsewhere["result"]["error"]["details"] = json!({
+            "lane_id": MODEL,
+            "fingerprint": "another-fingerprint",
+        });
+        assert!(matches!(
+            decode_refusal(&pinned_elsewhere),
+            SynapseEmbeddingError::FingerprintMismatch { .. }
+        ));
+        // Through the client, the other lane's refusal records no pause.
+        crate::semantic_index::with_lane_pause_clock(START, |clock| {
+            with_fake_synapse_refusing(
+                clock,
+                START + 1,
+                move |_| reply.clone(),
+                |config, _| {
+                    let mut client = SynapseEmbeddingClient::from_config(&config).unwrap();
+                    assert!(matches!(
+                        client.embed_query("query", Duration::from_secs(1)),
+                        Err(SynapseEmbeddingError::FingerprintMismatch { .. })
+                    ));
+                    assert!(
+                        lane_pause_for_root(config.route_project_root.as_deref().unwrap())
+                            .is_none()
+                    );
+                },
+            );
+        });
     }
 
     #[test]
