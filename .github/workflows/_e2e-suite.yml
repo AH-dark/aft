@@ -100,13 +100,13 @@ jobs:
           printf '{"git_sha":"%s","build_profile":"%s","sha256":"%s","source":"same-sha-artifact"}\n' \
             "$GITHUB_SHA" "$manifest_profile" "$sha256" > "$artifact_dir/build-info.json"
 
-      - uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/upload-artifact-retry
         with:
           name: e2e-linux-${{ inputs.cargo_profile }}-binary
           path: target/${{ env.CARGO_PROFILE_DIR }}/aft
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/upload-artifact-retry
         with:
           name: e2e-opencode2-${{ inputs.cargo_profile }}-binary
           path: target/opencode2-${{ env.CARGO_PROFILE_DIR }}/
@@ -139,7 +139,7 @@ jobs:
           bun run --cwd packages/opencode-plugin build
 
       - name: Download shared Linux binary
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-artifact-retry
         with:
           name: e2e-linux-${{ inputs.cargo_profile }}-binary
           path: tests/docker/fixtures
@@ -181,7 +181,7 @@ jobs:
 
       - name: Upload Linux plugin log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: e2e-linux-plugin-log-${{ github.run_attempt }}
           path: e2e-artifacts/linux/aft-plugin.log
@@ -214,7 +214,7 @@ jobs:
           bun-version: latest
 
       - name: Download same-SHA OpenCode 2 binary
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-artifact-retry
         with:
           name: e2e-opencode2-${{ inputs.cargo_profile }}-binary
           path: ${{ runner.temp }}/aft-opencode2
@@ -354,7 +354,7 @@ jobs:
 
       - name: Upload OpenCode 2 forensic artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: e2e-opencode2-forensics-${{ github.run_attempt }}
           path: ${{ runner.temp }}/opencode2-forensics.tar.zst
@@ -389,7 +389,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Download shared AFT binary
-        uses: actions/download-artifact@v4
+        uses: ./.github/actions/download-artifact-retry
         with:
           name: e2e-linux-${{ inputs.cargo_profile }}-binary
           path: target/${{ env.CARGO_PROFILE_DIR }}
@@ -479,7 +479,7 @@ jobs:
 
       - name: Upload Windows plugin log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: e2e-windows-plugin-log-${{ github.run_attempt }}
           path: ${{ runner.temp }}/aft-e2e-artifacts/windows/aft-plugin.log
@@ -557,7 +557,7 @@ jobs:
 
       - name: Upload macOS plugin log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: e2e-macos-plugin-log-${{ github.run_attempt }}
           path: ${{ runner.temp }}/aft-e2e-data/cortexkit/aft/logs/aft-plugin.log

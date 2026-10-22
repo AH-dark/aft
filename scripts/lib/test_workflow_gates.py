@@ -201,7 +201,7 @@ class LightPREventGateTests(unittest.TestCase):
             self.assertEqual(step["env"]["AFT_NEXTEST_PARTITION"], "hash:${{ inputs.shard }}/3")
             self.assertEqual(step["env"]["AFT_GATE_PHASES"], "nextest")
             self.assertEqual(step["env"]["AFT_GATE_SKIP_RELEASE_STORM"], "1")
-        download = next(step for step in steps if step.get("uses") == "actions/download-artifact@v4")
+        download = next(step for step in steps if step.get("uses") == "./.github/actions/download-artifact-retry")
         self.assertEqual(download["with"]["name"], "${{ inputs.platform }}-nextest-archive")
 
 
@@ -661,6 +661,179 @@ class CortexkitTrackingGateTests(unittest.TestCase):
             green = self._check(repo)
             self.assertEqual(green.returncode, 0, green.stdout + green.stderr)
             self.assertTrue(draft.exists(), "git rm --cached must keep the working copy")
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+UPLOAD_RETRY = "./.github/actions/upload-artifact-retry"
+DOWNLOAD_RETRY = "./.github/actions/download-artifact-retry"
+RETRY_ACTIONS = {
+    UPLOAD_RETRY: "actions/upload-artifact@v4",
+    DOWNLOAD_RETRY: "actions/download-artifact@v4",
+}
+DIRECT_ARTIFACT_PREFIXES = ("actions/upload-artifact@", "actions/download-artifact@")
+
+# Direct, single-attempt artifact steps that a required check may still run,
+# keyed by (file, job, step id). Each one must be continue-on-error and have a
+# fallback, so the artifact service failing cannot fail the check.
+SINGLE_ATTEMPT_ALLOWED = {
+    # The gate builds the binary itself when this download fails.
+    (".github/workflows/tests.yml", "search-quality-gate", "download-release-aft"),
+}
+
+# Artifacts whose contents a later required job reads. Their uploads must keep
+# failing the producing job when a file is missing.
+REQUIRED_DATA_UPLOADS = {
+    "linux-nextest-archive",
+    "macos-nextest-archive",
+    "macos-libtest-archive",
+    "macos-bin-archive",
+    "windows-nextest-archive",
+    "e2e-linux-${{ inputs.cargo_profile }}-binary",
+    "e2e-opencode2-${{ inputs.cargo_profile }}-binary",
+    "search-quality-aft-${{ github.sha }}",
+    "queue-context-${{ github.sha }}",
+}
+
+
+def _local_target(uses: str) -> Path | None:
+    """Map a local `uses:` reference to the file GitHub would load for it."""
+    if not uses.startswith("./"):
+        return None
+    target = REPO_ROOT / uses[2:]
+    return target if target.suffix in (".yml", ".yaml") else target / "action.yml"
+
+
+def required_check_steps() -> list[tuple[str, str, dict]]:
+    """Every step a merge-queue run of tests.yml can execute, as
+    (repo-relative file, job id, step). Reusable workflows and local composite
+    actions are followed, so a new suite or shared action is covered without
+    anyone remembering to list it here. Composite steps report job "(composite)".
+    """
+    pending = [REPO_ROOT / ".github/workflows/tests.yml"]
+    seen: set[Path] = set()
+    found: list[tuple[str, str, dict]] = []
+    while pending:
+        path = pending.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        document = workflow_gates.parse_workflow(str(path))
+        relative = str(path.relative_to(REPO_ROOT))
+        groups: list[tuple[str, list]] = []
+        jobs = document.get("jobs")
+        if isinstance(jobs, dict):
+            for job_id, job in jobs.items():
+                if not isinstance(job, dict):
+                    continue
+                target = _local_target(str(job.get("uses") or ""))
+                if target is not None:
+                    pending.append(target)
+                groups.append((job_id, job.get("steps") or []))
+        runs = document.get("runs")
+        if isinstance(runs, dict):
+            groups.append(("(composite)", runs.get("steps") or []))
+        for job_id, steps in groups:
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                found.append((relative, job_id, step))
+                target = _local_target(str(step.get("uses") or ""))
+                if target is not None:
+                    pending.append(target)
+    return found
+
+
+class ArtifactRetryTests(unittest.TestCase):
+    """GitHub's artifact service can time out for minutes at a time. An upload
+    or download that a required check runs must retry instead of failing a run
+    whose tests passed, and must still fail closed once the retries run out.
+    The only exceptions are listed in SINGLE_ATTEMPT_ALLOWED: steps whose
+    failure the check survives through a fallback."""
+
+    def setUp(self) -> None:
+        self.steps = required_check_steps()
+
+    def calls(self, action: str) -> list[tuple[str, str, dict]]:
+        return [entry for entry in self.steps if entry[2].get("uses") == action]
+
+    def test_traversal_reaches_the_unit_and_e2e_suites_and_shard_action(self) -> None:
+        files = {relative for relative, _, _ in self.steps}
+        for expected in (
+            ".github/workflows/tests.yml",
+            ".github/workflows/_unit-suite.yml",
+            ".github/workflows/_e2e-suite.yml",
+            ".github/actions/integration-shard/action.yml",
+            ".github/actions/upload-artifact-retry/action.yml",
+            ".github/actions/download-artifact-retry/action.yml",
+        ):
+            self.assertIn(expected, files)
+
+    def test_required_check_artifact_steps_use_the_retrying_actions(self) -> None:
+        wrappers = {str(_local_target(action).relative_to(REPO_ROOT)) for action in RETRY_ACTIONS}
+        offenders = []
+        allowed_seen = set()
+        for relative, job_id, step in self.steps:
+            uses = str(step.get("uses") or "")
+            if relative in wrappers or not uses.startswith(DIRECT_ARTIFACT_PREFIXES):
+                continue
+            key = (relative, job_id, step.get("id"))
+            if key in SINGLE_ATTEMPT_ALLOWED:
+                allowed_seen.add(key)
+                self.assertEqual(step.get("continue-on-error"), "true", key)
+                continue
+            offenders.append(f"{relative} job {job_id}: {step.get('name') or uses}")
+        self.assertEqual(
+            offenders,
+            [],
+            "artifact steps in required checks must use "
+            f"{UPLOAD_RETRY} or {DOWNLOAD_RETRY}, not a single attempt",
+        )
+        self.assertEqual(allowed_seen, SINGLE_ATTEMPT_ALLOWED, "stale single-attempt allowance")
+        self.assertGreaterEqual(len(self.calls(UPLOAD_RETRY)), len(REQUIRED_DATA_UPLOADS))
+        self.assertGreaterEqual(len(self.calls(DOWNLOAD_RETRY)), 8)
+
+    def test_retry_call_sites_are_never_continue_on_error(self) -> None:
+        for action in RETRY_ACTIONS:
+            for relative, job_id, step in self.calls(action):
+                with self.subTest(file=relative, job=job_id, name=step.get("with", {}).get("name")):
+                    self.assertNotIn("continue-on-error", step)
+
+    def test_required_data_uploads_still_fail_on_missing_files(self) -> None:
+        by_name = {
+            step.get("with", {}).get("name"): step for _, _, step in self.calls(UPLOAD_RETRY)
+        }
+        for name in sorted(REQUIRED_DATA_UPLOADS):
+            with self.subTest(artifact=name):
+                self.assertIn(name, by_name)
+                self.assertEqual(by_name[name]["with"].get("if-no-files-found"), "error")
+
+    def test_retry_actions_try_three_times_with_growing_pauses(self) -> None:
+        for action, inner in RETRY_ACTIONS.items():
+            with self.subTest(action=action):
+                document = workflow_gates.parse_workflow(str(_local_target(action)))
+                self.assertEqual(document["runs"]["using"], "composite")
+                steps = document["runs"]["steps"]
+                kinds = ["attempt" if step.get("uses") == inner else step.get("run") for step in steps]
+                self.assertEqual(kinds, ["attempt", "sleep 60", "attempt", "sleep 120", "attempt"])
+                attempts = [step for step in steps if step.get("uses") == inner]
+                self.assertEqual([step["id"] for step in attempts], ["attempt-1", "attempt-2", "attempt-3"])
+                self.assertEqual(attempts[0]["if"], "${{ !cancelled() }}")
+                for index in (1, 2):
+                    retry_if = f"${{{{ !cancelled() && steps.attempt-{index}.outcome == 'failure' }}}}"
+                    self.assertEqual(attempts[index]["if"], retry_if)
+                    self.assertEqual(steps[2 * index - 1]["if"], retry_if)
+                    self.assertEqual(steps[2 * index - 1]["shell"], "bash")
+                # Only the last attempt may fail the action: that is what keeps
+                # a missing artifact failing the job.
+                self.assertEqual([step.get("continue-on-error") for step in attempts], ["true", "true", None])
+                inputs = document["inputs"]
+                for step in attempts:
+                    for name in inputs:
+                        self.assertEqual(step["with"][name], f"${{{{ inputs.{name} }}}}")
+                if action == UPLOAD_RETRY:
+                    self.assertEqual(inputs["if-no-files-found"]["default"], "warn")
+                    self.assertNotIn("overwrite", attempts[0]["with"])
+                    self.assertEqual([step["with"].get("overwrite") for step in attempts[1:]], ["true", "true"])
 
 
 if __name__ == "__main__":

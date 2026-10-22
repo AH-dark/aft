@@ -60,7 +60,7 @@ runs:
       shell: bash
       run: ./scripts/install-typescript-test-servers.sh "${{ runner.temp }}/typescript-test-servers"
 
-    - uses: actions/download-artifact@v4
+    - uses: ./.github/actions/download-artifact-retry
       with:
         name: ${{ inputs.platform }}-nextest-archive
         path: ${{ runner.temp }}
@@ -105,7 +105,7 @@ runs:
 
     - name: Upload integration crash cores
       if: failure() && inputs.platform != 'windows' && inputs.shard == '2'
-      uses: actions/upload-artifact@v4
+      uses: ./.github/actions/upload-artifact-retry
       with:
         name: ${{ inputs.platform }}-integration-crash-${{ inputs.shard }}
         path: |

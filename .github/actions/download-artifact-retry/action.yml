@@ -1,0 +1,60 @@
+name: Download artifact with retry
+description: >-
+  actions/download-artifact@v4 for one named artifact, tried up to three times
+  with a 60 s and then a 120 s pause between attempts, so a few minutes of
+  GitHub artifact-service outage does not fail a job that needs the artifact.
+# Failure stays fail-closed: only the first two attempts may fail without
+# failing this action. If the third attempt fails (the service is still down,
+# or the producing job never uploaded the artifact), the calling step fails.
+# Callers must not mark this step continue-on-error when a required check
+# needs the downloaded data.
+inputs:
+  name:
+    description: Artifact name
+    required: true
+  path:
+    description: Destination directory
+    required: true
+runs:
+  using: composite
+  steps:
+    # Every condition names !cancelled() explicitly: the download and its
+    # retries still run after an earlier step in the job failed, and stop
+    # only when the job is cancelled.
+    - name: Download artifact (attempt 1 of 3)
+      id: attempt-1
+      if: ${{ !cancelled() }}
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+
+    - name: Wait 60 s before retrying the download
+      if: ${{ !cancelled() && steps.attempt-1.outcome == 'failure' }}
+      shell: bash
+      run: sleep 60
+
+    # A partial earlier extraction is overwritten file by file.
+    - name: Download artifact (attempt 2 of 3)
+      id: attempt-2
+      if: ${{ !cancelled() && steps.attempt-1.outcome == 'failure' }}
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+
+    - name: Wait 120 s before the last download attempt
+      if: ${{ !cancelled() && steps.attempt-2.outcome == 'failure' }}
+      shell: bash
+      run: sleep 120
+
+    # No continue-on-error here: if the last attempt fails, the job fails.
+    - name: Download artifact (attempt 3 of 3)
+      id: attempt-3
+      if: ${{ !cancelled() && steps.attempt-2.outcome == 'failure' }}
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}

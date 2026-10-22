@@ -79,7 +79,7 @@ jobs:
         if: ${{ always() && github.event_name == 'merge_group' }}
         run: |
           python3 -c 'import json, os, pathlib; group=json.loads(pathlib.Path(os.environ["GITHUB_EVENT_PATH"]).read_text())["merge_group"]; (pathlib.Path(os.environ["RUNNER_TEMP"])/"queue-context.json").write_text(json.dumps({key:group[key] for key in ("base_sha", "head_sha", "head_ref")}))'
-      - uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/upload-artifact-retry
         if: ${{ always() && github.event_name == 'merge_group' }}
         with:
           name: queue-context-${{ github.sha }}
@@ -219,7 +219,7 @@ jobs:
           RUSTC_WRAPPER: ${{ github.workspace }}/scripts/ci-rustc-cache.py
       - name: Verify release executable can self-report
         run: target/release/aft --version
-      - uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/upload-artifact-retry
         with:
           name: search-quality-aft-${{ github.sha }}
           path: target/release/aft
@@ -261,6 +261,11 @@ jobs:
         run: |
           python3 benchmarks/aft-search/search_quality.py --mode check-descriptor \
             --base-ref "$PR_BASE_SHA" --head "$PR_HEAD_SHA" --branch "$QUALITY_BRANCH"
+      # Deliberately a single attempt, not the retrying download action: when
+      # this download leaves target/release/aft absent, the next steps build
+      # the binary instead, so an artifact-service outage cannot fail the
+      # check, and retrying would only delay that fallback by minutes when the
+      # producing job did not upload.
       - name: Download the shared release AFT
         if: ${{ github.event_name != 'pull_request' }}
         id: download-release-aft
@@ -386,7 +391,7 @@ jobs:
           fi
       - name: Upload search-quality score and behavior diff
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: search-quality-score-${{ github.run_attempt }}
           path: |
