@@ -463,6 +463,54 @@ class LinuxUnitWorkflowTests(unittest.TestCase):
 
 
 class WindowsUnitWorkflowTests(unittest.TestCase):
+    def test_windows_defender_tuning_is_shared_and_hosted_only(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        path = root / ".github/actions/windows-ci-defender/action.yml"
+        action = workflow_gates.parse_workflow(str(path))
+        self.assertEqual(action["runs"]["using"], "composite")
+        steps = action["runs"]["steps"]
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["shell"], "pwsh")
+        script = steps[0]["run"]
+        self.assertIn("$env:RUNNER_ENVIRONMENT -ne 'github-hosted'", script)
+        self.assertLess(script.index("throw"), script.index("Add-MpPreference"))
+        for path in ("$env:GITHUB_WORKSPACE", "$env:TEMP", "$env:RUNNER_TEMP", "$env:USERPROFILE"):
+            self.assertIn(path, script)
+        self.assertIn("'.cargo'", script)
+        self.assertIn("Add-MpPreference -ExclusionPath $paths", script)
+        self.assertIn("Set-MpPreference -DisableRealtimeMonitoring $true", script)
+        self.assertIn("Get-MpComputerStatus", script)
+        self.assertNotIn("SilentlyContinue", script)
+
+    def test_every_windows_ci_lane_tunes_defender_before_other_setup(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        action = "./.github/actions/windows-ci-defender"
+        calls = []
+        for filename in ("_unit-suite.yml", "_e2e-suite.yml"):
+            suite = workflow_gates.parse_workflow(str(root / ".github/workflows" / filename))
+            for name, job in suite["jobs"].items():
+                steps = job.get("steps", [])
+                direct = [i for i, step in enumerate(steps) if step.get("uses") == action]
+                if job.get("runs-on") != "windows-2022":
+                    self.assertEqual(direct, [], name)
+                    continue
+                shared = [step for step in steps if step.get("uses") == "./.github/actions/integration-shard"]
+                if shared:
+                    self.assertEqual(shared[0]["with"]["platform"], "windows")
+                else:
+                    self.assertEqual(direct, [1], name)
+                    self.assertNotIn("continue-on-error", steps[1])
+                    calls.append(name)
+        self.assertEqual(set(calls), {
+            "unit-windows-nextest-archive", "unit-windows-libtest-shard", "unit-windows-watcher",
+            "unit-windows-check", "unit-windows-bash", "e2e-windows",
+        })
+        shared = workflow_gates.parse_workflow(str(root / ".github/actions/integration-shard/action.yml"))
+        step = shared["runs"]["steps"][0]
+        self.assertEqual(step["uses"], action)
+        self.assertEqual(step["if"], "inputs.platform == 'windows'")
+        self.assertNotIn("continue-on-error", step)
+
     def test_windows_serial_probes_run_once_in_archive_builder(self) -> None:
         root = Path(__file__).resolve().parents[2]
         suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
