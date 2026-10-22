@@ -122,6 +122,24 @@ function wakeRouteState(): WakeRouteState {
  */
 const MAX_UNROUTED_COMPLETIONS = 256;
 
+/**
+ * Delays before each automatic retry of a standalone wake (a pushed
+ * completion or watch match delivered without a SubC pool) whose delivery
+ * failed, most often because the host refused synthetic input for a while.
+ * Without SubC nothing nudges a later drain, and a once-watch stops scanning
+ * after its first match, so without these retries the result would wait for
+ * the session's next registration. After the last delay the wake is still
+ * kept for that registration.
+ */
+const STANDALONE_RETRY_DELAYS_MS: readonly number[] = [
+  500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000,
+];
+
+export interface V2RuntimeConsumerOptions {
+  /** Delays before each automatic retry of a failed standalone wake; tests shorten them. */
+  readonly standaloneRetryDelaysMs?: readonly number[];
+}
+
 function holdUnrouted(completion: BashCompletedPayload, bridge: AftProjectTransport): void {
   const { unrouted } = wakeRouteState();
   let held = 0;
@@ -358,6 +376,7 @@ export function createV2RuntimeConsumer(
   context: V2WakeHostContext,
   getConfig: () => AftConfig = () => ({}),
   getBridge?: (root?: string) => AftProjectTransport,
+  options: V2RuntimeConsumerOptions = {},
 ): V2RuntimeConsumer {
   const delivery = new V2SessionDelivery(context.session);
   // SubC owns acknowledgement retries outside this consumer and does not
@@ -378,11 +397,72 @@ export function createV2RuntimeConsumer(
   const matching = new Map<string, Promise<void>>();
   const draining = new Map<string, Promise<void>>();
   let disposed = false;
+  const retryDelays = options.standaloneRetryDelaysMs ?? STANDALONE_RETRY_DELAYS_MS;
+  /**
+   * Automatic retries of failed standalone wakes, keyed like `completing`
+   * (completions) and `pendingMatches` (watch matches). `attempts` counts
+   * the retries already scheduled; `timer` is set while one is waiting.
+   */
+  const retries = new Map<
+    string,
+    { attempts: number; timer?: ReturnType<typeof setTimeout> | undefined }
+  >();
+  const clearRetry = (key: string): void => {
+    const retry = retries.get(key);
+    if (retry?.timer !== undefined) clearTimeout(retry.timer);
+    retries.delete(key);
+  };
+  /**
+   * Retry a failed standalone wake after the next delay. A wake that already
+   * has a retry waiting keeps it: a failed attempt from another trigger (a
+   * session registration) neither adds a second timer nor uses up a delay.
+   * Each retry goes through the same delivery path as the first attempt,
+   * with its in-flight, admission and durable-pending checks, so it cannot
+   * wake the session twice. After the last delay this logs and stops; the
+   * wake stays held for the session's next registration.
+   */
+  const scheduleRetry = (key: string, sessionID: string, what: string, run: () => void): void => {
+    if (disposed || v2SessionDeleted(context, sessionID)) {
+      clearRetry(key);
+      return;
+    }
+    const retry = retries.get(key) ?? { attempts: 0 };
+    if (retry.timer !== undefined) return;
+    const delay = retryDelays[retry.attempts];
+    if (delay === undefined) {
+      retries.delete(key);
+      warn(
+        `[bash_wake] gave up retrying ${what} for session ${sessionID} after ${retry.attempts} retries; it stays pending until the session registers again`,
+      );
+      return;
+    }
+    retry.attempts += 1;
+    retry.timer = setTimeout(() => {
+      retry.timer = undefined;
+      if (disposed || retries.get(key) !== retry) return;
+      // A session deleted meanwhile still goes through `run`: the delivery
+      // path then acknowledges the wake without delivering it and ends the
+      // retries.
+      run();
+    }, delay);
+    // A waiting retry must not keep the host process alive on its own.
+    (retry.timer as { unref?: () => void }).unref?.();
+    retries.set(key, retry);
+  };
   const route: WakeRoute = {
     standalonePatternMatch: async (match, bridge) => {
+      const key = JSON.stringify([
+        match.session_id,
+        match.task_id,
+        match.watch_id,
+        match.match_offset,
+        match.reason,
+      ]);
       // As in `patternMatch`: a deleted session has no one to tell. Acknowledge
       // the match without queueing it, so the bridge does not deliver it again.
       if (v2SessionDeleted(context, match.session_id)) {
+        pendingMatches.delete(key);
+        clearRetry(key);
         await bridge
           .send("bash_ack_completions", {
             session_id: match.session_id,
@@ -405,13 +485,6 @@ export function createV2RuntimeConsumer(
           });
         return;
       }
-      const key = JSON.stringify([
-        match.session_id,
-        match.task_id,
-        match.watch_id,
-        match.match_offset,
-        match.reason,
-      ]);
       const active = matching.get(key);
       if (active) return active;
       const pending = pendingMatches.get(key) ?? { match, bridge, admitted: false };
@@ -517,11 +590,21 @@ export function createV2RuntimeConsumer(
         delivery.retirePatternMatch(wake);
       };
       const attempt = deliver()
-        .catch((error) => {
-          warn(
-            `[bash_pattern_match] delivery of watch ${match.watch_id} to session ${match.session_id} failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        })
+        .then(
+          () => clearRetry(key),
+          (error) => {
+            warn(
+              `[bash_pattern_match] delivery of watch ${match.watch_id} to session ${match.session_id} failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            // The match stays in `pendingMatches`. Retry it from there, unless
+            // something else delivered or retired it first.
+            scheduleRetry(key, match.session_id, `watch ${match.watch_id} match`, () => {
+              const current = pendingMatches.get(key);
+              if (current) void route.standalonePatternMatch?.(current.match, current.bridge);
+              else clearRetry(key);
+            });
+          },
+        )
         .finally(() => matching.delete(key));
       matching.set(key, attempt);
       return attempt;
@@ -648,6 +731,7 @@ export function createV2RuntimeConsumer(
           text: "",
         });
         pendingMatches.delete(key);
+        clearRetry(key);
       }
       forgetV2Watch(context, completion.session_id, completion.task_id);
       return true;
@@ -687,17 +771,18 @@ export function createV2RuntimeConsumer(
         await route.completion(completion, bridge);
         return;
       }
+      const key = JSON.stringify([completion.session_id, completion.task_id]);
       // As in `completion`: a deleted session gets no wake and no per-session
       // state, but the completion is still acknowledged so the bridge does not
       // deliver it again.
       if (v2SessionDeleted(context, completion.session_id)) {
+        clearRetry(key);
         await bridge.send("bash_ack_completions", {
           session_id: completion.session_id,
           task_ids: [completion.task_id],
         });
         return;
       }
-      const key = JSON.stringify([completion.session_id, completion.task_id]);
       const active = completing.get(key);
       if (active) return active;
       const deliver = async () => {
@@ -779,10 +864,28 @@ export function createV2RuntimeConsumer(
             text: "",
           });
           pendingMatches.delete(key);
+          clearRetry(key);
         }
         forgetV2Watch(context, completion.session_id, completion.task_id);
       };
-      const attempt = deliver().finally(() => completing.delete(key));
+      const attempt = deliver()
+        .then(
+          () => clearRetry(key),
+          (error) => {
+            // `routeCompletion` holds the failed completion for the session's
+            // next registration and logs the failure; retry it sooner here.
+            scheduleRetry(
+              key,
+              completion.session_id,
+              `completion of task ${completion.task_id}`,
+              () => {
+                void routeCompletion(completion, bridge);
+              },
+            );
+            throw error;
+          },
+        )
+        .finally(() => completing.delete(key));
       completing.set(key, attempt);
       return attempt;
     },
@@ -885,6 +988,7 @@ export function createV2RuntimeConsumer(
     },
     dispose: () => {
       disposed = true;
+      for (const key of [...retries.keys()]) clearRetry(key);
       pendingMatches.clear();
       delivery.dispose();
       subcDelivery.dispose();
