@@ -27,7 +27,14 @@ struct Fixture {
     payload: Vec<u8>,
     /// The last reservation id written before the replayed attempt.
     seeded: i64,
+    /// For a reuse fixture: the row's `ref_epoch` before the attempt and the
+    /// plane's `gc_epoch`, which a durable touch must leave on the row.
+    epochs: Option<(i64, i64)>,
 }
+
+/// The epoch a reuse fixture's plane store is advanced to before the replay,
+/// as a sweep would, so the copy's touch has something to change.
+const ADVANCED_GC_EPOCH: i64 = 5;
 
 /// A v2 source row and a v3 family whose registry and plane store already
 /// exist, all closed, so the replayed closure creates only WAL files.
@@ -59,6 +66,24 @@ fn fixture(reuse: bool) -> Fixture {
     })
     .unwrap();
     let seeded = last_reservation(&storage);
+    let epochs = reuse.then(|| {
+        let path = plane_path(&storage, FAMILY, FamilyPlane::Semantic).unwrap();
+        // The plane's owning connection; nothing else has it open.
+        let database =
+            connections::shared(&path, Kind::Plane(FamilyPlane::Semantic), false, false).unwrap();
+        let c = database.connection().unwrap();
+        c.execute(
+            "UPDATE store_meta SET gc_epoch = ?1 WHERE singleton = 1",
+            [ADVANCED_GC_EPOCH],
+        )
+        .unwrap();
+        checkpoint(&c).unwrap();
+        drop(c);
+        drop(database);
+        let old = ref_epoch(&storage, &key).expect("the reuse fixture holds the row");
+        assert!(old < ADVANCED_GC_EPOCH);
+        (old, ADVANCED_GC_EPOCH)
+    });
     Fixture {
         _root: root,
         storage,
@@ -66,7 +91,23 @@ fn fixture(reuse: bool) -> Fixture {
         key,
         payload,
         seeded,
+        epochs,
     }
+}
+
+fn ref_epoch(storage: &Path, key: &FamilyKey) -> Option<i64> {
+    PlaneReader::open_existing(storage, FAMILY, key.plane())
+        .unwrap()
+        .database
+        .connection()
+        .unwrap()
+        .query_row(
+            "SELECT ref_epoch FROM blob_payloads WHERE full_key = ?1",
+            [key.as_bytes().as_slice()],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
 }
 
 fn last_reservation(storage: &Path) -> i64 {
@@ -107,11 +148,35 @@ enum Seen {
     Unclaimed,
     /// `committed`, and the copied row reads back with a matching digest.
     Committed,
-    /// `committed` while a copied row is missing or fails its digest.
+    /// `committed` while a copied row is missing or fails its digest, or a
+    /// reused row's `ref_epoch` does not match the ledger state.
     Torn,
 }
 
 fn observe(fixture: &Fixture) -> Seen {
+    let seen = observe_rows(fixture);
+    let Some((old, new)) = fixture.epochs else {
+        return seen;
+    };
+    // The touch commits after the reservation and before the ledger commit:
+    // with no reservation it cannot be durable, with a durable commit it must
+    // be, and in between either value is whole.
+    let epoch = ref_epoch(&fixture.storage, &fixture.key);
+    let whole = match seen {
+        Seen::Absent => epoch == Some(old),
+        Seen::Unclaimed => epoch == Some(old) || epoch == Some(new),
+        Seen::Committed => epoch == Some(new),
+        Seen::Torn => false,
+    };
+    if whole {
+        seen
+    } else {
+        eprintln!("reused row ref_epoch {epoch:?} after {seen:?} (old {old}, new {new})");
+        Seen::Torn
+    }
+}
+
+fn observe_rows(fixture: &Fixture) -> Seen {
     let state: Option<String> = LedgerReader::open_existing(&fixture.storage, FAMILY)
         .expect("the registry reopens after the power cut")
         .database
@@ -193,6 +258,10 @@ fn replayed_copying_closure_is_whole_or_absent_after_any_power_cut() {
     assert_never_torn(&seen);
 }
 
+/// The reused row starts at an older `ref_epoch` than its plane's `gc_epoch`,
+/// so every cut also checks the touch that keeps the row from collection:
+/// the old epoch while the attempt is absent, the new one once its ledger
+/// commit is durable.
 #[test]
 fn replayed_reuse_only_closure_is_whole_or_absent_after_any_power_cut() {
     let _guard = serial();
