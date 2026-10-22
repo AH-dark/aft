@@ -6985,11 +6985,13 @@ async fn bash_kill_scope_never_resubmits_a_due_saved_draining_retry() {
 /// A `runon` task of `scope` whose draining retry is saved and due, as a
 /// module restart leaves it: its worker stopped and its registry is gone.
 /// Returns the runner, the paused retry clock, the task id and the path of
-/// its saved record. The runner keeps refusing as draining, and accepts a
-/// second connection, so a wrongly started worker can reach it.
+/// its saved record. The runner refuses the first `refusals` runs as
+/// draining and accepts the rest, which exit 0. It accepts a second
+/// connection, so a worker started after the restart can reach it.
 async fn saved_due_draining_retry(
     dir: &Path,
     scope: &subc_protocol::scope::ScopeStamp,
+    refusals: u32,
 ) -> (
     crate::exec_remote::wire_tests::Daemon,
     PausedDrainingClock,
@@ -6998,7 +7000,7 @@ async fn saved_due_draining_retry(
 ) {
     let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
         Script::Draining {
-            refusals: u32::MAX,
+            refusals,
             retry_after_ms: Some(200),
         },
         "exec-remote/v1",
@@ -7039,7 +7041,8 @@ fn assert_one_saved_task_paused(reply: &crate::protocol::Response, task: &str) {
 async fn bash_kill_scope_recovery_then_a_bind_share_one_saved_task() {
     let dir = tempfile::tempdir().unwrap();
     let scope = owner_scope("saved-recovery-then-bind");
-    let (daemon, _clock, task_id, json) = saved_due_draining_retry(dir.path(), &scope).await;
+    let (daemon, _clock, task_id, json) =
+        saved_due_draining_retry(dir.path(), &scope, u32::MAX).await;
     let (reached, release) = crate::commands::bash_kill_scope::saved_recovery_gate::arm(dir.path());
     let operation = start_kill_scope_with_saved_tasks(dir.path(), &scope);
     tokio::time::timeout(Duration::from_secs(30), reached)
@@ -7081,7 +7084,8 @@ async fn bash_kill_scope_recovery_then_a_bind_share_one_saved_task() {
 async fn a_bind_then_bash_kill_scope_recovery_share_one_saved_task() {
     let dir = tempfile::tempdir().unwrap();
     let scope = owner_scope("saved-bind-then-recovery");
-    let (daemon, _clock, task_id, json) = saved_due_draining_retry(dir.path(), &scope).await;
+    let (daemon, _clock, task_id, json) =
+        saved_due_draining_retry(dir.path(), &scope, u32::MAX).await;
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeBudgetCheck);
     let project = registry();
     project.replay_session(dir.path(), "session").unwrap();
@@ -7111,6 +7115,77 @@ async fn a_bind_then_bash_kill_scope_recovery_share_one_saved_task() {
     assert_paused(&project, &task_id);
     assert_saved_paused(&json);
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
+/// `bash.kill_scope` recovered a saved task and holds it without a worker.
+/// The task's project then binds and registers that same task. The pause
+/// records no cancellation (as when it fails part way), so the held task must
+/// go to the project's registry, whose one worker resumes it as the project's
+/// replay would have.
+#[tokio::test]
+async fn an_unpaused_held_task_is_handed_to_the_project_that_registered_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = owner_scope("held-handoff");
+    let (daemon, _clock, task_id, _json) = saved_due_draining_retry(dir.path(), &scope, 1).await;
+    let (recovered, errors) = BgTaskRegistry::recover_saved_scope_tasks(dir.path(), &scope, &[]);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(recovered.len(), 1);
+    let project = registry();
+    project.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        remote_workers(&task_id),
+        (1, 1),
+        "nothing may run while the task is held"
+    );
+    recovered[0].start_held_remote_workers();
+    recovered[0].detach();
+    let done = terminal(&project, &task_id).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    wait_for("the project's worker must stop", || {
+        (remote_workers(&task_id) == (2, 2)).then_some(())
+    })
+    .await;
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        2,
+        "the first, refused run and one resubmission after the restart"
+    );
+}
+
+/// A registry restored a saved task, and its worker stopped without finishing
+/// it. Another registry that restores the same task registers it and must run
+/// it with one worker of its own; both registries see the outcome.
+#[tokio::test]
+async fn a_later_registry_runs_a_restored_task_whose_worker_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = owner_scope("late-restore");
+    let (daemon, mut clock, task_id, _json) = saved_due_draining_retry(dir.path(), &scope, 1).await;
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    let first = registry();
+    first.replay_session(dir.path(), "session").unwrap();
+    clock.expect_event(DrainingClockEvent::Stopped).await;
+    wait_for("the first restored worker must stop", || {
+        (remote_workers(&task_id) == (2, 2)).then_some(())
+    })
+    .await;
+    assert!(!first.task(&task_id).unwrap().is_terminal());
+    let later = registry();
+    later.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&later, &task_id).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    wait_for("the later registry's worker must stop", || {
+        (remote_workers(&task_id) == (3, 3)).then_some(())
+    })
+    .await;
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        2,
+        "the first, refused run and one resubmission after the restart"
+    );
+    assert!(first.task(&task_id).unwrap().is_terminal());
 }
 
 /// After a module restart, the owner pauses a worker whose saved remote job
