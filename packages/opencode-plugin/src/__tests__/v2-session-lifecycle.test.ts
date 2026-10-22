@@ -530,6 +530,78 @@ test("V2 completion arriving after session deletion creates no session state and
   }
 });
 
+test("V2 watch match arriving after session deletion is acknowledged without a wake", async () => {
+  _resetSubagentCacheForTest();
+  __resetV2WakeRoutesForTests();
+  const bus = await Effect.runPromise(
+    PubSub.unbounded<{ type: string; data: { sessionID: string } }>(),
+  );
+  const scope = await Effect.runPromise(Scope.make());
+  const synthetic: unknown[] = [];
+  const host = {
+    location: { directory: process.cwd() },
+    event: { subscribe: () => Stream.fromPubSub(bus) },
+    session: {
+      get: () => Effect.succeed({ parentID: "parent" }),
+      prompt: () => Effect.succeed({ id: "wake" }),
+      synthetic: (input: unknown) =>
+        Effect.sync(() => {
+          synthetic.push(input);
+          return { id: "status" };
+        }),
+    },
+  };
+  const sends: Array<{ command: string; params: Record<string, unknown> }> = [];
+  const bridge = {
+    getCwd: () => process.cwd(),
+    send: async (command: string, params: Record<string, unknown>) => {
+      sends.push({ command, params });
+      return { success: true };
+    },
+  };
+  const consumer = createV2RuntimeConsumer(host as never);
+  try {
+    await Effect.runPromise(
+      registerV2SessionLifecycle(host).pipe(Effect.provideService(Scope.Scope, scope)),
+    );
+    consumer.registerSession?.("deleted-child");
+    await Effect.runPromise(
+      PubSub.publish(bus, { type: "session.deleted", data: { sessionID: "deleted-child" } }),
+    );
+    await Bun.sleep(10);
+    await consumer.bridgeOptions.onBashPatternMatch?.(
+      {
+        type: "bash_pattern_match",
+        session_id: "deleted-child",
+        task_id: "bash-late-child",
+        watch_id: "watch-late",
+        match_text: "ready",
+        match_offset: 12,
+        context: "server ready",
+        once: false,
+        reason: "pattern_match",
+      } as never,
+      bridge as never,
+    );
+    expect(sessionBgStates.has("deleted-child")).toBe(false);
+    expect(synthetic).toEqual([]);
+    expect(sends).toEqual([
+      {
+        command: "bash_ack_completions",
+        params: {
+          session_id: "deleted-child",
+          matches: [{ task_id: "bash-late-child", watch_id: "watch-late", match_offset: 12 }],
+        },
+      },
+    ]);
+  } finally {
+    consumer.dispose();
+    __resetV2WakeRoutesForTests();
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    sessionBgStates.clear();
+  }
+});
+
 test("V2 subc drain for a deleted session acknowledges its completion and watch match and leaves no session state", async () => {
   _resetSubagentCacheForTest();
   __resetV2WakeRoutesForTests();
