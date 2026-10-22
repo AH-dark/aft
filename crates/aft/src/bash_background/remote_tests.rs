@@ -5107,17 +5107,17 @@ fn published_report_vectors_render_changes_say_nothing_when_empty_and_name_what_
          25 writes under ignored paths on the server were NOT copied back, for example:\n  \
          scratch/debug.log\n  cache/result.bin";
     assert_eq!(
-        render_terminal_report(&report_vector("all")).as_deref(),
+        render_terminal_report(&report_vector("all"), &[]).as_deref(),
         Some(all)
     );
     // Reported and unchanged: a reporting runner sent every field, all
     // empty, so there is nothing to say.
     let unchanged = report_vector("unchanged");
     assert!(unchanged.git_state_changed.is_some());
-    assert_eq!(render_terminal_report(&unchanged), None);
+    assert_eq!(render_terminal_report(&unchanged, &[]), None);
     // Absent (an older runner): each missing report is named on its own line.
     assert_eq!(
-        render_terminal_report(&report_vector("older-runner")).as_deref(),
+        render_terminal_report(&report_vector("older-runner"), &[]).as_deref(),
         Some(
             "These files changed on the server and were NOT copied back:\n  result.txt\n\
              git state: not reported by the runner\n\
@@ -5127,11 +5127,11 @@ fn published_report_vectors_render_changes_say_nothing_when_empty_and_name_what_
     );
     // A detached HEAD has no ref on either side, so no ref line; an index
     // tree that became available counts as changed.
-    let detached = render_terminal_report(&report_vector("detached-head")).unwrap();
+    let detached = render_terminal_report(&report_vector("detached-head"), &[]).unwrap();
     assert!(!detached.contains("ref:"), "{detached}");
     assert!(detached.contains("HEAD: 111111111111 -> 222222222222\n  index tree changed"));
     // A capped untracked list says the runner listed only some of them.
-    let truncated = render_terminal_report(&report_vector("truncated-untracked")).unwrap();
+    let truncated = render_terminal_report(&report_vector("truncated-untracked"), &[]).unwrap();
     assert!(
         truncated
             .contains("  notes.txt\n  (the runner listed only some of them; more were created)\n"),
@@ -5160,7 +5160,7 @@ async fn a_reporting_runner_report_is_printed_after_the_output() {
     );
     assert!(
         rendered.ends_with(
-            &render_terminal_report(&crate::exec_remote::wire_tests::report_vector("all")).unwrap()
+            &render_terminal_report(&crate::exec_remote::wire_tests::report_vector("all"), &[]).unwrap()
         ),
         "{rendered}"
     );
@@ -7536,4 +7536,45 @@ async fn local_fallback_with_return_paths_says_the_files_stayed_in_place() {
         "{}",
         done.output_preview
     );
+}
+
+#[tokio::test]
+async fn runon_return_paths_copied_files_are_not_listed_as_left_on_the_server() {
+    // The command runs in `sub/`, so the runner names its files relative to
+    // the checkout (`sub/dist/hello.txt`) while return_paths names them
+    // relative to the workdir (`dist/hello.txt`).
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::ReturnVectorReporting(
+            "failed-missing",
+            &["sub/dist/hello.txt", "sub/dist/absent.txt", "sub/other.txt"],
+        ),
+        RETURN_CLAIMS,
+        1,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let workdir = dir.path().join("sub");
+    fs::create_dir(&workdir).unwrap();
+    let mut call = return_call(&["dist/hello.txt", "dist/absent.txt"]);
+    call["workdir"] = serde_json::json!(workdir);
+    let (reply, _) = orchestrated_reply(&ctx, &daemon, call).await;
+    assert!(reply.success, "{reply:?}");
+    assert_eq!(fs::read(workdir.join("dist/hello.txt")).unwrap(), b"hello");
+    let output = reply.data["output"].as_str().unwrap();
+    assert!(
+        output.contains(
+            "These files changed on the server and were NOT copied back:\n  \
+             sub/dist/absent.txt\n  sub/other.txt\n"
+        ),
+        "{output}"
+    );
+    assert!(
+        output.contains(
+            "These untracked files were created on the server and were NOT copied back:\n  \
+             sub/dist/absent.txt\n  sub/other.txt\n"
+        ),
+        "{output}"
+    );
+    assert!(!output.contains("sub/dist/hello.txt"), "{output}");
 }
