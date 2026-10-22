@@ -4467,6 +4467,7 @@ mod grant_path_tests {
             requested_platform: None,
             requested_vcpus: None,
             requested_network: false,
+            return_paths: Vec::new(),
             connection_file: REMOTE_RUNON_CONNECTION
                 .lock()
                 .unwrap()

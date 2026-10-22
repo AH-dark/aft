@@ -3448,7 +3448,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "029ddfaa46f2b46b773e15231b41cf5c86acd1ed1668068236039c1edb978aca",
+          "schema_digest": "019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f",
           "semantics": 2,
           "modes": [
             "classic",
@@ -3523,6 +3523,14 @@
               "runon": {
                 "type": "string",
                 "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options)."
+              },
+              "return_paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "description": "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (10 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason."
               }
             },
             "required": [
@@ -4679,7 +4687,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "029ddfaa46f2b46b773e15231b41cf5c86acd1ed1668068236039c1edb978aca",
+          "schema_digest": "019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f",
           "semantics": 2,
           "modes": [
             "classic",
@@ -4754,6 +4762,14 @@
               "runon": {
                 "type": "string",
                 "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options)."
+              },
+              "return_paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "description": "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (10 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason."
               }
             },
             "required": [
