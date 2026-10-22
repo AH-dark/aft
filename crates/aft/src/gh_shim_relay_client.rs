@@ -576,6 +576,15 @@ impl ExchangeIo for SubcExchangeIo<'_> {
         if let (Some(clock), Err(_)) = (&self.clock, &result) {
             clock.advance(sent.elapsed());
         }
+        #[cfg(test)]
+        if result.is_ok() {
+            TEST_EXCHANGE_REPLY_DELAY.with(|delay| {
+                let delay = delay.replace(Duration::ZERO);
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+            });
+        }
         result
     }
 }
@@ -585,6 +594,8 @@ thread_local! {
     /// Set by a test to run [`route`]'s exchange on a [`TestExchangeClock`]
     /// on this thread, still against the real subc consumer.
     static USE_TEST_EXCHANGE_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Pause after a successful reply to model a loaded runner between exchange steps.
+    static TEST_EXCHANGE_REPLY_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
 }
 
 /// An exchange clock for tests that drive the real subc consumer, so how
