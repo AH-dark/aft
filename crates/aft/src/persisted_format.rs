@@ -1423,10 +1423,14 @@ mod tests {
         std::os::unix::fs::symlink(target, alias).unwrap();
         #[cfg(windows)]
         {
+            // Rebuild both paths from their components so every separator is a
+            // backslash: `mklink` reads a `/inner` segment as an unknown switch.
+            let alias: std::path::PathBuf = alias.components().collect();
+            let target: std::path::PathBuf = target.components().collect();
             let output = std::process::Command::new("cmd.exe")
                 .args(["/c", "mklink", "/J"])
-                .arg(alias)
-                .arg(target)
+                .arg(&alias)
+                .arg(&target)
                 .output()
                 .unwrap();
             assert!(
