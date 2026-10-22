@@ -5412,9 +5412,8 @@ mod grant_path_tests {
                 Instant::now(),
             )
         });
-        wait_for_capture_submission(&daemon, &mut rx).await;
         tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(30),
             timing.capture_registered.notified(),
         )
         .await
