@@ -254,7 +254,7 @@ const hostPermissionGrants = new WeakMap<object, readonly string[]>();
  * How AFT answers the engine's outside-access asks for one call.
  * - `harness`: on OMP, OMP's own approval mode decides through the tools'
  *   declared tiers, so AFT never asks there.
- * - `askOnPi`: the user's `pi.ask_outside_access` setting (default on).
+ * - `askOnPi`: the user's `pi.external_access_ask` setting (default on).
  */
 export interface OutsideAccessPolicy {
   harness: PiHarness;
@@ -347,7 +347,7 @@ export function canPromptForOutsideAccess(
  * asked at all: outside access is allowed, and the engine's floors
  * (credentials, AFT's data folder, `sandbox.read_deny`) and a configured
  * `restrict_to_project_root` still refuse, because those are denials, never
- * asks. AFT asks only on plain Pi, with `pi.ask_outside_access` on, in Pi's
+ * asks. AFT asks only on plain Pi, with `pi.external_access_ask` on, in Pi's
  * own terminal UI; print, JSON and RPC sessions are never asked, so nothing
  * waits on an answer.
  */
@@ -378,7 +378,7 @@ export function outsideAccessPolicyFor(
   ctx: PluginContext,
   harness: PiHarness = detectPiHarness(),
 ): OutsideAccessPolicy {
-  return { harness, askOnPi: ctx.config.pi?.ask_outside_access ?? true };
+  return { harness, askOnPi: ctx.config.pi?.external_access_ask ?? true };
 }
 
 /** The policy of the registered tool call running now, if any. */

@@ -266,7 +266,7 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // turn it off; a project config may only turn it on. Not used on OMP,
     // where OMP's own `tools.approvalMode` decides: AFT reports a call that
     // names an outside path as the "exec" tier there.
-    "ask_outside_access": true
+    "external_access_ask": true
   },
 
   // OpenCode plugin only. When true, the auto-update hook installs newer

@@ -94,7 +94,7 @@ All keys are optional. Example:
     // directly in the model tools array. "host_default" mounts tools under xd://.
     "tool_presentation": "top_level",
     // Plain Pi: ask before an outside-project access (default true; only user config can turn it off; print/JSON/RPC sessions never ask; on OMP, OMP's tools.approvalMode decides and outside-path calls report the "exec" tier).
-    "ask_outside_access": true
+    "external_access_ask": true
   },
 
   "formatter": {

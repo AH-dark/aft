@@ -216,7 +216,7 @@ describe("OMP outside access end to end", () => {
           tool = definition;
         },
       } as unknown as ExtensionAPI,
-      { config: { pi: { ask_outside_access: true } } } as unknown as PluginContext,
+      { config: { pi: { external_access_ask: true } } } as unknown as PluginContext,
       "omp",
     );
     pi.registerTool({

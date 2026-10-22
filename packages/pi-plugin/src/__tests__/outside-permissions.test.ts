@@ -452,9 +452,9 @@ async function runRegistered(
 const tui = (confirm: (...args: unknown[]) => Promise<boolean>) =>
   ({ ...context(confirm), mode: "tui" }) as unknown as ExtensionContext;
 
-describe("pi.ask_outside_access", () => {
+describe("pi.external_access_ask", () => {
   test("Pi's terminal UI asks when the setting is on, and by default", async () => {
-    for (const config of [{ pi: { ask_outside_access: true } }, {}]) {
+    for (const config of [{ pi: { external_access_ask: true } }, {}]) {
       const confirm = mock(async () => true);
       const { text, sends } = await runRegistered(config, tui(confirm));
       expect(text).toBe("outside file body");
@@ -466,7 +466,7 @@ describe("pi.ask_outside_access", () => {
   test("with the setting off Pi's terminal UI does not ask and the file is read", async () => {
     const confirm = mock(async () => false);
     const { text, sends } = await runRegistered(
-      { pi: { ask_outside_access: false } },
+      { pi: { external_access_ask: false } },
       tui(confirm),
     );
     expect(text).toBe("outside file body");
@@ -475,11 +475,11 @@ describe("pi.ask_outside_access", () => {
   });
 
   test("a print or RPC session gets the file without asking, setting on or off", async () => {
-    for (const ask_outside_access of [true, false]) {
+    for (const external_access_ask of [true, false]) {
       for (const mode of ["print", "rpc"]) {
         const confirm = mock(async () => false);
         const extCtx = { ...context(confirm), mode } as unknown as ExtensionContext;
-        const { text } = await runRegistered({ pi: { ask_outside_access } }, extCtx);
+        const { text } = await runRegistered({ pi: { external_access_ask } }, extCtx);
         expect(text).toBe("outside file body");
         expect(confirm).not.toHaveBeenCalled();
       }
@@ -496,10 +496,10 @@ describe("pi.ask_outside_access", () => {
       { ...context(mock(async () => true)), mode: "rpc" } as unknown as ExtensionContext,
     ];
     for (const harness of ["pi", "omp"] as const) {
-      for (const ask_outside_access of [true, false]) {
+      for (const external_access_ask of [true, false]) {
         for (const extCtx of modes) {
           const error = await runRegistered(
-            { pi: { ask_outside_access } },
+            { pi: { external_access_ask } },
             extCtx,
             harness,
             refusal,
@@ -512,9 +512,9 @@ describe("pi.ask_outside_access", () => {
   });
 
   test("on OMP AFT never asks: OMP's approval mode decides through the tools' tiers", async () => {
-    for (const ask_outside_access of [true, false]) {
+    for (const external_access_ask of [true, false]) {
       const confirm = mock(async () => false);
-      const { text } = await runRegistered({ pi: { ask_outside_access } }, tui(confirm), "omp");
+      const { text } = await runRegistered({ pi: { external_access_ask } }, tui(confirm), "omp");
       expect(text).toBe("outside file body");
       expect(confirm).not.toHaveBeenCalled();
     }

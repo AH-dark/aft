@@ -861,7 +861,7 @@ function buildSchema(): Record<string, unknown> {
             description:
               "Pi and OMP tool presentation mode. 'top_level' registers tools with loadMode: essential on OMP so they appear at top level (default). 'host_default' uses host default loadMode (mounting tools under xd:// on OMP). User and project tiers are accepted with project precedence.",
           },
-          ask_outside_access: {
+          external_access_ask: {
             type: "boolean",
             default: true,
             description:
