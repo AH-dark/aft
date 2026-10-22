@@ -3183,10 +3183,11 @@ impl RustModuleIndex {
         Some(position)
     }
 
-    /// The declaration `path::name` names from module `scope` of `file`: the
-    /// module path is resolved from that module first, then from each parent
-    /// module the file glob-imports through a chain of `use super::*`. A path
-    /// ending in a type (`module::Type::method`) names that type's method.
+    /// The declaration `path::name` names from module `scope` of `file`. The
+    /// module path is resolved relative to that module; when `scope` is the
+    /// file's own module, it is also tried from each parent module reached
+    /// through a chain of file-level `use super::*` globs. A path ending in a
+    /// type (`module::Type::method`) names that type's method.
     fn resolve_item(
         &self,
         file: &str,
