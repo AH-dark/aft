@@ -188,37 +188,123 @@ fn grow_page_rows(root: &Path, model: &str, recommended: usize) {
 /// larger refused page is, so its next send uses a fresh key derived from the
 /// stable one and the refusal count instead: the same row, never the same
 /// request. A successful send forgets the entry, so later sends of that row
-/// use its stable key again.
-fn refused_request_keys() -> &'static Mutex<HashMap<String, u64>> {
-    static KEYS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+/// use its normal key again: the stable key, or after any drop the key derived
+/// from it and the drop count. [`RefusedRequestKeys`] bounds how many rows are
+/// remembered and for how long; a row it drops before it succeeds is never
+/// resent under a key that was refused.
+fn refused_request_keys() -> &'static Mutex<RefusedRequestKeys> {
+    static KEYS: OnceLock<Mutex<RefusedRequestKeys>> = OnceLock::new();
     KEYS.get_or_init(Mutex::default)
 }
 
-fn request_key_to_send(stable_key: &str) -> String {
-    let refusals = refused_request_keys()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(stable_key)
-        .copied();
-    match refusals {
-        Some(refusals) => hex_sha256(format!("{stable_key}:resend:{refusals}").as_bytes()),
-        None => stable_key.to_owned(),
+/// Most refused rows remembered at once. Only a successful send clears an
+/// entry, so a refused row that is abandoned (its build is cancelled, its
+/// root closes, its source changes) would otherwise stay for the whole
+/// session; past this many, the entry refused longest ago is dropped first.
+const MAX_REFUSED_REQUEST_KEYS: usize = 1_024;
+
+/// How long a refused row is remembered after its last refusal.
+const REFUSED_REQUEST_KEY_TTL_MS: u64 = 60 * 60 * 1_000;
+
+#[derive(Default)]
+struct RefusedRequestKeys {
+    entries: HashMap<String, RefusedRequestKey>,
+    /// How many entries the cap evicted, plus one for each expiry pass that
+    /// removed any: drops other than a row succeeding. A dropped row's next
+    /// send must not fall back to a key Synapse already refused, so every key
+    /// sent after a drop is derived from this count too: each drop moves all
+    /// rows onto keys never sent before it. Drops are rare, and a new key for
+    /// the same items costs only a new Synapse job.
+    drops: u64,
+}
+
+struct RefusedRequestKey {
+    refusals: u64,
+    last_refused_ms: u64,
+}
+
+impl RefusedRequestKeys {
+    fn key_to_send(&mut self, stable_key: &str, now_ms: u64) -> String {
+        self.expire(now_ms);
+        let base = if self.drops == 0 {
+            stable_key.to_owned()
+        } else {
+            hex_sha256(format!("{stable_key}:drops:{}", self.drops).as_bytes())
+        };
+        match self.entries.get(stable_key) {
+            Some(entry) => hex_sha256(format!("{base}:resend:{}", entry.refusals).as_bytes()),
+            None => base,
+        }
+    }
+
+    fn note_refused(&mut self, stable_key: &str, now_ms: u64) {
+        self.expire(now_ms);
+        if !self.entries.contains_key(stable_key) && self.entries.len() >= MAX_REFUSED_REQUEST_KEYS
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_refused_ms)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+                self.drops += 1;
+            }
+        }
+        let entry = self
+            .entries
+            .entry(stable_key.to_owned())
+            .or_insert(RefusedRequestKey {
+                refusals: 0,
+                last_refused_ms: now_ms,
+            });
+        entry.refusals += 1;
+        entry.last_refused_ms = now_ms;
+    }
+
+    fn forget(&mut self, stable_key: &str) {
+        self.entries.remove(stable_key);
+    }
+
+    fn expire(&mut self, now_ms: u64) {
+        let before = self.entries.len();
+        self.entries.retain(|_, entry| {
+            now_ms.saturating_sub(entry.last_refused_ms) < REFUSED_REQUEST_KEY_TTL_MS
+        });
+        if self.entries.len() < before {
+            self.drops += 1;
+        }
     }
 }
 
-fn note_refused_request_key(stable_key: &str) {
-    *refused_request_keys()
+/// Milliseconds since the first refused-row lookup in this process. The
+/// refused-row ages use their own monotonic clock rather than the lane-pause
+/// test clock, which is per test thread, so tests on other threads cannot age
+/// out each other's entries.
+fn refused_request_key_clock_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+fn request_key_to_send(stable_key: &str) -> String {
+    refused_request_keys()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(stable_key.to_owned())
-        .or_default() += 1;
+        .key_to_send(stable_key, refused_request_key_clock_ms())
+}
+
+fn note_refused_request_key(stable_key: &str) {
+    refused_request_keys()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .note_refused(stable_key, refused_request_key_clock_ms());
 }
 
 fn forget_refused_request_key(stable_key: &str) {
     refused_request_keys()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(stable_key);
+        .forget(stable_key);
 }
 
 pub(crate) fn lane_pause_for_root(root: &Path) -> Option<LanePause> {
@@ -2089,6 +2175,59 @@ mod tests {
                 assert_eq!(requests.lock().unwrap().len(), 3);
             });
         });
+    }
+
+    /// Models one send of `row` at `now_ms` that Synapse refuses as unsafe,
+    /// and returns the key that send used.
+    fn refuse_row(keys: &mut RefusedRequestKeys, row: &str, now_ms: u64) -> String {
+        let sent = keys.key_to_send(row, now_ms);
+        keys.note_refused(row, now_ms);
+        sent
+    }
+
+    #[test]
+    fn refused_rows_past_the_cap_drop_oldest_first_and_never_reuse_a_refused_key() {
+        let mut keys = RefusedRequestKeys::default();
+        let mut refused = vec![refuse_row(&mut keys, "row-0", 0)];
+        // Refused a second time, so both its stable and its first resend key
+        // were refused.
+        refused.push(refuse_row(&mut keys, "row-0", 1));
+        for row in 1..=MAX_REFUSED_REQUEST_KEYS {
+            refused.push(refuse_row(&mut keys, &format!("row-{row}"), 1 + row as u64));
+        }
+        assert_eq!(keys.entries.len(), MAX_REFUSED_REQUEST_KEYS);
+        assert!(
+            !keys.entries.contains_key("row-0"),
+            "the oldest entry stayed"
+        );
+        assert!(keys.entries.contains_key("row-1"));
+        let now = 2 + MAX_REFUSED_REQUEST_KEYS as u64;
+        let dropped = keys.key_to_send("row-0", now);
+        assert!(
+            !refused.contains(&dropped),
+            "a row dropped by the cap was resent under a key Synapse refused"
+        );
+        assert!(!refused.contains(&keys.key_to_send("row-1", now)));
+    }
+
+    #[test]
+    fn refused_rows_expire_after_their_age_limit_and_never_reuse_a_refused_key() {
+        let mut keys = RefusedRequestKeys::default();
+        let refused = refuse_row(&mut keys, "row", 0);
+        let resend = keys.key_to_send("row", REFUSED_REQUEST_KEY_TTL_MS - 1);
+        assert_ne!(resend, refused);
+        assert!(
+            keys.entries.contains_key("row"),
+            "expired before its age limit"
+        );
+        let late = keys.key_to_send("row", REFUSED_REQUEST_KEY_TTL_MS);
+        assert!(keys.entries.is_empty(), "kept past its age limit");
+        assert_ne!(
+            late, refused,
+            "an expired row was resent under the key Synapse refused"
+        );
+        // Without any drop the stable key is used as before.
+        assert_eq!(RefusedRequestKeys::default().key_to_send("row", 0), "row");
     }
 
     #[test]
