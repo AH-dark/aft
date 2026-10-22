@@ -1129,46 +1129,33 @@ pub fn create_task_layout(
 }
 
 fn lock_session_directory(session_dir: &Path) -> io::Result<File> {
-    let task_root = session_dir
-        .parent()
-        .ok_or_else(|| io::Error::other("task session directory has no parent"))?;
-    let storage_root = task_root
-        .parent()
-        .ok_or_else(|| io::Error::other("task root has no storage parent"))?;
-    crate::private_storage::open_dir(storage_root, task_root)?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(task_root.join(".session-directory.lock"))?;
-    lock.lock()?;
-    Ok(lock)
+    lock_session_directories(&[session_dir])?
+        .pop()
+        .ok_or_else(|| io::Error::other("task session lock was not acquired"))
 }
 
 fn lock_session_directories(session_dirs: &[&Path]) -> io::Result<Vec<File>> {
-    let mut task_roots = session_dirs
-        .iter()
-        .map(|session_dir| {
-            session_dir
-                .parent()
-                .map(Path::to_path_buf)
-                .ok_or_else(|| io::Error::other("task session directory has no parent"))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    task_roots.sort();
-    task_roots.dedup();
-    task_roots
+    let mut storage_roots = Vec::with_capacity(session_dirs.len());
+    for session_dir in session_dirs {
+        let task_root = session_dir
+            .parent()
+            .ok_or_else(|| io::Error::other("task session directory has no parent"))?;
+        let storage_root = task_root
+            .parent()
+            .ok_or_else(|| io::Error::other("task root has no storage parent"))?;
+        crate::private_storage::open_dir(storage_root, task_root)?;
+        storage_roots.push(storage_root.to_path_buf());
+    }
+    storage_roots.sort();
+    storage_roots.dedup();
+    storage_roots
         .into_iter()
-        .map(|task_root| {
-            let storage_root = task_root
-                .parent()
-                .ok_or_else(|| io::Error::other("task root has no storage parent"))?;
-            crate::private_storage::open_dir(storage_root, &task_root)?;
+        .map(|storage_root| {
             let lock = OpenOptions::new()
                 .create(true)
                 .read(true)
                 .write(true)
-                .open(task_root.join(".session-directory.lock"))?;
+                .open(storage_root.join(".bash-task-session.lock"))?;
             lock.lock()?;
             Ok(lock)
         })
