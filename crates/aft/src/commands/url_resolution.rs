@@ -123,6 +123,41 @@ mod url_tests {
         .unwrap()
     }
 
+    /// With `storage.cache_dir` set, every URL cache access goes through the
+    /// cache root: the download, the fresh-cache lookup and the remembered
+    /// failure check all run on the folder handed to the fetch, and a
+    /// remembered failure is keyed by it. None may read or write under the
+    /// durable storage root.
+    #[test]
+    fn url_fetches_and_their_cache_checks_use_the_cache_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let cache_parent = temp.path().join("cache-volume");
+        std::fs::create_dir(&cache_parent).unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(storage.clone()),
+            cache_dir: Some(cache_parent),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        assert!(ctx.cache_unavailable_reason().is_none());
+        let cache_root = ctx.cache_dir();
+        assert_ne!(cache_root, storage);
+        let url = "https://93.184.216.34/docs.md";
+        let document = cache_root.join("url_cache").join("fetched.md");
+        let resolved = resolve_with_fetch(&outline_request(url), &ctx, url, |_, folder, _| {
+            assert_eq!(
+                folder,
+                cache_root.as_path(),
+                "URL cache outside the cache root"
+            );
+            Ok(document.clone())
+        })
+        .expect("the fetch succeeded");
+        assert_eq!(resolved, document);
+    }
+
     #[test]
     fn url_download_is_refused_without_writing_while_the_cache_location_is_unavailable() {
         let temp = tempfile::tempdir().unwrap();
