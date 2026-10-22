@@ -214,13 +214,15 @@ pub(crate) fn grep_fan_out(
         }
         // Children are independent indexes, so they are searched in parallel:
         // the parent's latency then tracks its largest child, not the sum.
+        // Their path-ordered scans run at once, so they share one row budget.
+        let row_budget = crate::search_index::PATH_ORDER_BATCH_ROW_BUDGET / snapshots.len().max(1);
         use rayon::prelude::*;
         let answers = snapshots
             .par_iter()
             .map(|snapshot| {
                 let has_files = snapshot.has_file_in_scope_with_filters(search_root, filters);
                 let (result, timings) = snapshot
-                    .search_grep_profiled_with_filters_and_query_in_order(
+                    .search_grep_profiled_with_filters_and_query_in_order_with_row_budget(
                         pattern,
                         &query,
                         filters,
@@ -228,6 +230,7 @@ pub(crate) fn grep_fan_out(
                         max_results,
                         params.path_exclusion,
                         order,
+                        row_budget,
                     );
                 (has_files, result, timings)
             })

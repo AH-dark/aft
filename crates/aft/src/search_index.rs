@@ -1531,6 +1531,121 @@ pub enum GrepScanOrder {
 /// threads.
 pub(crate) const PATH_ORDER_BATCH_FILES: usize = 256;
 
+/// Rows the files of one path-ordered batch may hold together, on top of the
+/// lines already kept. Every file of a batch may keep at most its share of
+/// this budget (and never more than the cap still needs), so a batch of files
+/// that each match on most of their lines cannot hold hundreds of times the
+/// rows the cap keeps before the batch is cut. A file that has more matching
+/// lines than its share, at a point where the cap still needs more than that
+/// share from it, is searched again on its own for exactly the lines still
+/// needed; the kept lines are the same as if every file had kept all the
+/// cap needs. A share is never below one line, so a budget smaller than the
+/// batch can be passed by up to one row per file.
+///
+/// 1,048,576 rows is 4,096 lines per file in a full batch of 256. Measured
+/// on release builds: a capped grep of 256 files of 100,000 matching lines
+/// peaks at about 460 MB (walk) and 200 MB (index) with this budget, against
+/// 8.7 GB and 3.0 GB when every file kept all the cap needs, and it is no
+/// slower on real projects, where only the few files matching on more than
+/// 4,096 lines are ever searched twice. Keeping batches 256 files wide (rather
+/// than narrowing them while the cap still needs many lines) keeps a scan of
+/// many files with few matches each as fast as before.
+pub(crate) const PATH_ORDER_BATCH_ROW_BUDGET: usize = 1 << 20;
+
+/// Most lines one file of a path-ordered batch of `batch_files` files keeps:
+/// its share of `row_budget` (at least one line), and never more than the
+/// `remaining` lines the cap still needs.
+pub(crate) fn path_order_file_allowance(
+    remaining: usize,
+    batch_files: usize,
+    row_budget: usize,
+) -> usize {
+    (row_budget / batch_files.max(1)).max(1).min(remaining)
+}
+
+/// Adds one path-ordered batch to `kept`, which holds the lines kept from
+/// earlier batches, until `kept` holds `max_results` lines.
+///
+/// `per_file` holds, for each file of the batch in path order, the rows it
+/// kept under `allowance` and whether it has matching lines past them. When
+/// such a file is reached while the cap needs more lines from it than it
+/// kept, `search_again(file, need)` searches it on its own for at most
+/// `need` lines and returns the same pair. `held(rows)` is told how many rows
+/// are held at once (kept plus not yet taken) whenever that number grows.
+///
+/// Returns whether matching lines exist past the ones kept from this batch.
+pub(crate) fn keep_path_ordered_batch<T>(
+    kept: &mut Vec<T>,
+    max_results: usize,
+    allowance: usize,
+    per_file: Vec<(Vec<T>, bool)>,
+    mut search_again: impl FnMut(usize, usize) -> (Vec<T>, bool),
+    mut held: impl FnMut(usize),
+) -> bool {
+    let mut not_taken: usize = per_file.iter().map(|(rows, _)| rows.len()).sum();
+    held(kept.len() + not_taken);
+    let mut lines_past = false;
+    for (file, (rows, more)) in per_file.into_iter().enumerate() {
+        not_taken -= rows.len();
+        let need = max_results.saturating_sub(kept.len());
+        if need == 0 {
+            lines_past |= more || !rows.is_empty();
+            continue;
+        }
+        let (rows, more) = if more && rows.len() == allowance && allowance < need {
+            // The file stopped at its share of the batch budget, and the cap
+            // needs more of its lines than that.
+            drop(rows);
+            let again = search_again(file, need);
+            held(kept.len() + not_taken + again.0.len());
+            again
+        } else {
+            (rows, more)
+        };
+        lines_past |= more || rows.len() > need;
+        kept.extend(rows.into_iter().take(need));
+    }
+    lines_past
+}
+
+/// Records the most rows a path-ordered scan of a search root held at once,
+/// so tests can prove the scan's memory stays within its row budget
+/// whatever the files hold. Outside tests it does nothing.
+pub(crate) fn note_path_order_held_rows(search_root: &Path, rows: usize) {
+    #[cfg(test)]
+    path_order_held_rows_for_test::note(search_root, rows);
+    #[cfg(not(test))]
+    let _ = (search_root, rows);
+}
+
+/// Test-only record of the most rows a path-ordered scan held at once, by
+/// search root.
+#[cfg(test)]
+pub(crate) mod path_order_held_rows_for_test {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    static PEAKS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+    pub(crate) fn note(root: &Path, rows: usize) {
+        if let Ok(mut peaks) = PEAKS.get_or_init(Default::default).lock() {
+            let peak = peaks.entry(root.to_path_buf()).or_default();
+            *peak = (*peak).max(rows);
+        }
+    }
+
+    /// The most rows held at once since the last call, and resets it.
+    pub(crate) fn take(root: &Path) -> usize {
+        PEAKS
+            .get_or_init(Default::default)
+            .lock()
+            .ok()
+            .and_then(|mut peaks| peaks.remove(root))
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PathFilters {
     includes: Option<GlobSet>,
@@ -3236,6 +3351,7 @@ impl SearchIndexSnapshot {
             Some(max_files),
             budget,
             GrepScanOrder::Arrival,
+            PATH_ORDER_BATCH_ROW_BUDGET,
         )
         .0
     }
@@ -3316,6 +3432,33 @@ impl SearchIndexSnapshot {
         path_exclusion: Option<GrepPathExclusion>,
         order: GrepScanOrder,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
+        self.search_grep_profiled_with_filters_and_query_in_order_with_row_budget(
+            pattern,
+            query,
+            filters,
+            search_root,
+            max_results,
+            path_exclusion,
+            order,
+            PATH_ORDER_BATCH_ROW_BUDGET,
+        )
+    }
+
+    /// [`Self::search_grep_profiled_with_filters_and_query_in_order`] with
+    /// the rows a path-ordered batch may hold set by the caller, for callers
+    /// that run several of these scans at once and share one budget.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn search_grep_profiled_with_filters_and_query_in_order_with_row_budget(
+        &self,
+        pattern: &CompiledPattern,
+        query: &RegexQuery,
+        filters: &PathFilters,
+        search_root: &Path,
+        max_results: usize,
+        path_exclusion: Option<GrepPathExclusion>,
+        order: GrepScanOrder,
+        row_budget: usize,
+    ) -> (GrepResult, GrepQueryPhaseTimings) {
         self.search_grep_profiled_with_filters_and_query_and_limits(
             pattern,
             query,
@@ -3326,6 +3469,7 @@ impl SearchIndexSnapshot {
             None,
             INDEXED_GREP_SCAN_BUDGET,
             order,
+            row_budget,
         )
     }
 
@@ -3345,6 +3489,7 @@ impl SearchIndexSnapshot {
         max_files: Option<usize>,
         scan_budget: Duration,
         order: GrepScanOrder,
+        row_budget: usize,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
         self.search_grep_profiled_with_filters_and_query_and_limits_with_deadline(
             pattern,
@@ -3357,6 +3502,7 @@ impl SearchIndexSnapshot {
             scan_budget,
             || GrepScanDeadline::after_with_clock(scan_budget, Instant::now),
             order,
+            row_budget,
         )
     }
 
@@ -3372,6 +3518,7 @@ impl SearchIndexSnapshot {
         scan_budget: Duration,
         make_deadline: impl FnOnce() -> GrepScanDeadline,
         order: GrepScanOrder,
+        row_budget: usize,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
         let _io_scope = crate::bounded_io::enter_if_absent(scan_budget);
         let matcher = match pattern {
@@ -3431,10 +3578,11 @@ impl SearchIndexSnapshot {
 
         let pread_started = Instant::now();
         let mut matches = if order == GrepScanOrder::Path {
-            // Path-ordered batches: each file keeps at most the lines still
-            // missing from the cap when its batch starts, which is all it can
-            // contribute to the first lines by path. Rows are appended in
-            // batch order, so `kept` stays sorted by path, then line.
+            // Path-ordered batches: each file keeps at most its share of the
+            // batch's row budget, and never more than the lines still missing
+            // from the cap when its batch starts, which is all it can
+            // contribute to the first lines by path. Rows are added in batch
+            // order, so `kept` stays sorted by path, then line.
             let mut kept: Vec<SharedGrepMatch> = Vec::new();
             let batches = candidate_files.chunks(PATH_ORDER_BATCH_FILES);
             let batch_count = batches.len();
@@ -3448,7 +3596,8 @@ impl SearchIndexSnapshot {
                     break;
                 }
                 let remaining = max_results.saturating_sub(kept.len());
-                let per_file: Vec<Vec<SharedGrepMatch>> = batch
+                let allowance = path_order_file_allowance(remaining, batch.len(), row_budget);
+                let per_file: Vec<(Vec<SharedGrepMatch>, bool)> = batch
                     .par_iter()
                     .map_init(
                         || crate::bounded_io::enter(io_budget.clone()),
@@ -3456,15 +3605,15 @@ impl SearchIndexSnapshot {
                             if !claim_verification() {
                                 truncated.store(true, Ordering::Relaxed);
                                 engine_capped.store(true, Ordering::Relaxed);
-                                return Vec::new();
+                                return (Vec::new(), false);
                             }
                             let file_matches = AtomicUsize::new(0);
                             let file_truncated = AtomicBool::new(false);
                             let rows = search_candidate_file(
                                 file,
                                 &matcher,
-                                remaining,
-                                remaining,
+                                allowance,
+                                allowance,
                                 &file_matches,
                                 &files_searched,
                                 &files_with_matches,
@@ -3478,23 +3627,57 @@ impl SearchIndexSnapshot {
                             );
                             total_matches
                                 .fetch_add(file_matches.load(Ordering::Relaxed), Ordering::Relaxed);
-                            if file_truncated.load(Ordering::Relaxed) {
-                                truncated.store(true, Ordering::Relaxed);
-                            }
-                            rows
+                            (rows, file_truncated.load(Ordering::Relaxed))
                         },
                     )
                     .collect();
-                kept.extend(per_file.into_iter().flatten());
+                let search_again = |file: usize, need: usize| {
+                    // The file was already counted as searched (and as
+                    // matching) by the batch; only its match count changes.
+                    let file_matches = AtomicUsize::new(0);
+                    let file_truncated = AtomicBool::new(false);
+                    let rows = search_candidate_file(
+                        batch[file],
+                        &matcher,
+                        need,
+                        need,
+                        &file_matches,
+                        &AtomicUsize::new(0),
+                        &AtomicUsize::new(0),
+                        &AtomicUsize::new(0),
+                        &file_truncated,
+                        &engine_capped,
+                        &AtomicUsize::new(0),
+                        None,
+                        job_cancellation.as_ref(),
+                        &deadline,
+                    );
+                    // The batch counted `allowance + 1` matches for it.
+                    total_matches.fetch_add(
+                        file_matches
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(allowance + 1),
+                        Ordering::Relaxed,
+                    );
+                    (rows, file_truncated.load(Ordering::Relaxed))
+                };
+                let lines_past = keep_path_ordered_batch(
+                    &mut kept,
+                    max_results,
+                    allowance,
+                    per_file,
+                    search_again,
+                    |rows| note_path_order_held_rows(&search_root, rows),
+                );
+                if lines_past {
+                    truncated.store(true, Ordering::Relaxed);
+                }
                 if kept.len() >= max_results {
-                    if kept.len() > max_results || batch_index + 1 < batch_count {
-                        // Later lines exist, or later files were not read.
-                        truncated.store(true, Ordering::Relaxed);
-                    }
                     if batch_index + 1 < batch_count {
+                        // Later files were not read.
+                        truncated.store(true, Ordering::Relaxed);
                         engine_capped.store(true, Ordering::Relaxed);
                     }
-                    kept.truncate(max_results);
                     break;
                 }
             }
@@ -13452,6 +13635,7 @@ mod tests {
                 budget,
                 make_deadline,
                 GrepScanOrder::Arrival,
+                PATH_ORDER_BATCH_ROW_BUDGET,
             )
             .0
     }

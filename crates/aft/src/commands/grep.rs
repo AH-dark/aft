@@ -1899,6 +1899,115 @@ mod tests {
     }
 
     #[test]
+    fn path_ordered_indexed_scan_of_dense_files_holds_at_most_its_row_budget() {
+        // 256 files of 100,000 matching lines each against the default store
+        // cap of 100,100. Every file of the batch keeping all the lines the
+        // cap needs would hold 25.6 million rows to keep 100,100.
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let content = "x\n".repeat(100_000);
+        for index in 0..256 {
+            std::fs::write(root.join(format!("dense_{index:03}.txt")), &content).unwrap();
+        }
+        let index = crate::search_index::SearchIndex::build(&root);
+        let snapshot = index.snapshot();
+        let pattern = compiled_literal("x");
+        let query = crate::search_index::decompose_grep_pattern(&pattern);
+        let filters = build_path_filters(&[], &[]).unwrap();
+        let max_results = 100_100;
+        crate::search_index::path_order_held_rows_for_test::take(&root);
+        let (result, _) = snapshot.search_grep_profiled_with_filters_and_query_in_order(
+            &pattern,
+            &query,
+            &filters,
+            &root,
+            max_results,
+            None,
+            GrepScanOrder::Path,
+        );
+        let peak = crate::search_index::path_order_held_rows_for_test::take(&root);
+        assert!(
+            peak <= max_results + crate::search_index::PATH_ORDER_BATCH_ROW_BUDGET,
+            "held {peak} rows at once"
+        );
+        assert!(!result.scan_deadline_reached, "{result:?}");
+        assert!(result.truncated);
+        let first = root.join("dense_000.txt");
+        let second = root.join("dense_001.txt");
+        let expected: Vec<(PathBuf, u32)> = (1..=100_000)
+            .map(|line| (first.clone(), line))
+            .chain((1..=100).map(|line| (second.clone(), line)))
+            .collect();
+        let mut kept: Vec<(PathBuf, u32)> = result
+            .matches
+            .iter()
+            .map(|row| (row.file.clone(), row.line))
+            .collect();
+        kept.sort();
+        assert_eq!(kept, expected);
+    }
+
+    #[test]
+    fn path_ordered_batch_keeps_the_same_rows_as_keeping_everything_the_cap_needs() {
+        // Files of 0 to 7 matching lines, each keeping at most 2 in the batch:
+        // whatever the cap, the kept rows must be the first by file and line,
+        // as if every file had kept all the lines the cap still needs.
+        let line_counts = [3usize, 0, 1, 7, 2, 5, 0, 4];
+        let every_row: Vec<(usize, usize)> = line_counts
+            .iter()
+            .enumerate()
+            .flat_map(|(file, &count)| (1..=count).map(move |line| (file, line)))
+            .collect();
+        let rows_of = |file: usize, limit: usize| {
+            let rows: Vec<(usize, usize)> = (1..=line_counts[file].min(limit))
+                .map(|line| (file, line))
+                .collect();
+            (rows, line_counts[file] > limit)
+        };
+        let allowance = 2;
+        for max_results in 1..=every_row.len() + 1 {
+            let per_file = (0..line_counts.len())
+                .map(|file| rows_of(file, allowance.min(max_results)))
+                .collect();
+            let mut searched_again = Vec::new();
+            let mut peak = 0;
+            let mut kept = Vec::new();
+            let lines_past = crate::search_index::keep_path_ordered_batch(
+                &mut kept,
+                max_results,
+                allowance.min(max_results),
+                per_file,
+                |file, need| {
+                    searched_again.push((file, need));
+                    rows_of(file, need)
+                },
+                |rows| peak = peak.max(rows),
+            );
+            let expected = &every_row[..max_results.min(every_row.len())];
+            assert_eq!(kept, expected, "cap {max_results}");
+            assert_eq!(
+                lines_past,
+                max_results < every_row.len(),
+                "cap {max_results}"
+            );
+            // Only a file the cap needs more than two lines from is searched
+            // again, for exactly the lines still needed.
+            for &(file, need) in &searched_again {
+                let before = every_row
+                    .iter()
+                    .filter(|(row_file, _)| *row_file < file)
+                    .count();
+                assert_eq!(need, max_results - before, "cap {max_results}");
+                assert!(line_counts[file] > 2 && need > 2, "cap {max_results}");
+            }
+            assert!(
+                peak <= max_results + 2 * line_counts.len(),
+                "cap {max_results}"
+            );
+        }
+    }
+
+    #[test]
     fn line_spans_finds_every_requested_line_in_one_pass() {
         let content = b"a\nbb\r\nccc";
         let spans = line_spans(content, &[3, 1, 2, 9, 2]);
