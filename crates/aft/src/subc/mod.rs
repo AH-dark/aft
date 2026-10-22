@@ -6233,9 +6233,6 @@ where
         }
     }
 
-    // The reader task may be parked on `read_frame`; abort it (we are done with
-    // the connection) and flush the writer.
-    reader_task.abort();
     // The run-scope coordinator owns a writer sender even when no run is live.
     // Release it before joining the writer so an idle connection can drain.
     drop(run_scopes);
@@ -6250,7 +6247,14 @@ where
     {
         ledger_writer_task.abort();
     }
-    let writer_result = finish_writer_task(writer_task).await;
+    // The reader keeps consuming input until here: aborting it earlier could
+    // leave unread bytes in the socket, and closing over them resets the
+    // connection, losing the frames written above.
+    let ConnectionClose {
+        writer: writer_result,
+        input_ended,
+    } = close_daemon_connection(reader_rx, reader_task, writer_task).await;
+    log::debug!("subc attach: connection closed; daemon input ended first: {input_ended}");
     log::info!(
         "subc exit phase=loop_teardown elapsed_ms={}",
         teardown_started.elapsed().as_millis()
@@ -6385,6 +6389,14 @@ where
                 }
             }
         }
+        // Every queued frame is in the kernel. Half-close now, while the read
+        // half is still open, so the daemon reads EOF right after the last
+        // frame and can end its own side; teardown waits for that before it
+        // drops the socket (see `close_daemon_connection`).
+        write
+            .shutdown()
+            .await
+            .map_err(subc_transport::FrameIoError::Io)?;
         Ok(())
     })
 }
@@ -6461,6 +6473,10 @@ where
                         phase_trace: PhaseTrace::new(received_at),
                     };
                     if tx.send(Ok(decoded)).await.is_err() {
+                        // The loop is done with the connection. Keep consuming
+                        // input until the daemon closes its side, so the
+                        // socket is never closed with unread bytes.
+                        discard_input_until_eof(&mut read).await;
                         return;
                     }
                     #[cfg(any(test, feature = "test-timing-hooks"))]
@@ -6503,6 +6519,20 @@ where
     })
 }
 
+/// Reads and drops connection input until EOF or a read error.
+async fn discard_input_until_eof<R>(read: &mut R)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut scratch = vec![0u8; 16 * 1024];
+    loop {
+        match tokio::io::AsyncReadExt::read(read, &mut scratch).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+
 async fn finish_writer_task(
     mut writer_task: JoinHandle<Result<(), subc_transport::FrameIoError>>,
 ) -> Result<(), SubcError> {
@@ -6520,6 +6550,57 @@ async fn finish_writer_task(
                 ),
             )))
         }
+    }
+}
+
+/// Longest teardown waits, after the module's last frame and half-close, for
+/// the daemon to close its side of the connection.
+const DAEMON_CLOSE_WAIT: Duration = Duration::from_millis(250);
+
+/// How the daemon connection ended at teardown.
+struct ConnectionClose {
+    /// The writer task's result: every queued frame written and the write
+    /// side half-closed, or why not.
+    writer: Result<(), SubcError>,
+    /// True when the daemon closed its side (or the connection failed) before
+    /// the socket was dropped, so no unread input was left behind.
+    input_ended: bool,
+}
+
+/// Ends the daemon connection once the module loop is done with it.
+///
+/// Closing a TCP socket that still holds unread input makes Windows and Linux
+/// send a reset instead of FIN. A reset discards whatever the daemon has not
+/// yet read on Windows, and on Linux whatever this side has not yet sent, so
+/// the last responses and terminal frames would be lost. The order here keeps
+/// the close graceful: write every queued frame, half-close the write side so
+/// the daemon sees EOF, then keep consuming input until the daemon closes its
+/// side, bounded by [`DAEMON_CLOSE_WAIT`]. Every writer sender must already be
+/// dropped so the writer task can finish.
+async fn close_daemon_connection(
+    reader_rx: mpsc::Receiver<Result<DecodedFrame, SubcError>>,
+    mut reader_task: JoinHandle<()>,
+    writer_task: JoinHandle<Result<(), subc_transport::FrameIoError>>,
+) -> ConnectionClose {
+    // With the receiver gone the reader stops forwarding frames and only
+    // discards input (see `spawn_reader_task`).
+    drop(reader_rx);
+    let writer = finish_writer_task(writer_task).await;
+    let input_ended = match tokio::time::timeout(DAEMON_CLOSE_WAIT, &mut reader_task).await {
+        Ok(_) => true,
+        Err(_) => {
+            log::info!(
+                "subc attach: daemon kept the connection open {}ms after the module's last frame; closing",
+                DAEMON_CLOSE_WAIT.as_millis()
+            );
+            reader_task.abort();
+            let _ = reader_task.await;
+            false
+        }
+    };
+    ConnectionClose {
+        writer,
+        input_ended,
     }
 }
 
@@ -21273,6 +21354,168 @@ mod compile_fence_tests {
     }
 }
 
+#[cfg(test)]
+mod connection_close_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpSocket};
+
+    /// A connected loopback pair: the daemon's accepted socket and the
+    /// module's socket split into the loop's reader and writer tasks.
+    struct Connection {
+        daemon: TcpStream,
+        reader_rx: mpsc::Receiver<Result<DecodedFrame, SubcError>>,
+        reader_task: JoinHandle<()>,
+        writer_tx: mpsc::Sender<WriterFrame>,
+        writer_task: JoinHandle<Result<(), subc_transport::FrameIoError>>,
+        metrics: Arc<DispatchPathMetrics>,
+    }
+
+    async fn connect(
+        daemon_recv_buffer: Option<u32>,
+        module_send_buffer: Option<u32>,
+    ) -> Connection {
+        let listener_socket = TcpSocket::new_v4().unwrap();
+        if let Some(size) = daemon_recv_buffer {
+            // Accepted sockets inherit the listener's receive buffer.
+            listener_socket.set_recv_buffer_size(size).unwrap();
+        }
+        listener_socket
+            .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap();
+        let listener: TcpListener = listener_socket.listen(1).unwrap();
+        let address = listener.local_addr().unwrap();
+        let module_socket = TcpSocket::new_v4().unwrap();
+        if let Some(size) = module_send_buffer {
+            module_socket.set_send_buffer_size(size).unwrap();
+        }
+        let (accepted, module) = tokio::join!(listener.accept(), module_socket.connect(address));
+        let (daemon, _) = accepted.unwrap();
+        let (read, write) = tokio::io::split(module.unwrap());
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (reader_tx, reader_rx) = mpsc::channel(256);
+        let reader_task = spawn_reader_task(read, reader_tx);
+        let (writer_tx, writer_rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
+        let writer_task = spawn_writer_task(write, writer_rx, Arc::clone(&metrics));
+        Connection {
+            daemon,
+            reader_rx,
+            reader_task,
+            writer_tx,
+            writer_task,
+            metrics,
+        }
+    }
+
+    async fn queue_response(connection: &Connection, body_len: usize) -> Vec<u8> {
+        let frame = Frame::build(
+            FrameType::Response,
+            control_flags(),
+            1,
+            1,
+            7,
+            vec![b'r'; body_len],
+        )
+        .unwrap();
+        let mut expected = frame.header.encode().to_vec();
+        expected.extend_from_slice(&frame.body);
+        wire::send_counted_channel(
+            &connection.writer_tx,
+            &connection.metrics.writer_queued,
+            WriterFrame::plain(frame),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("writer queue closed"));
+        expected
+    }
+
+    async fn send_pings(daemon: &mut TcpStream, count: u64) {
+        for corr in 0..count {
+            let ping =
+                Frame::build(FrameType::Ping, control_flags(), 0, 0, corr, Vec::new()).unwrap();
+            write_frame(daemon, &ping).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn teardown_with_unread_daemon_input_still_delivers_every_written_byte() {
+        // A small daemon receive buffer keeps most of the response in the
+        // module's send queue when the socket is closed. A reset there drops
+        // that queue on Linux and the daemon's unread bytes on Windows, so any
+        // reset shows up as missing bytes or a reset error below.
+        let mut connection = connect(Some(4 * 1024), Some(1024 * 1024)).await;
+        // Input the loop never handles: more frames than the reader can
+        // forward into its channel, followed by the daemon's half-close.
+        send_pings(&mut connection.daemon, 1_000).await;
+        connection.daemon.shutdown().await.unwrap();
+        let expected = queue_response(&connection, 128 * 1024).await;
+        let Connection {
+            mut daemon,
+            reader_rx,
+            reader_task,
+            writer_tx,
+            writer_task,
+            ..
+        } = connection;
+        drop(writer_tx);
+
+        let close = close_daemon_connection(reader_rx, reader_task, writer_task).await;
+        close.writer.expect("writer flushes and half-closes");
+        assert!(close.input_ended, "the module consumes daemon input to EOF");
+
+        // Read only after the module socket is gone, so whatever reaches the
+        // daemon was delivered by the closed socket itself.
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), daemon.read_to_end(&mut received))
+            .await
+            .expect("daemon read finishes")
+            .expect("module closed with FIN, not a reset");
+        assert_eq!(received.len(), expected.len());
+        assert!(
+            received == expected,
+            "daemon received the module's exact output"
+        );
+    }
+
+    #[tokio::test]
+    async fn teardown_half_closes_so_a_daemon_waiting_for_eof_can_close_first() {
+        let connection = connect(None, None).await;
+        let expected = queue_response(&connection, 8 * 1024).await;
+        let Connection {
+            mut daemon,
+            reader_rx,
+            reader_task,
+            writer_tx,
+            writer_task,
+            ..
+        } = connection;
+        // This daemon closes its side only after it has read the module's EOF,
+        // and keeps sending until then.
+        let daemon_task = tokio::spawn(async move {
+            let mut received = Vec::new();
+            daemon.read_to_end(&mut received).await.unwrap();
+            send_pings(&mut daemon, 10).await;
+            daemon.shutdown().await.unwrap();
+            received
+        });
+        drop(writer_tx);
+
+        let close = close_daemon_connection(reader_rx, reader_task, writer_task).await;
+        close.writer.expect("writer flushes and half-closes");
+        assert!(
+            close.input_ended,
+            "the daemon must see EOF and close its side before the module gives up waiting"
+        );
+        let received = tokio::time::timeout(Duration::from_secs(10), daemon_task)
+            .await
+            .expect("daemon finishes")
+            .unwrap();
+        assert!(
+            received == expected,
+            "daemon received the module's exact output"
+        );
+    }
+}
 #[cfg(test)]
 mod writer_setup_tests {
     use super::*;
