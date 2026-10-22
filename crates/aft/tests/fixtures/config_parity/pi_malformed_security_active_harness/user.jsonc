@@ -2,7 +2,9 @@
   "harnesses": {
     "pi": {
       "sandbox": {
-        "profile": { "worker": 5 }
+        "profile": {
+          "worker": 5
+        }
       }
     },
     "opencode": {

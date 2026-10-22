@@ -169,6 +169,16 @@ function captureCase(caseDef: ParityCase, savedOpencodeConfigDir: string | undef
 }
 
 const CASES: ParityCase[] = [
+  { name: "malformed_security_sandbox", user: { sandbox: { profile: { worker: 5 } } } },
+  { name: "malformed_security_indexes", project: { indexes: { semantic: "off" } } },
+  { name: "malformed_security_remote_exec", project: { remote_exec: { enabled: "off" } } },
+  { name: "malformed_security_disables", user: { disabled_tools: "aft_write" } },
+  { name: "malformed_security_active_harness", user: { harnesses: { opencode: { sandbox: { profile: { worker: 5 } } }, pi: { sandbox: "opaque" } } } },
+  { name: "pi_malformed_security_sandbox", harness: "pi", user: { sandbox: { profile: { worker: 5 } } } },
+  { name: "pi_malformed_security_active_harness", harness: "pi", user: { harnesses: { pi: { sandbox: { profile: { worker: 5 } } }, opencode: { sandbox: "opaque" } } } },
+  { name: "malformed_nonsecurity_inspect_partial", user: { inspect: { categories: { diagnostics: "off" } }, format_on_edit: true } },
+  { name: "malformed_config_document", user: "{" },
+  { name: "pi_malformed_config_document", harness: "pi", user: "{" },
   { name: "privacy_user_on_project_off", user: { bash: { disclaim_privacy: true } }, project: { bash: { disclaim_privacy: false } } },
   { name: "privacy_project_on", user: { bash: { disclaim_privacy: false } }, project: { bash: { disclaim_privacy: true } } },
   { name: "privacy_project_off_dropped", project: { bash: { disclaim_privacy: false } } },
@@ -260,9 +270,8 @@ const CASES: ParityCase[] = [
     },
   },
   {
-    // Below the one-minute minimum is a config error, not a clamp: the
-    // invalid `bash` block is dropped (its `compress: false` too) and the rest
-    // of the file still loads.
+    // A bad resource value must not discard permission or scope settings in
+    // the same bash block, so reject the candidate rather than reset it.
     name: "bash_worker_wait_below_minimum",
     user: { format_on_edit: false, bash: { compress: false, worker_wait_max_ms: 59999 } },
   },
