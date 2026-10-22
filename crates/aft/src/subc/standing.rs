@@ -1520,6 +1520,114 @@ mod tests {
         );
     }
 
+    /// A cache recovery and a reconnect are both route-bind configures on the
+    /// actor's Mutating lane. A bind admitted beside a reader runs with only a
+    /// shared hold on the epoch gate, but it still marks the actor's writer in
+    /// flight for its whole job, and the scheduler then admits only read lanes:
+    /// a reconnect queued while the recovery runs does not start until the
+    /// recovery finishes, and it publishes last, so its settings win.
+    #[test]
+    fn reconnect_queued_while_a_cache_recovery_runs_waits_and_wins() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        let session = BoundCacheSession::start();
+        let (old_request, generation) = session
+            .ctx
+            .cache_recovery_request_if_due(std::time::Instant::now())
+            .expect("the connect request is retained for cache recovery");
+        let mut prepared = session.ctx.config().as_ref().clone();
+        root_cache::prepare_cache_root(&mut prepared);
+        let prepared = Arc::new(prepared);
+        let old_storage = session.ctx.config().storage_dir.clone();
+        let wait = std::time::Duration::from_secs(10);
+
+        // A reader holds the epoch gate, so the recovery starts with only a
+        // shared hold: the case the writer-in-flight rule alone serializes.
+        let (reader_started_tx, reader_started_rx) = std::sync::mpsc::channel();
+        let (reader_release_tx, reader_release_rx) = std::sync::mpsc::channel::<()>();
+        let reader = session.executor.submit(
+            session.root.clone(),
+            Lane::PureRead,
+            "held-reader".into(),
+            Box::new(move |_| {
+                reader_started_tx.send(()).unwrap();
+                let _ = reader_release_rx.recv_timeout(wait);
+                crate::protocol::Response::success("held-reader", serde_json::json!({}))
+            }),
+        );
+        reader_started_rx
+            .recv_timeout(wait)
+            .expect("the reader started");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let held = AtomicBool::new(false);
+        let (recovery_rx, _recovery_cancel) = session.executor.submit_bind_cancellable_async(
+            session.root.clone(),
+            "subc-bind-cache-recovery-test".into(),
+            Arc::new(move |ctx| {
+                // The generation check is about to pass; hold the job here,
+                // before the configure, as a slow recovery would.
+                if !held.swap(true, AtomicOrdering::SeqCst) {
+                    started_tx
+                        .send(crate::executor::current_bind_gate_is_shared())
+                        .unwrap();
+                    let _ = release_rx.lock().recv_timeout(wait);
+                }
+                crate::commands::configure::handle_cache_recovery(
+                    &old_request,
+                    generation,
+                    ctx,
+                    &prepared,
+                )
+            }),
+        );
+        let shared = started_rx.recv_timeout(wait).expect("the recovery started");
+        assert!(
+            shared,
+            "the recovery was expected to start with a shared hold"
+        );
+
+        let new_storage = session.temp.path().join("storage-after-reconnect");
+        let reconnect: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "subc-bind-reconnect-test", "command": "configure", "harness": "pi",
+            "project_root": session.project, "storage_dir": new_storage,
+            "cortexkit_user_config_path": session.user_file,
+        }))
+        .unwrap();
+        let reconnect_entered = Arc::new(AtomicBool::new(false));
+        let entered = Arc::clone(&reconnect_entered);
+        let (reconnect_rx, _reconnect_cancel) = session.executor.submit_bind_cancellable_async(
+            session.root.clone(),
+            "subc-bind-reconnect-test".into(),
+            Arc::new(move |ctx| {
+                entered.store(true, AtomicOrdering::SeqCst);
+                crate::commands::configure::handle_configure(&reconnect, ctx)
+            }),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !reconnect_entered.load(AtomicOrdering::SeqCst),
+            "the reconnect started while the recovery held the actor's writer slot"
+        );
+        assert_eq!(session.ctx.config().storage_dir, old_storage);
+
+        release_tx.send(()).unwrap();
+        reader_release_tx.send(()).unwrap();
+        reader.recv_timeout(wait).unwrap();
+        let recovery = recovery_rx.blocking_recv().unwrap();
+        assert!(recovery.success, "{recovery:?}");
+        let reconnected = reconnect_rx.blocking_recv().unwrap();
+        assert!(reconnected.success, "{reconnected:?}");
+        let config = session.ctx.config();
+        assert_eq!(config.storage_dir.as_deref(), Some(new_storage.as_path()));
+        assert_eq!(
+            config.harness,
+            Some(crate::harness::Harness::Pi),
+            "the recovery's old settings outlived the reconnect"
+        );
+    }
+
     #[test]
     fn cache_root_refresh_keeps_a_deferred_cache_dir_edit_deferred() {
         let session = BoundCacheSession::start();
