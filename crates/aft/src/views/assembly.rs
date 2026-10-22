@@ -445,6 +445,16 @@ pub fn prepare_checkout_deferring(
     super::io::WORK
         .full_walks
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The mark epoch read here, before the checkout is read, is the cutoff
+    // for this publication's settlement: an annotation marked with a higher
+    // epoch (by a newer preparation, or a configure scheduling more paths)
+    // belongs to a later publication and keeps its annotation; see
+    // `StatusIntent::marked_through`.
+    let mut status = PathStatusStore::open(view.view_dir())
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    let marked_through = status
+        .mark_epoch()
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     let head = head_tree_entries(&request.project_root)
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     profile.head_ms = head_started.elapsed().as_millis();
@@ -756,8 +766,6 @@ pub fn prepare_checkout_deferring(
     timing.phase("blob_and_alias_puts");
     prepared.profile.blob_puts = blob_puts;
     prepared.profile.pending_paths = blocking_paths.len() + semantic_pending_paths.len();
-    let mut status = PathStatusStore::open(view.view_dir())
-        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     status
         .mark_pending_many(
             blocking_paths
@@ -787,6 +795,7 @@ pub fn prepare_checkout_deferring(
             .map(|candidate| candidate.path.as_bytes().to_vec())
             .collect(),
         keep_pending: semantic_pending_paths.clone(),
+        marked_through,
         fresh_skips: fresh_skips.into_iter().collect(),
     };
     // Read the ledger now, off the commit barrier: when it already says what
@@ -2243,5 +2252,50 @@ mod status_settlement_tests {
         assert_eq!(prepared.settle_status(), SettleOutcome::Applied(1));
         assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(pending(storage.path()), 0);
+    }
+
+    /// A settlement applied after its publication released the commit
+    /// barrier must not clear what a newer preparation marked meanwhile: that
+    /// work is not covered by the older generation, and its data is still
+    /// missing. Here the older settlement waits while a newer preparation marks
+    /// two members pending (it needs semantic vectors nobody has stored); the
+    /// older settlement still clears the row scheduled before it started.
+    #[test]
+    fn views_a_held_older_settlement_keeps_pending_rows_a_newer_preparation_marked() {
+        let (_project, root) = latin1_repository();
+        let storage = tempfile::tempdir().unwrap();
+        publish_checkout(&request(&root, storage.path(), "head-1")).unwrap();
+        status(storage.path())
+            .mark_pending(b"gone.ts", "view publication scheduled", 1)
+            .unwrap();
+
+        let mut older =
+            prepare_checkout(&request(&root, storage.path(), "head-2"), &mut |_| Ok(())).unwrap();
+        assert!(older.commit().unwrap().published);
+
+        let newer = prepare_checkout(
+            &AssemblyRequest {
+                require_semantic: true,
+                ..request(&root, storage.path(), "head-3")
+            },
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        let marked = BTreeSet::from([b"file_0.ts".to_vec(), b"latin1.py".to_vec()]);
+        assert_eq!(newer.report().pending_paths, marked);
+        assert_eq!(pending(storage.path()), 3);
+
+        assert!(matches!(older.settle_status(), SettleOutcome::Applied(_)));
+        let ledger = status(storage.path());
+        assert!(ledger.status_for(b"gone.ts").unwrap().is_none());
+        for path in &marked {
+            assert_eq!(
+                ledger.status_for(path).unwrap().map(|row| row.state),
+                Some(crate::path_status::PathState::Pending),
+                "{} lost the pending row a newer preparation marked",
+                String::from_utf8_lossy(path)
+            );
+        }
+        drop(newer);
     }
 }
