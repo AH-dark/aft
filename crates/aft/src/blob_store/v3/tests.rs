@@ -415,6 +415,17 @@ fn child(storage: &Path, family: &str, mode: &str, control: &Path) -> std::proce
         .spawn()
         .unwrap()
 }
+/// Writes a child's control file whole. A plain `fs::write` creates the file
+/// before writing its contents, and the parent waits only for the file to
+/// exist, so it could read an empty outcome. Renaming a finished temporary
+/// file into place makes existence imply complete contents.
+fn write_control(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = PathBuf::from(partial);
+    fs::write(&partial, contents)?;
+    fs::rename(&partial, path)
+}
 fn wait_file(path: &Path, child: &mut std::process::Child) {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while !path.exists() {
@@ -454,7 +465,7 @@ fn v3_child() {
         let lock = ReservationLock::acquire(&storage).unwrap();
         let mut writer = RegistryWriter::open_existing(&storage, &family, &lock).unwrap();
         let _reservation = writer.reserve(100).unwrap();
-        fs::write(&control, b"reserved").unwrap();
+        write_control(&control, b"reserved").unwrap();
         loop {
             std::thread::park();
         }
@@ -463,7 +474,7 @@ fn v3_child() {
         let lock = ReservationLock::acquire(&storage).unwrap();
         let mut writer = RegistryWriter::open_existing(&storage, &family, &lock).unwrap();
         let _reservation = writer.reserve(1234).unwrap();
-        fs::write(&control, b"uncheckpointed").unwrap();
+        write_control(&control, b"uncheckpointed").unwrap();
         loop {
             std::thread::park();
         }
@@ -491,7 +502,7 @@ fn v3_child() {
             )
         };
         let before = read_audit::counts();
-        fs::write(
+        write_control(
             &control,
             serde_json::to_vec(
                 &serde_json::json!({"reserved":accounting.reserved_bytes,"readonly":readonly,"before":before}),
@@ -510,7 +521,7 @@ fn v3_child() {
             }
         }
         drop(ledger);
-        fs::write(&control,serde_json::to_vec(&serde_json::json!({"reserved":accounting.reserved_bytes,"readonly":readonly,"before":before,"after":read_audit::counts()})).unwrap()).unwrap();
+        write_control(&control,serde_json::to_vec(&serde_json::json!({"reserved":accounting.reserved_bytes,"readonly":readonly,"before":before,"after":read_audit::counts()})).unwrap()).unwrap();
         return;
     }
     if mode == "reserve" {
@@ -533,7 +544,7 @@ fn v3_child() {
             let reservation = writer.reserve(100)?;
             drop(writer);
             drop(lock);
-            fs::write(&control, b"reserved")?;
+            write_control(&control, b"reserved")?;
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
             while !control.with_extension("release").exists() {
                 assert!(
@@ -546,7 +557,7 @@ fn v3_child() {
             RegistryWriter::open_existing(&storage, &family, &lock)?.release(reservation)
         })();
         if let Err(error) = result {
-            fs::write(control, error.to_string()).unwrap();
+            write_control(&control, error.to_string()).unwrap();
         }
         return;
     }
@@ -561,7 +572,7 @@ fn v3_child() {
     impl DurabilityObserver for Park<'_> {
         fn reached(&self, step: DurabilityStep) {
             if step == self.step {
-                fs::write(self.control, step.as_str()).unwrap();
+                write_control(self.control, step.as_str()).unwrap();
                 loop {
                     std::thread::park();
                 }
