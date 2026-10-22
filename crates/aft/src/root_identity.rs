@@ -67,6 +67,13 @@ pub(crate) struct RecordStamp {
     identity: (u64, u64, i64, i64),
     #[cfg(windows)]
     created: u64,
+    /// Volume serial number and file index. A replacement renamed over the
+    /// record is a different file, so this changes even when the size,
+    /// modification time and creation time all match: Windows stamps file
+    /// times from a coarse clock (about 15.6 ms per tick), so two records
+    /// written in the same tick can carry identical times.
+    #[cfg(windows)]
+    identity: (u64, u64),
 }
 
 /// The caller supplies a canonical root so checking a memo requires just one
@@ -75,10 +82,26 @@ pub(crate) fn record_stamp(
     canonical_root: &Path,
     storage: &Path,
 ) -> io::Result<Option<RecordStamp>> {
-    let metadata = match std::fs::metadata(record_path(canonical_root, storage)) {
+    let path = record_path(canonical_root, storage);
+    #[cfg(not(windows))]
+    let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
+    };
+    // One metadata-only handle supplies both the times and the file identity,
+    // so they always describe the same file. Like `std::fs::metadata`, it
+    // requests no data access and shares read, write and delete, so it does
+    // not block a concurrent writer's rename over the record.
+    #[cfg(windows)]
+    let (metadata, identity) = {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = match std::fs::OpenOptions::new().access_mode(0).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        (file.metadata()?, windows_file_identity(&file)?)
     };
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -94,11 +117,34 @@ pub(crate) fn record_stamp(
             metadata.ctime(),
             metadata.ctime_nsec(),
         ),
-        // Rust's stable Windows API lacks a file ID; creation time distinguishes
-        // replacement records when their size and modification time match.
         #[cfg(windows)]
         created: metadata.creation_time(),
+        #[cfg(windows)]
+        identity,
     }))
+}
+
+/// Rust's stable `MetadataExt` on Windows exposes no file ID, so read it from
+/// the open handle.
+#[cfg(windows)]
+fn windows_file_identity(file: &std::fs::File) -> io::Result<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: the open file owns a valid handle and `info` is writable. A
+    // successful call initializes the structure before it is read below.
+    let info = unsafe {
+        if GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        info.assume_init()
+    };
+    Ok((
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
 }
 
 pub(crate) fn read(root: &Path, storage: &Path) -> io::Result<Option<Identity>> {
@@ -512,6 +558,19 @@ mod tests {
             filetime::FileTime::from_last_modification_time(&metadata),
         )
         .unwrap();
+        // Windows file times come from a coarse clock, so a replacement written
+        // in the same tick as the original carries the same creation time.
+        // Copy it explicitly so the test does not depend on machine speed.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileTimesExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&replacement)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_created(metadata.created().unwrap()))
+                .unwrap();
+        }
         std::fs::rename(&replacement, &path).unwrap();
         assert_ne!(record_stamp(&root, storage.path()).unwrap(), before);
     }
