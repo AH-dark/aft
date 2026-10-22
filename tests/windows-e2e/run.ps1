@@ -457,11 +457,17 @@ function Run-OpencodeSession {
     try {
         # OpenCode's openai adapter requires SOME api key; aimock ignores it.
         $env:OPENAI_API_KEY = "sk-mock-windows-e2e"
-        # Cold-cache OpenCode forks an npm install of its own default plugin and
-        # joins it under a 5-minute lock before external plugins load (see
-        # tests/docker/test-e2e.sh for the source lines); a slow registry made
-        # that a silent multi-minute stall. AFT needs no host default plugins.
+        # OpenCode's built-in plugins are not needed by AFT. This flag does not
+        # skip the config-directory install described below.
         $env:OPENCODE_DISABLE_DEFAULT_PLUGINS = "true"
+        # Every OpenCode start installs @opencode-ai/plugin into each config
+        # directory without node_modules and loads no external plugin until
+        # that install finishes. The install waits for npm's security audit
+        # request, which can hang for up to 5 minutes when the audit service
+        # stalls, so the cold first launch never loaded AFT within its budget.
+        # This skips only the audit; the install still runs. See
+        # run_opencode_session in tests/docker/test-e2e.sh for the source lines.
+        $env:npm_config_audit = "false"
 
         # On Windows, `npm install -g opencode-ai` deposits THREE shims at
         # %APPDATA%\npm\:
