@@ -8447,15 +8447,7 @@ mod tests {
     /// look test-only.
     #[test]
     fn review_method_called_from_production_closure_and_test_keeps_body_production() {
-        let aggregate = stored_rust_fixture_scan(&[
-            ("src/main.rs", "mod subc;\nfn main() { subc::start(None); }\n"),
-            (
-                "src/subc/mod.rs",
-                "mod stall_watchdog;\npub(crate) fn start(o: Option<stall_watchdog::Config>) {\n    let _ = o.unwrap_or_else(|| stall_watchdog::Config::production());\n}\n",
-            ),
-            (
-                "src/subc/stall_watchdog.rs",
-                r#"
+        let watchdog = r#"
 pub(super) struct PlatformCapture;
 pub(crate) struct Config { capture: std::sync::Arc<PlatformCapture> }
 impl Config {
@@ -8468,11 +8460,25 @@ mod tests {
     #[test]
     fn production_config() { let _ = super::Config::production(); }
 }
-"#,
-            ),
-        ]);
-        assert!(headline_symbols(&aggregate).is_empty(), "{aggregate:#}");
-        assert!(test_only_symbols(&aggregate).is_empty(), "{aggregate:#}");
+"#;
+        // The module-qualified call is also resolved by the source scan; the
+        // imported-type call is resolved only by the stored callgraph, which
+        // names the method `production`.
+        for start in [
+            "mod stall_watchdog;\npub(crate) fn start(o: Option<stall_watchdog::Config>) {\n    let _ = o.unwrap_or_else(|| stall_watchdog::Config::production());\n}\n",
+            "mod stall_watchdog;\nuse stall_watchdog::Config;\npub(crate) fn start(o: Option<Config>) {\n    let _ = o.unwrap_or_else(|| Config::production());\n}\n",
+        ] {
+            let aggregate = stored_rust_fixture_scan(&[
+                ("src/main.rs", "mod subc;\nfn main() { subc::start(None); }\n"),
+                ("src/subc/mod.rs", start),
+                ("src/subc/stall_watchdog.rs", watchdog),
+            ]);
+            assert!(headline_symbols(&aggregate).is_empty(), "{start}\n{aggregate:#}");
+            assert!(
+                test_only_symbols(&aggregate).is_empty(),
+                "{start}\n{aggregate:#}"
+            );
+        }
     }
 
     /// `super::` inside an inline module names the enclosing module first:
