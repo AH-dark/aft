@@ -20,6 +20,11 @@ on:
         required: false
         type: boolean
         default: false
+      storm_profile_probe:
+        description: Compare the no-LTO storm profile with the normal thin-LTO lane
+        required: false
+        type: boolean
+        default: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -217,6 +222,7 @@ jobs:
           python3 -m unittest discover -s scripts/lib -p test_rust_gate_collection.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_macos_integration_archive.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_windows_probes.py -v
+          python3 -m unittest discover -s scripts/lib -p test_ci_storm_controls.py -v
           python3 -m unittest discover -s scripts/lib -p test_cache_write_policy.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_artifact.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_workflow.py -v
@@ -531,28 +537,20 @@ jobs:
           cargo test --locked -p agent-file-tools --features test-timing-hooks --test integration "$test_name" -- --exact
 
   # ---------------------------------------------------------------------------
-  # Release-storm latency calibration (Linux, release profile).
-  # Split from unit-linux: the storm phase needs a release-profile build of
-  # the integration binary, which serialized 2-5 minutes behind the debug
-  # gate. Three warm-cache runs spent 9.8-10.9 minutes compiling/linking but
-  # only 1.0-1.1 minutes executing the 15 calibrated tests. sccache covers the
-  # workspace crates rust-cache deliberately excludes; the actual storm still
-  # runs alone on its dedicated runner so noisy shards cannot distort absolute
-  # latency bounds. Linux remains the release-storm arbiter; macOS and Windows
-  # skip the phase entirely.
+  # Release-calibrated storm latency on a dedicated free Linux runner. The
+  # harness retains opt-level 3 and every absolute bound without paying the
+  # shipped binary's fat-LTO link. Delayed bind/read controls must still fail.
   # ---------------------------------------------------------------------------
   unit-linux-storm:
     name: Release storm (Linux)
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-22.04
-    # The storm runs a release-profile build first. With a cold compiler cache
-    # that build plus the storm takes about 23 minutes on a normal runner, and
-    # a slow runner crossed the old 25-minute cap mid-test.
     timeout-minutes: 40
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_CI_STORM_LTO: thin
     steps:
       - uses: actions/checkout@v5
 
@@ -562,13 +560,35 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          shared-key: ci-storm-thin
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: ./.github/actions/setup-nextest
 
-      - name: Release storm tests (production-calibrated latency bounds)
-        run: cargo nextest run --no-fail-fast --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
+      - uses: ./.github/actions/storm-suite
+
+  unit-linux-storm-profile-probe:
+    name: Storm profile comparison (no LTO)
+    if: ${{ inputs.storm_profile_probe && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_CI_STORM_LTO: "false"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci-storm-off
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/setup-nextest
+      - uses: ./.github/actions/storm-suite
 
   # ---------------------------------------------------------------------------
   # MSRV floor check (Linux, pinned to the declared rust-version).

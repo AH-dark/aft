@@ -56,8 +56,14 @@ class MergeQueueWorkflowTests(unittest.TestCase):
             self.assertNotIn("if", job)
             called = workflow_gates.parse_workflow(str(ROOT / ".github/workflows" / file))
             self.assertIn("workflow_call", called["on"])
-            for nested in called["jobs"].values():
+            for nested_id, nested in called["jobs"].items():
                 condition = nested.get("if", "")
+                if nested_id == "unit-linux-storm-profile-probe":
+                    self.assertEqual(job_id, "unit")
+                    self.assertEqual(condition, "${{ inputs.storm_profile_probe && github.event_name != 'pull_request' }}")
+                    required = (ROOT / ".github/required-checks.txt").read_text().splitlines()
+                    self.assertNotIn(f"{name} / {nested['name']}", required)
+                    continue
                 self.assertIn(condition, (
                     "${{ github.event_name != 'pull_request' }}",
                     "${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}",

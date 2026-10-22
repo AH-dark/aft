@@ -49,3 +49,13 @@ debug = 1
 # entire aft process and takes down all tools. With "unwind", the
 # catch_unwind in configure.rs catches it and degrades gracefully.
 panic = "unwind"
+
+# The latency harness keeps release optimization and absolute bounds, but does
+# not ship its binaries. Parallel codegen and thin LTO avoid the fat-LTO link
+# paid by production artifacts; CI also checks delayed-response controls.
+[profile.ci-storm]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+debug-assertions = false
