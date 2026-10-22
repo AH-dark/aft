@@ -42,7 +42,14 @@ use super::persistence::TaskLayout;
 pub(crate) struct Stamp {
     modified: SystemTime,
     len: u64,
-    identity: (u64, u64),
+    /// A replacement is a different file, so this changes even when a
+    /// same-length rewrite lands within one tick of the filesystem clock and
+    /// keeps every time.
+    identity: crate::file_identity::FileIdentity,
+    /// Windows also keeps the creation time, which a replacement normally
+    /// changes, for a filesystem that reports no file identity.
+    #[cfg(windows)]
+    created: u64,
 }
 
 impl Stamp {
@@ -52,32 +59,15 @@ impl Stamp {
     pub(crate) fn of(path: &Path) -> std::io::Result<Self> {
         #[cfg(test)]
         super::persistence::work_counts::record_stat();
-        let metadata = std::fs::symlink_metadata(path)?;
+        let (metadata, identity) = crate::file_identity::symlink_metadata(path)?;
         Ok(Self {
             modified: metadata.modified()?,
             len: metadata.len(),
-            identity: identity(&metadata),
+            identity,
+            #[cfg(windows)]
+            created: std::os::windows::fs::MetadataExt::creation_time(&metadata),
         })
     }
-}
-
-#[cfg(unix)]
-fn identity(metadata: &std::fs::Metadata) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt;
-    (metadata.dev(), metadata.ino())
-}
-
-#[cfg(windows)]
-fn identity(metadata: &std::fs::Metadata) -> (u64, u64) {
-    // Stable Rust has no file index on Windows; a replacement file is a new
-    // file with its own creation time, and its write time changes as well.
-    use std::os::windows::fs::MetadataExt;
-    (metadata.creation_time(), 0)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn identity(_metadata: &std::fs::Metadata) -> (u64, u64) {
-    (0, 0)
 }
 
 /// True while a file modified at `modified` is inside `grace`. Matches the
@@ -598,4 +588,24 @@ pub(crate) fn persisted_gc_health_for(root: &Path) -> Option<PersistedGcHealth> 
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(root)
         .map(|state| state.health.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Task metadata is written by atomic replacement. A rewrite that lands
+    /// within one clock tick and keeps the length leaves the size and every
+    /// time unchanged, so only the file identity shows that the remembered
+    /// verdict was derived from a different file.
+    #[test]
+    fn same_length_replacement_with_identical_times_changes_the_stamp() {
+        let directory = tempfile::tempdir().unwrap();
+        let metadata = directory.path().join("task.json");
+        std::fs::write(&metadata, br#"{"status":"running"}"#).unwrap();
+        let before = Stamp::of(&metadata).unwrap();
+        assert_eq!(Stamp::of(&metadata).unwrap(), before);
+        crate::file_identity::replace_keeping_times(&metadata, br#"{"status":"stopped"}"#);
+        assert_ne!(Stamp::of(&metadata).unwrap(), before);
+    }
 }

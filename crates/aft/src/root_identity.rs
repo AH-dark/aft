@@ -73,7 +73,7 @@ pub(crate) struct RecordStamp {
     /// times from a coarse clock (about 15.6 ms per tick), so two records
     /// written in the same tick can carry identical times.
     #[cfg(windows)]
-    identity: (u64, u64),
+    identity: crate::file_identity::FileIdentity,
 }
 
 /// The caller supplies a canonical root so checking a memo requires just one
@@ -90,18 +90,19 @@ pub(crate) fn record_stamp(
         Err(error) => return Err(error),
     };
     // One metadata-only handle supplies both the times and the file identity,
-    // so they always describe the same file. Like `std::fs::metadata`, it
-    // requests no data access and shares read, write and delete, so it does
-    // not block a concurrent writer's rename over the record.
+    // so they always describe the same file. A record whose identity cannot
+    // be read yields an error, which leaves the memo uncached rather than
+    // trusting times alone.
     #[cfg(windows)]
-    let (metadata, identity) = {
-        use std::os::windows::fs::OpenOptionsExt;
-        let file = match std::fs::OpenOptions::new().access_mode(0).open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        (file.metadata()?, windows_file_identity(&file)?)
+    let (metadata, identity) = match crate::file_identity::metadata(&path) {
+        Ok((_, crate::file_identity::FileIdentity::Unavailable)) => {
+            return Err(io::Error::other(
+                "the root identity record reported no file identity",
+            ))
+        }
+        Ok(found) => found,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
     };
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -122,29 +123,6 @@ pub(crate) fn record_stamp(
         #[cfg(windows)]
         identity,
     }))
-}
-
-/// Rust's stable `MetadataExt` on Windows exposes no file ID, so read it from
-/// the open handle.
-#[cfg(windows)]
-fn windows_file_identity(file: &std::fs::File) -> io::Result<(u64, u64)> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-    };
-    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-    // SAFETY: the open file owns a valid handle and `info` is writable. A
-    // successful call initializes the structure before it is read below.
-    let info = unsafe {
-        if GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        info.assume_init()
-    };
-    Ok((
-        u64::from(info.dwVolumeSerialNumber),
-        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-    ))
 }
 
 pub(crate) fn read(root: &Path, storage: &Path) -> io::Result<Option<Identity>> {

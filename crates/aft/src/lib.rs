@@ -96,6 +96,7 @@ pub mod executor;
 pub mod extract;
 pub mod feature_config;
 pub mod feature_status;
+pub(crate) mod file_identity;
 pub mod file_kind;
 pub mod fleet_status;
 pub mod format;

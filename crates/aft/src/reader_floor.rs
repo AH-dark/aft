@@ -349,13 +349,22 @@ fn prepared_roots() -> &'static Mutex<HashSet<PathBuf>> {
 struct FloorStamp {
     size: u64,
     modified: SystemTime,
+    /// The floor is replaced by renaming a new file over it. A replacement
+    /// written within one tick of the filesystem clock keeps the size and
+    /// modification time of a same-length floor, and only its identity shows
+    /// that the refusals derived from the old floor must be recomputed.
+    identity: crate::file_identity::FileIdentity,
 }
 
 impl FloorStamp {
-    fn from_metadata(metadata: &fs::Metadata) -> io::Result<Self> {
+    fn new(
+        metadata: &fs::Metadata,
+        identity: crate::file_identity::FileIdentity,
+    ) -> io::Result<Self> {
         Ok(Self {
             size: metadata.len(),
             modified: metadata.modified()?,
+            identity,
         })
     }
 }
@@ -366,8 +375,8 @@ fn floor_stamps() -> &'static Mutex<HashMap<PathBuf, Option<FloorStamp>>> {
 }
 
 fn stat_floor(path: &Path) -> io::Result<Option<FloorStamp>> {
-    match fs::metadata(path) {
-        Ok(metadata) => FloorStamp::from_metadata(&metadata).map(Some),
+    match crate::file_identity::metadata(path) {
+        Ok((metadata, identity)) => FloorStamp::new(&metadata, identity).map(Some),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
@@ -379,10 +388,13 @@ fn read_snapshot(path: &Path) -> io::Result<(Option<FloorStamp>, Option<Vec<u8>>
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((None, None)),
         Err(error) => return Err(error),
     };
-    let before = FloorStamp::from_metadata(&file.metadata()?)?;
+    // The open handle keeps naming the same file throughout, so one identity
+    // read serves both stamps.
+    let identity = crate::file_identity::FileIdentity::of_file(&file);
+    let before = FloorStamp::new(&file.metadata()?, identity)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    let after = FloorStamp::from_metadata(&file.metadata()?)?;
+    let after = FloorStamp::new(&file.metadata()?, identity)?;
     if before != after || after.size != bytes.len() as u64 {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -1169,6 +1181,38 @@ pub(crate) mod tests {
         fs::create_dir(&path).unwrap();
         assert!(refresh_refused(root.path()).is_err());
         assert_eq!(persisted_format::refusals_under(root.path()), before);
+    }
+
+    #[test]
+    fn refused_retry_reparses_a_same_length_replacement_with_identical_times() {
+        // A floor rewritten by atomic replacement within one clock tick keeps
+        // its size and times; only the file identity shows the new file.
+        let root = prepared_refused_root();
+        let path = floor_path(root.path());
+        let supported = PersistedStore::AftDb.supported();
+        let text = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        let store = text.find("\"aft.db\"").unwrap();
+        let (head, tail) = text.split_at(store);
+        let lowered = format!(
+            "{head}{}",
+            tail.replacen(&(supported + 1).to_string(), &supported.to_string(), 1)
+        );
+        crate::file_identity::replace_keeping_times(&path, lowered.as_bytes());
+        assert_eq!(
+            read(root.path()).unwrap().unwrap().stores["aft.db"],
+            u64::from(supported)
+        );
+        refresh_refused(root.path()).unwrap();
+        assert!(
+            persisted_format::gate(
+                PersistedStore::AftDb,
+                &root.path().join("aft.db"),
+                &root.path().join("aft.db"),
+                None
+            )
+            .is_ok(),
+            "the lowered replacement floor must lift the refusal"
+        );
     }
 
     #[test]

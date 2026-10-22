@@ -8708,6 +8708,14 @@ struct RootCommitStamp {
 struct RootCommitFileIdentity {
     #[cfg(unix)]
     inode: (u64, u64),
+    /// Volume serial number and file index: a file renamed over another is a
+    /// different file, even when its size and times match because both were
+    /// written within one tick of the Windows file clock (about 15.6 ms).
+    /// Unix keeps the device and inode in `inode` above instead, so the
+    /// digest `repository_identity_stamp` hands to root identity records
+    /// (built from this type's `Debug` text) is unchanged there.
+    #[cfg(not(unix))]
+    identity: crate::file_identity::FileIdentity,
     /// Size, modification and status-change times. Left out for a directory
     /// whose entries change on ordinary git use (the `.git` directory gains
     /// and renames `index.lock` on every status refresh); only its
@@ -8717,8 +8725,8 @@ struct RootCommitFileIdentity {
 
 impl RootCommitFileIdentity {
     fn of(path: &Path, directory_contents: bool) -> Option<Option<Self>> {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) => {
+        match crate::file_identity::symlink_metadata(path) {
+            Ok((metadata, identity)) => {
                 // Link identity does not cover changes to the target's history
                 // data, so leave linked files and directories uncached.
                 if metadata.file_type().is_symlink() {
@@ -8728,11 +8736,16 @@ impl RootCommitFileIdentity {
                 use std::os::unix::fs::MetadataExt;
                 #[cfg(unix)]
                 let changed = (metadata.ctime(), metadata.ctime_nsec());
+                // Unix reads the same device and inode from `metadata` below.
+                #[cfg(unix)]
+                let _ = identity;
                 #[cfg(not(unix))]
                 let changed = (0, 0);
                 Some(Some(Self {
                     #[cfg(unix)]
                     inode: (metadata.dev(), metadata.ino()),
+                    #[cfg(not(unix))]
+                    identity,
                     contents: (!metadata.is_dir() || directory_contents).then(|| {
                         (
                             metadata.len(),
@@ -13546,6 +13559,27 @@ mod tests {
         let root = dir.path().join(name);
         fs::create_dir_all(root.join(".git")).expect("create git marker");
         root
+    }
+
+    /// `git pack-refs` rewrites `packed-refs` by atomic replacement. When the
+    /// current branch is packed and moves to another 40-character commit, the
+    /// file keeps its length; a rewrite within one clock tick also keeps every
+    /// time, so only the file identity shows that the root commit may differ.
+    #[test]
+    fn root_commit_stamp_sees_a_same_length_packed_refs_replacement() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let directory = tempfile::tempdir().unwrap();
+        let root = git_like_root(&directory, "repository");
+        let git = root.join(".git");
+        fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let packed = |commit: char| format!("{} refs/heads/main\n", commit.to_string().repeat(40));
+        fs::write(git.join("packed-refs"), packed('a')).unwrap();
+        let before = RootCommitStamp::capture(&root).expect("the fixture must allow caching");
+        crate::file_identity::replace_keeping_times(
+            &git.join("packed-refs"),
+            packed('b').as_bytes(),
+        );
+        assert_ne!(RootCommitStamp::capture(&root), Some(before));
     }
 
     #[test]

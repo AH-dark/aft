@@ -3726,6 +3726,10 @@ enum GitEntryKind {
 struct GitEntrySignature {
     kind: GitEntryKind,
     modified: Option<SystemTime>,
+    /// A `.git` entry replaced within one tick of the filesystem clock keeps
+    /// its kind and modification time; only its identity shows that it is a
+    /// different entry.
+    identity: crate::file_identity::FileIdentity,
 }
 
 #[derive(Clone, Debug)]
@@ -3876,8 +3880,8 @@ impl BorrowedIndexCache {
 }
 
 fn git_entry_signature(project_root: &Path) -> GitEntrySignature {
-    match std::fs::symlink_metadata(project_root.join(".git")) {
-        Ok(metadata) => GitEntrySignature {
+    match crate::file_identity::symlink_metadata(&project_root.join(".git")) {
+        Ok((metadata, identity)) => GitEntrySignature {
             kind: if metadata.file_type().is_file() {
                 GitEntryKind::File
             } else if metadata.file_type().is_dir() {
@@ -3886,14 +3890,17 @@ fn git_entry_signature(project_root: &Path) -> GitEntrySignature {
                 GitEntryKind::Other
             },
             modified: metadata.modified().ok(),
+            identity,
         },
         Err(error) if error.kind() == io::ErrorKind::NotFound => GitEntrySignature {
             kind: GitEntryKind::Missing,
             modified: None,
+            identity: crate::file_identity::FileIdentity::Unavailable,
         },
         Err(_) => GitEntrySignature {
             kind: GitEntryKind::Other,
             modified: None,
+            identity: crate::file_identity::FileIdentity::Unavailable,
         },
     }
 }
@@ -15688,6 +15695,32 @@ mod readonly_artifact_cache_key_tests {
                 .expect("another root must finish while the first derivation is paused")
                 .unwrap(),
             expected
+        );
+    }
+}
+
+#[cfg(test)]
+mod git_entry_signature_tests {
+    use super::*;
+
+    /// The borrowed-index cache trusts a remembered external root while its
+    /// `.git` entry is unchanged. A `gitdir:` pointer file rewritten by atomic
+    /// replacement within one clock tick keeps its size and times, so only
+    /// the file identity shows that it is a different file.
+    #[test]
+    fn same_length_git_file_replacement_forgets_the_resolved_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let marker = root.join(".git");
+        std::fs::write(&marker, b"gitdir: ../first\n").unwrap();
+        let mut cache = BorrowedIndexCache::default();
+        cache.remember_resolved_root(root.clone());
+        assert_eq!(cache.resolved_root(&root), Some(root.clone()));
+        crate::file_identity::replace_keeping_times(&marker, b"gitdir: ../other\n");
+        assert_eq!(
+            cache.resolved_root(&root),
+            None,
+            "a replaced .git entry must make the root resolve again"
         );
     }
 }
