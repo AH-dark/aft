@@ -6439,3 +6439,90 @@ async fn exec_remote_run_scope_revocation_reports_reason() {
         .iter()
         .any(|(_, body)| body["method"] == "exec.cancel"));
 }
+
+#[tokio::test]
+async fn optional_worker_broker_remote_local_fallback_without_service_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    let daemon = daemon(Script::Refused, "exec-remote/v1").await;
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    ensure_git_fixture(project.path());
+    let temp = project.path().join("000000000001");
+    std::fs::create_dir(&temp).unwrap();
+    std::fs::write(
+        project.path().join("sandbox-launch"),
+        "while [ \"$1\" != -- ]; do shift; done; shift; exec \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        project.path().join("sandbox-launch"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let mut profile = crate::sandbox_profile::SandboxProfile::build(
+        vec![project.path().to_owned()],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        temp.clone(),
+    )
+    .unwrap();
+    profile.mode = crate::config::SandboxMode::Strict;
+    let plan = crate::sandbox_spawn::SpawnPlan::launcher_for_test(profile, "/bin/sh".into());
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(project.path().to_owned()),
+            storage_dir: Some(storage.path().to_owned()),
+            experimental_bash_background: true,
+            ..Default::default()
+        },
+    );
+    let command="test -z \"${AFT_GH_READ_SOCKET+x}\" && test -z \"${AFT_GH_READ_CAPABILITY_FILE+x}\" && test -z \"${AFT_GH_SHIM_TICKET+x}\" && printf FALLBACK_WITHOUT_BROKER";
+    let response = crate::gh_shim_worker_broker::without_service_for_test(|| {
+        crate::sandbox_spawn::with_worker_jail(true, || {
+            crate::sandbox_spawn::with_spawn_plan_for_test(plan, || {
+                crate::bash_background::spawn(
+                    "optional-fallback",
+                    "session",
+                    command,
+                    crate::bash_background::BashShell::Bash,
+                    resolve_posix_shell(),
+                    Some(project.path().to_owned()),
+                    None,
+                    crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    &ctx,
+                    true,
+                    true,
+                    false,
+                    false,
+                    24,
+                    80,
+                    vec![],
+                    false,
+                    None,
+                    Some(launch(daemon.connection.clone())),
+                )
+            })
+        })
+    });
+    assert!(response.success, "{response:?}");
+    let task = response.data["task_id"].as_str().unwrap();
+    let done = terminal(ctx.bash_background(), task).await;
+    assert_eq!(done.exit_code, Some(0), "{}", done.output_preview);
+    assert!(
+        done.output_preview.contains("FALLBACK_WITHOUT_BROKER"),
+        "{}",
+        done.output_preview
+    );
+    assert!(
+        done.output_preview.contains("ran locally"),
+        "{}",
+        done.output_preview
+    );
+    assert!(!temp.join(".gh-read-capability").exists());
+    assert!(!temp.with_file_name("000000000001.gh-read.sock").exists());
+}

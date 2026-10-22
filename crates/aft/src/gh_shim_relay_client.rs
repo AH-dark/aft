@@ -53,6 +53,9 @@ const BINDINGS_CHECK_FILE: &str = "relay-bindings-check.json";
 /// Everything the relay needs from the process, gathered once so tests can
 /// supply a fake daemon and ticket without touching the environment.
 pub(super) struct RelayContext {
+    pub(super) worker_broker: Option<
+        Result<crate::gh_shim_worker_broker::Client, crate::gh_shim_worker_broker::ClientError>,
+    >,
     pub(super) connection_file: Option<PathBuf>,
     pub(super) ticket: Option<String>,
     pub(super) transient_delays: [Duration; 2],
@@ -62,9 +65,21 @@ pub(super) struct RelayContext {
 
 impl RelayContext {
     pub(super) fn from_process() -> Self {
+        let worker = std::env::var_os(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV).is_some()
+            || std::env::var_os(crate::gh_shim_worker_broker::SOCKET_ENV).is_some()
+            || std::env::var_os(crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV).is_some();
         Self {
-            connection_file: super::configured_connection_file(),
-            ticket: std::env::var(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV).ok(),
+            worker_broker: worker.then(crate::gh_shim_worker_broker::Client::from_process),
+            connection_file: if worker {
+                None
+            } else {
+                super::configured_connection_file()
+            },
+            ticket: if worker {
+                None
+            } else {
+                std::env::var(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV).ok()
+            },
             transient_delays: TRANSIENT_RETRY_DELAYS,
             relay_budget: relay_budget_from_process(),
         }
@@ -1150,6 +1165,31 @@ pub(super) fn worker_repository(relay: &RelayContext) -> Result<String, String> 
 }
 
 fn session_context(relay: &RelayContext) -> Result<Option<SessionContext>, String> {
+    if let Some(client) = &relay.worker_broker {
+        let client = client.as_ref().map_err(ToString::to_string)?;
+        let data = crate::gh_shim_worker_broker::request(
+            client,
+            crate::gh_shim_worker_broker::Operation::SessionContext,
+            relay.relay_budget,
+        )?;
+        let worker = data["worker"]
+            .as_bool()
+            .ok_or("broker omitted worker role")?;
+        let head = data["head"].as_bool().ok_or("broker omitted head role")?;
+        if !worker || head {
+            return Err("broker did not authenticate a worker".into());
+        }
+        let repository = data["repository"]
+            .as_str()
+            .filter(|r| super::canonical_repository_key(r).as_deref() == Some(*r))
+            .ok_or("broker returned an invalid repository")?
+            .to_string();
+        return Ok(Some(SessionContext {
+            worker,
+            head,
+            repository: Some(repository),
+        }));
+    }
     let Some(ticket) = relay.ticket.as_deref().filter(|ticket| !ticket.is_empty()) else {
         return Ok(None);
     };
@@ -1198,6 +1238,16 @@ fn session_context(relay: &RelayContext) -> Result<Option<SessionContext>, Strin
 /// Send one github_read request through AFT's ticket-authenticated management
 /// relay. Tool refusals remain Response bodies; Error frames are transport errors.
 pub(super) fn read_request(relay: &RelayContext, request: &Value) -> Result<Value, String> {
+    if let Some(client) = &relay.worker_broker {
+        let client = client.as_ref().map_err(ToString::to_string)?;
+        let request =
+            serde_json::from_value(request.clone()).map_err(|_| "invalid worker read request")?;
+        return crate::gh_shim_worker_broker::request(
+            client,
+            crate::gh_shim_worker_broker::Operation::ReadRequest { request },
+            relay.relay_budget,
+        );
+    }
     let ticket = relay
         .ticket
         .as_deref()

@@ -242,6 +242,7 @@ fn render_worker_keychain_denies(
     source: &mut String,
     profile: &SandboxProfile,
 ) -> Result<(), String> {
+    render_worker_broker_denies(source, profile)?;
     if !profile.worker_jail {
         return Ok(());
     }
@@ -269,6 +270,42 @@ fn render_worker_keychain_denies(
         ));
     }
     Ok(())
+}
+
+fn render_worker_broker_denies(
+    source: &mut String,
+    profile: &SandboxProfile,
+) -> Result<(), String> {
+    #[cfg(not(unix))]
+    {
+        let _ = (source, profile);
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        if !profile.worker_jail {
+            return Ok(());
+        }
+        // Broker endpoints are host-owned siblings of task temp directories.
+        // A worker may connect to its own endpoint, never another command's.
+        let name = profile
+            .temp_dir
+            .file_name()
+            .ok_or("worker temp has no name")?
+            .to_string_lossy();
+        let own_socket = profile
+            .temp_dir
+            .with_file_name(format!("{name}.gh-read.sock"));
+        let root = aft::sandbox_spawn::managed_task_temp_root()
+            .to_str()
+            .ok_or("broker root is not UTF-8")?;
+        source.push_str(&format!(
+        "(deny network-outbound (require-all (remote unix-socket (path-regex #\"^{}/[^/]+[.]gh-read[.]sock$\")) (require-not (path \"{}\"))))\n",
+        regex::escape(root),
+        escape_path(&own_socket)?
+    ));
+        Ok(())
+    }
 }
 
 /// The shim stats and resolves its marker before a no-report data-access query.
@@ -1163,5 +1200,37 @@ mod session_read_tests {
                 "{source}"
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod broker_root_render_tests {
+    use super::*;
+    #[test]
+    fn gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = aft::sandbox_spawn::managed_task_temp_root();
+        let own = root.join("0123456789ab");
+        let mut profile = SandboxProfile::build(
+            vec![fixture.path().to_owned()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            fixture.path().to_owned(),
+        )
+        .unwrap();
+        profile.worker_jail = true;
+        profile.temp_dir = own.clone();
+        let source = render_profile(&profile).unwrap();
+        let expected=format!("(deny network-outbound (require-all (remote unix-socket (path-regex #\"^{}/[^/]+[.]gh-read[.]sock$\")) (require-not (path \"{}\"))))",regex::escape(root.to_str().unwrap()),escape_path(&own.with_file_name("0123456789ab.gh-read.sock")).unwrap());
+        assert!(source.lines().any(|line|line==expected),"rendered worker socket rule must match the allocator namespace and exact own endpoint: {source}");
+        profile.worker_jail = false;
+        assert!(
+            !render_profile(&profile).unwrap().contains("gh-read[.]sock"),
+            "head profiles must not receive the worker socket restriction"
+        );
     }
 }

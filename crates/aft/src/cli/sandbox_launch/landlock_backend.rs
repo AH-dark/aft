@@ -334,15 +334,7 @@ fn close_inherited_fds() -> Result<(), String> {
     // there, so closing from 5 is defense-in-depth for a non-CLOEXEC leak,
     // not the primary descriptor-hygiene mechanism. This launcher preserves
     // only the exit and failure markers remapped to descriptors 3 and 4.
-    let result = unsafe { libc::syscall(libc::SYS_close_range, 5_u32, u32::MAX, 0_u32) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "failed to close inherited file descriptors before Landlock: {}",
-            std::io::Error::last_os_error()
-        ))
-    }
+    aft::launch_fds::close_inherited()
 }
 
 struct OpenedRulePath {

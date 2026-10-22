@@ -101,6 +101,33 @@ class BranchPatternTests(unittest.TestCase):
 
 
 class LightPREventGateTests(unittest.TestCase):
+    def test_worker_payload_probe_label_names_the_explicit_stdio_contract(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "crates/aft/tests/sandbox_launch_probe.rs").read_text()
+        self.assertTrue("fn task_store_paths_are_denied_while_explicit_stdin_remains_readable()" in source,
+                        "the payload probe must name its explicit-stdin contract")
+        self.assertFalse("fn task_store_paths_are_denied_while_held_payload_fd_remains_readable()" in source,
+                         "the old high-FD inheritance label must not overstate this probe")
+
+    def test_worker_read_landlock_is_required_and_emitted_for_every_main_event(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        required = (root / ".github/required-checks.txt").read_text().splitlines()
+        self.assertIn("Unit / Worker GitHub reads (required Landlock)", required)
+        workflow = workflow_gates.parse_workflow(str(root / ".github/workflows/tests.yml"))
+        for event in ("pull_request", "push"):
+            config = workflow["on"][event]
+            self.assertIn("main", config["branches"])
+            self.assertNotIn("paths", config)
+            self.assertNotIn("paths-ignore", config)
+        self.assertNotIn("if", workflow["jobs"]["unit"])
+        suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
+        job = suite["jobs"]["worker-gh-read-landlock"]
+        self.assertEqual(job["name"], "Worker GitHub reads (required Landlock)")
+        # Like every other unit leaf job it skips pull requests and runs in the
+        # merge queue and on main, so every commit that lands has passed it.
+        self.assertEqual(job["if"], "${{ github.event_name != 'pull_request' }}")
+        self.assertEqual(str(job["env"]["AFT_REQUIRE_LANDLOCK"]), "1")
+
     def test_pr_exclusion_is_an_event_warning_not_a_dead_train_ref_gate(self) -> None:
         self.assertEqual(workflow_gates.classify("${{ github.event_name != 'pull_request' }}"), "warn")
 
@@ -109,13 +136,13 @@ class LightPREventGateTests(unittest.TestCase):
             "${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}",
         ), "ref")
 
-    def test_prs_report_all_26_required_contexts_as_static_skipped_jobs(self) -> None:
+    def test_prs_report_all_27_required_contexts_including_the_live_worker_gate(self) -> None:
         root = Path(__file__).resolve().parents[2]
         required = {
             line for line in (root / ".github/required-checks.txt").read_text().splitlines()
             if line.startswith(("Unit / ", "E2E / "))
         }
-        self.assertEqual(len(required), 26)
+        self.assertEqual(len(required), 27)
         jobs = {}
         for caller, file in (("Unit", "_unit-suite.yml"), ("E2E", "_e2e-suite.yml")):
             suite = workflow_gates.parse_workflow(str(root / ".github/workflows" / file))

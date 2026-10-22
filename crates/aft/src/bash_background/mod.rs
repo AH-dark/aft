@@ -1041,13 +1041,9 @@ pub(crate) fn spawn(
     // The ticket lets this command's `gh` shim relay bot writes for the
     // session that spawned it. Dropping it on any early return revokes it; a
     // spawned task's terminal transition revokes it after `bind_task`.
-    let gh_shim_ticket = crate::gh_shim_ticket::PendingTicket::issue(
+    let gh_shim_ticket = crate::gh_shim_ticket::PendingTicket::issue_for_project(
         session_id,
-        &project_root
-            .as_deref()
-            .unwrap_or(&workdir)
-            .display()
-            .to_string(),
+        project_root.as_deref(),
     );
     if let Err(error) = crate::agent_child_env::inject(
         config.as_ref(),
@@ -1118,6 +1114,32 @@ pub(crate) fn spawn(
             (plan, Some(task))
         } else {
             let root = project_root.as_deref().unwrap_or(&workdir);
+            if crate::sandbox_spawn::worker_jail_active() && remote.is_some() {
+                // A host-local socket is not delegated to remote execution or
+                // its later local fallback. Neither path requires broker setup.
+                for key in [
+                    crate::gh_shim_worker_broker::SOCKET_ENV,
+                    crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV,
+                    crate::gh_shim_worker_broker::STATE_ENV,
+                ] {
+                    env.remove(key);
+                }
+                crate::slog_info!("gh_shim worker_read unavailable: task={} reason=remote launch or local fallback has no host broker; command continues without broker authority",task.paths.task_id.escape_debug());
+            }
+            if crate::sandbox_spawn::worker_jail_active()
+                && remote.is_none()
+                && plan.enforces_shell_containment()
+            {
+                crate::gh_shim_worker_broker::provision_optional(
+                    &gh_shim_ticket,
+                    &task.paths.task_id,
+                    plan.temp_dir(),
+                    std::time::Instant::now() + hard_kill.limit(),
+                    ctx.bash_background().clone(),
+                    &mut env,
+                    config.github.shim,
+                );
+            }
             enter_bash_startup_step(BashStartupStep::Environment);
             let environment = crate::sandbox_spawn::approved_environment_for_plan(&plan, &env);
             enter_bash_startup_step(BashStartupStep::ControlFiles);

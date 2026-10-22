@@ -633,6 +633,7 @@ fn v19_pr_ready_without_an_agent_session_never_falls_back_to_upstream() {
         agent_id: "alfonso-aft".into(),
     };
     let relay = RelayContext {
+        worker_broker: None,
         connection_file: None,
         ticket: None,
         transient_delays: [Duration::ZERO; 2],

@@ -112,7 +112,15 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
         }
         .canonicalize_for_launch()
         .map_err(|error| SandboxLaunchError::unavailable(error.to_string()));
-        let applied = profile.and_then(|profile| apply_sandbox(&profile));
+        let applied = profile.and_then(|profile| {
+            // Seal while still privileged: confinement must not be able to
+            // block descriptor flag changes. CLOEXEC keeps this launcher’s
+            // error write available but closes the channel in the target.
+            if let Some(fd) = args.failure_fd {
+                seal_failure_fd(fd).map_err(SandboxLaunchError::unavailable)?;
+            }
+            apply_sandbox(&profile)
+        });
         if let Err(error) = applied {
             if error.exit_code == SANDBOX_UNAVAILABLE_EXIT_CODE {
                 if let Some(path) = args.failure_marker.as_deref() {
@@ -325,12 +333,36 @@ fn write_failure_fd(fd: RawFd) -> std::io::Result<()> {
     file.write_all(b"sandbox_unavailable")
 }
 
+#[cfg(unix)]
+fn seal_failure_fd(fd: RawFd) -> Result<(), String> {
+    // Keep the channel available for launcher failures, but never delegate it
+    // to the successfully jailed executable, even in reserved marker slots.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF) {
+            return Ok(());
+        }
+        return Err(format!(
+            "cannot inspect failure descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(format!(
+            "cannot seal failure descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
     if profile.mode == aft::config::SandboxMode::Off {
         emit_off_worker_gh_warning(profile);
         return Ok(());
     }
+    aft::launch_fds::close_inherited().map_err(SandboxLaunchError::unavailable)?;
     seatbelt::apply(profile).map_err(|error| {
         SandboxLaunchError::unavailable(format!("failed to apply Seatbelt profile: {error}"))
     })?;

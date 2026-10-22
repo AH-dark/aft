@@ -211,6 +211,9 @@ fn linux_system_read_allow() -> Vec<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn landlock_available() -> bool {
+    if std::env::var("AFT_PROBE_FORCE_NO_LANDLOCK").as_deref() == Ok("1") {
+        return false;
+    }
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
         Command::new(AFT_BIN)
@@ -218,6 +221,31 @@ fn landlock_available() -> bool {
             .output()
             .is_ok_and(|output| output.status.success())
     })
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn launcher_fd_probe_required_mode_cannot_silently_skip() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "launcher_closes_late_inherited_listener_above_marker_slots",
+            "--nocapture",
+        ])
+        .env("AFT_REQUIRE_LANDLOCK", "1")
+        .env("AFT_PROBE_FORCE_NO_LANDLOCK", "1")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "mandatory fd probe must fail when the backend is unavailable, not return success"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("AFT_REQUIRE_LANDLOCK=1 but Landlock ABI is unavailable"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 macro_rules! skip_if_landlock_absent {
@@ -918,7 +946,7 @@ fn linux_vanished_listed_read_grant_launches_without_broadening_access() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn task_store_paths_are_denied_while_held_payload_fd_remains_readable() {
+fn task_store_paths_are_denied_while_explicit_stdin_remains_readable() {
     let root = tempfile::tempdir().expect("create task-store probe root");
     let store = root.path().join("bash-tasks/session");
     let own_control = store.join("bash-0000000000000001/control");
@@ -933,8 +961,8 @@ fn task_store_paths_are_denied_while_held_payload_fd_remains_readable() {
     fs::write(&own_payload_path, b"approved-payload\n").expect("write own payload");
     fs::write(&sibling_payload_path, b"sibling-secret\n").expect("write sibling payload");
     let own_payload = fs::File::open(&own_payload_path).expect("open own payload before sandbox");
-    let payload_fd = own_payload.as_raw_fd();
-    set_close_on_exec(payload_fd, false);
+    // Payloads intentionally carried by the caller use stdio; arbitrary
+    // inherited descriptors above the reserved marker slots are closed.
 
     let profile = SandboxProfile::build(
         vec![own_io],
@@ -949,14 +977,11 @@ fn task_store_paths_are_denied_while_held_payload_fd_remains_readable() {
     .expect("build task-store denial profile");
     let mut inherited = InheritedProfile::new(&profile);
     inherited.rewind();
-    let script = format!(
-        "cat /dev/fd/{payload_fd}; cat {}",
-        shell_path(&sibling_payload_path)
-    );
+    let script = format!("cat; cat {}", shell_path(&sibling_payload_path));
     let output = launcher_command(inherited.fd(), &["/bin/bash", "-c", &script])
+        .stdin(std::process::Stdio::from(own_payload))
         .output()
         .expect("launch task-store Seatbelt probe");
-    set_close_on_exec(payload_fd, true);
 
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
@@ -1688,4 +1713,97 @@ fn shell_cannot_write_saved_task_output() {
         assert_denied(&output, "saved output write");
     }
     assert_eq!(fs::read(&outputs.own.stdout).unwrap(), b"saved-output\n");
+}
+
+#[test]
+fn launcher_closes_late_inherited_listener_above_marker_slots() {
+    #[cfg(target_os = "linux")]
+    skip_if_landlock_absent!();
+    use std::os::unix::process::CommandExt;
+    let mut fixture = ProbeFixture::new();
+    let listener =
+        std::os::unix::net::UnixListener::bind(fixture.project.join("listener.sock")).unwrap();
+    let source = listener.as_raw_fd();
+    let profile_fd = fixture.profile.fd();
+    fixture.profile.rewind();
+    let script="import errno,os\nfor fd in [5,10,128]:\n try:\n  os.fstat(fd)\n except OSError as e:\n  assert e.errno == errno.EBADF\n else:\n  raise AssertionError('inherited broker listener remained open')\nprint('LATE_LISTENERS_CLOSED')\n";
+    let mut command = launcher_command(131, &["python3", "-c", script]);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(profile_fd, 131) < 0 || libc::fcntl(131, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for target in [5, 10, 128] {
+                if libc::dup2(source, target) < 0 || libc::fcntl(target, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if ![5, 10, 128, 131].contains(&source) {
+                libc::close(source);
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("LATE_LISTENERS_CLOSED"));
+}
+
+#[test]
+fn launcher_failure_marker_cannot_be_forged_by_jailed_exec() {
+    #[cfg(target_os = "linux")]
+    skip_if_landlock_absent!();
+    use std::os::unix::process::CommandExt;
+    for slot in [3, 4] {
+        let mut fixture = ProbeFixture::new();
+        fixture.profile.rewind();
+        let marker_path = fixture.outside_home.join("supervisor-failure-marker");
+        let marker = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker_path)
+            .unwrap();
+        let profile_fd = fixture.profile.fd();
+        let marker_fd = marker.as_raw_fd();
+        let script="import errno,os,sys\nfd=int(sys.argv[1])\ntry:\n os.write(fd,b'sandbox_unavailable')\nexcept OSError as e:\n assert e.errno==errno.EBADF\n print('FAILURE_MARKER_CLOSED')\nelse:\n raise AssertionError('jailed exec can forge sandbox_unavailable')\n";
+        let mut command = Command::new(AFT_BIN);
+        command.args([
+            "sandbox-launch",
+            "--profile-fd",
+            "130",
+            "--failure-fd",
+            &slot.to_string(),
+            "--",
+            "python3",
+            "-c",
+            script,
+            &slot.to_string(),
+        ]);
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(profile_fd, 130) < 0 || libc::fcntl(130, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(marker_fd, slot) < 0 || libc::fcntl(slot, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "reserved failure slot {slot} reached jailed exec: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("FAILURE_MARKER_CLOSED"));
+        assert!(
+            fs::read(marker_path).unwrap().is_empty(),
+            "the supervisor's marker must remain unforgeable"
+        );
+    }
 }

@@ -1,0 +1,154 @@
+use super::*;
+use std::time::{Duration, Instant};
+
+fn exercise(kind: &str, shim_enabled: bool, service_available: bool) {
+    use crate::config::SandboxMode;
+    use crate::sandbox_spawn::{with_spawn_plan_for_test, with_worker_jail, SpawnPlan};
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let temp = project.path().join("000000000001");
+    std::fs::create_dir(&temp).unwrap();
+    let marker = project.path().join("command-ran");
+    let release = project.path().join("release");
+    let launcher_profile = project.path().join("observed-profile.json");
+    // This fixture observes the production spawn/PTY adapters, not OS isolation.
+    // A real native jail is covered separately by the unchanged security suite.
+    std::fs::write(
+        project.path().join("sandbox-launch"),
+        format!(
+        "printf '%s' \"$2\" > '{}'; while [ \"$1\" != -- ]; do shift; done; shift; exec \"$@\"\n",
+        launcher_profile.display(),
+    ),
+    )
+    .unwrap();
+    let mut profile = crate::sandbox_profile::SandboxProfile::build(
+        vec![project.path().to_owned()],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        temp.clone(),
+    )
+    .unwrap();
+    profile.mode = SandboxMode::Strict;
+    let plan = SpawnPlan::launcher_for_test(profile, PathBuf::from("/bin/sh"));
+    let ctx = spawn_test_context(project.path(), storage.path());
+    ctx.update_config(|config| {
+        config.github.shim = shim_enabled;
+        config.sandbox.profile.worker = SandboxMode::Strict;
+        config.git.co_author = "off".into();
+    });
+    let mut command = if service_available {
+        format!("test -S \"$AFT_GH_READ_SOCKET\" && test -r \"$AFT_GH_READ_CAPABILITY_FILE\" && test -z \"${{AFT_GH_SHIM_TICKET+x}}\" && printf BROKER_PROVIDED > '{}'", marker.display())
+    } else {
+        format!("test -z \"${{AFT_GH_READ_SOCKET+x}}\" && test -z \"${{AFT_GH_READ_CAPABILITY_FILE+x}}\" && test -z \"${{AFT_GH_SHIM_TICKET+x}}\" && test -z \"${{AFT_GH_SHIM_STATE_DIR+x}}\" && printf BROKER_ABSENT > '{}'", marker.display())
+    };
+    if kind == "promoted" {
+        command.push_str(&format!(
+            "; while ! test -f '{}'; do sleep .02; done",
+            release.display()
+        ));
+    }
+    let mut request =
+        spawn_test_request(&format!("optional-{kind}"), &command, kind == "background");
+    if kind == "pty" {
+        request.params["pty"] = json!(true);
+    }
+    let run = || {
+        let (response, logs) = crate::logging::capture_log_lines(|| {
+            with_worker_jail(true, || {
+                with_spawn_plan_for_test(plan, || handle(&request, &ctx))
+            })
+        });
+        if !service_available {
+            assert!(
+                logs.iter().any(
+                    |line| line.contains("command continues without broker authority")
+                        && line.contains(if shim_enabled {
+                            "no daemon scope service"
+                        } else {
+                            "shim is disabled"
+                        })
+                ),
+                "{logs:?}"
+            );
+        }
+        assert!(
+            response.success,
+            "{kind}: optional broker must not prevent startup: {response:?}"
+        );
+        let task = response.data["task_id"].as_str().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let expected = if service_available {
+            "BROKER_PROVIDED"
+        } else {
+            "BROKER_ABSENT"
+        };
+        while std::fs::read_to_string(&marker).ok().as_deref() != Some(expected) {
+            assert!(
+                Instant::now() < deadline,
+                "{kind}: child did not run: {:?}",
+                ctx.bash_background()
+                    .status(task, "sandbox-spawn-test", None, None, 4096)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), expected);
+        let observed: crate::sandbox_profile::SandboxProfile =
+            serde_json::from_slice(&std::fs::read(&launcher_profile).unwrap()).unwrap();
+        assert_eq!(
+            observed.mode,
+            SandboxMode::Strict,
+            "broker absence must not downgrade confinement"
+        );
+        if !service_available {
+            assert!(!temp.join(".gh-read-capability").exists());
+            assert!(!temp.with_file_name("000000000001.gh-read.sock").exists());
+        }
+        if kind == "promoted" {
+            assert!(ctx
+                .bash_background()
+                .promote(task, "sandbox-spawn-test")
+                .unwrap());
+            assert!(
+                !temp.join(".gh-read-capability").exists(),
+                "promotion must not mint a grant"
+            );
+            std::fs::write(&release, "release").unwrap();
+        }
+        stop_spawned_test_task(&ctx, &response);
+    };
+    if service_available {
+        crate::gh_shim_worker_broker::with_available_service_for_test(project.path(), run);
+    } else {
+        crate::gh_shim_worker_broker::without_service_for_test(run);
+    }
+}
+
+#[test]
+fn optional_worker_broker_foreground_without_service_runs() {
+    exercise("foreground", true, false);
+}
+#[test]
+fn optional_worker_broker_background_without_service_runs() {
+    exercise("background", true, false);
+}
+#[test]
+fn optional_worker_broker_pty_without_service_runs() {
+    exercise("pty", true, false);
+}
+#[test]
+fn optional_worker_broker_promoted_without_service_runs() {
+    exercise("promoted", true, false);
+}
+#[test]
+fn optional_worker_broker_disabled_shim_runs() {
+    exercise("foreground", false, false);
+}
+#[tokio::test]
+async fn optional_worker_broker_spawn_with_service_is_still_provided() {
+    let _state = crate::test_env::gh_shim_state_guard();
+    exercise("foreground", true, true);
+}

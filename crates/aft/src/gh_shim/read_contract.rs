@@ -7,6 +7,50 @@ use serde_json::Value;
 
 pub(crate) const MAX_REPLY_BYTES: u64 = 1_048_576;
 
+// Pagination; native renderers' content/run filters; ordinary repository REST
+// filters. Query language, URL/method selection and header keys are not authority
+// that a worker GET may delegate to the upstream provider.
+#[cfg(unix)]
+pub(crate) const WORKER_GET_QUERY_KEYS: &[&str] = &[
+    // Shared list pagination.
+    "page",
+    "per_page",
+    // Filters emitted by native content and workflow/run renderers.
+    "ref",
+    "branch",
+    "head_sha",
+    "event",
+    "actor",
+    "status",
+    "check_suite_id",
+    // Repository-local REST filters; none selects a host, method or principal.
+    "state",
+    "labels",
+    "milestone",
+    "assignee",
+    "creator",
+    "mentioned",
+    "since",
+    "sort",
+    "direction",
+    "base",
+    "head",
+    "path",
+    "sha",
+];
+#[cfg(unix)]
+const MAX_WORKER_QUERY_PAIRS: usize = 16;
+#[cfg(unix)]
+const MAX_WORKER_QUERY_VALUE_BYTES: usize = 4096;
+
+#[derive(Debug)]
+#[cfg(unix)]
+pub(crate) struct WorkerReadRefusal {
+    pub code: &'static str,
+    pub key: Option<String>,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, tag = "action")]
 pub(crate) enum Request {
@@ -70,6 +114,141 @@ pub(crate) struct LogArgs {
 }
 
 impl Request {
+    /// Decode once at the worker boundary. Keep a slash-containing reference in
+    /// its one API segment; no other encoded separator or second decode is valid.
+    #[cfg(unix)]
+    pub(crate) fn canonicalize_worker_path(&mut self) -> Result<(), WorkerReadRefusal> {
+        let Self::Get { args, .. } = self else {
+            return Ok(());
+        };
+        let invalid = |message: &str| WorkerReadRefusal {
+            code: "worker_path_invalid",
+            key: None,
+            message: message.into(),
+        };
+        if args.path.is_empty() {
+            return Ok(());
+        }
+        let mut parts = Vec::new();
+        for part in args.path.split('/') {
+            let mut bytes = Vec::new();
+            let mut input = part.as_bytes().iter().copied();
+            while let Some(byte) = input.next() {
+                if byte == b'%' {
+                    let high = input.next().and_then(|byte| (byte as char).to_digit(16));
+                    let low = input.next().and_then(|byte| (byte as char).to_digit(16));
+                    let (Some(high), Some(low)) = (high, low) else {
+                        return Err(invalid("worker path has malformed percent encoding"));
+                    };
+                    bytes.push((high * 16 + low) as u8);
+                } else {
+                    bytes.push(byte);
+                }
+            }
+            let decoded = String::from_utf8(bytes)
+                .map_err(|_| invalid("worker path must decode as UTF-8"))?;
+            if decoded.contains('%') || decoded.chars().any(char::is_control) {
+                return Err(invalid(
+                    "worker path forbids double encoding and control characters",
+                ));
+            }
+            parts.push(decoded);
+        }
+        if parts[0].eq_ignore_ascii_case("graphql") {
+            return Err(WorkerReadRefusal {
+                code: "worker_graphql_not_supported",
+                key: None,
+                message: "worker reads do not support GraphQL paths".into(),
+            });
+        }
+        let names: Vec<_> = parts.iter().map(String::as_str).collect();
+        let reference = match names.as_slice() {
+            ["branches", _]
+            | ["branches", _, "protection"]
+            | ["branches", _, "protection", "required_status_checks"]
+            | ["commits", _]
+            | ["commits", _, "status" | "statuses" | "check-runs"] => Some(1),
+            ["releases", "tags", _] => Some(2),
+            _ => None,
+        };
+        for (index, part) in parts.iter().enumerate() {
+            if part.split('/').any(|part| matches!(part, "" | "." | ".."))
+                || (part.contains('/') && reference != Some(index))
+            {
+                return Err(invalid(
+                    "worker path separators and dot segments cannot change endpoint structure",
+                ));
+            }
+        }
+        let canonical = parts
+            .iter()
+            .map(|part| part.replace('/', "%2F"))
+            .collect::<Vec<_>>()
+            .join("/");
+        validate_path(&canonical).map_err(|message| invalid(&message))?;
+        args.path = canonical;
+        Ok(())
+    }
+
+    /// Extra policy for the new worker broker only. Existing head/operator
+    /// executor paths retain their query behavior and call validate instead.
+    #[cfg(unix)]
+    pub(crate) fn validate_worker_query(&self) -> Result<(), WorkerReadRefusal> {
+        let Self::Get { args, .. } = self else {
+            return Ok(());
+        };
+        if args
+            .path
+            .split('/')
+            .next()
+            .is_some_and(|part| part.eq_ignore_ascii_case("graphql"))
+        {
+            return Err(WorkerReadRefusal {
+                code: "worker_graphql_not_supported",
+                key: None,
+                message: "worker reads do not support GraphQL paths".into(),
+            });
+        }
+        if args.query.len() > MAX_WORKER_QUERY_PAIRS {
+            return Err(WorkerReadRefusal {
+                code: "worker_query_too_many_pairs",
+                key: None,
+                message: format!("worker GET permits at most {MAX_WORKER_QUERY_PAIRS} query pairs"),
+            });
+        }
+        for (key, value) in &args.query {
+            if !WORKER_GET_QUERY_KEYS.contains(&key.as_str()) {
+                return Err(WorkerReadRefusal {
+                    code: "worker_query_key_not_allowed",
+                    key: Some(key.clone()),
+                    message: format!(
+                        "worker GET query key {key:?} is not allowed. Allowed keys: {}",
+                        WORKER_GET_QUERY_KEYS.join(", ")
+                    ),
+                });
+            }
+            if value.len() > MAX_WORKER_QUERY_VALUE_BYTES {
+                return Err(WorkerReadRefusal { code:"worker_query_value_too_long", key:Some(key.clone()), message:format!("worker GET query value for {key:?} exceeds {MAX_WORKER_QUERY_VALUE_BYTES} bytes") });
+            }
+            if value.chars().any(char::is_control) {
+                return Err(WorkerReadRefusal {
+                    code: "worker_query_value_invalid",
+                    key: Some(key.clone()),
+                    message: format!(
+                        "worker GET query value for {key:?} contains control characters"
+                    ),
+                });
+            }
+            // The upstream provider constructs the final URL. Do not depend on
+            // query escaping to prevent a worker value from adding/truncating
+            // pairs, including a second decode of an encoded delimiter.
+            if value.contains(['&', '=', '#', '%']) {
+                return Err(WorkerReadRefusal {code:"worker_query_value_ambiguous",key:Some(key.clone()),message:format!("worker GET query value for {key:?} must not contain &, =, # or percent escapes")});
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn repository(&self) -> &str {
         match self {
             Self::Get { repository, .. }

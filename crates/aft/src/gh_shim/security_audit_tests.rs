@@ -218,6 +218,7 @@ fn audit_v19_status_matches_legacy_bytes_even_with_a_lookup_record() {
 
 fn relay(ticket: Option<&str>) -> RelayContext {
     RelayContext {
+        worker_broker: None,
         connection_file: None,
         ticket: ticket.map(str::to_string),
         transient_delays: [Duration::ZERO; 2],
@@ -816,6 +817,7 @@ fn audit_worker_speech_still_uses_governed_relay_not_native_gh() {
     let file = fixture.home.path().join("connection.json");
     daemon.write_connection_file(&file);
     let relay = RelayContext {
+        worker_broker: None,
         connection_file: Some(file),
         ticket: Some("worker-ticket".into()),
         transient_delays: [Duration::ZERO; 2],

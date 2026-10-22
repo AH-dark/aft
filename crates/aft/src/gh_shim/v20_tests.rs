@@ -443,6 +443,7 @@ fn v20_head_and_older_manifests_keep_mechanical_classification() {
             .is_none()
     );
     let relay = RelayContext {
+        worker_broker: None,
         connection_file: None,
         ticket: None,
         transient_delays: [Duration::ZERO; 2],
@@ -930,6 +931,7 @@ fn v20_missing_ticket_refuses_without_delegation_or_credentials() {
     };
     let manifest = manifest();
     let relay = RelayContext {
+        worker_broker: None,
         connection_file: None,
         ticket: None,
         transient_delays: [Duration::ZERO; 2],
@@ -1123,6 +1125,7 @@ fn v20_executor_uses_pinned_plexus_repo_get_request_and_success() {
     };
     let manifest = manifest();
     let relay = RelayContext {
+        worker_broker: None,
         connection_file: None,
         ticket: Some("test-ticket".into()),
         transient_delays: [Duration::ZERO; 2],
@@ -1409,4 +1412,58 @@ fn audit_search_repository_json_is_refused_before_any_result_relabeling() {
         )
         .is_ok());
     }
+}
+
+#[test]
+fn v20_broker_t7_worker_discovery_never_loads_general_connection() {
+    let _lock = crate::test_env::process_env_lock();
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("cortexkit");
+    std::fs::create_dir_all(&config).unwrap();
+    let connection = root.path().join("general-connection.json");
+    std::fs::write(&connection, "not-a-real-general-credential").unwrap();
+    std::fs::write(
+        config.join("aft.jsonc"),
+        serde_json::to_vec(&json!({"subc":{"connection_file":connection}})).unwrap(),
+    )
+    .unwrap();
+    let changes = [
+        (
+            "XDG_CONFIG_HOME",
+            root.path().to_string_lossy().into_owned(),
+        ),
+        ("AFT_GH_SHIM_WORKER", "1".into()),
+        ("AFT_GH_SHIM_TICKET", "outer-command-ticket".into()),
+        (
+            "AFT_GH_READ_SOCKET",
+            root.path().join("broker.sock").display().to_string(),
+        ),
+        (
+            "AFT_GH_READ_CAPABILITY_FILE",
+            root.path().join("capability").display().to_string(),
+        ),
+    ];
+    let saved: Vec<_> = changes
+        .iter()
+        .map(|(key, _)| (*key, std::env::var_os(key)))
+        .collect();
+    for (key, value) in &changes {
+        std::env::set_var(key, value);
+    }
+    let context = RelayContext::from_process();
+    for (key, value) in saved {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+    assert!(context.worker_broker.is_some());
+    assert!(
+        context.ticket.is_none(),
+        "a worker must never retain the general relay ticket"
+    );
+    assert!(
+        context.connection_file.is_none(),
+        "a worker must never discover the general daemon credential"
+    );
 }

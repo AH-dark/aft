@@ -405,3 +405,83 @@ Audit line: `{as_of_unix_secs, tuple: "label create", repository, label, color}`
 
 Without the bypass it refuses as `gh_shim_unclassified`. `label delete` and
 `label edit` stay undeclared.
+
+## Worker broker security boundary and GET query contract
+
+Worker reads use a command-scoped bearer at a dedicated Unix socket. This
+boundary separates **independently jailed commands**; it does not isolate an
+unsandboxed process owned by the same user. Such a process can read a mode-0600
+capability file and use its matching endpoint. The host and other unsandboxed
+same-user processes are trusted. Processes within an authorized command may
+intentionally delegate its read capability until command revocation. Neither a
+particular `gh` executable nor process ancestry is authenticated by the bearer.
+
+The daemon derives the command identity, live scope and repository binding; it
+admits only session-context lookup and the typed governed read operation. The
+worker's signed manifest snapshot is not daemon authority, and the daemon checks
+its own active v20-or-later manifest before serving reads.
+
+Only the worker broker's `github.repo.get` query map has the following closed
+key set. Existing operator/head execution paths retain their current behavior.
+
+- Pagination: `page`, `per_page`.
+- Native content/run reads: `ref`, `branch`, `head_sha`, `event`, `actor`, `status`,
+  `check_suite_id`.
+- Repository REST filters: `state`, `labels`, `milestone`, `assignee`, `creator`,
+  `mentioned`, `since`, `sort`, `direction`, `base`, `head`, `path`, `sha`.
+
+At most 16 pairs are permitted; each decoded value is at most 4096 UTF-8 bytes
+and must contain no control characters. Unknown keys, including `q`, `query`,
+`url`, `method`, and header-like keys, are refused before upstream work with a
+typed refusal naming the key and listing the allowed keys. Dedicated search
+requests still accept an unqualified search term; repository/organization/user
+qualifiers, boolean operators and parentheses remain forbidden there. A GET
+request cannot substitute a GraphQL endpoint.
+
+Revocation invalidates the registry grant and closes the endpoint and its
+connections. Production relay operations own cancellation-safe, bounded route
+cleanup rather than relying on a canceled client's future to release a lease.
+Endpoint ownership records and generation locks live outside worker-writable
+scratch; startup reclaims endpoints of dead generations without PID-based
+ownership guesses or deleting a live replacement.
+
+On Linux, pathname AF_UNIX connection itself is not restricted by the deployed
+Landlock ABI, so capability-file isolation is essential. A separately jailed
+command can also consume another command's **pre-authentication** socket slots
+without learning its capability. Per-endpoint/global caps and short frame
+read deadlines bound the resources, but repeated connections can still starve
+reads. This is a known availability limit, not cross-command read authority.
+
+Worker GET paths are decoded exactly once before policy checks. Encoded GraphQL,
+malformed/double encoding, dot segments and control characters are refused. A
+slash-containing branch, commit or release-tag reference remains encoded as
+`%2F` in its designated single endpoint segment; other encoded slashes cannot
+change endpoint structure. AFT forwards the canonical checked path, not the
+caller's alternate spelling. This worker-only rule does not alter existing
+head/operator path behavior.
+
+Query pairs are sent to the upstream provider as typed JSON strings; AFT does not
+construct the final GitHub URL and does not attest the downstream URL encoder.
+Worker GET values therefore refuse `&`, `=`, `#` and percent escapes as well as
+control characters. This prevents a value such as `state=open&x=y` from reaching
+that boundary as an extra or truncated parameter. Existing head/operator query
+values retain their previous behavior.
+
+### Regression labels and their actual scope
+
+Two test names changed between the earlier broker implementation and its
+lifecycle fixes; a third payload name was left stale and is corrected now:
+
+- `gh_shim_broker_revocation_discards_in_flight_reply` became
+  `gh_shim_broker_revocation_during_lookup_refuses_before_upstream`: the original
+  case revokes during lookup and requires **zero** upstream calls. Its old name
+  was reused for a separately added test with one held upstream call and a
+  post-revocation discarded result; that is not a third historical rename.
+- `worker_gh_read_t10_cancel_midflight_discards_the_upstream_reply` became
+  `worker_gh_read_t10_cancel_midflight_terminates_reader_without_output`: it kills
+  the reader and observes no output. Independent broker suppression is proved
+  by `worker_gh_read_revocation_suppresses_reply_to_surviving_observer` instead.
+- `task_store_paths_are_denied_while_held_payload_fd_remains_readable` now becomes
+  `task_store_paths_are_denied_while_explicit_stdin_remains_readable`: approved
+  payload bytes arrive deliberately through stdin while sibling-store reads
+  are denied. It does not claim arbitrary high-descriptor inheritance.

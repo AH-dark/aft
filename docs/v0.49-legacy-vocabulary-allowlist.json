@@ -3275,6 +3275,17 @@
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
+      "path": "crates/aft/tests/worker_jail.rs",
+      "line": 3706,
+      "column": 53,
+      "token": "filePath",
+      "text": "assert!(read[\"input_schema\"][\"properties\"].get(\"filePath\").is_none());",
+      "location": "line 3706, column 53",
+      "ordinal": 1,
+      "class": "compatibility-fixture",
+      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
+    },
+    {
       "path": "docs/design/opencode-v2-plugin-playbook.md",
       "line": 75,
       "column": 15,
