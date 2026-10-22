@@ -984,8 +984,16 @@ mod tests {
     #[test]
     fn slow_edit_line_carries_argument_shape_and_phase_times_but_never_text() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        // Not plain canonicalize: on Windows that returns a verbatim
+        // `\\?\C:\...` path, whose `?` makes the edit translator treat the
+        // target as a possible glob and route the call to `edit_match`
+        // instead of `batch`, which this test pins.
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
         let file = root.join("private-name.ts");
+        assert!(
+            !crate::commands::edit_match::is_glob_pattern(&file.display().to_string()),
+            "test path {file:?} has glob characters"
+        );
         std::fs::write(&file, "const value = 1;\n").unwrap();
         let ctx = AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
@@ -1001,13 +1009,14 @@ mod tests {
             &root,
             serde_json::json!({"path": file, "oldString": missing, "newString": replacement}),
         );
+        let expected = format!(
+            " wait_ms=0 cmd=batch target=file edits=1 match_bytes={} replacement_bytes={} outcome=batch_edit_failed root=/repo",
+            missing.len(),
+            replacement.len()
+        );
         assert!(
-            failed.contains(&format!(
-                " wait_ms=0 cmd=batch target=file edits=1 match_bytes={} replacement_bytes={} outcome=batch_edit_failed root=/repo",
-                missing.len(),
-                replacement.len()
-            )),
-            "{failed}"
+            failed.contains(&expected),
+            "expected {expected:?}\nin full slow-call line {failed:?}"
         );
 
         let applied = slow_edit_line(
@@ -1015,9 +1024,10 @@ mod tests {
             &root,
             serde_json::json!({"path": file, "oldString": "value = 1", "newString": "SECRET-NEW = 2"}),
         );
+        let expected = " cmd=batch target=file edits=1 match_bytes=9 replacement_bytes=14 outcome=ok edit_phases=backup:";
         assert!(
-            applied.contains(" cmd=batch target=file edits=1 match_bytes=9 replacement_bytes=14 outcome=ok edit_phases=backup:"),
-            "{applied}"
+            applied.contains(expected),
+            "expected {expected:?}\nin full slow-call line {applied:?}"
         );
         for phase in [
             "write:",
