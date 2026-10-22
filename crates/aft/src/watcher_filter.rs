@@ -3918,57 +3918,65 @@ mod tests {
             6
         );
 
-        // The first two workers outlive their callers' deadlines. Release their
-        // worker permits without changing any root's matcher generation, then
-        // drive WatcherExclusionRetry as the native backend poll loops do.
+        // The first two workers outlive their callers' deadlines. Release them
+        // and wait until both have returned their permits: until then the
+        // retries below would race those workers for capacity.
         drop(releases);
-        thread::scope(|scope| {
-            let retries = roots
-                .into_iter()
-                .map(|(root, path, matcher, mut retry, counters, _)| {
-                    let pool = pool.clone();
-                    scope.spawn(move || {
-                        let worker_path = path.clone();
-                        let worker_matcher = matcher.clone();
-                        let plan = retry
-                            .attempt_at(
-                                &path,
-                                1,
-                                &counters,
-                                Instant::now() + Duration::from_secs(10),
-                                || {
-                                    run_bounded_exclusion_planner(
-                                        Duration::from_secs(2),
-                                        pool,
-                                        move || {
-                                            derive_exclusion_plan(
-                                                &worker_path,
-                                                &worker_matcher,
-                                                Some(WATCHER_EXCLUSION_LIMIT),
-                                                crate::watcher_backend::BACKEND_EXCLUSION_COVERAGE,
-                                            )
-                                        },
-                                    )
-                                },
-                            )
-                            .expect("an unavailable generation must not be consumed")
-                            .expect("capacity is free");
-                        assert!(
-                            watcher_exclusion_paths(&plan.selected).contains(&path.join("target")),
-                            "same-generation retry must install target/: {plan:?}"
-                        );
-                        let health = counters.snapshot().exclusion_planning.unwrap();
-                        assert_eq!(health.matcher_generation, 1);
-                        assert_eq!(health.attempts, 2);
-                        assert_eq!(health.status, "planned");
-                        drop(root);
-                    })
-                })
-                .collect::<Vec<_>>();
-            for retry in retries {
-                retry.join().unwrap();
+        {
+            let hang_guard = Instant::now() + Duration::from_secs(60);
+            let mut in_flight = pool.in_flight.lock().unwrap();
+            while *in_flight > 0 {
+                let remaining = hang_guard.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "released planner workers never returned their permits"
+                );
+                in_flight = pool.available.wait_timeout(in_flight, remaining).unwrap().0;
             }
-        });
+        }
+
+        // Drive WatcherExclusionRetry for each root in turn, as a native
+        // backend poll loop does, without changing any root's matcher
+        // generation. Each plan is computed before its attempt, so the
+        // bounded worker only returns it and the attempt's 2 s budget does not
+        // time the filesystem walk. That budget covers both the wait for a
+        // permit and the plan: on a loaded Windows runner one plan of these
+        // small roots took up to 1.2 s, and eight concurrent retries planning
+        // inside it ran out of time while queued for the pool's two permits.
+        // The attempt still takes a permit from the shared pool.
+        for (root, path, matcher, mut retry, counters, _) in roots {
+            let planned = derive_exclusion_plan(
+                &path,
+                &matcher,
+                Some(WATCHER_EXCLUSION_LIMIT),
+                crate::watcher_backend::BACKEND_EXCLUSION_COVERAGE,
+            );
+            let plan = retry
+                .attempt_at(
+                    &path,
+                    1,
+                    &counters,
+                    Instant::now() + Duration::from_secs(10),
+                    || {
+                        run_bounded_exclusion_planner(
+                            Duration::from_secs(2),
+                            pool.clone(),
+                            move || planned,
+                        )
+                    },
+                )
+                .expect("an unavailable generation must not be consumed")
+                .expect("capacity is free");
+            assert!(
+                watcher_exclusion_paths(&plan.selected).contains(&path.join("target")),
+                "same-generation retry must install target/: {plan:?}"
+            );
+            let health = counters.snapshot().exclusion_planning.unwrap();
+            assert_eq!(health.matcher_generation, 1);
+            assert_eq!(health.attempts, 2);
+            assert_eq!(health.status, "planned");
+            drop(root);
+        }
     }
 
     fn assert_unavailable_generation_replan(keep_target_ignored: bool) {
