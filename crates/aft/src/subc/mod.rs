@@ -8307,13 +8307,21 @@ async fn submit_provider_read(
             };
             if job_operation == "tool.catalog" {
                 if let Err(error) = &result {
+                    // Name the refused field and AFT's own message so a refused plan
+                    // fetch can be diagnosed from this line alone; the consumer may
+                    // surface only the code. Both are debug-quoted because the field
+                    // can carry a caller-chosen parameter name, which must not be able
+                    // to break the line or forge another log entry.
                     log::warn!(
-                        "tool.catalog fetch failed session={} channel={} epoch={} corr={} error_code={}",
+                        "tool.catalog fetch failed session={} channel={} epoch={} corr={} error_code={} field={:?} message={:?}",
                         job_session,
                         route.channel,
                         route.epoch,
                         corr,
-                        error.code
+                        error.code,
+                        cortexkit_role_tool_provider::errors::invalid_request_field(error)
+                            .unwrap_or("-"),
+                        error.message
                     );
                 }
             }
