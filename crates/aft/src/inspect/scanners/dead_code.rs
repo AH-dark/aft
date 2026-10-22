@@ -1766,25 +1766,28 @@ fn materialize_dead_code_contributions(
             }
             for call in &mut internal_calls {
                 if let Some(items) = rust_items_by_file.get(&contribution.file) {
-                    call.caller_symbol = rust_method_node(items, &call.caller_symbol)
-                        .unwrap_or_else(|| {
-                            rust_function_identity(
-                                items,
-                                &call.caller_symbol,
-                                Some(call.line),
-                                None,
-                            )
-                        });
+                    call.caller_symbol =
+                        rust_method_node(items, &call.caller_symbol, Some(call.line))
+                            .unwrap_or_else(|| {
+                                rust_function_identity(
+                                    items,
+                                    &call.caller_symbol,
+                                    Some(call.line),
+                                    None,
+                                )
+                            });
                 }
                 if let Some(items) = rust_items_by_file.get(&call.file) {
-                    call.symbol = rust_method_node(items, &call.symbol).unwrap_or_else(|| {
-                        rust_function_identity(
-                            items,
-                            &call.symbol,
-                            None,
-                            (call.file == contribution.file).then_some(call.caller_symbol.as_str()),
-                        )
-                    });
+                    call.symbol =
+                        rust_method_node(items, &call.symbol, None).unwrap_or_else(|| {
+                            rust_function_identity(
+                                items,
+                                &call.symbol,
+                                None,
+                                (call.file == contribution.file)
+                                    .then_some(call.caller_symbol.as_str()),
+                            )
+                        });
                 }
                 // An edge to a struct, enum or other type declaration carries no
                 // test status: production code uses types through type
@@ -1889,7 +1892,7 @@ fn materialize_dead_code_contributions(
             // the same method node as the edges above.
             if let Some(items) = rust_items_by_file.get(&contribution.file) {
                 for root in &mut liveness_roots {
-                    if let Some(node) = rust_method_node(items, root) {
+                    if let Some(node) = rust_method_node(items, root, None) {
                         *root = node;
                     }
                 }
@@ -5080,49 +5083,96 @@ fn rust_export_identity(export: &ExportContribution, facts: Option<&RustApiFacts
 /// The graph node of a method named with its impl, such as `Config::production`
 /// or `Display for Config::fmt` (how source scans name a method, optionally
 /// behind its module path). The stored callgraph and the export rows name a
-/// method by its own name only. When exactly one impl in this file defines a
-/// method with that name, both spellings denote the same declaration, so it
-/// maps to the short name and the method has one node. Same-named methods of
-/// several types keep their separate impl-qualified nodes. Anything else
-/// returns `None`.
-fn rust_method_node(items: &[RustApiItem], symbol: &str) -> Option<String> {
+/// method by its own name only. When exactly one impl in this file (one type
+/// and trait) defines a method with that name, both spellings denote the same
+/// declaration, so it maps to the short name and the method has one node.
+/// Same-named methods of several types keep their separate impl-qualified
+/// nodes.
+///
+/// The name must denote that method and nothing else. A module path written
+/// before the type must be the impl's own module. A free function whose
+/// module-qualified name ends with the same path (`mod Config { fn
+/// production() }` beside `impl Config { fn production() }` in another
+/// module) may be what the name means, so the name keeps its own node. For a
+/// caller, `caller_line` (a line inside the caller's body) decides instead:
+/// the caller is the nearest same-named declaration starting at or before
+/// it, and only that impl's method maps. Anything else returns `None`.
+fn rust_method_node(
+    items: &[RustApiItem],
+    symbol: &str,
+    caller_line: Option<u32>,
+) -> Option<String> {
     let (prefix, name) = symbol.rsplit_once("::")?;
     let type_name = |path: &str| {
         let path = path.split('<').next().unwrap_or(path).trim();
         path.rsplit("::").next().unwrap_or(path).to_string()
     };
-    let (trait_name, owner) = match prefix.rsplit_once(" for ") {
-        Some((trait_path, owner)) => (Some(type_name(trait_path)), type_name(owner)),
-        None => (None, type_name(prefix)),
+    // The module path written before the type; trait-form names carry none
+    // that can be told apart from the trait's own path.
+    let (trait_name, owner, module_path) = match prefix.rsplit_once(" for ") {
+        Some((trait_path, owner)) => (Some(type_name(trait_path)), type_name(owner), None),
+        None => {
+            let path = prefix.split('<').next().unwrap_or(prefix).trim();
+            let mut segments = path.split("::").collect::<Vec<_>>();
+            segments.pop();
+            (None, type_name(prefix), Some(segments))
+        }
     };
-    let owners = items
+    let impls = items
         .iter()
         .filter(|item| item.name == name && item.owner.is_some())
         .map(|item| (&item.owner, &item.trait_name))
         .collect::<BTreeSet<_>>();
     // A free function with the method's name already owns the short node.
-    if owners.len() != 1
+    if impls.len() != 1
         || items
             .iter()
             .any(|item| item.owner.is_none() && item.scope.is_empty() && item.name == name)
     {
         return None;
     }
-    items
-        .iter()
-        .any(|item| {
-            item.name == name
-                && item
-                    .owner
+    let is_the_method = |item: &RustApiItem| {
+        item.name == name
+            && item
+                .owner
+                .as_deref()
+                .is_some_and(|item_owner| type_name(item_owner) == owner)
+            && trait_name.as_ref().is_none_or(|trait_name| {
+                item.trait_name
                     .as_deref()
-                    .is_some_and(|item_owner| type_name(item_owner) == owner)
-                && trait_name.as_ref().is_none_or(|trait_name| {
-                    item.trait_name
-                        .as_deref()
-                        .is_some_and(|item_trait| &type_name(item_trait) == trait_name)
-                })
-        })
-        .then(|| name.to_string())
+                    .is_some_and(|item_trait| &type_name(item_trait) == trait_name)
+            })
+            && module_path.as_ref().is_none_or(|path| {
+                path.is_empty()
+                    || path
+                        .iter()
+                        .copied()
+                        .eq(item.scope.iter().map(String::as_str))
+            })
+    };
+    if let Some(line) = caller_line {
+        if let Some(declaration) = items
+            .iter()
+            .filter(|item| item.name == name && item.line <= line)
+            .max_by_key(|item| item.line)
+        {
+            return is_the_method(declaration).then(|| name.to_string());
+        }
+    }
+    let symbol_path = symbol.split("::").collect::<Vec<_>>();
+    if items.iter().any(|item| {
+        item.owner.is_none()
+            && item
+                .scope
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::once(item.name.as_str()))
+                .collect::<Vec<_>>()
+                .ends_with(&symbol_path)
+    }) {
+        return None;
+    }
+    items.iter().any(is_the_method).then(|| name.to_string())
 }
 
 fn rust_function_identity(
@@ -8480,6 +8530,128 @@ mod tests {
                 "{start}\n{aggregate:#}"
             );
         }
+    }
+
+    fn headline_symbol_lines(aggregate: &Value) -> Vec<String> {
+        let mut headline = aggregate["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                format!(
+                    "{}:{}",
+                    item["symbol"].as_str().unwrap_or_default(),
+                    item["line"]
+                )
+            })
+            .collect::<Vec<_>>();
+        headline.sort();
+        headline
+    }
+
+    /// A free function in a module named like a type (`Config::production` in
+    /// `mod Config`) is not that type's method, even when one impl in the file
+    /// defines a method with the same name: a call to the free function keeps
+    /// the free function live, and the uncalled method stays dead together
+    /// with the helper only its body calls. The planted dead
+    /// `other::production` makes the short name ambiguous, so only the source
+    /// scan, which keeps the module path, links the call.
+    #[test]
+    fn review_module_qualified_free_function_is_not_the_same_named_method() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() { Config::production(); }
+#[allow(non_snake_case)]
+mod Config {
+    pub(crate) fn production() {}
+}
+mod other {
+    pub(crate) fn production() {}
+}
+mod types {
+    pub(crate) struct Config;
+    impl Config {
+        pub(crate) fn production() -> Self { helper(); Config }
+    }
+    pub(crate) fn helper() {}
+}
+"#,
+        )]);
+        assert_eq!(
+            headline_symbol_lines(&aggregate),
+            vec!["helper:15", "production:13", "production:8"],
+            "{aggregate:#}"
+        );
+    }
+
+    /// The same in a nested module (`settings::Config::production`): the call
+    /// from `main` keeps the free function live, and the uncalled method is
+    /// still reported dead.
+    #[test]
+    fn review_nested_module_free_function_called_from_main_stays_live() {
+        let aggregate = stored_rust_fixture_scan(&[(
+            "src/main.rs",
+            r#"
+fn main() { settings::Config::production(); }
+mod settings {
+    #[allow(non_snake_case)]
+    pub(crate) mod Config {
+        pub(crate) fn production() {}
+    }
+    pub(crate) mod other {
+        pub(crate) fn production() {}
+    }
+}
+mod types {
+    pub(crate) struct Config;
+    impl Config {
+        pub(crate) fn production() -> Self { Config }
+    }
+}
+"#,
+        )]);
+        assert_eq!(
+            headline_symbol_lines(&aggregate),
+            vec!["production:15", "production:9"],
+            "{aggregate:#}"
+        );
+    }
+
+    /// The impl-named spelling maps to the short method node only when it can
+    /// denote nothing but that impl's method.
+    #[test]
+    fn rust_method_node_maps_only_the_impl_method_identity() {
+        let item = |scope: &[&str], name: &str, line: u32, owner: Option<&str>| RustApiItem {
+            name: name.to_string(),
+            scope: scope.iter().map(|segment| segment.to_string()).collect(),
+            public: false,
+            line,
+            owner: owner.map(str::to_string),
+            trait_name: None,
+        };
+        // `mod Config { fn production() }` at line 2 and
+        // `mod types { impl Config { fn production() } }` at line 10.
+        let items = vec![
+            item(&["Config"], "production", 2, None),
+            item(&["types"], "production", 10, Some("Config")),
+        ];
+        let node =
+            |symbol: &str, caller_line: Option<u32>| rust_method_node(&items, symbol, caller_line);
+        assert_eq!(
+            node("types::Config::production", None).as_deref(),
+            Some("production")
+        );
+        // The free function's module-qualified name.
+        assert_eq!(node("Config::production", None), None);
+        // A module path that is not the impl's own module.
+        assert_eq!(node("other::Config::production", None), None);
+        // A caller is the declaration enclosing its call line.
+        assert_eq!(
+            node("Config::production", Some(11)).as_deref(),
+            Some("production")
+        );
+        assert_eq!(node("Config::production", Some(3)), None);
     }
 
     /// `super::` inside an inline module names the enclosing module first:
