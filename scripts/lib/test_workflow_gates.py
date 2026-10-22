@@ -224,7 +224,11 @@ class CISpeedWorkflowTests(unittest.TestCase):
         self.assertEqual(build["run"], "cargo build --release --locked -p agent-file-tools --bin aft")
 
     def test_direct_ci_storm_nextest_run_keeps_all_failures(self) -> None:
-        self.assertIn("cargo nextest run --no-fail-fast", workflow_job("unit-linux-storm"))
+        root = Path(__file__).resolve().parents[2]
+        action = workflow_gates.parse_workflow(str(root / ".github/actions/storm-suite/action.yml"))
+        commands = "\n".join(step.get("run", "") for step in action["runs"]["steps"])
+        self.assertIn("cargo nextest run --no-fail-fast", commands)
+        self.assertIn("./.github/actions/storm-suite", workflow_job("unit-linux-storm"))
 
     def test_nextest_install_requires_cache_retry_and_published_checksum(self) -> None:
         root = Path(__file__).resolve().parents[2]
@@ -304,7 +308,7 @@ class CISpeedWorkflowTests(unittest.TestCase):
             for job in unit["jobs"].values()
             for step in job.get("steps", [])
         ]
-        self.assertEqual(uses.count("./.github/actions/setup-nextest"), 14)
+        self.assertEqual(uses.count("./.github/actions/setup-nextest"), 15)
         shard = workflow_gates.parse_workflow(str(github / "actions/integration-shard/action.yml"))
         self.assertEqual(
             sum(step.get("uses") == "./.github/actions/setup-nextest" for step in shard["runs"]["steps"]),
