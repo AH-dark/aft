@@ -2022,14 +2022,16 @@ struct HealOutcome {
 /// reading payloads, and repairs only the candidates whose rows are gone:
 /// - a missing call-graph payload is extracted again from the working-tree
 ///   file. When the file changed since the previous manifest, its current
-///   content is extracted under its new key, as an edit would be;
+///   content is extracted under its new key, as an edit would be. Unchanged
+///   content keeps its semantic key while that payload is still stored;
 /// - a file that can no longer be read is left out of the generation and
 ///   recorded as failed, so one path never fails the whole publication; a file
 ///   deleted since the checkout was listed is left out like any deletion;
 /// - with the call graph off, a missing call-graph key is dropped, as a
 ///   publication with the call graph off writes no key;
 /// - a missing semantic key becomes the key the caller just stored for the
-///   path, or no key, leaving the path pending for semantic work.
+///   path, or no key, leaving the path pending for semantic work; the entry
+///   keeps its call-graph key.
 fn heal_missing_payloads(
     reader: &CandidateReader<'_>,
     semantic: &BlobStore,
@@ -2092,8 +2094,14 @@ fn heal_missing_payloads(
                     planes.callgraph = None;
                     outcome.callgraph_dropped += 1;
                 }
-                ManifestEntry::Regular { mode, .. } => {
+                ManifestEntry::Regular { mode, planes, .. } => {
                     let executable = *mode == 0o100755;
+                    // The semantic payload is a separate plane: when it is
+                    // still stored, repairing the call graph must not lose it.
+                    let stored_semantic = planes
+                        .semantic
+                        .clone()
+                        .filter(|semantic| !semantic_missing.contains(semantic));
                     let absolute = request
                         .project_root
                         .join(path_from_bytes(candidate.path.as_bytes()));
@@ -2101,7 +2109,7 @@ fn heal_missing_payloads(
                     match read_working_tree_file(&absolute) {
                         Ok(Some(source)) => {
                             fresh_reads.insert(candidate.path.as_bytes().to_vec());
-                            let (fresh, skip) = reader.regular(
+                            let (mut fresh, skip) = reader.regular(
                                 candidate.path,
                                 &absolute,
                                 executable,
@@ -2109,6 +2117,17 @@ fn heal_missing_payloads(
                                 None,
                                 false,
                             )?;
+                            // Unchanged content (the same call-graph key) keeps
+                            // the semantic key it had, unless the caller just
+                            // stored one. Changed content takes only what the
+                            // caller stored, as an edit would.
+                            let unchanged =
+                                manifest_entry_callgraph_key(&fresh.entry) == Some(key.as_str());
+                            if let ManifestEntry::Regular { planes, .. } = &mut fresh.entry {
+                                if unchanged && planes.semantic.is_none() {
+                                    planes.semantic = stored_semantic;
+                                }
+                            }
                             fresh_skips.extend(skip);
                             healed.push(fresh);
                             outcome.reextracted += 1;
@@ -2527,6 +2546,120 @@ mod payload_heal_tests {
             .unwrap()
             .execute_batch("DELETE FROM blob_payloads")
             .unwrap();
+    }
+
+    fn clear_callgraph_rows(storage: &Path, family: &str) {
+        let store = BlobStore::open(storage, family, BlobPlane::Callgraph).unwrap();
+        Connection::open(store.path())
+            .unwrap()
+            .execute_batch("DELETE FROM blob_payloads")
+            .unwrap();
+    }
+
+    fn callgraph_key(manifest: &Manifest, path: &[u8]) -> Option<String> {
+        match manifest.get(&RelPath::new(path.to_vec()).unwrap()) {
+            Some(ManifestEntry::Regular { planes, .. }) => planes.callgraph.clone(),
+            _ => None,
+        }
+    }
+
+    /// A committed checkout of `lib.rs` and `other.rs`, published with a
+    /// stored semantic payload for `lib.rs`. Returns the project, the storage,
+    /// the request, `lib.rs`'s semantic key and the published manifest.
+    fn two_plane_checkout(
+        family: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        AssemblyRequest,
+        String,
+        Manifest,
+    ) {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let lib = b"pub fn example() {}\n";
+        fs::write(project.path().join("lib.rs"), lib).unwrap();
+        fs::write(project.path().join("other.rs"), "pub fn other() {}\n").unwrap();
+        git(project.path(), &["init", "--quiet"]);
+        git(project.path(), &["add", "."]);
+        git(project.path(), &["commit", "--quiet", "-m", "base"]);
+        let key = crate::blob_store::SemanticKey::for_current(lib, b"lib.rs", "model").full_key();
+        BlobStore::open(storage.path(), family, BlobPlane::Semantic)
+            .unwrap()
+            .put(&key, b"vector")
+            .unwrap();
+        let request = AssemblyRequest {
+            storage: storage.path().to_path_buf(),
+            project_root: project.path().to_path_buf(),
+            family: family.into(),
+            scope: format!("{family}-scope"),
+            desired_head: "head".into(),
+            changed_paths: BTreeSet::new(),
+            semantic_keys: BTreeMap::from([(b"lib.rs".to_vec(), key.to_hex())]),
+            require_semantic: true,
+            allow_blob_put: true,
+            callgraph: true,
+        };
+        let initial = publish_checkout(&request).unwrap();
+        assert!(initial.published, "{initial:?}");
+        let manifest = initial.manifest.unwrap();
+        assert_eq!(semantic_key(&manifest, b"lib.rs"), Some(key.to_hex()));
+        (project, storage, request, key.to_hex(), manifest)
+    }
+
+    /// Repairing a missing call-graph payload heals only that plane: an
+    /// unchanged file keeps its semantic key while that payload is still
+    /// stored, even when the caller supplies no semantic keys (as a
+    /// publication with read-only shared artifacts does), so the file is not
+    /// left pending semantic work.
+    #[test]
+    fn views_callgraph_heal_keeps_a_stored_semantic_key() {
+        let family = "callgraph-heal-keeps-semantic";
+        let (project, storage, mut request, semantic, before) = two_plane_checkout(family);
+        clear_callgraph_rows(storage.path(), family);
+        fs::write(project.path().join("other.rs"), "pub fn other2() {}\n").unwrap();
+        request.changed_paths = BTreeSet::from([b"other.rs".to_vec()]);
+        request.semantic_keys = BTreeMap::new();
+
+        let healed = publish_checkout(&request).unwrap();
+        assert!(healed.published, "{healed:?}");
+        let manifest = healed.manifest.as_ref().unwrap();
+        assert_eq!(semantic_key(manifest, b"lib.rs"), Some(semantic));
+        assert!(
+            !healed.pending_paths.contains(b"lib.rs".as_slice()),
+            "lib.rs is not left pending semantic work: {healed:?}"
+        );
+        let callgraph = callgraph_key(manifest, b"lib.rs").unwrap();
+        assert_eq!(Some(callgraph.clone()), callgraph_key(&before, b"lib.rs"));
+        let store = BlobStore::open(storage.path(), family, BlobPlane::Callgraph).unwrap();
+        assert!(store
+            .missing_hex_keys([callgraph.as_str()], None)
+            .unwrap()
+            .missing
+            .is_empty());
+    }
+
+    /// The mirror case: a missing semantic payload drops only the semantic key
+    /// and leaves the stored call-graph key in place.
+    #[test]
+    fn views_semantic_heal_keeps_a_stored_callgraph_key() {
+        let family = "semantic-heal-keeps-callgraph";
+        let (project, storage, mut request, _semantic, before) = two_plane_checkout(family);
+        clear_semantic_rows(storage.path(), family);
+        fs::write(project.path().join("other.rs"), "pub fn other2() {}\n").unwrap();
+        request.changed_paths = BTreeSet::from([b"other.rs".to_vec()]);
+        request.semantic_keys = BTreeMap::new();
+
+        let healed = publish_checkout(&request).unwrap();
+        assert!(healed.published, "{healed:?}");
+        let manifest = healed.manifest.as_ref().unwrap();
+        assert_eq!(semantic_key(manifest, b"lib.rs"), None);
+        assert!(healed.pending_paths.contains(b"lib.rs".as_slice()));
+        assert_eq!(
+            callgraph_key(manifest, b"lib.rs"),
+            callgraph_key(&before, b"lib.rs"),
+            "the stored call-graph key is kept"
+        );
     }
 
     /// A semantic key carried over from the previous manifest whose payload
