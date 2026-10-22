@@ -1828,11 +1828,50 @@ impl BgTaskRegistry {
         task: Arc<BgTask>,
         initial: Option<(Result<RunRequest, exec::Error>, LocalFallback)>,
     ) -> Result<(), String> {
-        // Two recovery paths can restore the same saved task (see
-        // `SavedRemoteTaskClaim`); a second worker would act on the task
-        // without seeing what the first one decided, so only one may run.
-        if task.remote_worker_running.swap(true, Ordering::AcqRel) {
-            return Ok(());
+        {
+            // A finished task whose owed runner cancel the startup pass
+            // (`start_owed_cancel_pass`) sends or has sent gets no worker:
+            // the cancel goes out once per job.
+            let mut owed = owed_cancels()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let owes_cancel = task.state.lock().is_ok_and(|state| {
+                state.metadata.is_terminal()
+                    && state
+                        .metadata
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.cancel_pending)
+            });
+            if owes_cancel {
+                if let Some(outcome) = owed.settled.get(&task.task_id) {
+                    // This registry read the record before the pass saved
+                    // the outcome, and may have rewritten it since: save the
+                    // outcome again with the task's own record.
+                    apply_owed_cancel_outcome(&task, outcome);
+                    let mut db = DeferredDbWrites::new(self, &task);
+                    if let Ok(state) = task.state.lock() {
+                        let _ = self.persist_task_locked(&task, &state.metadata, &mut db);
+                    }
+                    return Ok(());
+                }
+                if let Some(OwedCancelOwner::Pass { adopters }) = owed.claims.get_mut(&task.task_id)
+                {
+                    adopters.push(Arc::downgrade(&task));
+                    return Ok(());
+                }
+            }
+            // Two recovery paths can restore the same saved task (see
+            // `SavedRemoteTaskClaim`); a second worker would act on the task
+            // without seeing what the first one decided, so only one may run.
+            if task.remote_worker_running.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
+            // While this worker runs, the startup pass leaves the task's
+            // cancel to it.
+            owed.claims
+                .entry(task.task_id.clone())
+                .or_insert(OwedCancelOwner::Worker);
         }
         #[cfg(test)]
         tests::note_remote_worker_start(&task.task_id);
@@ -1849,6 +1888,7 @@ impl BgTaskRegistry {
                 if let Err(error) = result {
                     if registry.finish_owner_pause_cancel(&task, Err(error.clone())) {
                         task.remote_launch_ready.store(true, Ordering::Release);
+                        release_worker_owed_cancel_claim(&task.task_id);
                         task.remote_worker_running.store(false, Ordering::Release);
                         #[cfg(test)]
                         tests::note_remote_worker_exit(&task.task_id);
@@ -1880,11 +1920,13 @@ impl BgTaskRegistry {
                 // Refusals must be rendered from their settled terminal state,
                 // not raced against the worker that is still recording them.
                 task.remote_launch_ready.store(true, Ordering::Release);
+                release_worker_owed_cancel_claim(&task.task_id);
                 task.remote_worker_running.store(false, Ordering::Release);
                 #[cfg(test)]
                 tests::note_remote_worker_exit(&task.task_id);
             })
             .map_err(|e| {
+                release_worker_owed_cancel_claim(&spawned.task_id);
                 spawned
                     .remote_worker_running
                     .store(false, Ordering::Release);
@@ -3191,6 +3233,429 @@ fn remote_kill_settle_bound() -> Duration {
             .saturating_sub(REMOTE_KILL_REPLY_MARGIN)
             .min(REMOTE_KILL_SETTLE_CAP)
     })
+}
+
+/// Who in this process is sending a saved remote task's owed runner cancel
+/// (`RemoteTask::cancel_pending`).
+#[cfg(unix)]
+enum OwedCancelOwner {
+    /// The task's remote worker is running; it sends the cancel itself.
+    Worker,
+    /// The startup pass (`start_owed_cancel_pass`) is sending it. Registries
+    /// that restore the task meanwhile register here as adopters instead of
+    /// starting a worker; the pass gives them its outcome when it is done.
+    Pass {
+        adopters: Vec<std::sync::Weak<BgTask>>,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct OwedCancels {
+    /// At most one sender per task id, so the cancel goes out once per job.
+    claims: HashMap<String, OwedCancelOwner>,
+    /// Owed cancels the startup pass settled, by task id, with the outcome it
+    /// recorded. A replay that read the task's record before the pass saved
+    /// it takes the outcome from here instead of sending the cancel again.
+    settled: HashMap<String, String>,
+}
+
+/// The one claim table for owed cancels in this process. Taken with no lock
+/// held except, in `start_remote_worker`, the saved-task claim lock (which is
+/// always outermost); a task's `state` may be taken while it is held.
+#[cfg(unix)]
+fn owed_cancels() -> &'static Mutex<OwedCancels> {
+    static OWED: std::sync::OnceLock<Mutex<OwedCancels>> = std::sync::OnceLock::new();
+    OWED.get_or_init(Default::default)
+}
+
+/// A remote worker stopped: the startup pass may send the task's cancel if
+/// it is still owed.
+#[cfg(unix)]
+fn release_worker_owed_cancel_claim(task_id: &str) {
+    let mut owed = owed_cancels()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if matches!(owed.claims.get(task_id), Some(OwedCancelOwner::Worker)) {
+        owed.claims.remove(task_id);
+    }
+}
+
+/// Record in a task held in memory the outcome of the startup pass's
+/// attempt to send its owed cancel.
+#[cfg(unix)]
+fn apply_owed_cancel_outcome(task: &BgTask, outcome: &str) {
+    if let Ok(mut state) = task.state.lock() {
+        if let Some(remote) = state.metadata.remote.as_mut() {
+            if !outcome.starts_with("failed") || remote.job_id.is_none() {
+                remote.cancel_pending = false;
+            }
+            remote.owner_pause_cancel = Some(outcome.to_owned());
+        }
+    }
+    task.kill_settled.notify_all();
+}
+
+/// How many saved task records the startup pass's discovery scan reads at
+/// most. A storage root holds every session's task history; the scan stops
+/// here rather than scaling without bound. (A record found to owe a cancel is
+/// read again before sending and when its outcome is saved.)
+#[cfg(unix)]
+const OWED_CANCEL_SCAN_LIMIT: usize = 20_000;
+
+/// Connection attempts per owed cancel, and the first wait between them; the
+/// wait doubles after each failed attempt: 1, 2, 4, 8 and 16 seconds in
+/// production, from 50 ms in test builds.
+#[cfg(unix)]
+const OWED_CANCEL_ATTEMPTS: u32 = 6;
+#[cfg(all(unix, not(test)))]
+const OWED_CANCEL_FIRST_BACKOFF: Duration = Duration::from_secs(1);
+#[cfg(all(unix, test))]
+const OWED_CANCEL_FIRST_BACKOFF: Duration = Duration::from_millis(50);
+
+/// What one startup pass did, for its log line and for tests.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub(crate) struct OwedCancelReport {
+    pub examined: usize,
+    pub sent: usize,
+    pub failed: usize,
+    pub cleared_without_job: usize,
+    pub left_to_worker: usize,
+}
+
+#[cfg(unix)]
+impl BgTaskRegistry {
+    /// Send the runner cancels that saved, finished remote tasks under
+    /// `storage_root` still owe, without waiting for their projects to bind.
+    ///
+    /// An owner pause marks a task finished before its worker sends the
+    /// runner its cancel. If the module stops in between, the record keeps
+    /// the cancel owed (`RemoteTask::cancel_pending`); replay sends it, but a
+    /// paused worker's checkout may never bind again, and its runner job then
+    /// holds a runner slot until its own deadline. This pass reads saved
+    /// task records directly (the storage root's own task directory and each
+    /// harness directory beneath it, at most `OWED_CANCEL_SCAN_LIMIT`
+    /// records) and sends the owed cancels one after another on one dedicated
+    /// background thread, never on the request loop. It starts no project, binds no root and restores no
+    /// task. Runs once per storage root per process; later calls return
+    /// `None`.
+    pub(crate) fn start_owed_cancel_pass(
+        storage_root: &Path,
+    ) -> Option<std::thread::JoinHandle<OwedCancelReport>> {
+        static STARTED: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+        let key = canonicalized_path(storage_root);
+        if !STARTED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key)
+        {
+            return None;
+        }
+        let storage_root = storage_root.to_path_buf();
+        std::thread::Builder::new()
+            .name("aft-owed-cancels".into())
+            .spawn(move || {
+                let report = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(send_owed_cancels(&storage_root)),
+                    Err(error) => {
+                        crate::slog_warn!("owed runner cancels not sent: {error}");
+                        OwedCancelReport::default()
+                    }
+                };
+                crate::slog_info!(
+                    "owed runner cancels under {}: examined={} sent={} failed={} cleared_without_job={} left_to_worker={}",
+                    storage_root.display(),
+                    report.examined,
+                    report.sent,
+                    report.failed,
+                    report.cleared_without_job,
+                    report.left_to_worker
+                );
+                report
+            })
+            .map_err(|error| crate::slog_warn!("owed runner cancel pass not started: {error}"))
+            .ok()
+    }
+}
+
+/// Saved finished remote tasks under `storage_root` that owe their runner a
+/// cancel, as (session directory, task id), with how many records were read.
+#[cfg(unix)]
+fn owed_cancel_candidates(storage_root: &Path) -> (Vec<(PathBuf, String)>, usize) {
+    let mut storage_dirs = vec![storage_root.to_path_buf()];
+    if let Ok(entries) = fs::read_dir(storage_root) {
+        let mut harness_dirs = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.join("bash-tasks").is_dir())
+            .collect::<Vec<_>>();
+        harness_dirs.sort();
+        storage_dirs.extend(harness_dirs);
+    }
+    let mut candidates = Vec::new();
+    let mut examined = 0;
+    'dirs: for storage_dir in storage_dirs {
+        let Ok(sessions) = fs::read_dir(storage_dir.join("bash-tasks")) else {
+            continue;
+        };
+        let mut session_dirs = sessions
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        session_dirs.sort();
+        for session_dir in session_dirs {
+            let Ok((task_ids, _invalid)) = discover_task_ids(&session_dir) else {
+                continue;
+            };
+            for task_id in task_ids {
+                if examined >= OWED_CANCEL_SCAN_LIMIT {
+                    crate::slog_warn!(
+                        "owed runner cancel pass stopped after reading {examined} task records under {}",
+                        storage_root.display()
+                    );
+                    break 'dirs;
+                }
+                examined += 1;
+                let Ok(metadata) = resolve_task_layout(&session_dir, &task_id)
+                    .and_then(|layout| read_task_at(&layout))
+                else {
+                    continue;
+                };
+                if metadata.task_id == task_id
+                    && metadata.is_terminal()
+                    && metadata
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.cancel_pending)
+                {
+                    candidates.push((session_dir.clone(), task_id));
+                }
+            }
+        }
+    }
+    (candidates, examined)
+}
+
+#[cfg(unix)]
+async fn send_owed_cancels(storage_root: &Path) -> OwedCancelReport {
+    let (candidates, examined) = owed_cancel_candidates(storage_root);
+    let mut report = OwedCancelReport {
+        examined,
+        ..Default::default()
+    };
+    for (session_dir, task_id) in candidates {
+        {
+            let mut owed = owed_cancels()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if owed.claims.contains_key(&task_id) || owed.settled.contains_key(&task_id) {
+                report.left_to_worker += 1;
+                continue;
+            }
+            owed.claims.insert(
+                task_id.clone(),
+                OwedCancelOwner::Pass {
+                    adopters: Vec::new(),
+                },
+            );
+        }
+        #[cfg(test)]
+        tests::draining_gate(storage_root, tests::DrainingGate::OwedCancelClaimed).await;
+        let sent = send_owed_cancel(&session_dir, &task_id).await;
+        // Saved under the claim table's lock: a registry restoring the task
+        // meanwhile either adopts the claim (and gets the outcome below) or
+        // finds the outcome settled and saves it again over the older record
+        // it read.
+        let mut owed = owed_cancels()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outcome = save_owed_cancel_outcome(&session_dir, &task_id, sent);
+        let adopters = match owed.claims.remove(&task_id) {
+            Some(OwedCancelOwner::Pass { adopters }) => adopters,
+            _ => Vec::new(),
+        };
+        match outcome {
+            OwedCancelOutcome::NoLongerOwed => {}
+            OwedCancelOutcome::Settled(outcome) => {
+                if outcome == "sent" {
+                    report.sent += 1;
+                } else {
+                    report.cleared_without_job += 1;
+                }
+                for task in adopters.iter().filter_map(std::sync::Weak::upgrade) {
+                    apply_owed_cancel_outcome(&task, &outcome);
+                }
+                owed.settled.insert(task_id, outcome);
+            }
+            OwedCancelOutcome::Failed(outcome) => {
+                report.failed += 1;
+                for task in adopters.iter().filter_map(std::sync::Weak::upgrade) {
+                    apply_owed_cancel_outcome(&task, &outcome);
+                }
+            }
+        }
+    }
+    report
+}
+
+#[cfg(unix)]
+enum OwedCancelOutcome {
+    /// Nothing was sent: the record could not be read, or it no longer owes
+    /// a cancel (a worker settled it first).
+    NoLongerOwed,
+    /// No longer owed: the runner acknowledged the cancel, or no job id was
+    /// saved for any cancel to reach. Writing the outcome to the record is
+    /// best effort; a failed write is logged.
+    Settled(String),
+    /// The send failed and the cancel stays owed, so the next process start
+    /// tries again (the pass runs once per storage root per process).
+    Failed(String),
+}
+
+/// What sending one owed cancel did, before it is saved.
+#[cfg(unix)]
+enum OwedCancelSend {
+    NoLongerOwed,
+    /// Whether the record stops owing the cancel, and the outcome to save.
+    Done {
+        cleared: bool,
+        outcome: String,
+    },
+}
+
+/// Save one owed cancel's outcome to the task's record. The record is
+/// finished, so it is rewritten directly: `update_task_at` keeps a finished
+/// record's fields unchanged.
+#[cfg(unix)]
+fn save_owed_cancel_outcome(
+    session_dir: &Path,
+    task_id: &str,
+    sent: OwedCancelSend,
+) -> OwedCancelOutcome {
+    let OwedCancelSend::Done { cleared, outcome } = sent else {
+        return OwedCancelOutcome::NoLongerOwed;
+    };
+    let saved = resolve_task_layout(session_dir, task_id).and_then(|layout| {
+        let mut record = read_task_at(&layout)?;
+        if let Some(remote) = record.remote.as_mut() {
+            if cleared {
+                remote.cancel_pending = false;
+            }
+            remote.owner_pause_cancel = Some(outcome.clone());
+        }
+        write_task_at(&layout, &record)
+    });
+    if let Err(error) = saved {
+        crate::slog_warn!(
+            "owed runner cancel for task {task_id}: outcome {outcome} not saved: {error}"
+        );
+    }
+    if cleared {
+        OwedCancelOutcome::Settled(outcome)
+    } else {
+        OwedCancelOutcome::Failed(outcome)
+    }
+}
+
+/// Send one saved task's owed cancel.
+#[cfg(unix)]
+async fn send_owed_cancel(session_dir: &Path, task_id: &str) -> OwedCancelSend {
+    let Ok(metadata) =
+        resolve_task_layout(session_dir, task_id).and_then(|layout| read_task_at(&layout))
+    else {
+        return OwedCancelSend::NoLongerOwed;
+    };
+    // Read again under the claim: a worker that stopped before the claim
+    // was taken may have sent the cancel already.
+    let Some(remote) = metadata
+        .remote
+        .as_ref()
+        .filter(|remote| remote.cancel_pending && metadata.is_terminal())
+    else {
+        return OwedCancelSend::NoLongerOwed;
+    };
+    let (cleared, outcome) = match remote.job_id {
+        None => {
+            crate::slog_info!(
+                "owed runner cancel for task {task_id}: no runner job id was saved, so no cancel can reach it"
+            );
+            (
+                true,
+                "failed: no runner job id was saved, so the runner could not be asked to cancel"
+                    .to_string(),
+            )
+        }
+        Some(job_id) => match cancel_with_backoff(&metadata, remote, task_id, job_id).await {
+            Ok(()) => (true, "sent".to_string()),
+            Err(error) => (false, format!("failed: {error}")),
+        },
+    };
+    OwedCancelSend::Done { cleared, outcome }
+}
+
+/// Connect to the task's runner and send `exec.cancel` for `job_id`,
+/// retrying a failed connection or call with doubling waits.
+#[cfg(unix)]
+async fn cancel_with_backoff(
+    metadata: &PersistedTask,
+    remote: &RemoteTask,
+    task_id: &str,
+    job_id: Uuid,
+) -> Result<(), String> {
+    let Some(connection) = remote.connection_file.as_ref() else {
+        crate::slog_warn!(
+            "owed runner cancel for task {task_id} job {job_id}: no runner connection was saved"
+        );
+        return Err("no runner connection was saved".into());
+    };
+    let root = metadata
+        .project_root
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let mut wait = OWED_CANCEL_FIRST_BACKOFF;
+    let mut last_error = String::new();
+    for attempt in 1..=OWED_CANCEL_ATTEMPTS {
+        let result = match ExecRemoteClient::connect(
+            connection,
+            subc_protocol::BindIdentity::new(
+                root.display().to_string(),
+                remote.harness.clone(),
+                remote.session.clone(),
+            ),
+        )
+        .await
+        {
+            Ok(client) => client.cancel_job(job_id).await.map(|_| ()),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => {
+                crate::slog_info!(
+                    "owed runner cancel for task {task_id} job {job_id}: sent (attempt {attempt})"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                last_error = error.to_string();
+                crate::slog_warn!(
+                    "owed runner cancel for task {task_id} job {job_id}: attempt {attempt} of {OWED_CANCEL_ATTEMPTS} failed: {last_error}"
+                );
+                #[cfg(test)]
+                tests::note_owed_cancel_attempt_failed(task_id);
+            }
+        }
+        if attempt < OWED_CANCEL_ATTEMPTS {
+            tokio::time::sleep(wait).await;
+            wait = wait.saturating_mul(2);
+        }
+    }
+    Err(last_error)
 }
 
 #[cfg(unix)]
