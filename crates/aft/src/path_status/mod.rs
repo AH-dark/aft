@@ -199,15 +199,25 @@ fn next_mark(transaction: &rusqlite::Transaction<'_>) -> Result<i64, PathStatusE
 /// stamped. Its existing rows keep no mark, which reads as older than any
 /// settlement.
 fn add_mark_column(connection: &mut rusqlite::Connection) -> Result<(), PathStatusError> {
+    // Check without a write lock first: every open runs this, including the
+    // status reader, and an up-to-date ledger must not wait behind a large
+    // marking or settlement write. Only a ledger that still needs the column
+    // takes the write lock, and it checks again under it.
+    if mark_column_exists(connection)? {
+        return Ok(());
+    }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let has_mark = transaction
-        .prepare("SELECT 1 FROM pragma_table_info('path_status') WHERE name = 'mark'")?
-        .exists([])?;
-    if !has_mark {
+    if !mark_column_exists(&transaction)? {
         transaction.execute_batch("ALTER TABLE path_status ADD COLUMN mark INTEGER")?;
     }
     transaction.commit()?;
     Ok(())
+}
+
+fn mark_column_exists(connection: &rusqlite::Connection) -> Result<bool, PathStatusError> {
+    Ok(connection
+        .prepare("SELECT 1 FROM pragma_table_info('path_status') WHERE name = 'mark'")?
+        .exists([])?)
 }
 
 /// The two path problem states exposed by view status.
@@ -1134,6 +1144,25 @@ mod tests {
         assert!(store.status_for(b"covered.rs").unwrap().is_none());
         assert!(store.status_for(b"remarked.rs").unwrap().is_some());
         assert!(store.status_for(b"newer.rs").unwrap().is_some());
+    }
+
+    /// Opening an up-to-date ledger takes no write lock, so the status reader
+    /// is never queued behind a large marking or settlement write.
+    #[test]
+    fn opening_an_upgraded_ledger_does_not_wait_for_a_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(super::PathStatusStore::open(directory.path()).unwrap());
+        let writer = rusqlite::Connection::open(directory.path().join("derived.sqlite")).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        let store = super::PathStatusStore::open(directory.path()).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "open waited {:?} behind a writer",
+            started.elapsed()
+        );
+        assert_eq!(store.summary().unwrap().pending_count, 0);
+        writer.execute_batch("ROLLBACK").unwrap();
     }
 
     /// A ledger written before annotations carried a mark still reads, its
