@@ -820,7 +820,16 @@ pub fn prepare_cache_root(
             message: format!("User configuration is unreadable or invalid ({reason}); AFT is running without its caches until the configuration is valid."),
         });
     }
-    let requested = config.cache_dir.clone();
+    // A prepared config holds the resolved directory in `cache_dir`. Recheck
+    // the spelling the user configured instead, so a symlink in it that now
+    // names another directory is refused rather than silently ignored. A
+    // `cache_dir` changed since preparation is a new setting and is used as is.
+    let requested = match (&config.cache_dir, &config.cache_dir_configured) {
+        (Some(current), Some(configured)) if *current == configured.resolved => {
+            Some(configured.spelling.clone())
+        }
+        (current, _) => current.clone(),
+    };
     if requested.is_none() && !config.cache_dir_opt_out {
         // A storage root that once kept its caches on another volume must not
         // quietly start writing them to its own volume again because the
@@ -877,6 +886,10 @@ pub fn prepare_cache_root(
             // Check before creating even the durable directory: an unavailable
             // volume must not cause an artifact write at any alternate location.
             root = parent.join("aft");
+            config.cache_dir_configured = Some(crate::config::ConfiguredCacheDir {
+                spelling: configured.clone(),
+                resolved: parent.clone(),
+            });
             config.cache_dir = Some(parent.clone());
             let storage_exists = storage.exists();
             let mut existing = storage.as_path();

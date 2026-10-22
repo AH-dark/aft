@@ -1002,6 +1002,7 @@ fn classification_is_exhaustive(config: &Config) {
         storage_lease: _,
         cache_unavailable: _,
         cache_config_unknown: _,
+        cache_dir_configured: _,
         cache_epoch: _,
         cache_lease: _,
         harness: _,

@@ -155,6 +155,47 @@ fn cache_root_unavailable_rejects_dangling_and_retargeting_symlinks() {
     assert!(!other.join("aft").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn cache_root_recheck_notices_a_repointed_link_while_the_old_target_remains() {
+    // The volume probe re-prepares the running config, whose `cache_dir` is
+    // the directory the link resolved to. It must resolve the configured link
+    // again: if the link now names another directory, caches stop, even
+    // though the old target is still there and healthy.
+    let temp = tempfile::tempdir().unwrap();
+    let link = temp.path().join("cache-link");
+    let target = temp.path().join("target");
+    let other = temp.path().join("other");
+    fs::create_dir(&target).unwrap();
+    fs::create_dir(&other).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let mut config = Config {
+        storage_dir: Some(temp.path().join("storage")),
+        cache_dir: Some(link.clone()),
+        ..Default::default()
+    };
+    let warning = prepare_cache_root(&mut config);
+    assert!(warning.is_none(), "{warning:?}");
+    assert!(cache_unavailable(&config).is_none());
+
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&other, &link).unwrap();
+    let mut rechecked = config.clone();
+    let warning = prepare_cache_root(&mut rechecked).expect("a repointed link must be refused");
+    assert_eq!(warning.code, CACHE_DIR_UNAVAILABLE, "{warning:?}");
+    assert!(cache_unavailable(&rechecked).is_some());
+    assert!(target.join("aft").is_dir(), "the old target is untouched");
+    assert!(!other.join("aft").exists());
+
+    // Pointing the link back at the enrolled directory restores caches.
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let mut restored = config.clone();
+    let warning = prepare_cache_root(&mut restored);
+    assert!(warning.is_none(), "{warning:?}");
+    assert!(cache_unavailable(&restored).is_none());
+}
+
 fn fixture(custom: bool) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, AppContext) {
     let temp = tempfile::tempdir().unwrap();
     let storage = temp.path().join("aft");

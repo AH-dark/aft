@@ -817,12 +817,26 @@ impl Default for BashConfig {
     }
 }
 
+/// `storage.cache_dir` as configured and the directory it named when the cache
+/// root was prepared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredCacheDir {
+    pub spelling: PathBuf,
+    pub resolved: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Existing cache parent; AFT owns only its `aft` namespace. None preserves the storage-root layout.
     #[serde(skip_deserializing)]
     pub cache_dir: Option<PathBuf>,
+    /// The spelling of `cache_dir` the user configured, kept once preparation
+    /// replaces `cache_dir` with the directory it resolved to. A symlink in
+    /// that spelling may later be repointed; every recheck resolves the
+    /// configured spelling again so the change is noticed.
+    #[serde(skip)]
+    pub cache_dir_configured: Option<ConfiguredCacheDir>,
     /// Runtime validation failure; a configured unavailable root never falls back.
     #[serde(skip_deserializing)]
     pub cache_unavailable: Option<String>,
@@ -994,6 +1008,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             cache_dir: None,
+            cache_dir_configured: None,
             cache_unavailable: None,
             cache_config_unknown: None,
             cache_dir_opt_out: false,
