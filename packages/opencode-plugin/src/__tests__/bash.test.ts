@@ -1415,7 +1415,15 @@ describe("OpenCode bash adapter", () => {
  * RegExp stands in for Rust regex syntax. */
 function regexMatchLikeEngine(params: Record<string, unknown>): BridgeResponse {
   const text = String(params.text ?? "");
+  // serde_json refuses a lone surrogate escape, so the engine never sees one.
+  if (/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text)) {
+    return { success: false, code: "invalid_request", message: "lone surrogate in text" };
+  }
   const start = Number(params.start ?? 0);
+  const bytes = Buffer.from(text);
+  if (start > bytes.length || (start < bytes.length && (bytes[start]! & 0xc0) === 0x80)) {
+    return { success: false, code: "invalid_request", message: "start is not a char boundary" };
+  }
   const regex = new RegExp(String(params.pattern), "gm");
   regex.lastIndex = Buffer.from(text).subarray(0, start).toString().length;
   const found = regex.exec(text);
@@ -2092,6 +2100,19 @@ describe("bash_status tool", () => {
     expect(afterX).not.toContain("matched");
     const afterSpace = await watchExitedRegex(trimmedStart(" ", "READY"), "\\bREADY");
     expect(afterSpace).toContain('matched "READY" in stdout at offset 65536');
+  });
+
+  test("a window trim that lands inside an emoji still finds READY after it", async () => {
+    // The emoji ends the first page. After the second page, the 64 KiB byte
+    // window would start on the emoji's second UTF-16 unit, a lone surrogate.
+    const stdout = Buffer.concat([
+      Buffer.alloc(64 * 1024 - 4, "x"),
+      Buffer.from("😀"),
+      Buffer.from("READY"),
+      Buffer.alloc(64 * 1024 - 3 - 5, "y"),
+    ]);
+    const result = await watchExitedRegex(stdout, "READY");
+    expect(result).toContain('matched "READY" in stdout at offset 65536');
   });
 
   test("an older engine that ignores start cannot match on the context character", async () => {

@@ -820,12 +820,19 @@ function trimWaitScanBuffer(
   };
 }
 
-/** The whole character (one or two UTF-16 units) just before `index`. */
+/**
+ * The whole character (one or two UTF-16 units) just before `index`. A lone
+ * surrogate is never returned, because it cannot be sent as JSON text.
+ */
 function characterBefore(text: string, index: number): string {
   if (index <= 0) return "";
-  const code = text.charCodeAt(index - 1);
-  const pair = code >= 0xdc00 && code <= 0xdfff && index >= 2;
-  return text.slice(pair ? index - 2 : index - 1, index);
+  const last = text.charCodeAt(index - 1);
+  if (isLowSurrogate(last)) {
+    return index >= 2 && isHighSurrogate(text.charCodeAt(index - 2))
+      ? text.slice(index - 2, index)
+      : "";
+  }
+  return isHighSurrogate(last) ? "" : text.slice(index - 1, index);
 }
 
 /** The string index of the character that starts `byteOffset` bytes into `text`. */
@@ -851,7 +858,19 @@ function regexKeepStart(text: string, maxBytes: number): number {
       high = mid;
     }
   }
-  return low;
+  // Never start the window inside a surrogate pair: a lone surrogate cannot
+  // be sent as JSON text. Moving forward past the pair keeps the byte bound.
+  return isLowSurrogate(text.charCodeAt(low)) && isHighSurrogate(text.charCodeAt(low - 1))
+    ? low + 1
+    : low;
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
 }
 
 export function __trimWaitScanBufferForTests(
