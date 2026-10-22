@@ -380,6 +380,31 @@ export function createV2RuntimeConsumer(
   let disposed = false;
   const route: WakeRoute = {
     standalonePatternMatch: async (match, bridge) => {
+      // As in `patternMatch`: a deleted session has no one to tell. Acknowledge
+      // the match without queueing it, so the bridge does not deliver it again.
+      if (v2SessionDeleted(context, match.session_id)) {
+        await bridge
+          .send("bash_ack_completions", {
+            session_id: match.session_id,
+            ...(match.reason === "task_exit"
+              ? { task_ids: [match.task_id] }
+              : {
+                  matches: [
+                    {
+                      task_id: match.task_id,
+                      watch_id: match.watch_id,
+                      match_offset: match.match_offset,
+                    } satisfies BashPatternMatchAck,
+                  ],
+                }),
+          })
+          .catch((error) => {
+            warn(
+              `[bash_pattern_match] acknowledging watch ${match.watch_id} of deleted session ${match.session_id} failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          });
+        return;
+      }
       const key = JSON.stringify([
         match.session_id,
         match.task_id,
@@ -660,6 +685,16 @@ export function createV2RuntimeConsumer(
     standaloneCompletion: async (completion, bridge) => {
       if (subcPool) {
         await route.completion(completion, bridge);
+        return;
+      }
+      // As in `completion`: a deleted session gets no wake and no per-session
+      // state, but the completion is still acknowledged so the bridge does not
+      // deliver it again.
+      if (v2SessionDeleted(context, completion.session_id)) {
+        await bridge.send("bash_ack_completions", {
+          session_id: completion.session_id,
+          task_ids: [completion.task_id],
+        });
         return;
       }
       const key = JSON.stringify([completion.session_id, completion.task_id]);
