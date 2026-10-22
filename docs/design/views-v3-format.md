@@ -349,6 +349,11 @@ starts the next lap in the same pass so a lone family is visited every pass.
 - **Bounds** match `collect_one_v2_family`: a `PASS_BUDGET` (5 s) deadline and
   at most `HISTORY_ENTRIES` (8192) members per pass. Plane rows are left for
   slice 4's v3 plane sweep.
+- **Resume position.** Each visit saves the scope of the last member it
+  examined (`retention/cursors/v3-members/<family>.json`). The next visit
+  takes members in scope order after it and wraps to the start at the end, so
+  members that stay live, protected or slow cannot keep later members from
+  being examined.
 - **The lock wait shares that budget.** The collector takes the reservation
   lock with `ReservationLock::acquire_until(storage, deadline)`, using the
   family's pass deadline, never the 120 s wait of `acquire`. When another
@@ -362,7 +367,8 @@ Tests (`storage_retention::v3_collector_tests`):
 `v3_eviction_interrupted_after_its_evicting_commit_is_finished_next_pass`,
 `collecting_a_view_member_lowers_committed_usage_by_its_allocated_bytes`,
 `v3_collector_never_creates_a_registry`,
-`v3_collector_skips_a_family_whose_reservation_lock_is_busy` and
+`v3_collector_skips_a_family_whose_reservation_lock_is_busy`,
+`v3_collector_resumes_after_the_last_examined_member` and
 `no_production_path_writes_v3_over_a_v0_60_0_floor`.
 
 ## Replay prototype

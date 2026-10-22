@@ -3053,7 +3053,7 @@ fn run_pass_with_budget(
             .timings_ms
             .insert("blobs_v2".into(), phase.elapsed().as_millis() as u64);
         let phase = Instant::now();
-        if let Err(error) = collect_one_v3_family(storage, cancelled, &mut report, PASS_BUDGET) {
+        if let Err(error) = collect_one_v3_family(storage, cancelled, &mut report, V3Bounds::PASS) {
             report.errors.push(error.to_string());
         }
         report
@@ -3449,11 +3449,43 @@ fn v3_finish_eviction(
 /// is skipped before the storage-root reservation lock is taken, because
 /// taking that lock creates `blobs/v3/reservations.lock`. Views-off and
 /// views-on users who never published v3 data therefore get no v3 file.
+/// Per-visit bounds of the v3 collector. Production uses [`V3Bounds::PASS`];
+/// tests shrink them so a bound can be reached with a handful of members.
+#[derive(Clone, Copy, Debug)]
+struct V3Bounds {
+    /// Time for the lock wait, the member work and the measurements together.
+    budget: Duration,
+    /// Members examined in one visit, as `collect_one_v2_family` caps them.
+    members: usize,
+}
+
+impl V3Bounds {
+    const PASS: Self = Self {
+        budget: PASS_BUDGET,
+        members: HISTORY_ENTRIES,
+    };
+}
+
+/// Where the next visit of one v3 family resumes: the scope of the last
+/// member a visit examined. Members are taken in scope order after it,
+/// wrapping to the start, so a full window of live or protected members
+/// cannot keep later members from ever being examined.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct V3MemberCursor {
+    last_scope: Option<String>,
+}
+
+fn v3_member_cursor_path(storage: &Path, family: &str) -> PathBuf {
+    storage
+        .join("retention/cursors/v3-members")
+        .join(format!("{family}.json"))
+}
+
 fn collect_one_v3_family(
     storage: &Path,
     cancelled: &dyn Fn() -> bool,
     report: &mut SweepReport,
-    budget: Duration,
+    bounds: V3Bounds,
 ) -> io::Result<()> {
     // Only family directories take the pass's one visit, so the lock file
     // beside them never uses up a pass.
@@ -3485,7 +3517,7 @@ fn collect_one_v3_family(
         return Ok(());
     };
     let family = item.entry.file_name().to_string_lossy().into_owned();
-    let result = collect_v3_family(storage, &family, cancelled, report, budget);
+    let result = collect_v3_family(storage, &family, cancelled, report, bounds);
     // A family skipped because its reservation lock was busy keeps the lap
     // position, so the next pass tries it first.
     if !cancelled() && !matches!(result, Ok(V3Visit::LockBusy)) {
@@ -3520,7 +3552,7 @@ fn collect_v3_family(
     family: &str,
     cancelled: &dyn Fn() -> bool,
     report: &mut SweepReport,
-    budget: Duration,
+    bounds: V3Bounds,
 ) -> io::Result<V3Visit> {
     use crate::blob_store::v3::{RegistryWriter, ReservationLock};
     let v3 = |error: crate::blob_store::v3::Error| io::Error::other(error.to_string());
@@ -3528,7 +3560,7 @@ fn collect_v3_family(
     if !registry_path.try_exists()? {
         return Ok(V3Visit::Done);
     }
-    let deadline = Instant::now() + budget;
+    let deadline = Instant::now() + bounds.budget;
     // Lock first, then the registry barrier, the order every v3 writer uses.
     // The wait for the lock comes out of the same budget as the member work:
     // a publisher holding it must not stall the retention lane, which also
@@ -3547,23 +3579,52 @@ fn collect_v3_family(
     // Opening the registry takes a covering measurement and releases the
     // reservations of dead owners.
     let mut registry = RegistryWriter::open_existing(storage, family, &lock).map_err(v3)?;
+    let cursor_path = v3_member_cursor_path(storage, family);
+    // An unreadable cursor only costs the resume position.
+    let resume = read_json::<V3MemberCursor>(&cursor_path)
+        .ok()
+        .and_then(|cursor| cursor.last_scope);
+    let limit = bounds.members as i64;
     let members: Vec<V3Member> = registry
         .with_barrier(|tx| {
-            let mut statement = tx.prepare(
-                "SELECT scope,kind,root,view_dir,last_bind_ms,state FROM members ORDER BY scope LIMIT ?1",
-            )?;
-            let rows = statement
-                .query_map([HISTORY_ENTRIES as i64], v3_member_row)?
+            // The window starts after the last member examined. When it
+            // reaches the end of the scope order first, it continues from the
+            // start, up to and including that member.
+            let mut rows = tx
+                .prepare(
+                    "SELECT scope,kind,root,view_dir,last_bind_ms,state FROM members WHERE scope > ?1 ORDER BY scope LIMIT ?2",
+                )?
+                .query_map(
+                    rusqlite::params![resume.as_deref().unwrap_or_default(), limit],
+                    v3_member_row,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            if let Some(resume) = resume.as_deref() {
+                let room = limit - rows.len() as i64;
+                if room > 0 {
+                    rows.extend(
+                        tx.prepare(
+                            "SELECT scope,kind,root,view_dir,last_bind_ms,state FROM members WHERE scope <= ?1 ORDER BY scope LIMIT ?2",
+                        )?
+                        .query_map(rusqlite::params![resume, room], v3_member_row)?
+                        .collect::<rusqlite::Result<Vec<_>>>()?,
+                    );
+                }
+            }
             Ok(rows)
         })
         .map_err(v3)?;
     let mut domain = DomainReport::default();
+    let mut last_examined = None;
     for member in members {
         if cancelled() || Instant::now() >= deadline {
             report.stopped_early = true;
             break;
         }
+        // Noted before the member's work. The resume position is saved only
+        // when the visit's loop ends, so a visit that stops on an error
+        // resumes from its previous position.
+        last_examined = Some(member.scope.clone());
         if member.kind != "view" {
             continue;
         }
@@ -3643,6 +3704,14 @@ fn collect_v3_family(
             V3Step::Retained if missing => domain.skipped_protected += 1,
             V3Step::Retained | V3Step::Present | V3Step::Gone | V3Step::Due { .. } => {}
         }
+    }
+    if let Some(last_scope) = last_examined {
+        atomic_json(
+            &cursor_path,
+            &V3MemberCursor {
+                last_scope: Some(last_scope),
+            },
+        )?;
     }
     // Every collector pass ends with a covering measurement, so committed
     // usage also reflects files removed by anything else since the last one.
@@ -7563,7 +7632,7 @@ mod v3_collector_tests {
 
     fn pass(storage: &Path) -> SweepReport {
         let mut report = SweepReport::default();
-        collect_one_v3_family(storage, &|| false, &mut report, PASS_BUDGET).unwrap();
+        collect_one_v3_family(storage, &|| false, &mut report, V3Bounds::PASS).unwrap();
         assert!(report.errors.is_empty(), "{report:?}");
         report
     }
@@ -7790,7 +7859,7 @@ mod v3_collector_tests {
             );
             let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut report = SweepReport::default();
-                let _ = collect_one_v3_family(&storage, &|| false, &mut report, PASS_BUDGET);
+                let _ = collect_one_v3_family(&storage, &|| false, &mut report, V3Bounds::PASS);
             }));
             assert!(crashed.is_err());
         }
@@ -7810,6 +7879,57 @@ mod v3_collector_tests {
         assert_eq!(finished.removed_roots, 1, "{finished:?}");
         assert!(member_scopes(&storage).is_empty());
         assert!(!view_dir(&storage, "crash").exists());
+    }
+
+    /// A window of protected members cannot starve the members after it: each
+    /// visit resumes after the last member the previous one examined, and
+    /// wraps to the start at the end of the scope order.
+    #[test]
+    fn v3_collector_resumes_after_the_last_examined_member() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        fs::create_dir_all(&storage).unwrap();
+        let names = ["p1", "p2", "p3", "z-target"];
+        let roots = names
+            .iter()
+            .map(|name| (*name, bound_root(&temp, &storage, name)))
+            .collect::<HashMap<_, _>>();
+        let members = names
+            .iter()
+            .map(|name| (*name, "view", Some(roots[name].as_path())))
+            .collect::<Vec<_>>();
+        seed(&storage, &members);
+        let owner = live_owner();
+        with_registry(&storage, |tx| {
+            tx.execute("UPDATE members SET last_bind_ms=0", [])?;
+            for (index, scope) in ["p1", "p2", "p3"].into_iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO view_sessions VALUES(?1,?2,?3,?4,0)",
+                    rusqlite::params![format!("live-{index}"), scope, owner.pid, owner.start_time],
+                )?;
+            }
+            Ok(())
+        });
+        for name in names {
+            fill_view_dir(&view_dir(&storage, name));
+            fs::remove_dir(&roots[name]).unwrap();
+        }
+        // Two members per visit: the protected members alone fill a window.
+        let bounds = V3Bounds {
+            members: 2,
+            ..V3Bounds::PASS
+        };
+        let mut passes = 0;
+        while member_scopes(&storage).contains(&"z-target".to_owned()) {
+            passes += 1;
+            assert!(passes <= 4, "z-target was never collected");
+            let mut report = SweepReport::default();
+            collect_one_v3_family(&storage, &|| false, &mut report, bounds).unwrap();
+            assert!(report.errors.is_empty(), "{report:?}");
+        }
+        assert_eq!(member_scopes(&storage), ["p1", "p2", "p3"]);
+        assert!(!view_dir(&storage, "z-target").exists());
     }
 
     /// Another process's hold on the reservation lock costs the pass at most
@@ -7842,7 +7962,11 @@ mod v3_collector_tests {
         std::thread::spawn(move || {
             let started = Instant::now();
             let mut report = SweepReport::default();
-            let result = collect_one_v3_family(&pass_storage, &|| false, &mut report, budget)
+            let bounds = V3Bounds {
+                budget,
+                ..V3Bounds::PASS
+            };
+            let result = collect_one_v3_family(&pass_storage, &|| false, &mut report, bounds)
                 .map_err(|error| error.to_string());
             let _ = sender.send((result, report, started.elapsed()));
         });
