@@ -270,6 +270,9 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
         &base_indent,
         lang,
         indent_style,
+        // The selection's own line break is stripped above, so a one-line
+        // body carries no line ending; take it from the whole file.
+        crate::indent::source_line_ending(&source),
     );
 
     let call_site = generate_call_site(
@@ -830,6 +833,26 @@ mod approved_audit11 {
         assert_eq!(response["success"], true, "{response}");
         assert_eq!(response["return_type"], "void");
         assert_eq!(bytes, "\u{feff}function helper(items) {\r\n    items.map(item => { return item; });\r\n    observe();\r\n}\r\n\r\nfunction outer(items) {\r\n    helper(items);\r\n    finish();\r\n}\r\n".as_bytes());
+    }
+
+    #[test]
+    fn single_line_extraction_keeps_crlf_with_formatting_off() {
+        // The selected line's only line break is stripped before generation,
+        // so the helper's line ending must come from the whole file.
+        let source = "function outer() {\r\n    prepare();\r\n    observe();\r\n}\r\n";
+        let (response, bytes) = extract(source, "ts", 3, 4);
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "function helper() {\r\n    observe();\r\n}\r\n\r\nfunction outer() {\r\n    prepare();\r\n    helper();\r\n}\r\n"
+        );
+        let source = "def outer():\r\n    prepare()\r\n    observe()\r\n";
+        let (response, bytes) = extract(source, "py", 3, 4);
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "def helper():\r\n    observe()\r\n\r\ndef outer():\r\n    prepare()\r\n    helper()\r\n"
+        );
     }
 
     #[test]

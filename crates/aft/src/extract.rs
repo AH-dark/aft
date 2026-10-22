@@ -1092,6 +1092,7 @@ pub fn generate_extracted_function(
     base_indent: &str,
     lang: LangId,
     indent_style: IndentStyle,
+    line_ending: &str,
 ) -> String {
     let indent_unit = indent_style.as_str();
 
@@ -1103,6 +1104,7 @@ pub fn generate_extracted_function(
             body_text,
             base_indent,
             indent_unit,
+            line_ending,
         ),
         LangId::Python => generate_py_function(
             name,
@@ -1111,6 +1113,7 @@ pub fn generate_extracted_function(
             body_text,
             base_indent,
             indent_unit,
+            line_ending,
         ),
         _ => {
             // Shouldn't reach here due to language guard, but produce something reasonable
@@ -1121,6 +1124,7 @@ pub fn generate_extracted_function(
                 body_text,
                 base_indent,
                 indent_unit,
+                line_ending,
             )
         }
     }
@@ -1133,6 +1137,7 @@ fn generate_ts_function(
     body_text: &str,
     base_indent: &str,
     indent_unit: &str,
+    line_ending: &str,
 ) -> String {
     let params_str = params.join(", ");
     let mut lines = Vec::new();
@@ -1174,7 +1179,7 @@ fn generate_ts_function(
     }
 
     lines.push(format!("{}}}", base_indent));
-    lines.join(crate::indent::source_line_ending(body_text))
+    lines.join(line_ending)
 }
 
 fn generate_py_function(
@@ -1184,6 +1189,7 @@ fn generate_py_function(
     body_text: &str,
     base_indent: &str,
     indent_unit: &str,
+    line_ending: &str,
 ) -> String {
     let params_str = params.join(", ");
     let mut lines = Vec::new();
@@ -1218,7 +1224,7 @@ fn generate_py_function(
         ReturnKind::Void => {}
     }
 
-    lines.join(crate::indent::source_line_ending(body_text))
+    lines.join(line_ending)
 }
 
 /// Interior rows of multiline literals contain data, not syntactic indentation.
@@ -2041,6 +2047,7 @@ class UserService:
                 "",
                 LangId::TypeScript,
                 IndentStyle::Spaces(2),
+                "\n",
             ),
             "function makeValues() {\n  const a = 1;\n  const b = 2;\n  return { a, b };\n}"
         );
@@ -2088,6 +2095,7 @@ class UserService:
                 "",
                 LangId::Python,
                 IndentStyle::Spaces(4),
+                "\n",
             ),
             "def make_values():\n    a = 1\n    b = 2\n    return a, b"
         );
@@ -2136,6 +2144,7 @@ class UserService:
             "",
             LangId::TypeScript,
             IndentStyle::Spaces(2),
+            "\n",
         );
         let call = generate_call_site(
             "computeInitial",
@@ -2164,6 +2173,7 @@ class UserService:
             "",
             LangId::TypeScript,
             IndentStyle::Spaces(2),
+            "\n",
         );
         assert!(result.contains("function compute(x)"));
         assert!(result.contains("return added;"));
@@ -2181,6 +2191,7 @@ class UserService:
             "",
             LangId::TypeScript,
             IndentStyle::Spaces(2),
+            "\n",
         );
         assert_eq!(
             result,
@@ -2199,6 +2210,7 @@ class UserService:
             "",
             LangId::Python,
             IndentStyle::Spaces(4),
+            "\n",
         );
         assert!(result.contains("def compute(x):"));
         assert!(result.contains("return added"));
@@ -2447,6 +2459,7 @@ mod audit11_regressions {
             "",
             LangId::Python,
             IndentStyle::Spaces(4),
+            "\n",
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.py");
@@ -2491,6 +2504,7 @@ mod audit11_regressions {
             "",
             LangId::TypeScript,
             IndentStyle::Spaces(4),
+            "\n",
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.txt");
@@ -2512,7 +2526,7 @@ mod audit11_regressions {
             ("    const value = `first\r\n  literal\r\n\r\nlast`;\r\n    consume(value);", LangId::TypeScript, "function helper() {\r\n    const value = `first\r\n  literal\r\n\r\nlast`;\r\n    consume(value);\r\n}"),
             ("    value = '''first\r\n  literal\r\n\r\nlast'''\r\n    consume(value)", LangId::Python, "def helper():\r\n    value = '''first\r\n  literal\r\n\r\nlast'''\r\n    consume(value)"),
         ] {
-            let generated = generate_extracted_function("helper", &[], &ReturnKind::Void, body, "", lang, IndentStyle::Spaces(4));
+            let generated = generate_extracted_function("helper", &[], &ReturnKind::Void, body, "", lang, IndentStyle::Spaces(4), "\r\n");
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("out.txt");
             let config = crate::config::Config { format_on_edit: false, ..Default::default() };

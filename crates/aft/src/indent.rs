@@ -285,6 +285,7 @@ mod audit11_regressions {
             "",
             LangId::TypeScript,
             detect_indent(source, LangId::TypeScript),
+            source_line_ending(source),
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.txt");
