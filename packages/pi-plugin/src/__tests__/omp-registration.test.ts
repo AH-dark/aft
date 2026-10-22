@@ -13,8 +13,10 @@ import {
   resetRecordedExtensionApi,
   setHarnessOverrideForTesting,
 } from "../harness.js";
+import { OMP_TOOL_TIERS } from "../omp-approval.js";
 import {
   bindToolRegistrationFunnel,
+  registerLatePowershellTool,
   registerPiToolSurface,
   resolvePiToolSurface,
 } from "../tool-registration.js";
@@ -175,20 +177,40 @@ describe("Full surface registration funnel", () => {
   }
 
   test("OMP top_level registers every surface tool with loadMode essential and folded description", () => {
-    const { tools } = registerWithHarness("omp", {
+    const config: AftConfig = {
       disabled_tools: [],
       bash: true,
       pi: { tool_presentation: "top_level" },
+    };
+    const { api, tools } = makeMockApi();
+    // Shaped like OMP's ExtensionAPI, so a registration that detects the host
+    // itself (as the late session_start one does) sees OMP.
+    Object.assign(api, { arktype: {} });
+    const ctx = makePluginContext(makeMockBridge(() => ({ success: true, text: "ok" })).bridge, {
+      config,
     });
+    registerPiToolSurface(api, ctx, resolvePiToolSurface(config), "omp");
+    // What index.ts does at session_start once Pi reveals PowerShell.
+    expect(tools.has("powershell")).toBe(false);
+    registerLatePowershellTool(api, ctx, false);
+    expect(tools.has("powershell")).toBe(true);
 
     expect(tools.size).toBeGreaterThan(0);
     for (const [name, tool] of tools) {
-      const toolWithLoadMode = tool as unknown as { loadMode?: string };
-      expect(toolWithLoadMode.loadMode).toBe(
+      const registered = tool as unknown as {
+        loadMode?: string;
+        approval?: (args: unknown) => unknown;
+      };
+      expect(registered.loadMode).toBe(
         "essential",
         `Tool ${name} must carry loadMode: "essential" on OMP under top_level presentation`,
       );
+      expect(typeof registered.approval).toBe("function");
+      expect(registered.approval?.({})).toBe(OMP_TOOL_TIERS[name]);
     }
+    expect((tools.get("powershell") as unknown as { approval: () => unknown }).approval()).toBe(
+      "exec",
+    );
 
     // Check bash tool description has folded guidance
     const bashTool = tools.get("bash");

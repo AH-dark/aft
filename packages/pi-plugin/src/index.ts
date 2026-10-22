@@ -105,6 +105,7 @@ import {
   piHashlineDowngrade,
   piHashlineEffective,
   refreshPiRevisionReadTools,
+  registerLatePowershellTool,
   registerPiToolSurface,
   resolvePiToolSurface,
 } from "./tool-registration.js";
@@ -963,7 +964,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     if (!liveSurface.hoistPowershell) return;
     // Companions were registered by name in the first pass, independently of
     // which shell tools exist, so only the PowerShell slot is added here.
-    registerBashTool(pi, ctx, liveSurface.semantic, "powershell", false, "powershell");
+    registerLatePowershellTool(pi, ctx, liveSurface.semantic);
     powershellRegistered = true;
   });
 

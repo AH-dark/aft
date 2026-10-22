@@ -297,6 +297,22 @@ export function registerPiToolSurface(
   if (surface.delete || surface.move) registerFsTools(boundPi, ctx, surface);
 }
 
+/**
+ * Register the `powershell` slot after session start, when a modern Pi first
+ * reveals that its optional built-in PowerShell tool is active. It goes through
+ * the same registration funnel as the first pass, so on OMP it carries
+ * `loadMode` and its approval tier like every other AFT tool.
+ */
+export function registerLatePowershellTool(
+  pi: ExtensionAPI,
+  ctx: PluginContext,
+  semantic: boolean,
+  harness?: PiHarness,
+): void {
+  const boundPi = bindToolRegistrationFunnel(pi, ctx, harness);
+  registerBashTool(boundPi, ctx, semantic, "powershell", false, "powershell");
+}
+
 /** Replace Pi's captured revision-read schemas without changing the loaded tool set. */
 export function refreshPiRevisionReadTools(
   pi: ExtensionAPI,
