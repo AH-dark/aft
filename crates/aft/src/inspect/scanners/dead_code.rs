@@ -1586,6 +1586,7 @@ fn materialize_dead_code_contributions(
                 .map(|facts| (contribution.file.clone(), facts.items.clone()))
         })
         .collect::<BTreeMap<_, _>>();
+    let rust_modules = RustModuleIndex::new(&parsed);
     // Rust type declarations, by the same (file, identity) nodes the edges
     // use: the short export symbol plus the module-qualified name of each
     // declaration with that name.
@@ -1671,6 +1672,11 @@ fn materialize_dead_code_contributions(
                             test_origin,
                             &exported_symbols_by_file,
                             &files_by_exported_symbol,
+                            &rust_modules,
+                            rust_items_by_file
+                                .get(&contribution.file)
+                                .map(Vec::as_slice)
+                                .unwrap_or_default(),
                         ),
                     };
                     projected
@@ -1718,12 +1724,18 @@ fn materialize_dead_code_contributions(
             // to type declarations drop that status again below.
             let source_test_origin =
                 |line: u32| contribution.location_is_test_code(&test_module_files, line);
+            let caller_items = rust_items_by_file
+                .get(&contribution.file)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             internal_calls.extend(resolve_macro_token_liveness_edges(
                 project_root,
                 &contribution.file,
                 &contribution.macro_token_refs,
                 &contribution.rust_imports,
                 &exported_symbols_by_file,
+                &rust_modules,
+                caller_items,
                 &source_test_origin,
             ));
             if let Some(facts) = &contribution.rust_api {
@@ -1733,6 +1745,8 @@ fn materialize_dead_code_contributions(
                     &facts.initializer_references,
                     &contribution.rust_imports,
                     &exported_symbols_by_file,
+                    &rust_modules,
+                    caller_items,
                     &source_test_origin,
                 ));
                 // The parser does not expose private statics as symbols, so
@@ -3054,6 +3068,209 @@ fn project_internal_call(
     })
 }
 
+/// Where each Rust module lives, read from the module declarations of the
+/// scanned files (honouring `#[path]`) instead of from file names alone. It
+/// resolves module paths the file-name rules miss: `super::` written inside an
+/// inline module, modules declared with `#[path]`, and module names a file
+/// sees only through a chain of `use super::*` globs.
+#[derive(Debug, Default)]
+struct RustModuleIndex {
+    /// (declaring file, module path inside that file) -> file of an
+    /// out-of-line module.
+    files: BTreeMap<(String, Vec<String>), String>,
+    /// (file, module path inside that file) of each inline module.
+    inline: BTreeSet<(String, Vec<String>)>,
+    /// Out-of-line module file -> the file and inline module path declaring it.
+    parents: BTreeMap<String, (String, Vec<String>)>,
+    /// Files with a file-level `use super::*;`.
+    globs_parent: BTreeSet<String>,
+}
+
+impl RustModuleIndex {
+    fn new(contributions: &[DeadCodeContribution]) -> Self {
+        let known = contributions
+            .iter()
+            .map(|contribution| contribution.file.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut index = Self::default();
+        for contribution in contributions {
+            if contribution.globs_parent_module {
+                index.globs_parent.insert(contribution.file.clone());
+            }
+            let Some(facts) = &contribution.rust_api else {
+                continue;
+            };
+            for module in &facts.modules {
+                let mut path = module.scope.clone();
+                path.push(module.name.clone());
+                let key = (contribution.file.clone(), path.clone());
+                let Some(declared) = &module.file else {
+                    index.inline.insert(key);
+                    continue;
+                };
+                // The declared location, its `mod.rs` form, and (for a crate
+                // root with a manifest-chosen name) the file beside the root.
+                let beside_root = Path::new(&contribution.file)
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .join(path.join("/"))
+                    .with_extension("rs")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let Some(file) = [
+                    declared.clone(),
+                    format!("{}/mod.rs", declared.trim_end_matches(".rs")),
+                    beside_root.clone(),
+                    format!("{}/mod.rs", beside_root.trim_end_matches(".rs")),
+                ]
+                .into_iter()
+                .find(|candidate| known.contains(candidate.as_str())) else {
+                    continue;
+                };
+                index.parents.insert(
+                    file.clone(),
+                    (contribution.file.clone(), module.scope.clone()),
+                );
+                index.files.insert(key, file);
+            }
+        }
+        index
+    }
+
+    /// The module (file and inline module path inside it) that `path` names
+    /// when written in module `scope` of `file`.
+    fn resolve_module(
+        &self,
+        file: &str,
+        scope: &[String],
+        path: &[String],
+    ) -> Option<(String, Vec<String>)> {
+        let mut position = (file.to_string(), scope.to_vec());
+        let mut rest = path;
+        match rest.first().map(String::as_str) {
+            Some("crate") => {
+                // Bounded so a cyclic `#[path]` declaration cannot loop.
+                for _ in 0..=self.parents.len() {
+                    let Some((parent, _)) = self.parents.get(&position.0) else {
+                        break;
+                    };
+                    position = (parent.clone(), Vec::new());
+                }
+                position.1.clear();
+                rest = &rest[1..];
+            }
+            Some("self") => rest = &rest[1..],
+            _ => {
+                while rest.first().is_some_and(|segment| segment == "super") {
+                    if position.1.pop().is_none() {
+                        position = self.parents.get(&position.0)?.clone();
+                    }
+                    rest = &rest[1..];
+                }
+            }
+        }
+        for segment in rest {
+            let mut key = (position.0.clone(), position.1.clone());
+            key.1.push(segment.clone());
+            if let Some(child) = self.files.get(&key) {
+                position = (child.clone(), Vec::new());
+            } else if self.inline.contains(&key) {
+                position = key;
+            } else {
+                return None;
+            }
+        }
+        Some(position)
+    }
+
+    /// The declaration `path::name` names from module `scope` of `file`: the
+    /// module path is resolved from that module first, then from each parent
+    /// module the file glob-imports through a chain of `use super::*`. A path
+    /// ending in a type (`module::Type::method`) names that type's method.
+    fn resolve_item(
+        &self,
+        file: &str,
+        scope: &[String],
+        path: &[String],
+        name: &str,
+        exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    ) -> Option<ExportNode> {
+        if path.is_empty() {
+            return None;
+        }
+        let lookup = |module_path: &[String], symbol_prefix: &[String]| {
+            let target = |(module_file, module_scope): (String, Vec<String>)| {
+                let symbol = module_scope
+                    .iter()
+                    .chain(symbol_prefix)
+                    .map(String::as_str)
+                    .chain(std::iter::once(name))
+                    .collect::<Vec<_>>()
+                    .join("::");
+                exported_symbol_target(&module_file, &symbol, exported_symbols_by_file)
+            };
+            if let Some(found) = self
+                .resolve_module(file, scope, module_path)
+                .and_then(target)
+            {
+                return Some(found);
+            }
+            if !scope.is_empty() || matches!(module_path[0].as_str(), "crate" | "self" | "super") {
+                return None;
+            }
+            let mut current = file.to_string();
+            let mut visited = BTreeSet::new();
+            while self.globs_parent.contains(&current) && visited.insert(current.clone()) {
+                let (parent, parent_scope) = self.parents.get(&current)?.clone();
+                if let Some(found) = self
+                    .resolve_module(&parent, &parent_scope, module_path)
+                    .and_then(target)
+                {
+                    return Some(found);
+                }
+                current = parent;
+            }
+            None
+        };
+        lookup(path, &[]).or_else(|| {
+            let (type_name, module_path) = path.split_last()?;
+            if module_path.is_empty() {
+                return None;
+            }
+            lookup(module_path, std::slice::from_ref(type_name))
+        })
+    }
+}
+
+/// The inline module path a caller is declared in, from its declaration in
+/// the file's items; without one, the leading module segments of its name.
+fn rust_caller_module_scope(items: &[RustApiItem], caller_symbol: &str, line: u32) -> Vec<String> {
+    let name = caller_symbol.rsplit("::").next().unwrap_or(caller_symbol);
+    let declared_before = items
+        .iter()
+        .filter(|item| item.name == name && item.line <= line)
+        .collect::<Vec<_>>();
+    // Prefer the declaration whose qualified name the caller's name matches.
+    if let Some(item) = declared_before
+        .iter()
+        .filter(|item| rust_qualified_item_name(item).ends_with(caller_symbol))
+        .max_by_key(|item| item.line)
+        .or_else(|| declared_before.iter().max_by_key(|item| item.line))
+    {
+        return item.scope.clone();
+    }
+    let mut scope = rust_path_segments(caller_symbol);
+    scope.pop();
+    if scope.iter().any(|segment| {
+        segment.contains(' ') || segment.chars().next().is_some_and(char::is_uppercase)
+    }) {
+        // An impl name (`Type::method`, `Trait for Type::method`) is not a
+        // module path.
+        return Vec::new();
+    }
+    scope
+}
+
 /// Imports in scope for resolving paths written in `file`: its own, plus its
 /// parent module's when it glob-imports the parent (`use super::*;`, the usual
 /// first line of an out-of-line `tests.rs`).
@@ -3248,6 +3465,8 @@ fn rust_unresolved_path_call_edges(
     test_origin: bool,
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
     files_by_exported_symbol: &BTreeMap<String, BTreeSet<String>>,
+    modules: &RustModuleIndex,
+    caller_items: &[RustApiItem],
 ) -> Vec<InternalCall> {
     if language_for_file(caller_file) != "rust" {
         return Vec::new();
@@ -3316,6 +3535,15 @@ fn rust_unresolved_path_call_edges(
             exported_symbols_by_file,
         ));
     }
+    if targets.is_empty() && qualifier != "Self" {
+        targets.extend(modules.resolve_item(
+            caller_file,
+            &rust_caller_module_scope(caller_items, &call.caller_symbol, call.line),
+            path,
+            name,
+            exported_symbols_by_file,
+        ));
+    }
 
     targets
         .into_iter()
@@ -3338,6 +3566,8 @@ fn resolve_macro_token_liveness_edges(
     refs: &[MacroTokenRefContribution],
     rust_imports: &[RawImportContribution],
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    modules: &RustModuleIndex,
+    caller_items: &[RustApiItem],
     test_origin: &dyn Fn(u32) -> bool,
 ) -> Vec<InternalCall> {
     let mut calls = Vec::new();
@@ -3347,7 +3577,16 @@ fn resolve_macro_token_liveness_edges(
             reference,
             rust_imports,
             exported_symbols_by_file,
-        ) else {
+        )
+        .or_else(|| {
+            modules.resolve_item(
+                caller_file,
+                &rust_caller_module_scope(caller_items, &reference.caller_symbol, reference.line),
+                reference.path.as_deref().unwrap_or(&[]),
+                &reference.name,
+                exported_symbols_by_file,
+            )
+        }) else {
             continue;
         };
         calls.push(InternalCall {
@@ -8234,6 +8473,71 @@ mod tests {
         ]);
         assert!(headline_symbols(&aggregate).is_empty(), "{aggregate:#}");
         assert!(test_only_symbols(&aggregate).is_empty(), "{aggregate:#}");
+    }
+
+    /// `super::` inside an inline module names the enclosing module first:
+    /// from `mod source_replacement` in `edit.rs` it reaches `edit`'s
+    /// out-of-line child `edit/windows_replace.rs`, also from a cfg branch.
+    #[test]
+    fn review_super_path_in_inline_module_reaches_out_of_line_sibling() {
+        let aggregate = stored_rust_fixture_scan(&[
+            ("src/main.rs", "mod edit;\nfn main() { edit::write(); }\n"),
+            (
+                "src/edit.rs",
+                r#"
+#[cfg(windows)]
+mod windows_replace;
+pub(crate) fn write() { let _ = source_replacement::may_keep_access(); }
+mod source_replacement {
+    #[cfg(unix)]
+    pub(super) fn may_keep_access() -> bool { true }
+    #[cfg(windows)]
+    pub(super) fn may_keep_access() -> bool { super::windows_replace::link_count() == Some(1) }
+}
+"#,
+            ),
+            (
+                "src/edit/windows_replace.rs",
+                "pub(super) fn link_count() -> Option<u32> { None }\npub(super) fn unused() {}\n",
+            ),
+        ]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/edit/windows_replace.rs::unused"],
+            "{aggregate:#}"
+        );
+    }
+
+    /// A module name can reach a file through chained `use super::*` globs and
+    /// `#[path]` declarations: `read_executor.rs` (the `#[path]` module
+    /// `executor` of `worker_reads`) sees `relay_client`, which `gh_shim.rs`
+    /// declares with `#[path = "gh_shim_relay_client.rs"]`.
+    #[test]
+    fn review_module_through_chained_globs_and_path_attributes_resolves() {
+        let aggregate = stored_rust_fixture_scan(&[
+            ("src/main.rs", "mod gh_shim;\nfn main() { gh_shim::run(); }\n"),
+            (
+                "src/gh_shim.rs",
+                "mod worker_reads;\n#[path = \"gh_shim_relay_client.rs\"]\nmod relay_client;\npub(crate) fn run() { worker_reads::serve(); }\n",
+            ),
+            (
+                "src/gh_shim_relay_client.rs",
+                "pub(super) fn read_request() -> u32 { 1 }\npub(super) fn unused() {}\n",
+            ),
+            (
+                "src/gh_shim/worker_reads.rs",
+                "use super::*;\n#[path = \"read_executor.rs\"]\nmod executor;\nuse executor::execute_read;\npub(super) fn serve() { let mut send = |r: u32| execute_read(r); send(1); }\n",
+            ),
+            (
+                "src/gh_shim/read_executor.rs",
+                "use super::*;\npub(super) fn execute_read(r: u32) -> u32 {\n    execute_read_with(r, &mut |_| relay_client::read_request())\n}\npub(super) fn execute_read_with(r: u32, send: &mut impl FnMut(u32) -> u32) -> u32 { send(r) }\n",
+            ),
+        ]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/gh_shim_relay_client.rs::unused"],
+            "{aggregate:#}"
+        );
     }
 
     #[test]
