@@ -13457,7 +13457,6 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::io::Write;
-    #[cfg(unix)]
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};

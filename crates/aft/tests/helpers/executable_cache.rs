@@ -61,7 +61,11 @@ pub fn cached_executable_named_in(root: &Path, bytes: &[u8], name: &str) -> io::
         .tempdir_in(cache_root)?;
     let pending = pending_dir.path().join("executable");
     write_executable_with_mode(&pending, bytes, 0o755)?;
+    #[cfg(target_os = "linux")]
     OpenOptions::new().read(true).open(&pending)?.sync_all()?;
+    // Windows requires a writable handle for FlushFileBuffers.
+    #[cfg(not(target_os = "linux"))]
+    OpenOptions::new().write(true).open(&pending)?.sync_all()?;
 
     match fs::hard_link(&pending, &path) {
         Ok(()) => {}
