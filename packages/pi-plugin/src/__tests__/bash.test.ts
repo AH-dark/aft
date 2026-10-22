@@ -2086,6 +2086,7 @@ describe("bash tool adapter", () => {
     const offsets: unknown[] = [];
     const bridge = {
       send: async (command: string, params: Record<string, unknown> = {}) => {
+        if (command === "bash_regex_match") return regexMatchLikeEngine(params);
         if (command !== "bash_status") return { success: true };
         onPage?.();
         offsets.push(params.output_offset);
@@ -2118,6 +2119,58 @@ describe("bash tool adapter", () => {
       }),
     );
   }
+
+  /** Answers bash_regex_match like the engine: a multi-line regex, the first
+   * match, and its byte offset. JS RegExp stands in for Rust regex syntax. */
+  function regexMatchLikeEngine(params: Record<string, unknown>) {
+    const text = String(params.text ?? "");
+    const found = new RegExp(String(params.pattern), "m").exec(text);
+    if (!found) return { success: true, matched: false };
+    return {
+      success: true,
+      matched: true,
+      match_text: found[0],
+      match_offset: Buffer.byteLength(text.slice(0, found.index)),
+      match_index_chars: found.index,
+    };
+  }
+
+  /** `head` ends exactly at the first 64 KiB page edge and `tail` follows it. */
+  function acrossFirstPage(head: string, tail: string): Buffer {
+    return Buffer.concat([
+      Buffer.alloc(64 * 1024 - Buffer.byteLength(head), "."),
+      Buffer.from(head + tail),
+    ]);
+  }
+
+  async function watchExitedRegex(stdout: Buffer, regex: string): Promise<string> {
+    const { bridge } = pagedExitedBridge(stdout);
+    return await watchPaged(bridge, { task_id: "bash-paged-regex", pattern: { regex } });
+  }
+
+  test("an end anchor at a page edge is not a match when the output continues", async () => {
+    const result = await watchExitedRegex(acrossFirstPage("READY", "-NOT\n"), "READY$");
+    expect(result).not.toContain("matched");
+    expect(result).toContain("task exited (completed, exit 0)");
+    // At the true end of the output the same anchor still matches.
+    const atEnd = await watchExitedRegex(acrossFirstPage("READY", ""), "READY$");
+    expect(atEnd).toContain('matched "READY" in stdout at offset 65531');
+  });
+
+  test("a word boundary at a page edge is not a match when the word continues", async () => {
+    const result = await watchExitedRegex(acrossFirstPage(" READY", "NESS\n"), "\\bREADY\\b");
+    expect(result).not.toContain("matched");
+    const real = await watchExitedRegex(acrossFirstPage(" READY", " now\n"), "\\bREADY\\b");
+    expect(real).toContain('matched "READY" in stdout at offset 65531');
+  });
+
+  test("a regex match straddling two pages is found once at its offset", async () => {
+    const result = await watchExitedRegex(
+      acrossFirstPage("BOUND", "ARY-7\nmore\nBOUNDARY-8\n"),
+      "BOUNDARY-\\d",
+    );
+    expect(result).toContain('matched "BOUNDARY-7" in stdout at offset 65531');
+  });
 
   test("watch drains an exited task's pages and finds a match after 64 KiB", async () => {
     const stdout = Buffer.concat([Buffer.alloc(64 * 1024, "x"), Buffer.from("READY\n")]);

@@ -1465,6 +1465,8 @@ async function waitForBashStatus(
     output: { text: "", baseOffset: 0 },
     stderr: { text: "", baseOffset: 0 },
   };
+  // A regex match held back at a page edge, per stream (see the scan below).
+  const deferredMatch: Record<OutputStream, boolean> = { output: false, stderr: false };
   const bridgeOptions = {
     keepBridgeOnTimeout: true,
     transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
@@ -1528,13 +1530,18 @@ async function waitForBashStatus(
 
       if (waitFor) {
         const scan = await readNewTaskOutput(data, spillCursor, decoders);
-        if (scan) {
-          spillCursor = scan.nextCursor;
-          // Independent buffers prevent a stdout suffix and stderr prefix from
-          // becoming a fabricated match. When both streams match in one poll,
-          // readNewTaskOutput's stdout-first chunk order is the tie-breaker.
-          for (const chunk of scan.chunks) {
-            const state = scanState[chunk.stream];
+        spillCursor = scan.nextCursor;
+        // Independent buffers prevent a stdout suffix and stderr prefix from
+        // becoming a fabricated match. When both streams match in one poll,
+        // stdout is checked first and wins.
+        for (const stream of OUTPUT_STREAMS) {
+          const chunk = scan.chunks.find((candidate) => candidate.stream === stream);
+          const more = streamHasMore(data, stream);
+          // A held-back match is checked again once its stream is known to end there.
+          if (!chunk && !(deferredMatch[stream] && !more)) continue;
+          deferredMatch[stream] = false;
+          const state = scanState[stream];
+          if (chunk) {
             if (state.text.length === 0) state.baseOffset = chunk.baseOffset;
             state.text += chunk.text;
             if (waitFor.kind === "regex") {
@@ -1542,32 +1549,37 @@ async function waitForBashStatus(
               state.text = trimmed.text;
               state.baseOffset = trimmed.baseOffset;
             }
-            const match = await findWaitMatch(bridge, extCtx, state.text, waitFor);
-            if (match) {
-              if (waitForExit && terminal) {
-                sawTerminal = true;
-                consumeBgCompletion(sessionId, taskId);
-                await markBgCompletionDelivered(
-                  { ctx, directory: extCtx.cwd, sessionID: sessionId },
-                  taskId,
-                );
-              }
-              const matchStream: "stdout" | "stderr" | undefined =
-                data.mode === "pty" ? undefined : chunk.stream === "output" ? "stdout" : "stderr";
-              return withWaited(
-                data,
-                waited("matched", {
-                  match: match.text,
-                  match_offset: state.baseOffset + match.byteOffset,
-                  match_stream: matchStream,
-                }),
+          }
+          const match = await findWaitMatch(bridge, extCtx, state.text, waitFor);
+          if (match && more && regexMatchReachesBufferEnd(waitFor, match, state.text)) {
+            // A page ends where the read stopped, not where the output ends.
+            // A regex match reaching the end of the buffer may depend on what
+            // follows ($, \z, \b, a greedy repeat), so it waits for the next page.
+            deferredMatch[stream] = true;
+          } else if (match) {
+            if (waitForExit && terminal) {
+              sawTerminal = true;
+              consumeBgCompletion(sessionId, taskId);
+              await markBgCompletionDelivered(
+                { ctx, directory: extCtx.cwd, sessionID: sessionId },
+                taskId,
               );
             }
-            if (waitFor.kind === "substring") {
-              const trimmed = trimWaitScanBuffer(state.text, state.baseOffset, waitFor);
-              state.text = trimmed.text;
-              state.baseOffset = trimmed.baseOffset;
-            }
+            const matchStream: "stdout" | "stderr" | undefined =
+              data.mode === "pty" ? undefined : stream === "output" ? "stdout" : "stderr";
+            return withWaited(
+              data,
+              waited("matched", {
+                match: match.text,
+                match_offset: state.baseOffset + match.byteOffset,
+                match_stream: matchStream,
+              }),
+            );
+          }
+          if (waitFor.kind === "substring") {
+            const trimmed = trimWaitScanBuffer(state.text, state.baseOffset, waitFor);
+            state.text = trimmed.text;
+            state.baseOffset = trimmed.baseOffset;
           }
         }
       }
@@ -1614,7 +1626,7 @@ async function readNewTaskOutput(
   data: Record<string, unknown>,
   cursor: OutputCursor,
   decoders: Record<OutputStream, BashOutputPageDecoder>,
-): Promise<{ chunks: OutputScanChunk[]; nextCursor: OutputCursor } | undefined> {
+): Promise<{ chunks: OutputScanChunk[]; nextCursor: OutputCursor }> {
   const stdoutBytes =
     typeof data.output_chunk_base64 === "string"
       ? Buffer.from(data.output_chunk_base64, "base64")
@@ -1678,6 +1690,26 @@ function isRegexWaitObject(value: unknown): value is { regex: string } {
 }
 
 type WaitMatch = { text: string; byteOffset: number };
+
+const OUTPUT_STREAMS: readonly OutputStream[] = ["output", "stderr"];
+
+/** Whether bash_status reported captured bytes past this page for `stream`. */
+function streamHasMore(data: Record<string, unknown>, stream: OutputStream): boolean {
+  return (stream === "output" ? data.output_has_more : data.stderr_has_more) === true;
+}
+
+/** A regex match that ends exactly at the end of the scanned text. A literal
+ * is complete once its bytes are in, so it never qualifies. */
+function regexMatchReachesBufferEnd(
+  pattern: BashWaitPattern,
+  match: WaitMatch,
+  text: string,
+): boolean {
+  return (
+    pattern.kind === "regex" &&
+    match.byteOffset + Buffer.byteLength(match.text, "utf8") === Buffer.byteLength(text, "utf8")
+  );
+}
 
 async function validateWaitRegex(
   bridge: AftProjectTransport,

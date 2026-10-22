@@ -1408,6 +1408,21 @@ describe("OpenCode bash adapter", () => {
   });
 });
 
+/** Answers bash_regex_match like the engine: a multi-line regex, the first
+ * match, and its byte offset. JS RegExp stands in for Rust regex syntax. */
+function regexMatchLikeEngine(params: Record<string, unknown>): BridgeResponse {
+  const text = String(params.text ?? "");
+  const found = new RegExp(String(params.pattern), "m").exec(text);
+  if (!found) return { success: true, matched: false };
+  return {
+    success: true,
+    matched: true,
+    match_text: found[0],
+    match_offset: Buffer.byteLength(text.slice(0, found.index)),
+    match_index_chars: found.index,
+  };
+}
+
 describe("bash_status tool", () => {
   function makeCtx(
     sendImpl: (
@@ -1934,9 +1949,11 @@ describe("bash_status tool", () => {
   });
 
   /** Serves an exited task's stdout the way bash_status pages it: at most
-   * 64 KiB per call from the requested offset, with output_has_more. */
+   * 64 KiB per call from the requested offset, with output_has_more. Regex
+   * matching stands in for the engine's multi-line regex with a JS RegExp. */
   function pagedExitedTask(stdout: Buffer, onPage?: () => void) {
     return (cmd: string, params: Record<string, unknown>): BridgeResponse => {
+      if (cmd === "bash_regex_match") return regexMatchLikeEngine(params);
       if (cmd !== "bash_status") return { success: true };
       onPage?.();
       const offset = Number(params.output_offset ?? 0);
@@ -1956,6 +1973,46 @@ describe("bash_status tool", () => {
       };
     };
   }
+
+  /** `head` ends exactly at the first 64 KiB page edge and `tail` follows it. */
+  function acrossFirstPage(head: string, tail: string): Buffer {
+    return Buffer.concat([
+      Buffer.alloc(64 * 1024 - Buffer.byteLength(head), "."),
+      Buffer.from(head + tail),
+    ]);
+  }
+
+  async function watchExitedRegex(stdout: Buffer, regex: string): Promise<string> {
+    const { watchTool } = makeCtx(pagedExitedTask(stdout));
+    return await watchTool.execute(
+      { taskId: "bash-paged-regex", pattern: { regex } },
+      createMockSdkContext(),
+    );
+  }
+
+  test("an end anchor at a page edge is not a match when the output continues", async () => {
+    const result = await watchExitedRegex(acrossFirstPage("READY", "-NOT\n"), "READY$");
+    expect(result).not.toContain("matched");
+    expect(result).toContain("task exited (completed, exit 0)");
+    // At the true end of the output the same anchor still matches.
+    const atEnd = await watchExitedRegex(acrossFirstPage("READY", ""), "READY$");
+    expect(atEnd).toContain('matched "READY" in stdout at offset 65531');
+  });
+
+  test("a word boundary at a page edge is not a match when the word continues", async () => {
+    const result = await watchExitedRegex(acrossFirstPage(" READY", "NESS\n"), "\\bREADY\\b");
+    expect(result).not.toContain("matched");
+    const real = await watchExitedRegex(acrossFirstPage(" READY", " now\n"), "\\bREADY\\b");
+    expect(real).toContain('matched "READY" in stdout at offset 65531');
+  });
+
+  test("a regex match straddling two pages is found once at its offset", async () => {
+    const result = await watchExitedRegex(
+      acrossFirstPage("BOUND", "ARY-7\nmore\nBOUNDARY-8\n"),
+      "BOUNDARY-\\d",
+    );
+    expect(result).toContain('matched "BOUNDARY-7" in stdout at offset 65531');
+  });
 
   test("watch drains an exited task's pages and finds a match after 64 KiB", async () => {
     const stdout = Buffer.concat([Buffer.alloc(64 * 1024, "x"), Buffer.from("READY\n")]);
