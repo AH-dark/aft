@@ -60,6 +60,7 @@ class MergeQueueWorkflowTests(unittest.TestCase):
                 condition = nested.get("if", "")
                 self.assertIn(condition, (
                     "${{ github.event_name != 'pull_request' }}",
+                    "${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}",
                     "${{ always() && github.event_name != 'pull_request' }}",
                 ))
                 self.assertNotIn("github.ref", condition)
