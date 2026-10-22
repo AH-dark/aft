@@ -380,13 +380,90 @@ pub(crate) struct ColdBuildLimiter {
 
 #[derive(Debug)]
 struct AdmissionState {
-    last_admitted_class: Option<ColdBuildAdmissionClass>,
+    /// The class turn read by last-slot alternation is the class of the most
+    /// recent turn that is either settled or still pending (see
+    /// [`AdmissionState::last_admitted_class`]). Each new-slot admission takes
+    /// a turn number when its permit is installed, under this lock. Its
+    /// caller's admission predicate then runs with the lock released, so the
+    /// turn stays pending until the predicate answers. Either way the turn
+    /// leaves `pending_turns`; an accepted turn also replaces `settled_turn`
+    /// when it is newer than the one settled there. A refused turn therefore
+    /// leaves the class turn exactly as if it had never been taken, whatever
+    /// order concurrent requests settle in.
+    next_turn: u64,
+    settled_turn: Option<(u64, ColdBuildAdmissionClass)>,
+    pending_turns: BTreeMap<u64, ColdBuildAdmissionClass>,
     next_admission_order: u64,
     next_census_id: u64,
     events: VecDeque<ColdBuildAdmissionEvent>,
     holders: BTreeMap<u64, CensusRecord>,
     holders_by_root: BTreeMap<String, RootHolder>,
     queued: BTreeMap<u64, CensusRecord>,
+}
+
+impl AdmissionState {
+    /// Class of the latest turn that has not been refused: a pending turn
+    /// counts as soon as its permit is installed, so requests that arrive
+    /// while its predicate runs see it.
+    fn last_admitted_class(&self) -> Option<ColdBuildAdmissionClass> {
+        let pending = self
+            .pending_turns
+            .last_key_value()
+            .map(|(turn, class)| (*turn, *class));
+        match (pending, self.settled_turn) {
+            (Some(pending), Some(settled)) => Some(if pending.0 > settled.0 {
+                pending.1
+            } else {
+                settled.1
+            }),
+            (pending, settled) => pending.or(settled).map(|(_, class)| class),
+        }
+    }
+}
+
+/// A class turn taken for a new slot whose admission predicate has not
+/// answered yet. Settling it confirms the turn and records the admission
+/// event; dropping it unsettled (refusal or a panicking predicate) withdraws
+/// the turn so it never skews later alternation.
+struct ClassTurnReservation {
+    limiter: Arc<ColdBuildLimiter>,
+    turn: u64,
+    settled: bool,
+}
+
+impl ClassTurnReservation {
+    fn settle(mut self, request: &ColdBuildAdmissionRequest) {
+        let mut state = self
+            .limiter
+            .admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(class) = state.pending_turns.remove(&self.turn) {
+            // A later turn may already have settled; keep whichever is newer.
+            if state
+                .settled_turn
+                .is_none_or(|(settled, _)| settled < self.turn)
+            {
+                state.settled_turn = Some((self.turn, class));
+            }
+        }
+        ColdBuildLimiter::record_admission_locked(&mut state, request);
+        self.settled = true;
+    }
+}
+
+impl Drop for ClassTurnReservation {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.limiter
+            .admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_turns
+            .remove(&self.turn);
+    }
 }
 
 #[derive(Debug)]
@@ -420,7 +497,9 @@ impl ColdBuildLimiter {
             limit,
             waiting_by_class: std::array::from_fn(|_| AtomicUsize::new(0)),
             admission_state: Mutex::new(AdmissionState {
-                last_admitted_class: None,
+                next_turn: 1,
+                settled_turn: None,
+                pending_turns: BTreeMap::new(),
                 next_admission_order: 1,
                 next_census_id: 1,
                 events: VecDeque::with_capacity(ADMISSION_EVENT_RETENTION),
@@ -486,9 +565,15 @@ impl ColdBuildLimiter {
     /// permit is therefore installed first, the lock released, and the
     /// predicate checked. A refused permit is dropped before any build starts:
     /// a newly taken slot goes back to the limiter, and a shared root permit
-    /// only loses this request's reference. The admission event and class
-    /// rotation are recorded only once the predicate accepts, so refused work
-    /// still leaves no admission behind.
+    /// only loses this request's reference.
+    ///
+    /// A new slot's class turn is reserved when the permit is installed, while
+    /// the lock is still held, so a request arriving while the predicate runs
+    /// already sees this class as the latest admission and leaves the last
+    /// free slot to a waiting request of another class. If the predicate
+    /// refuses (or panics), the reservation is withdrawn and the class turn is
+    /// what it was without this request. The admission event is recorded only
+    /// once the predicate accepts, so refused work leaves no admission behind.
     fn try_acquire_classified(
         self: &Arc<Self>,
         request: &ColdBuildAdmissionRequest,
@@ -496,31 +581,31 @@ impl ColdBuildLimiter {
         ticket: Option<u64>,
         admitted_after_acquire: impl FnOnce() -> bool,
     ) -> Option<ColdBuildPermit> {
-        let (permit, took_new_slot) = self.install_classified_permit(request, kind, ticket)?;
+        // Declared after the permit so that, on refusal or unwinding, the
+        // reservation is withdrawn before the slot is returned.
+        let (permit, reservation) = self.install_classified_permit(request, kind, ticket)?;
         if !admitted_after_acquire() {
+            drop(reservation);
             drop(permit);
             return None;
         }
-        if took_new_slot {
-            let mut state = self
-                .admission_state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Self::record_admission_locked(&mut state, request);
+        if let Some(reservation) = reservation {
+            reservation.settle(request);
         }
         Some(permit)
     }
 
     /// The locked half of [`Self::try_acquire_classified`]: share the root's
-    /// existing permit or take and install a new slot. Returns whether a new
-    /// slot was taken, which is what counts as an admission. Runs no caller
-    /// code while `admission_state` is held.
+    /// existing permit or take and install a new slot. A new slot also
+    /// reserves its class turn, returned as the reservation; sharing a root's
+    /// permit is not an admission and reserves nothing. Runs no caller code
+    /// while `admission_state` is held.
     fn install_classified_permit(
         self: &Arc<Self>,
         request: &ColdBuildAdmissionRequest,
         kind: &str,
         ticket: Option<u64>,
-    ) -> Option<(ColdBuildPermit, bool)> {
+    ) -> Option<(ColdBuildPermit, Option<ClassTurnReservation>)> {
         let mut state = self
             .admission_state
             .lock()
@@ -532,7 +617,7 @@ impl ColdBuildLimiter {
                 // briefly double-owning capacity for the same root on another
                 // free slot.
                 let lease = holder.permit.upgrade()?;
-                return Some((ColdBuildPermit { lease }, false));
+                return Some((ColdBuildPermit { lease }, None));
             }
         }
 
@@ -553,7 +638,7 @@ impl ColdBuildLimiter {
         // stranding independent roots behind an artificial one-at-a-time turn.
         if available <= 1
             && self.has_waiter_from_another_class(request.class)
-            && state.last_admitted_class == Some(request.class)
+            && state.last_admitted_class() == Some(request.class)
         {
             return None;
         }
@@ -567,7 +652,15 @@ impl ColdBuildLimiter {
             request.census_label(),
             kind,
         );
-        Some((permit, true))
+        let turn = state.next_turn;
+        state.next_turn = state.next_turn.saturating_add(1);
+        state.pending_turns.insert(turn, request.class);
+        let reservation = ClassTurnReservation {
+            limiter: Arc::clone(self),
+            turn,
+            settled: false,
+        };
+        Some((permit, Some(reservation)))
     }
 
     fn install_permit_locked(
@@ -616,7 +709,6 @@ impl ColdBuildLimiter {
             admission_order: state.next_admission_order,
         };
         state.next_admission_order += 1;
-        state.last_admitted_class = Some(request.class);
         if state.events.len() == ADMISSION_EVENT_RETENTION {
             state.events.pop_front();
         }
@@ -1376,6 +1468,149 @@ mod tests {
         );
         drop(root_holder);
         assert_eq!(limiter.available.load(Ordering::Acquire), 2);
+    }
+
+    fn current_class_turn(limiter: &ColdBuildLimiter) -> Option<ColdBuildAdmissionClass> {
+        limiter
+            .admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_admitted_class()
+    }
+
+    /// Starts a request on its own thread whose admission predicate signals
+    /// that it is running, then waits for the test to open the gate with the
+    /// predicate's answer. The returned handle yields the request's permit.
+    fn request_with_gated_predicate(
+        limiter: &Arc<ColdBuildLimiter>,
+        request: ColdBuildAdmissionRequest,
+    ) -> (
+        std::sync::mpsc::Sender<bool>,
+        std::thread::JoinHandle<Option<ColdBuildPermit>>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<bool>();
+        let limiter = Arc::clone(limiter);
+        let handle = std::thread::spawn(move || {
+            limiter.try_acquire_classified(&request, "gated", None, || {
+                entered_tx
+                    .send(())
+                    .expect("test receives the entered signal");
+                gate_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("test opens the predicate gate")
+            })
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("gated predicate starts");
+        (gate_tx, handle)
+    }
+
+    #[test]
+    fn pending_admission_keeps_the_last_slot_for_a_waiting_other_class() {
+        let limiter = test_limiter(2);
+        let inspect =
+            ColdBuildAdmissionRequest::new("inspect", ColdBuildAdmissionClass::InspectTriggered);
+        let inspect_waiter = AdmissionWaiter::register(&limiter, &inspect, "inspect");
+
+        let (gate, first) = request_with_gated_predicate(
+            &limiter,
+            ColdBuildAdmissionRequest::new("maintenance-a", ColdBuildAdmissionClass::Maintenance),
+        );
+        // The first maintenance request holds one slot and its predicate has
+        // not answered. A second maintenance request must already see the
+        // maintenance turn and leave the last slot to the queued inspect.
+        let second = try_acquire_classified_with_limiter(
+            &limiter,
+            &ColdBuildAdmissionRequest::new("maintenance-b", ColdBuildAdmissionClass::Maintenance),
+        );
+        let second_took_last_slot = second.is_some();
+        drop(second);
+        gate.send(true).expect("open the gate");
+        let first = first.join().expect("gated request joins");
+        assert!(
+            !second_took_last_slot,
+            "a maintenance request took the last free slot while another maintenance \
+             admission was pending and inspect was queued"
+        );
+        assert!(first.is_some(), "the gated request is admitted");
+        let inspect_permit = limiter
+            .try_acquire_classified(&inspect, "inspect", Some(inspect_waiter.census_id), || true)
+            .expect("queued inspect takes the slot left for it");
+        drop((inspect_waiter, inspect_permit, first));
+        assert_eq!(limiter.available.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn refused_pending_admission_restores_the_previous_class_turn() {
+        let limiter = test_limiter(3);
+        let earlier = try_acquire_classified_with_limiter(
+            &limiter,
+            &ColdBuildAdmissionRequest::new(
+                "inspect-earlier",
+                ColdBuildAdmissionClass::InspectTriggered,
+            ),
+        )
+        .expect("earlier inspect admission");
+        assert_eq!(
+            current_class_turn(&limiter),
+            Some(ColdBuildAdmissionClass::InspectTriggered)
+        );
+
+        let (gate, refused) = request_with_gated_predicate(
+            &limiter,
+            ColdBuildAdmissionRequest::new("maintenance", ColdBuildAdmissionClass::Maintenance),
+        );
+        let turn_while_pending = current_class_turn(&limiter);
+        gate.send(false).expect("refuse the gated request");
+        assert!(refused.join().expect("gated request joins").is_none());
+        assert_eq!(
+            turn_while_pending,
+            Some(ColdBuildAdmissionClass::Maintenance),
+            "a pending admission takes the class turn while its predicate runs"
+        );
+        assert_eq!(
+            current_class_turn(&limiter),
+            Some(ColdBuildAdmissionClass::InspectTriggered),
+            "a refused admission must leave the class turn as it was before it"
+        );
+        assert_eq!(
+            limiter.available.load(Ordering::Acquire),
+            2,
+            "the refused admission returns its slot"
+        );
+        assert_eq!(limiter.admission_events().len(), 1);
+
+        // Out of order: a later inspect admission settles while an earlier
+        // maintenance admission is still pending, then the maintenance one is
+        // refused. The turn must be the inspect one, not the refused class.
+        let (gate, refused) = request_with_gated_predicate(
+            &limiter,
+            ColdBuildAdmissionRequest::new("maintenance-2", ColdBuildAdmissionClass::Maintenance),
+        );
+        let later = try_acquire_classified_with_limiter(
+            &limiter,
+            &ColdBuildAdmissionRequest::new(
+                "inspect-later",
+                ColdBuildAdmissionClass::InspectTriggered,
+            ),
+        )
+        .expect("later inspect admission");
+        gate.send(false).expect("refuse the gated request");
+        assert!(refused.join().expect("gated request joins").is_none());
+        assert_eq!(
+            current_class_turn(&limiter),
+            Some(ColdBuildAdmissionClass::InspectTriggered)
+        );
+        assert!(limiter
+            .admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_turns
+            .is_empty());
+        drop((earlier, later));
+        assert_eq!(limiter.available.load(Ordering::Acquire), 3);
     }
 }
 
