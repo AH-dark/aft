@@ -2597,6 +2597,66 @@ mod payload_heal_tests {
         );
         assert!(dropped.pending_paths.contains(b"lib.rs".as_slice()));
     }
+
+    /// A path left out because its missing payload could not be rebuilt is
+    /// marked failed only once its generation is served, like every other
+    /// status change: preparing the generation writes nothing.
+    #[test]
+    fn views_unrebuildable_payload_is_marked_failed_only_after_its_generation_is_served() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(project.path().join("lib.rs"), "pub fn lib() {}\n").unwrap();
+        fs::write(project.path().join("other.rs"), "pub fn other() {}\n").unwrap();
+        git(project.path(), &["init", "--quiet"]);
+        git(project.path(), &["add", "."]);
+        git(project.path(), &["commit", "--quiet", "-m", "base"]);
+        let mut request = AssemblyRequest {
+            storage: storage.path().to_path_buf(),
+            project_root: project.path().to_path_buf(),
+            family: "unrebuildable-family".into(),
+            scope: "unrebuildable-scope".into(),
+            desired_head: "head".into(),
+            changed_paths: BTreeSet::new(),
+            semantic_keys: BTreeMap::new(),
+            require_semantic: false,
+            allow_blob_put: true,
+            callgraph: true,
+        };
+        assert!(publish_checkout(&request).unwrap().published);
+        let store = BlobStore::open(storage.path(), &request.family, BlobPlane::Callgraph).unwrap();
+        Connection::open(store.path())
+            .unwrap()
+            .execute_batch("DELETE FROM blob_payloads")
+            .unwrap();
+        drop(store);
+        // lib.rs can no longer be read as a file; other.rs changes.
+        fs::remove_file(project.path().join("lib.rs")).unwrap();
+        fs::create_dir(project.path().join("lib.rs")).unwrap();
+        fs::write(project.path().join("other.rs"), "pub fn other2() {}\n").unwrap();
+        request.changed_paths = BTreeSet::from([b"other.rs".to_vec()]);
+        let view = ViewStore::open(storage.path(), &request.scope).unwrap();
+        let status = || {
+            crate::path_status::PathStatusStore::open(view.view_dir())
+                .unwrap()
+                .status_for(b"lib.rs")
+                .unwrap()
+        };
+
+        let mut prepared = prepare_checkout(&request, &mut |_| Ok(())).unwrap();
+        assert_eq!(status(), None, "preparing the generation wrote no status");
+        let report = prepared.commit().unwrap();
+        assert!(report.published, "{report:?}");
+        assert!(report
+            .manifest
+            .as_ref()
+            .unwrap()
+            .get(&RelPath::new(b"lib.rs".to_vec()).unwrap())
+            .is_none());
+        prepared.settle_status();
+        let failed = status().expect("marked once the generation is served");
+        assert_eq!(failed.state, crate::path_status::PathState::Failed);
+        assert_eq!(failed.reason, MISSING_PAYLOAD_SOURCE_UNREADABLE);
+    }
 }
 
 #[cfg(test)]
