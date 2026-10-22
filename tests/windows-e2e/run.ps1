@@ -378,6 +378,18 @@ $AftConfig = @"
 "@
 Set-Content -Path (Join-Path $ConfigDir "aft.jsonc") -Value $AftConfig
 
+# Give OpenCode's config directories ($ConfigDir, plus ~\.opencode if it
+# exists) the @opencode-ai/plugin install that OpenCode would otherwise run
+# from the npm registry on the first launch, before it loads any plugin. The
+# version comes from the installed OpenCode, and a failed install stops setup
+# here instead of stalling a test launch.
+Write-Host "-- Seeding OpenCode config-directory dependencies --"
+& node (Join-Path $RepoRoot "tests\docker\seed-opencode-config-deps.mjs")
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Failed to seed OpenCode config-directory dependencies (see the message above)" -ForegroundColor Red
+    exit 2
+}
+
 # Inject the locally-built binary into the cache. The aft-bridge resolver's
 # `getCacheDir()` returns `$env:LOCALAPPDATA\aft\bin` on Windows — *not*
 # `$env:USERPROFILE\.cache\aft\bin` — because that's the canonical Windows
