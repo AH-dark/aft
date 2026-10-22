@@ -520,3 +520,58 @@ describe("pi.ask_outside_access", () => {
     }
   });
 });
+
+describe("asks that are not outside-path asks", () => {
+  const outsideAsk = {
+    kind: "external_directory",
+    grant_id: "outside:a",
+    path: "/outside/a",
+    operation: "read",
+  };
+  const otherAsks: Array<[string, Array<Record<string, unknown>>]> = [
+    ["bash rule", [{ kind: "bash", grant_id: "bash:rm-rf", patterns: ["rm -rf *"] }]],
+    ["escalation", [{ kind: "escalation", grant_id: "escalation:host" }]],
+    ["unknown kind", [{ kind: "network", grant_id: "outside:looks-alike" }]],
+    [
+      "external_directory without an outside: grant",
+      [{ kind: "external_directory", grant_id: "bash:dir", path: "/outside/a" }],
+    ],
+    ["outside ask beside a bash rule", [outsideAsk, { kind: "bash", grant_id: "bash:rm" }]],
+  ];
+  const policies = [
+    { harness: "pi", askOnPi: false },
+    { harness: "pi", askOnPi: true },
+    { harness: "omp", askOnPi: true },
+  ] as const;
+
+  test("are never approved without a prompt, in any mode or setting", async () => {
+    const confirm = mock(async () => true);
+    const contexts: Array<ExtensionContext | undefined> = [
+      { ...context(confirm), mode: "tui" } as unknown as ExtensionContext,
+      { ...context(confirm), mode: "print" } as unknown as ExtensionContext,
+      { ...context(confirm), mode: "rpc" } as unknown as ExtensionContext,
+      undefined,
+    ];
+    for (const [label, asks] of otherAsks) {
+      for (const policy of policies) {
+        for (const extCtx of contexts) {
+          const sends: Array<Record<string, unknown>> = [];
+          const send = async (args: Record<string, unknown>) => {
+            sends.push(structuredClone(args));
+            return { success: false, code: "permission_required", asks } as Record<string, unknown>;
+          };
+          const response = await withOutsidePermissionOperation(
+            () => withOutsidePermissions({}, extCtx, send),
+            undefined,
+            policy,
+          );
+          // Handed back untouched after one send: nothing was approved.
+          expect(response.code, label).toBe("permission_required");
+          expect(sends, label).toHaveLength(1);
+          expect(sends[0], label).not.toHaveProperty("permissions_granted");
+        }
+      }
+    }
+    expect(confirm).not.toHaveBeenCalled();
+  });
+});

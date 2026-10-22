@@ -364,6 +364,15 @@ function defaultOutsideAccessPolicy(): OutsideAccessPolicy {
   return { harness: detectPiHarness(), askOnPi: true };
 }
 
+/** An engine ask for one outside path: kind `external_directory` with an `outside:` grant ID. */
+export function isOutsideAccessAsk(ask: unknown): boolean {
+  if (ask === null || typeof ask !== "object") return false;
+  const { kind, grant_id: grantId } = ask as { kind?: unknown; grant_id?: unknown };
+  return (
+    kind === "external_directory" && typeof grantId === "string" && grantId.startsWith("outside:")
+  );
+}
+
 /** The outside-access policy `ctx`'s current config selects on `harness`. */
 export function outsideAccessPolicyFor(
   ctx: PluginContext,
@@ -441,12 +450,11 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
           reason?: string;
         }>
       | undefined;
-    if (
-      !asks?.length ||
-      !asks.every(
-        (ask) => ask.kind === "external_directory" && ask.grant_id?.startsWith("outside:"),
-      )
-    ) {
+    // Only outside-path asks are answered here, and only they are ever
+    // approved without a prompt. Any other ask (a bash rule, an escalation, a
+    // kind a later engine adds) goes back to the caller untouched, so it can
+    // never be approved silently.
+    if (!asks?.length || !asks.every(isOutsideAccessAsk)) {
       if (granted.length) continuations?.set(key, granted);
       return response;
     }
