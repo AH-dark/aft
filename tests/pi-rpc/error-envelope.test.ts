@@ -37,6 +37,8 @@ async function withPiTool(
   opts: {
     message: string;
     setup?: (env: PiIsolatedEnv) => Promise<void>;
+    /** Tool arguments computed after `setup`, replacing `toolCall.arguments`. */
+    toolArguments?: () => Record<string, unknown>;
     onClient?: (client: RpcClient) => void;
     afterTool?: (env: PiIsolatedEnv, toolEnd: Record<string, unknown>) => Promise<void>;
   },
@@ -48,7 +50,7 @@ async function withPiTool(
     await opts.setup?.(env);
     aimock.registerToolCallFixture({
       predicate: () => true,
-      toolCalls: [toolCall],
+      toolCalls: [opts.toolArguments ? { ...toolCall, arguments: opts.toolArguments() } : toolCall],
       followupText: "Done.",
     });
     const spawned = spawnPiRpc({
@@ -88,35 +90,83 @@ describe("tool error envelopes (real Pi RPC)", () => {
     expect(resultText(toolEnd).toLowerCase()).toMatch(/not.*found|enoent/);
   }, 120_000);
 
-  test("read outside the project is denied at once when no prompt is possible", async () => {
-    // Pi's RPC mode has no screen of its own, so outside access that needs
-    // approval is refused immediately instead of waiting for an answer.
-    let startedAt = 0;
-    let endedAt = 0;
-    let confirmRequested = false;
+  // Pi's RPC mode is never asked about outside access (only Pi's own terminal
+  // UI is), so outside access is allowed without a prompt, as before AFT asked.
+  // The engine's floors still refuse, and nothing waits on the RPC client.
+  function watchRead(client: RpcClient, seen: { confirm: boolean; start: number; end: number }) {
+    client.onEvent((event) => {
+      if (event.toolName !== "read") return;
+      if (event.type === "tool_execution_start") seen.start = Date.now();
+      if (event.type === "tool_execution_end") seen.end = Date.now();
+    });
+    client.onExtensionUIRequest((request) => {
+      if (request.method === "confirm") seen.confirm = true;
+    });
+  }
+
+  test("read of an existing file outside the project succeeds without a prompt", async () => {
+    const seen = { confirm: false, start: 0, end: 0 };
+    let outsideFile = "";
+    const toolEnd = await withPiTool(
+      // The path is filled in once the isolated environment exists.
+      { name: "read", arguments: { path: "" } },
+      {
+        message: "Read the outside notes.",
+        setup: async (env) => {
+          // Beside the project, and outside the system temp folder, so the
+          // engine treats it as outside access rather than scratch.
+          const outside = join(env.baseDir, "outside");
+          await mkdir(outside, { recursive: true });
+          outsideFile = join(outside, "notes.txt");
+          await writeFile(outsideFile, "outside notes 4b2e\n");
+        },
+        toolArguments: () => ({ path: outsideFile }),
+        onClient: (client) => watchRead(client, seen),
+      },
+    );
+    expect(toolEnd.isError).toBe(false);
+    expect(resultText(toolEnd)).toContain("outside notes 4b2e");
+    expect(seen.confirm).toBe(false);
+  }, 120_000);
+
+  test("read of a nonexistent outside path gives the not-found result without a prompt", async () => {
+    const seen = { confirm: false, start: 0, end: 0 };
     const toolEnd = await withPiTool(
       { name: "read", arguments: { path: "/does/not/exist" } },
       {
         message: "Read /does/not/exist.",
-        onClient: (client) => {
-          client.onEvent((event) => {
-            if (event.toolName !== "read") return;
-            if (event.type === "tool_execution_start") startedAt = Date.now();
-            if (event.type === "tool_execution_end") endedAt = Date.now();
-          });
-          client.onExtensionUIRequest((request) => {
-            if (request.method === "confirm") confirmRequested = true;
-          });
-        },
+        onClient: (client) => watchRead(client, seen),
       },
     );
     expect(toolEnd.isError).toBe(true);
-    expect(resultText(toolEnd)).toContain("none was possible");
-    // The refusal does not say whether the path exists.
-    expect(resultText(toolEnd).toLowerCase()).not.toMatch(/not.*found|enoent/);
-    expect(confirmRequested).toBe(false);
-    expect(startedAt).toBeGreaterThan(0);
-    expect(endedAt - startedAt).toBeLessThan(5_000);
+    expect(resultText(toolEnd).toLowerCase()).toMatch(/not.*found|enoent/);
+    expect(seen.confirm).toBe(false);
+    expect(seen.start).toBeGreaterThan(0);
+    expect(seen.end - seen.start).toBeLessThan(5_000);
+  }, 120_000);
+
+  test("read of a floor-protected path is still refused, without a prompt", async () => {
+    const seen = { confirm: false, start: 0, end: 0 };
+    let protectedFile = "";
+    const toolEnd = await withPiTool(
+      { name: "read", arguments: { path: "" } },
+      {
+        message: "Read the CortexKit data file.",
+        setup: async (env) => {
+          // Pi runs with HOME set to the environment's config folder, so
+          // this is `~/.local/share/cortexkit` for the session.
+          const store = join(env.configDir, ".local", "share", "cortexkit");
+          await mkdir(store, { recursive: true });
+          protectedFile = join(store, "probe.txt");
+          await writeFile(protectedFile, "protected body 9d1a\n");
+        },
+        toolArguments: () => ({ path: protectedFile }),
+        onClient: (client) => watchRead(client, seen),
+      },
+    );
+    expect(toolEnd.isError).toBe(true);
+    expect(resultText(toolEnd)).not.toContain("protected body 9d1a");
+    expect(seen.confirm).toBe(false);
   }, 120_000);
 
   test("edit with no matching oldString errors and leaves file unchanged", async () => {
