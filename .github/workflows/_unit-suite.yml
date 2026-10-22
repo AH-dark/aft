@@ -98,7 +98,7 @@ jobs:
           LINUX_NEXTEST_ARCHIVE: ${{ runner.temp }}/linux-nextest.tar.zst
 
       # nextest has already compressed the tarball with zstd.
-      - uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/upload-artifact-retry
         with:
           name: linux-nextest-archive
           path: ${{ runner.temp }}/linux-nextest.tar.zst
@@ -337,7 +337,7 @@ jobs:
           AFT_SUBC_E2E_LOG_DIR: ${{ runner.temp }}/aft-subc-e2e-logs
       - name: Upload subc diagnostics on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: subc-e2e-logs-${{ matrix.suite }}-linux
           path: ${{ runner.temp }}/aft-subc-e2e-logs/
@@ -649,7 +649,7 @@ jobs:
         env:
           MACOS_NEXTEST_ARCHIVE: ${{ runner.temp }}/macos-nextest.tar.zst
 
-      - uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/upload-artifact-retry
         with:
           name: macos-nextest-archive
           path: |
@@ -711,7 +711,7 @@ jobs:
         env:
           MACOS_LIBTEST_ARCHIVE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
 
-      - uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/upload-artifact-retry
         with:
           name: macos-libtest-archive
           path: |
@@ -769,7 +769,7 @@ jobs:
         env:
           MACOS_BIN_ARCHIVE: ${{ runner.temp }}/macos-bin-nextest.tar.zst
 
-      - uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/upload-artifact-retry
         with:
           name: macos-bin-archive
           path: |
@@ -801,22 +801,22 @@ jobs:
           curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/mac" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
-      - uses: actions/download-artifact@v4
+      - uses: ./.github/actions/download-artifact-retry
         with:
           name: macos-nextest-archive
           path: ${{ runner.temp }}
 
-      - uses: actions/download-artifact@v4
+      - uses: ./.github/actions/download-artifact-retry
         with:
           name: macos-libtest-archive
           path: ${{ runner.temp }}
 
-      - uses: actions/download-artifact@v4
+      - uses: ./.github/actions/download-artifact-retry
         with:
           name: macos-bin-archive
           path: ${{ runner.temp }}
 
-      - uses: actions/download-artifact@v4
+      - uses: ./.github/actions/download-artifact-retry
         with:
           name: macos-watcher-inventory
           path: ${{ runner.temp }}
@@ -953,12 +953,12 @@ jobs:
           curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/mac" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
-      - uses: actions/download-artifact@v4
+      - uses: ./.github/actions/download-artifact-retry
         with:
           name: macos-libtest-archive
           path: ${{ runner.temp }}
 
-      - uses: actions/download-artifact@v4
+      - uses: ./.github/actions/download-artifact-retry
         with:
           name: macos-bin-archive
           path: ${{ runner.temp }}
@@ -980,7 +980,7 @@ jobs:
 
       - name: Upload macOS libtest shard output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: macos-libtest-shard-${{ matrix.shard }}-log
           path: ${{ runner.temp }}/macos-libtest-shard-${{ matrix.shard }}.log
@@ -1035,7 +1035,7 @@ jobs:
 
       - name: Upload macOS watcher output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: macos-watcher-log
           path: ${{ runner.temp }}/macos-watcher.log
@@ -1043,7 +1043,7 @@ jobs:
 
       - name: Upload macOS watcher inventory
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: macos-watcher-inventory
           path: ${{ runner.temp }}/macos-watcher-inventory.txt
@@ -1242,7 +1242,7 @@ jobs:
 
       # The archive is already zstd-compressed. Disabling the artifact action's
       # second compression avoids spending CPU to recompress incompressible data.
-      - uses: actions/upload-artifact@v4
+      - uses: ./.github/actions/upload-artifact-retry
         with:
           name: windows-nextest-archive
           path: ${{ runner.temp }}/windows-nextest.tar.zst
@@ -1314,7 +1314,7 @@ jobs:
           curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
-      - uses: actions/download-artifact@v4
+      - uses: ./.github/actions/download-artifact-retry
         with:
           name: windows-nextest-archive
           path: ${{ runner.temp }}
@@ -1338,7 +1338,7 @@ jobs:
 
       - name: Upload Windows libtest shard output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: windows-libtest-shard-${{ matrix.shard }}-log
           path: ${{ runner.temp }}/windows-libtest-shard-${{ matrix.shard }}.log
@@ -1385,7 +1385,7 @@ jobs:
 
       - name: Upload Windows watcher + conformance output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/upload-artifact-retry
         with:
           name: windows-watcher-conformance-log
           path: ${{ runner.temp }}/windows-watcher-conformance.log

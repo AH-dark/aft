@@ -1,0 +1,91 @@
+name: Upload artifact with retry
+description: >-
+  actions/upload-artifact@v4, tried up to three times with a 60 s and then a
+  120 s pause between attempts, so a few minutes of GitHub artifact-service
+  outage does not fail a job whose tests passed.
+# Why this exists: the artifact service sometimes times out for a minute or
+# more (`Failed to CreateArtifact: Failed to make request after 5 attempts:
+# Request timeout`). The upload action's own retries all fall inside that
+# window, so a fully green test job failed on its upload step and took a
+# required check, and the merge queue entry, down with it.
+#
+# Failure stays fail-closed. Only the first two attempts may fail without
+# failing this action; if the third attempt fails, the calling step fails.
+# A missing file under `if-no-files-found: error` therefore still fails the
+# job, after the same retries. Callers must not mark this step
+# continue-on-error when a required check needs the uploaded data.
+inputs:
+  name:
+    description: Artifact name
+    required: true
+  path:
+    description: Files, directories or wildcard patterns to upload
+    required: true
+  if-no-files-found:
+    description: warn, error or ignore, as for actions/upload-artifact
+    required: false
+    default: warn
+  compression-level:
+    description: Zlib compression level, 0-9, as for actions/upload-artifact
+    required: false
+    default: "6"
+  retention-days:
+    description: Days to keep the artifact; empty uses the repository default
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    # Every condition names !cancelled() explicitly. Callers run this action
+    # after a failed step (`if: always()` / `if: failure()` diagnostics), and
+    # an implicit success() would skip the upload in exactly those runs.
+    - name: Upload artifact (attempt 1 of 3)
+      id: attempt-1
+      if: ${{ !cancelled() }}
+      continue-on-error: true
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        if-no-files-found: ${{ inputs.if-no-files-found }}
+        compression-level: ${{ inputs.compression-level }}
+        retention-days: ${{ inputs.retention-days }}
+
+    - name: Wait 60 s before retrying the upload
+      if: ${{ !cancelled() && steps.attempt-1.outcome == 'failure' }}
+      shell: bash
+      run: sleep 60
+
+    # overwrite: a timed-out attempt may still have created the artifact on
+    # the service side, and a second upload under the same name would then be
+    # refused as a duplicate.
+    - name: Upload artifact (attempt 2 of 3)
+      id: attempt-2
+      if: ${{ !cancelled() && steps.attempt-1.outcome == 'failure' }}
+      continue-on-error: true
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        if-no-files-found: ${{ inputs.if-no-files-found }}
+        compression-level: ${{ inputs.compression-level }}
+        retention-days: ${{ inputs.retention-days }}
+        overwrite: true
+
+    - name: Wait 120 s before the last upload attempt
+      if: ${{ !cancelled() && steps.attempt-2.outcome == 'failure' }}
+      shell: bash
+      run: sleep 120
+
+    # No continue-on-error here: if the last attempt fails, the job fails.
+    - name: Upload artifact (attempt 3 of 3)
+      id: attempt-3
+      if: ${{ !cancelled() && steps.attempt-2.outcome == 'failure' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        if-no-files-found: ${{ inputs.if-no-files-found }}
+        compression-level: ${{ inputs.compression-level }}
+        retention-days: ${{ inputs.retention-days }}
+        overwrite: true

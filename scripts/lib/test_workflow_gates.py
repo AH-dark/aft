@@ -201,7 +201,7 @@ class LightPREventGateTests(unittest.TestCase):
             self.assertEqual(step["env"]["AFT_NEXTEST_PARTITION"], "hash:${{ inputs.shard }}/3")
             self.assertEqual(step["env"]["AFT_GATE_PHASES"], "nextest")
             self.assertEqual(step["env"]["AFT_GATE_SKIP_RELEASE_STORM"], "1")
-        download = next(step for step in steps if step.get("uses") == "actions/download-artifact@v4")
+        download = next(step for step in steps if step.get("uses") == "./.github/actions/download-artifact-retry")
         self.assertEqual(download["with"]["name"], "${{ inputs.platform }}-nextest-archive")
 
 
@@ -661,6 +661,291 @@ class CortexkitTrackingGateTests(unittest.TestCase):
             green = self._check(repo)
             self.assertEqual(green.returncode, 0, green.stdout + green.stderr)
             self.assertTrue(draft.exists(), "git rm --cached must keep the working copy")
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+UPLOAD_RETRY = "./.github/actions/upload-artifact-retry"
+DOWNLOAD_RETRY = "./.github/actions/download-artifact-retry"
+RETRY_ACTIONS = {
+    UPLOAD_RETRY: "actions/upload-artifact@v4",
+    DOWNLOAD_RETRY: "actions/download-artifact@v4",
+}
+DIRECT_ARTIFACT_PREFIXES = ("actions/upload-artifact@", "actions/download-artifact@")
+
+# Direct, single-attempt artifact steps that a required check may still run,
+# keyed by (file, job, step id). Each one must be continue-on-error and have a
+# fallback, so the artifact service failing cannot fail the check.
+SINGLE_ATTEMPT_ALLOWED = {
+    # The gate builds the binary itself when this download fails.
+    (".github/workflows/tests.yml", "search-quality-gate", "download-release-aft"),
+}
+
+# Artifacts whose contents a later required job reads. Their uploads must keep
+# failing the producing job when a file is missing.
+REQUIRED_DATA_UPLOADS = {
+    "linux-nextest-archive",
+    "macos-nextest-archive",
+    "macos-libtest-archive",
+    "macos-bin-archive",
+    "windows-nextest-archive",
+    "e2e-linux-${{ inputs.cargo_profile }}-binary",
+    "e2e-opencode2-${{ inputs.cargo_profile }}-binary",
+    "search-quality-aft-${{ github.sha }}",
+    "queue-context-${{ github.sha }}",
+}
+
+
+def _local_target(uses: str) -> Path | None:
+    """Map a local `uses:` reference to the file GitHub would load for it."""
+    if not uses.startswith("./"):
+        return None
+    target = REPO_ROOT / uses[2:]
+    return target if target.suffix in (".yml", ".yaml") else target / "action.yml"
+
+
+def required_check_steps() -> list[tuple[str, str, dict]]:
+    """Every step a merge-queue run of tests.yml can execute, as
+    (repo-relative file, job id, step). Reusable workflows and local composite
+    actions are followed, so a new suite or shared action is covered without
+    anyone remembering to list it here. Composite steps report job "(composite)".
+    """
+    pending = [REPO_ROOT / ".github/workflows/tests.yml"]
+    seen: set[Path] = set()
+    found: list[tuple[str, str, dict]] = []
+    while pending:
+        path = pending.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        document = workflow_gates.parse_workflow(str(path))
+        relative = str(path.relative_to(REPO_ROOT))
+        groups: list[tuple[str, list]] = []
+        jobs = document.get("jobs")
+        if isinstance(jobs, dict):
+            for job_id, job in jobs.items():
+                if not isinstance(job, dict):
+                    continue
+                target = _local_target(str(job.get("uses") or ""))
+                if target is not None:
+                    pending.append(target)
+                groups.append((job_id, job.get("steps") or []))
+        runs = document.get("runs")
+        if isinstance(runs, dict):
+            groups.append(("(composite)", runs.get("steps") or []))
+        for job_id, steps in groups:
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                found.append((relative, job_id, step))
+                target = _local_target(str(step.get("uses") or ""))
+                if target is not None:
+                    pending.append(target)
+    return found
+
+
+class ArtifactRetryTests(unittest.TestCase):
+    """GitHub's artifact service can time out for minutes at a time. An upload
+    or download that a required check runs must retry instead of failing a run
+    whose tests passed, and must still fail closed once the retries run out.
+    The only exceptions are listed in SINGLE_ATTEMPT_ALLOWED: steps whose
+    failure the check survives through a fallback."""
+
+    def setUp(self) -> None:
+        self.steps = required_check_steps()
+
+    def calls(self, action: str) -> list[tuple[str, str, dict]]:
+        return [entry for entry in self.steps if entry[2].get("uses") == action]
+
+    def test_traversal_reaches_the_unit_and_e2e_suites_and_shard_action(self) -> None:
+        files = {relative for relative, _, _ in self.steps}
+        for expected in (
+            ".github/workflows/tests.yml",
+            ".github/workflows/_unit-suite.yml",
+            ".github/workflows/_e2e-suite.yml",
+            ".github/actions/integration-shard/action.yml",
+            ".github/actions/upload-artifact-retry/action.yml",
+            ".github/actions/download-artifact-retry/action.yml",
+        ):
+            self.assertIn(expected, files)
+
+    def test_required_check_artifact_steps_use_the_retrying_actions(self) -> None:
+        wrappers = {str(_local_target(action).relative_to(REPO_ROOT)) for action in RETRY_ACTIONS}
+        offenders = []
+        allowed_seen = set()
+        for relative, job_id, step in self.steps:
+            uses = str(step.get("uses") or "")
+            if relative in wrappers or not uses.startswith(DIRECT_ARTIFACT_PREFIXES):
+                continue
+            key = (relative, job_id, step.get("id"))
+            if key in SINGLE_ATTEMPT_ALLOWED:
+                allowed_seen.add(key)
+                self.assertEqual(step.get("continue-on-error"), "true", key)
+                continue
+            offenders.append(f"{relative} job {job_id}: {step.get('name') or uses}")
+        self.assertEqual(
+            offenders,
+            [],
+            "artifact steps in required checks must use "
+            f"{UPLOAD_RETRY} or {DOWNLOAD_RETRY}, not a single attempt",
+        )
+        self.assertEqual(allowed_seen, SINGLE_ATTEMPT_ALLOWED, "stale single-attempt allowance")
+        self.assertGreaterEqual(len(self.calls(UPLOAD_RETRY)), len(REQUIRED_DATA_UPLOADS))
+        self.assertGreaterEqual(len(self.calls(DOWNLOAD_RETRY)), 8)
+
+    def test_retry_call_sites_are_never_continue_on_error(self) -> None:
+        for action in RETRY_ACTIONS:
+            for relative, job_id, step in self.calls(action):
+                with self.subTest(file=relative, job=job_id, name=step.get("with", {}).get("name")):
+                    self.assertNotIn("continue-on-error", step)
+
+    def test_required_data_uploads_still_fail_on_missing_files(self) -> None:
+        by_name = {
+            step.get("with", {}).get("name"): step for _, _, step in self.calls(UPLOAD_RETRY)
+        }
+        for name in sorted(REQUIRED_DATA_UPLOADS):
+            with self.subTest(artifact=name):
+                self.assertIn(name, by_name)
+                self.assertEqual(by_name[name]["with"].get("if-no-files-found"), "error")
+
+    def test_retry_actions_try_three_times_with_growing_pauses(self) -> None:
+        for action, inner in RETRY_ACTIONS.items():
+            with self.subTest(action=action):
+                document = workflow_gates.parse_workflow(str(_local_target(action)))
+                self.assertEqual(document["runs"]["using"], "composite")
+                steps = document["runs"]["steps"]
+                kinds = ["attempt" if step.get("uses") == inner else step.get("run") for step in steps]
+                self.assertEqual(kinds, ["attempt", "sleep 60", "attempt", "sleep 120", "attempt"])
+                attempts = [step for step in steps if step.get("uses") == inner]
+                self.assertEqual([step["id"] for step in attempts], ["attempt-1", "attempt-2", "attempt-3"])
+                self.assertEqual(attempts[0]["if"], "${{ !cancelled() }}")
+                for index in (1, 2):
+                    retry_if = f"${{{{ !cancelled() && steps.attempt-{index}.outcome == 'failure' }}}}"
+                    self.assertEqual(attempts[index]["if"], retry_if)
+                    self.assertEqual(steps[2 * index - 1]["if"], retry_if)
+                    self.assertEqual(steps[2 * index - 1]["shell"], "bash")
+                # Only the last attempt may fail the action: that is what keeps
+                # a missing artifact failing the job.
+                self.assertEqual([step.get("continue-on-error") for step in attempts], ["true", "true", None])
+                inputs = document["inputs"]
+                for step in attempts:
+                    for name in inputs:
+                        self.assertEqual(step["with"][name], f"${{{{ inputs.{name} }}}}")
+                if action == UPLOAD_RETRY:
+                    self.assertEqual(inputs["if-no-files-found"]["default"], "warn")
+                    self.assertNotIn("overwrite", attempts[0]["with"])
+                    self.assertEqual([step["with"].get("overwrite") for step in attempts[1:]], ["true", "true"])
+
+
+# Time a job must keep after its inner caps for a retrying artifact transfer:
+# the retry actions pause 60 s + 120 s and make up to three attempts.
+RETRY_MARGIN_MINUTES = 5.0
+
+# The word `timeout` followed by a duration, as the coreutils command is
+# written (a `--timeout` flag does not match), with its options. `-k`/`-s`
+# take their value as a separate word. This is a text match, not a shell
+# parse, so a quoted "timeout 5m" would also count.
+_SHELL_TIMEOUT = re.compile(
+    r"(?<![-\w])timeout\s+"
+    r"((?:(?:-k|-s|--kill-after|--signal)\s+\S+\s+|-\S+\s+)*)"
+    r"(\d+(?:\.\d+)?)([smhd]?)(?=\s)"
+)
+_KILL_AFTER = re.compile(r"(?:--kill-after=|-k\s+)(\d+(?:\.\d+)?)([smhd]?)")
+_MINUTES_PER_UNIT = {"": 1 / 60, "s": 1 / 60, "m": 1.0, "h": 60.0, "d": 1440.0}
+
+
+def step_cap_minutes(step: dict) -> float:
+    """A step's declared cap in minutes. The `timeout` commands found in its
+    script are summed (they run one after another), each with any
+    --kill-after grace added; when the step also sets `timeout-minutes`, the
+    smaller of the two applies. 0 means the step declares no cap."""
+    step_limit = float(step["timeout-minutes"]) if "timeout-minutes" in step else 0.0
+    shell_limit = 0.0
+    run = step.get("run")
+    if isinstance(run, str):
+        for options, number, unit in _SHELL_TIMEOUT.findall(run):
+            shell_limit += float(number) * _MINUTES_PER_UNIT[unit]
+            kill = _KILL_AFTER.search(options)
+            if kill:
+                shell_limit += float(kill.group(1)) * _MINUTES_PER_UNIT[kill.group(2)]
+    if step_limit and shell_limit:
+        return min(step_limit, shell_limit)
+    return step_limit or shell_limit
+
+
+def expanded_steps(steps: list) -> list[dict]:
+    """A job's steps with local composite actions replaced by their own steps,
+    except the retry actions, which stay as single steps to be found."""
+    expanded: list[dict] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        uses = str(step.get("uses") or "")
+        target = _local_target(uses)
+        if uses in RETRY_ACTIONS or target is None or target.name != "action.yml":
+            expanded.append(step)
+            continue
+        runs = workflow_gates.parse_workflow(str(target)).get("runs") or {}
+        expanded.extend(expanded_steps(runs.get("steps") or []))
+    return expanded
+
+
+def retry_job_budgets() -> list[tuple[str, str, float, float]]:
+    """(file, job, job timeout, inner caps before the job's last retrying
+    artifact step) for every job that uses a retry action, in tests.yml and
+    the reusable workflows it calls."""
+    files = sorted({
+        relative for relative, _, _ in required_check_steps()
+        if relative.startswith(".github/workflows/")
+    })
+    budgets = []
+    for relative in files:
+        jobs = workflow_gates.parse_workflow(str(REPO_ROOT / relative)).get("jobs") or {}
+        for job_id, job in jobs.items():
+            if not isinstance(job, dict):
+                continue
+            steps = expanded_steps(job.get("steps") or [])
+            retries = [i for i, step in enumerate(steps) if step.get("uses") in RETRY_ACTIONS]
+            if not retries:
+                continue
+            caps = sum(step_cap_minutes(step) for step in steps[: retries[-1]])
+            # GitHub's default job timeout is 360 minutes.
+            timeout = float(job.get("timeout-minutes", 360))
+            budgets.append((relative, job_id, timeout, caps))
+    return budgets
+
+
+class ArtifactRetryTimeBudgetTests(unittest.TestCase):
+    """A job that hits its own timeout is cancelled before its later steps run,
+    so a retrying upload placed after a capped test step must still fit inside
+    the job's timeout when that step uses its whole cap."""
+
+    def test_jobs_with_retrying_transfers_leave_time_beyond_their_inner_caps(self) -> None:
+        short = [
+            f"{relative} job {job_id}: timeout-minutes {timeout:g} < inner caps "
+            f"{caps:g} + {RETRY_MARGIN_MINUTES:g}"
+            for relative, job_id, timeout, caps in retry_job_budgets()
+            if timeout < caps + RETRY_MARGIN_MINUTES
+        ]
+        self.assertEqual(short, [], "raise these jobs' timeout-minutes; do not shrink their test caps")
+
+    def test_budget_scan_sees_the_capped_opencode2_matrix(self) -> None:
+        budgets = {(relative, job_id): caps for relative, job_id, _, caps in retry_job_budgets()}
+        self.assertGreaterEqual(len(budgets), 15)
+        self.assertAlmostEqual(budgets[(".github/workflows/_e2e-suite.yml", "e2e-opencode2-linux")], 22.5)
+        # The integration-shard action's download is found through the composite.
+        self.assertIn((".github/workflows/_unit-suite.yml", "unit-macos-nextest"), budgets)
+
+    def test_step_caps_read_timeout_commands_and_step_limits(self) -> None:
+        for step, minutes in (
+            ({"run": "timeout --signal=TERM --kill-after=30s 22m bash run.sh"}, 22.5),
+            ({"run": "timeout -k 60 10m make\ntimeout 90 make check"}, 12.5),
+            ({"run": "time bun test --timeout 30000 src/"}, 0.0),
+            ({"run": "timeout 1h make", "timeout-minutes": "15"}, 15.0),
+            ({"timeout-minutes": "7"}, 7.0),
+            ({"uses": "actions/checkout@v5"}, 0.0),
+        ):
+            with self.subTest(step=step):
+                self.assertAlmostEqual(step_cap_minutes(step), minutes)
 
 
 if __name__ == "__main__":
