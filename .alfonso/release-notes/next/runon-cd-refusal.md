@@ -1,0 +1,1 @@
+- `runon` now refuses literal top-level `cd` and `pushd` targets outside the checkout copied to the build server, before submitting the job or running anything locally. Set the bash tool's `workdir` to the intended folder instead. In-checkout paths, dynamic targets, and directory changes inside subshells are unchanged.

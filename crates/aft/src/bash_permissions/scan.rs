@@ -250,6 +250,77 @@ pub(super) fn collect_commands<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tre
     }
 }
 
+/// Resolve literal directory changes in the outer shell against the call's
+/// working folder. The scan skips nested shells and function definitions.
+#[cfg(any(unix, test))]
+pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
+    fn literal_word(raw: &str) -> Option<String> {
+        let mut parsed = crate::bash_rewrite::parser::parse(raw)?;
+        (parsed.args.len() == 1 && parsed.appends_to.is_none() && parsed.heredoc.is_none())
+            .then(|| parsed.args.remove(0))
+    }
+
+    fn visit(node: Node<'_>, source: &str, cwd: &Path, targets: &mut Vec<PathBuf>) {
+        match node.kind() {
+            "subshell"
+            | "command_substitution"
+            | "process_substitution"
+            | "function_definition" => {
+                return;
+            }
+            "command" => {
+                let parts = command_parts(source, node);
+                let head = parts.first().and_then(|part| literal_word(&part.text));
+                if matches!(head.as_deref(), Some("cd" | "pushd")) {
+                    if let Some(target) = parts
+                        .iter()
+                        .skip(1)
+                        .find(|part| !part.text.starts_with('-'))
+                    {
+                        let raw = target.text.as_str();
+                        let expand_home = raw == "~" || raw.starts_with("~/");
+                        // The literal decoder rejects active expansions. Escape
+                        // only the supported unquoted home prefix for decoding;
+                        // quoted or escaped tildes remain ordinary path text.
+                        let word = if expand_home {
+                            format!("\\{raw}")
+                        } else {
+                            raw.to_owned()
+                        };
+                        if let Some(text) = literal_word(&word).filter(|text| {
+                            text != "-"
+                                && !(head.as_deref() == Some("pushd") && text.starts_with('+'))
+                        }) {
+                            let path = if expand_home {
+                                let Some(home) = std::env::var_os("HOME") else {
+                                    return;
+                                };
+                                PathBuf::from(home).join(text.strip_prefix("~/").unwrap_or(""))
+                            } else {
+                                cwd.join(text)
+                            };
+                            targets.push(super::resolve_with_existing_ancestors(&path));
+                        }
+                    }
+                }
+                // Do not visit substitutions used as arguments to this command.
+                return;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            visit(child, source, cwd, targets);
+        }
+    }
+
+    let mut targets = Vec::new();
+    if let Some(tree) = parse_tree(command) {
+        visit(tree.root_node(), command, cwd, &mut targets);
+    }
+    targets
+}
+
 fn command_parts(source: &str, node: Node<'_>) -> Vec<Part> {
     let mut out = Vec::new();
 
@@ -654,6 +725,81 @@ fn push_ask(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, ask: Perm
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_level_directory_targets_resolve_lists_and_options_against_call_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let targets = top_level_directory_targets(
+            "cd -- nested && printf ok; pushd '../sibling repo'; cd ./other/..",
+            &cwd,
+        );
+        assert_eq!(
+            targets,
+            vec![
+                cwd.join("nested"),
+                cwd.parent().unwrap().join("sibling repo"),
+                cwd
+            ]
+        );
+    }
+
+    #[test]
+    fn top_level_directory_targets_ignore_dynamic_and_nested_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        for command in [
+            "cd $OTHER_CHECKOUT",
+            "cd \"${OTHER_CHECKOUT}\"",
+            "cd $(printf /outside)",
+            "cd -",
+            "pushd +1",
+            "cd ../*",
+            "printf '%s' \"$(cd /outside; pwd)\"",
+            "(cd /outside; printf nested)",
+            "f() { cd /outside; }; printf defined",
+        ] {
+            assert!(
+                top_level_directory_targets(command, dir.path()).is_empty(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_directory_targets_keep_quoted_tilde_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            top_level_directory_targets("cd '~/nested'", &cwd),
+            vec![cwd.join("~/nested")]
+        );
+        assert_eq!(
+            top_level_directory_targets(
+                "cd ../sibling\\ repo; cd '../literal*'; cd '../$literal'",
+                &cwd
+            ),
+            vec![
+                cwd.parent().unwrap().join("sibling repo"),
+                cwd.parent().unwrap().join("literal*"),
+                cwd.parent().unwrap().join("$literal")
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn top_level_directory_targets_resolve_symlinks_even_with_missing_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        let sibling = dir.path().join("sibling");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::os::unix::fs::symlink(&sibling, checkout.join("link")).unwrap();
+        assert_eq!(
+            top_level_directory_targets("cd link/missing", &checkout),
+            vec![sibling.canonicalize().unwrap().join("missing")]
+        );
+    }
     use crate::bash_permissions::normalize_path;
 
     #[test]

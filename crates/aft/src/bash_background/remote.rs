@@ -1603,6 +1603,45 @@ struct LocalFallback {
 }
 
 #[cfg(unix)]
+enum RemoteRequestError {
+    Build(exec::Error),
+    CdOutsideCheckout(String),
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for RemoteRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Build(error) => error.fmt(f),
+            Self::CdOutsideCheckout(message) => f.write_str(message),
+        }
+    }
+}
+
+#[cfg(unix)]
+const RUNON_CD_OUTSIDE_CHECKOUT_MESSAGE: &str = "runon refused: the command changes into <path>, which is outside the checkout the build server copies (<checkout root>); the command did not run. Set the bash tool's workdir to that folder instead of using cd.";
+
+#[cfg(unix)]
+fn runon_cd_refusal(command: &str, cwd: &Path) -> Result<Option<String>, exec::Error> {
+    let Some(checkout) = worktree_root_containing(cwd)? else {
+        return Ok(None);
+    };
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|error| exec::Error::Protocol(error.to_string()))?;
+    Ok(
+        crate::bash_permissions::scan::top_level_directory_targets(command, &cwd)
+            .into_iter()
+            .find(|target| !target.starts_with(&checkout))
+            .map(|target| {
+                RUNON_CD_OUTSIDE_CHECKOUT_MESSAGE
+                    .replace("<checkout root>", &checkout.display().to_string())
+                    .replace("<path>", &target.display().to_string())
+            }),
+    )
+}
+
+#[cfg(unix)]
 impl BgTaskRegistry {
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
@@ -1810,6 +1849,7 @@ impl BgTaskRegistry {
             self.persist_task_locked(&task, &state.metadata, &mut db)
                 .map_err(|e| e.to_string())?;
         }
+        let explicit_runon = launch.explicit_runon;
         let request = environment.and_then(|environment| {
             *task
                 .completion_secrets
@@ -1839,6 +1879,18 @@ impl BgTaskRegistry {
                 },
             )
         });
+        let request = request
+            .map_err(RemoteRequestError::Build)
+            .and_then(|request| {
+                if explicit_runon {
+                    if let Some(message) =
+                        runon_cd_refusal(command, &workdir).map_err(RemoteRequestError::Build)?
+                    {
+                        return Err(RemoteRequestError::CdOutsideCheckout(message));
+                    }
+                }
+                Ok(request)
+            });
         let fallback = LocalFallback {
             plan,
             shell_path,
@@ -1858,7 +1910,7 @@ impl BgTaskRegistry {
     fn start_remote_worker(
         &self,
         task: Arc<BgTask>,
-        initial: Option<(Result<RunRequest, exec::Error>, LocalFallback)>,
+        initial: Option<(Result<RunRequest, RemoteRequestError>, LocalFallback)>,
     ) -> Result<(), String> {
         let registry = self.clone();
         std::thread::Builder::new()
@@ -1904,7 +1956,7 @@ impl BgTaskRegistry {
     async fn run_remote_task(
         &self,
         task: Arc<BgTask>,
-        mut initial: Option<(Result<RunRequest, exec::Error>, LocalFallback)>,
+        mut initial: Option<(Result<RunRequest, RemoteRequestError>, LocalFallback)>,
     ) -> Result<(), String> {
         let remote = task
             .state
@@ -1960,6 +2012,17 @@ impl BgTaskRegistry {
                 self.remote_terminal(&task, exec::grade(record), None);
                 return Ok(());
             }
+        }
+        if let Some((Err(RemoteRequestError::CdOutsideCheckout(message)), _)) = initial.as_ref() {
+            self.remote_terminal(
+                &task,
+                Verdict::RunLocally {
+                    reason: RefusalReason::Unreachable,
+                    refusal_detail: None,
+                },
+                Some(message.clone()),
+            );
+            return Ok(());
         }
         let connection = remote
             .connection_file
