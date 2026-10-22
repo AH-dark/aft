@@ -402,6 +402,12 @@ fn sqlite_uri_target(path: &Path) -> Option<SqliteUriTarget> {
             && bytes[2] == b':'
         {
             decoded[1..].to_string()
+        } else if decoded.starts_with(r"/\\") {
+            // `/\\?\C:\...` is a verbatim (`\\?\`) or UNC path whose
+            // backslashes the URI kept percent-encoded, as the call-graph
+            // store's read-only URI spells long and resolved paths. SQLite
+            // drops the leading slash before opening it.
+            decoded[1..].to_string()
         } else {
             decoded
         };
@@ -606,6 +612,14 @@ mod sqlite_uri_tests {
             target("file:////%3F/C:/Users/aft/db.sqlite?mode=ro"),
             Some(SqliteUriTarget::File(PathBuf::from(
                 r"\\?\C:\Users\aft\db.sqlite"
+            )))
+        );
+        // The call-graph store's read-only URI keeps a verbatim path's
+        // backslashes percent-encoded after one leading slash.
+        assert_eq!(
+            target("file:///%5C%5C%3F%5CC:%5CUsers%5Caft%5Cdb%231.sqlite?mode=ro"),
+            Some(SqliteUriTarget::File(PathBuf::from(
+                r"\\?\C:\Users\aft\db#1.sqlite"
             )))
         );
         assert_eq!(

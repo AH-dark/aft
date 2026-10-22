@@ -731,7 +731,7 @@ mod tests {
         assert!(!storage.path().join("semantic").exists());
     }
     use super::*;
-    use crate::search_index::{artifact_cache_key_with_memo, resolve_cache_dir};
+    use crate::search_index::resolve_cache_dir;
 
     use std::collections::BTreeMap;
     use std::fs;
@@ -1325,6 +1325,101 @@ mod tests {
             Some(crate::root_identity::Identity::Git { .. })
         ));
         (project, root, path_key, git_key, owner)
+    }
+
+    /// `storage.cache_dir` moves artifacts, not identity. The folder below has
+    /// a saved path identity on its durable root and is a Git repository now,
+    /// so a lookup in a storage root without that record would choose a Git
+    /// key. Readers that name the cache root must resolve the key configure
+    /// memoizes for the durable root, and the call-graph folder must sit on
+    /// the cache root under that key.
+    #[test]
+    fn cache_root_readers_resolve_the_key_configure_memoizes_for_the_durable_root() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let storage = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let (_project, root, path_key, git_key, _owner) =
+            folder_with_path_identity_in_a_and_git_identity_in_b(storage.path(), other.path());
+        let mut config = crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            cache_dir: Some(cache.path().to_path_buf()),
+            ..crate::config::Config::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let durable = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        let artifacts = crate::root_cache::cache_root(&config);
+        assert_ne!(artifacts, durable);
+        let ctx = crate::context::AppContext::new(
+            crate::context::default_language_provider_factory(),
+            config,
+        );
+
+        let configured = ctx
+            .memoized_artifact_cache_key_for_configure(&root, &root, &durable, None)
+            .unwrap()
+            .expect("settled path identity on the durable root");
+        assert_eq!(configured, path_key);
+        assert_ne!(configured, git_key);
+        assert_eq!(
+            artifact_cache_key_read_only(&root, &artifacts).unwrap(),
+            configured,
+            "a reader naming the cache root must use the durable root's identity"
+        );
+        let reader = borrowed_context(&root, storage.path());
+        assert_eq!(
+            reader
+                .memoized_readonly_artifact_cache_key(&root, &artifacts)
+                .unwrap(),
+            configured
+        );
+        assert_eq!(
+            ctx.callgraph_store_dir(),
+            artifacts.join("callgraph").join(&configured)
+        );
+    }
+
+    /// Without `storage.cache_dir` the artifact root is the durable root, so
+    /// readers resolve keys and folders exactly where they did before the
+    /// setting existed: the saved identity's key, under the storage root.
+    #[test]
+    fn without_cache_dir_reader_keys_and_folders_stay_on_the_durable_root() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let storage = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let (_project, root, path_key, _git_key, owner) =
+            folder_with_path_identity_in_a_and_git_identity_in_b(storage.path(), other.path());
+        let config = owner.config();
+        assert!(config.cache_dir.is_none());
+        let artifacts = config.cache_storage_dir().expect("configured storage");
+        assert_eq!(artifacts, storage.path());
+        assert_eq!(
+            crate::root_cache::identity_storage_root(&artifacts),
+            std::borrow::Cow::Borrowed(storage.path())
+        );
+        assert_eq!(
+            path_key,
+            crate::search_index::artifact_path_identity_key(&root)
+        );
+        assert_eq!(
+            artifact_cache_key_read_only(&root, &artifacts).unwrap(),
+            path_key
+        );
+        assert_eq!(
+            owner
+                .memoized_readonly_artifact_cache_key(&root, &artifacts)
+                .unwrap(),
+            path_key
+        );
+        assert_eq!(
+            resolve_cache_dir_with_key(&path_key, Some(&artifacts)),
+            storage.path().join("index").join(&path_key)
+        );
+        assert_eq!(
+            owner.callgraph_store_dir(),
+            storage.path().join("callgraph").join(&path_key)
+        );
     }
 
     #[test]

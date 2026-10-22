@@ -16232,7 +16232,7 @@ mod tests {
                     Some(&common_dir),
                 )
                 .unwrap(),
-            key
+            Some(key.clone())
         );
         crate::root_cache::configure_artifact_access(&canonical_main, &key, false);
         let source = canonical_main.join("tracked.rs");
@@ -16272,7 +16272,7 @@ mod tests {
                 Some(&common_dir),
             )
             .unwrap(),
-            key
+            Some(key.clone())
         );
         // ... while a fresh derivation falls back to a path-based key, which
         // names a folder that holds no snapshot.

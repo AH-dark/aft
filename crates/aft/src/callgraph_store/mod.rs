@@ -25568,6 +25568,39 @@ mod cold_build_insert_tests {
         assert!(!path.exists(), "no refused database was created");
     }
 
+    /// A store under a `storage.cache_dir` root whose path is longer than the
+    /// classic Windows limit still opens read-only. On Windows its URI names
+    /// the long-path (`\\?\`) spelling SQLite needs, and the cache-location
+    /// checks must admit that spelling of a path inside the prepared cache
+    /// root. Elsewhere the path is used as it is.
+    #[test]
+    fn readonly_store_opens_past_the_windows_path_limit_under_a_cache_root() {
+        let storage = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            cache_dir: Some(cache.path().to_path_buf()),
+            ..crate::config::Config::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let mut dir = crate::root_cache::cache_root(&config).join("callgraph");
+        while dir.as_os_str().len() < 300 {
+            dir = dir.join("long-path-segment-0123456789");
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("readonly-probe.sqlite");
+        Connection::open(crate::db::lifecycle::sqlite_open_path(&path))
+            .unwrap()
+            .execute_batch("CREATE TABLE probe(value INTEGER); INSERT INTO probe VALUES (7);")
+            .unwrap();
+        let conn = open_readonly_connection(&path)
+            .unwrap_or_else(|error| panic!("read-only open of {} failed: {error}", path.display()));
+        let value: i64 = conn
+            .query_row("SELECT value FROM probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 7);
+    }
+
     #[test]
     fn legacy_migration_completion_log_has_operator_fields() {
         assert_eq!(

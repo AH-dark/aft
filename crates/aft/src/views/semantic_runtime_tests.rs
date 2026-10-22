@@ -828,7 +828,7 @@ fn base_ref_selection_child() {
         std::fs::write(storage.path().join("views-harness.marker"), b"test\n").unwrap();
     }
     let first = CheckoutSemantic::new(
-        storage.path(),
+        &crate::root_cache::StoragePaths::same(storage.path()),
         "family",
         "first",
         root.path(),
@@ -837,7 +837,7 @@ fn base_ref_selection_child() {
     )
     .unwrap();
     let second = CheckoutSemantic::new(
-        storage.path(),
+        &crate::root_cache::StoragePaths::same(storage.path()),
         "family",
         "second",
         root.path(),
@@ -944,8 +944,15 @@ fn base_ref_unmarked_storage_warns_exactly_once() {
 
 #[cfg(unix)]
 fn base_ref_runtime(storage: &Path, scope: &str, root: &Path) -> CheckoutSemantic {
-    let mut runtime =
-        CheckoutSemantic::new(storage, "family", scope, root, producer(), Weak::new()).unwrap();
+    let mut runtime = CheckoutSemantic::new(
+        &crate::root_cache::StoragePaths::same(storage),
+        "family",
+        scope,
+        root,
+        producer(),
+        Weak::new(),
+    )
+    .unwrap();
     if !runtime.base_ref_prototype {
         runtime.base_ref_prototype = true;
         super::super::io::BASE_REF_PROTOTYPE_USERS.fetch_add(1, Ordering::Relaxed);
@@ -1162,11 +1169,11 @@ fn base_ref_identity_mismatch_takes_strict_path() {
             "{mismatch}"
         );
         let mut runtime = CheckoutSemantic::new(
-            if mismatch == "storage" {
+            &crate::root_cache::StoragePaths::same(if mismatch == "storage" {
                 other_storage.path()
             } else {
                 storage.path()
-            },
+            }),
             if mismatch == "family" {
                 "other"
             } else {
@@ -1252,7 +1259,7 @@ fn base_ref_active_prebind_write_waits_even_without_begin_notification() {
     let writing = super::super::intent::record_paths([path.as_path()]);
     assert!(super::super::intent::active(worker.path()));
     let mut runtime = CheckoutSemantic::new(
-        storage.path(),
+        &crate::root_cache::StoragePaths::same(storage.path()),
         "family",
         "worker",
         worker.path(),
@@ -1593,7 +1600,7 @@ fn base_ref_real_model_parity_including_prebind_edit() {
     let producer = SemanticProducer::current(fingerprint.as_string(), fingerprint.embed_text_caps);
     let open = |scope: &str, root: &Path, prototype: bool| {
         let mut runtime = CheckoutSemantic::new(
-            &storage,
+            &crate::root_cache::StoragePaths::same(&storage),
             &family,
             scope,
             root,

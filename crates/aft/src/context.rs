@@ -7221,6 +7221,11 @@ impl AppContext {
         canonical_root: &Path,
         storage: &Path,
     ) -> Result<String, crate::search_index::ArtifactCacheKeyProbeError> {
+        // Readers name the root they open artifacts from. A `storage.cache_dir`
+        // cache root resolves to its durable owner here, so this memo entry and
+        // the identity record it checks are the ones configure uses for that
+        // durable root.
+        let storage: &Path = &crate::root_cache::identity_storage_root(storage);
         self.memoized_readonly_artifact_cache_key_with(canonical_root, storage, || {
             crate::search_index::artifact_cache_key_read_only(canonical_root, storage)
         })

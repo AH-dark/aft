@@ -337,6 +337,33 @@ pub fn cache_unavailable(config: &crate::config::Config) -> Option<String> {
         })
     })
 }
+/// The storage root whose identity records key the artifacts kept under
+/// `storage`.
+///
+/// A cache root prepared for `storage.cache_dir` holds rebuildable artifacts
+/// only. A project's saved identity record and artifact-key memo stay on the
+/// durable storage root that owns the cache root, and configure memoizes the
+/// project's key under that durable root. Readers often name the cache root,
+/// because that is where they open the artifacts; resolving the identity
+/// there would find no record and could pick a different key, which names
+/// folders configure never wrote. So a prepared cache root resolves to its
+/// durable owner. Every other path is returned as given, which includes every
+/// root while no `cache_dir` is configured: those keys do not change.
+pub(crate) fn identity_storage_root(storage: &Path) -> std::borrow::Cow<'_, Path> {
+    let registry = STATUS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let owner = registry
+        .locations
+        .get(storage)
+        .and_then(|(_, _, identity)| identity.as_ref())
+        .and_then(|identity| registry.owners.get(identity));
+    match owner {
+        Some(durable) if durable != storage => std::borrow::Cow::Owned(durable.clone()),
+        _ => std::borrow::Cow::Borrowed(storage),
+    }
+}
 fn status(root: &Path) -> (Option<String>, u64, Option<Identity>) {
     STATUS
         .get_or_init(Default::default)
