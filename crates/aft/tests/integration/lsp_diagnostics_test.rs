@@ -2115,6 +2115,15 @@ fn test_ensure_file_open_detects_disk_drift() {
 
 #[test]
 fn watcher_external_edit_hides_stale_diagnostics_and_resyncs_lsp() {
+    assert_watcher_external_edit_hides_stale_diagnostics(false);
+}
+
+#[test]
+fn watcher_external_edit_retries_stale_diagnostics_after_manager_contention() {
+    assert_watcher_external_edit_hides_stale_diagnostics(true);
+}
+
+fn assert_watcher_external_edit_hides_stale_diagnostics(contend_manager: bool) {
     let (_temp_dir, root, files) = rust_workspace_with_files(&["main.rs"]);
     let file = &files[0];
     let ctx = AppContext::new(
@@ -2168,11 +2177,23 @@ fn watcher_external_edit_hides_stale_diagnostics_and_resyncs_lsp() {
         .send(WatcherDispatchEvent::Paths(vec![file.clone()]))
         .expect("send watcher event");
 
+    if contend_manager {
+        // The watcher starts an applicability refresh that can own this lock.
+        // Hold it across a drain to force that overlap without a timing race.
+        let _lsp = ctx.lsp();
+        let _ = drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+    }
     drain_watcher_events(&ctx);
 
+    let after_watcher = ctx
+        .lsp()
+        .get_diagnostics_for_file(file)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
     assert!(
-        ctx.lsp().get_diagnostics_for_file(file).is_empty(),
-        "watcher-stale diagnostics must be hidden until the LSP republishes"
+        after_watcher.is_empty(),
+        "watcher-stale diagnostics must be hidden until the LSP republishes: {after_watcher:?}"
     );
 
     let changed_event = collect_event(&mut ctx.lsp(), |event| {
@@ -2222,6 +2243,12 @@ fn watcher_external_edit_hides_stale_diagnostics_and_resyncs_lsp() {
             .iter()
             .any(|diagnostic| diagnostic.code.as_deref() == Some("E0002")),
         "fresh publish should replace the stale diagnostics: {after:?}"
+    );
+    assert!(
+        after
+            .iter()
+            .all(|diagnostic| diagnostic.code.as_deref() != Some("E0001")),
+        "diagnostics for the old contents must not survive the fresh publish: {after:?}"
     );
 }
 
@@ -3449,16 +3476,16 @@ fn watcher_overflow_under_manager_contention_sends_one_config_notification() {
         .collect();
     paths.push(root.join("Cargo.toml"));
     {
-        // Keep the manager unavailable throughout the drain, not just while
-        // calling the forwarding API, to exercise the actual queued path.
+        // Keep the manager unavailable during a slice. Diagnostics work must
+        // remain pending without losing the capped forwarding batch.
         let _held = ctx.lsp();
         watcher_tx
             .send(WatcherDispatchEvent::Paths(paths))
             .expect("send watcher event");
-        drain_watcher_events(&ctx);
-        assert!(ctx.lsp_watcher_forward_pending_for_test());
-        assert_eq!(ctx.lsp_watcher_forward_helpers_spawned_for_test(), 1);
+        let outcome = drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert!(outcome.has_more, "the busy diagnostics phase must retry");
     }
+    drain_watcher_events(&ctx);
     wait_for_watcher_forward_helper(&ctx);
     let (watched, _) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
     assert_eq!(watched.len(), 1, "one capped forward: {watched:?}");

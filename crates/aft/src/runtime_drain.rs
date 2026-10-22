@@ -2749,15 +2749,35 @@ fn apply_watcher_path_phase(
     budget: Duration,
     mut apply: impl FnMut(&Path),
 ) -> bool {
+    try_apply_watcher_path_phase(stage, paths, remaining, started, budget, |path| {
+        apply(path);
+        true
+    })
+}
+
+fn try_apply_watcher_path_phase(
+    stage: WatcherDrainApplyPhase,
+    paths: &mut VecDeque<PathBuf>,
+    remaining: &mut usize,
+    started: Instant,
+    budget: Duration,
+    mut apply: impl FnMut(&Path) -> bool,
+) -> bool {
     while *remaining > 0 {
         let path = paths
             .pop_front()
             .expect("watcher apply phase tracks its remaining paths");
-        {
+        let applied = {
             let _watchdog = WatcherDrainUnitGuard::start(stage, &path);
             delay_watcher_unit_for_test();
             wait_on_watcher_phase_commit_gate_for_test(&path);
-            apply(&path);
+            apply(&path)
+        };
+        if !applied {
+            // Retain the unfinished path for the next slice rather than
+            // acknowledging work that a busy subsystem could not apply.
+            paths.push_front(path);
+            return false;
         }
         paths.push_back(path);
         *remaining -= 1;
@@ -3278,24 +3298,32 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 }
                 completed
             }
-            WatcherDrainApplyPhase::LspDiagnostics => apply_watcher_path_phase(
+            WatcherDrainApplyPhase::LspDiagnostics => try_apply_watcher_path_phase(
                 WatcherDrainApplyPhase::LspDiagnostics,
                 &mut paths,
                 &mut remaining,
                 started,
                 WATCHER_DRAIN_SLICE_BUDGET,
                 |path| {
-                    let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                    ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                        // Applicability refreshes also take this lock. Keep the
+                        // invalidation pending when they overlap the watcher.
+                        let Some(mut lsp) = ctx.try_lsp() else {
+                            return false;
+                        };
                         if !path.exists() {
-                            status_changed |= ctx.lsp_clear_diagnostics_for_file(path);
-                            return;
+                            status_changed |= lsp.clear_diagnostics_for_file(path);
+                            return true;
                         }
-                        let stale = ctx.lsp_mark_diagnostics_stale_for_file(path);
+                        let stale = lsp.mark_diagnostics_stale_for_file(path);
+                        drop(lsp);
                         status_changed |= stale.changed;
                         if stale.had_entries {
                             ctx.lsp_resync_changed_file_for_diagnostics(path);
                         }
-                    });
+                        true
+                    })
+                    .unwrap_or(true)
                 },
             ),
             WatcherDrainApplyPhase::Complete => true,
@@ -5082,6 +5110,46 @@ mod tests {
         assert_eq!(remaining, 1);
         assert_eq!(applied, vec![PathBuf::from("first.rs")]);
         assert_eq!(paths.front(), Some(&PathBuf::from("second.rs")));
+    }
+
+    #[test]
+    fn watcher_path_phase_retains_busy_path_without_replaying_completed_paths() {
+        let _clock = WatcherDrainTestClock::freeze();
+        let started = watcher_drain_now();
+        let first = PathBuf::from("first.rs");
+        let second = PathBuf::from("second.rs");
+        let mut paths = VecDeque::from([first.clone(), second.clone()]);
+        let mut remaining = paths.len();
+        let mut applied = Vec::new();
+        assert!(!try_apply_watcher_path_phase(
+            WatcherDrainApplyPhase::LspDiagnostics,
+            &mut paths,
+            &mut remaining,
+            started,
+            WATCHER_DRAIN_SLICE_BUDGET,
+            |path| {
+                if path == second {
+                    return false;
+                }
+                applied.push(path.to_path_buf());
+                true
+            },
+        ));
+        assert_eq!(remaining, 1);
+        assert_eq!(paths.front(), Some(&second));
+        assert!(try_apply_watcher_path_phase(
+            WatcherDrainApplyPhase::LspDiagnostics,
+            &mut paths,
+            &mut remaining,
+            started,
+            WATCHER_DRAIN_SLICE_BUDGET,
+            |path| {
+                applied.push(path.to_path_buf());
+                true
+            },
+        ));
+        assert_eq!(remaining, 0);
+        assert_eq!(applied, vec![first, second]);
     }
 
     /// A burst of watcher events for files whose bytes still match the index
