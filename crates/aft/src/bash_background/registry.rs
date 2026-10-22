@@ -13706,16 +13706,24 @@ mod tests {
         (dir, registry, task)
     }
 
+    /// The exit marker as written, read through the registered-artifact
+    /// opener like every other consumer of task artifacts.
+    #[cfg(unix)]
+    fn registered_exit_marker(task: &BgTask) -> String {
+        let bytes = open_task_artifact(&task.paths, TaskArtifact::Exit)
+            .unwrap()
+            .read_all()
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
     #[cfg(unix)]
     #[test]
     fn approved_signal_death_synthesizes_shell_exit_code() {
         for (command, expected) in [("kill -TERM $$", 143), ("kill -KILL $$", 137)] {
             let (_dir, registry, task) = approved_reap_fixture(command);
             registry.reap_child(&task);
-            assert_eq!(
-                fs::read_to_string(&task.paths.exit).unwrap(),
-                expected.to_string()
-            );
+            assert_eq!(registered_exit_marker(&task), expected.to_string());
             registry.poll_task(&task).unwrap();
             let snapshot = task.snapshot(0);
             assert_eq!(snapshot.info.status, BgTaskStatus::Failed);
@@ -13728,7 +13736,7 @@ mod tests {
     fn approved_numeric_exit_code_is_preserved() {
         let (_dir, registry, task) = approved_reap_fixture("exit 7");
         registry.reap_child(&task);
-        assert_eq!(fs::read_to_string(&task.paths.exit).unwrap(), "7");
+        assert_eq!(registered_exit_marker(&task), "7");
         registry.poll_task(&task).unwrap();
         assert_eq!(task.snapshot(0).exit_code, Some(7));
     }
