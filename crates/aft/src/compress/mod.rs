@@ -3083,3 +3083,48 @@ mod normalize_command_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod approved_audit11 {
+    use super::*;
+
+    #[test]
+    fn compound_commands_use_generic_instead_of_runner_rules() {
+        let output = "   Compiling example v0.1.0\n    Finished `dev` profile target(s)\npackage installation detail\nsecond command detail\n";
+        let expected = GenericCompressor::compress_stripped_output(output);
+        let registry = FilterRegistry::default();
+        for command in [
+            "cd project && cargo build && printf done",
+            "cargo build; printf done",
+            "cargo build || printf failed",
+            "cargo build\nprintf done",
+            "(cd project; cargo build && printf done)",
+            "cargo build & printf done",
+            "cargo build; { printf a; printf b; }",
+        ] {
+            assert!(
+                matches!(
+                    resolve_dispatch_target(command),
+                    DispatchTarget::ForceGeneric
+                ),
+                "compound dispatch must remain generic: {command}"
+            );
+            let result = compress_with_registry_exit_code(command, output, Some(0), &registry);
+            assert_eq!(result.text, expected, "{command}");
+        }
+        for command in [
+            "cd 'a&&b' && cargo build",
+            "cargo build --message 'a;b'",
+            "cargo build --message \"a&&b\"",
+            "cargo build --message a\\;b",
+            "cargo build 2>&1",
+            "cargo build > output &> errors",
+            "cargo build --message $(printf 'a;b')",
+        ] {
+            assert!(
+                matches!(resolve_dispatch_target(command), DispatchTarget::Command(_)),
+                "{command}"
+            );
+        }
+    }
+}
