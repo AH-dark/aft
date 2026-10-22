@@ -2442,6 +2442,12 @@ impl BgTaskRegistry {
             retry.resubmits + 1,
         );
         let until = now.saturating_add(hint);
+        // Stands in for the daemon stopping while it waits: the worker ends
+        // and leaves only the refusal it has already saved.
+        #[cfg(test)]
+        if tests::stop_draining_worker(root) {
+            return Ok(HintedRetryStep::Ended);
+        }
         loop {
             let cancel = task
                 .state
@@ -2452,7 +2458,9 @@ impl BgTaskRegistry {
                 .as_ref()
                 .is_some_and(|remote| remote.cancel_requested);
             if cancel {
-                self.remote_terminal(task, Verdict::Cancelled, None);
+                // The runner refused this submission, so for an owner pause
+                // withholding the resubmission is the whole cancellation.
+                self.cancel_draining_retry(task);
                 return Ok(HintedRetryStep::Ended);
             }
             let now = draining_now_ms(root);
@@ -2467,6 +2475,8 @@ impl BgTaskRegistry {
                 _ = draining_retry_sleep(root, now, until - now) => {},
             }
         }
+        #[cfg(test)]
+        tests::draining_gate(root, tests::DrainingGate::BeforeHintedResubmit).await;
         {
             let mut db = DeferredDbWrites::new(self, task);
             let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
@@ -2478,7 +2488,7 @@ impl BgTaskRegistry {
             if remote.cancel_requested {
                 drop(state);
                 drop(db);
-                self.remote_terminal(task, Verdict::Cancelled, None);
+                self.cancel_draining_retry(task);
                 return Ok(HintedRetryStep::Ended);
             }
             // The wait can end late, and a zero hint does not wait at all, so
@@ -2969,10 +2979,11 @@ impl BgTaskRegistry {
         Ok(())
     }
 
-    /// Stop a draining retry that has a cancellation intent instead of
-    /// resubmitting it. The runner refused the job, so there is no runner job
-    /// to cancel: for an owner pause, withholding the resubmission is the
-    /// whole cancellation, and it is recorded as sent.
+    /// Stop a draining retry, or a retry after a hinted signer refusal, that
+    /// has a cancellation intent instead of resubmitting it. The runner refused
+    /// the job, so there is no runner job to cancel: for an owner pause,
+    /// withholding the resubmission is the whole cancellation, and it is
+    /// recorded as sent.
     fn cancel_draining_retry(&self, task: &Arc<BgTask>) {
         if !self.finish_owner_pause_cancel(task, Ok(())) {
             self.remote_terminal(task, Verdict::Cancelled, None);
