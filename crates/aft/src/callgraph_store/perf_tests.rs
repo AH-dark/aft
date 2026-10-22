@@ -1501,8 +1501,9 @@ static STATEMENT_PROFILES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(Default::default);
 
 /// SQLite calls this when a statement finishes. The full-scan step counter
-/// counts rows a statement visited by walking a whole table or index rather
-/// than seeking, which is the "whole-table work" the measurement looks for.
+/// counts forward steps a statement took through a full table scan rather
+/// than an index lookup, so a large value marks the "whole-table work" the
+/// measurement looks for.
 unsafe extern "C" fn record_statement_profile(
     mask: std::os::raw::c_uint,
     _context: *mut c_void,
@@ -1555,7 +1556,8 @@ fn trace_statements(conn: &TrackedConnection) {
     assert_eq!(rc, ffi::SQLITE_OK, "install SQLite profile trace");
 }
 
-/// Print the statements that walked whole tables or indexes, heaviest first.
+/// Print profile totals and up to 12 statements, ordered by full-scan steps
+/// and then by VM steps.
 fn report_statement_profiles(label: &str) {
     let profiles = std::mem::take(&mut *STATEMENT_PROFILES.lock().unwrap());
     let mut rows = profiles.into_iter().collect::<Vec<_>>();
@@ -1631,8 +1633,9 @@ fn sqlite_file_bytes(path: &Path) -> (u64, u64) {
 /// build that publishes a generation, then for each refresh a fresh refresh
 /// connection (the refresh worker opens one per batch) and one changed file.
 ///
-/// Prints `/proc/self/io` deltas for each step and, for the refresh body, the
-/// statements that walked whole tables. Linux only: elsewhere the counters
+/// Prints `/proc/self/io` deltas for each step and, for the refresh body,
+/// statement profile totals and the 12 statements with the most full-scan
+/// steps, then VM steps. Linux only: elsewhere the counters
 /// read as zero. Sizes come from `AFT_CALLGRAPH_SCALING_FILES`
 /// (comma-separated, default `5000,20000,60000`). Run it alone
 /// (`--ignored --test-threads=1`): the counters are process-wide.

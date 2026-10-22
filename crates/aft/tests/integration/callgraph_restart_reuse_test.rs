@@ -4,8 +4,9 @@
 //! A cold build writes a brand-new generation file named
 //! `<key>.g<nanos>.<pid>.sqlite` and points `<key>.current` at it, so the
 //! pointer's contents identify the build that produced the store being served.
-//! If a later process serves the same pointer, it reused the earlier build; a
-//! different pointer means that process paid for a full cold build.
+//! If a later process serves the same pointer, nothing rebuilt the store in
+//! between; a different pointer names a newer published generation, that is,
+//! a cold build ran (in whichever process published it).
 //!
 //! Each process is a real child `aft` with its own HOME and XDG folders; only
 //! the explicit `storage_dir` is shared, which is how several editor sessions
@@ -112,8 +113,9 @@ fn configure(aft: &mut AftProcess, root: &Path, storage: &Path) {
     assert_eq!(response["success"], true, "configure: {response:?}");
 }
 
-/// Ask for `target`'s callers until the store answers (the harness gives the
-/// first op an inline build window; a `Building` answer is retried).
+/// Ask for `target`'s callers until the store answers. The test harness lets
+/// the first call-graph request wait for a build to finish; a request that
+/// still answers `callgraph_building` is retried.
 fn callers(aft: &mut AftProcess, root: &Path) -> Value {
     let request = json!({
         "id": "callers",
