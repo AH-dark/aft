@@ -834,3 +834,54 @@ fn grep_counted_folder_include_selects_its_files() {
         assert!(reached.contains(&file), "{file} is not reachable:\n{text}");
     }
 }
+
+#[test]
+fn grep_summary_rolls_files_up_under_their_folders() {
+    // Sixty files in two folders, more than the summary lists one by one:
+    // at least five files of each folder are left for the per-folder
+    // roll-up, which must name both folders in grep's own path form
+    // (`alpha\one\` on Windows), never put them all under the top folder.
+    let project = tempfile::tempdir().expect("tempdir");
+    for folder in ["alpha/one", "beta/two"] {
+        for index in 0..30 {
+            write_file(
+                project.path(),
+                &format!("{folder}/f{index:02}.txt"),
+                &numbered_lines(3, "needle"),
+            );
+        }
+    }
+    let ctx = grep_ctx(project.path());
+
+    let (_, text) = run_grep(&ctx, serde_json::json!({"pattern": "needle"}));
+    let rollup = text
+        .lines()
+        .find(|line| line.starts_with("+35 more files (105 lines), files/lines per folder: "))
+        .unwrap_or_else(|| panic!("no per-folder roll-up:\n{text}"));
+    let separator = std::path::MAIN_SEPARATOR;
+    let parts: Vec<&str> = rollup
+        .split_once("per folder: ")
+        .map(|(_, parts)| parts.split(", ").collect())
+        .unwrap_or_default();
+    let folders: Vec<&str> = parts
+        .iter()
+        .filter_map(|part| part.rsplit_once(' ').map(|(folder, _)| folder))
+        .collect();
+    let mut sorted = folders.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        vec![
+            format!("alpha{separator}one{separator}"),
+            format!("beta{separator}two{separator}")
+        ],
+        "roll-up {rollup:?} in text:\n{text}"
+    );
+    let files: usize = parts
+        .iter()
+        .filter_map(|part| part.rsplit_once(' '))
+        .filter_map(|(_, counts)| counts.split_once('/'))
+        .map(|(count, _)| count.parse::<usize>().expect("file count"))
+        .sum();
+    assert_eq!(files, 35, "roll-up {rollup:?}");
+}

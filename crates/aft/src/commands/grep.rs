@@ -1136,14 +1136,23 @@ fn files_first_summary(shown: &[usize], files: &[MatchingFile<'_>], rendered: us
 }
 
 /// The folder a summary roll-up counts a file under: its first two parent
-/// folders (`packages/core/`), or `./` for a file at the top.
+/// folders (`packages/core/`), or `./` for a file at the top, written with
+/// the platform's separator like the paths grep prints (`packages\core\` on
+/// Windows). The printed path is split in the `/` form of
+/// [`include_glob_form`], because Windows prints `\` and a split on `/`
+/// alone would put every file under `./`.
 fn summary_folder(display: &str) -> String {
-    let parents: Vec<&str> = display.split('/').collect();
+    let slashed = include_glob_form(display);
+    let parents: Vec<&str> = slashed.split('/').collect();
     let parents = &parents[..parents.len().saturating_sub(1)];
+    let separator = std::path::MAIN_SEPARATOR_STR;
     if parents.is_empty() {
-        "./".to_string()
+        format!(".{separator}")
     } else {
-        format!("{}/", parents[..parents.len().min(2)].join("/"))
+        format!(
+            "{}{separator}",
+            parents[..parents.len().min(2)].join(separator)
+        )
     }
 }
 
