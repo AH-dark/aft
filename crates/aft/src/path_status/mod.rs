@@ -29,12 +29,23 @@ pub const SKIPPED_PATH_SAMPLE_CAP: usize = 5;
 pub enum SkipReason {
     /// The file is in a call-graph language but is not valid UTF-8, so the
     /// parser cannot read it. It is published with an empty call graph; the
-    /// call graph built without views also leaves such files out.
+    /// call graph built without views also leaves such files out. The
+    /// semantic index cannot read it either, so no semantic vectors wait for
+    /// it.
     NonUtf8Source,
     /// HEAD lists the path with a Git mode that is neither a regular file, a
     /// symlink nor a submodule, which view assembly does not know how to
     /// publish. The path is left out of the generation.
     UnsupportedGitMode,
+    /// The file is larger than the semantic index reads
+    /// (`semantic_index::MAX_SEMANTIC_FILE_BYTES`), so it never has semantic
+    /// vectors. It is published without them.
+    SemanticFileTooLarge,
+    /// The project walk the semantic index uses leaves the file out (a
+    /// skipped directory such as `dist/` or `node_modules/`, or a
+    /// `.gitignore`/`.aftignore` rule), although Git tracks it. It is
+    /// published without semantic vectors.
+    ExcludedFromSemanticIndex,
 }
 
 impl SkipReason {
@@ -42,7 +53,29 @@ impl SkipReason {
         match self {
             Self::NonUtf8Source => "non_utf8_source",
             Self::UnsupportedGitMode => "unsupported_git_mode",
+            Self::SemanticFileTooLarge => "semantic_file_too_large",
+            Self::ExcludedFromSemanticIndex => "excluded_from_semantic_index",
         }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        [
+            Self::NonUtf8Source,
+            Self::UnsupportedGitMode,
+            Self::SemanticFileTooLarge,
+            Self::ExcludedFromSemanticIndex,
+        ]
+        .into_iter()
+        .find(|reason| reason.as_str() == value)
+    }
+
+    /// Whether a member skipped for this reason never gets semantic vectors,
+    /// so it is not waiting for them.
+    pub const fn excludes_semantic(self) -> bool {
+        matches!(
+            self,
+            Self::NonUtf8Source | Self::SemanticFileTooLarge | Self::ExcludedFromSemanticIndex
+        )
     }
 }
 
@@ -71,6 +104,9 @@ pub(crate) struct StatusIntent {
     /// a newer preparation that marked pending while this settlement waited
     /// to be applied, so the settlement leaves it alone.
     pub marked_through: u64,
+    /// Members that cannot be read for their semantic vectors, with the
+    /// failure; they are marked failed.
+    pub failed: std::collections::BTreeMap<Vec<u8>, String>,
     /// Skip outcomes for members read afresh: `Some` records a skip, `None`
     /// removes one. Members reused unread keep their rows, since their
     /// content, and so their outcome, did not change.
@@ -78,16 +114,18 @@ pub(crate) struct StatusIntent {
 }
 
 /// The ledger rows a settlement writes: annotations to delete (with the state
-/// they were read in) and skips to record (`Some`) or delete (`None`).
+/// they were read in), annotations to mark failed, and skips to record
+/// (`Some`) or delete (`None`).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StatusChanges {
     pub clear: Vec<(Vec<u8>, PathState)>,
+    pub fail: Vec<(Vec<u8>, String)>,
     pub skips: Vec<(Vec<u8>, Option<SkipReason>)>,
 }
 
 impl StatusChanges {
     pub(crate) fn is_empty(&self) -> bool {
-        self.clear.is_empty() && self.skips.is_empty()
+        self.clear.is_empty() && self.fail.is_empty() && self.skips.is_empty()
     }
 }
 
@@ -100,18 +138,30 @@ fn plan_settlement(
     let mut changes = StatusChanges::default();
     // An annotation written before marks were stamped has no mark; it is
     // older than any settlement that reads it.
-    let mut annotations =
-        connection.prepare_cached("SELECT rel_path, state, COALESCE(mark, 0) FROM path_status")?;
+    let mut annotations = connection
+        .prepare_cached("SELECT rel_path, state, reason, COALESCE(mark, 0) FROM path_status")?;
+    let mut failed = intent.failed.clone();
     for row in annotations.query_map([], |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
         ))
     })? {
-        let (path, state, mark) = row?;
+        let (path, state, reason, mark) = row?;
         let state = PathState::parse(&state).ok_or(PathStatusError::InvalidState(state))?;
         if u64::try_from(mark).unwrap_or(0) > intent.marked_through {
+            // Marked by later work, which owns the row now: neither clear
+            // it nor mark it failed.
+            failed.remove(&path);
+            continue;
+        }
+        if let Some(failure) = failed.get(&path) {
+            // Already failed for the same reason: nothing to write.
+            if state == PathState::Failed && *failure == reason {
+                failed.remove(&path);
+            }
             continue;
         }
         let joined = !intent.keep_pending.contains(&path);
@@ -123,6 +173,7 @@ fn plan_settlement(
             changes.clear.push((path, state));
         }
     }
+    changes.fail = failed.into_iter().collect();
     let mut recorded = std::collections::BTreeMap::new();
     let mut skips = connection.prepare_cached("SELECT rel_path, reason FROM path_skips")?;
     for row in skips.query_map([], |row| {
@@ -609,6 +660,20 @@ impl PathStatusStore {
             for (path, state) in &changes.clear {
                 clear.execute(params![path, state.as_str()])?;
             }
+            // A failure describes the work this settlement covers, so it is
+            // stamped with the settlement's own cutoff: a settlement of later
+            // work can clear it, and it never looks newer than that work.
+            let mark = i64::try_from(intent.marked_through).unwrap_or(i64::MAX);
+            let mut fail = transaction.prepare_cached(UPSERT_PATH_STATUS)?;
+            for (path, reason) in &changes.fail {
+                fail.execute(params![
+                    path,
+                    PathState::Failed.as_str(),
+                    reason,
+                    generation,
+                    mark
+                ])?;
+            }
             let mut upsert = transaction.prepare_cached(
                 "INSERT INTO path_skips (rel_path, reason, since_generation)
                  VALUES (?1, ?2, ?3)
@@ -626,7 +691,22 @@ impl PathStatusStore {
             }
         }
         transaction.commit()?;
-        Ok(changes.clear.len() + changes.skips.len())
+        Ok(changes.clear.len() + changes.fail.len() + changes.skips.len())
+    }
+
+    /// Every recorded skip, by path.
+    pub(crate) fn skip_reasons(
+        &self,
+    ) -> Result<std::collections::BTreeMap<Vec<u8>, String>, PathStatusError> {
+        let mut skips = self
+            .connection
+            .prepare("SELECT rel_path, reason FROM path_skips")?;
+        let rows = skips
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     fn upsert(
@@ -1026,6 +1106,7 @@ mod tests {
             members: members.iter().map(|path| path.to_vec()).collect(),
             keep_pending: keep_pending.iter().map(|path| path.to_vec()).collect(),
             marked_through: u64::MAX,
+            failed: Default::default(),
             fresh_skips: fresh_skips
                 .iter()
                 .map(|(path, reason)| (path.to_vec(), *reason))
@@ -1116,6 +1197,7 @@ mod tests {
             store.plan_settlement(&next).unwrap(),
             StatusChanges {
                 clear: Vec::new(),
+                fail: Vec::new(),
                 skips: vec![
                     (b"latin1_0.py".to_vec(), None),
                     (b"latin1_1.py".to_vec(), None)

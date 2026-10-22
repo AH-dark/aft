@@ -10112,7 +10112,7 @@ fn canonicalize_existing_or_deleted_path(path: &Path) -> PathBuf {
 /// track it (0 chunks) instead of reading it — freshness then skips it on later
 /// refreshes. 4 MiB keeps essentially all hand-written source while capping the
 /// pathological tail.
-const MAX_SEMANTIC_FILE_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_SEMANTIC_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 fn collect_semantic_file(
     project_root: &Path,
