@@ -167,7 +167,9 @@ pub fn run(args: Vec<OsString>) -> Result<(), ProfileError> {
 
     // Symbolization needs a debug artifact that may have to be fetched. If that
     // step fails, the captured sample is still the evidence the operator came
-    // for: keep it on disk and name it, rather than discarding the only copy.
+    // for: try to keep it on disk, name where it went (or why it could not be
+    // kept), and still report the raw stacks with the reason on each affected
+    // thread rather than discarding them.
     let symbolicated = resolve_debug_artifact(
         &target.image,
         &target_report.version,
@@ -175,17 +177,27 @@ pub fn run(args: Vec<OsString>) -> Result<(), ProfileError> {
         args.dsym.as_deref(),
     )
     .and_then(|debug| symbolicate(&mut threads, &debug, &target.image));
-    if let Err(error) = symbolicated {
-        let kept = preserve_raw_sample(target.pid, &captured.raw);
-        return Err(ProfileError::runtime(match kept {
-            Ok(path) => format!(
-                "{error}; the unsymbolicated sample was kept at {}",
-                path.display()
-            ),
-            Err(keep_error) => {
-                format!("{error}; the unsymbolicated sample could not be kept either: {keep_error}")
+    match symbolicated {
+        Err(error) => {
+            let reason = match preserve_raw_sample(target.pid, &captured.raw) {
+                Ok(path) => format!(
+                    "{error}; the unsymbolicated sample was kept at {}",
+                    path.display()
+                ),
+                Err(keep_error) => {
+                    format!(
+                        "{error}; the unsymbolicated sample could not be kept either: {keep_error}"
+                    )
+                }
+            };
+            eprintln!("aft profile: symbols unavailable: {reason}");
+            mark_symbols_unavailable(&mut threads, &target.image, &reason);
+        }
+        Ok(()) => {
+            if let Some(warning) = partial_symbols_warning(&threads) {
+                eprintln!("{warning}");
             }
-        }));
+        }
     }
 
     let mut report = build_report(target_report, captured.sampler, threads);
@@ -1476,6 +1488,7 @@ fn capture_proc_stacks(pid: u32, seconds: u64) -> Result<CapturedSample, Profile
                 name,
                 declared_samples: 0,
                 nodes: Vec::new(),
+                symbols_unavailable: None,
             });
             thread.declared_samples += 1;
             append_proc_stack(thread, &state, &stack);
@@ -1492,24 +1505,18 @@ fn capture_proc_stacks(pid: u32, seconds: u64) -> Result<CapturedSample, Profile
 
 #[cfg(target_os = "linux")]
 fn append_proc_stack(thread: &mut SampleThread, state: &str, stack: &str) {
-    let first = thread.nodes.len();
-    thread.nodes.push(SampleNode {
-        parent: None,
-        samples: 1,
-        frame: state.to_string(),
-        offset: None,
-    });
-    let mut parent = Some(first);
-    for line in stack.lines().filter(|line| !line.trim().is_empty()) {
-        let index = thread.nodes.len();
-        thread.nodes.push(SampleNode {
-            parent,
-            samples: 1,
-            frame: line.trim().to_string(),
-            offset: parse_hex_address(line),
-        });
-        parent = Some(index);
-    }
+    // `/proc/<tid>/stack` lists the innermost kernel frame first; store the
+    // frames outermost first under the thread state, like the other samplers.
+    let frames = stack
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    append_stack(
+        thread,
+        std::iter::once(state.to_string()).chain(frames.into_iter().rev()),
+    );
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -1540,6 +1547,7 @@ fn parse_macos_sample(raw: &str) -> Vec<SampleThread> {
                 name,
                 declared_samples: samples,
                 nodes: Vec::new(),
+                symbols_unavailable: None,
             });
             stack.clear();
             continue;
@@ -1628,7 +1636,7 @@ fn parse_sample_offset(frame: &str) -> Option<String> {
     None
 }
 
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_hex_address(line: &str) -> Option<String> {
     line.split_whitespace()
         .find(|part| part.starts_with("0x"))
@@ -1638,56 +1646,105 @@ fn parse_hex_address(line: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_perf_script(raw: &str) -> Vec<SampleThread> {
     let mut threads = BTreeMap::<String, SampleThread>::new();
     let mut current: Option<String> = None;
-    let mut current_parent: Option<usize> = None;
+    // `perf script` prints each callchain innermost frame first. Collect a
+    // whole sample, then store it outermost first so the tree has the same
+    // orientation as macOS `sample` output (root = thread entry).
+    let mut frames = Vec::<String>::new();
+    let flush = |threads: &mut BTreeMap<String, SampleThread>,
+                 current: &Option<String>,
+                 frames: &mut Vec<String>| {
+        if let Some(thread) = current.as_ref().and_then(|key| threads.get_mut(key)) {
+            append_stack(thread, frames.drain(..).rev());
+        }
+        frames.clear();
+    };
     for line in raw.lines() {
-        if !line.starts_with(char::is_whitespace) && line.contains('/') && line.contains(':') {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            let Some(pid_tid) = fields.get(1) else {
+        if !line.starts_with(char::is_whitespace) {
+            flush(&mut threads, &current, &mut frames);
+            current = None;
+            let Some((name, tid)) = parse_perf_header(line) else {
                 continue;
             };
-            let Some((_, tid)) = pid_tid.split_once('/') else {
-                continue;
-            };
-            let key = tid.to_string();
-            let name = fields.first().copied().unwrap_or("aft").to_string();
-            let thread = threads.entry(key.clone()).or_insert_with(|| SampleThread {
-                id: key.clone(),
+            let thread = threads.entry(tid.clone()).or_insert_with(|| SampleThread {
+                id: tid.clone(),
                 name,
                 declared_samples: 0,
                 nodes: Vec::new(),
+                symbols_unavailable: None,
             });
             thread.declared_samples += 1;
-            current = Some(key);
-            current_parent = None;
-            continue;
-        }
-        let Some(key) = current.as_ref() else {
-            continue;
-        };
-        if !line.starts_with(char::is_whitespace) {
-            current = None;
-            current_parent = None;
+            current = Some(tid);
             continue;
         }
         let text = line.trim();
-        if text.is_empty() {
-            continue;
+        if current.is_some() && !text.is_empty() {
+            frames.push(text.to_string());
         }
-        let thread = threads.get_mut(key).expect("perf sample thread exists");
+    }
+    flush(&mut threads, &current, &mut frames);
+    threads.into_values().collect()
+}
+
+/// Read the thread name and id from a `perf script` sample header. The
+/// default fields print `comm tid [cpu] time: ...`; with `-F +pid` the id is
+/// `pid/tid`, and `[cpu]` appears only when the samples carry a CPU. A thread
+/// name may contain spaces and digits (`worker 7`), so the id is found from
+/// the fixed fields after the name: the token just before the timestamp, or
+/// before `[cpu]` when that is present. Reading left to right would take a
+/// digit inside the name as the id and merge unrelated threads.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_perf_header(line: &str) -> Option<(String, String)> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let is_number = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    let is_timestamp = |text: &str| {
+        text.strip_suffix(':').is_some_and(|value| {
+            value.bytes().any(|byte| byte.is_ascii_digit())
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        })
+    };
+    let is_cpu = |text: &str| {
+        text.strip_prefix('[')
+            .and_then(|text| text.strip_suffix(']'))
+            .is_some_and(is_number)
+    };
+    let time = fields.iter().position(|field| is_timestamp(field))?;
+    let mut position = time.checked_sub(1)?;
+    if is_cpu(fields[position]) {
+        position = position.checked_sub(1)?;
+    }
+    // A header always starts with the thread name, so the id is never first.
+    if position == 0 {
+        return None;
+    }
+    let tid = match fields[position].rsplit_once('/') {
+        Some((pid, tid)) if is_number(pid) && is_number(tid) => tid,
+        None if is_number(fields[position]) => fields[position],
+        _ => return None,
+    };
+    Some((fields[..position].join(" "), tid.to_string()))
+}
+
+/// Store one sample's frames, given outermost first, as a one-sample chain.
+/// `thread_report` folds identical chains together before ranking.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn append_stack(thread: &mut SampleThread, frames: impl IntoIterator<Item = String>) {
+    let mut parent = None;
+    for frame in frames {
         let index = thread.nodes.len();
         thread.nodes.push(SampleNode {
-            parent: current_parent,
+            parent,
             samples: 1,
-            frame: text.to_string(),
-            offset: parse_hex_address(text),
+            offset: parse_hex_address(&frame),
+            frame,
         });
-        current_parent = Some(index);
+        parent = Some(index);
     }
-    threads.into_values().collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1696,6 +1753,9 @@ struct SampleThread {
     name: String,
     declared_samples: u64,
     nodes: Vec<SampleNode>,
+    /// Set when frames from the profiled image could not be symbolized; the
+    /// raw frames stay in `nodes` and this says why.
+    symbols_unavailable: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2083,41 +2143,14 @@ fn symbolicate(
     {
         let offsets = image_offsets(threads, image);
         let symbols = symbolicate_macos(&debug.dwarf, &offsets)?;
-        for thread in threads {
-            for node in &mut thread.nodes {
-                if let Some(symbol) = node
-                    .offset
-                    .as_ref()
-                    .filter(|_| frame_belongs_to_image(&node.frame, image))
-                    .and_then(|offset| symbols.get(offset))
-                {
-                    node.frame = demangle_rust_symbols(symbol);
-                } else {
-                    node.frame = demangle_rust_symbols(&node.frame);
-                }
-            }
-        }
+        apply_symbols(threads, &symbols, image);
         return Ok(());
     }
     #[cfg(target_os = "linux")]
     {
         let addresses = image_offsets(threads, image);
         let symbols = symbolicate_linux(&debug.dwarf, &addresses)?;
-        for thread in threads {
-            for node in &mut thread.nodes {
-                if let Some(symbol) = node
-                    .offset
-                    .as_ref()
-                    .filter(|_| frame_belongs_to_image(&node.frame, image))
-                    .and_then(|address| symbols.get(address))
-                {
-                    if !symbol.starts_with("??") {
-                        node.frame = demangle_rust_symbols(symbol);
-                    }
-                }
-                node.frame = demangle_rust_symbols(&node.frame);
-            }
-        }
+        apply_symbols(threads, &symbols, image);
         return Ok(());
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -2125,6 +2158,82 @@ fn symbolicate(
         let _ = (threads, debug, image);
         Ok(())
     }
+}
+
+/// Replace each image frame with its symbol. A frame the debug symbols could
+/// not resolve keeps its raw `???` load-address text, and its thread records
+/// how many such frames remain, so a partly symbolized stack never passes for
+/// a fully symbolized one.
+fn apply_symbols(threads: &mut [SampleThread], symbols: &HashMap<String, String>, image: &Path) {
+    for thread in threads {
+        let mut unresolved = 0_usize;
+        for node in &mut thread.nodes {
+            let image_offset = node
+                .offset
+                .as_ref()
+                .filter(|_| frame_belongs_to_image(&node.frame, image));
+            if let Some(offset) = image_offset {
+                match symbols
+                    .get(offset)
+                    .filter(|symbol| is_resolved_symbol(symbol))
+                {
+                    Some(symbol) => node.frame = symbol.clone(),
+                    None => unresolved += 1,
+                }
+            }
+            node.frame = demangle_rust_symbols(&node.frame);
+        }
+        if unresolved > 0 {
+            thread.symbols_unavailable = Some(format!(
+                "{unresolved} frame(s) in {} did not resolve in the debug symbols; raw load-address frames kept",
+                image_display_name(image)
+            ));
+        }
+    }
+}
+
+/// `atos` echoes an unresolvable offset back as a hex address and `addr2line`
+/// prints `??`; neither is a symbol.
+fn is_resolved_symbol(symbol: &str) -> bool {
+    let symbol = symbol.trim();
+    !symbol.is_empty() && !symbol.starts_with("??") && !symbol.starts_with("0x")
+}
+
+/// One stderr line for a run where symbolization worked but left some frames
+/// raw, so that a partial result is announced even when nobody reads each
+/// thread's `symbols_unavailable`.
+fn partial_symbols_warning(threads: &[SampleThread]) -> Option<String> {
+    let affected = threads
+        .iter()
+        .filter(|thread| thread.symbols_unavailable.is_some())
+        .count();
+    (affected > 0).then(|| {
+        format!(
+            "aft profile: symbols unavailable for some frames on {affected} of {} thread(s); see symbols_unavailable on each affected thread",
+            threads.len()
+        )
+    })
+}
+
+/// When no debug symbols could be used at all, every thread that has frames
+/// from the profiled image keeps those frames raw and carries the reason.
+fn mark_symbols_unavailable(threads: &mut [SampleThread], image: &Path, reason: &str) {
+    for thread in threads {
+        let has_image_frames = thread
+            .nodes
+            .iter()
+            .any(|node| node.offset.is_some() && frame_belongs_to_image(&node.frame, image));
+        if has_image_frames {
+            thread.symbols_unavailable = Some(reason.to_string());
+        }
+    }
+}
+
+fn image_display_name(image: &Path) -> String {
+    image
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| image.display().to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -2262,12 +2371,22 @@ struct ThreadReport {
     waiting_samples: u64,
     verdict: String,
     heaviest_paths: Vec<HotPath>,
+    /// Why some of this thread's frames from the profiled image are still raw
+    /// `???` load-address frames. Absent when every such frame was symbolized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbols_unavailable: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct HotPath {
+    /// Running samples that passed through every frame in `frames`.
     samples: u64,
     frames: Vec<String>,
+    /// True when the last frame in `frames` is not a leaf of the sample tree:
+    /// the path stops there because at least a quarter of the thread's running
+    /// samples go through that frame without going through any single callee
+    /// that carries a quarter itself.
+    truncated_at_fanout: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2324,6 +2443,8 @@ fn build_report(
 }
 
 fn thread_report(thread: &SampleThread) -> ThreadReport {
+    let merged = merge_matching_prefixes(thread);
+    let thread = &merged;
     let leaves = leaf_paths(thread);
     let leaf_samples = leaves.iter().map(|(samples, _)| *samples).sum::<u64>();
     let parse_inconsistent = leaf_samples != thread.declared_samples;
@@ -2336,19 +2457,7 @@ fn thread_report(thread: &SampleThread) -> ThreadReport {
         })
         .collect::<Vec<_>>();
     let running_samples: u64 = running_paths.iter().map(|(samples, _)| *samples).sum();
-    let threshold = running_samples.div_ceil(4);
-    let mut heaviest_paths = running_paths
-        .into_iter()
-        .filter(|(samples, _)| *samples >= threshold && *samples > 0)
-        .map(|(samples, path)| HotPath {
-            samples,
-            frames: path
-                .into_iter()
-                .map(|index| thread.nodes[index].frame.clone())
-                .collect(),
-        })
-        .collect::<Vec<_>>();
-    heaviest_paths.sort_by(|left, right| right.samples.cmp(&left.samples));
+    let heaviest_paths = heaviest_paths(thread, &running_paths, running_samples);
     ThreadReport {
         id: thread.id.clone(),
         name: if thread.name.is_empty() {
@@ -2363,6 +2472,127 @@ fn thread_report(thread: &SampleThread) -> ThreadReport {
         waiting_samples: total_samples.saturating_sub(running_samples),
         verdict: subsystem_for_paths(&heaviest_paths),
         heaviest_paths,
+        symbols_unavailable: thread.symbols_unavailable.clone(),
+    }
+}
+
+/// Rank where a thread's running samples go.
+///
+/// A frame qualifies when at least a quarter of the thread's running samples
+/// pass through it. A qualifying frame is reported when at least a quarter of
+/// the running samples pass through it but through none of its qualifying
+/// direct callees: either a hot leaf (an exact stack) or a frame whose work is
+/// spread over callees too small to qualify. Reporting only hot leaves would
+/// leave a busy thread with an empty list whenever its work fans out, which
+/// reads like "no work" when the work is in fact there. Those uncovered
+/// quarters are disjoint, so at most four paths are reported. Each path's
+/// `samples` is inclusive, so a fan-out path and a hot callee's path may nest
+/// and their counts overlap. If no frame qualifies (the running samples are
+/// split across several roots), the heaviest root is reported instead.
+fn heaviest_paths(
+    thread: &SampleThread,
+    running_paths: &[(u64, Vec<usize>)],
+    running_samples: u64,
+) -> Vec<HotPath> {
+    if running_samples == 0 {
+        return Vec::new();
+    }
+    let mut inclusive = vec![0_u64; thread.nodes.len()];
+    for (samples, path) in running_paths {
+        for index in path {
+            inclusive[*index] += samples;
+        }
+    }
+    let threshold = running_samples.div_ceil(4);
+    let mut has_children = vec![false; thread.nodes.len()];
+    let mut in_qualifying_children = vec![0_u64; thread.nodes.len()];
+    for (index, node) in thread.nodes.iter().enumerate() {
+        if let Some(parent) = node.parent.filter(|parent| *parent < thread.nodes.len()) {
+            has_children[parent] = true;
+            if inclusive[index] >= threshold {
+                in_qualifying_children[parent] += inclusive[index];
+            }
+        }
+    }
+    let hot_path = |index: usize| HotPath {
+        samples: inclusive[index],
+        frames: node_path(thread, index)
+            .into_iter()
+            .map(|index| thread.nodes[index].frame.clone())
+            .collect(),
+        truncated_at_fanout: has_children[index],
+    };
+    let mut paths = (0..thread.nodes.len())
+        .filter(|index| {
+            inclusive[*index] >= threshold
+                && inclusive[*index].saturating_sub(in_qualifying_children[*index]) >= threshold
+        })
+        .map(hot_path)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        // Only reachable when the running samples are split across several
+        // root frames, none holding a quarter. Name the heaviest root rather
+        // than report nothing for a thread that ran.
+        if let Some(root) = (0..thread.nodes.len())
+            .filter(|index| thread.nodes[*index].parent.is_none() && inclusive[*index] > 0)
+            .max_by_key(|index| inclusive[*index])
+        {
+            paths.push(hot_path(root));
+        }
+    }
+    paths.sort_by(|left, right| right.samples.cmp(&left.samples));
+    paths
+}
+
+/// Fold stacks that share the same frames from the root into one tree.
+///
+/// The Linux samplers record each sample as its own chain of nodes, while
+/// macOS `sample` already prints a merged call tree. Ranking counts samples
+/// per node, so without this step a stack seen 100 times on Linux would be 100
+/// one-sample chains, and none would look hot. Folding makes both platforms
+/// rank the same shape.
+///
+/// A node that ended a stack (a leaf) folds only into other leaves, never into
+/// a frame that also has callees. Otherwise the samples spent in that frame
+/// itself would disappear from the leaf totals that `parse_inconsistent` and
+/// the running count are built from. Parents must precede their children in
+/// `nodes`, which every parser here guarantees.
+fn merge_matching_prefixes(thread: &SampleThread) -> SampleThread {
+    let mut has_children = vec![false; thread.nodes.len()];
+    for node in &thread.nodes {
+        if let Some(parent) = node.parent.filter(|parent| *parent < thread.nodes.len()) {
+            has_children[parent] = true;
+        }
+    }
+    let mut merged = Vec::<SampleNode>::with_capacity(thread.nodes.len());
+    let mut merged_index = vec![usize::MAX; thread.nodes.len()];
+    let mut by_key = HashMap::<(Option<usize>, bool, &str), usize>::new();
+    for (index, node) in thread.nodes.iter().enumerate() {
+        // A parent that is missing or listed after its child cannot be
+        // folded safely; keep such a node as its own root.
+        let parent = node
+            .parent
+            .filter(|parent| *parent < index)
+            .map(|parent| merged_index[parent]);
+        let key = (parent, has_children[index], node.frame.as_str());
+        let target = *by_key.entry(key).or_insert_with(|| {
+            merged.push(SampleNode {
+                parent,
+                samples: 0,
+                frame: node.frame.clone(),
+                offset: node.offset.clone(),
+            });
+            merged.len() - 1
+        });
+        merged[target].samples += node.samples;
+        merged_index[index] = target;
+    }
+    SampleThread {
+        id: thread.id.clone(),
+        name: thread.name.clone(),
+        declared_samples: thread.declared_samples,
+        nodes: merged,
+        symbols_unavailable: thread.symbols_unavailable.clone(),
     }
 }
 
@@ -2587,23 +2817,31 @@ fn mb_signed(bytes: i64) -> String {
 }
 
 fn print_human(report: &ProfileReport) {
-    println!("AFT CPU profile ({})", report.sampler);
-    println!("pid: {}", report.target.pid);
-    println!("image: {}", report.target.image);
-    println!("sha256: {}", report.target.sha256);
-    println!("version: {}", report.target.version);
-    print!("{}", render_target_identity(&report.target));
-    println!("\nThread census (running / total):");
+    print!("{}", render_human(report));
+}
+
+fn render_human(report: &ProfileReport) -> String {
+    let mut out = String::new();
+    writeln!(out, "AFT CPU profile ({})", report.sampler).unwrap();
+    writeln!(out, "pid: {}", report.target.pid).unwrap();
+    writeln!(out, "image: {}", report.target.image).unwrap();
+    writeln!(out, "sha256: {}", report.target.sha256).unwrap();
+    writeln!(out, "version: {}", report.target.version).unwrap();
+    out.push_str(&render_target_identity(&report.target));
+    writeln!(out, "\nThread census (running / total):").unwrap();
     let mut threads = report.threads.iter().collect::<Vec<_>>();
     threads.sort_by(|left, right| right.running_samples.cmp(&left.running_samples));
     for thread in threads {
         if thread.parse_inconsistent {
-            println!(
+            writeln!(
+                out,
                 "  {} {}: (parse inconsistent: leaves={} declared={}) — {}",
                 thread.id, thread.name, thread.leaf_samples, thread.total_samples, thread.verdict
-            );
+            )
+            .unwrap();
         } else {
-            println!(
+            writeln!(
+                out,
                 "  {} {}: {} / {} running ({} waiting) — {}",
                 thread.id,
                 thread.name,
@@ -2611,10 +2849,16 @@ fn print_human(report: &ProfileReport) {
                 thread.total_samples,
                 thread.waiting_samples,
                 thread.verdict
-            );
+            )
+            .unwrap();
+        }
+        // Shown on every affected thread, waiting or below the hot cutoff
+        // too, so a raw stack is never mistaken for a symbolized one.
+        if let Some(reason) = &thread.symbols_unavailable {
+            writeln!(out, "    {} symbols unavailable: {reason}", thread.id).unwrap();
         }
     }
-    println!("\nHot running threads:");
+    writeln!(out, "\nHot running threads:").unwrap();
     for thread in report
         .threads
         .iter()
@@ -2622,21 +2866,29 @@ fn print_human(report: &ProfileReport) {
         .take(TOP_THREADS)
     {
         for path in &thread.heaviest_paths {
-            println!(
-                "  {} ({}): {}",
+            writeln!(
+                out,
+                "  {} ({}): {}{}",
                 thread.id,
                 path.samples,
-                human_hot_path_frames(path).join(" > ")
-            );
+                human_hot_path_frames(path).join(" > "),
+                if path.truncated_at_fanout {
+                    " > (spread over smaller callees)"
+                } else {
+                    ""
+                }
+            )
+            .unwrap();
         }
     }
-    println!("\nTop inclusive running symbols:");
+    writeln!(out, "\nTop inclusive running symbols:").unwrap();
     for symbol in &report.top_symbols {
-        println!("  {:>5} {}", symbol.inclusive_samples, symbol.symbol);
+        writeln!(out, "  {:>5} {}", symbol.inclusive_samples, symbol.symbol).unwrap();
     }
     if let Some(raw) = &report.raw_sample {
-        println!("\nRaw sampler output:\n{raw}");
+        writeln!(out, "\nRaw sampler output:\n{raw}").unwrap();
     }
+    out
 }
 
 fn render_target_identity(target: &TargetReport) -> String {
@@ -3193,6 +3445,339 @@ mod tests {
         assert!(!thread_report(thread).parse_inconsistent);
     }
 
+    // A live `sample` of the daemon's health-rollup thread (unsymbolicated, with
+    // load addresses). Its working samples sit under one frame and then spread
+    // across many leaves of 1-9 samples each, so no single leaf stack reaches a
+    // quarter of the running samples. The report must still name where the work
+    // is instead of returning an empty path list.
+    #[test]
+    fn busy_thread_whose_work_fans_out_still_reports_heaviest_path() {
+        let raw = include_str!("../../tests/fixtures/ck-aft-health-rollup-sample.txt");
+        let threads = parse_macos_sample(raw);
+        assert_eq!(threads.len(), 1);
+        let report = thread_report(&threads[0]);
+        assert_eq!(report.name, "aft-health-rollup");
+        assert!(!report.parse_inconsistent);
+        assert_eq!(report.total_samples, 526);
+        assert_eq!(report.waiting_samples, 385);
+        assert_eq!(report.running_samples, 141);
+
+        assert!(
+            !report.heaviest_paths.is_empty(),
+            "a thread with {} running samples reported no heaviest path",
+            report.running_samples
+        );
+        let heaviest = &report.heaviest_paths[0];
+        assert_eq!(heaviest.samples, 140);
+        assert_eq!(heaviest.frames.len(), 5);
+        assert!(heaviest.frames[0].starts_with("thread_start"));
+        assert!(heaviest.frames[4].contains("load address 0x1043fc000 + 0x955a58"));
+        assert!(heaviest.truncated_at_fanout);
+        // The two callees that each carry a quarter of the running samples are
+        // reported too, nested under the fan-out frame. The 36-sample one ends
+        // one frame deeper, at its only callee, which carries all 36.
+        let nested = report.heaviest_paths[1..]
+            .iter()
+            .map(|path| (path.samples, path.frames.len()))
+            .collect::<Vec<_>>();
+        assert_eq!(nested, vec![(37, 6), (36, 7)]);
+        let threshold = report.running_samples.div_ceil(4);
+        assert!(report
+            .heaviest_paths
+            .iter()
+            .all(|path| path.samples >= threshold));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["heaviest_paths"][0]["samples"], 140);
+        assert_eq!(json["heaviest_paths"][0]["truncated_at_fanout"], true);
+        assert!(json.get("symbols_unavailable").is_none());
+    }
+
+    // `perf script` default text: one callchain per sample, innermost frame
+    // first. The health-rollup thread repeats one stack 100 times and spreads
+    // another 60 samples under one frame over 30 leaf sites; the executor
+    // thread uses the `pid/tid` header that `perf script -F +pid` prints.
+    // A thread name may itself contain numbers; the id comes from the fixed
+    // fields after the name, so `worker 7` with tid 4242 is thread 4242.
+    #[test]
+    fn perf_header_takes_the_id_after_a_name_that_contains_numbers() {
+        let cases = [
+            (
+                "worker 7 4242 [003] 12345.004000: 1 cycles:",
+                "worker 7",
+                "4242",
+            ),
+            ("worker 7 4242 12345.004000: 1 cycles:", "worker 7", "4242"),
+            ("pool 1/2 99/4243 [000] 1.5: 1 cycles:", "pool 1/2", "4243"),
+            (
+                "aft-health-rollup 4244 77.25: 1 cycles:",
+                "aft-health-rollup",
+                "4244",
+            ),
+        ];
+        for (header, name, tid) in cases {
+            assert_eq!(
+                parse_perf_header(header),
+                Some((name.to_string(), tid.to_string())),
+                "{header}"
+            );
+        }
+        // Stack frames and lines without a timestamp are not headers.
+        assert_eq!(
+            parse_perf_header("55d1c0a2d0b3 aft::subc::health::run+0x23 (/x)"),
+            None
+        );
+        assert_eq!(parse_perf_header("4242 12345.004000: 1 cycles:"), None);
+    }
+
+    #[test]
+    fn linux_perf_stacks_fold_into_one_tree_before_ranking() {
+        let raw = include_str!("../../tests/fixtures/linux-perf-script.txt");
+        let threads = parse_perf_script(raw);
+        let ids = threads
+            .iter()
+            .map(|thread| (thread.id.as_str(), thread.declared_samples))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![("4242", 160), ("4243", 8)]);
+        assert_eq!(threads[0].name, "aft-health-roll");
+
+        let report = thread_report(&threads[0]);
+        assert!(!report.parse_inconsistent);
+        assert_eq!(report.running_samples, 160);
+        let summary = report
+            .heaviest_paths
+            .iter()
+            .map(|path| {
+                (
+                    path.samples,
+                    path.truncated_at_fanout,
+                    path.frames.first().cloned().unwrap_or_default(),
+                    path.frames.last().cloned().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let outermost = "7f3a2b126850 __clone3+0x30 (/usr/lib/x86_64-linux-gnu/libc.so.6)";
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    100,
+                    false,
+                    outermost.to_string(),
+                    "55d1c0a2d0b3 aft::subc::health::count_actors+0x23 (/usr/local/bin/aft)"
+                        .to_string()
+                ),
+                (
+                    60,
+                    true,
+                    outermost.to_string(),
+                    "55d1c0a2e2c8 aft::subc::health::scan_actor_snapshots+0x88 (/usr/local/bin/aft)"
+                        .to_string()
+                ),
+            ]
+        );
+
+        let executor = thread_report(&threads[1]);
+        assert_eq!(executor.heaviest_paths.len(), 1);
+        assert_eq!(executor.heaviest_paths[0].samples, 8);
+        assert!(!executor.heaviest_paths[0].truncated_at_fanout);
+    }
+
+    #[test]
+    fn folding_keeps_samples_that_ended_in_a_frame_with_callees_elsewhere() {
+        // Three perf samples: one stopped in `B` itself, two went on into `C`.
+        let mut thread = SampleThread {
+            id: "7".to_string(),
+            name: "worker".to_string(),
+            declared_samples: 3,
+            nodes: Vec::new(),
+            symbols_unavailable: None,
+        };
+        for frames in [vec!["A", "B"], vec!["A", "B", "C"], vec!["A", "B", "C"]] {
+            append_stack(&mut thread, frames.into_iter().map(str::to_string));
+        }
+        let report = thread_report(&thread);
+        assert!(!report.parse_inconsistent);
+        assert_eq!(report.leaf_samples, 3);
+        assert_eq!(report.running_samples, 3);
+    }
+
+    #[test]
+    fn symbol_gaps_are_shown_on_every_affected_thread_past_the_hot_cutoff() {
+        let thread = |id: &str, samples: u64, frame: &str, reason: Option<&str>| SampleThread {
+            id: id.to_string(),
+            name: format!("worker-{id}"),
+            declared_samples: samples,
+            nodes: vec![SampleNode {
+                parent: None,
+                samples,
+                frame: frame.to_string(),
+                offset: None,
+            }],
+            symbols_unavailable: reason.map(str::to_string),
+        };
+        let busy = "???  (in ck-aft)  load address 0x1000 + 0x10";
+        let parked = "__psynch_cvwait  (in libsystem_kernel.dylib) + 8";
+        let past_cutoff = "3 frame(s) in ck-aft did not resolve in the debug symbols";
+        let waiting = "no cached debug symbols for loaded UUID ABC";
+        let mut threads = (1..=TOP_THREADS as u64)
+            .map(|rank| thread(&format!("hot{rank}"), 100 - rank, busy, None))
+            .collect::<Vec<_>>();
+        // Ranked sixth by running samples, so it is not among the hot threads.
+        threads.push(thread("cool", 5, busy, Some(past_cutoff)));
+        threads.push(thread("parked", 50, parked, Some(waiting)));
+        let target = TargetReport {
+            pid: 1,
+            image: "/tmp/ck-aft".to_string(),
+            sha256: "test".to_string(),
+            version: "test".to_string(),
+            debug_id: "test".to_string(),
+            image_on_disk_differs: false,
+            image_on_disk_status: "readable".to_string(),
+            image_on_disk_debug_id: None,
+        };
+        let report = build_report(target, "test".to_string(), threads);
+
+        let human = render_human(&report);
+        assert!(
+            human.contains(&format!("cool symbols unavailable: {past_cutoff}")),
+            "{human}"
+        );
+        assert!(
+            human.contains(&format!("parked symbols unavailable: {waiting}")),
+            "{human}"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        let reasons = json["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|thread| {
+                Some((
+                    thread["id"].as_str()?.to_string(),
+                    thread["symbols_unavailable"].as_str()?.to_string(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons,
+            vec![
+                ("cool".to_string(), past_cutoff.to_string()),
+                ("parked".to_string(), waiting.to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn hot_leaf_is_reported_as_an_exact_stack() {
+        let node = |parent: Option<usize>, samples: u64, frame: &str| SampleNode {
+            parent,
+            samples,
+            frame: frame.to_string(),
+            offset: None,
+        };
+        let thread = SampleThread {
+            id: "1".to_string(),
+            name: "worker".to_string(),
+            declared_samples: 10,
+            nodes: vec![
+                node(None, 10, "root"),
+                node(Some(0), 8, "hot"),
+                node(Some(0), 2, "cold"),
+            ],
+            symbols_unavailable: None,
+        };
+        let report = thread_report(&thread);
+        assert_eq!(report.heaviest_paths.len(), 1);
+        assert_eq!(report.heaviest_paths[0].samples, 8);
+        assert_eq!(report.heaviest_paths[0].frames, vec!["root", "hot"]);
+        assert!(!report.heaviest_paths[0].truncated_at_fanout);
+    }
+
+    #[test]
+    fn unresolved_image_frames_stay_raw_and_the_thread_says_why() {
+        let raw = include_str!("../../tests/fixtures/ck-aft-health-rollup-sample.txt");
+        let image = Path::new("/Users/someone/bin/ck-aft");
+        let resolved = "aft::subc::health::build_health_diagnostic_rollup_from_actors (in ck-aft) (health.rs:10)";
+
+        // Every image offset resolves: no gap is reported.
+        let mut threads = parse_macos_sample(raw);
+        let symbols = image_offsets(&threads, image)
+            .into_iter()
+            .map(|offset| (offset.clone(), format!("symbol_{offset} (in ck-aft)")))
+            .collect::<HashMap<_, _>>();
+        apply_symbols(&mut threads, &symbols, image);
+        assert_eq!(threads[0].symbols_unavailable, None);
+        assert_eq!(partial_symbols_warning(&threads), None);
+        assert!(threads[0]
+            .nodes
+            .iter()
+            .all(|node| !node.frame.starts_with("???")));
+
+        // `atos` echoes an unknown offset as a hex address, and an offset it
+        // printed nothing for is missing from the map. Both stay raw.
+        let mut threads = parse_macos_sample(raw);
+        let mut symbols = HashMap::new();
+        symbols.insert("0x955a58".to_string(), resolved.to_string());
+        symbols.insert(
+            "0x1355eb4".to_string(),
+            "0x0000000101355eb4 (in ck-aft)".to_string(),
+        );
+        apply_symbols(&mut threads, &symbols, image);
+        let reason = threads[0].symbols_unavailable.clone().unwrap();
+        let warning = partial_symbols_warning(&threads).unwrap();
+        assert!(warning.contains("on 1 of 1 thread(s)"), "{warning}");
+        assert!(
+            reason.contains("did not resolve in the debug symbols"),
+            "{reason}"
+        );
+        assert!(reason.contains("ck-aft"), "{reason}");
+
+        // Checked on the parsed frames rather than on the ranked paths, so this
+        // test covers symbol handling independently of path ranking.
+        let frame_at = |offset: &str| {
+            threads[0]
+                .nodes
+                .iter()
+                .find(|node| node.offset.as_deref() == Some(offset))
+                .map(|node| node.frame.clone())
+                .unwrap()
+        };
+        assert_eq!(frame_at("0x955a58"), resolved);
+        assert!(frame_at("0x1355eb4").contains("load address 0x1043fc000 + 0x1355eb4"));
+        assert!(frame_at("0x1f096b8").contains("load address 0x1043fc000 + 0x1f096b8"));
+        let report = thread_report(&threads[0]);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["symbols_unavailable"], reason.as_str());
+    }
+
+    #[test]
+    fn symbolization_failure_keeps_raw_stacks_and_names_the_reason() {
+        let raw = include_str!("../../tests/fixtures/ck-aft-health-rollup-sample.txt");
+        let mut threads = parse_macos_sample(raw);
+        threads.push(SampleThread {
+            id: "2".to_string(),
+            name: "system-only".to_string(),
+            declared_samples: 4,
+            nodes: vec![SampleNode {
+                parent: None,
+                samples: 4,
+                frame: "kevent  (in libsystem_kernel.dylib) + 8  [0x1832d6fcc]".to_string(),
+                offset: None,
+            }],
+            symbols_unavailable: None,
+        });
+        let reason = "no cached debug symbols for loaded UUID ABC";
+        mark_symbols_unavailable(&mut threads, Path::new("/Users/someone/bin/ck-aft"), reason);
+        assert_eq!(threads[1].symbols_unavailable, None);
+
+        let report = thread_report(&threads[0]);
+        assert_eq!(report.symbols_unavailable.as_deref(), Some(reason));
+        assert!(threads[0]
+            .nodes
+            .iter()
+            .any(|node| node.frame.starts_with("???  (in ck-aft)  load address")));
+    }
+
     #[test]
     fn inconsistent_leaf_totals_are_marked_and_not_ranked_as_hot() {
         let inconsistent = SampleThread {
@@ -3213,6 +3798,7 @@ mod tests {
                     offset: None,
                 },
             ],
+            symbols_unavailable: None,
         };
         let report = thread_report(&inconsistent);
         assert!(report.parse_inconsistent);
@@ -3257,6 +3843,7 @@ mod tests {
                 "frame-11".to_string(),
                 "frame-12".to_string(),
             ],
+            truncated_at_fanout: false,
         };
         let rendered = human_hot_path_frames(&path);
         assert_eq!(rendered.first().map(String::as_str), Some("… (1 more)"));
@@ -3277,6 +3864,7 @@ mod tests {
                 frame: "__psynch_cvwait (in libsystem_kernel.dylib) + 8".to_string(),
                 offset: None,
             }],
+            symbols_unavailable: None,
         };
         let report = thread_report(&thread);
         assert_eq!(report.running_samples, 0);
