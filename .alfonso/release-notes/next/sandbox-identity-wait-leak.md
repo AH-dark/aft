@@ -1,1 +1,1 @@
-- A Unix background shell now closes its identity-gate pipe if task registration fails or the registry begins shutting down before release. The waiting wrapper receives EOF and exits without running the command, rather than remaining blocked with an orphaned task shell.
+- A background command that AFT failed to start (for example after an internal error during registration or while AFT was shutting down) no longer leaves a shell process waiting forever; it exits without running the command.
