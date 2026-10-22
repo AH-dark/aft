@@ -187,6 +187,7 @@ mod trace_to_symbol_test;
 mod typescript_native_lsp_test;
 mod undo_path_lifecycle_test;
 mod url_fetch_test;
+mod v3_isolation;
 mod view_assembly_wiring_test;
 mod vue_test;
 mod worker_session_test;

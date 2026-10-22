@@ -6,7 +6,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
@@ -161,25 +161,92 @@ fn probe_free_space(_path: &Path) -> Option<(u64, u64)> {
 /// Read the whole namespace, including SQLite sidecars and member directories.
 /// Symlinks are charged as entries, not followed outside the namespace.
 pub fn allocated_bytes(path: &Path) -> Result<u64> {
+    Ok(allocated_bytes_until(path, None)?.expect("a walk without a deadline completes"))
+}
+
+/// [`allocated_bytes`], stopping at `deadline`. The deadline is checked before
+/// each directory entry is read, and a walk that reaches it returns `None`:
+/// its partial sum is never a total.
+pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<Option<u64>> {
     let mut total = 0u64;
     for entry in fs::read_dir(path)? {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        WALK_DELAY.with(|delay| {
+            if !delay.get().is_zero() {
+                std::thread::sleep(delay.get());
+            }
+        });
         let entry = entry?;
         let meta = fs::symlink_metadata(entry.path())?;
         if meta.is_dir() {
-            total = total.saturating_add(allocated_bytes(&entry.path())?);
+            let Some(bytes) = allocated_bytes_until(&entry.path(), deadline)? else {
+                return Ok(None);
+            };
+            total = total.saturating_add(bytes);
         } else {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                total = total.saturating_add(meta.blocks().saturating_mul(512));
-            }
-            #[cfg(not(unix))]
-            {
-                total = total.saturating_add(meta.len());
-            }
+            total = total.saturating_add(file_allocated(&meta));
+        }
+    }
+    Ok(Some(total))
+}
+
+/// The bytes one non-directory entry is charged in the namespace inventory.
+fn file_allocated(meta: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
+/// The inventory charge of the registry's own files (`members.sqlite` and
+/// its `-wal` and `-shm`), the only files a measurement's commit and
+/// checkpoint change. A few stats, never a walk.
+fn registry_allocated(dir: &Path) -> Result<u64> {
+    let mut total = 0u64;
+    for name in ["members.sqlite", "members.sqlite-wal", "members.sqlite-shm"] {
+        match fs::symlink_metadata(dir.join(name)) {
+            Ok(meta) => total = total.saturating_add(file_allocated(&meta)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+thread_local! {
+    static WALK_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+/// Test seam: every namespace walk on this thread sleeps this long per entry.
+/// Its only caller is a unix-only test.
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn set_walk_delay_for_test(delay: Duration) {
+    WALK_DELAY.with(|cell| cell.set(delay));
+}
+
+/// The outcome of a covering measurement taken under a deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Measurement {
+    /// A complete walk was recorded, with this many allocated bytes.
+    Recorded(u64),
+    /// The deadline passed before a measurement was confirmed. Either the
+    /// first walk was cut short, and nothing was recorded or released (the
+    /// registry keeps its last complete measurement, which can only overstate
+    /// usage after deletions), or the walk was recorded but the deadline
+    /// stopped the recheck, and the saved total was raised by the registry's
+    /// own growth so it is never below what the family uses. Every writer
+    /// open measures again, so the next writer (or the collector's next
+    /// visit) repays it.
+    Owed,
 }
 
 /// Owning capability for the non-reentrant storage-root lease. Pass this guard
@@ -194,6 +261,19 @@ impl ReservationLock {
         let guard = crate::fs_lock::try_acquire(
             &storage.join("blobs/v3/reservations.lock"),
             Duration::from_secs(120),
+        )
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        Ok(Self {
+            guard,
+            storage: storage.to_path_buf(),
+        })
+    }
+    /// Like [`Self::acquire`], but waits no later than `deadline`; a deadline already past makes exactly one attempt.
+    pub fn acquire_until(storage: &Path, deadline: std::time::Instant) -> Result<Self> {
+        fs::create_dir_all(storage.join("blobs/v3"))?;
+        let guard = crate::fs_lock::try_acquire_until(
+            &storage.join("blobs/v3/reservations.lock"),
+            deadline,
         )
         .map_err(|e| Error::Io(std::io::Error::other(e)))?;
         Ok(Self {
@@ -582,14 +662,36 @@ impl<'a> RegistryWriter<'a> {
     pub fn open_existing(storage: &Path, family: &str, lock: &'a ReservationLock) -> Result<Self> {
         Self::open(storage, family, lock, false)
     }
+    /// [`Self::open_existing`] whose covering measurement stops at `deadline`.
+    /// An [`Measurement::Owed`] open still returns the writer.
+    pub fn open_existing_until(
+        storage: &Path,
+        family: &str,
+        lock: &'a ReservationLock,
+        deadline: Instant,
+    ) -> Result<(Self, Measurement)> {
+        let mut writer = Self::open_unmeasured(storage, family, lock, false)?;
+        let measurement = writer.covering_measurement_until(deadline)?;
+        Ok((writer, measurement))
+    }
     fn open(storage: &Path, family: &str, lock: &'a ReservationLock, create: bool) -> Result<Self> {
+        let mut writer = Self::open_unmeasured(storage, family, lock, create)?;
+        writer.covering_measurement()?;
+        Ok(writer)
+    }
+    fn open_unmeasured(
+        storage: &Path,
+        family: &str,
+        lock: &'a ReservationLock,
+        create: bool,
+    ) -> Result<Self> {
         persisted_format::register_storage_root(storage);
         lock.verify(storage)?;
         let dir = family_dir(storage, family)?;
         if create {
             fs::create_dir_all(&dir)?;
         }
-        let mut writer = Self {
+        Ok(Self {
             database: connections::shared(
                 &dir.join("members.sqlite"),
                 Kind::Registry,
@@ -598,9 +700,7 @@ impl<'a> RegistryWriter<'a> {
             )?,
             dir,
             lock,
-        };
-        writer.covering_measurement()?;
-        Ok(writer)
+        })
     }
     pub fn accounting(&self) -> Result<Accounting> {
         accounting(&**self.connection()?)
@@ -611,17 +711,58 @@ impl<'a> RegistryWriter<'a> {
     /// After deleting namespace files, call this to refresh accounting. It releases dead rows
     /// in the same barrier transaction as the measurement, retaining plane data.
     pub fn covering_measurement(&mut self) -> Result<u64> {
-        self.measure_and_release(None)
+        match self.measure_and_release(None, None)? {
+            Measurement::Recorded(bytes) => Ok(bytes),
+            Measurement::Owed => unreachable!("a measurement without a deadline completes"),
+        }
     }
-    fn measure_and_release(&mut self, release: Option<i64>) -> Result<u64> {
+    /// [`Self::covering_measurement`] that stops at `deadline`, recording
+    /// nothing when it does.
+    pub fn covering_measurement_until(&mut self, deadline: Instant) -> Result<Measurement> {
+        self.measure_and_release(None, Some(deadline))
+    }
+    fn measure_and_release(
+        &mut self,
+        release: Option<i64>,
+        deadline: Option<Instant>,
+    ) -> Result<Measurement> {
         self.lock.verify(&self.lock.storage)?;
         // Checkpoint first: recording a measurement must not itself leave a new
         // WAL charge. Repeat if the accounting update allocated registry pages.
         let mut connection = self.connection()?;
         checkpoint(&connection)?;
+        // The last total this call committed, with the registry-file bytes the
+        // walk behind it counted.
+        let mut committed: Option<(u64, u64)> = None;
         for _ in 0..8 {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let bytes = allocated_bytes(&self.dir)?;
+            // Nothing writes the registry files between this stat and the
+            // walk: this transaction holds the registry's write lock and its
+            // own writes come later.
+            let counted = registry_allocated(&self.dir)?;
+            // Dropping the transaction rolls it back: a walk cut short by the
+            // deadline records nothing and releases nothing.
+            let Some(bytes) = allocated_bytes_until(&self.dir, deadline)? else {
+                drop(tx);
+                return match committed {
+                    None => Ok(Measurement::Owed),
+                    Some((bytes, counted)) => {
+                        settle_registry_growth(&mut connection, &self.dir, bytes, counted)
+                    }
+                };
+            };
+            #[cfg(test)]
+            let expire_recheck = GROW_AND_EXPIRE_RECHECK.with(|seam| seam.replace(false));
+            #[cfg(test)]
+            if expire_recheck {
+                // Make this commit allocate registry pages the walk did not see.
+                for index in 0..256 {
+                    tx.execute(
+                        "INSERT INTO view_sessions VALUES(?1,'seam',1,1,0)",
+                        [format!("{index:04}{}", "x".repeat(1024))],
+                    )?;
+                }
+            }
             if let Some(id) = release {
                 tx.execute(
                     "UPDATE reservations SET state='released',reserved_bytes=0 WHERE id=?1",
@@ -661,8 +802,21 @@ impl<'a> RegistryWriter<'a> {
             )?;
             tx.commit()?;
             checkpoint(&connection)?;
-            if allocated_bytes(&self.dir)? == bytes {
-                return Ok(bytes);
+            committed = Some((bytes, counted));
+            #[cfg(test)]
+            let deadline = if expire_recheck {
+                Some(Instant::now())
+            } else {
+                deadline
+            };
+            // The commit and checkpoint above can allocate registry pages the
+            // walk did not count, so only a complete recheck that finds the
+            // same total confirms it. A recheck the deadline stops is not a
+            // confirmation.
+            match allocated_bytes_until(&self.dir, deadline)? {
+                Some(again) if again == bytes => return Ok(Measurement::Recorded(bytes)),
+                Some(_) => {}
+                None => return settle_registry_growth(&mut connection, &self.dir, bytes, counted),
             }
         }
         Err(Error::Refused("reservation_ledger_unreadable"))
@@ -700,7 +854,7 @@ impl<'a> RegistryWriter<'a> {
         if reservation.registry != self.registry_identity()? {
             return Err(Error::ReservationRegistryMismatch);
         }
-        self.measure_and_release(Some(reservation.id))?;
+        self.measure_and_release(Some(reservation.id), None)?;
         Ok(())
     }
     pub fn reserve(&mut self, request: u64) -> Result<Reservation> {
@@ -747,6 +901,54 @@ pub struct Reservation {
     before: u64,
     registry: RegistryIdentity,
 }
+/// After a committed measurement whose recheck the deadline stopped: raises
+/// the saved total by the registry files' growth since the walk counted them,
+/// so it is never below what the family uses, and returns
+/// [`Measurement::Owed`]. Only the registry's own commits and checkpoints change
+/// files while the reservation lock is held, so stats of those files replace
+/// the walk; each correction is itself committed and checkpointed, and the
+/// files are re-stated until that leaves them unchanged.
+fn settle_registry_growth(
+    connection: &mut Connection,
+    dir: &Path,
+    bytes: u64,
+    counted: u64,
+) -> Result<Measurement> {
+    let mut recorded = bytes;
+    for _ in 0..8 {
+        let safe = bytes
+            .saturating_sub(counted)
+            .saturating_add(registry_allocated(dir)?)
+            .max(recorded);
+        if safe == recorded {
+            // No growth since the total last saved: it stands.
+            return Ok(Measurement::Owed);
+        }
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE accounting SET measured_bytes=?1 WHERE singleton=1",
+            [safe],
+        )?;
+        tx.commit()?;
+        checkpoint(connection)?;
+        recorded = safe;
+    }
+    Err(Error::Refused("reservation_ledger_unreadable"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static GROW_AND_EXPIRE_RECHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Test seam: the next deadline-bounded measurement on this thread commits
+/// extra registry pages after its walk, and its recheck finds the deadline
+/// already passed. Its only caller is a unix-only test.
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn grow_and_expire_recheck_for_test() {
+    GROW_AND_EXPIRE_RECHECK.with(|seam| seam.set(true));
+}
+
 fn checkpoint(c: &Connection) -> Result<()> {
     let (busy, _, _): (i64, i64, i64) =
         c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {

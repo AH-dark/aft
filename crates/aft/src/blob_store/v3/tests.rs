@@ -1537,3 +1537,33 @@ fn nested_v3_roots_select_the_inner_owner_floor_without_hiding_outer_refusals() 
         (vec![outer_floor], 0)
     );
 }
+
+/// When the deadline stops the recheck after the measurement's own commit
+/// allocated registry pages the walk did not count, the result is owed and
+/// the saved total is still never below what the family really uses.
+#[cfg(unix)]
+#[test]
+fn a_recheck_stopped_by_the_deadline_never_saves_a_total_below_usage() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let mut writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    let before = inventory(&writer.dir);
+    grow_and_expire_recheck_for_test();
+    let measured = writer
+        .covering_measurement_until(std::time::Instant::now() + Duration::from_secs(60))
+        .unwrap();
+    let actual = inventory(&writer.dir);
+    assert!(actual > before, "the seam allocated no registry pages");
+    let saved = LedgerReader::open_existing(root.path(), A)
+        .unwrap()
+        .accounting()
+        .unwrap()
+        .usage();
+    assert!(
+        saved >= actual,
+        "saved {saved} is below the family's {actual}"
+    );
+    assert_eq!(measured, Measurement::Owed);
+}
