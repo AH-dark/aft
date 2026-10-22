@@ -728,8 +728,9 @@ fn settled_runon_launch_reply(
                 _ => None,
             };
         }
-        return background_runon
-            .then(|| accepted_runon_launch_reply(registry, task_id, session, response));
+        return background_runon.then(|| {
+            accepted_runon_launch_reply(registry.remote_progress(task_id, session), response)
+        });
     }
     // Without Accepted, a task that already ended (refused, failed, outcome
     // unknown, killed) reports that saved outcome; only a live task says
@@ -740,14 +741,12 @@ fn settled_runon_launch_reply(
 }
 
 fn accepted_runon_launch_reply(
-    registry: &crate::bash_background::BgTaskRegistry,
-    task_id: &str,
-    session: &str,
+    progress: Option<crate::bash_background::registry::remote::RemoteProgress>,
     response: &Response,
 ) -> Response {
     let mut reply = copy_response(response);
     reply.data["status"] = json!("running");
-    if let Some(progress) = registry.remote_progress(task_id, session) {
+    if let Some(progress) = progress {
         let phase = progress.phase.tag();
         reply.data["phase"] = json!(phase);
         reply.data["remote_phase"] = json!(phase);
@@ -777,15 +776,45 @@ fn accepted_runon_launch_reply(
     reply
 }
 
-/// The launch reply when the capture wait ends (deadline or module drain)
-/// without having seen the worker settle. Reads saved state off the frame
-/// runtime and decides it with [`settled_runon_launch_reply`], so a wait that
-/// saw the worker settle and one that did not give the same answer for the
-/// same saved state. `Accepted` can land between the last poll and this read:
-/// an accepted background task gets a refreshed task handle, while a foreground
-/// task keeps its normal wait path. A refusal after acceptance is returned as
-/// an error; without `Accepted`, a saved terminal outcome is returned or a live
-/// task says `starting` with the capture warning.
+/// A deadline cannot wait for the blocking pool or task/artifact locks. Remote
+/// commits publish this small in-memory projection before releasing task state,
+/// so a delayed read never turns a saved Accepted or refusal into `starting`.
+fn cached_runon_launch_reply(
+    registry: &crate::bash_background::BgTaskRegistry,
+    task_id: &str,
+    session: &str,
+    response: &Response,
+    background_runon: bool,
+) -> Option<Response> {
+    if let Some(launch) = registry.runon_launch_state(task_id, session) {
+        if let Some(terminal) = launch.terminal {
+            let now = Instant::now();
+            if let crate::commands::bash_orchestrate::BashStep::Done(reply) =
+                crate::commands::bash_orchestrate::decide_bash_step(
+                    terminal,
+                    now,
+                    false,
+                    false,
+                    now,
+                    &response.id,
+                )
+            {
+                return Some(reply);
+            }
+        }
+        if launch.accepted {
+            return background_runon
+                .then(|| accepted_runon_launch_reply(Some(launch.progress), response));
+        }
+    }
+    Some(with_capture_warning(response))
+}
+
+/// The launch reply when a deadline or module drain ends the capture wait.
+/// Read the published launch state without waiting for task locks or the
+/// blocking pool: accepted foreground calls keep their normal wait path,
+/// accepted background calls get a refreshed task handle, and saved refusals
+/// remain errors.
 async fn unsettled_runon_launch_reply(
     registry: crate::bash_background::BgTaskRegistry,
     task_id: String,
@@ -793,12 +822,7 @@ async fn unsettled_runon_launch_reply(
     response: &Response,
     background_runon: bool,
 ) -> Option<Response> {
-    let pending = copy_response(response);
-    tokio::task::spawn_blocking(move || {
-        settled_runon_launch_reply(&registry, &task_id, &session, &pending, background_runon)
-    })
-    .await
-    .unwrap_or_else(|_| Some(with_capture_warning(response)))
+    cached_runon_launch_reply(&registry, &task_id, &session, response, background_runon)
 }
 
 /// The least time one capture-state read gets, even when the capture deadline
@@ -877,6 +901,9 @@ async fn await_runon_launch_reply(
     let deadline = deadline?;
     let task_id = response.data.get("task_id")?.as_str()?.to_owned();
     let capture = async {
+        if background_runon {
+            return cached_runon_launch_reply(&registry, &task_id, session, response, true);
+        }
         loop {
             let observed_registry = registry.clone();
             let observed_task = task_id.clone();
@@ -919,7 +946,15 @@ async fn await_runon_launch_reply(
                 }
                 // The state read itself overran the deadline and its grace;
                 // reading it again could block the reply just as long.
-                Err(_) => return Some(with_capture_warning(response)),
+                Err(_) => {
+                    return cached_runon_launch_reply(
+                        &registry,
+                        &task_id,
+                        session,
+                        response,
+                        background_runon,
+                    )
+                }
                 _ => {
                     return unsettled_runon_launch_reply(
                         registry.clone(),
@@ -937,7 +972,7 @@ async fn await_runon_launch_reply(
         biased;
         _ = claim.module_loop_claimed() => None,
         _ = cancel.cancelled() => None,
-        _ = async { tokio::time::sleep_until(reply_deadline.unwrap().into()).await }, if reply_deadline.is_some() => Some(with_capture_warning(response)),
+        _ = async { tokio::time::sleep_until(reply_deadline.unwrap().into()).await }, if reply_deadline.is_some() => cached_runon_launch_reply(&registry, &task_id, session, response, background_runon),
         _ = async {
             while !cancel.drain.is_active() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -5938,6 +5973,94 @@ mod grant_path_tests {
                 .status,
             crate::bash_background::BgTaskStatus::Completed
         );
+    }
+
+    /// A saturated blocking pool must not turn an already accepted launch back
+    /// into a pending launch. The dispatch stays held while the reply is chosen.
+    #[cfg(unix)]
+    #[test]
+    fn runon_capture_accepted_reply_does_not_queue_for_blocking_pool() {
+        assert_capture_reply_without_blocking_pool(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runon_capture_refused_reply_does_not_queue_for_blocking_pool() {
+        assert_capture_reply_without_blocking_pool(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_capture_reply_without_blocking_pool(refused: bool) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                use crate::exec_remote::wire_tests::Script;
+                for background in [true, false] {
+                    let script = if refused { Script::AcceptedThenRefused } else { Script::Plain };
+                    let (_daemon, _dir, root, executor, ctx) = capture_fixture(script).await;
+                    let timing = BashTimingForTest::new(Instant::now());
+                    let cancel = BashWaitCancel {
+                        run_scope: None,
+                        scope: None,
+                        late_results: false,
+                        ledger_carrier: None,
+                        connection: PersistentCancelSignal::new(),
+                        route: PersistentCancelSignal::new(),
+                        drain: drain::ModuleDrainWindow::default(),
+                    };
+                    let (mut rx, task_id) = held_capture_call(
+                        &executor,
+                        &root,
+                        json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000}),
+                        timing.clone(),
+                        cancel.clone(),
+                    )
+                    .await;
+                    wait_for_task_state(&ctx, "Accepted and terminal", |registry| {
+                        registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
+                            && registry.is_task_terminal(&task_id)
+                    })
+                    .await;
+
+                    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    let blocker = tokio::task::spawn_blocking(move || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+                    });
+                    entered_rx.await.unwrap();
+                    let pending = with_capture_warning(&Response::success(
+                        "queued-observation", json!({"task_id":task_id, "status":"running"}),
+                    ));
+                    let reply = await_runon_launch_reply(
+                        ctx.bash_background().clone(), "deadline-session", &pending,
+                        Some(Instant::now() + Duration::from_secs(60)), &cancel,
+                        &drain::BashCallClaim::default(), false,
+                        (!background).then(Instant::now), background,
+                    ).await;
+                    release_tx.send(()).unwrap();
+                    blocker.await.unwrap();
+                    BashTimingForTest::release(&timing.result);
+                    let _ = tokio::time::timeout(Duration::from_secs(60), rx.recv()).await.unwrap();
+                    if !background && !refused {
+                        assert!(reply.is_none(), "accepted foreground calls keep waiting: {reply:?}");
+                        continue;
+                    }
+                    let reply = reply.unwrap();
+                    if refused {
+                        assert!(!reply.success, "a saved refusal must win: {reply:?}");
+                        assert_eq!(reply.data["code"], "remote_unavailable");
+                    } else {
+                        assert_eq!(reply.data["status"], "running", "accepted launch: {reply:?}");
+                        assert!(reply.data["remote_job_id"].is_string(), "{reply:?}");
+                        assert_ne!(reply.data["remote_phase"], "submitting", "{reply:?}");
+                    }
+                    assert!(!reply.data.to_string().contains(REMOTE_INPUT_CAPTURE_WARNING), "{reply:?}");
+                }
+            });
     }
 
     /// This test checks launch replies after the input-capture wait ends once
