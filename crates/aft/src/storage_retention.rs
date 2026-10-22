@@ -3049,6 +3049,13 @@ fn run_pass_with_budget(
         report
             .timings_ms
             .insert("blobs_v2".into(), phase.elapsed().as_millis() as u64);
+        let phase = Instant::now();
+        if let Err(error) = collect_one_v3_family(storage, cancelled, &mut report) {
+            report.errors.push(error.to_string());
+        }
+        report
+            .timings_ms
+            .insert("blobs_v3".into(), phase.elapsed().as_millis() as u64);
     }
     report
         .timings_ms
@@ -3156,6 +3163,467 @@ fn collect_one_v2_family(
         report.stopped_early |= swept.stopped_early;
         Ok(())
     })
+}
+
+/// One v3 member row as the retention collector reads it.
+struct V3Member {
+    scope: String,
+    kind: String,
+    root: Option<Vec<u8>>,
+    view_dir: String,
+    last_bind_ms: u64,
+    state: String,
+}
+
+/// Outcome of one barrier step for a missing-root v3 member, with the same
+/// meaning as the v2 family sweep's deregistration steps.
+enum V3Step {
+    /// The member row is gone.
+    Gone,
+    /// The root exists again (or is not eligible); the count was reset.
+    Present,
+    /// Protected or not yet counted to the limit; the member stays.
+    Retained,
+    /// The count reached the limit with this recorded value.
+    Due { recorded: i64 },
+    /// The recheck passed and `evicting` is committed.
+    Evicting,
+}
+
+/// Protection of a v3 member: a live session row, a live pin or a protected
+/// read marker. Rows, pins and markers whose owner is dead are removed on the
+/// way, so they never keep a member. `Err` is uncertainty (an unreadable pin,
+/// or a `pins/` or `readers/` listing longer than the bound) and keeps the
+/// member without resetting its count, as the v2 family sweep does.
+fn v3_member_protected(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &str,
+    view_dir: &Path,
+) -> Result<bool, String> {
+    let sessions: Vec<(String, crate::pins::PinOwner)> = tx
+        .prepare("SELECT session_id,owner_pid,owner_start FROM view_sessions WHERE scope=?1")
+        .and_then(|mut statement| {
+            statement
+                .query_map([scope], |row| {
+                    Ok((
+                        row.get(0)?,
+                        crate::pins::PinOwner {
+                            pid: row.get(1)?,
+                            start_time: row.get(2)?,
+                        },
+                    ))
+                })?
+                .collect()
+        })
+        .map_err(|error| error.to_string())?;
+    let mut live = false;
+    for (session, owner) in sessions {
+        if crate::pins::owner_is_live(&owner) {
+            live = true;
+        } else {
+            tx.execute("DELETE FROM view_sessions WHERE session_id=?1", [&session])
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    if live {
+        return Ok(true);
+    }
+    for entry in bounded_dirs(&view_dir.join("pins"), TREE_ENTRIES).map_err(|e| e.to_string())? {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let metadata = crate::pins::read_metadata_strict(&path)
+            .map_err(|error| format!("malformed pin {}: {error}", path.display()))?;
+        let (metadata_path, keys_path) = crate::pins::pin_paths(view_dir, &metadata.generation);
+        if metadata_path != path {
+            return Err(format!("pin {} names another generation", path.display()));
+        }
+        if crate::pins::owner_is_live(&metadata.owner) {
+            return Ok(true);
+        }
+        let _ = fs::remove_file(&metadata_path);
+        let _ = fs::remove_file(&keys_path);
+    }
+    for entry in bounded_dirs(&view_dir.join("readers"), TREE_ENTRIES).map_err(|e| e.to_string())? {
+        if !entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            continue;
+        }
+        let generation = entry
+            .file_name()
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "non-UTF-8 reader directory".to_string())?;
+        if crate::root_cache::sweep_read_markers(view_dir, &generation).protected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn v3_root_path(root: &[u8]) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(root)))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(root).ok().map(PathBuf::from)
+    }
+}
+
+/// True when the root is certainly gone. An unreadable parent is not "gone".
+fn v3_root_missing(root: &Path) -> bool {
+    matches!(fs::symlink_metadata(root), Err(error) if error.kind() == io::ErrorKind::NotFound)
+}
+
+fn v3_member(tx: &rusqlite::Transaction<'_>, scope: &str) -> rusqlite::Result<Option<V3Member>> {
+    use rusqlite::OptionalExtension;
+    tx.query_row(
+        "SELECT scope,kind,root,view_dir,last_bind_ms,state FROM members WHERE scope=?1",
+        [scope],
+        v3_member_row,
+    )
+    .optional()
+}
+
+fn v3_member_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<V3Member> {
+    Ok(V3Member {
+        scope: row.get(0)?,
+        kind: row.get(1)?,
+        root: row.get(2)?,
+        view_dir: row.get(3)?,
+        last_bind_ms: row.get(4)?,
+        state: row.get(5)?,
+    })
+}
+
+fn v3_missing_sweeps(tx: &rusqlite::Transaction<'_>, scope: &str) -> rusqlite::Result<Option<i64>> {
+    use rusqlite::OptionalExtension;
+    tx.query_row(
+        "SELECT missing_sweeps FROM members WHERE scope=?1",
+        [scope],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+fn v3_reset_missing_sweeps(tx: &rusqlite::Transaction<'_>, scope: &str) -> rusqlite::Result<()> {
+    tx.execute(
+        "UPDATE members SET missing_sweeps=0 WHERE scope=?1",
+        [scope],
+    )
+    .map(|_| ())
+}
+
+/// The first barrier step: resets or advances the member's count of
+/// consecutive missing-root passes, or reports that removal is due.
+fn v3_count_missing_pass(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &str,
+    view_dir: &Path,
+    missing: bool,
+) -> rusqlite::Result<V3Step> {
+    let Some(recorded) = v3_missing_sweeps(tx, scope)? else {
+        return Ok(V3Step::Gone);
+    };
+    if !missing {
+        if recorded != 0 {
+            v3_reset_missing_sweeps(tx, scope)?;
+        }
+        return Ok(V3Step::Present);
+    }
+    match v3_member_protected(tx, scope, view_dir) {
+        Ok(false) => {}
+        Ok(true) => {
+            v3_reset_missing_sweeps(tx, scope)?;
+            return Ok(V3Step::Retained);
+        }
+        Err(_) => return Ok(V3Step::Retained),
+    }
+    let count = recorded.max(0) as u32 + 1;
+    if count < crate::views::registry::MISSING_ROOT_SWEEPS {
+        tx.execute(
+            "UPDATE members SET missing_sweeps=?2 WHERE scope=?1",
+            rusqlite::params![scope, i64::from(count)],
+        )?;
+        return Ok(V3Step::Retained);
+    }
+    Ok(V3Step::Due { recorded })
+}
+
+/// The second barrier step, taken under the storage-root reservation lock
+/// just before deletion: re-reads the row and rechecks its kind, root, count
+/// and every protection, then commits `evicting`. A pin or session that
+/// appeared since the first step keeps the member.
+fn v3_recheck_and_mark_evicting(
+    tx: &rusqlite::Transaction<'_>,
+    storage: &Path,
+    scope: &str,
+    view_dir: &Path,
+    recorded: i64,
+) -> rusqlite::Result<V3Step> {
+    let Some(current) = v3_member(tx, scope)? else {
+        return Ok(V3Step::Gone);
+    };
+    if v3_missing_sweeps(tx, scope)? != Some(recorded) {
+        return Ok(V3Step::Retained);
+    }
+    let due = current.kind == "view"
+        && current
+            .root
+            .as_deref()
+            .and_then(v3_root_path)
+            .is_some_and(|root| {
+                v3_root_missing(&root) && missing_root_due(storage, &root, current.last_bind_ms)
+            });
+    if !due {
+        v3_reset_missing_sweeps(tx, scope)?;
+        return Ok(V3Step::Present);
+    }
+    match v3_member_protected(tx, scope, view_dir) {
+        Ok(false) => {}
+        Ok(true) => {
+            v3_reset_missing_sweeps(tx, scope)?;
+            return Ok(V3Step::Retained);
+        }
+        Err(_) => return Ok(V3Step::Retained),
+    }
+    tx.execute(
+        "UPDATE members SET state=?2 WHERE scope=?1",
+        rusqlite::params![scope, crate::views::registry::STATE_EVICTING],
+    )?;
+    Ok(V3Step::Evicting)
+}
+
+/// Removes the view directory of a member whose `evicting` state is
+/// committed, deletes its row, then takes a covering measurement so committed
+/// usage falls by the bytes actually freed. A crash anywhere in here leaves
+/// the `evicting` row, and the next pass calls this again to finish.
+fn v3_finish_eviction(
+    storage: &Path,
+    registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
+    scope: &str,
+    view_dir: &Path,
+) -> io::Result<()> {
+    #[cfg(test)]
+    test_hook(storage, "v3-evicting-committed");
+    #[cfg(not(test))]
+    let _ = storage;
+    crate::views::registry::remove_view_dir(view_dir)?;
+    registry
+        .with_barrier(|tx| {
+            tx.execute(
+                "DELETE FROM members WHERE scope=?1 AND state=?2",
+                rusqlite::params![scope, crate::views::registry::STATE_EVICTING],
+            )?;
+            Ok(())
+        })
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    registry
+        .covering_measurement()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(())
+}
+
+/// The v3 retention collector. Each pass visits one family under
+/// `blobs/v3/` and applies the v2 missing-root rule to its `kind = view`
+/// members: a member is removed with its view directory once its root has
+/// been missing, unprotected and past the recency and mount guards for
+/// `MISSING_ROOT_SWEEPS` consecutive passes. `kind = base` members and
+/// members with no root are never removed. Plane rows stay for the v3 plane
+/// sweep.
+///
+/// It only opens registries that already exist. A storage root with no
+/// `blobs/v3/` lists nothing, and a family directory without `members.sqlite`
+/// is skipped before the storage-root reservation lock is taken, because
+/// taking that lock creates `blobs/v3/reservations.lock`. Views-off and
+/// views-on users who never published v3 data therefore get no v3 file.
+fn collect_one_v3_family(
+    storage: &Path,
+    cancelled: &dyn Fn() -> bool,
+    report: &mut SweepReport,
+) -> io::Result<()> {
+    // Only family directories take the pass's one visit, so the lock file
+    // beside them never uses up a pass.
+    let next = || {
+        traversal_batch_filtered(
+            storage,
+            &[(storage.join("blobs/v3"), false)],
+            "families-v3",
+            1,
+            &|entry| {
+                key_valid(&entry.file_name().to_string_lossy())
+                    && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            },
+        )
+    };
+    let mut batch = next()?;
+    if batch.entries.is_empty() && batch.cursor_path.try_exists()? {
+        // The end of a lap: save the reset cursor and start the next lap in
+        // this same pass, so a lone family is visited on every pass rather
+        // than every other one. With no saved cursor there is nothing to
+        // reset, so a storage root that never had v3 data gets no cursor file.
+        atomic_json(&batch.cursor_path, &batch.end)?;
+        batch = next()?;
+    }
+    if cancelled() {
+        return Ok(());
+    }
+    let Some(item) = batch.entries.into_iter().next() else {
+        return Ok(());
+    };
+    let family = item.entry.file_name().to_string_lossy().into_owned();
+    let result = collect_v3_family(storage, &family, cancelled, report);
+    if !cancelled() {
+        // Advance even when family work fails, so later families can still run.
+        atomic_json(&batch.cursor_path, &item.after)?;
+    }
+    result
+}
+
+fn collect_v3_family(
+    storage: &Path,
+    family: &str,
+    cancelled: &dyn Fn() -> bool,
+    report: &mut SweepReport,
+) -> io::Result<()> {
+    use crate::blob_store::v3::{RegistryWriter, ReservationLock};
+    let v3 = |error: crate::blob_store::v3::Error| io::Error::other(error.to_string());
+    let registry_path = storage.join("blobs/v3").join(family).join("members.sqlite");
+    if !registry_path.try_exists()? {
+        return Ok(());
+    }
+    let deadline = Instant::now() + PASS_BUDGET;
+    // Lock first, then the registry barrier, the order every v3 writer uses.
+    // Opening the registry takes a covering measurement and releases the
+    // reservations of dead owners.
+    let lock = ReservationLock::acquire(storage).map_err(v3)?;
+    let mut registry = RegistryWriter::open_existing(storage, family, &lock).map_err(v3)?;
+    let members: Vec<V3Member> = registry
+        .with_barrier(|tx| {
+            let mut statement = tx.prepare(
+                "SELECT scope,kind,root,view_dir,last_bind_ms,state FROM members ORDER BY scope LIMIT ?1",
+            )?;
+            let rows = statement
+                .query_map([HISTORY_ENTRIES as i64], v3_member_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .map_err(v3)?;
+    let mut domain = DomainReport::default();
+    for member in members {
+        if cancelled() || Instant::now() >= deadline {
+            report.stopped_early = true;
+            break;
+        }
+        if member.kind != "view" {
+            continue;
+        }
+        domain.examined += 1;
+        // Delete only the directory this family and scope own. A row whose
+        // stored path points anywhere else is kept and reported.
+        let view_dir = crate::blob_store::v3::view_dir(storage, family, &member.scope);
+        let Some(view_dir) = view_dir
+            .ok()
+            .filter(|expected| Path::new(&member.view_dir) == expected)
+        else {
+            domain.skipped_unknown += 1;
+            if report.errors.len() < 16 {
+                report.errors.push(format!(
+                    "v3 member {} in family {family} names an unexpected view directory",
+                    member.scope
+                ));
+            }
+            continue;
+        };
+        if member.state == crate::views::registry::STATE_EVICTING {
+            let bytes = retention_tree_bytes(&view_dir, deadline).ok();
+            v3_finish_eviction(storage, &mut registry, &member.scope, &view_dir)?;
+            record_v3_removal(&mut domain, bytes);
+            continue;
+        }
+        let Some(root) = member.root.as_deref().and_then(v3_root_path) else {
+            domain.skipped_live += 1;
+            continue;
+        };
+        let eligibility = if v3_root_missing(&root) {
+            missing_root_eligibility(storage, &root, member.last_bind_ms)
+        } else {
+            RootEligibility::Live
+        };
+        match eligibility {
+            RootEligibility::Live => domain.skipped_live += 1,
+            RootEligibility::Recent => domain.skipped_recent += 1,
+            RootEligibility::MountMismatch => domain.skipped_mount_mismatch += 1,
+            RootEligibility::Due => {}
+        }
+        let missing = eligibility == RootEligibility::Due;
+        let step = registry
+            .with_barrier(|tx| {
+                Ok(v3_count_missing_pass(
+                    tx,
+                    &member.scope,
+                    &view_dir,
+                    missing,
+                )?)
+            })
+            .map_err(v3)?;
+        let step = match step {
+            V3Step::Due { recorded } => {
+                #[cfg(test)]
+                test_hook(storage, "v3-before-recheck");
+                registry
+                    .with_barrier(|tx| {
+                        Ok(v3_recheck_and_mark_evicting(
+                            tx,
+                            storage,
+                            &member.scope,
+                            &view_dir,
+                            recorded,
+                        )?)
+                    })
+                    .map_err(v3)?
+            }
+            other => other,
+        };
+        match step {
+            V3Step::Evicting => {
+                let bytes = retention_tree_bytes(&view_dir, deadline).ok();
+                v3_finish_eviction(storage, &mut registry, &member.scope, &view_dir)?;
+                record_v3_removal(&mut domain, bytes);
+            }
+            V3Step::Retained if missing => domain.skipped_protected += 1,
+            V3Step::Retained | V3Step::Present | V3Step::Gone | V3Step::Due { .. } => {}
+        }
+    }
+    // Every collector pass ends with a covering measurement, so committed
+    // usage also reflects files removed by anything else since the last one.
+    registry.covering_measurement().map_err(v3)?;
+    report.examined += domain.examined;
+    report.skipped_live += domain.skipped_live;
+    report.skipped_recent += domain.skipped_recent;
+    report.skipped_mount_mismatch += domain.skipped_mount_mismatch;
+    report.skipped_protected += domain.skipped_protected;
+    report.skipped_unknown += domain.skipped_unknown;
+    report.removed_roots += domain.removed_roots;
+    report.removed_bytes += domain.removed_bytes;
+    report.unmeasured_removed_roots += domain.unmeasured_removed_roots;
+    report
+        .domains
+        .entry("views/v3".to_owned())
+        .or_default()
+        .add(&domain);
+    Ok(())
+}
+
+fn record_v3_removal(domain: &mut DomainReport, bytes: Option<u64>) {
+    domain.removed_roots += 1;
+    match bytes {
+        Some(bytes) => domain.removed_bytes += bytes,
+        None => domain.unmeasured_removed_roots += 1,
+    }
 }
 
 #[cfg(test)]
@@ -6924,4 +7392,650 @@ fn cache_key_present(storage: &Path, key: &str, deadline: Instant) -> io::Result
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod v3_collector_tests {
+    use super::*;
+    use crate::blob_store::v2::{FamilyKey, FamilyPlane};
+    use crate::blob_store::v3::{self, RegistryWriter, ReservationLock};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const FAMILY: &str = "0123456789abcdef";
+
+    fn plane_key() -> FamilyKey {
+        FamilyKey::new(FamilyPlane::Semantic, [9; 32])
+    }
+
+    /// Creates the v3 registry in a child process. Publication reads a
+    /// process-global free-space override that the `blob_store::v3` tests
+    /// change under their own lock; a child keeps these tests out of that.
+    fn seed(storage: &Path, members: &[(&str, &str, Option<&Path>)]) {
+        let spec = members
+            .iter()
+            .map(|(scope, kind, root)| {
+                format!(
+                    "{scope}\t{kind}\t{}",
+                    root.map(|root| root.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage_retention::v3_collector_tests::seed_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("AFT_V3_COLLECTOR_STORAGE", storage)
+            .env("AFT_V3_COLLECTOR_MEMBERS", spec)
+            .env("RUSTC_WRAPPER", "")
+            .env("CARGO_BUILD_RUSTC_WRAPPER", "")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            storage
+                .join("blobs/v3")
+                .join(FAMILY)
+                .join("members.sqlite")
+                .exists(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn seed_child() {
+        let Some(storage) = std::env::var_os("AFT_V3_COLLECTOR_STORAGE") else {
+            return;
+        };
+        let storage = PathBuf::from(storage);
+        let members = std::env::var("AFT_V3_COLLECTOR_MEMBERS").unwrap();
+        v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
+        v3::publish(&storage, FAMILY, 1 << 20, None, |publication| {
+            for line in members.lines() {
+                let mut fields = line.split('\t');
+                let scope = fields.next().unwrap();
+                let kind = fields.next().unwrap();
+                let root = fields.next().filter(|root| !root.is_empty()).map(Path::new);
+                publication.registry.register_member(scope, kind, root)?;
+            }
+            publication.put(&plane_key(), b"v3 plane payload", 1)
+        })
+        .unwrap();
+    }
+
+    fn with_registry<T>(
+        storage: &Path,
+        body: impl FnOnce(&rusqlite::Transaction<'_>) -> v3::Result<T>,
+    ) -> T {
+        let lock = ReservationLock::acquire(storage).unwrap();
+        let mut registry = RegistryWriter::open_existing(storage, FAMILY, &lock).unwrap();
+        registry.with_barrier(body).unwrap()
+    }
+
+    fn member_scopes(storage: &Path) -> Vec<String> {
+        with_registry(storage, |tx| {
+            Ok(tx
+                .prepare("SELECT scope FROM members ORDER BY scope")?
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?)
+        })
+    }
+
+    fn missing_sweeps(storage: &Path, scope: &str) -> i64 {
+        with_registry(storage, |tx| {
+            Ok(tx.query_row(
+                "SELECT missing_sweeps FROM members WHERE scope=?1",
+                [scope],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
+    fn view_dir(storage: &Path, scope: &str) -> PathBuf {
+        v3::view_dir(storage, FAMILY, scope).unwrap()
+    }
+
+    /// A checkout root with a durable binding old enough to be past its
+    /// grace and with the volume evidence the mount guard needs.
+    fn bound_root(temp: &Path, storage: &Path, name: &str) -> PathBuf {
+        let root = temp.join("roots").join(name);
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let scope = crate::path_identity::project_scope_key(&root);
+        record_bind(storage, &root, &scope).unwrap();
+        let record = storage.join(format!("retention/roots/{scope}.json"));
+        let mut binding: Binding = read_json(&record).unwrap();
+        binding.last_bound_ms = 0;
+        atomic_json(&record, &binding).unwrap();
+        root
+    }
+
+    fn pass(storage: &Path) -> SweepReport {
+        let mut report = SweepReport::default();
+        collect_one_v3_family(storage, &|| false, &mut report).unwrap();
+        assert!(report.errors.is_empty(), "{report:?}");
+        report
+    }
+
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    fn write_pin(view_dir: &Path, generation: &str, owner: crate::pins::PinOwner) -> PathBuf {
+        let (metadata_path, keys_path) = crate::pins::pin_paths(view_dir, generation);
+        fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        let metadata = crate::pins::PinMetadata {
+            family: FAMILY.to_owned(),
+            view: view_dir.file_name().unwrap().to_string_lossy().into_owned(),
+            generation: generation.to_owned(),
+            owner,
+            created_at: crate::pins::now_ms(),
+            renewed_at: crate::pins::now_ms(),
+        };
+        fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        fs::write(&keys_path, b"").unwrap();
+        metadata_path
+    }
+
+    fn live_owner() -> crate::pins::PinOwner {
+        let pid = std::process::id();
+        crate::pins::PinOwner {
+            pid,
+            start_time: crate::root_cache::process_start_time_ms(pid).unwrap(),
+        }
+    }
+
+    /// A read marker that names a process that has exited.
+    fn dead_read_marker(view_dir: &Path, generation: &str) -> PathBuf {
+        let marker = crate::root_cache::ReadMarker::create(view_dir, generation).unwrap();
+        let path = marker.path().to_path_buf();
+        let mut metadata = marker.metadata().clone();
+        std::mem::forget(marker);
+        metadata.pid = dead_pid();
+        fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        path
+    }
+
+    fn fill_view_dir(view_dir: &Path) {
+        fs::create_dir_all(view_dir).unwrap();
+        fs::write(view_dir.join("data.bin"), vec![7u8; 64 * 1024]).unwrap();
+    }
+
+    #[test]
+    fn v3_collector_applies_the_missing_root_rule_to_view_members_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        fs::create_dir_all(&storage).unwrap();
+        // Scopes are visited in this (sorted) order; the late-pin member
+        // comes first so the test hook below pins it before anything else.
+        let names = [
+            "a-late-pin",
+            "base",
+            "dead-owner",
+            "eligible",
+            "live-reader",
+            "live-session",
+            "one-pass",
+            "reappeared",
+            "recent",
+        ];
+        let roots = names
+            .iter()
+            .map(|name| (*name, bound_root(&temp, &storage, name)))
+            .collect::<HashMap<_, _>>();
+        let mut members = names
+            .iter()
+            .map(|name| {
+                let kind = if *name == "base" { "base" } else { "view" };
+                (*name, kind, Some(roots[name].as_path()))
+            })
+            .collect::<Vec<_>>();
+        members.push(("no-root", "view", None));
+        seed(&storage, &members);
+        // Every member was bound long ago except "recent".
+        with_registry(&storage, |tx| {
+            tx.execute(
+                "UPDATE members SET last_bind_ms=0 WHERE scope!='recent'",
+                [],
+            )?;
+            Ok(())
+        });
+        for (name, _, _) in &members {
+            fill_view_dir(&view_dir(&storage, name));
+        }
+        let owner = live_owner();
+        let dead = dead_pid();
+        with_registry(&storage, |tx| {
+            tx.execute(
+                "INSERT INTO view_sessions VALUES('live',?1,?2,?3,0),('dead','dead-owner',?4,?3,0)",
+                rusqlite::params!["live-session", owner.pid, owner.start_time, dead],
+            )?;
+            Ok(())
+        });
+        let _live_marker =
+            crate::root_cache::ReadMarker::create(&view_dir(&storage, "live-reader"), "g1")
+                .unwrap();
+        let dead_pin = write_pin(
+            &view_dir(&storage, "dead-owner"),
+            "g1",
+            crate::pins::PinOwner {
+                pid: dead,
+                start_time: 1,
+            },
+        );
+        let dead_marker = dead_read_marker(&view_dir(&storage, "dead-owner"), "g1");
+        let late_pin_dir = view_dir(&storage, "a-late-pin");
+        let pinned = Arc::new(AtomicBool::new(false));
+        let hook_pinned = Arc::clone(&pinned);
+        let _hook = observe_test_hook(
+            &storage,
+            Arc::new(move |step| {
+                if step == "v3-before-recheck" && !hook_pinned.swap(true, Ordering::SeqCst) {
+                    write_pin(&late_pin_dir, "late", live_owner());
+                }
+            }),
+        );
+        for name in names.iter().filter(|name| **name != "one-pass") {
+            fs::remove_dir(&roots[name]).unwrap();
+        }
+
+        assert_eq!(crate::views::registry::MISSING_ROOT_SWEEPS, 2);
+        let first = pass(&storage);
+        assert_eq!(first.removed_roots, 0, "{first:?}");
+        assert_eq!(member_scopes(&storage).len(), members.len());
+        // Dead-owner protection is reclaimed and does not hold the count back.
+        assert_eq!(missing_sweeps(&storage, "dead-owner"), 1);
+        assert!(!dead_pin.exists());
+        assert!(!dead_marker.exists());
+        assert_eq!(
+            with_registry(&storage, |tx| Ok(tx.query_row(
+                "SELECT COUNT(*) FROM view_sessions WHERE scope='dead-owner'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?)),
+            0
+        );
+        assert_eq!(missing_sweeps(&storage, "reappeared"), 1);
+        assert_eq!(missing_sweeps(&storage, "live-session"), 0);
+        assert_eq!(missing_sweeps(&storage, "live-reader"), 0);
+        assert_eq!(missing_sweeps(&storage, "recent"), 0);
+        assert!(!pinned.load(Ordering::SeqCst));
+
+        fs::create_dir_all(&roots["reappeared"]).unwrap();
+        fs::remove_dir(&roots["one-pass"]).unwrap();
+        let second = pass(&storage);
+        assert!(pinned.load(Ordering::SeqCst), "the recheck hook never ran");
+        assert_eq!(second.removed_roots, 2, "{second:?}");
+        assert_eq!(second.removed_bytes, 2 * 64 * 1024, "{second:?}");
+        assert_eq!(
+            member_scopes(&storage),
+            [
+                "a-late-pin",
+                "base",
+                "live-reader",
+                "live-session",
+                "no-root",
+                "one-pass",
+                "reappeared",
+                "recent"
+            ]
+        );
+        for removed in ["dead-owner", "eligible"] {
+            assert!(!view_dir(&storage, removed).exists(), "{removed}");
+        }
+        for kept in member_scopes(&storage) {
+            assert!(
+                view_dir(&storage, &kept).join("data.bin").exists(),
+                "{kept}"
+            );
+        }
+        assert_eq!(missing_sweeps(&storage, "a-late-pin"), 0);
+        assert_eq!(missing_sweeps(&storage, "reappeared"), 0);
+        assert_eq!(missing_sweeps(&storage, "one-pass"), 1);
+        assert_eq!(missing_sweeps(&storage, "base"), 0);
+        // Plane rows are not the collector's to delete.
+        assert_eq!(
+            v3::PlaneReader::open_existing(&storage, FAMILY, FamilyPlane::Semantic)
+                .unwrap()
+                .get(&plane_key())
+                .unwrap()
+                .as_deref(),
+            Some(&b"v3 plane payload"[..])
+        );
+    }
+
+    #[test]
+    fn v3_eviction_interrupted_after_its_evicting_commit_is_finished_next_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        fs::create_dir_all(&storage).unwrap();
+        let root = bound_root(&temp, &storage, "crash");
+        seed(&storage, &[("crash", "view", Some(&root))]);
+        with_registry(&storage, |tx| {
+            tx.execute("UPDATE members SET last_bind_ms=0", [])?;
+            Ok(())
+        });
+        fill_view_dir(&view_dir(&storage, "crash"));
+        fs::remove_dir(&root).unwrap();
+        pass(&storage);
+        {
+            let _hook = observe_test_hook(
+                &storage,
+                Arc::new(|step| {
+                    if step == "v3-evicting-committed" {
+                        panic!("simulated crash after the evicting commit");
+                    }
+                }),
+            );
+            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut report = SweepReport::default();
+                let _ = collect_one_v3_family(&storage, &|| false, &mut report);
+            }));
+            assert!(crashed.is_err());
+        }
+        let state: String = with_registry(&storage, |tx| {
+            Ok(
+                tx.query_row("SELECT state FROM members WHERE scope='crash'", [], |row| {
+                    row.get(0)
+                })?,
+            )
+        });
+        assert_eq!(state, crate::views::registry::STATE_EVICTING);
+        assert!(view_dir(&storage, "crash").join("data.bin").exists());
+        let finished = pass(&storage);
+        assert_eq!(finished.removed_roots, 1, "{finished:?}");
+        assert!(member_scopes(&storage).is_empty());
+        assert!(!view_dir(&storage, "crash").exists());
+    }
+
+    /// The st_blocks size of every file below `path`, computed here rather
+    /// than through the accounting code under test.
+    #[cfg(unix)]
+    fn inventory(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                if metadata.is_dir() {
+                    inventory(&path)
+                } else {
+                    metadata.blocks() * 512
+                }
+            })
+            .sum()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collecting_a_view_member_lowers_committed_usage_by_its_allocated_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        fs::create_dir_all(&storage).unwrap();
+        let root = bound_root(&temp, &storage, "accounted");
+        seed(&storage, &[("accounted", "view", Some(&root))]);
+        with_registry(&storage, |tx| {
+            tx.execute("UPDATE members SET last_bind_ms=0", [])?;
+            Ok(())
+        });
+        let member = view_dir(&storage, "accounted");
+        fs::create_dir_all(member.join("pins")).unwrap();
+        fs::create_dir_all(member.join("readers")).unwrap();
+        for (index, size) in [300 * 1024, 4096, 17].into_iter().enumerate() {
+            fs::write(member.join(format!("file-{index}")), vec![1u8; size]).unwrap();
+        }
+        fs::remove_dir(&root).unwrap();
+        // The first pass only counts the missing root.
+        pass(&storage);
+        let family = storage.join("blobs/v3").join(FAMILY);
+        let usage = || {
+            v3::LedgerReader::open_existing(&storage, FAMILY)
+                .unwrap()
+                .accounting()
+                .unwrap()
+                .usage()
+        };
+        let before = usage();
+        assert_eq!(before, inventory(&family));
+        let member_bytes = inventory(&member);
+        assert!(member_bytes >= 300 * 1024);
+        let collected = pass(&storage);
+        assert_eq!(collected.removed_roots, 1, "{collected:?}");
+        assert!(!member.exists());
+        let after = usage();
+        assert_eq!(after, inventory(&family));
+        assert_eq!(before - after, member_bytes);
+    }
+
+    /// `reader-floor.json` as the `aft` binary built from tag v0.60.0 writes
+    /// it on a fresh storage root: one configure, captured byte for byte from
+    /// a build of commit 988f4f3e52b9.
+    const V0_60_0_FLOOR: &str = "{\n  \"floor_schema\": 1,\n  \"stores\": {\n    \"aft.db\": 18,\n    \"artifact_owner\": 1,\n    \"backup_meta\": 5,\n    \"bash_task\": 7,\n    \"callgraph\": 1,\n    \"search\": 4,\n    \"semantic\": 7,\n    \"semantic_segment\": 1,\n    \"symbols\": 3,\n    \"symbols_extraction\": 4\n  }\n}\n";
+
+    fn walkdir_for_test(path: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(path).into_iter().flatten().flatten() {
+            out.push(entry.path());
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                out.extend(walkdir_for_test(&entry.path()));
+            }
+        }
+        out
+    }
+
+    /// An OpenAI-compatible embedding endpoint on loopback that answers
+    /// every input with the same vector, so the semantic runtime loads with
+    /// no network. Returns its base URL; the listener lives for the process.
+    fn fixed_vector_embedder() -> String {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    let mut buf = [0; 8192];
+                    let (start, length) = loop {
+                        let Ok(n) = stream.read(&mut buf) else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&buf[..n]);
+                        if let Some(end) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
+                            let length: usize = String::from_utf8_lossy(&bytes[..end])
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if bytes.len() >= end + 4 + length {
+                                break (end + 4, length);
+                            }
+                        }
+                    };
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&bytes[start..start + length]).unwrap_or_default();
+                    let inputs = body["input"].as_array().map_or(1, Vec::len);
+                    let data = (0..inputs)
+                        .map(|index| {
+                            serde_json::json!({"index": index, "embedding": [0.25, 0.5, 0.75, 1.0]})
+                        })
+                        .collect::<Vec<_>>();
+                    let body = serde_json::json!({ "data": data }).to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        base_url
+    }
+
+    struct NoProcesses;
+    impl crate::migration::prune_legacy::ProcessCensus for NoProcesses {
+        fn take(&self) -> Result<Vec<crate::migration::prune_legacy::CensusFinding>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Every path this build runs for ordinary users, with views off and on,
+    /// leaves a storage root that v0.60.0 prepared without any v3 file and
+    /// with its reader floor unchanged: configure, the deferred configure
+    /// work, an enforcement pass, two retention passes (which include the v3
+    /// collector) and both modes of `aft cache prune-legacy`.
+    #[test]
+    fn no_production_path_writes_v3_over_a_v0_60_0_floor() {
+        use crate::migration::prune_legacy::{prune_legacy, PruneOptions};
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        let project = temp.join("project");
+        fs::create_dir_all(&storage).unwrap();
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("src/lib.rs"), "pub fn marker() {}\n").unwrap();
+        for args in [
+            &["init", "--quiet"][..],
+            &["add", "."],
+            &[
+                "-c",
+                "user.name=Retention Tests",
+                "-c",
+                "user.email=retention@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ],
+        ] {
+            let mut command = std::process::Command::new("git");
+            crate::test_env::apply_hermetic_git_env(command.current_dir(&project));
+            let output = command.args(args).output().unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        }
+        fs::write(storage.join("reader-floor.json"), V0_60_0_FLOOR).unwrap();
+        let embedder = fixed_vector_embedder();
+        for views in [false, true] {
+            let ctx = crate::context::AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    storage_dir: Some(storage.clone()),
+                    ..crate::config::Config::default()
+                },
+            );
+            let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+                "id": "cfg",
+                "command": "configure",
+                "project_root": project,
+                "storage_dir": storage,
+                "harness": "opencode",
+                "config": [{
+                    "tier": "user",
+                    "source": "/u/aft.jsonc",
+                    "doc": serde_json::json!({
+                        "views": { "enabled": views },
+                        "indexes": { "trigram": false, "semantic": true, "callgraph": true },
+                        "semantic": {
+                            "backend": "openai_compatible",
+                            "model": "fixed-vector",
+                            "base_url": embedder,
+                            "timeout_ms": 5_000
+                        }
+                    }).to_string(),
+                }],
+            }))
+            .unwrap();
+            let response = crate::commands::configure::handle_configure(&request, &ctx);
+            assert!(response.success, "{}", response.data);
+            crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+            if views {
+                // The checkout's semantic runtime owns the v2 family registry;
+                // wait for it to load as the binary's drain loop would.
+                let deadline = Instant::now() + Duration::from_secs(120);
+                let registry = loop {
+                    crate::runtime_drain::drain_semantic_index_events(&ctx);
+                    if let Some(registry) = ctx.checkout_view_registry() {
+                        break registry;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the views-on runtime never loaded: {:#?}",
+                        walkdir_for_test(&storage)
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                };
+                crate::views::eviction::enforce(&registry, Default::default()).unwrap();
+            }
+        }
+        for _ in 0..2 {
+            let report = run_pass_with_budget(&storage, &|| false, &Instant::now, PASS_BUDGET);
+            assert!(report.timings_ms.contains_key("blobs_v3"), "{report:?}");
+        }
+        for yes in [false, true] {
+            let mut out = Vec::new();
+            prune_legacy(
+                &storage,
+                &PruneOptions {
+                    yes,
+                    now: std::time::SystemTime::now(),
+                },
+                &NoProcesses,
+                None,
+                &mut out,
+            )
+            .unwrap();
+            assert!(!out.is_empty());
+        }
+        assert!(storage.join("blobs/v2").exists(), "views-on never ran");
+        assert!(!storage.join("blobs/v3").exists());
+        assert_eq!(
+            fs::read_to_string(storage.join("reader-floor.json")).unwrap(),
+            V0_60_0_FLOOR
+        );
+    }
+
+    #[test]
+    fn v3_collector_never_creates_a_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path();
+        // A storage root without blobs/v3 gets nothing at all.
+        pass(storage);
+        assert!(!storage.join("blobs/v3").exists());
+        assert!(!storage.join("retention/cursors/families-v3.json").exists());
+        // A family directory without a registry (here, only a member tree)
+        // is skipped before the reservation lock is taken.
+        let member = view_dir(storage, "orphan");
+        fill_view_dir(&member);
+        pass(storage);
+        pass(storage);
+        assert!(!storage
+            .join("blobs/v3")
+            .join(FAMILY)
+            .join("members.sqlite")
+            .exists());
+        assert!(!storage.join("blobs/v3/reservations.lock").exists());
+        assert!(member.join("data.bin").exists());
+    }
 }
