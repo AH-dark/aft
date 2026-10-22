@@ -20,7 +20,7 @@ export const TERMINAL_SCAN_INCOMPLETE_TEXT =
  * `commands/bash_watch.rs`; a bridge test keeps the two identical.
  */
 export const REGEX_WINDOW_SCAN_INCOMPLETE_TEXT =
-  "The pattern scan is incomplete: no match was found, but output older than the 64 KiB regex scan window was dropped while scanning, so a regex match longer than the window cannot be ruled out. A literal (string) pattern is scanned exactly at any length.";
+  "No match found, but the scan is incomplete: a regex match longer than 64 KiB may have been missed. Literal patterns are always scanned in full.";
 
 /**
  * Decodes one stream's raw pages without turning a UTF-8 character split

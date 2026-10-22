@@ -44,7 +44,7 @@ const REGEX_SCAN_CONTEXT_BYTES: usize = 4;
 /// Added to an exited task's no-match result when a regex scan had to drop
 /// older output from its window, so the non-match is not a complete answer.
 /// Literal patterns never set it: their kept tail is exact.
-const REGEX_WINDOW_SCAN_INCOMPLETE: &str = "The pattern scan is incomplete: no match was found, but output older than the 64 KiB regex scan window was dropped while scanning, so a regex match longer than the window cannot be ruled out. A literal (string) pattern is scanned exactly at any length.";
+const REGEX_WINDOW_SCAN_INCOMPLETE: &str = "No match found, but the scan is incomplete: a regex match longer than 64 KiB may have been missed. Literal patterns are always scanned in full.";
 /// Most lines of a still-running command's output shown to a worker.
 const WORKER_OUTPUT_TAIL_LINES: usize = 20;
 /// Output preview a watch result carries for a finished task.
