@@ -9658,6 +9658,7 @@ impl BgTaskRegistry {
                         if paused {
                             let mut db = DeferredDbWrites::new(self, &task);
                             let mut state = task.lock_state().map_err(|_| "task lock poisoned")?;
+                            // Saved after the stop's terminal record: a replay reading between the two writes misses this notice until its next replay.
                             state.metadata.cancelled_call_unannounced = true;
                             self.persist_task_locked(&task, &state.metadata, &mut db)
                                 .map_err(|e| e.to_string())?;
