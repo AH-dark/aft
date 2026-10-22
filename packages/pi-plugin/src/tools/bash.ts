@@ -1400,7 +1400,12 @@ type BashWaitPattern = { kind: "substring"; value: string } | { kind: "regex"; s
 type OutputStream = "output" | "stderr";
 type OutputCursor = { output: number; stderr: number };
 type OutputScanChunk = { stream: OutputStream; text: string; baseOffset: number };
-type OutputScanState = Record<OutputStream, { text: string; baseOffset: number }>;
+/**
+ * One stream's scan buffer. `context` is the character just before a trimmed
+ * regex window: it is sent with the text but the search starts after it, so
+ * the trimmed start never looks like the start of the output.
+ */
+type OutputScanState = Record<OutputStream, { text: string; baseOffset: number; context: string }>;
 
 async function bashStatusSnapshot(
   bridge: AftProjectTransport,
@@ -1466,8 +1471,8 @@ async function waitForBashStatus(
   // One decoder per stream, so a character split across two pages decodes whole.
   const decoders = { output: new BashOutputPageDecoder(), stderr: new BashOutputPageDecoder() };
   const scanState: OutputScanState = {
-    output: { text: "", baseOffset: 0 },
-    stderr: { text: "", baseOffset: 0 },
+    output: { text: "", baseOffset: 0, context: "" },
+    stderr: { text: "", baseOffset: 0, context: "" },
   };
   // Stream byte offset of a regex match held back at a page edge, per stream
   // (see the scan below).
@@ -1557,13 +1562,20 @@ async function waitForBashStatus(
             if (state.text.length === 0) state.baseOffset = chunk.baseOffset;
             state.text += chunk.text;
             if (waitFor.kind === "regex") {
-              const trimmed = trimWaitScanBuffer(state.text, state.baseOffset, waitFor, held);
+              const trimmed = trimWaitScanBuffer(
+                state.text,
+                state.baseOffset,
+                waitFor,
+                held,
+                state.context,
+              );
               if (trimmed.baseOffset !== state.baseOffset) regexWindowDropped = true;
               state.text = trimmed.text;
               state.baseOffset = trimmed.baseOffset;
+              state.context = trimmed.context;
             }
           }
-          const match = await findWaitMatch(bridge, extCtx, state.text, waitFor);
+          const match = await findWaitMatch(bridge, extCtx, state.text, waitFor, state.context);
           if (match && more && regexMatchReachesBufferEnd(waitFor, match, state.text)) {
             // A page ends where the read stopped, not where the output ends.
             // A regex match reaching the end of the buffer may depend on what
@@ -1740,6 +1752,7 @@ async function findWaitMatch(
   extCtx: ExtensionContext,
   text: string,
   pattern: BashWaitPattern,
+  context = "",
 ): Promise<WaitMatch | undefined> {
   if (pattern.kind === "substring") {
     const index = text.indexOf(pattern.value);
@@ -1747,7 +1760,7 @@ async function findWaitMatch(
       ? { text: pattern.value, byteOffset: Buffer.byteLength(text.slice(0, index), "utf8") }
       : undefined;
   }
-  return await matchRegexWithBridge(bridge, extCtx, pattern.source, text);
+  return await matchRegexWithBridge(bridge, extCtx, pattern.source, text, context);
 }
 
 async function matchRegexWithBridge(
@@ -1755,20 +1768,43 @@ async function matchRegexWithBridge(
   extCtx: ExtensionContext,
   pattern: string,
   text: string,
+  context = "",
 ): Promise<WaitMatch | undefined> {
+  const start = Buffer.byteLength(context, "utf8");
   try {
-    const result = await callBashBridge(bridge, "bash_regex_match", { pattern, text }, extCtx);
+    const result = await callBashBridge(
+      bridge,
+      "bash_regex_match",
+      start === 0 ? { pattern, text } : { pattern, text: context + text, start },
+      extCtx,
+    );
     if (result.matched !== true) return undefined;
-    return {
-      text: typeof result.match_text === "string" ? result.match_text : "",
-      byteOffset: coerceMatchOffset(result.match_offset),
-    };
+    return contextRelativeMatch(result, start);
   } catch (err) {
     if (err instanceof BridgeError && err.code === "invalid_regex") {
       throw new Error(`invalid_request: invalid_regex: ${err.message}`);
     }
     throw err;
   }
+}
+
+/**
+ * A bash_regex_match reply as a match in the text after `start` bytes of
+ * context. An engine that echoes `start` searched from there. An older engine
+ * ignores `start` and searches from the beginning, so a match it reports
+ * inside the context may rest on a false start of input; it is dropped,
+ * missing a match rather than inventing one.
+ */
+function contextRelativeMatch(
+  result: Record<string, unknown>,
+  start: number,
+): WaitMatch | undefined {
+  const offset = coerceMatchOffset(result.match_offset);
+  if (offset < start) return undefined;
+  return {
+    text: typeof result.match_text === "string" ? result.match_text : "",
+    byteOffset: offset - start,
+  };
 }
 
 function coerceMatchOffset(value: unknown): number {
@@ -1786,7 +1822,8 @@ function trimWaitScanBuffer(
   baseOffset: number,
   pattern: BashWaitPattern,
   heldAt?: number,
-): { text: string; baseOffset: number } {
+  context = "",
+): { text: string; baseOffset: number; context: string } {
   let keepFrom =
     pattern.kind === "substring"
       ? substringKeepStart(text, pattern.value)
@@ -1794,12 +1831,21 @@ function trimWaitScanBuffer(
   if (heldAt !== undefined && heldAt >= baseOffset) {
     keepFrom = Math.min(keepFrom, charIndexAtByteOffset(text, heldAt - baseOffset));
   }
-  if (keepFrom <= 0) return { text, baseOffset };
+  if (keepFrom <= 0) return { text, baseOffset, context };
 
   return {
     text: text.slice(keepFrom),
     baseOffset: baseOffset + Buffer.byteLength(text.slice(0, keepFrom), "utf8"),
+    context: characterBefore(text, keepFrom),
   };
+}
+
+/** The whole character (one or two UTF-16 units) just before `index`. */
+function characterBefore(text: string, index: number): string {
+  if (index <= 0) return "";
+  const code = text.charCodeAt(index - 1);
+  const pair = code >= 0xdc00 && code <= 0xdfff && index >= 2;
+  return text.slice(pair ? index - 2 : index - 1, index);
 }
 
 /** The string index of the character that starts `byteOffset` bytes into `text`. */
@@ -1832,7 +1878,7 @@ export function __trimWaitScanBufferForTests(
   text: string,
   baseOffset: number,
   pattern: BashWaitPattern,
-): { text: string; baseOffset: number } {
+): { text: string; baseOffset: number; context: string } {
   return trimWaitScanBuffer(text, baseOffset, pattern);
 }
 

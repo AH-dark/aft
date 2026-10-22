@@ -1409,19 +1409,34 @@ describe("OpenCode bash adapter", () => {
   });
 });
 
-/** Answers bash_regex_match like the engine: a multi-line regex, the first
- * match, and its byte offset. JS RegExp stands in for Rust regex syntax. */
+/** Answers bash_regex_match like the engine: a multi-line regex searched from
+ * the optional `start` byte offset with the text before it as context (Rust's
+ * find_at), the first match, its byte offset, and `start` echoed back. JS
+ * RegExp stands in for Rust regex syntax. */
 function regexMatchLikeEngine(params: Record<string, unknown>): BridgeResponse {
   const text = String(params.text ?? "");
-  const found = new RegExp(String(params.pattern), "m").exec(text);
-  if (!found) return { success: true, matched: false };
+  const start = Number(params.start ?? 0);
+  const regex = new RegExp(String(params.pattern), "gm");
+  regex.lastIndex = Buffer.from(text).subarray(0, start).toString().length;
+  const found = regex.exec(text);
+  const echo = params.start === undefined ? {} : { start };
+  if (!found) return { success: true, matched: false, ...echo };
   return {
     success: true,
     matched: true,
     match_text: found[0],
     match_offset: Buffer.byteLength(text.slice(0, found.index)),
     match_index_chars: found.index,
+    ...echo,
   };
+}
+
+/** An engine released before `start` existed: it ignores the field and
+ * searches the whole text, which then starts with the context character. */
+function regexMatchLikeOlderEngine(params: Record<string, unknown>): BridgeResponse {
+  const { start: _ignored, ...rest } = params;
+  const { start: _echo, ...reply } = regexMatchLikeEngine(rest) as Record<string, unknown>;
+  return reply as BridgeResponse;
 }
 
 describe("bash_status tool", () => {
@@ -1952,9 +1967,13 @@ describe("bash_status tool", () => {
   /** Serves an exited task's stdout the way bash_status pages it: at most
    * 64 KiB per call from the requested offset, with output_has_more. Regex
    * matching stands in for the engine's multi-line regex with a JS RegExp. */
-  function pagedExitedTask(stdout: Buffer, onPage?: () => void) {
+  function pagedExitedTask(
+    stdout: Buffer,
+    onPage?: () => void,
+    regexEngine: (params: Record<string, unknown>) => BridgeResponse = regexMatchLikeEngine,
+  ) {
     return (cmd: string, params: Record<string, unknown>): BridgeResponse => {
-      if (cmd === "bash_regex_match") return regexMatchLikeEngine(params);
+      if (cmd === "bash_regex_match") return regexEngine(params);
       if (cmd !== "bash_status") return { success: true };
       onPage?.();
       const offset = Number(params.output_offset ?? 0);
@@ -1983,8 +2002,12 @@ describe("bash_status tool", () => {
     ]);
   }
 
-  async function watchExitedRegex(stdout: Buffer, regex: string): Promise<string> {
-    const { watchTool } = makeCtx(pagedExitedTask(stdout));
+  async function watchExitedRegex(
+    stdout: Buffer,
+    regex: string,
+    regexEngine?: (params: Record<string, unknown>) => BridgeResponse,
+  ): Promise<string> {
+    const { watchTool } = makeCtx(pagedExitedTask(stdout, undefined, regexEngine));
     return await watchTool.execute(
       { taskId: "bash-paged-regex", pattern: { regex } },
       createMockSdkContext(),
@@ -2043,6 +2066,43 @@ describe("bash_status tool", () => {
     );
     expect(literal).toContain("task exited (completed, exit 0).");
     expect(literal).not.toContain("incomplete");
+  });
+
+  /** Two full 64 KiB pages and a tail: `before` ends the first page and the
+   * second starts with `head`. Scanning the second page trims the window to
+   * start exactly at `head`, with `before` as the only character before it. */
+  function trimmedStart(before: string, head: string): Buffer {
+    return Buffer.concat([
+      Buffer.alloc(64 * 1024 - 1, "x"),
+      Buffer.from(before + head),
+      Buffer.alloc(64 * 1024 - Buffer.byteLength(head), "y"),
+      Buffer.from("tail\n"),
+    ]);
+  }
+
+  test("a line anchor at a trimmed window start sees the real preceding character", async () => {
+    const afterX = await watchExitedRegex(trimmedStart("x", "READY"), "^READY");
+    expect(afterX).not.toContain("matched");
+    const afterNewline = await watchExitedRegex(trimmedStart("\n", "READY"), "^READY");
+    expect(afterNewline).toContain('matched "READY" in stdout at offset 65536');
+  });
+
+  test("a word boundary at a trimmed window start sees the real preceding character", async () => {
+    const afterX = await watchExitedRegex(trimmedStart("x", "READY"), "\\bREADY");
+    expect(afterX).not.toContain("matched");
+    const afterSpace = await watchExitedRegex(trimmedStart(" ", "READY"), "\\bREADY");
+    expect(afterSpace).toContain('matched "READY" in stdout at offset 65536');
+  });
+
+  test("an older engine that ignores start cannot match on the context character", async () => {
+    // The real output has "x" after 64 KiB of "x", so ^xREADY is no match.
+    // An engine that ignores `start` sees the context "x" as the start of input.
+    const result = await watchExitedRegex(
+      trimmedStart("x", "READY"),
+      "^xREADY",
+      regexMatchLikeOlderEngine,
+    );
+    expect(result).not.toContain("matched");
   });
 
   test("a regex match straddling two pages is found once at its offset", async () => {
