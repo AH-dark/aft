@@ -2409,7 +2409,7 @@ fn refresh_writer_available(root: &RefreshRoot, fallback: bool) -> std::io::Resu
     }
 }
 
-fn refresh_lease_release_event(event: &notify::Event, lease: &Path) -> bool {
+pub(crate) fn refresh_lease_release_event(event: &notify::Event, lease: &Path) -> bool {
     use notify::{event::ModifyKind, EventKind};
     let named_release = matches!(
         event.kind,
@@ -2435,13 +2435,16 @@ fn refresh_lease_release_event(event: &notify::Event, lease: &Path) -> bool {
 /// block another thread's file I/O forever (see the Windows
 /// `DirectoryWatcher`). macOS and Linux keep notify's watcher.
 #[cfg(not(windows))]
-type ReadinessWatcher = notify::RecommendedWatcher;
+pub(crate) type ReadinessWatcher = notify::RecommendedWatcher;
 #[cfg(windows)]
-type ReadinessWatcher = ForwardingDirectoryWatcher;
+pub(crate) type ReadinessWatcher = ForwardingDirectoryWatcher;
 
 /// Watches `dir`, without its subdirectories, and hands every event to
 /// `handler` until the returned watcher is dropped.
-fn watch_readiness_directory<F>(dir: &Path, handler: F) -> notify::Result<ReadinessWatcher>
+pub(crate) fn watch_readiness_directory<F>(
+    dir: &Path,
+    handler: F,
+) -> notify::Result<ReadinessWatcher>
 where
     F: FnMut(notify::Result<notify::Event>) + Send + 'static,
 {
@@ -2463,7 +2466,7 @@ where
 /// own drains that channel into the callback, as notify's watcher thread
 /// called it directly.
 #[cfg(windows)]
-struct ForwardingDirectoryWatcher {
+pub(crate) struct ForwardingDirectoryWatcher {
     watcher: Option<crate::watcher_backend::DirectoryWatcher>,
     forwarder: Option<std::thread::JoinHandle<()>>,
 }

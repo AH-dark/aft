@@ -763,6 +763,10 @@ impl InspectCache {
             .is_some_and(|retry_at| Instant::now() >= retry_at)
     }
 
+    pub(super) fn waiting_for_writer(&self) -> bool {
+        self.writer_retry_at.is_some()
+    }
+
     fn refresh_read_marker(&self) -> Result<(), InspectCacheError> {
         if let Some(marker) = self.read_marker.as_ref() {
             marker.touch_if_due()?;
