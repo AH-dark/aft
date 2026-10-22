@@ -7197,6 +7197,268 @@ async fn a_bind_racing_a_saved_tasks_stop_gets_its_notices() {
     assert_project_told_of_the_stop_once(&project, &task_id);
 }
 
+/// What the threads of a stress round that has not finished are doing.
+struct RoundSnapshot {
+    /// Which of the shared task's main locks are held, and what each
+    /// relevant thread is blocked in, by syscall and (for a lock wait) by
+    /// the lock's name.
+    report: String,
+    /// A round thread is in a syscall other than a lock wait (on the build
+    /// servers, typically an `fsync` of a task record that is slow under
+    /// load, made while holding the task's state lock), or a background-task
+    /// thread is in a disk syscall: the round may still be making progress.
+    /// Always true where threads cannot be inspected.
+    progressing: bool,
+}
+
+/// Disk syscalls (read, write, open, openat, fsync, fdatasync, rename,
+/// renameat2, unlink, unlinkat, newfstatat, getdents64, ftruncate) by number.
+#[cfg(target_arch = "x86_64")]
+const DISK_SYSCALLS: &[&str] = &[
+    "0", "1", "2", "257", "74", "75", "82", "316", "87", "263", "262", "217", "77",
+];
+#[cfg(target_arch = "aarch64")]
+const DISK_SYSCALLS: &[&str] = &[
+    "63", "64", "56", "82", "83", "38", "276", "35", "79", "61", "46",
+];
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const DISK_SYSCALLS: &[&str] = &[];
+
+/// Snapshot the round's threads. On Linux, a thread blocked on a std mutex
+/// or condvar waits in `futex` (syscall 202 on x86_64, 98 on aarch64) with
+/// the address of that mutex or condvar as its first argument; the snapshot
+/// compares it with the named locks below and labels each waiter it matches.
+fn round_snapshot(
+    task: &BgTask,
+    recovery: &BgTaskRegistry,
+    project: &BgTaskRegistry,
+) -> RoundSnapshot {
+    fn held<T>(lock: &Mutex<T>) -> bool {
+        matches!(lock.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+    }
+    fn addr<T>(lock: &T) -> usize {
+        lock as *const T as usize
+    }
+    let mut named: Vec<(String, usize)> = vec![
+        ("claims".into(), addr(saved_remote_task_claims())),
+        ("task.state".into(), addr(&task.state)),
+        ("task.notice_registry".into(), addr(&task.notice_registry)),
+        (
+            "task.routed".into(),
+            addr(&task.terminal_notification_routed),
+        ),
+        ("task.terminal_render".into(), addr(&task.terminal_render)),
+        ("task.terminal_at".into(), addr(&task.terminal_at)),
+        (
+            "task.completion_secrets".into(),
+            addr(&task.completion_secrets),
+        ),
+        ("task.kill_settled".into(), addr(&task.kill_settled)),
+        (
+            "task.json_writes".into(),
+            addr(&task.db_write_order.json_writes),
+        ),
+        ("task.db_pending".into(), addr(&task.db_write_order.pending)),
+        ("task.db_written".into(), addr(&task.db_write_order.written)),
+        ("db_write_orders".into(), addr(db_write_orders())),
+    ];
+    for (name, registry) in [("recovery", recovery), ("project", project)] {
+        let inner = &registry.inner;
+        named.extend([
+            (format!("{name}.tasks"), addr(&inner.tasks)),
+            (
+                format!("{name}.watchdog_tasks"),
+                addr(&inner.watchdog_tasks),
+            ),
+            (format!("{name}.cleanup_queue"), addr(&inner.cleanup_queue)),
+            (format!("{name}.completions"), addr(&inner.completions)),
+            (
+                format!("{name}.watch_registry"),
+                addr(&inner.watch_registry),
+            ),
+            (
+                format!("{name}.session_harnesses"),
+                addr(&inner.session_harnesses),
+            ),
+            (
+                format!("{name}.live_delivery_sessions"),
+                addr(&inner.live_delivery_sessions),
+            ),
+            (
+                format!("{name}.cancelled_call_tasks"),
+                addr(&inner.cancelled_call_tasks),
+            ),
+            (
+                format!("{name}.held_remote_workers"),
+                addr(&inner.held_remote_workers),
+            ),
+        ]);
+    }
+    let held_now = [
+        ("claims", held(saved_remote_task_claims())),
+        ("task.state", held(&task.state)),
+        ("task.notice_registry", held(&task.notice_registry)),
+        ("task.routed", held(&task.terminal_notification_routed)),
+        ("task.terminal_render", held(&task.terminal_render)),
+    ]
+    .into_iter()
+    .filter(|(_, held)| *held)
+    .map(|(name, _)| name)
+    .collect::<Vec<_>>();
+    let Ok(entries) = fs::read_dir("/proc/self/task") else {
+        return RoundSnapshot {
+            report: format!("held: {held_now:?}; threads cannot be inspected here"),
+            progressing: true,
+        };
+    };
+    let mut threads = Vec::new();
+    let mut progressing = false;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let comm = fs::read_to_string(dir.join("comm")).unwrap_or_default();
+        let comm = comm.trim();
+        let syscall = fs::read_to_string(dir.join("syscall")).unwrap_or_default();
+        let mut fields = syscall.split_whitespace();
+        let number = fields.next().unwrap_or("").to_string();
+        let lock_wait = number == "202" || number == "98";
+        let target = fields
+            .next()
+            .and_then(|arg| usize::from_str_radix(arg.trim_start_matches("0x"), 16).ok());
+        let lock = target
+            .filter(|_| lock_wait)
+            .and_then(|target| {
+                named
+                    .iter()
+                    .find(|(_, start)| target >= *start && target < *start + 64)
+            })
+            .map(|(name, _)| name.as_str());
+        // A round thread outside a futex wait may still be making progress;
+        // so may a background-task thread (watchdog, scratch cleanup) in a
+        // disk syscall, possibly while holding a lock a round thread waits for.
+        if (comm.starts_with("stress-") && !lock_wait)
+            || (comm.starts_with("aft-bash") && DISK_SYSCALLS.contains(&number.as_str()))
+        {
+            progressing = true;
+        }
+        if lock.is_some() || comm.starts_with("stress-") {
+            let wchan = fs::read_to_string(dir.join("wchan")).unwrap_or_default();
+            threads.push(format!(
+                "{comm}: syscall {number} ({}){}",
+                wchan.trim(),
+                lock.map(|lock| format!(" waiting on {lock}"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    RoundSnapshot {
+        report: format!("held: {held_now:?}; threads: {threads:?}"),
+        progressing,
+    }
+}
+
+/// The owner's stop of a saved task that `bash.kill_scope` recovered, and
+/// the task's project registering the same task, run at the same moment on
+/// two threads, 200 times. Each round must finish (a lock-order deadlock
+/// between the two paths would hang one of them) and must queue exactly one
+/// completion for the project's session, whichever path gets there first.
+/// Both paths write the task's record while holding its state lock, and on
+/// a loaded build server one such disk sync can take several seconds; a
+/// round is therefore failed as deadlocked once it has run five seconds with
+/// its threads only waiting on locks, and otherwise after thirty.
+#[tokio::test]
+async fn concurrent_stop_and_registration_of_a_shared_task_never_deadlock() {
+    const ROUNDS: usize = 200;
+    // A round unfinished this long whose threads only wait on locks is
+    // deadlocked, and fails at once.
+    const DEADLOCK_DEADLINE: Duration = Duration::from_secs(5);
+    // A round whose threads are still doing disk I/O (slow syncs under load)
+    // gets this long in all, so a stuck round can never hang the suite.
+    const ROUND_CAP: Duration = Duration::from_secs(30);
+    for round in 0..ROUNDS {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = owner_scope(&format!("stop-registration-race-{round}"));
+        let (_daemon, _clock, task_id, _json) =
+            saved_due_draining_retry(dir.path(), &scope, u32::MAX).await;
+        let (recovered, errors) =
+            BgTaskRegistry::recover_saved_scope_tasks(dir.path(), &scope, &[]);
+        assert!(errors.is_empty(), "round {round}: {errors:?}");
+        let recovery = recovered.into_iter().next().unwrap();
+        let shared = recovery.task(&task_id).unwrap();
+        let project = registry();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let (finished, results) = std::sync::mpsc::channel::<(&str, Result<(), String>)>();
+        {
+            let (start, finished, recovery, scope) = (
+                start.clone(),
+                finished.clone(),
+                recovery.clone(),
+                scope.clone(),
+            );
+            std::thread::Builder::new()
+                .name("stress-stop".into())
+                .spawn(move || {
+                    start.wait();
+                    let result = recovery.pause_scope(&scope, true).map(|_| ());
+                    let _ = finished.send(("stop", result));
+                })
+                .unwrap();
+        }
+        {
+            let (project, storage) = (project.clone(), dir.path().to_path_buf());
+            std::thread::Builder::new()
+                .name("stress-register".into())
+                .spawn(move || {
+                    start.wait();
+                    let result = project.replay_session(&storage, "session");
+                    let _ = finished.send(("registration", result));
+                })
+                .unwrap();
+        }
+        let started = Instant::now();
+        let mut finished_paths = Vec::new();
+        while finished_paths.len() < 2 {
+            let deadline = if started.elapsed() < DEADLOCK_DEADLINE {
+                DEADLOCK_DEADLINE
+            } else {
+                // Past the deadlock deadline, keep waiting while the snapshot
+                // reports possible progress; look again each second.
+                started.elapsed() + Duration::from_secs(1)
+            };
+            match results.recv_timeout(deadline.saturating_sub(started.elapsed())) {
+                Ok((path, result)) => {
+                    result.unwrap_or_else(|error| panic!("round {round}: {path} failed: {error}"));
+                    finished_paths.push(path);
+                }
+                Err(_) => {
+                    let snapshot = round_snapshot(&shared, &recovery, &project);
+                    if !snapshot.progressing {
+                        panic!(
+                            "round {round}: DEADLOCK: a concurrent stop and project registration of one shared task did not both finish within {:?}, and their threads only wait on locks (finished: {finished_paths:?}); {}",
+                            started.elapsed(),
+                            snapshot.report
+                        );
+                    }
+                    if started.elapsed() >= ROUND_CAP {
+                        panic!(
+                            "round {round}: a concurrent stop and project registration of one shared task did not both finish within {ROUND_CAP:?} (finished: {finished_paths:?}); {}",
+                            snapshot.report
+                        );
+                    }
+                }
+            }
+        }
+        let completions = project
+            .drain_completions_for_session(Some("session"))
+            .into_iter()
+            .filter(|completion| completion.task_id == task_id)
+            .count();
+        assert_eq!(completions, 1, "round {round}: completions for {task_id}");
+        assert_paused(&project, &task_id);
+        recovery.detach();
+        project.detach();
+    }
+}
+
 /// `bash.kill_scope` recovered a saved task and holds it without a worker.
 /// The task's project then binds and registers that same task. The pause
 /// records no cancellation (as when it fails part way), so the held task must
