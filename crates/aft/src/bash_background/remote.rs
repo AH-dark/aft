@@ -2845,12 +2845,11 @@ impl BgTaskRegistry {
         if !self.record_remote_cancel(task)? {
             return self.kill(&task.task_id, &task.session_id);
         }
+        let bound = remote_kill_settle_bound();
         let state = task.state.lock().map_err(|_| "task lock poisoned")?;
         let (state, _) = task
             .kill_settled
-            .wait_timeout_while(state, Duration::from_secs(30), |s| {
-                !s.metadata.is_terminal()
-            })
+            .wait_timeout_while(state, bound, |s| !s.metadata.is_terminal())
             .map_err(|_| "task lock poisoned")?;
         if !state.metadata.is_terminal() {
             return Err(
@@ -2860,6 +2859,41 @@ impl BgTaskRegistry {
         drop(state);
         Ok(self.snapshot_with_terminal_cache(task, 8 * 1024))
     }
+}
+
+/// Longest a kill waits, after recording a remote task's cancellation, for
+/// the runner to report the task's terminal state. A runner normally confirms
+/// a cancel within a second or two. A slower one gets the "terminal pending"
+/// reply instead; the cancellation is already recorded, and the terminal still
+/// arrives later and is delivered as the task's completion.
+///
+/// The cap is small because the wait blocks the calling thread. `bash_kill`
+/// runs in the executor's mutating lane: it holds one of the executor's few
+/// general worker threads, and the mutating lane admits one job per project at
+/// a time, so the project's edits and other mutating calls queue behind the
+/// wait too. The scope-end kill also runs on an executor worker, and the
+/// abort, withdrawal and hard-kill paths wait on their own threads.
+#[cfg(unix)]
+const REMOTE_KILL_SETTLE_CAP: Duration = Duration::from_secs(5);
+
+/// Part of the request's budget left over after the wait, for building the
+/// reply and handing it back before the tool call's own deadline.
+#[cfg(unix)]
+const REMOTE_KILL_REPLY_MARGIN: Duration = Duration::from_secs(2);
+
+/// How long [`BgTaskRegistry::kill_remote_task`] may wait for the terminal
+/// state: what is left of the current request's budget minus the reply
+/// margin, and never more than [`REMOTE_KILL_SETTLE_CAP`]. A kill made
+/// outside any request (no budget installed) waits for the cap alone.
+#[cfg(unix)]
+fn remote_kill_settle_bound() -> Duration {
+    crate::bounded_io::current().map_or(REMOTE_KILL_SETTLE_CAP, |budget| {
+        budget
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(REMOTE_KILL_REPLY_MARGIN)
+            .min(REMOTE_KILL_SETTLE_CAP)
+    })
 }
 
 #[cfg(unix)]

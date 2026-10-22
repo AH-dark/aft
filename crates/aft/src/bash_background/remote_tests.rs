@@ -1800,6 +1800,142 @@ async fn exec_remote_bash_kill_sends_cancel_and_reports_terminal() {
         .any(|(_, b)| b["method"] == "exec.cancel"));
 }
 
+const TERMINAL_PENDING: &str =
+    "remote cancellation requested; terminal pending; inspect bash_status (never rerun)";
+
+/// Start a remote task on a runner that confirms a cancel but sends the
+/// terminal only once the test releases `completion_gate`, and wait until the
+/// runner has accepted it.
+async fn start_held_terminal_task(
+    registry: &BgTaskRegistry,
+    dir: &Path,
+) -> (crate::exec_remote::wire_tests::Daemon, String) {
+    let daemon = daemon(Script::GappedCancel, "exec-remote/v1").await;
+    let task_id = start(registry, dir, daemon.connection.clone());
+    let task = registry.task(&task_id).unwrap();
+    wait_for(
+        "acceptance must be consumed before killing the task",
+        || {
+            task.state
+                .lock()
+                .unwrap()
+                .metadata
+                .remote
+                .as_ref()
+                .unwrap()
+                .job_id
+                .map(|_| ())
+        },
+    )
+    .await;
+    (daemon, task_id)
+}
+
+/// Kill `task_id` on a blocking thread, inside a request budget of `budget`
+/// when one is given, and time the call.
+async fn timed_kill(
+    registry: &BgTaskRegistry,
+    task_id: &str,
+    budget: Option<Duration>,
+) -> (Result<BgTaskSnapshot, String>, Duration) {
+    let (killing, task_id) = (registry.clone(), task_id.to_string());
+    tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        let result =
+            crate::bounded_io::with_budget(budget.map(crate::bounded_io::Budget::after), || {
+                killing.kill(&task_id, "session")
+            });
+        (result, started.elapsed())
+    })
+    .await
+    .unwrap()
+}
+
+/// The cancellation is recorded even when the kill stopped waiting: once the
+/// runner sends the terminal, the task still ends as killed.
+async fn assert_held_terminal_still_lands(
+    registry: &BgTaskRegistry,
+    daemon: &crate::exec_remote::wire_tests::Daemon,
+    task_id: &str,
+) {
+    daemon.wait_for_requests("exec.cancel", 1).await;
+    daemon.wait_for_requests("exec.attach", 1).await;
+    daemon.completion_gate.notify_one();
+    let done = terminal(registry, task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+}
+
+/// A runner that confirms the cancel but holds back the terminal must not keep
+/// a `bash_kill` past its request's budget: the kill stops waiting a reply
+/// margin before the budget ends and answers "terminal pending", instead of
+/// waiting until the caller's own deadline passes and the reply is lost.
+#[tokio::test]
+async fn exec_remote_bash_kill_with_held_terminal_replies_pending_within_request_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let (daemon, task_id) = start_held_terminal_task(&registry, dir.path()).await;
+    let budget = REMOTE_KILL_REPLY_MARGIN + Duration::from_secs(1);
+    let (result, elapsed) = timed_kill(&registry, &task_id, Some(budget)).await;
+    assert_eq!(result.unwrap_err(), TERMINAL_PENDING);
+    assert!(
+        elapsed < budget,
+        "the kill must reply before its request budget runs out: took {elapsed:?} of a {budget:?} budget"
+    );
+    assert_held_terminal_still_lands(&registry, &daemon, &task_id).await;
+}
+
+/// Without a request budget, or inside an ordinary 25-second tool call budget,
+/// the wait for a held-back terminal still stops at a small fixed cap, so a
+/// kill never holds its executor worker (and its project's other mutating
+/// calls) for long. The bound is absolute, not derived from the cap, so
+/// raising the cap toward the old 30-second wait goes red here; it leaves room
+/// above the cap for a task-record write stalled on a busy test disk.
+#[tokio::test]
+async fn exec_remote_bash_kill_with_held_terminal_stops_waiting_at_the_cap() {
+    for budget in [None, Some(Duration::from_secs(25))] {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry();
+        let (daemon, task_id) = start_held_terminal_task(&registry, dir.path()).await;
+        let (result, elapsed) = timed_kill(&registry, &task_id, budget).await;
+        assert_eq!(result.unwrap_err(), TERMINAL_PENDING);
+        assert!(
+            elapsed < Duration::from_secs(12),
+            "the kill must stop waiting at the cap (budget {budget:?}): took {elapsed:?}"
+        );
+        assert_held_terminal_still_lands(&registry, &daemon, &task_id).await;
+    }
+}
+
+/// Inside an ordinary tool call's budget, a terminal that arrives promptly is
+/// still waited for, and the kill returns the killed snapshot.
+#[tokio::test]
+async fn exec_remote_bash_kill_inside_tool_call_budget_returns_prompt_terminal() {
+    let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let task = registry.task(&task_id).unwrap();
+    wait_for(
+        "acceptance must be consumed before killing the task",
+        || {
+            task.state
+                .lock()
+                .unwrap()
+                .metadata
+                .remote
+                .as_ref()
+                .unwrap()
+                .job_id
+                .map(|_| ())
+        },
+    )
+    .await;
+    let (result, _) = timed_kill(&registry, &task_id, Some(Duration::from_secs(25))).await;
+    let done = result.unwrap();
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+    assert!(done.info.status_reason.unwrap().contains("cancel"));
+}
+
 #[tokio::test]
 async fn exec_remote_bash_continuous_output_cannot_starve_cancel() {
     let daemon = daemon(Script::Continuous, "exec-remote/v1").await;
