@@ -1695,6 +1695,13 @@ const HEALTH_METRICS_BUDGET_BYTES: usize = 12 * 1024;
 pub(super) const HEALTH_ROLLUP_TTL: Duration = Duration::from_secs(3);
 const HEALTH_RETENTION_COUNT_MAX_AGE_MS: u64 = 30_000;
 const HEALTH_ALLOCATOR_MAX_AGE_MS: u64 = 30_000;
+/// How long the health rollup carries the full memory census forward while
+/// no `memory.census` read asked for a new one. Measuring it renders an
+/// uncapped row for every actor root, and only `memory.census` reads it; the
+/// compact memory figures in the health reply are measured on every rollup.
+/// A read always asks the next rollup for a fresh census, so a client that
+/// polls sees figures one rollup old, and the census reports its own age.
+const HEALTH_MEMORY_CENSUS_INTERVAL_MS: u64 = 30_000;
 
 fn encoded_health_metrics_len(metrics: &serde_json::Map<String, Value>) -> usize {
     #[cfg(test)]
@@ -1845,7 +1852,18 @@ struct HealthDiagnosticRollup {
     generation: u64,
     stale_reason: Option<&'static str>,
     metrics: Value,
-    memory_census: Value,
+    /// The full memory census `memory.census` serves. It is measured at its
+    /// own cadence (see [`HEALTH_MEMORY_CENSUS_INTERVAL_MS`]), so a rollup may
+    /// carry forward the census an earlier rollup measured; sharing it by
+    /// `Arc` keeps that carry free.
+    memory_census: Arc<Value>,
+    /// When `memory_census` was measured, on the cache clock. `None` until
+    /// the rollup that measured it is published, which stamps it with the
+    /// publication time.
+    memory_census_at_ms: Option<u64>,
+    /// Per-step timing of the rollup that produced this snapshot.
+    #[cfg(test)]
+    tick: Value,
 }
 
 impl HealthDiagnosticRollup {
@@ -1898,7 +1916,10 @@ impl HealthDiagnosticRollup {
             generation: 0,
             stale_reason: Some("not_yet_sampled"),
             metrics,
-            memory_census: placeholder_memory_census(),
+            memory_census: Arc::new(placeholder_memory_census()),
+            memory_census_at_ms: None,
+            #[cfg(test)]
+            tick: Value::Null,
         }
     }
 }
@@ -1958,6 +1979,12 @@ pub(super) struct HealthRollupCache {
     #[cfg(test)]
     retention_count_reads: AtomicU64,
     census_rows: std::sync::Mutex<crate::commands::memory_census::CensusRootRows>,
+    /// Set by every `memory.census` read and taken by the next rollup, which
+    /// then measures a fresh census instead of carrying the last one.
+    census_requested: AtomicBool,
+    /// Full memory censuses measured by rollups.
+    #[cfg(test)]
+    census_builds: AtomicU64,
 }
 
 impl HealthRollupCache {
@@ -1980,6 +2007,9 @@ impl HealthRollupCache {
             #[cfg(test)]
             retention_count_reads: AtomicU64::new(0),
             census_rows: std::sync::Mutex::new(Default::default()),
+            census_requested: AtomicBool::new(false),
+            #[cfg(test)]
+            census_builds: AtomicU64::new(0),
         }
     }
 
@@ -2087,6 +2117,9 @@ impl HealthRollupCache {
             // different publications when a refresh races with a probe.
             rollup.generated_at_ms = Some(self.now_ms());
             rollup.generation = self.published_generation.load(Ordering::Acquire) + 1;
+            // A census this rollup measured is as old as the rollup; one it
+            // carried forward keeps the time it was measured.
+            rollup.memory_census_at_ms = rollup.memory_census_at_ms.or(rollup.generated_at_ms);
             let generation = rollup.generation;
             let rollup = Arc::new(rollup);
             let mut snapshot = self
@@ -2255,15 +2288,80 @@ impl HealthRollupCache {
     }
 
     pub(super) fn memory_census(&self) -> Value {
-        let (snapshot, age_ms) = self.snapshot();
-        let mut census = snapshot.memory_census.clone();
+        // A reader wants current figures: have the next rollup measure them.
+        self.census_requested.store(true, Ordering::Release);
+        let (snapshot, _) = self.snapshot();
+        let mut census = Value::clone(&snapshot.memory_census);
+        // The census can be older than the rollup serving it. Its age, and
+        // the ages of the measurements inside it, count from when it was
+        // measured.
+        let census_age_ms = snapshot
+            .memory_census_at_ms
+            .map(|measured| self.now_ms().saturating_sub(measured));
         if let Some(tick) = census
             .get_mut("health_rollup_tick")
             .and_then(Value::as_object_mut)
         {
-            tick.insert("age_ms".into(), json!(age_ms));
+            tick.insert("age_ms".into(), json!(census_age_ms));
+        }
+        if let Some(census_age_ms) = census_age_ms.filter(|age| *age > 0) {
+            let add_age = |age: Option<&mut Value>| {
+                if let Some(age) = age {
+                    if let Some(measured) = age.as_u64() {
+                        *age = json!(measured.saturating_add(census_age_ms));
+                    }
+                }
+            };
+            add_age(
+                census
+                    .get_mut("process")
+                    .and_then(|process| process.get_mut("allocator_observation_age_ms")),
+            );
+            if let Some(rows) = census.get_mut("roots").and_then(Value::as_object_mut) {
+                for row in rows.values_mut() {
+                    add_age(row.get_mut("memory_measured_age_ms"));
+                }
+            }
         }
         census
+    }
+
+    /// The published census, if the next rollup may carry it forward instead
+    /// of measuring a new one: it covers exactly the roots in `actor_entries`,
+    /// no read has asked for a fresh census since it was measured, and it is
+    /// younger than [`HEALTH_MEMORY_CENSUS_INTERVAL_MS`]. Takes a pending read
+    /// request, because the rollup that asks this then measures the census.
+    fn reusable_memory_census(
+        &self,
+        actor_entries: &[(ProjectRootId, Arc<AppContext>)],
+    ) -> Option<(Arc<Value>, u64)> {
+        let requested = self.census_requested.swap(false, Ordering::AcqRel);
+        let published = Arc::clone(
+            &self
+                .snapshot
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let measured_at_ms = published.memory_census_at_ms?;
+        if requested
+            || published.generation == 0
+            || self.now_ms().saturating_sub(measured_at_ms) >= HEALTH_MEMORY_CENSUS_INTERVAL_MS
+        {
+            return None;
+        }
+        // A root that was bound or dropped since must show in the census at
+        // once, not after the interval.
+        let rows = published.memory_census.get("roots")?.as_object()?;
+        let same_roots = rows.len() == actor_entries.len()
+            && actor_entries
+                .iter()
+                .all(|(root_id, _)| rows.contains_key(&root_id.as_path().display().to_string()));
+        same_roots.then(|| (Arc::clone(&published.memory_census), measured_at_ms))
+    }
+
+    #[cfg(test)]
+    fn census_builds_for_test(&self) -> u64 {
+        self.census_builds.load(Ordering::Relaxed)
     }
 }
 
@@ -2701,6 +2799,10 @@ fn build_health_diagnostic_rollup_from_actors(
         .iter()
         .map(|(_, context)| Arc::clone(context))
         .collect::<Vec<_>>();
+    // Decided before the roots are visited: a carried census needs no
+    // per-root census rows.
+    let reused_census = cache.reusable_memory_census(&actor_entries);
+    let measure_census = reused_census.is_none();
     let standing_entries = standing_health_entries(&actor_entries);
     rollup_mark!(timer, "standing roots / database open");
     let mut standing_matched = vec![false; standing_entries.len()];
@@ -2763,8 +2865,10 @@ fn build_health_diagnostic_rollup_from_actors(
         rollup_mark!(timer, "root setup / retention scheduling");
         let (census_memory, memory) = ctx.memory_root_snapshot_and_rollup();
         rollup_mark!(timer, "per-root memory census");
-        census_ages.insert(root_label.clone(), memory.measured_age_ms);
-        census_roots.insert(root_label.clone(), census_memory);
+        if measure_census {
+            census_ages.insert(root_label.clone(), memory.measured_age_ms);
+            census_roots.insert(root_label.clone(), census_memory);
+        }
         let memory = if standing.is_some() {
             memory.with_standing()
         } else {
@@ -2992,36 +3096,48 @@ fn build_health_diagnostic_rollup_from_actors(
     rollup_mark!(timer, "root JSON assembly");
     let allocator = cache.allocator_observation();
     rollup_mark!(timer, "allocator observation");
-    let memory = memory_rollup_metrics(Some(crate::memory::MemoryRollupSnapshot::new(
+    // Shared bases and semantic arenas are measured once for the compact
+    // rollup; a rollup that also measures the census reuses that measurement.
+    let shared_memory = crate::memory::SharedProcessMemory::measure();
+    let memory = memory_rollup_metrics(Some(crate::memory::MemoryRollupSnapshot::with_shared(
         "ready",
         memory_roots,
         allocator.clone(),
+        &shared_memory,
     )));
-    let census_snapshot = crate::memory::MemorySnapshot::new_uncapped_with_allocator(
-        "ready",
-        census_roots,
-        allocator,
-    );
+    let census_snapshot = measure_census.then(|| {
+        crate::memory::MemorySnapshot::new_uncapped_with_shared(
+            "ready",
+            census_roots,
+            allocator,
+            shared_memory,
+        )
+    });
     rollup_mark!(timer, "process memory snapshots");
-    let census_rows = cache
-        .census_rows
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .render(&census_snapshot);
-    let mut memory_census = crate::commands::memory_census::render_memory_census_with_roots(
-        &census_snapshot,
-        census_rows,
-    );
-    if let Some(rows) = memory_census
-        .get_mut("roots")
-        .and_then(Value::as_object_mut)
-    {
-        for (root, age_ms) in census_ages {
-            if let Some(row) = rows.get_mut(&root).and_then(Value::as_object_mut) {
-                row.insert("memory_measured_age_ms".into(), json!(age_ms));
+    let measured_census = census_snapshot.map(|census_snapshot| {
+        #[cfg(test)]
+        cache.census_builds.fetch_add(1, Ordering::Relaxed);
+        let census_rows = cache
+            .census_rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .render(&census_snapshot);
+        let mut memory_census = crate::commands::memory_census::render_memory_census_with_roots(
+            &census_snapshot,
+            census_rows,
+        );
+        if let Some(rows) = memory_census
+            .get_mut("roots")
+            .and_then(Value::as_object_mut)
+        {
+            for (root, age_ms) in census_ages {
+                if let Some(row) = rows.get_mut(&root).and_then(Value::as_object_mut) {
+                    row.insert("memory_measured_age_ms".into(), json!(age_ms));
+                }
             }
         }
-    }
+        memory_census
+    });
     rollup_mark!(timer, "census JSON rendering");
     let lifecycle = crate::lifecycle_census::collect(shared_app, &lifecycle_contexts);
     rollup_mark!(timer, "lifecycle OS probes");
@@ -3093,8 +3209,16 @@ fn build_health_diagnostic_rollup_from_actors(
         log::debug!("health rollup tick: {tick}");
     }
     // Keep detailed timing outside the size-budgeted health reply: adding it
-    // there would displace root diagnostics. The uncapped census retains it.
-    memory_census["health_rollup_tick"] = tick;
+    // there would displace root diagnostics. The uncapped census retains the
+    // timing of the rollup that measured it.
+    let (memory_census, memory_census_at_ms) = match (measured_census, reused_census) {
+        (Some(mut memory_census), _) => {
+            memory_census["health_rollup_tick"] = tick.clone();
+            (Arc::new(memory_census), None)
+        }
+        (None, Some((memory_census, measured_at_ms))) => (memory_census, Some(measured_at_ms)),
+        (None, None) => unreachable!("a census is measured whenever none is reused"),
+    };
     HealthDiagnosticRollup {
         status: if busy_roots > 0 || standing_refusals > 0 {
             HealthStatus::Degraded
@@ -3107,6 +3231,9 @@ fn build_health_diagnostic_rollup_from_actors(
         stale_reason: None,
         metrics,
         memory_census,
+        memory_census_at_ms,
+        #[cfg(test)]
+        tick,
     }
 }
 
@@ -5716,6 +5843,221 @@ mod tests {
             census["roots"][label.as_str()]["memory_measured_age_ms"].is_u64(),
             "the census row must carry its age: {census}"
         );
+    }
+
+    fn install_arena_runs(
+        arena: &crate::views::semantic_arena::SemanticArena,
+        runs: std::ops::Range<u64>,
+        chunks: usize,
+    ) {
+        for run in runs {
+            let mut key = [0u8; 32];
+            key[..8].copy_from_slice(&run.to_le_bytes());
+            arena.install(
+                crate::blob_store::v2::FamilyKey::new(
+                    crate::blob_store::v2::FamilyPlane::Semantic,
+                    key,
+                ),
+                crate::semantic_index::SemanticVectors::synthetic_for_test(
+                    Path::new(&format!("src/run_{run}.rs")),
+                    chunks,
+                    2,
+                ),
+            );
+        }
+    }
+
+    /// The census row of one arena family, as `memory.census` reports it.
+    fn census_family_row(census: &Value, family: &str) -> Value {
+        census["process"]["semantic_arenas"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["family"] == family))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// Walking an arena's runs visits every vector they hold. Nothing about
+    /// the runs changes between rollups unless a run is added or dropped, so
+    /// only those two changes may walk them again, and each must show at once.
+    #[test]
+    fn arena_memory_is_walked_again_only_when_its_runs_change() {
+        let storage = tempfile::tempdir().unwrap();
+        let arena = crate::views::semantic_arena::arena_for(storage.path(), "walk-on-change");
+        install_arena_runs(&arena, 0..4, 10);
+        let walks = || arena.run_memory_walks_for_test();
+        let first = arena.memory();
+        assert_eq!((first.runs, first.chunks), (4, 40));
+        // Rollups of tests running in parallel census every live arena, so
+        // they may have walked this one between the installs above. Once the
+        // runs stop changing, each change is walked exactly once, by
+        // whichever thread reads it first.
+        let after_first = walks();
+        assert!(after_first >= 1, "the first read must walk the runs");
+        for _ in 0..5 {
+            assert_eq!(arena.memory(), first, "unchanged runs reported new totals");
+        }
+        assert_eq!(walks(), after_first, "unchanged runs were walked again");
+
+        install_arena_runs(&arena, 4..5, 10);
+        let grown = arena.memory();
+        assert_eq!(
+            (grown.runs, grown.chunks),
+            (5, 50),
+            "an added run was missed"
+        );
+        assert!(grown.bytes > first.bytes);
+        assert_eq!(walks(), after_first + 1);
+
+        // Nothing but the arena holds the runs, so trimming drops them all.
+        assert_eq!(arena.trim(), 5);
+        let trimmed = arena.memory();
+        assert_eq!(
+            (trimmed.runs, trimmed.chunks),
+            (0, 0),
+            "dropped runs were still counted"
+        );
+        assert_eq!(walks(), after_first + 2);
+    }
+
+    /// What a rollup costs while nothing changes, counted rather than timed:
+    /// it walks no arena runs and no root index, and it measures no memory
+    /// census, however many roots and resident chunks there are. The compact
+    /// memory figures are still measured on every rollup.
+    #[test]
+    fn an_unchanged_rollup_does_constant_work_per_tick() {
+        let storage = tempfile::tempdir().unwrap();
+        let arena = crate::views::semantic_arena::arena_for(storage.path(), "constant-work");
+        install_arena_runs(&arena, 0..50, 100);
+        let executor = Executor::new();
+        let app = crate::context::App::default_shared();
+        let mut dirs = Vec::new();
+        for index in 0..20 {
+            let (dir, root) = test_root(&format!("constant-work-{index}"));
+            assert!(executor.register_actor(root, test_ctx()));
+            dirs.push(dir);
+        }
+        let cache = HealthRollupCache::new();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        let counters = || {
+            (
+                arena.run_memory_walks_for_test(),
+                crate::context::memory_estimate_walks_for_test(),
+                cache.census_builds_for_test(),
+            )
+        };
+        let before_first = counters();
+        cache.refresh_for_test(&executor, &app);
+        let after_first = counters();
+        // Parallel tests' rollups also census this arena, so the walk of its
+        // runs may have been made on another thread; it was made once.
+        assert!(after_first.0 >= 1, "no rollup walked the arena");
+        assert_eq!(
+            after_first.1 - before_first.1,
+            20,
+            "one index walk per root"
+        );
+        assert_eq!(
+            after_first.2 - before_first.2,
+            1,
+            "the first rollup measures the census"
+        );
+        // Nine more rollups, three seconds apart: 27 s, inside the census
+        // interval, with no census read in between.
+        for tick in 1..=9u64 {
+            cache.clock_ms.store(tick * 3_000, Ordering::Relaxed);
+            let before = counters();
+            cache.refresh_for_test(&executor, &app);
+            let after = counters();
+            assert_eq!(
+                (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+                (0, 0, 0),
+                "rollup {tick} redid work for unchanged inputs (arena walks, index walks, census builds)"
+            );
+            let (snapshot, age) = cache.snapshot();
+            assert_eq!(age, Some(0));
+            assert_eq!(snapshot.metrics["root_count"], 20);
+            // The rollup still times every step, including the census steps
+            // it passed through without measuring a census.
+            assert_eq!(snapshot.tick["steps"].as_object().unwrap().len(), 14);
+            assert!(
+                snapshot.metrics["memory"]["semantic_arena_bytes"]
+                    .as_u64()
+                    .unwrap()
+                    >= arena.memory().bytes,
+                "the compact memory figures must still count the arena"
+            );
+        }
+    }
+
+    /// The full census is measured when a read asks for it, when its roots
+    /// change, or when it reaches the census interval; in between the rollup
+    /// carries it, and a read reports how old it and its figures are.
+    #[test]
+    fn the_memory_census_is_measured_on_demand_and_reports_its_age() {
+        let storage = tempfile::tempdir().unwrap();
+        let family = "census-on-demand";
+        let arena = crate::views::semantic_arena::arena_for(storage.path(), family);
+        install_arena_runs(&arena, 0..2, 10);
+        let executor = Executor::new();
+        let app = crate::context::App::default_shared();
+        let (_first_dir, first_root) = test_root("census-on-demand-first");
+        assert!(executor.register_actor(first_root.clone(), test_ctx()));
+        let first_label = first_root.as_path().display().to_string();
+        let cache = HealthRollupCache::new();
+        let builds = || cache.census_builds_for_test();
+        let refresh_at = |now_ms: u64| {
+            cache.clock_ms.store(now_ms, Ordering::Relaxed);
+            let before = builds();
+            cache.refresh_for_test(&executor, &app);
+            builds() - before
+        };
+        assert_eq!(refresh_at(0), 1, "the first rollup measures the census");
+        let measured_bytes = census_family_row(&cache.memory_census(), family)["bytes"].clone();
+        assert!(measured_bytes.as_u64().is_some_and(|bytes| bytes > 0));
+        // That read asked for a fresh census; the next rollup measures it.
+        assert_eq!(refresh_at(3_000), 1, "a census read was not answered");
+        assert_eq!(refresh_at(6_000), 0, "a census was measured with no read");
+
+        // A change no read has asked about yet: the carried census still
+        // shows the old figures, and says they are 4 s old.
+        install_arena_runs(&arena, 2..3, 10);
+        cache.clock_ms.store(7_000, Ordering::Relaxed);
+        let carried = cache.memory_census();
+        assert_eq!(carried["health_rollup_tick"]["age_ms"], 4_000);
+        assert_eq!(census_family_row(&carried, family)["bytes"], measured_bytes);
+        assert!(
+            carried["roots"][&first_label]["memory_measured_age_ms"]
+                .as_u64()
+                .is_some_and(|age| age >= 4_000),
+            "a carried row must count the census age: {carried}"
+        );
+        assert_eq!(refresh_at(9_000), 1);
+        let fresh = cache.memory_census();
+        assert_eq!(fresh["health_rollup_tick"]["age_ms"], 0);
+        assert!(
+            census_family_row(&fresh, family)["bytes"].as_u64().unwrap()
+                > measured_bytes.as_u64().unwrap(),
+            "the census measured after the read missed the added run"
+        );
+
+        // A root bound since the last census is measured at once.
+        assert_eq!(refresh_at(12_000), 1, "the read above was not answered");
+        let (_second_dir, second_root) = test_root("census-on-demand-second");
+        assert!(executor.register_actor(second_root.clone(), test_ctx()));
+        assert_eq!(
+            refresh_at(15_000),
+            1,
+            "a newly bound root waited for the interval"
+        );
+        let second_label = second_root.as_path().display().to_string();
+        assert!(cache.snapshot().0.memory_census["roots"]
+            .get(&second_label)
+            .is_some());
+
+        // With no read and no root change, the census is measured again once
+        // it reaches the interval.
+        assert_eq!(refresh_at(44_999), 0);
+        assert_eq!(refresh_at(45_000), 1, "the census outlived its interval");
     }
 
     /// Reads add files to a root's symbol cache far more often than edits

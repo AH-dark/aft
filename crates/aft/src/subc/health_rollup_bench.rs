@@ -114,7 +114,10 @@ fn bench_health_rollup_steps() {
         let mut key = [0u8; 32];
         key[..8].copy_from_slice(&(run as u64).to_le_bytes());
         arenas[run % arenas.len()].install(
-            crate::blob_store::v2::FamilyKey::new(crate::blob_store::v2::FamilyPlane::Semantic, key),
+            crate::blob_store::v2::FamilyKey::new(
+                crate::blob_store::v2::FamilyPlane::Semantic,
+                key,
+            ),
             crate::semantic_index::SemanticVectors::synthetic_for_test(
                 Path::new(&format!("src/arena_{run}.rs")),
                 100,
@@ -205,6 +208,7 @@ fn bench_health_rollup_steps() {
             .is_some_and(|view| view.pending_paths == 1 && view.failed_paths == 1)
     }));
     STEPS.with(|steps| *steps.borrow_mut() = Some(BTreeMap::new()));
+    let census_builds_before = cache.census_builds_for_test();
     let mut total = 0u64;
     let mut elapsed_steps = BTreeMap::<String, f64>::new();
     let mut elapsed_total = 0.0;
@@ -244,7 +248,7 @@ fn bench_health_rollup_steps() {
             &app,
             executor.actor_entries(),
         );
-        let tick = &built.memory_census["health_rollup_tick"];
+        let tick = &built.tick;
         elapsed_total += tick["elapsed_ms"].as_f64().unwrap();
         for (step, value) in tick["steps"].as_object().unwrap() {
             *elapsed_steps.entry(step.clone()).or_default() +=
@@ -281,6 +285,10 @@ fn bench_health_rollup_steps() {
         "TOTAL: us/tick={:.2} us/second={:.2}",
         total as f64 / TICKS as f64 / 1000.,
         total as f64 / TICKS as f64 / 3000.
+    );
+    println!(
+        "memory census measured on {} of {TICKS} ticks",
+        cache.census_builds_for_test() - census_builds_before
     );
     let metrics = DispatchPathMetrics::new();
     let pending = HashMap::new();

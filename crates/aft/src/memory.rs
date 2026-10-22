@@ -664,6 +664,23 @@ pub struct MemorySnapshot {
     pub process: ProcessMemorySnapshot,
 }
 
+/// Memory attributed once for the whole process rather than to any root:
+/// shared semantic bases and views-on semantic arenas.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedProcessMemory {
+    pub(crate) shared_semantic_bases: MemoryEstimate,
+    pub(crate) semantic_arenas: SemanticArenaCensus,
+}
+
+impl SharedProcessMemory {
+    pub(crate) fn measure() -> Self {
+        Self {
+            shared_semantic_bases: crate::semantic_index::shared_semantic_bases_memory(),
+            semantic_arenas: SemanticArenaCensus::measure(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct MemoryRollupSnapshot {
     pub(crate) roots_status: &'static str,
@@ -675,17 +692,33 @@ pub(crate) struct MemoryRollupSnapshot {
 }
 
 impl MemoryRollupSnapshot {
+    #[cfg(test)]
     pub(crate) fn new(
         roots_status: &'static str,
         roots: BTreeMap<String, RootMemoryRollup>,
         allocator: AllocatorObservation,
     ) -> Self {
-        let shared_semantic_bases = crate::semantic_index::shared_semantic_bases_memory();
+        Self::with_shared(
+            roots_status,
+            roots,
+            allocator,
+            &SharedProcessMemory::measure(),
+        )
+    }
+
+    /// [`Self::new`] with the process-wide shared memory already measured, so
+    /// one health rollup measures it once for every surface it fills.
+    pub(crate) fn with_shared(
+        roots_status: &'static str,
+        roots: BTreeMap<String, RootMemoryRollup>,
+        allocator: AllocatorObservation,
+        shared: &SharedProcessMemory,
+    ) -> Self {
         let process = ProcessMemorySnapshot::from_root_rollups(
             roots.values(),
             roots.len(),
-            &shared_semantic_bases,
-            &SemanticArenaCensus::measure(),
+            &shared.shared_semantic_bases,
+            &shared.semantic_arenas,
             allocator,
         );
         let roots_total = roots.len();
@@ -709,6 +742,7 @@ impl MemorySnapshot {
             roots,
             true,
             AllocatorObservation::from_source(AllocatorSource::Cached),
+            SharedProcessMemory::measure(),
         )
     }
 
@@ -725,7 +759,24 @@ impl MemorySnapshot {
         roots: BTreeMap<String, RootMemorySnapshot>,
         allocator: AllocatorObservation,
     ) -> Self {
-        Self::with_cap(roots_status, roots, false, allocator)
+        Self::with_cap(
+            roots_status,
+            roots,
+            false,
+            allocator,
+            SharedProcessMemory::measure(),
+        )
+    }
+
+    /// The uncapped form with the process-wide shared memory already
+    /// measured; see [`MemoryRollupSnapshot::with_shared`].
+    pub(crate) fn new_uncapped_with_shared(
+        roots_status: &'static str,
+        roots: BTreeMap<String, RootMemorySnapshot>,
+        allocator: AllocatorObservation,
+        shared: SharedProcessMemory,
+    ) -> Self {
+        Self::with_cap(roots_status, roots, false, allocator, shared)
     }
 
     fn with_cap(
@@ -733,9 +784,12 @@ impl MemorySnapshot {
         roots: BTreeMap<String, RootMemorySnapshot>,
         cap_detail: bool,
         allocator: AllocatorObservation,
+        shared: SharedProcessMemory,
     ) -> Self {
-        let shared_semantic_bases = crate::semantic_index::shared_semantic_bases_memory();
-        let semantic_arenas = SemanticArenaCensus::measure();
+        let SharedProcessMemory {
+            shared_semantic_bases,
+            semantic_arenas,
+        } = shared;
         // Totals cover EVERY root before the detail map is capped.
         let rollups: Vec<_> = roots.values().map(RootMemorySnapshot::rollup).collect();
         let process = ProcessMemorySnapshot::from_root_rollups(
