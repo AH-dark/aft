@@ -17,6 +17,10 @@
 //! that Rust code creates (the v3 opener pre-creates a new database file)
 //! and directories are not modelled; replay fixtures create their stores
 //! before the replay starts.
+//!
+//! The replay tests run on unix only, where directory sync is a real
+//! operation; elsewhere only the open hook and the fault switch are used.
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use rusqlite::{ffi, Connection, OpenFlags};
 use std::collections::HashMap;

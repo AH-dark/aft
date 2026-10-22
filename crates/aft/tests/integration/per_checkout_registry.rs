@@ -1059,6 +1059,7 @@ fn a_publisher_killed_at_any_durability_boundary_leaves_protected_bytes_readable
 }
 
 /// Every `.sqlite` file under `blobs/v3/`.
+#[cfg(unix)]
 fn v3_stores(storage: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
         let Ok(entries) = fs::read_dir(dir) else {
@@ -1078,6 +1079,7 @@ fn v3_stores(storage: &Path) -> Vec<PathBuf> {
     found
 }
 
+#[cfg(unix)]
 fn floor_stores(storage: &Path) -> serde_json::Map<String, serde_json::Value> {
     let floor: serde_json::Value =
         serde_json::from_slice(&fs::read(storage.join("reader-floor.json")).unwrap()).unwrap();
