@@ -36,11 +36,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # Rust + plugin unit tests on Linux (fast inner loop)
   #
-  # Three warm-cache main runs spent 6.1-6.8 minutes in the Rust gate while the
-  # explicit debug build took only 0.7-1.1 minutes. The nextest slice alone ran
-  # 1,690 tests for 4.4-4.7 minutes, so compile-cache tuning cannot move the
-  # dominant execution cost. Build one archive and hash-partition that exact
-  # inventory; libtest and watcher phases retain their original execution.
+  # Build the non-watcher inventory once for both integration and unit shards.
+  # Serial probes run before upload; watcher and feature-enabled conformance
+  # retain their isolated execution. The required check joins every lane.
   # ---------------------------------------------------------------------------
   unit-linux-nextest-archive:
     name: Cargo test archive (Linux)
@@ -71,13 +69,25 @@ jobs:
 
       - uses: ./.github/actions/setup-nextest
 
-      - name: Build nextest archive (Linux integration suite)
-        run: cargo nextest archive --workspace -E 'kind(test) - binary(=watcher_integration)' --archive-file "$LINUX_NEXTEST_ARCHIVE"
+      - name: Build nextest archive (Linux Rust suite)
+        run: cargo nextest archive --workspace -E '(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)' --archive-file "$LINUX_NEXTEST_ARCHIVE"
+        env:
+          LINUX_NEXTEST_ARCHIVE: ${{ runner.temp }}/linux-nextest.tar.zst
+
+      - name: Run the serial TLS probe
+        run: cargo nextest run --archive-file "$LINUX_NEXTEST_ARCHIVE" --profile gate -E 'kind(lib)' -- platform_verifier_tls_client_subprocess
+        env:
+          LINUX_NEXTEST_ARCHIVE: ${{ runner.temp }}/linux-nextest.tar.zst
+
+      - name: Run the serial backtrace probe
+        run: cargo nextest run --archive-file "$LINUX_NEXTEST_ARCHIVE" --profile gate -E 'kind(lib)' -- panic_hook_preserves_default_backtrace_behavior_and_persists
         env:
           LINUX_NEXTEST_ARCHIVE: ${{ runner.temp }}/linux-nextest.tar.zst
 
       - name: Prove split Rust test inventory is exact
         run: python3 scripts/rust-test-inventory-proof.py
+        env:
+          AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/linux-nextest.tar.zst
 
       - name: Report nextest archive size
         run: |
@@ -94,8 +104,61 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-  unit-linux:
+  unit-linux-summary:
     name: Unit tests (Linux)
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    needs:
+      - unit-linux
+      - unit-linux-nextest-archive
+      - unit-linux-libtest-shard
+      - unit-linux-nextest
+      - unit-linux-nextest-2
+      - unit-linux-nextest-3
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every Linux unit lane
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          lanes = json.loads(os.environ["NEEDS"])
+          print({name: lane["result"] for name, lane in lanes.items()})
+          raise SystemExit(0 if all(lane["result"] == "success" for lane in lanes.values()) else 1)
+          PY
+
+  unit-linux-libtest-shard:
+    name: Cargo libtest shard ${{ matrix.shard }}/3 (Linux)
+    if: ${{ github.event_name != 'pull_request' }}
+    needs: unit-linux-nextest-archive
+    # Spawned ck-subc release binaries need glibc 2.39 (Ubuntu 24.04).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-nextest
+      - uses: ./.github/actions/download-artifact-retry
+        with:
+          name: linux-nextest-archive
+          path: ${{ runner.temp }}
+      - name: Run Linux unit archive partition
+        run: ./scripts/rust-test-gate.sh
+        env:
+          AFT_GATE_PHASES: lib-shard
+          AFT_UNIT_TEST_RUNNER: nextest
+          AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
+          AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/linux-nextest.tar.zst
+          NEXTEST_TEST_THREADS: num-cpus
+
+  unit-linux:
+    name: Cargo conformance + Bun tests (Linux)
     if: ${{ github.event_name != 'pull_request' }}
     # ck-subc release binaries need glibc 2.39 (Ubuntu 24.04).
     runs-on: ubuntu-24.04
@@ -215,17 +278,16 @@ jobs:
       - name: Native generated-schema byte gate
         run: bun packages/opencode-plugin/scripts/build-tool-schemas.ts --check
 
-      - name: Rust test gate (unit on libtest, integration on nextest, watcher isolated)
+      - name: Rust test gate (watcher isolated, feature-enabled conformance)
         run: ./scripts/rust-test-gate.sh
         env:
           # The checked-in profile reserves 2 cores for workstation headroom,
           # which starves ~4-core CI runners. CI runners are otherwise idle,
           # so use every core.
           NEXTEST_TEST_THREADS: "num-cpus"
-          # The archive shards own the nextest integration inventory; keep the
-          # libtest and serialized watcher invocations unchanged, and run the
-          # provider's durable crash hooks in the feature-enabled grouped suite.
-          AFT_GATE_PHASES: lib,watcher,conformance
+          # The archive shards own lib, bin and integration tests. Watcher tests
+          # stay serialized; conformance enables the test-timing-hooks feature.
+          AFT_GATE_PHASES: watcher,conformance
           # The release-storm phase runs in its own parallel job
           # (unit-linux-storm) so its release-profile build is off this
           # job's critical path.
