@@ -71,12 +71,19 @@ fn retry_waited_ms(remote: &RemoteTask) -> Option<u64> {
 /// behind this session's own earlier job in the same workspace, say so and
 /// name that job and its task instead of quoting the runner's queue report.
 fn remote_refusal_message(reason: &str, detail: Option<&str>, remote: &RemoteTask) -> String {
-    match &remote.workspace_holder {
+    let message = match &remote.workspace_holder {
         Some(holder) if reason == "queue_wait_exceeded" => format!(
             "runon refused: your earlier job {} in this workspace is still running (task {}); this command waited behind it until the runner's queue wait limit passed and was not run; wait for task {} to end (bash_status shows it), then retry",
             holder.job_id, holder.task_id, holder.task_id
         ),
         _ => retry_refusal_message(reason, detail, retry_waited_ms(remote)),
+    };
+    match remote
+        .job_id
+        .or_else(|| remote.terminal.as_ref().map(|record| record.job_id))
+    {
+        Some(job_id) => format!("{message}; remote job {job_id}"),
+        None => message,
     }
 }
 
@@ -326,21 +333,30 @@ fn platform_acknowledged(remote: &RemoteTask) -> bool {
 
 #[cfg(unix)]
 fn remote_execution_note(remote: &RemoteTask) -> String {
-    let mut note = match remote.requested_vcpus {
-        Some(1) => format!("ran remotely on {RUNNER_ID} (1 vCPU requested)"),
-        Some(count) => format!("ran remotely on {RUNNER_ID} ({count} vCPUs requested)"),
-        None => format!("ran remotely on {RUNNER_ID}"),
-    };
-    if remote.requested_network {
-        if remote.requested_vcpus.is_some() {
-            note.pop();
-            note.push_str(", network)");
+    let job_id = remote
+        .job_id
+        .or_else(|| remote.terminal.as_ref().map(|record| record.job_id));
+    let mut details = Vec::new();
+    if let Some(count) = remote.requested_vcpus {
+        details.push(if count == 1 {
+            "1 vCPU requested".to_string()
         } else {
-            note.push_str(" (network)");
-        }
-        if remote.accepted && !remote.granted_network {
-            note.push_str("\nOFFLINE: the runner did not grant the requested network access");
-        }
+            format!("{count} vCPUs requested")
+        });
+    }
+    if let Some(job_id) = job_id {
+        details.push(format!("job {job_id}"));
+    }
+    if remote.requested_network {
+        details.push("network".to_string());
+    }
+    let mut note = if details.is_empty() {
+        format!("ran remotely on {RUNNER_ID}")
+    } else {
+        format!("ran remotely on {RUNNER_ID} ({})", details.join(", "))
+    };
+    if remote.requested_network && remote.accepted && !remote.granted_network {
+        note.push_str("\nOFFLINE: the runner did not grant the requested network access");
     }
     note
 }
@@ -1390,6 +1406,12 @@ impl OutputSink for TaskSink {
                 .unwrap_or_default();
             *existing = note + &suffix;
         }
+        crate::slog_info!(
+            "runon: remote task accepted task_id={} session={} job_id={}",
+            self.task.task_id,
+            state.metadata.session_id,
+            accepted.job_id,
+        );
         self.registry
             .persist_task_locked(&self.task, &state.metadata, &mut db)?;
         // The remote executor's Accepted record confirms inputs were captured.
@@ -2735,7 +2757,7 @@ impl BgTaskRegistry {
         let refused = matches!(&verdict, Verdict::RunLocally { .. });
         let unknown = matches!(&verdict, Verdict::OutcomeUnknown);
         let (status, code, mut reason) = terminal_outcome(verdict, error);
-        {
+        let (session_id, job_id, status_label) = {
             let mut db = DeferredDbWrites::new(self, task);
             let Ok(mut state) = task.state.lock() else {
                 return;
@@ -2776,19 +2798,24 @@ impl BgTaskRegistry {
                 }
             }
             if refused {
-                state.metadata.execution_note = Some(
-                    if state
-                        .metadata
-                        .remote
-                        .as_ref()
-                        .is_some_and(|remote| remote.terminal.is_some())
-                    {
-                        "remote executor refused before start"
-                    } else {
-                        "runon refused before remote dispatch; command did not run"
-                    }
-                    .into(),
-                );
+                let accepted_refusal = state
+                    .metadata
+                    .remote
+                    .as_ref()
+                    .is_some_and(|remote| remote.terminal.is_some());
+                let job_id = state.metadata.remote.as_ref().and_then(|remote| {
+                    remote
+                        .job_id
+                        .or_else(|| remote.terminal.as_ref().map(|record| record.job_id))
+                });
+                state.metadata.execution_note = Some(if accepted_refusal {
+                    job_id.map_or_else(
+                        || "remote executor refused before start".into(),
+                        |job_id| format!("remote executor refused before start (job {job_id})"),
+                    )
+                } else {
+                    "runon refused before remote dispatch; command did not run".into()
+                });
             } else if matches!(
                 status,
                 BgTaskStatus::Completed
@@ -2803,6 +2830,7 @@ impl BgTaskRegistry {
             {
                 reason = state.metadata.status_reason.clone();
             }
+            let status_label = format!("{status:?}");
             state.metadata.mark_terminal(status, code, reason.clone());
             // Remote execution has no local shell wrapper to write markers.
             // Publish from durable runner proof, including after registry restart.
@@ -2815,10 +2843,24 @@ impl BgTaskRegistry {
                     .get_or_insert_with(|| remote_note.clone());
                 note.push_str(&format!("\n{reason}"));
             }
+            let session_id = state.metadata.session_id.clone();
+            let job_id = state.metadata.remote.as_ref().and_then(|remote| {
+                remote
+                    .job_id
+                    .or_else(|| remote.terminal.as_ref().map(|record| record.job_id))
+            });
             task.mark_terminal_now();
             let _ = self.persist_task_locked(task, &state.metadata, &mut db);
             task.kill_settled.notify_all();
-        }
+            (session_id, job_id, status_label)
+        };
+        crate::slog_info!(
+            "runon: remote task ended task_id={} session={} job_id={} status={}",
+            task.task_id,
+            session_id,
+            job_id.map_or_else(|| "none".to_string(), |job_id| job_id.to_string()),
+            status_label,
+        );
         let _ = self.post_terminal_transition(task, true);
         self.inner.terminal_transition.notify_waiters();
         let _ = self.inner.wake_tx.try_send(());

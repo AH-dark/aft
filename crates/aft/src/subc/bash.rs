@@ -5635,7 +5635,7 @@ mod grant_path_tests {
         let response = done.response_for_test();
         assert!(!response.success, "{response:?}");
         assert_eq!(response.data["code"], "remote_unavailable");
-        assert_eq!(response.data["message"], "runon refused: remote refused: unreachable; command was not run; retry, or omit runon to run locally");
+        assert_eq!(response.data["message"], "runon refused: remote refused: unreachable; command was not run; retry, or omit runon to run locally; remote job 0192a64a-1234-7000-8000-000000000001");
         assert!(response.data["task_id"].as_str().is_some());
     }
 

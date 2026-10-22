@@ -1808,6 +1808,42 @@ describe("bash tool adapter", () => {
     expect(toolText(result)).toContain(reason);
   });
 
+  test("running bash_status shows the full assigned remote job ID", async () => {
+    const jobId = "0192a64a-1234-7000-8000-000000000001";
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge } = makeTrackableMockBridge({
+      status: "running",
+      remote_job_id: jobId,
+      remote_phase_note: "queued on the runner (1 s)",
+    });
+    registerBashTool(api, makeMockContext(bridge));
+
+    const result = await tools
+      .get("bash_status")!
+      .execute("call", { task_id: "bash-remote" }, undefined, undefined, { cwd: projectRoot });
+
+    expect(toolText(result)).toContain(`remote job ${jobId}`);
+    expect(toolText(result)).toContain("queued on the runner (1 s)");
+  });
+
+  test("running bash_status omits the job label before runner acceptance", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge } = makeTrackableMockBridge({
+      status: "running",
+      remote_phase_note: "submitting to the runner (capturing inputs; not accepted yet)",
+    });
+    registerBashTool(api, makeMockContext(bridge));
+
+    const result = await tools
+      .get("bash_status")!
+      .execute("call", { task_id: "bash-remote" }, undefined, undefined, { cwd: projectRoot });
+
+    expect(toolText(result)).toContain("Task bash-remote: running");
+    expect(toolText(result)).not.toContain("remote job");
+  });
+
   test("bash_watch pattern substring returns waited matched details", async () => {
     const outputPath = await spill("alpha ready beta\n");
     try {

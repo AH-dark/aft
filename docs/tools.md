@@ -399,10 +399,11 @@ when present. If the runner accepts a `net` job but does not acknowledge outboun
 (including older runners), the header plainly says `OFFLINE: the runner did not grant the
 requested network access`.
 
-Successful remote runs begin with `ran remotely on ck-motor`; when a vCPU count was requested,
-the header includes it, for example `ran remotely on ck-motor (4 vCPUs requested, network)`
-when `net` was also requested. A runner's `Started` record publishes phase `running`; its
-wall-clock start time is not an AFT timeout. Only
+Remote results begin with `ran remotely on ck-motor`. The header names the accepted job's full
+ID when available. If a vCPU count was requested, it includes that too; for example
+`ran remotely on ck-motor (4 vCPUs requested, job <UUID>, network)` when `net` was also
+requested. Refusals after acceptance name the job ID too. A runner's `Started` record marks the job
+as running; its timeout is measured from then, not from when it entered the queue. Only
 automatic prefix routing (without an explicit `runon`) retains local fallback with the advisory
 `ran locally on macOS: remote refused: <reason>` (or the local OS name). A job that started
 remotely is never automatically resubmitted: if AFT loses track of it, the reply says the

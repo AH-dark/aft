@@ -1,0 +1,2 @@
+Task bash-remote: running · remote job 0192a64a-1234-7000-8000-000000000001 · queued on the runner (1 s)
+A completion reminder will be delivered automatically; don't poll.

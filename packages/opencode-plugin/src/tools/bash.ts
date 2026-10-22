@@ -930,6 +930,9 @@ async function formatBashStatusText(
   if (typeof data.live_descendants_summary === "string") {
     text += ` · ${data.live_descendants_summary}`;
   }
+  if (status === "running" && typeof data.remote_job_id === "string") {
+    text += ` · remote job ${data.remote_job_id}`;
+  }
   // A remote task's build-server status note: that it is still queued (and
   // for how long), or when the runner will stop it. Without this note a
   // queued job would show as plain "running".

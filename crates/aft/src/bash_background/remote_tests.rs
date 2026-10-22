@@ -632,11 +632,29 @@ fn refusal_response(snapshot: BgTaskSnapshot) -> crate::protocol::Response {
 fn assert_runon_refusal(response: &crate::protocol::Response, reason: &str) {
     assert!(!response.success, "{response:?}");
     assert_eq!(response.data["code"], "remote_unavailable", "{response:?}");
-    assert_eq!(
-        response.data["message"],
-        format!("runon refused: remote refused: {reason}; command was not run; retry, or omit runon to run locally"),
-        "{response:?}"
+    let job_id = response
+        .data
+        .get("remote_job_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            response
+                .data
+                .get("output")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|output| {
+                    output.lines().find_map(|line| {
+                        line.strip_prefix("remote executor refused before start (job ")
+                            .and_then(|line| line.strip_suffix(')'))
+                            .map(str::to_owned)
+                    })
+                })
+        });
+    let expected = format!(
+        "runon refused: remote refused: {reason}; command was not run; retry, or omit runon to run locally{}",
+        job_id.map_or_else(String::new, |job_id| format!("; remote job {job_id}")),
     );
+    assert_eq!(response.data["message"], expected, "{response:?}");
 }
 
 #[test]
@@ -740,7 +758,11 @@ async fn runon_refusal_detail_is_rendered_and_sanitized() {
     let message = response.data["message"].as_str().unwrap();
     assert!(message.starts_with("runon refused: remote refused: runner_draining (runner says: maintenance window) after retrying for "), "{message}");
     assert!(
-        message.ends_with("; command was not run; retry, or omit runon to run locally"),
+        message.ends_with("; command was not run; retry, or omit runon to run locally; remote job 0192a64a-1234-7000-8000-000000000001"),
+        "{message}"
+    );
+    assert!(
+        message.contains("remote job 0192a64a-1234-7000-8000-000000000001"),
         "{message}"
     );
     assert!(!message.contains(['\n', '\t']), "{message}");
@@ -867,14 +889,11 @@ fn exec_remote_bash_unknown_reply_without_job_omits_status_hint() {
     let (registry, task_id, _) =
         persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf unused");
     let task = registry.task(&task_id).unwrap();
-    task.state
-        .lock()
-        .unwrap()
-        .metadata
-        .remote
-        .as_mut()
-        .unwrap()
-        .job_id = None;
+    {
+        let mut state = task.state.lock().unwrap();
+        state.metadata.remote.as_mut().unwrap().job_id = None;
+        state.metadata.execution_note = Some("ran remotely on ck-motor".into());
+    }
     registry.remote_terminal(
         &task,
         Verdict::OutcomeUnknown,
@@ -890,10 +909,159 @@ fn exec_remote_bash_unknown_reply_without_job_omits_status_hint() {
     );
     assert!(!done.output_preview.contains("exec.status"));
     assert!(!done.output_preview.contains("(job"));
+    assert_eq!(
+        done.output_preview.lines().next(),
+        Some("ran remotely on ck-motor")
+    );
     assert!(!done.output_preview.contains("never rerun"));
     assert!(done
         .output_preview
         .contains("remote route interrupted before acceptance"));
+    let completion = registry.completion_snapshot_for_task(&task).unwrap();
+    assert_eq!(
+        completion.output_preview.lines().next(),
+        Some("ran remotely on ck-motor")
+    );
+}
+
+fn remote_terminal_preview_with_job(
+    verdict: Verdict,
+    accepted_refusal: bool,
+) -> (String, Option<RemoteRefusal>) {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, _) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf unused");
+    let task = registry.task(&task_id).unwrap();
+    {
+        let mut state = task.state.lock().unwrap();
+        let remote = state.metadata.remote.as_mut().unwrap();
+        remote.explicit_runon = true;
+        remote.job_id = Some(id());
+        remote.requested_vcpus = Some(4);
+        if accepted_refusal {
+            remote.terminal = Some(TerminalRecord::new(
+                id(),
+                Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::Unreachable,
+                },
+                0,
+                0,
+                0,
+            ));
+        }
+    }
+    registry.remote_terminal(&task, verdict, None);
+    let snapshot = registry.observed_status(&task_id, "session", 8192).unwrap();
+    let expected_header = if accepted_refusal {
+        "remote executor refused before start (job 0192a64a-1234-7000-8000-000000000001)"
+    } else {
+        EXPECTED_REMOTE_JOB_HEADER
+    };
+    assert!(
+        snapshot.output_preview.starts_with(expected_header),
+        "{}",
+        snapshot.output_preview
+    );
+    let foreground = crate::commands::bash_orchestrate::format_foreground_result(&snapshot);
+    assert!(foreground.contains(expected_header), "{foreground}");
+    let completion = registry.completion_snapshot_for_task(&task).unwrap();
+    assert!(
+        completion.output_preview.starts_with(expected_header),
+        "{}",
+        completion.output_preview
+    );
+    (snapshot.output_preview, snapshot.remote_refusal)
+}
+
+const EXPECTED_REMOTE_JOB_HEADER: &str =
+    "ran remotely on ck-motor (4 vCPUs requested, job 0192a64a-1234-7000-8000-000000000001)";
+
+#[test]
+fn remote_success_result_names_the_full_job_id() {
+    let (output, _) = remote_terminal_preview_with_job(Verdict::Exited { code: 0 }, false);
+    assert_eq!(output.lines().next(), Some(EXPECTED_REMOTE_JOB_HEADER));
+}
+
+#[test]
+fn remote_nonzero_exit_result_names_the_full_job_id() {
+    let (output, _) = remote_terminal_preview_with_job(Verdict::Exited { code: 7 }, false);
+    assert_eq!(output.lines().next(), Some(EXPECTED_REMOTE_JOB_HEADER));
+}
+
+#[test]
+fn remote_refusal_after_acceptance_names_the_full_job_id() {
+    let (output, refusal) = remote_terminal_preview_with_job(
+        Verdict::RunLocally {
+            reason: RefusalReason::Unreachable,
+            refusal_detail: None,
+        },
+        true,
+    );
+    assert_eq!(
+        output.lines().next(),
+        Some("remote executor refused before start (job 0192a64a-1234-7000-8000-000000000001)")
+    );
+    assert!(refusal
+        .unwrap()
+        .message
+        .contains("remote job 0192a64a-1234-7000-8000-000000000001"));
+}
+
+#[test]
+fn remote_timeout_result_names_the_full_job_id() {
+    let (output, _) = remote_terminal_preview_with_job(Verdict::DeadlineKilled, false);
+    assert_eq!(output.lines().next(), Some(EXPECTED_REMOTE_JOB_HEADER));
+}
+
+#[test]
+fn remote_cancel_result_names_the_full_job_id() {
+    let (output, _) = remote_terminal_preview_with_job(Verdict::Cancelled, false);
+    assert_eq!(output.lines().next(), Some(EXPECTED_REMOTE_JOB_HEADER));
+}
+
+#[test]
+fn remote_kill_result_names_the_full_job_id() {
+    let (output, _) = remote_terminal_preview_with_job(Verdict::CancelKilled, false);
+    assert_eq!(output.lines().next(), Some(EXPECTED_REMOTE_JOB_HEADER));
+}
+
+#[test]
+fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
+    let mut remote = RemoteTask {
+        accepted_platform: None,
+        explicit_runon: false,
+        connection_file: None,
+        harness: "runner".into(),
+        session: "session".into(),
+        requested_platform: None,
+        requested_vcpus: Some(4),
+        requested_network: false,
+        granted_network: false,
+        accepted: true,
+        started: None,
+        job_id: None,
+        last_seq: None,
+        gap_recovery: None,
+        undelivered_output: Vec::new(),
+        stdout_len: 0,
+        stderr_len: 0,
+        unknown_len: 0,
+        cancel_requested: false,
+        terminal: None,
+        fallback_digest: None,
+        env_not_forwarded: None,
+        queue_position: None,
+        output_received: false,
+        retry: None,
+        output_incomplete: None,
+        workspace_holder: None,
+    };
+    assert_eq!(
+        remote_execution_note(&remote),
+        "ran remotely on ck-motor (4 vCPUs requested)"
+    );
+    remote.requested_vcpus = None;
+    assert_eq!(remote_execution_note(&remote), "ran remotely on ck-motor");
 }
 
 /// Promotion, wait-mode detach, remote hand-back, module-drain detach and the
@@ -1536,7 +1704,7 @@ async fn runon_queue_wait_refusal_names_this_sessions_earlier_job_in_the_workspa
     let holder: Uuid = "0192a64a-1234-7000-8000-0000000000aa".parse().unwrap();
     let (done, restarted, earlier) = queue_wait_refusal(holder, holder).await;
     let expected = format!(
-        "runon refused: your earlier job {holder} in this workspace is still running (task {earlier}); this command waited behind it until the runner's queue wait limit passed and was not run; wait for task {earlier} to end (bash_status shows it), then retry"
+        "runon refused: your earlier job {holder} in this workspace is still running (task {earlier}); this command waited behind it until the runner's queue wait limit passed and was not run; wait for task {earlier} to end (bash_status shows it), then retry; remote job 0192a64a-1234-7000-8000-000000000001"
     );
     assert_eq!(done.info.status_reason.as_deref(), Some(expected.as_str()));
     assert_eq!(restarted, expected);
@@ -1574,7 +1742,7 @@ async fn exec_remote_bash_raw_utf8_pipeline_and_workspace_changes() {
     );
     assert_eq!(
         done.output_preview.lines().next(),
-        Some("ran remotely on ck-motor")
+        Some("ran remotely on ck-motor (job 0192a64a-1234-7000-8000-000000000001)")
     );
     // The changed file is named after the output, and it was not copied back.
     assert!(
@@ -1636,7 +1804,7 @@ async fn exec_remote_bash_from_a_jailed_worker_is_submitted_unchanged() {
     assert_eq!(fs::read(&task.paths.stdout).unwrap(), "€".as_bytes());
     assert_eq!(
         done.output_preview.lines().next(),
-        Some("ran remotely on ck-motor")
+        Some("ran remotely on ck-motor (job 0192a64a-1234-7000-8000-000000000001)")
     );
     assert!(!done.output_preview.contains("local-proof"));
 }
@@ -4182,9 +4350,9 @@ async fn runon_network_is_present_on_wire_only_when_requested() {
         assert_eq!(captured.weight_hint, cpus, "{runon}: {runs:?}");
         if network.is_some() {
             let expected = if cpus.is_some() {
-                "ran remotely on ck-motor (4 vCPUs requested, network)"
+                "ran remotely on ck-motor (4 vCPUs requested, job 0192a64a-1234-7000-8000-000000000001, network)"
             } else {
-                "ran remotely on ck-motor (network)"
+                "ran remotely on ck-motor (job 0192a64a-1234-7000-8000-000000000001, network)"
             };
             assert_eq!(done.output_preview.lines().next(), Some(expected));
             assert!(!done.output_preview.contains("OFFLINE"), "{done:?}");
@@ -4431,7 +4599,7 @@ async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
     let rendered = crate::commands::bash_orchestrate::format_foreground_result(&done);
     assert_eq!(
         rendered.lines().next(),
-        Some("ran remotely on ck-motor"),
+        Some("ran remotely on ck-motor (job 0192a64a-1234-7000-8000-000000000001)"),
         "{rendered}"
     );
     // A report without a changed-file list says so, after the output.
@@ -4465,7 +4633,7 @@ async fn runon_vcpu_count_is_sent_as_weight_hint_on_the_wire() {
     let rendered = crate::commands::bash_orchestrate::format_foreground_result(&done);
     assert_eq!(
         rendered.lines().next(),
-        Some("ran remotely on ck-motor (4 vCPUs requested)"),
+        Some("ran remotely on ck-motor (4 vCPUs requested, job 0192a64a-1234-7000-8000-000000000001)"),
         "{rendered}"
     );
 }
@@ -4974,7 +5142,7 @@ async fn a_reporting_runner_report_is_printed_after_the_output() {
     let rendered = crate::commands::bash_orchestrate::format_foreground_result(&done);
     assert_eq!(
         rendered.lines().next(),
-        Some("ran remotely on ck-motor"),
+        Some("ran remotely on ck-motor (job 0192a64a-1234-7000-8000-000000000001)"),
         "{rendered}"
     );
     assert!(
@@ -5565,7 +5733,8 @@ async fn bash_status_and_watch_show_the_persisted_remote_phase_after_a_restart()
         if started {
             assert!(
                 status.starts_with(&format!(
-                    "Task {task_id}: running · the runner stops it 30 s after it started\n"
+                    "Task {task_id}: running · remote job {} · the runner stops it 30 s after it started\n",
+                    id()
                 )),
                 "{status}"
             );
@@ -5574,7 +5743,10 @@ async fn bash_status_and_watch_show_the_persisted_remote_phase_after_a_restart()
                 "{watch}"
             );
         } else {
-            let header = format!("Task {task_id}: running · queued on the runner (");
+            let header = format!(
+                "Task {task_id}: running · remote job {} · queued on the runner (",
+                id()
+            );
             assert!(status.starts_with(&header), "{status}");
             assert!(
                 status.lines().next().unwrap().ends_with(" s, position 1)"),

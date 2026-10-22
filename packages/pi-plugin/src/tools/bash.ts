@@ -511,6 +511,8 @@ interface BashStatusDetails {
   live_descendants_summary?: string;
   /** Text note saying which phase a still-running remote task has reached on the build server. */
   remote_phase_note?: string;
+  /** The build server's assigned job ID, present after it accepts a remote task. */
+  remote_job_id?: string;
   waited?: BashStatusWaited;
 }
 
@@ -2008,6 +2010,9 @@ async function formatBashStatus(
   let text = `Task ${taskId}: ${details.status}${exit}${dur}`;
   if (details.live_descendants_summary) {
     text += ` · ${details.live_descendants_summary}`;
+  }
+  if (details.status === "running" && details.remote_job_id) {
+    text += ` · remote job ${details.remote_job_id}`;
   }
   // A bash_watch reply (`details.waited` set) already reports the remote
   // phase in its kill-deadline line, so skip it here to avoid printing it twice.
