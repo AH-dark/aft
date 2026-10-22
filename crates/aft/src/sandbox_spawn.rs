@@ -8449,7 +8449,13 @@ mod policy_tests {
         let account = root.path().join("account");
         std::fs::create_dir(&account).unwrap();
         let ctx = context(project.clone());
-        ctx.update_config(|config| config.storage_dir = Some(root.path().join("store")));
+        let operator_binary = root.path().join("operator-aft");
+        std::fs::write(&operator_binary, "operator executable fixture").unwrap();
+        let _launcher = install_sandbox_launcher_for_test(&project, operator_binary.clone());
+        ctx.update_config(|config| {
+            config.storage_dir = Some(root.path().join("store"));
+            config.gh_shim.binary_path = Some(operator_binary);
+        });
         let untrusted = AuthenticatedPrincipal::RouteBind {
             trust: PrincipalTrust::Untrusted,
             route_channel: 7,

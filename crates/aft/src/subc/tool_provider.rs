@@ -5830,7 +5830,14 @@ mod route_tests {
                 RouteRole::ToolProviderV1,
                 subc_protocol::call_mode::CallMode::Classic,
             );
+            let operator_binary = storage.path().join("operator-aft");
+            std::fs::write(&operator_binary, "operator executable fixture").unwrap();
+            let _launcher = crate::sandbox_spawn::install_sandbox_launcher_for_test(
+                &identity.project_root,
+                operator_binary.clone(),
+            );
             ctx.update_config(|config| {
+                config.gh_shim.binary_path = Some(operator_binary);
                 config.sandbox.profile.head = if worker_mode == SandboxMode::Off {
                     SandboxMode::Strict
                 } else {
