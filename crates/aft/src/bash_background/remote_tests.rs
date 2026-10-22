@@ -6652,6 +6652,32 @@ pub(super) enum DrainingGate {
     /// After the runner refused a submission that AFT will not retry, before
     /// the worker reports the refusal.
     BeforeRefusalReport,
+    /// After a retry's resubmission failed without reaching the runner
+    /// (see `refuse_resubmission`), before the worker reports that.
+    BeforeNoStartRefusal,
+}
+
+fn refused_resubmission_roots() -> &'static Mutex<HashSet<PathBuf>> {
+    static ROOTS: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Make the next retry resubmission under `root` fail as a call that never
+/// reached the runner.
+fn refuse_next_resubmission(root: &Path) {
+    refused_resubmission_roots()
+        .lock()
+        .unwrap()
+        .insert(test_clock_key(root));
+}
+
+/// Called by a retry worker as it resubmits: true once after
+/// `refuse_next_resubmission` for its root.
+pub(super) fn refuse_resubmission(root: &Path) -> bool {
+    refused_resubmission_roots()
+        .lock()
+        .unwrap()
+        .remove(&test_clock_key(root))
 }
 
 type DrainingGateKey = (PathBuf, DrainingGate);
@@ -8182,6 +8208,80 @@ async fn bash_kill_scope_settles_when_paused_as_a_refusal_is_reported() {
         &registry.task(&task).unwrap().paths.json,
         "runner_sign_missing",
     );
+    assert_no_retry_sleep(&mut clock);
+}
+
+/// The saved record of a task the owner paused while its retry's resubmission
+/// failed without reaching the runner: paused, the cancellation recorded as
+/// sent, and no runner job or sign that the command started.
+fn assert_unsent_pause_saved(json: &Path) {
+    assert_saved_paused(json);
+    let remote = read_task(json).unwrap().remote.unwrap();
+    assert!(
+        remote.started.is_none() && !remote.output_received && remote.job_id.is_none(),
+        "{remote:?}"
+    );
+}
+
+/// A signer refusal's resubmission fails without reaching the runner, and the
+/// owner's pause lands before the worker reports that. The worker must still
+/// settle the pause: no submission of the command is left that could run.
+#[tokio::test]
+async fn bash_kill_scope_settles_when_paused_as_a_signer_resubmit_fails_unsent() {
+    let daemon = daemon(signer_retry_script(1), "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("signer-unsent");
+    refuse_next_resubmission(dir.path());
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeNoStartRefusal);
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let first = clock.now();
+    clock.expect_sleep(first, first + 2000).await;
+    clock.advance(2000);
+    gate.reached().await;
+    let operation = start_kill_scope(&registry, &scope);
+    pause_recorded(&registry, &task).await;
+    gate.release();
+    assert_pause_settles_promptly(&registry, operation, &task).await;
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_unsent_pause_saved(&registry.task(&task).unwrap().paths.json);
+    assert_no_retry_sleep(&mut clock);
+}
+
+/// The same for a draining retry: its resubmission fails without reaching the
+/// runner, and the pause lands before the worker reports that.
+#[tokio::test]
+async fn bash_kill_scope_settles_when_paused_as_a_draining_resubmit_fails_unsent() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: 1,
+            retry_after_ms: Some(200),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("draining-unsent");
+    refuse_next_resubmission(dir.path());
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeNoStartRefusal);
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let first = clock.now();
+    clock.expect_sleep(first, first + 200).await;
+    clock.advance(200);
+    gate.reached().await;
+    let operation = start_kill_scope(&registry, &scope);
+    pause_recorded(&registry, &task).await;
+    gate.release();
+    assert_pause_settles_promptly(&registry, operation, &task).await;
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_unsent_pause_saved(&registry.task(&task).unwrap().paths.json);
     assert_no_retry_sleep(&mut clock);
 }
 

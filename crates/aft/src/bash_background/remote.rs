@@ -2467,10 +2467,15 @@ impl BgTaskRegistry {
         }
         // A fresh submission gets its own signer-retry allowance, counted from now.
         let hinted = HintedRetry::start(root, request);
-        match client.run(&hinted.request).await {
+        match resubmit(client, &hinted.request, root).await {
             Ok(stream) => Ok(Some((stream, hinted))),
             Err(error) if proves_no_start(&error) => {
+                #[cfg(test)]
+                tests::draining_gate(root, tests::DrainingGate::BeforeNoStartRefusal).await;
                 self.refuse_remote_before_dispatch(task, &error.to_string())?;
+                // A pause that landed meanwhile already ended the task; the
+                // resubmission never reached the runner, so nothing runs.
+                self.settle_owner_pause_without_resubmit(task);
                 Ok(None)
             }
             Err(error) => Err(format!("remote outcome unknown; not resubmitted: {error}")),
@@ -2598,10 +2603,15 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
         }
         retry.resubmits += 1;
-        match client.run(&retry.request).await {
+        match resubmit(client, &retry.request, root).await {
             Ok(stream) => Ok(HintedRetryStep::Resubmitted(stream)),
             Err(error) if proves_no_start(&error) => {
+                #[cfg(test)]
+                tests::draining_gate(root, tests::DrainingGate::BeforeNoStartRefusal).await;
                 self.refuse_remote_before_dispatch(task, &error.to_string())?;
+                // A pause that landed meanwhile already ended the task; the
+                // resubmission never reached the runner, so nothing runs.
+                self.settle_owner_pause_without_resubmit(task);
                 Ok(HintedRetryStep::Ended)
             }
             Err(error) => Err(format!("remote outcome unknown; not resubmitted: {error}")),
@@ -3488,6 +3498,23 @@ fn append_executor_environment_disclosure(metadata: &mut PersistedTask) {
     if !note.contains(&disclosure) {
         note.push_str(&format!("\n{disclosure}"));
     }
+}
+
+/// Send a retry's resubmission. Tests can make it fail as a call that never
+/// reached the runner (see `tests::refuse_resubmission`).
+#[cfg(unix)]
+async fn resubmit(
+    client: &ExecRemoteClient,
+    request: &RunRequest,
+    _root: &Path,
+) -> Result<exec::RemoteStream, exec::Error> {
+    #[cfg(test)]
+    if tests::refuse_resubmission(_root) {
+        return Err(exec::Error::Protocol(
+            "test: resubmission failed before it was sent".into(),
+        ));
+    }
+    client.run(request).await
 }
 
 #[cfg(unix)]
