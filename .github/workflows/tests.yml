@@ -168,8 +168,8 @@ jobs:
   # path). The tradeoff — runner minutes spent on e2e when unit fails — is
   # accepted for the wall-clock halving.
   #
-  # All refs use the optimized, non-LTO stage profile. The release workflow
-  # builds and tests the shipped fat-LTO binaries before it can publish them.
+  # The staging selector uses non-LTO optimized builds except on macOS, where
+  # behavior-only E2E uses debug. Publication tests shipped fat-LTO binaries.
   # ---------------------------------------------------------------------------
   e2e:
     name: E2E
