@@ -3656,11 +3656,19 @@ async fn send_owed_cancels(storage_root: &Path) -> OwedCancelReport {
         let mut owed = owed_cancels()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let outcome = save_owed_cancel_outcome(&session_dir, &task_id, &marker, sent);
         let adopters = match owed.claims.remove(&task_id) {
             Some(OwedCancelOwner::Pass { adopters }) => adopters,
             _ => Vec::new(),
         };
+        // Registries holding the task get the outcome before the record is
+        // saved: their own later save of the task writes what they hold, and
+        // must not put the cancel back as owed.
+        if let OwedCancelSend::Done { outcome, .. } = &sent {
+            for task in adopters.iter().filter_map(std::sync::Weak::upgrade) {
+                apply_owed_cancel_outcome(&task, outcome);
+            }
+        }
+        let outcome = save_owed_cancel_outcome(&session_dir, &task_id, &marker, sent);
         match outcome {
             OwedCancelOutcome::Stale => report.stale_markers += 1,
             OwedCancelOutcome::Kept => report.left_to_worker += 1,
@@ -3670,17 +3678,9 @@ async fn send_owed_cancels(storage_root: &Path) -> OwedCancelReport {
                 } else {
                     report.cleared_without_job += 1;
                 }
-                for task in adopters.iter().filter_map(std::sync::Weak::upgrade) {
-                    apply_owed_cancel_outcome(&task, &outcome);
-                }
                 owed.settled.insert(task_id, outcome);
             }
-            OwedCancelOutcome::Failed(outcome) => {
-                report.failed += 1;
-                for task in adopters.iter().filter_map(std::sync::Weak::upgrade) {
-                    apply_owed_cancel_outcome(&task, &outcome);
-                }
-            }
+            OwedCancelOutcome::Failed => report.failed += 1,
         }
     }
     report
@@ -3701,7 +3701,7 @@ enum OwedCancelOutcome {
     Settled(String),
     /// The send failed and the cancel stays owed, so the next process start
     /// tries again (the pass runs once per storage root per process).
-    Failed(String),
+    Failed,
 }
 
 /// What sending one owed cancel did, before it is saved.
@@ -3715,9 +3715,10 @@ enum OwedCancelSend {
     Done { cleared: bool, outcome: String },
 }
 
-/// Save one owed cancel's outcome to the task's record. The record is
-/// finished, so it is rewritten directly: `update_task_at` keeps a finished
-/// record's fields unchanged.
+/// Save one owed cancel's outcome to the task's record: `cancel_pending` and
+/// `owner_pause_cancel`, merged into the latest record under its write lock;
+/// no other field is written back. The record is finished, so it is written
+/// directly: `update_task_at` keeps a finished record's fields unchanged.
 #[cfg(unix)]
 fn save_owed_cancel_outcome(
     session_dir: &Path,
@@ -3734,14 +3735,27 @@ fn save_owed_cancel_outcome(
         OwedCancelSend::Done { cleared, outcome } => (cleared, outcome),
     };
     let saved = resolve_task_layout(session_dir, task_id).and_then(|layout| {
+        let session_id = read_task_at(&layout)?.session_id;
+        // The task's record write lock, the one a registry holding the task
+        // takes for every save of it (shared through `DbWriteOrder`): the
+        // record is read again under it and only this pass's two fields are
+        // changed, so a save that landed meanwhile (a cleared cancelled-call
+        // notice, say) is kept, never written back to its older value.
+        let order = DbWriteOrder::for_task(&session_id, task_id);
+        let mut json_writes = order.lock_json_writes();
         let mut record = read_task_at(&layout)?;
+        #[cfg(test)]
+        tests::owed_cancel_save_gate(task_id);
         if let Some(remote) = record.remote.as_mut() {
             if cleared {
                 remote.cancel_pending = false;
             }
             remote.owner_pause_cancel = Some(outcome.clone());
         }
-        write_task_at(&layout, &record)
+        write_task_at(&layout, &record)?;
+        // A checkpoint snapshot taken before this write must not replace it.
+        *json_writes += 1;
+        Ok(())
     });
     match saved {
         // The marker goes only once the record says nothing is owed.
@@ -3754,7 +3768,7 @@ fn save_owed_cancel_outcome(
     if cleared {
         OwedCancelOutcome::Settled(outcome)
     } else {
-        OwedCancelOutcome::Failed(outcome)
+        OwedCancelOutcome::Failed
     }
 }
 

@@ -7399,6 +7399,94 @@ async fn a_stale_owed_cancel_marker_is_removed_without_sending() {
     assert!(!owed_marker(dir.path(), &task_id).exists());
 }
 
+type OwedCancelSaveGate = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+fn owed_cancel_save_gates() -> &'static Mutex<HashMap<String, OwedCancelSaveGate>> {
+    static GATES: std::sync::OnceLock<Mutex<HashMap<String, OwedCancelSaveGate>>> =
+        std::sync::OnceLock::new();
+    GATES.get_or_init(Default::default)
+}
+
+/// Called by the owed cancel pass between reading a task's record and
+/// writing its outcome; holds the pass there once if a test armed it.
+pub(super) fn owed_cancel_save_gate(task: &str) {
+    let armed = owed_cancel_save_gates().lock().unwrap().remove(task);
+    if let Some((reached, release)) = armed {
+        let _ = reached.send(());
+        let _ = release.recv_timeout(Duration::from_secs(30));
+    }
+}
+
+/// While the startup pass saves a paused task's owed-cancel outcome, the
+/// task's project (which replayed it meanwhile) takes the session's
+/// cancelled-call notices, clearing the record's notice flag. The pass must
+/// keep that change: the session gets the owner-cancellation notice once,
+/// and not again after another replay.
+#[tokio::test]
+async fn the_owed_cancel_pass_keeps_a_cancelled_call_notice_taken_during_its_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, task_id, job_id, json) = saved_task_owing_a_cancel(dir.path(), 3).await;
+    assert!(read_task(&json).unwrap().cancelled_call_unannounced);
+    let mut claimed = HeldDrainingGate::arm(dir.path(), DrainingGate::OwedCancelClaimed);
+    let (save_reached, release_save) = {
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        owed_cancel_save_gates()
+            .lock()
+            .unwrap()
+            .insert(task_id.clone(), (reached_tx, release_rx));
+        (reached, release)
+    };
+    let pass = {
+        let handle = BgTaskRegistry::start_owed_cancel_pass(dir.path()).unwrap();
+        tokio::task::spawn_blocking(move || handle.join().unwrap())
+    };
+    claimed.reached().await;
+    // The project replays the task while the pass holds its claim.
+    let project = registry();
+    project.replay_session(dir.path(), "session").unwrap();
+    claimed.release();
+    tokio::time::timeout(Duration::from_secs(30), save_reached)
+        .await
+        .expect("the pass must reach its save")
+        .unwrap();
+    // The session takes its notices between the pass's read and its write.
+    let taking = {
+        let project = project.clone();
+        tokio::task::spawn_blocking(move || project.take_cancelled_call_notices("session"))
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    release_save.send(()).unwrap();
+    let notices = taking.await.unwrap();
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|notice| notice.contains(&task_id))
+            .count(),
+        1,
+        "{notices:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(60), pass)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_owed_cancel_sent_once(&daemon, job_id, &json);
+    let saved = read_task(&json).unwrap();
+    assert!(!saved.cancelled_call_unannounced, "{saved:?}");
+    project.detach();
+    // Another replay must not announce the cancelled call again.
+    let again = registry();
+    again.replay_session(dir.path(), "session").unwrap();
+    let repeated = again.take_cancelled_call_notices("session");
+    assert!(
+        !repeated.iter().any(|notice| notice.contains(&task_id)),
+        "the notice was delivered again: {repeated:?}"
+    );
+}
+
 /// The startup pass has claimed a saved task's owed cancel when its project
 /// binds and replays the task. The replay must not start a worker that sends
 /// the cancel a second time; it takes the pass's outcome instead.
