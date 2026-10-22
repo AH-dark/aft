@@ -1844,7 +1844,10 @@ fn format_grep(data: &Value) -> String {
             });
 
         if matches.is_empty() {
-            format!("Found {total_matches} match across {files_with_matches} file")
+            crate::commands::grep::found_matches_phrase(
+                total_matches as usize,
+                files_with_matches as usize,
+            )
         } else {
             let body = matches
                 .iter()
@@ -1860,7 +1863,13 @@ fn format_grep(data: &Value) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            format!("{body}\n\nFound {total_matches} match across {files_with_matches} file")
+            format!(
+                "{body}\n\n{}",
+                crate::commands::grep::found_matches_phrase(
+                    total_matches as usize,
+                    files_with_matches as usize,
+                )
+            )
         }
     };
 

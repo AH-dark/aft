@@ -168,6 +168,7 @@ pub(crate) fn grep_fan_out(
     scope: &GrepScope,
     params: &GrepParams,
     filters: &PathFilters,
+    order: crate::search_index::GrepScanOrder,
 ) -> Option<(GrepResult, GrepExecutionPhaseTimings, Vec<Value>)> {
     let session = super::session_for(ctx)?;
     let project_root = crate::grep_executor::project_root(ctx);
@@ -184,9 +185,10 @@ pub(crate) fn grep_fan_out(
                 multi_root: false,
                 per_root_max: scope.per_root_max,
             };
-            let (result, root_phases) = crate::grep_executor::execute_profiled_with_filters(
-                ctx, pattern, &single, params, filters,
-            );
+            let (result, root_phases) =
+                crate::grep_executor::execute_profiled_with_filters_in_order(
+                    ctx, pattern, &single, params, filters, order,
+                );
             scope_has_files |= root_phases.indexed_scope_has_files.unwrap_or(true);
             results.push(result);
             continue;
@@ -212,19 +214,24 @@ pub(crate) fn grep_fan_out(
         }
         // Children are independent indexes, so they are searched in parallel:
         // the parent's latency then tracks its largest child, not the sum.
+        // Their path-ordered scans run at once, so they share one row budget.
+        let row_budget = crate::search_index::PATH_ORDER_BATCH_ROW_BUDGET / snapshots.len().max(1);
         use rayon::prelude::*;
         let answers = snapshots
             .par_iter()
             .map(|snapshot| {
                 let has_files = snapshot.has_file_in_scope_with_filters(search_root, filters);
-                let (result, timings) = snapshot.search_grep_profiled_with_filters_and_query(
-                    pattern,
-                    &query,
-                    filters,
-                    search_root,
-                    max_results,
-                    params.path_exclusion,
-                );
+                let (result, timings) = snapshot
+                    .search_grep_profiled_with_filters_and_query_in_order_with_row_budget(
+                        pattern,
+                        &query,
+                        filters,
+                        search_root,
+                        max_results,
+                        params.path_exclusion,
+                        order,
+                        row_budget,
+                    );
                 (has_files, result, timings)
             })
             .collect::<Vec<_>>();

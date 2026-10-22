@@ -96,6 +96,7 @@ pub mod executor;
 pub mod extract;
 pub mod feature_config;
 pub mod feature_status;
+pub mod file_kind;
 pub mod fleet_status;
 pub mod format;
 pub mod fs_lock;

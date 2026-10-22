@@ -1,7 +1,7 @@
 {
   "id": "confine-vector",
   "success": true,
-  "text": "Found 0 match across 0 file [index: fallback; searched all 0 files directly]\n\n(0 files searched: the include pattern matched none of 2 files; nothing was searched.)",
+  "text": "Found 0 matches in 0 files [index: fallback; searched all 0 files directly]\n\n(0 files searched: the include pattern matched none of 2 files; nothing was searched.)",
   "complete": true,
   "no_files_matched_scope": true,
   "skipped_foreign_mounts": 0,
@@ -12,6 +12,9 @@
   "lines_truncated": 0,
   "next_offset": null,
   "total_matches": 0,
+  "display_matches": 0,
+  "counted_matches": 0,
+  "counted_files": [],
   "files_searched": 0,
   "files_read_directly": 0,
   "files_with_matches": 0,

@@ -5,7 +5,6 @@
       "**/*.ts",
       "**/*.{vue,tsx}"
     ],
-    "max_results": 100,
     "pattern": "value"
   },
   "command": "grep"

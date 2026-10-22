@@ -21,7 +21,7 @@ import { asRecord } from "./util.js";
  * pins its whole trailer line character for character.
  */
 export const TRUNCATION_TRAILER_PATTERN =
-  "^shown (?<shown>\\d+) of (?:≥)?(?<total>\\d+) (?<unit>[^ ]+) \\((?<reason>cap|depth|budget|walk)\\)(?: · narrow: (?<narrow>.+))?$";
+  "^shown (?<shown>\\d+) of (?:≥)?(?<total>\\d+) (?<unit>[^ ]+) \\((?<reason>cap|depth|budget|walk|kind)\\)(?: · narrow: (?<narrow>.+))?$";
 
 /**
  * The kill-deadline line, in each wording the product emits

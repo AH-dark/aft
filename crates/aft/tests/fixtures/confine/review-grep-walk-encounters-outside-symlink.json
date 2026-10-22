@@ -1,7 +1,7 @@
 {
   "id": "confine-vector",
   "success": true,
-  "text": "only.rs\n1: fn pinned_token() {}\n\nFound 1 match across 1 file [index: fallback; searched all 2 files directly]",
+  "text": "only.rs\n1: fn pinned_token() {}\n\nFound 1 match in 1 file [index: fallback; searched all 2 files directly]",
   "complete": true,
   "no_files_matched_scope": false,
   "skipped_foreign_mounts": 0,
@@ -20,6 +20,9 @@
   "lines_truncated": 0,
   "next_offset": null,
   "total_matches": 1,
+  "display_matches": 1,
+  "counted_matches": 0,
+  "counted_files": [],
   "files_searched": 2,
   "files_read_directly": 2,
   "files_with_matches": 1,

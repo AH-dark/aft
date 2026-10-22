@@ -6,10 +6,13 @@ pub const R23_MAX_DISPLAY_TOTAL: usize = 999_999_999;
 pub const R23_CLAMP_THRESHOLD: usize = 1_000_000_000;
 
 /// Reason why a list-shaped surface was cut short.
-/// Precedence ordering: TimeLimit > Walk > Depth > Budget > Cap.
+/// Precedence ordering: TimeLimit > Walk > Depth > Budget > Cap > Kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
+    /// Entries were counted instead of listed because of what kind of file
+    /// holds them (grep counts lockfile and log lines, for example).
+    Kind,
     Cap,
     Budget,
     Depth,
@@ -26,6 +29,7 @@ impl Reason {
             Self::Depth => 3,
             Self::Budget => 2,
             Self::Cap => 1,
+            Self::Kind => 0,
         }
     }
 
@@ -36,6 +40,7 @@ impl Reason {
             Self::Depth => "depth",
             Self::Budget => "budget",
             Self::Cap => "cap",
+            Self::Kind => "kind",
         }
     }
 }

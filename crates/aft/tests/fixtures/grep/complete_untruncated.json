@@ -38,5 +38,5 @@
   "truncated": false,
   "walk_truncated": false,
   "skipped_foreign_mounts": 0,
-  "text": "src/comp_a.rs:1: complete line 1\nsrc/comp_a.rs:2: complete line 2\n\nsrc/comp_b.rs:1: complete line 1\nsrc/comp_b.rs:2: complete line 2\n\nFound 4 match across 2 file"
+  "text": "src/comp_a.rs:1: complete line 1\nsrc/comp_a.rs:2: complete line 2\n\nsrc/comp_b.rs:1: complete line 1\nsrc/comp_b.rs:2: complete line 2\n\nFound 4 matches across 2 files"
 }

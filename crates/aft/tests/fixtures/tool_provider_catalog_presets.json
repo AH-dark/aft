@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "12c4092096233ce2687c9af87090482388c9560b4a24322f5c793e35e67365f5",
-      "catalog_digest": "12c4092096233ce2687c9af87090482388c9560b4a24322f5c793e35e67365f5",
+      "generation": "58c99d0c6ac7aa45cc00e9e1c0f7c9f366de8d344ba86f04e3373a52b5006066",
+      "catalog_digest": "58c99d0c6ac7aa45cc00e9e1c0f7c9f366de8d344ba86f04e3373a52b5006066",
       "tools": [
         {
           "name": "status",
@@ -315,7 +315,7 @@
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Shows up to 100 matching lines per call; lines longer than 500 characters are cut and marked `[line truncated]`, and a page stops early once its rows reach about 50 KB. Pass `offset` (skip that many matching lines) to page through the rest, or narrow with `path` or `include`. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Lockfiles, generated and minified files, logs and command output, and JSON data files are counted, not printed, unless `path` or `include` names them; the reply lists them with the value to pass. Long lines are shown as a window around the match. A large result starts with matching lines per file and a 40-line first page; pass `offset` to page. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -330,7 +330,7 @@
                 "type": "string"
               },
               "offset": {
-                "description": "Zero-based count of matching lines to skip, for paging (default: 0, max: 100000).",
+                "description": "Rows of shown results to skip; follow the next offset the reply names.",
                 "type": "integer",
                 "minimum": 0,
                 "maximum": 100000
@@ -1236,8 +1236,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "79d0ab2dfe16220f79e5030d8b86118c18f1cb1776a0578a5969afb5fe2c1816",
-      "catalog_digest": "79d0ab2dfe16220f79e5030d8b86118c18f1cb1776a0578a5969afb5fe2c1816",
+      "generation": "02fd2e73621a84e1473425a7fccc10f4ac572366e0ddd7edffd88401174ba104",
+      "catalog_digest": "02fd2e73621a84e1473425a7fccc10f4ac572366e0ddd7edffd88401174ba104",
       "tools": [
         {
           "name": "status",
@@ -1614,7 +1614,7 @@
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Shows up to 100 matching lines per call; lines longer than 500 characters are cut and marked `[line truncated]`, and a page stops early once its rows reach about 50 KB. Pass `offset` (skip that many matching lines) to page through the rest, or narrow with `path` or `include`. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Lockfiles, generated and minified files, logs and command output, and JSON data files are counted, not printed, unless `path` or `include` names them; the reply lists them with the value to pass. Long lines are shown as a window around the match. A large result starts with matching lines per file and a 40-line first page; pass `offset` to page. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -1629,7 +1629,7 @@
                 "type": "string"
               },
               "offset": {
-                "description": "Zero-based count of matching lines to skip, for paging (default: 0, max: 100000).",
+                "description": "Rows of shown results to skip; follow the next offset the reply names.",
                 "type": "integer",
                 "minimum": 0,
                 "maximum": 100000
@@ -2536,8 +2536,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "82c1e4b4f3c0d02c8fe8e41f97399ac6d7954d76628b632e7c2854f488e7e144",
-      "catalog_digest": "82c1e4b4f3c0d02c8fe8e41f97399ac6d7954d76628b632e7c2854f488e7e144",
+      "generation": "b9f52eab7b5fbe5109f23c609b5c726ccd9b86d7abf7e1d974ed4d157c2c8101",
+      "catalog_digest": "b9f52eab7b5fbe5109f23c609b5c726ccd9b86d7abf7e1d974ed4d157c2c8101",
       "tools": [
         {
           "name": "read",
@@ -2606,7 +2606,7 @@
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Shows up to 100 matching lines per call; lines longer than 500 characters are cut and marked `[line truncated]`, and a page stops early once its rows reach about 50 KB. Pass `offset` (skip that many matching lines) to page through the rest, or narrow with `path` or `include`. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Lockfiles, generated and minified files, logs and command output, and JSON data files are counted, not printed, unless `path` or `include` names them; the reply lists them with the value to pass. Long lines are shown as a window around the match. A large result starts with matching lines per file and a 40-line first page; pass `offset` to page. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -2621,7 +2621,7 @@
                 "type": "string"
               },
               "offset": {
-                "description": "Zero-based count of matching lines to skip, for paging (default: 0, max: 100000).",
+                "description": "Rows of shown results to skip; follow the next offset the reply names.",
                 "type": "integer",
                 "minimum": 0,
                 "maximum": 100000
@@ -2981,8 +2981,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "82c1e4b4f3c0d02c8fe8e41f97399ac6d7954d76628b632e7c2854f488e7e144",
-      "catalog_digest": "82c1e4b4f3c0d02c8fe8e41f97399ac6d7954d76628b632e7c2854f488e7e144",
+      "generation": "b9f52eab7b5fbe5109f23c609b5c726ccd9b86d7abf7e1d974ed4d157c2c8101",
+      "catalog_digest": "b9f52eab7b5fbe5109f23c609b5c726ccd9b86d7abf7e1d974ed4d157c2c8101",
       "tools": [
         {
           "name": "read",
@@ -3051,7 +3051,7 @@
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Shows up to 100 matching lines per call; lines longer than 500 characters are cut and marked `[line truncated]`, and a page stops early once its rows reach about 50 KB. Pass `offset` (skip that many matching lines) to page through the rest, or narrow with `path` or `include`. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Lockfiles, generated and minified files, logs and command output, and JSON data files are counted, not printed, unless `path` or `include` names them; the reply lists them with the value to pass. Long lines are shown as a window around the match. A large result starts with matching lines per file and a 40-line first page; pass `offset` to page. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -3066,7 +3066,7 @@
                 "type": "string"
               },
               "offset": {
-                "description": "Zero-based count of matching lines to skip, for paging (default: 0, max: 100000).",
+                "description": "Rows of shown results to skip; follow the next offset the reply names.",
                 "type": "integer",
                 "minimum": 0,
                 "maximum": 100000
@@ -3427,8 +3427,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "1fb7289a7ebcb3c57f9b0dc2f73fac5aeea2ee604e0b340b14b8e2f723ab2e0c",
-      "catalog_digest": "1fb7289a7ebcb3c57f9b0dc2f73fac5aeea2ee604e0b340b14b8e2f723ab2e0c",
+      "generation": "7356f39e4f1a5d671a61eb6e0980907615f67d0627e1868438983452a6bf2b58",
+      "catalog_digest": "7356f39e4f1a5d671a61eb6e0980907615f67d0627e1868438983452a6bf2b58",
       "tools": [
         {
           "name": "status",
@@ -3736,7 +3736,7 @@
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Shows up to 100 matching lines per call; lines longer than 500 characters are cut and marked `[line truncated]`, and a page stops early once its rows reach about 50 KB. Pass `offset` (skip that many matching lines) to page through the rest, or narrow with `path` or `include`. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Lockfiles, generated and minified files, logs and command output, and JSON data files are counted, not printed, unless `path` or `include` names them; the reply lists them with the value to pass. Long lines are shown as a window around the match. A large result starts with matching lines per file and a 40-line first page; pass `offset` to page. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -3751,7 +3751,7 @@
                 "type": "string"
               },
               "offset": {
-                "description": "Zero-based count of matching lines to skip, for paging (default: 0, max: 100000).",
+                "description": "Rows of shown results to skip; follow the next offset the reply names.",
                 "type": "integer",
                 "minimum": 0,
                 "maximum": 100000
@@ -4658,8 +4658,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "b2743a03889ef597ccc57e87d588496c999e83db3ad521807fb9e0ff219e9567",
-      "catalog_digest": "b2743a03889ef597ccc57e87d588496c999e83db3ad521807fb9e0ff219e9567",
+      "generation": "e11d20ee7161cb404fa6e462d67184efe8d7fb2f43e663ae852631f5aebe402b",
+      "catalog_digest": "e11d20ee7161cb404fa6e462d67184efe8d7fb2f43e663ae852631f5aebe402b",
       "tools": [
         {
           "name": "status",
@@ -5040,7 +5040,7 @@
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Shows up to 100 matching lines per call; lines longer than 500 characters are cut and marked `[line truncated]`, and a page stops early once its rows reach about 50 KB. Pass `offset` (skip that many matching lines) to page through the rest, or narrow with `path` or `include`. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Lockfiles, generated and minified files, logs and command output, and JSON data files are counted, not printed, unless `path` or `include` names them; the reply lists them with the value to pass. Long lines are shown as a window around the match. A large result starts with matching lines per file and a 40-line first page; pass `offset` to page. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -5055,7 +5055,7 @@
                 "type": "string"
               },
               "offset": {
-                "description": "Zero-based count of matching lines to skip, for paging (default: 0, max: 100000).",
+                "description": "Rows of shown results to skip; follow the next offset the reply names.",
                 "type": "integer",
                 "minimum": 0,
                 "maximum": 100000

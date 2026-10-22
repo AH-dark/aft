@@ -17,8 +17,8 @@ use crate::protocol::Response;
 use crate::search_index::{
     build_path_filters, decompose_grep_pattern, resolve_search_scope,
     sort_grep_matches_by_mtime_desc, sort_walked_paths_by_mtime_desc, try_read_with_budget,
-    GrepMatch, GrepPathExclusion, GrepQueryPhaseTimings, GrepResult, IndexStatus, PathFilters,
-    RegexQuery, WalkBound, INTERACTIVE_ARTIFACT_READ_BUDGET,
+    GrepMatch, GrepPathExclusion, GrepQueryPhaseTimings, GrepResult, GrepScanOrder, IndexStatus,
+    PathFilters, RegexQuery, WalkBound, INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
 
 /// Maximum files enumerated during grep/glob index-unavailable fallback walks.
@@ -274,6 +274,46 @@ pub fn project_root(ctx: &AppContext) -> PathBuf {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
     crate::bounded_io::canonicalize(&project_root).unwrap_or(project_root)
+}
+
+/// The test-only finishing order for a path-ordered fallback batch, or
+/// `None` (outside tests always) to search the batch in parallel.
+fn path_batch_order_for_test(search_root: &Path) -> Option<bool> {
+    #[cfg(test)]
+    {
+        scan_order_for_test::get(search_root)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = search_root;
+        None
+    }
+}
+
+/// Test-only override of the order in which the files of a path-ordered
+/// fallback batch finish: when set for a search root, the batch's files are
+/// searched one at a time, forward or reversed, instead of in parallel.
+#[cfg(test)]
+pub(crate) mod scan_order_for_test {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    static ORDERS: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+
+    pub(crate) fn set(root: &Path, reversed: bool) {
+        if let Ok(mut orders) = ORDERS.get_or_init(Default::default).lock() {
+            orders.insert(root.to_path_buf(), reversed);
+        }
+    }
+
+    pub(crate) fn get(root: &Path) -> Option<bool> {
+        ORDERS
+            .get_or_init(Default::default)
+            .lock()
+            .ok()
+            .and_then(|orders| orders.get(root).copied())
+    }
 }
 
 pub(crate) fn resolve_grep_scope(
@@ -555,6 +595,27 @@ pub(crate) fn execute_profiled_with_filters(
     params: &GrepParams,
     filters: &PathFilters,
 ) -> (GrepResult, GrepExecutionPhaseTimings) {
+    execute_profiled_with_filters_in_order(
+        ctx,
+        pattern,
+        scope,
+        params,
+        filters,
+        GrepScanOrder::Arrival,
+    )
+}
+
+/// [`execute_profiled_with_filters`] with a choice of which lines are kept
+/// once the search passes `params.max_results`: the first found, or the
+/// first by path and line.
+pub(crate) fn execute_profiled_with_filters_in_order(
+    ctx: &AppContext,
+    pattern: &CompiledPattern,
+    scope: &GrepScope,
+    params: &GrepParams,
+    filters: &PathFilters,
+    order: GrepScanOrder,
+) -> (GrepResult, GrepExecutionPhaseTimings) {
     let project_root = project_root(ctx);
     let query_started = Instant::now();
     let query = decompose_grep_pattern(pattern);
@@ -569,6 +630,7 @@ pub(crate) fn execute_profiled_with_filters(
             filters,
             params.max_results,
             &project_root,
+            order,
         );
         phases.query_decomposition = query_decomposition;
         return (result, phases);
@@ -586,6 +648,7 @@ pub(crate) fn execute_profiled_with_filters(
             filters,
             scope.per_root_max,
             &project_root,
+            order,
         );
         results.push(result);
         if let Some(phases) = phases.as_mut() {
@@ -675,6 +738,7 @@ fn execute_root_profiled(
     filters: &PathFilters,
     max_results: usize,
     project_root: &Path,
+    order: GrepScanOrder,
 ) -> (GrepResult, GrepExecutionPhaseTimings) {
     // A confined search never starts outside its fence, whether at a named
     // file (read directly below, not walked) or at a directory.
@@ -729,6 +793,7 @@ fn execute_root_profiled(
             params.path_exclusion,
             &mut counts,
             root.ignored_target,
+            order,
         );
         return (
             result,
@@ -765,14 +830,16 @@ fn execute_root_profiled(
         // holds no files (everything ignored, or an empty project): that is a
         // real, complete answer, not a missing scope.
         if indexed_scope_has_files || is_same_directory(&root.search_root, project_root) {
-            let (result, mut query_timings) = snapshot.search_grep_profiled_with_filters_and_query(
-                pattern,
-                query,
-                filters,
-                &root.search_root,
-                max_results,
-                params.path_exclusion,
-            );
+            let (result, mut query_timings) = snapshot
+                .search_grep_profiled_with_filters_and_query_in_order(
+                    pattern,
+                    query,
+                    filters,
+                    &root.search_root,
+                    max_results,
+                    params.path_exclusion,
+                    order,
+                );
             query_timings.post_filter += scope_elapsed;
             return (
                 result,
@@ -824,6 +891,7 @@ fn execute_root_profiled(
         params.path_exclusion,
         &mut counts,
         ignored_target,
+        order,
     );
     (
         result,
@@ -1699,6 +1767,7 @@ fn fallback_grep(
         path_exclusion,
         &mut ScopeFileCounts::default(),
         false,
+        GrepScanOrder::Arrival,
     )
 }
 
@@ -1714,6 +1783,7 @@ fn fallback_grep_counted(
     path_exclusion: Option<GrepPathExclusion>,
     counts: &mut ScopeFileCounts,
     ignored_target: bool,
+    order: GrepScanOrder,
 ) -> GrepResult {
     fallback_grep_with_limits_counted(
         project_root,
@@ -1728,6 +1798,7 @@ fn fallback_grep_counted(
         FALLBACK_WALK_BUDGET,
         counts,
         ignored_target,
+        order,
     )
 }
 
@@ -1760,6 +1831,7 @@ fn fallback_grep_with_limits(
         budget,
         &mut ScopeFileCounts::default(),
         false,
+        GrepScanOrder::Arrival,
     )
 }
 
@@ -1777,6 +1849,7 @@ fn fallback_grep_with_limits_counted(
     budget: Duration,
     counts: &mut ScopeFileCounts,
     ignored_target: bool,
+    order: GrepScanOrder,
 ) -> GrepResult {
     let _io_scope = crate::bounded_io::enter_if_absent(budget);
     let total_matches = AtomicUsize::new(0);
@@ -1791,6 +1864,8 @@ fn fallback_grep_with_limits_counted(
 
     let mut matches = Vec::new();
     let mut batch: Vec<PathBuf> = Vec::with_capacity(256);
+    // Files for a path-ordered scan, searched one at a time after the walk.
+    let mut ordered: Vec<PathBuf> = Vec::new();
     let io_budget = crate::bounded_io::current();
     let confinement = crate::context::confinement::capture();
 
@@ -1860,6 +1935,10 @@ fn fallback_grep_with_limits_counted(
             if stop_scan.load(Ordering::Relaxed) {
                 return;
             }
+            if order == GrepScanOrder::Path {
+                ordered.push(path.clone());
+                return;
+            }
             batch.push(path.clone());
             if batch.len() >= 256 {
                 flush_batch(&mut batch, &mut matches);
@@ -1868,6 +1947,128 @@ fn fallback_grep_with_limits_counted(
         ignored_target,
     );
     flush_batch(&mut batch, &mut matches);
+    // A path-ordered scan searches the walked files sorted by path, in
+    // batches, in parallel within a batch, and stops after the batch that
+    // brings the kept lines to the cap. Each file keeps at most its share of
+    // the batch's row budget and never more than the lines still missing
+    // when its batch starts (a file the cap needs more lines from is searched
+    // again on its own); rows are added in batch order, so the kept lines are
+    // the first by path and line whatever order files finish in. Only a scan
+    // stopped by its deadline, cancelled, or cut short by the walk's file
+    // limit can keep different lines.
+    ordered.sort();
+    let batches = ordered.chunks(crate::search_index::PATH_ORDER_BATCH_FILES);
+    let batch_count = batches.len();
+    for (batch_index, batch) in batches.enumerate() {
+        if Instant::now() >= scan_deadline
+            || job_cancellation
+                .as_ref()
+                .is_some_and(|token| token.cancel_requested_before_commit())
+        {
+            engine_capped.store(true, Ordering::Relaxed);
+            break;
+        }
+        let remaining = max_results.saturating_sub(matches.len());
+        let allowance = crate::search_index::path_order_file_allowance(
+            remaining,
+            batch.len(),
+            crate::search_index::PATH_ORDER_BATCH_ROW_BUDGET,
+        );
+        let search_one = |file: &PathBuf| {
+            let file_matches = AtomicUsize::new(0);
+            let file_truncated = AtomicBool::new(false);
+            let rows = fallback_search_file(
+                file,
+                pattern,
+                allowance,
+                allowance,
+                &file_matches,
+                &files_searched,
+                &files_with_matches,
+                &file_truncated,
+                &engine_capped,
+                job_cancellation.as_ref(),
+                Some(scan_deadline),
+                false,
+            );
+            total_matches.fetch_add(file_matches.load(Ordering::Relaxed), Ordering::Relaxed);
+            (rows, file_truncated.load(Ordering::Relaxed))
+        };
+        let per_file: Vec<(Vec<GrepMatch>, bool)> = match path_batch_order_for_test(search_root) {
+            Some(reversed) => {
+                // Tests finish the batch's files one at a time, forward or
+                // reversed, to show the kept lines do not depend on it.
+                let mut slots: Vec<(Vec<GrepMatch>, bool)> =
+                    (0..batch.len()).map(|_| (Vec::new(), false)).collect();
+                let mut positions: Vec<usize> = (0..batch.len()).collect();
+                if reversed {
+                    positions.reverse();
+                }
+                for position in positions {
+                    slots[position] = search_one(&batch[position]);
+                }
+                slots
+            }
+            None => batch
+                .par_iter()
+                .map_init(
+                    || crate::bounded_io::enter(io_budget.clone()),
+                    |_scope, file| {
+                        crate::context::confinement::inherit(confinement.clone(), || {
+                            search_one(file)
+                        })
+                    },
+                )
+                .collect(),
+        };
+        let search_again = |file: usize, need: usize| {
+            // The file was already counted as searched (and as matching) by
+            // the batch; only its match count changes.
+            let file_matches = AtomicUsize::new(0);
+            let file_truncated = AtomicBool::new(false);
+            let rows = fallback_search_file(
+                &batch[file],
+                pattern,
+                need,
+                need,
+                &file_matches,
+                &AtomicUsize::new(0),
+                &AtomicUsize::new(0),
+                &file_truncated,
+                &engine_capped,
+                job_cancellation.as_ref(),
+                Some(scan_deadline),
+                false,
+            );
+            // The batch counted `allowance + 1` matches for it.
+            total_matches.fetch_add(
+                file_matches
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(allowance + 1),
+                Ordering::Relaxed,
+            );
+            (rows, file_truncated.load(Ordering::Relaxed))
+        };
+        let lines_past = crate::search_index::keep_path_ordered_batch(
+            &mut matches,
+            max_results,
+            allowance,
+            per_file,
+            search_again,
+            |rows| crate::search_index::note_path_order_held_rows(search_root, rows),
+        );
+        if lines_past {
+            truncated.store(true, Ordering::Relaxed);
+        }
+        if matches.len() >= max_results {
+            if batch_index + 1 < batch_count {
+                // Later files were not read.
+                truncated.store(true, Ordering::Relaxed);
+                engine_capped.store(true, Ordering::Relaxed);
+            }
+            break;
+        }
+    }
     *counts = progress.counts;
     let mut walk_bound = progress.bound;
     if Instant::now() >= scan_deadline {
@@ -2442,6 +2643,66 @@ mod tests {
         );
     }
 
+    /// 256 files of 100,000 matching lines each: 25.6 million matching lines,
+    /// of which the default store cap of 100,100 keeps the first by path.
+    fn dense_lines_project() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let content = "x\n".repeat(100_000);
+        for index in 0..256 {
+            std::fs::write(root.join(format!("dense_{index:03}.txt")), &content).unwrap();
+        }
+        (dir, root)
+    }
+
+    /// The rows a capped path-ordered grep of [`dense_lines_project`] keeps:
+    /// every line of the first file and the first 100 of the second.
+    fn dense_lines_first_rows(root: &Path) -> Vec<(PathBuf, u32)> {
+        let first = root.join("dense_000.txt");
+        let second = root.join("dense_001.txt");
+        (1..=100_000)
+            .map(|line| (first.clone(), line))
+            .chain((1..=100).map(|line| (second.clone(), line)))
+            .collect()
+    }
+
+    #[test]
+    fn path_ordered_fallback_scan_of_dense_files_holds_at_most_its_row_budget() {
+        let (_dir, root) = dense_lines_project();
+        let max_results = 100_100;
+        crate::search_index::path_order_held_rows_for_test::take(&root);
+        let result = fallback_grep_with_limits_counted(
+            &root,
+            &root,
+            &root,
+            &literal("x"),
+            &PathFilters::default(),
+            max_results,
+            IndexStatus::Fallback,
+            None,
+            10_000,
+            Duration::from_secs(600),
+            &mut ScopeFileCounts::default(),
+            false,
+            GrepScanOrder::Path,
+        );
+        let peak = crate::search_index::path_order_held_rows_for_test::take(&root);
+        // Every file of a batch keeping all 100,100 lines the cap needs would
+        // hold 25.6 million rows to keep 100,100.
+        assert!(
+            peak <= max_results + crate::search_index::PATH_ORDER_BATCH_ROW_BUDGET,
+            "held {peak} rows at once"
+        );
+        assert!(result.truncated);
+        let mut kept: Vec<(PathBuf, u32)> = result
+            .matches
+            .iter()
+            .map(|row| (row.file.clone(), row.line))
+            .collect();
+        kept.sort();
+        assert_eq!(kept, dense_lines_first_rows(&root));
+    }
+
     fn grep_match(file: &Path, line: u32, column: u32) -> GrepMatch {
         GrepMatch {
             file: file.to_path_buf(),
@@ -2557,13 +2818,17 @@ mod tests {
 
     /// The grep tool's reply text for `result`, as `handle_grep` builds it.
     fn grep_tool_text(result: &GrepResult, project_root: &Path) -> String {
-        let page_matches: Vec<&GrepMatch> = result.matches.iter().collect();
-        let page = crate::commands::grep::render_grep_page(
-            &page_matches,
-            project_root,
-            crate::commands::grep::GREP_MAX_OUTPUT_BYTES,
-        );
-        let mut text = crate::commands::grep::grep_page_text(result, &page, 0, false);
+        let mut text = crate::commands::grep::grep_page_output(
+            result,
+            &crate::commands::grep::GrepPageRequest {
+                project_root,
+                include: &[],
+                file_roots: &[],
+                offset: 0,
+                explicit_page_rows: None,
+            },
+        )
+        .text;
         if let Some(note) = crate::commands::grep::walk_coverage_note(result) {
             text.push_str("\n\n");
             text.push_str(&note);
@@ -2593,7 +2858,7 @@ mod tests {
         let text = grep_tool_text(&result, project.path());
         assert_eq!(
             text,
-            "Found 0 match across 0 file [index: building; searched all 3 files directly]"
+            "Found 0 matches in 0 files [index: building; searched all 3 files directly]"
         );
     }
 
@@ -2619,7 +2884,7 @@ mod tests {
         let text = grep_tool_text(&result, project.path());
         assert!(
             text.starts_with(
-                "Found 0 match across 0 file [index: building; incomplete: checked 2 files before the walk's 2-file limit]"
+                "Found 0 matches in 0 files [index: building; incomplete: checked 2 files before the walk's 2-file limit]"
             ),
             "{text}"
         );
@@ -2769,6 +3034,7 @@ mod tests {
                 None,
                 &mut counts,
                 false,
+                GrepScanOrder::Arrival,
             );
             assert_eq!(result.total_matches, 5, "{ignored_directory}: {result:?}");
             assert!(!result.walk_truncated, "{ignored_directory}: {result:?}");

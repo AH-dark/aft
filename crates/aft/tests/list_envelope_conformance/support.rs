@@ -19,7 +19,9 @@ use aft::list_surfaces::bash::{
     append_envelope_trailer, build_bash_output_envelope, produce_bash_reply_data,
 };
 use aft::list_surfaces::glob::{build_glob_envelope, build_glob_envelope_with_time_limit};
-use aft::list_surfaces::grep::build_grep_envelope_from_parts;
+use aft::list_surfaces::grep::{
+    build_grep_envelope_from_parts, build_grep_envelope_with_counted, GrepPageCounts,
+};
 use aft::list_surfaces::inspect::build_inspect_envelope;
 use aft::list_surfaces::outline::build_outline_files_envelope;
 use aft::list_surfaces::search::attach_projected_search_envelope;
@@ -152,6 +154,22 @@ const WALK_CAP: &[ReasonSpec] = &[
         kind: ReasonKind::Selecting,
     },
 ];
+// grep also counts lines in lockfiles, logs and other non-source kinds
+// instead of printing them; those cuts are `kind`, ranked below `cap`.
+const GREP_REASONS: &[ReasonSpec] = &[
+    ReasonSpec {
+        reason: Reason::Walk,
+        kind: ReasonKind::Bounding,
+    },
+    ReasonSpec {
+        reason: Reason::Cap,
+        kind: ReasonKind::Selecting,
+    },
+    ReasonSpec {
+        reason: Reason::Kind,
+        kind: ReasonKind::Selecting,
+    },
+];
 const GLOB_REASONS: &[ReasonSpec] = &[
     ReasonSpec {
         reason: Reason::TimeLimit,
@@ -231,8 +249,8 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         mode: "",
         list_id: "payload.matches",
         unit: Unit::Rows,
-        narrow: &["offset", "path", "include", "exclude"],
-        reasons: WALK_CAP,
+        narrow: &["offset", "path", "include"],
+        reasons: GREP_REASONS,
     },
     SurfaceSpec {
         command: "glob",
@@ -338,12 +356,23 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
         ),
         ("search", "") => fixture_search_envelope(10, has(Reason::Cap), has(Reason::Budget)),
         ("grep", "") => {
+            let counted = if has(Reason::Kind) { 112 } else { 0 };
+            let page = |shown: usize, display: usize| GrepPageCounts {
+                offset: 0,
+                shown,
+                total_matches: display + counted,
+                display_matches: display,
+                matches_count: shown,
+                counted_matches: counted,
+            };
             if has(Reason::Walk) && has(Reason::Cap) {
-                build_grep_envelope_from_parts(100, 100, 100, true, true, 0)
+                build_grep_envelope_with_counted(page(100, 100), true, true, 0)
             } else if has(Reason::Walk) {
-                build_grep_envelope_from_parts(12, 12, 12, false, true, 0)
+                build_grep_envelope_with_counted(page(12, 12), false, true, 0)
+            } else if has(Reason::Cap) {
+                build_grep_envelope_with_counted(page(100, 1204), true, false, 0)
             } else {
-                build_grep_envelope_from_parts(100, 1204, 100, true, false, 0)
+                build_grep_envelope_with_counted(page(2, 2), false, false, 0)
             }
         }
         ("glob", "") if has(Reason::TimeLimit) => {
@@ -404,10 +433,13 @@ fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
         ("search", "") if has(Reason::Depth) => Total::AtLeast(10),
         ("search", "") => Total::AtLeast(if has(Reason::Cap) { 11 } else { 10 }),
         ("grep", "") => {
+            let counted = if has(Reason::Kind) { 112 } else { 0 };
             if has(Reason::Walk) {
-                Total::AtLeast(if has(Reason::Cap) { 100 } else { 12 })
+                Total::AtLeast(if has(Reason::Cap) { 100 } else { 12 } + counted)
+            } else if has(Reason::Cap) {
+                Total::AtLeast(1204 + counted)
             } else {
-                Total::AtLeast(1204)
+                Total::Exact(2 + counted)
             }
         }
         ("glob", "") if has(Reason::TimeLimit) => {

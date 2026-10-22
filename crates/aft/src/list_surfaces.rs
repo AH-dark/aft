@@ -178,7 +178,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         mode: "",
         list_id: "payload.matches",
         unit: Unit::Rows,
-        narrow: &["offset", "path", "include", "exclude"],
+        narrow: &["offset", "path", "include"],
         reasons: &[
             ReasonEntry {
                 reason: Reason::Walk,
@@ -188,7 +188,17 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "DEFAULT_MAX_RESULTS, GREP_MAX_OUTPUT_BYTES, MAX_DISPLAY_MATCHES_PER_FILE, handle_grep, handle_grep_inner, format_grep_text, render_grep_page, rendered_grep_match_count",
+                predicate_name: "DEFAULT_MAX_RESULTS, GREP_MAX_OUTPUT_BYTES, MAX_DISPLAY_MATCHES_PER_FILE, FIRST_PAGE_ROWS, FIRST_PAGE_BYTES, FIRST_PAGE_ROUNDS, WHOLE_RESULT_ROWS, WHOLE_RESULT_BYTES, SUMMARY_FILES_LISTED, SUMMARY_FOLDERS_LISTED, handle_grep, handle_grep_inner, format_grep_text, grep_page_output, round_robin_order, files_first_summary, rendered_grep_match_count",
+            },
+            // Lines in lockfiles, generated and minified files, logs and
+            // JSON data files are counted per file instead of printed, unless
+            // the call names them; past COUNTED_ENTRIES_LISTED entries the
+            // counted-only block folds the rest into one row per kind and
+            // marker.
+            ReasonEntry {
+                reason: Reason::Kind,
+                kind: ReasonKind::Selecting,
+                predicate_name: "HANDFUL_ROWS, HANDFUL_BYTES, COUNTED_ENTRIES_LISTED, grep_page_output, counted_entries, include_targets",
             },
         ],
     },

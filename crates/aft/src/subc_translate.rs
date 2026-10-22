@@ -2009,7 +2009,9 @@ fn translate_grep(args: Value, project_root: &Path) -> Result<Translated, Transl
             }
         }
     }
-    out.insert("max_results".to_string(), Value::Number(100u64.into()));
+    // No `max_results`: the grep command sizes its own pages (a 40-line
+    // first page for a large result, 100 lines after), which a fixed page
+    // size here would override.
 
     Ok(Translated {
         command: "grep".into(),

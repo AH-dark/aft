@@ -152,7 +152,7 @@ export function splitIncludeArg(raw: string): string[] {
 export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const grepTool: ToolDefinition = {
     description:
-      "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Shows up to 100 matching lines per call; lines longer than 500 characters are cut and marked `[line truncated]`, and a page stops early once its rows reach about 50 KB. Pass `offset` (skip that many matching lines) to page through the rest, or narrow with `path` or `include`. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+      "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Lockfiles, generated and minified files, logs and command output, and JSON data files are counted, not printed, unless `path` or `include` names them; the reply lists them with the value to pass. Long lines are shown as a window around the match. A large result starts with matching lines per file and a 40-line first page; pass `offset` to page. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
     args: {
       pattern: arg(z.string().describe("Regular expression pattern to search for")),
       include: arg(
@@ -166,7 +166,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       ),
       offset: arg(
         optionalInt(0, 100000).describe(
-          "Zero-based count of matching lines to skip, for paging (default: 0, max: 100000).",
+          "Rows of shown results to skip; follow the next offset the reply names.",
         ),
       ),
     },

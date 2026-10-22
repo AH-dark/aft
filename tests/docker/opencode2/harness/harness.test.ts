@@ -1292,7 +1292,8 @@ describe("source-of-truth derivation", () => {
     ).toEqual(["budget", "walk"]);
     expect(surfaces.find((surface) => surface.id === "grep..payload.matches")).toMatchObject({
       unit: "rows",
-      narrow: ["offset", "path", "include", "exclude"],
+      narrow: ["offset", "path", "include"],
+      reasons: ["walk", "cap", "kind"],
     });
     const matrix = JSON.parse(
       await readFile(join(repo, "tests/docker/opencode2/matrix/applicability.json"), "utf8"),
