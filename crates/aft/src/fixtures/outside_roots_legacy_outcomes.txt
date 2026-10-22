@@ -1630,3 +1630,355 @@ root=none route=deny forced=true temp-scratch write-location
   absent: err path_outside_root: project root is required when path restriction is forced
   false: err path_outside_root: project root is required when path restriction is forced
   true: err path_outside_root: project root is required when path restriction is forced
+root=linked route=lowered forced=false main-checkout-file read
+  absent: ok <dir>/main/tracked.txt
+  false: ok <dir>/main/tracked.txt
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=lowered forced=false main-checkout-file mutate
+  absent: ok <dir>/main/tracked.txt
+  false: ok <dir>/main/tracked.txt
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=lowered forced=false main-checkout-file write-location
+  absent: ok <dir>/main/tracked.txt
+  false: ok <dir>/main/tracked.txt
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=lowered forced=false main-checkout-missing read
+  absent: ok <dir>/main/new.txt
+  false: ok <dir>/main/new.txt
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=lowered forced=false main-checkout-missing mutate
+  absent: ok <dir>/main/new.txt
+  false: ok <dir>/main/new.txt
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=lowered forced=false main-checkout-missing write-location
+  absent: ok <dir>/main/new.txt
+  false: ok <dir>/main/new.txt
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=lowered forced=false linked-inside read
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=lowered forced=false linked-inside mutate
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=lowered forced=false linked-inside write-location
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=lowered forced=true main-checkout-file read
+  absent: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=lowered forced=true main-checkout-file mutate
+  absent: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=lowered forced=true main-checkout-file write-location
+  absent: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=lowered forced=true main-checkout-missing read
+  absent: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=lowered forced=true main-checkout-missing mutate
+  absent: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=lowered forced=true main-checkout-missing write-location
+  absent: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=lowered forced=true linked-inside read
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=lowered forced=true linked-inside mutate
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=lowered forced=true linked-inside write-location
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=plugin forced=false main-checkout-file read
+  absent: ok <dir>/main/tracked.txt
+  false: ok <dir>/main/tracked.txt
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=plugin forced=false main-checkout-file mutate
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=plugin forced=false main-checkout-file write-location
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=plugin forced=false main-checkout-missing read
+  absent: ok <dir>/main/new.txt
+  false: ok <dir>/main/new.txt
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=plugin forced=false main-checkout-missing mutate
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=plugin forced=false main-checkout-missing write-location
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=plugin forced=false linked-inside read
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=plugin forced=false linked-inside mutate
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=plugin forced=false linked-inside write-location
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=plugin forced=true main-checkout-file read
+  absent: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=plugin forced=true main-checkout-file mutate
+  absent: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=plugin forced=true main-checkout-file write-location
+  absent: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=plugin forced=true main-checkout-missing read
+  absent: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=plugin forced=true main-checkout-missing mutate
+  absent: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=plugin forced=true main-checkout-missing write-location
+  absent: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=plugin forced=true linked-inside read
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=plugin forced=true linked-inside mutate
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=plugin forced=true linked-inside write-location
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=elicitation forced=false main-checkout-file read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=elicitation forced=false main-checkout-file mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=elicitation forced=false main-checkout-file write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=elicitation forced=false main-checkout-missing read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=elicitation forced=false main-checkout-missing mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=elicitation forced=false main-checkout-missing write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=elicitation forced=false linked-inside read
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=elicitation forced=false linked-inside mutate
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=elicitation forced=false linked-inside write-location
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=elicitation forced=true main-checkout-file read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=elicitation forced=true main-checkout-file mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=elicitation forced=true main-checkout-file write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=elicitation forced=true main-checkout-missing read
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=elicitation forced=true main-checkout-missing mutate
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=elicitation forced=true main-checkout-missing write-location
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=elicitation forced=true linked-inside read
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=elicitation forced=true linked-inside mutate
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=elicitation forced=true linked-inside write-location
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=deny forced=false main-checkout-file read
+  absent: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=deny forced=false main-checkout-file mutate
+  absent: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=deny forced=false main-checkout-file write-location
+  absent: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=deny forced=false main-checkout-missing read
+  absent: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=deny forced=false main-checkout-missing mutate
+  absent: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=deny forced=false main-checkout-missing write-location
+  absent: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=deny forced=false linked-inside read
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=deny forced=false linked-inside mutate
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=deny forced=false linked-inside write-location
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=deny forced=true main-checkout-file read
+  absent: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=deny forced=true main-checkout-file mutate
+  absent: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=deny forced=true main-checkout-file write-location
+  absent: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/tracked.txt' is outside the project root '<dir>/linked'
+root=linked route=deny forced=true main-checkout-missing read
+  absent: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=deny forced=true main-checkout-missing mutate
+  absent: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=deny forced=true main-checkout-missing write-location
+  absent: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  false: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+  true: err path_outside_root: path '<dir>/main/new.txt' is outside the project root '<dir>/linked'
+root=linked route=deny forced=true linked-inside read
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=deny forced=true linked-inside mutate
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+root=linked route=deny forced=true linked-inside write-location
+  absent: ok <dir>/linked/tracked.txt
+  false: ok <dir>/linked/tracked.txt
+  true: ok <dir>/linked/tracked.txt
+search route=lowered forced=false nested-git-root aft_search
+  absent: ok external_root=<dir>/root/nested interpreted_as=regex results=["<dir>/root/nested/marker.rs"]
+  false: ok external_root=<dir>/root/nested interpreted_as=regex results=["<dir>/root/nested/marker.rs"]
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+search route=lowered forced=false outside-git-root aft_search
+  absent: ok external_root=<dir>/outside-repo interpreted_as=regex results=["<dir>/outside-repo/marker.rs"]
+  false: ok external_root=<dir>/outside-repo interpreted_as=regex results=["<dir>/outside-repo/marker.rs"]
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo
+search route=lowered forced=true nested-git-root aft_search
+  absent: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+  false: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+search route=lowered forced=true outside-git-root aft_search
+  absent: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo
+  false: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo
+search route=plugin forced=false nested-git-root aft_search
+  absent: ok external_root=<dir>/root/nested interpreted_as=regex results=["<dir>/root/nested/marker.rs"]
+  false: ok external_root=<dir>/root/nested interpreted_as=regex results=["<dir>/root/nested/marker.rs"]
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+search route=plugin forced=false outside-git-root aft_search
+  absent: ask permission_required
+  false: ask permission_required
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo
+search route=plugin forced=true nested-git-root aft_search
+  absent: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+  false: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+search route=plugin forced=true outside-git-root aft_search
+  absent: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo
+  false: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo
+search route=elicitation forced=false nested-git-root aft_search
+  absent: ok external_root=<dir>/root/nested interpreted_as=regex results=["<dir>/root/nested/marker.rs"]
+  false: ok external_root=<dir>/root/nested interpreted_as=regex results=["<dir>/root/nested/marker.rs"]
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+search route=elicitation forced=false outside-git-root aft_search
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo
+search route=elicitation forced=true nested-git-root aft_search
+  absent: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+  false: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+search route=elicitation forced=true outside-git-root aft_search
+  absent: ask access_ask_required
+  false: ask access_ask_required
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo
+search route=deny forced=false nested-git-root aft_search
+  absent: ok external_root=<dir>/root/nested interpreted_as=regex results=["<dir>/root/nested/marker.rs"]
+  false: ok external_root=<dir>/root/nested interpreted_as=regex results=["<dir>/root/nested/marker.rs"]
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+search route=deny forced=false outside-git-root aft_search
+  absent: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo
+  false: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo
+search route=deny forced=true nested-git-root aft_search
+  absent: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+  false: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/root/nested
+search route=deny forced=true outside-git-root aft_search
+  absent: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo
+  false: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo
+  true: err path_outside_root: aft_search path is outside the configured project root while path restriction is enabled: <dir>/outside-repo

@@ -4,7 +4,9 @@
 //! the same refusal code and the same refusal text, for reads, mutations and
 //! preserved-final-component writes, on every ask route, with and without the
 //! per-request restriction an untrusted subc consumer's calls force onto
-//! themselves (`AppContext::force_restrict_guard`).
+//! themselves (`AppContext::force_restrict_guard`). The table also covers a
+//! linked worktree reading its main checkout, and `aft_search` given a Git
+//! repository other than the project root.
 //!
 //! The expected outcomes live in `fixtures/outside_roots_legacy_outcomes.txt`.
 //! They were recorded from the engine as it decided before the setting was
@@ -74,6 +76,13 @@ impl Fixture {
     /// Resolve a user `aft.jsonc` document through the real config resolver,
     /// then point the resulting context at this fixture.
     fn context(&self, doc: &str, project_root: bool) -> AppContext {
+        AppContext::new(
+            Box::new(crate::language::StubProvider),
+            self.config(doc, project_root.then(|| self.root.clone())),
+        )
+    }
+
+    fn config(&self, doc: &str, project_root: Option<PathBuf>) -> Config {
         let resolved = resolve_config(&[ConfigTier {
             tier: "user".into(),
             source: "/fixture/user/aft.jsonc".into(),
@@ -81,11 +90,69 @@ impl Fixture {
         }]);
         assert!(resolved.dropped.is_empty(), "{:?}", resolved.dropped);
         let mut config: Config = resolved.config;
-        config.project_root = project_root.then(|| self.root.clone());
+        config.project_root = project_root;
         config.storage_dir = Some(self.base().join("store"));
         config.backup.enabled = Some(false);
         config.sandbox.read_deny = vec![self.outside.join("floor.txt")];
-        AppContext::new(Box::new(crate::language::StubProvider), config)
+        config
+    }
+
+    /// A real linked worktree: `main/` is a repository with one commit and
+    /// `linked/` was added from it with `git worktree add`. A context rooted
+    /// at `linked/` that records `main/.git` as its common Git directory gets
+    /// the standalone exemption that lets it read `main/`, while outside
+    /// paths ask; under outside roots: deny the exemption does not apply.
+    fn linked_context(&self, doc: &str) -> (AppContext, PathBuf, PathBuf) {
+        let main = self.base().join("main");
+        let linked = self.base().join("linked");
+        if !linked.exists() {
+            std::fs::create_dir(&main).unwrap();
+            std::fs::write(main.join("tracked.txt"), "tracked").unwrap();
+            git(&main, &["init", "-q"]);
+            git(&main, &["add", "tracked.txt"]);
+            git(&main, &["commit", "-q", "-m", "fixture"]);
+            git(&main, &["worktree", "add", "-q", "../linked"]);
+        }
+        let ctx = AppContext::new(
+            Box::new(crate::language::StubProvider),
+            self.config(doc, Some(linked.clone())),
+        );
+        ctx.set_cache_role(true, Some(main.join(".git")));
+        (ctx, main, linked)
+    }
+
+    /// A context for `aft_search` (`semantic_search`) rooted at `root/`, with
+    /// a Git repository nested inside the root and another one outside it.
+    /// Both repositories have a saved trigram index, which an allowed search
+    /// uses after its freshness check walks the repository.
+    fn search_context(&self, doc: &str) -> (AppContext, PathBuf, PathBuf) {
+        let nested = self.root.join("nested");
+        let outside_repo = self.base().join("outside-repo");
+        let storage = self.base().join("store");
+        for repo in [&nested, &outside_repo] {
+            if !repo.exists() {
+                std::fs::create_dir(repo).unwrap();
+                std::fs::write(repo.join("marker.rs"), "fn nested_marker() {}\n").unwrap();
+                git(repo, &["init", "-q"]);
+                crate::search_index::SearchIndex::build(repo).write_to_disk(
+                    &crate::search_index::resolve_cache_dir(repo, Some(&storage)),
+                    None,
+                );
+            }
+        }
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            self.config(doc, Some(self.root.clone())),
+        );
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            crate::context::SemanticIndexStatus::Disabled;
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(crate::search_index::SearchIndex::build(&self.root));
+        (ctx, nested, outside_repo)
     }
 
     /// Paths each configuration is asked about. Relative probes only run when
@@ -118,6 +185,28 @@ impl Fixture {
     fn normalize(&self, text: &str) -> String {
         text.replace(&self.base().display().to_string(), "<dir>")
     }
+}
+
+/// Run git for a fixture with the host's global and system configuration
+/// (and any injected `GIT_CONFIG_*` entries) ignored.
+fn git(dir: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=AFT test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "0")
+        .output()
+        .expect("git runs");
+    assert!(output.status.success(), "git {args:?}: {output:?}");
 }
 
 #[derive(Clone, Copy)]
@@ -211,7 +300,100 @@ fn outcome_table(f: &Fixture) -> Vec<(String, [String; 3])> {
             }
         }
     }
+    // A linked worktree's main checkout: readable without an ask on a
+    // standalone route while outside paths ask, refused like any other outside
+    // path under outside roots: deny.
+    let linked = EXISTING_CONFIGS.map(|(_, doc)| f.linked_context(doc));
+    let (_, main, linked_root) = &linked[0];
+    let linked_probes = [
+        ("main-checkout-file", main.join("tracked.txt")),
+        ("main-checkout-missing", main.join("new.txt")),
+        ("linked-inside", linked_root.join("tracked.txt")),
+    ];
+    for route in Route::ALL {
+        let _route = route.install(&owner);
+        for forced in [false, true] {
+            for (probe, path) in &linked_probes {
+                for check in CHECKS {
+                    let key = format!(
+                        "root=linked route={} forced={forced} {probe} {check}",
+                        route.label(),
+                    );
+                    let outcomes =
+                        [0, 1, 2].map(|index| outcome(f, &linked[index].0, forced, check, path));
+                    rows.push((key, outcomes));
+                }
+            }
+        }
+    }
+    // `aft_search` with a path naming a Git repository other than the
+    // project root: one nested inside the root (refused by the search's own
+    // root check) and one outside it (refused by path validation; the search
+    // then rewrites the refusal message to name the resolved Git root).
+    let search = EXISTING_CONFIGS.map(|(_, doc)| f.search_context(doc));
+    let (_, nested, outside_repo) = &search[0];
+    let search_probes = [
+        ("nested-git-root", nested.clone()),
+        ("outside-git-root", outside_repo.clone()),
+    ];
+    for route in Route::ALL {
+        let _route = route.install(&owner);
+        for forced in [false, true] {
+            for (probe, path) in &search_probes {
+                let key = format!(
+                    "search route={} forced={forced} {probe} aft_search",
+                    route.label(),
+                );
+                let outcomes =
+                    [0, 1, 2].map(|index| search_outcome(f, &search[index].0, forced, path));
+                rows.push((key, outcomes));
+            }
+        }
+    }
     rows
+}
+
+/// One `aft_search` outcome as a single line: the external root, how the
+/// request was interpreted and the result file paths, or the refusal code
+/// and text.
+fn search_outcome(f: &Fixture, ctx: &AppContext, forced: bool, path: &Path) -> String {
+    let req_id = "outside-roots";
+    let _forced = forced.then(|| ctx.force_restrict_guard(req_id));
+    let request = crate::protocol::RawRequest {
+        id: req_id.into(),
+        command: "semantic_search".into(),
+        session_id: Some("outside-roots-session".into()),
+        lsp_hints: None,
+        params: serde_json::json!({"pattern": "nested_marker", "path": path}),
+    };
+    let response = crate::commands::semantic_search::handle_semantic_search(&request, ctx);
+    if is_access_request(&response) {
+        return format!("ask {}", response.data["code"].as_str().unwrap_or("?"));
+    }
+    let value = serde_json::to_value(&response).unwrap();
+    if value["success"] == true {
+        let mut files = value["results"]
+            .as_array()
+            .map(|results| {
+                results
+                    .iter()
+                    .map(|result| f.normalize(result["file"].as_str().unwrap_or("?")))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        files.sort();
+        format!(
+            "ok external_root={} interpreted_as={} results={files:?}",
+            f.normalize(value["external_root"].as_str().unwrap_or("-")),
+            value["interpreted_as"].as_str().unwrap_or("-"),
+        )
+    } else {
+        format!(
+            "err {}: {}",
+            value["code"].as_str().unwrap_or("?"),
+            f.normalize(value["message"].as_str().unwrap_or(""))
+        )
+    }
 }
 
 fn render(rows: &[(String, [String; 3])]) -> String {
@@ -274,13 +456,23 @@ fn outside_roots_setting_on_denies_every_path_outside_the_root() {
             "dotdot-escape",
             "symlink-file-escape",
             "symlink-dir-escape",
+            "main-checkout-file",
+            "main-checkout-missing",
+            // A Git repository nested inside the configured project root:
+            // `aft_search` treats its Git root as external and refuses it
+            // under outside roots: deny.
+            "nested-git-root",
+            "outside-git-root",
         ]
         .iter()
         .any(|probe| key.contains(&format!(" {probe} ")));
         // A write location keeps its final component as spelled, so the
         // in-root link itself (not its outside target) is what is judged.
         let link_itself = key.contains(" symlink-file-escape write-location");
-        if key.starts_with("root=set") && leaves_root && !link_itself {
+        let has_root = ["root=set", "root=linked", "search"]
+            .iter()
+            .any(|prefix| key.starts_with(prefix));
+        if has_root && leaves_root && !link_itself {
             assert!(on.starts_with("err path_outside_root: "), "{key}: {on}");
         }
     }
