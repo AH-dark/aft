@@ -38,6 +38,10 @@ pub(crate) const DEFAULT_PRIMARY_WATCH_TIMEOUT_MS: u64 = 30_000;
 pub(crate) const MAX_WATCH_TIMEOUT_MS: u64 = 1_800_000;
 /// How much recent output a regex watch keeps for matching across reads.
 const REGEX_SCAN_WINDOW_BYTES: usize = 64 * 1024;
+/// Added to an exited task's no-match result when a regex scan had to drop
+/// older output from its window, so the non-match is not a complete answer.
+/// Literal patterns never set it: their kept tail is exact.
+const REGEX_WINDOW_SCAN_INCOMPLETE: &str = "The pattern scan is incomplete: no match was found, but output older than the 64 KiB regex scan window was dropped while scanning, so a regex match longer than the window cannot be ruled out. A literal (string) pattern is scanned exactly at any length.";
 /// Most lines of a still-running command's output shown to a worker.
 const WORKER_OUTPUT_TAIL_LINES: usize = 20;
 /// Output preview a watch result carries for a finished task.
@@ -98,6 +102,8 @@ struct Waited {
     elapsed_ms: u64,
     limit_ms: u64,
     matched: Option<(String, u64, Option<&'static str>)>,
+    /// The task exited without a match, but the regex window dropped bytes.
+    scan_incomplete: bool,
 }
 
 fn wait_limit_outcome(
@@ -129,6 +135,9 @@ struct StreamScan {
     /// captured bytes were still to be read. It is checked again once the
     /// next page arrives or the stream is known to end there.
     deferred: bool,
+    /// A regex scan cut older bytes out of its window, so a match longer
+    /// than the window could have been missed.
+    dropped: bool,
 }
 
 fn parse_params(req: &RawRequest) -> Result<BashWatchParams, String> {
@@ -446,6 +455,7 @@ impl WatchJob {
             elapsed_ms: started.elapsed().as_millis() as u64,
             limit_ms: deadline.saturating_duration_since(started).as_millis() as u64,
             matched,
+            scan_incomplete: false,
         };
         loop {
             if cancellation.cancel_already_requested() {
@@ -478,15 +488,18 @@ impl WatchJob {
             let now = Instant::now();
             // A nearby process kill may extend an ordinary watch limit, never
             // the reply deadline: the caller must receive its task id in time.
+            let window_dropped = stdout.dropped || stderr.dropped;
             if now >= self.budget.deadline {
-                return Some(waited(
+                let mut result = waited(
                     if terminal {
                         WaitReason::Exited
                     } else {
                         WaitReason::Timeout
                     },
                     None,
-                ));
+                );
+                result.scan_incomplete = terminal && window_dropped;
+                return Some(result);
             }
             let kill_remaining = if self.worker {
                 self.registry
@@ -497,7 +510,9 @@ impl WatchJob {
             if let Some(reason) =
                 wait_limit_outcome(now >= deadline, terminal, self.worker, kill_remaining)
             {
-                return Some(waited(reason, None));
+                let mut result = waited(reason, None);
+                result.scan_incomplete = reason == WaitReason::Exited && window_dropped;
+                return Some(result);
             }
             if stdout.has_more || stderr.has_more {
                 continue;
@@ -588,6 +603,7 @@ impl WatchJob {
             if cut > 0 {
                 scan.buffer.drain(..cut);
                 scan.base += cut as u64;
+                scan.dropped |= matches!(pattern, WaitPattern::Regex(_));
             }
         }
         None
@@ -607,6 +623,9 @@ impl WatchJob {
             "elapsed_ms": waited.elapsed_ms,
             "limit_ms": waited.limit_ms,
         });
+        if waited.scan_incomplete {
+            data["waited"]["scan_incomplete"] = json!(true);
+        }
         if let Some((text, offset, stream)) = &waited.matched {
             data["waited"]["match"] = json!(text);
             data["waited"]["match_offset"] = json!(offset);
@@ -680,6 +699,10 @@ impl WatchJob {
                     .map(|code| format!(", exit {code}"))
                     .unwrap_or_default();
                 text.push_str(&format!("\n{waited_text}; task exited ({status}{exit})."));
+                if waited.scan_incomplete {
+                    text.push(' ');
+                    text.push_str(REGEX_WINDOW_SCAN_INCOMPLETE);
+                }
             }
         }
         if !running && !snapshot.output_preview.is_empty() {
@@ -1067,6 +1090,61 @@ mod tests {
             waited.matched,
             Some(("BOUNDARY-7".into(), (PAGE - 5) as u64, Some("stdout")))
         );
+    }
+
+    /// A full terminal watch of `output` for `pattern`, with its rendered text.
+    fn exited_watch_text(output: &[u8], pattern: WaitPattern) -> (Waited, String) {
+        let (_dir, mut job) = terminal_watch_with_stdout(output);
+        job.pattern = Some(pattern);
+        let waited = job.wait(&crate::executor::JobCancellation::new()).unwrap();
+        let snapshot = job
+            .registry
+            .observed_status(&job.task_id, &job.session, 0)
+            .unwrap();
+        let text = job.render(&snapshot, &waited);
+        (waited, text)
+    }
+
+    fn literal_pattern(text: &str) -> WaitPattern {
+        match parse_pattern(Some(&json!(text))) {
+            Ok(Some(pattern)) => pattern,
+            _ => panic!("literal {text:?} must parse"),
+        }
+    }
+
+    #[test]
+    fn approved_regex_match_longer_than_window_reports_incomplete_not_no_match() {
+        let mut output = b"BEGIN\n".to_vec();
+        output.extend(std::iter::repeat_n(b'x', 200 * 1024));
+        output.extend_from_slice(b"\nEND\n");
+        let (waited, text) = exited_watch_text(&output, regex_pattern(r"BEGIN[\s\S]*END"));
+        assert!(matches!(waited.reason, WaitReason::Exited));
+        assert!(waited.matched.is_none());
+        assert!(
+            waited.scan_incomplete,
+            "a 200 KiB match was ruled out by a 64 KiB window"
+        );
+        assert!(text.contains(REGEX_WINDOW_SCAN_INCOMPLETE), "{text}");
+    }
+
+    #[test]
+    fn approved_absent_regex_is_incomplete_only_when_the_window_dropped_bytes() {
+        let large = vec![b'x'; 200 * 1024];
+        let (waited, text) = exited_watch_text(&large, regex_pattern("NEVER"));
+        assert!(waited.matched.is_none());
+        assert!(waited.scan_incomplete, "{text}");
+        assert!(text.contains(REGEX_WINDOW_SCAN_INCOMPLETE), "{text}");
+
+        let small = vec![b'x'; 1024];
+        let (waited, text) = exited_watch_text(&small, regex_pattern("NEVER"));
+        assert!(matches!(waited.reason, WaitReason::Exited));
+        assert!(!waited.scan_incomplete, "{text}");
+        assert!(!text.contains("incomplete"), "{text}");
+
+        // A literal keeps an exact tail, so dropping bytes loses nothing.
+        let (waited, text) = exited_watch_text(&large, literal_pattern("NEVER"));
+        assert!(!waited.scan_incomplete, "{text}");
+        assert!(!text.contains("incomplete"), "{text}");
     }
 
     /// Runs the wait on its own thread with slowed page reads. The hard
