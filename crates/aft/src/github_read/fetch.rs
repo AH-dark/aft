@@ -119,9 +119,9 @@ pub trait GhCommandRunner: Send + Sync {
     ) -> Result<(GhCommandOutput, bool), GhCommandError>;
 }
 
-/// Longest one `gh` command may run before it is killed. A `gh` that hangs
-/// (on an authentication prompt or a stalled connection) would otherwise keep
-/// its read, and the thread that runs it, alive indefinitely.
+/// Longest one `gh` command may run before it is killed. A `gh` stalled on a
+/// connection would otherwise keep its read, and the thread that runs it,
+/// alive indefinitely.
 const GH_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Production runner that executes the bare `gh` command in the caller's

@@ -303,8 +303,8 @@ struct RememberedFailure {
     at: Instant,
 }
 
-/// Failures of the last [`FAILURE_MEMORY`]. Expired entries are dropped on
-/// every insert, so the map holds only failures from the last minute.
+/// Remembered failures. Expired entries are dropped on every insert, and a
+/// lookup ignores an entry older than [`FAILURE_MEMORY`].
 fn failure_memory() -> &'static std::sync::Mutex<HashMap<FailureKey, RememberedFailure>> {
     static FAILURES: std::sync::OnceLock<std::sync::Mutex<HashMap<FailureKey, RememberedFailure>>> =
         std::sync::OnceLock::new();
@@ -1101,8 +1101,9 @@ where
 /// A host the SSRF check approved gets exactly the approved addresses. Any
 /// other host is looked up here without the SSRF check: that is a proxy host,
 /// or any host when private addresses are allowed. The lookup runs on its own
-/// thread so the request's timeout can abandon it; the request timeout is the
-/// fetch deadline, so the name lookup cannot outlive the fetch.
+/// thread so the request's timeout can abandon it: the request stops waiting
+/// at the fetch deadline, although the system resolver's thread may run on
+/// until its lookup returns.
 struct GuardedResolver {
     approved: Arc<ApprovedHosts>,
     connect_overrides: Vec<(String, SocketAddr)>,
