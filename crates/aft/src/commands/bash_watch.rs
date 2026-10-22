@@ -936,6 +936,100 @@ mod tests {
         assert!(text.contains("captured output"));
     }
 
+    const PAGE: usize = 64 * 1024;
+    const BUDGET_PAGES: usize = 6;
+    /// The match sits inside the last of `BUDGET_PAGES` captured pages.
+    const LAST_PAGE_MATCH: u64 = ((BUDGET_PAGES - 1) * PAGE + 100) as u64;
+    /// Each page read (stdout and stderr per scan pass) sleeps this long, so a
+    /// full drain takes about `BUDGET_PAGES * 2 * PAGE_DELAY`.
+    const PAGE_DELAY: Duration = Duration::from_millis(150);
+
+    /// An exited task with `BUDGET_PAGES` pages of stdout, watched by a primary
+    /// call with a long `limit_ms` and a reply budget parsed from `deadline_ms`
+    /// the way the transport parses it.
+    fn budgeted_terminal_watch(client_window: Duration) -> (tempfile::TempDir, WatchJob) {
+        let (dir, mut job, _snapshot) = approved_terminal_watch_fixture();
+        let ctx = context(dir.path(), dir.path());
+        let layout = with_authenticated_principal(principal(dir.path()), || {
+            let storage = crate::bash_background::task_storage_dir(&ctx);
+            let session = crate::bash_background::persistence::session_tasks_dir(&storage, SESSION);
+            crate::bash_background::persistence::resolve_task_layout(&session, TASK).unwrap()
+        });
+        let mut output = vec![b'x'; BUDGET_PAGES * PAGE];
+        let at = LAST_PAGE_MATCH as usize;
+        output[at..at + 11].copy_from_slice(b"FINAL-MATCH");
+        std::fs::write(&layout.paths.stdout, output).unwrap();
+        let wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        job.budget = crate::commands::blocking_wait::ReplyBudget::from_envelope(
+            Instant::now(),
+            &json!({ "deadline_ms": wall_ms + client_window.as_millis() as u64 }),
+        );
+        job.limit_ms = 30_000;
+        (dir, job)
+    }
+
+    /// Runs the wait on its own thread with slowed page reads. The hard
+    /// deadline keeps a wait that ignores its budget from hanging the suite.
+    fn wait_with_slow_pages(job: WatchJob) -> (WatchJob, Waited, Duration) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            crate::bash_background::registry::ARTIFACT_PAGE_DELAY
+                .with(|delay| delay.set(Some(PAGE_DELAY)));
+            let started = Instant::now();
+            let waited = job.wait(&crate::executor::JobCancellation::new());
+            let _ = tx.send((job, waited, started.elapsed()));
+        });
+        let (job, waited, elapsed) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("watch did not answer within the test's hard deadline");
+        (job, waited.expect("watch was not cancelled"), elapsed)
+    }
+
+    #[test]
+    fn approved_terminal_drain_answers_within_short_reply_budget() {
+        // A 1s client window leaves a 500ms reply deadline; a full drain of the
+        // backlog would take about 1.8s, well past the client's deadline.
+        let client_window = Duration::from_millis(1_000);
+        let (_dir, job) = budgeted_terminal_watch(client_window);
+        let (job, waited, elapsed) = wait_with_slow_pages(job);
+        assert!(
+            elapsed + Duration::from_millis(100) < client_window,
+            "reply took {elapsed:?}, too close to the {client_window:?} client deadline"
+        );
+        assert!(
+            matches!(waited.reason, WaitReason::Timeout),
+            "the backlog could not be drained inside the budget, so the scan is incomplete"
+        );
+        assert!(waited.matched.is_none());
+        let snapshot = job
+            .registry
+            .observed_status(&job.task_id, &job.session, 0)
+            .unwrap();
+        let text = job.render(&snapshot, &waited);
+        assert!(
+            text.contains("task already exited; the pattern scan is incomplete"),
+            "{text}"
+        );
+        assert!(!text.contains("still running"), "{text}");
+        // An unfinished scan must not read as a completed scan that found nothing.
+        assert!(!text.contains("without match"), "{text}");
+        assert!(!text.contains("task exited ("), "{text}");
+    }
+
+    #[test]
+    fn approved_terminal_drain_finds_last_page_match_within_long_reply_budget() {
+        let (_dir, job) = budgeted_terminal_watch(Duration::from_secs(20));
+        let (_job, waited, _elapsed) = wait_with_slow_pages(job);
+        assert!(matches!(waited.reason, WaitReason::Matched));
+        assert_eq!(
+            waited.matched,
+            Some(("FINAL-MATCH".into(), LAST_PAGE_MATCH, Some("stdout")))
+        );
+    }
+
     async fn watch_with_deadline(ctx: Arc<AppContext>, request: RawRequest) -> Response {
         watch_with_wait_deadline(ctx, request, Duration::from_secs(3)).await
     }

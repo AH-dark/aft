@@ -1727,6 +1727,10 @@ impl BgTaskRegistry {
                 run(&task.paths);
             }
         });
+        #[cfg(test)]
+        if let Some(delay) = ARTIFACT_PAGE_DELAY.with(std::cell::Cell::get) {
+            std::thread::sleep(delay);
+        }
         let start = offset.min(len);
         let requested = len.saturating_sub(start).min(ARTIFACT_PAGE_BYTES as u64);
         let bytes = file
@@ -12106,6 +12110,13 @@ fn canonicalized_path(path: &Path) -> PathBuf {
 thread_local! {
     static ARTIFACT_RANGE_AFTER_STAT: std::cell::RefCell<Option<Box<dyn FnOnce(&TaskPaths)>>> = const { std::cell::RefCell::new(None) };
     static ARTIFACT_READ_ALL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Sleep added to every page read on this thread, so a test can make
+    /// draining a captured backlog slower than a caller's reply budget.
+    pub(crate) static ARTIFACT_PAGE_DELAY: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
