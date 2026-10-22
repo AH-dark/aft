@@ -564,11 +564,20 @@ impl WatchJob {
             if pty && index == 1 {
                 break;
             }
-            let Ok(page) =
-                self.registry
-                    .read_artifact_page(&self.task_id, &self.session, artifact, scan.next)
-            else {
-                scan.has_more = false;
+            if Instant::now() >= self.budget.deadline {
+                scan.has_more = true;
+                continue;
+            }
+            let Ok(page) = self.registry.read_artifact_page_until(
+                &self.task_id,
+                &self.session,
+                artifact,
+                scan.next,
+                self.budget.deadline,
+            ) else {
+                // A timed-out read did not establish EOF, even for an exited
+                // task. Keep the result incomplete rather than claiming no match.
+                scan.has_more = Instant::now() >= self.budget.deadline;
                 continue;
             };
             scan.has_more = page.has_more;
@@ -1249,10 +1258,14 @@ mod tests {
     /// Runs the wait on its own thread with slowed page reads. The hard
     /// deadline keeps a wait that ignores its budget from hanging the suite.
     fn wait_with_slow_pages(job: WatchJob) -> (WatchJob, Waited, Duration) {
+        wait_with_page_delay(job, PAGE_DELAY)
+    }
+
+    fn wait_with_page_delay(job: WatchJob, page_delay: Duration) -> (WatchJob, Waited, Duration) {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             crate::bash_background::registry::ARTIFACT_PAGE_DELAY
-                .with(|delay| delay.set(Some(PAGE_DELAY)));
+                .with(|delay| delay.set(Some(page_delay)));
             let started = Instant::now();
             let waited = job.wait(&crate::executor::JobCancellation::new());
             let _ = tx.send((job, waited, started.elapsed()));
@@ -1265,11 +1278,11 @@ mod tests {
 
     #[test]
     fn approved_terminal_drain_answers_within_short_reply_budget() {
-        // A 1s client window leaves a 500ms reply deadline; a full drain of the
-        // backlog would take about 1.8s, well past the client's deadline.
+        // A 1s client window leaves a 500ms reply deadline. Even one 1200ms
+        // artifact read must not consume the time reserved for reply delivery.
         let client_window = Duration::from_millis(1_000);
         let (_dir, job) = budgeted_terminal_watch(client_window);
-        let (job, waited, elapsed) = wait_with_slow_pages(job);
+        let (job, waited, elapsed) = wait_with_page_delay(job, Duration::from_millis(1_200));
         assert!(
             elapsed + Duration::from_millis(100) < client_window,
             "reply took {elapsed:?}, too close to the {client_window:?} client deadline"
