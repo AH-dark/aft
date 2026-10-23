@@ -301,9 +301,22 @@ fn head_access_differences(head: &RouteIdentity, other: &RouteIdentity) -> Vec<&
     .collect()
 }
 
-/// Whether two head routes' sandbox principals grant the same access. Each route
-/// bind stamps its own channel and epoch into the principal, so those two fields
-/// differ between any two routes of one head and are not access settings.
+#[derive(PartialEq, Eq)]
+struct PrincipalAccessClass {
+    strict_sandbox: bool,
+    flow_read_carrier: bool,
+}
+
+fn principal_access_class(principal: &AuthenticatedPrincipal) -> PrincipalAccessClass {
+    PrincipalAccessClass {
+        strict_sandbox: crate::sandbox_spawn::principal_requires_strict(principal),
+        flow_read_carrier: super::flow_read::principal_is_flow_read_carrier(principal),
+    }
+}
+
+/// Compare the production sandbox and flow-read rules, not the principal ID.
+/// Route channels and epochs identify individual binds, not access settings;
+/// the selected head still supplies its complete, unchanged principal.
 fn same_principal_access(a: &AuthenticatedPrincipal, b: &AuthenticatedPrincipal) -> bool {
     match (a, b) {
         (
@@ -312,7 +325,7 @@ fn same_principal_access(a: &AuthenticatedPrincipal, b: &AuthenticatedPrincipal)
                 project_root: a_root,
                 harness: a_harness,
                 session_id: a_session,
-                principal_id: a_principal,
+                principal_id: _,
                 route_channel: _,
                 route_epoch: _,
             },
@@ -321,7 +334,7 @@ fn same_principal_access(a: &AuthenticatedPrincipal, b: &AuthenticatedPrincipal)
                 project_root: b_root,
                 harness: b_harness,
                 session_id: b_session,
-                principal_id: b_principal,
+                principal_id: _,
                 route_channel: _,
                 route_epoch: _,
             },
@@ -330,7 +343,7 @@ fn same_principal_access(a: &AuthenticatedPrincipal, b: &AuthenticatedPrincipal)
                 && a_root == b_root
                 && a_harness == b_harness
                 && a_session == b_session
-                && a_principal == b_principal
+                && principal_access_class(a) == principal_access_class(b)
         }
         _ => a == b,
     }

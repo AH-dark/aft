@@ -590,6 +590,66 @@ fn codemode_head_routes_that_disagree_on_spawn_principal_are_ambiguous() {
 }
 
 #[test]
+fn codemode_head_routes_with_equivalent_first_party_principals_are_served() {
+    for (first, second) in [
+        ("direct", "reserved:prefrontal-core"),
+        ("reserved:prefrontal-core", "direct"),
+    ] {
+        let mut f = linked_fixture();
+        let root = f.head_root.clone();
+        second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
+        with_principal_id(&mut f.routes, channel(1), first);
+        with_principal_id(&mut f.routes, channel(3), second);
+        let body = call("read", json!({"path": "notes.txt"}));
+        let effective = owner(admit(&f.routes, channel(9), Some(&body)));
+        let head = &f.routes[&channel(1)];
+        assert_eq!(effective.spawn_principal, head.spawn_principal);
+        assert_eq!(effective.root, head.root);
+        assert_eq!(effective.project_root, head.project_root);
+        assert_eq!(effective.session, head.session);
+        assert_eq!(effective.harness, head.harness);
+        assert_eq!(effective.trust, head.trust);
+        assert_eq!(effective.disabled_tools, head.disabled_tools);
+        assert!(Arc::ptr_eq(
+            &effective.run_owner.as_ref().unwrap().head.0,
+            &head.0
+        ));
+    }
+}
+
+#[test]
+fn codemode_head_routes_with_unverified_or_absent_principals_are_ambiguous() {
+    for id in [Some("unverified"), None] {
+        let mut f = linked_fixture();
+        let root = f.head_root.clone();
+        second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
+        with_principal_id(&mut f.routes, channel(1), "direct");
+        let second = f.routes.get_mut(&channel(3)).unwrap();
+        if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+            &mut Arc::get_mut(&mut second.0).unwrap().spawn_principal
+        {
+            *principal_id = id.map(str::to_owned);
+        }
+        assert_ambiguous_field(&f, "spawn_principal");
+    }
+}
+
+#[test]
+fn codemode_head_routes_with_different_flow_read_carrier_access_are_ambiguous() {
+    let mut f = linked_fixture();
+    let root = f.head_root.clone();
+    second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
+    with_principal_id(&mut f.routes, channel(1), "direct");
+    with_principal_id(&mut f.routes, channel(3), "reserved:basal");
+    // Hold sandbox access equal to isolate the carrier's additional read capability.
+    assert_eq!(
+        principal_access_class(&f.routes[&channel(1)].spawn_principal).strict_sandbox,
+        principal_access_class(&f.routes[&channel(3)].spawn_principal).strict_sandbox
+    );
+    assert_ambiguous_field(&f, "spawn_principal");
+}
+
+#[test]
 fn codemode_head_routes_that_disagree_on_consumer_elicitation_are_ambiguous() {
     let mut f = linked_fixture();
     let root = f.head_root.clone();
