@@ -1,0 +1,1 @@
+- The bash tool's build-server guidance no longer assumes the agent runs on macOS, and says plainly that building and testing go remote; only running a binary that already exists on the machine stays local.
