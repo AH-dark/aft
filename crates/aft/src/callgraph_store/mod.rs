@@ -23685,6 +23685,52 @@ mod refresh_worker_tests {
     struct ForeignRefreshWriter {
         child: std::process::Child,
         killed: bool,
+        output: crossbeam_channel::Receiver<std::result::Result<String, String>>,
+        tail: VecDeque<String>,
+    }
+
+    fn wait_for_foreign_writer_marker(
+        output: &crossbeam_channel::Receiver<std::result::Result<String, String>>,
+        tail: &mut VecDeque<String>,
+        marker: &str,
+        budget: Duration,
+    ) -> std::result::Result<(), String> {
+        let deadline = Instant::now() + budget;
+        loop {
+            match output.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Ok(line)) => {
+                    let ready = line.trim() == marker;
+                    if tail.len() == 32 {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
+                    if ready {
+                        return Ok(());
+                    }
+                }
+                Ok(Err(error)) => {
+                    return Err(format!("waiting for {marker}: {error}; stdout={tail:?}"))
+                }
+                Err(error) => {
+                    return Err(format!("waiting for {marker}: {error}; stdout={tail:?}"))
+                }
+            }
+        }
+    }
+
+    fn foreign_writer_exit_before(
+        child: &mut std::process::Child,
+        budget: Duration,
+    ) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + budget;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Err(error) => panic!("foreign writer {} exit status failed: {error}", child.id()),
+                Ok(None) if Instant::now() >= deadline => return None,
+                Ok(None) => std::thread::park_timeout(Duration::from_millis(5)),
+            }
+        }
     }
 
     impl ForeignRefreshWriter {
@@ -23703,53 +23749,107 @@ mod refresh_worker_tests {
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            let mut output = std::io::BufReader::new(child.stdout.as_mut().unwrap());
-            let mut line = String::new();
-            loop {
-                assert!(
-                    output.read_line(&mut line).unwrap() > 0,
-                    "writer exited before acquiring lease"
-                );
-                if line.trim() == "writer-ready" {
-                    break;
+            let stdout = child.stdout.take().unwrap();
+            let (send, output) = crossbeam_channel::unbounded();
+            // A blocking pipe read belongs on a drain thread, not on the test
+            // thread whose marker deadline must still fire if the child stalls.
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if send.send(line.map_err(|error| error.to_string())).is_err() {
+                        return;
+                    }
                 }
-                line.clear();
-            }
-            Self {
+                let _ = send.send(Err("child stdout closed".into()));
+            });
+            let mut writer = Self {
                 child,
                 killed: false,
+                output,
+                tail: VecDeque::new(),
+            };
+            writer.wait_for_marker("writer-ready");
+            writer
+        }
+
+        fn wait_for_marker(&mut self, marker: &str) {
+            if let Err(error) = wait_for_foreign_writer_marker(
+                &self.output,
+                &mut self.tail,
+                marker,
+                Duration::from_secs(30),
+            ) {
+                let status = self.child.try_wait();
+                let _ = self.child.kill();
+                self.killed = true;
+                let reaped = foreign_writer_exit_before(&mut self.child, Duration::from_secs(5));
+                panic!("foreign writer {} protocol failed: {error}; status={status:?}; reaped={reaped:?}", self.child.id());
             }
         }
 
         fn kill(&mut self) {
             self.child.kill().unwrap();
-            assert!(!self.child.wait().unwrap().success());
             self.killed = true;
+            let status = foreign_writer_exit_before(&mut self.child, Duration::from_secs(5))
+                .expect("killed foreign writer was not reaped before its deadline");
+            assert!(!status.success());
         }
 
         fn publish(&mut self) {
-            use std::io::{BufRead, Write};
+            use std::io::Write;
             self.child.stdin.as_mut().unwrap().write_all(b"p").unwrap();
-            let mut output = std::io::BufReader::new(self.child.stdout.as_mut().unwrap());
-            let mut line = String::new();
-            loop {
-                assert!(
-                    output.read_line(&mut line).unwrap() > 0,
-                    "writer exited before publishing"
-                );
-                if line.trim() == "published-ready" {
-                    break;
-                }
-                line.clear();
-            }
+            self.wait_for_marker("published-ready");
         }
     }
 
     impl Drop for ForeignRefreshWriter {
         fn drop(&mut self) {
             drop(self.child.stdin.take());
-            assert!(self.killed || self.child.wait().unwrap().success());
+            let status = foreign_writer_exit_before(&mut self.child, Duration::from_secs(30));
+            if status.is_none() {
+                let _ = self.child.kill();
+                let reaped = foreign_writer_exit_before(&mut self.child, Duration::from_secs(5));
+                if !std::thread::panicking() {
+                    panic!("foreign writer {} did not exit before deadline; reaped={reaped:?}; stdout={:?}", self.child.id(), self.tail);
+                }
+            } else if !self.killed && !std::thread::panicking() {
+                assert!(
+                    status.unwrap().success(),
+                    "foreign writer failed; stdout={:?}",
+                    self.tail
+                );
+            }
         }
+    }
+
+    #[test]
+    fn foreign_writer_marker_deadline_reports_captured_output() {
+        let (send, receive) = crossbeam_channel::unbounded();
+        send.send(Ok("child diagnostic".to_string())).unwrap();
+        let mut tail = VecDeque::new();
+        let error =
+            wait_for_foreign_writer_marker(&receive, &mut tail, "writer-ready", Duration::ZERO)
+                .unwrap_err();
+        assert!(
+            error.contains("writer-ready") && error.contains("child diagnostic"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn foreign_writer_marker_accepts_ready_and_reports_eof() {
+        let (send, receive) = crossbeam_channel::unbounded();
+        send.send(Ok("writer-ready".to_string())).unwrap();
+        let mut tail = VecDeque::new();
+        wait_for_foreign_writer_marker(&receive, &mut tail, "writer-ready", Duration::ZERO)
+            .unwrap();
+        send.send(Err("child stdout closed".into())).unwrap();
+        let error =
+            wait_for_foreign_writer_marker(&receive, &mut tail, "published-ready", Duration::ZERO)
+                .unwrap_err();
+        assert!(
+            error.contains("published-ready") && error.contains("child stdout closed"),
+            "{error}"
+        );
     }
 
     fn run_refresh_fallback_probe(worker: &CallgraphRefreshTestWorker) {
