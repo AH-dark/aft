@@ -186,6 +186,17 @@ impl ProjectionFleet {
         if let Some(previous) = self.entries.remove(&root) {
             self.bytes = self.bytes.saturating_sub(previous.bytes);
         }
+        // A snapshot that cannot fit alone must not evict useful roots before
+        // eventually evicting itself. It is still available to the scan caller.
+        if bytes > budget {
+            if let Some(slot) = slot.upgrade() {
+                if let Ok(mut cached) = slot.lock() {
+                    cached.take();
+                }
+            }
+            self.drops = self.drops.saturating_add(1);
+            return;
+        }
         self.bytes = self.bytes.saturating_add(bytes);
         self.entries.insert(
             root,
@@ -3602,8 +3613,9 @@ impl InspectManager {
         let project_files = scope_files(&snapshot.project_root, &project_scope);
         let current_by_relative = current_project_files(&snapshot.project_root, &project_files);
 
-        let mut records_match = true;
         for record in &cached_records {
+            #[cfg(test)]
+            FRESHNESS_RECORD_VISITS.with(|visits| visits.set(visits.get() + 1));
             let absolute = if record.file_path.is_absolute() {
                 record.file_path.clone()
             } else {
@@ -3612,13 +3624,12 @@ impl InspectManager {
             match verify_contribution_file(&absolute, &record.freshness) {
                 ContributionFreshness::Fresh { .. } => {}
                 ContributionFreshness::Stale | ContributionFreshness::Deleted => {
-                    records_match = false;
+                    return Ok(false);
                 }
             }
         }
 
-        Ok(records_match
-            && current_by_relative.len() == cached_relative.len()
+        Ok(current_by_relative.len() == cached_relative.len()
             && current_by_relative
                 .keys()
                 .all(|relative| cached_relative.contains(relative)))
@@ -4135,9 +4146,7 @@ impl InspectManager {
             }
             aggregate_job.callgraph_snapshot = scan_job.callgraph_snapshot.clone();
             #[cfg(debug_assertions)]
-            if debug_cold_cache {
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            cold_cache_test_delay(debug_cold_cache, std::thread::sleep);
             let scan_started = Instant::now();
             self.record_build_progress(
                 &job.key,
@@ -4917,6 +4926,15 @@ struct Tier2PhaseTimings {
 }
 
 const TIER2_WORK_LOG_THRESHOLD: Duration = Duration::from_millis(50);
+
+#[cfg(debug_assertions)]
+// Timing fixtures are built with Cargo's test-timing-hooks feature to request
+// this artificial delay. Ordinary debug builds do not enable that feature.
+fn cold_cache_test_delay(cold: bool, sleep: impl FnOnce(Duration)) {
+    if cold && cfg!(feature = "test-timing-hooks") {
+        sleep(Duration::from_millis(10));
+    }
+}
 
 fn projection_estimator_duration(phases: &Tier2PhaseTimings) -> Duration {
     // Projection journal files are the denominator used by the cost model.
@@ -7715,11 +7733,30 @@ fn display_file_from_occurrence(value: &str) -> &str {
 }
 
 #[cfg(test)]
+thread_local! {
+    static FRESHNESS_RECORD_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 // Some tests here are `cfg(debug_assertions)` (they lean on debug-only seams);
 // helpers only they use read as dead in release-profile test builds.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod guard_tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn audit05_debug_cold_scans_use_only_opt_in_delay() {
+        let requested = std::cell::Cell::new(None);
+        cold_cache_test_delay(true, |duration| requested.set(Some(duration)));
+        assert_eq!(
+            requested.get(),
+            cfg!(feature = "test-timing-hooks").then_some(Duration::from_millis(10))
+        );
+        cold_cache_test_delay(false, |_| {
+            panic!("warm scans never request a fixture delay")
+        });
+    }
 
     fn write_ts_project(file_count: usize) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -10354,6 +10391,18 @@ export function bannerUnused() {}
         assert_stale(manager.tier2_read_cached(snapshot, InspectCategory::Duplicates, scope));
     }
 
+    #[test]
+    fn audit05_freshness_stops_after_first_mismatch() {
+        let (_dir, manager, snapshot, _scope, files) = duplicate_cache_fixture();
+        std::fs::remove_file(&files[1]).unwrap();
+        let cache = manager.cache_for_snapshot(&snapshot).unwrap();
+        FRESHNESS_RECORD_VISITS.with(|visits| visits.set(0));
+        assert!(!manager
+            .tier2_cached_aggregate_is_fresh(&snapshot, InspectCategory::Duplicates, cache.as_ref())
+            .unwrap());
+        assert_eq!(FRESHNESS_RECORD_VISITS.with(|visits| visits.get()), 1);
+    }
+
     fn duplicate_cache_fixture() -> (
         tempfile::TempDir,
         InspectManager,
@@ -11937,6 +11986,24 @@ export function main() { foo(); }
                 drops: 1,
             }
         );
+    }
+
+    #[test]
+    fn audit05_oversized_projection_preserves_other_roots() {
+        let first: Arc<ProjectionSlot> = Arc::new(Mutex::new(None));
+        let oversized: Arc<ProjectionSlot> = Arc::new(Mutex::new(None));
+        let mut fleet = ProjectionFleet::default();
+        fleet.admit(PathBuf::from("first"), Arc::downgrade(&first), 40, 100);
+        fleet.admit(
+            PathBuf::from("oversized"),
+            Arc::downgrade(&oversized),
+            101,
+            100,
+        );
+        assert!(fleet.entries.contains_key(Path::new("first")));
+        assert!(!fleet.entries.contains_key(Path::new("oversized")));
+        assert_eq!(fleet.bytes, 40);
+        assert_eq!(fleet.drops, 1);
     }
 
     #[test]
