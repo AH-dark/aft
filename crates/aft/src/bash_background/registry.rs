@@ -444,6 +444,21 @@ static TERMINAL_PUBLICATION_GATES: std::sync::OnceLock<Mutex<HashMap<String, Kil
     std::sync::OnceLock::new();
 
 #[cfg(test)]
+static REHYDRATED_REGISTRATION_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGate>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn wait_on_rehydrated_registration_gate_for_test(task_id: &str) {
+    let gate = REHYDRATED_REGISTRATION_GATES
+        .get()
+        .and_then(|gates| gates.lock().unwrap().remove(task_id));
+    if let Some(gate) = gate {
+        let _ = gate.reached.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn install_kill_signal_gate_for_test(
     task_id: &str,
@@ -10305,7 +10320,9 @@ impl BgTaskRegistry {
         }
         let mode = metadata.mode.clone();
         let recovered_terminal = metadata.status.is_terminal().then(|| metadata.clone());
-        let task = Arc::new(BgTask {
+        #[cfg(test)]
+        wait_on_rehydrated_registration_gate_for_test(&task_id);
+        let mut task = BgTask {
             completion_secrets: Mutex::new(
                 metadata
                     .has_safe_completion_redaction_after_restart()
@@ -10324,7 +10341,7 @@ impl BgTaskRegistry {
             // launch, which registers through here too, sets its own.
             holds_background_slot: AtomicBool::new(true),
             hard_kill_renewable: renewable,
-            drain_reply: self.new_drain_reply_cache(&metadata, renewable),
+            drain_reply: self.drain_reply_cache(&metadata.task_id, &metadata.session_id),
             persisted_hard_kill_ms: AtomicU64::new(persisted_hard_kill_ms),
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.finished_at.map(started_instant_from_unix_millis)),
@@ -10368,13 +10385,13 @@ impl BgTaskRegistry {
                 terminal_output_cache: None,
                 pending_terminal_override: None,
             }),
-        });
+        };
         self.record_live_delivery_session(&task.session_id);
         self.remember_session_harness(&task);
         // A watch's single-record recovery can race configure replay. Keep the
         // first registered task and its runtime instead of replacing its state
         // with another disk snapshot (or orphaning an authoritative child).
-        {
+        let task = {
             let mut tasks = self
                 .inner
                 .tasks
@@ -10383,8 +10400,19 @@ impl BgTaskRegistry {
             if tasks.contains_key(&task_id) {
                 return Ok(());
             }
+            // Only the registration winner may initialize the shared reply.
+            // Its state is still exclusively owned, so publication cannot
+            // wait on task state or overwrite a newer registered writer.
+            let state = task
+                .state
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            task.drain_reply
+                .publish_metadata(&state.metadata, renewable);
+            let task = Arc::new(task);
             tasks.insert(task_id.clone(), Arc::clone(&task));
-        }
+            task
+        };
         self.inner
             .cleanup_queue
             .lock()

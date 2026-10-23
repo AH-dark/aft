@@ -4246,4 +4246,6 @@ fn proves_no_start(error: &exec::Error) -> bool {
 mod tests;
 
 #[cfg(all(test, unix))]
-pub(crate) use tests::uncaptured_terminal_before_render_for_test;
+pub(crate) use tests::{
+    captured_task_after_losing_replay_for_test, uncaptured_terminal_before_render_for_test,
+};

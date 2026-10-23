@@ -202,6 +202,83 @@ mod frame_loop_lock_tests {
     use super::*;
 
     #[tokio::test]
+    async fn module_drain_keeps_live_capture_when_stale_replay_loses_registration() {
+        let (dir, registry, task) =
+            crate::bash_background::registry::remote::captured_task_after_losing_replay_for_test();
+        let root = ProjectRootId::from_path(dir.path()).unwrap();
+        let cached = registry.drain_reply_cache(&task.task_id, &task.session_id);
+        let metrics = DispatchPathMetrics::new();
+        let route = RouteChannel {
+            channel: 1,
+            epoch: 1,
+        };
+        metrics.held_bash_calls.insert(route, 1);
+        metrics
+            .held_bash_calls
+            .set_phase(route, 1, drain::BashHoldPhase::Wait);
+        metrics.held_bash_calls.set_detach_target(
+            route,
+            1,
+            drain::BashDetachTarget {
+                reply_cache: cached.clone(),
+                run_scoped: true,
+                task_id: task.task_id.clone(),
+                session_id: task.session_id.clone(),
+                wait_mode: false,
+                worker_session: false,
+                server_completion: false,
+                late_results: false,
+                registry: registry.clone(),
+                request_id: "losing-replay".into(),
+                ver: PROTOCOL_VERSION,
+                flags: Flags::new(false, Priority::Passive, false),
+                format_context: Default::default(),
+            },
+        );
+        let routes = HashMap::from([(
+            route,
+            super::super::test_support::route_identity(&root, &task.session_id),
+        )]);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
+        let state = task.state.lock().unwrap();
+        assert!(state.metadata.remote.as_ref().unwrap().accepted);
+        let no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
+        let reply = answer_held_bash_calls_from_module_loop(&writer_tx, &routes, &metrics, true);
+        tokio::pin!(reply);
+        let answered = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(reply.as_mut(), cx))
+        })
+        .await;
+        assert!(
+            matches!(answered, std::task::Poll::Ready(Ok(1))),
+            "drain must not wait on task state: {answered:?}"
+        );
+        let frame = writer_rx.try_recv().expect("drain frame").frame;
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(
+            body["structuredContent"]["status"], "running",
+            "losing replay rewound capture: {body}"
+        );
+        assert!(
+            !body.to_string().contains(REMOTE_INPUT_CAPTURE_WARNING),
+            "{body}"
+        );
+        assert!(
+            !body.to_string().contains("stale pre-capture replay"),
+            "{body}"
+        );
+        let published = cached.snapshot();
+        assert_eq!(published.inputs_captured, Some(true));
+        assert_eq!(
+            published.execution_note.as_deref(),
+            Some("live input capture recorded")
+        );
+        assert_eq!(published.deadline.unwrap().0.limit_ms, 60_000);
+        drop(no_task_locks);
+        drop(state);
+    }
+
+    #[tokio::test]
     async fn module_drain_reports_uncaptured_terminal_before_output_rendering() {
         for refused in [true, false] {
             let fixture = crate::bash_background::registry::remote::uncaptured_terminal_before_render_for_test(refused);
