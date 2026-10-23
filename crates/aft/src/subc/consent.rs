@@ -949,7 +949,7 @@ fn scope_reason(grant: &AccessGrant) -> &'static str {
 /// when that directory passes `probe_directory_scope_with`: it is not the home
 /// folder, a home ancestor, a root-level or volume-level folder, or a protected
 /// system folder. Unknown home/volume identity stays file-only.
-fn directory_scope(grant: &AccessGrant) -> AccessGrant {
+pub(crate) fn directory_scope(grant: &AccessGrant) -> AccessGrant {
     directory_scope_with(grant, directory_is_root_alias)
 }
 

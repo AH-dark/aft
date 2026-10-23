@@ -206,6 +206,7 @@ mod bash_grant_tests;
 mod bash_selector_tests;
 mod codemode;
 mod consent;
+pub(crate) use consent::directory_scope;
 mod drain;
 mod flow_read;
 mod health;

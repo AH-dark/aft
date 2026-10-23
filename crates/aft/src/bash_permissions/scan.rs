@@ -554,14 +554,6 @@ fn resolve_existing(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| super::normalize_path(path))
 }
 
-fn permission_dir(path: &Path) -> PathBuf {
-    if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent().unwrap_or(path).to_path_buf()
-    }
-}
-
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -631,8 +623,22 @@ fn push_external_path(
     if read_exemption.is_some_and(|is_exempt| is_exempt(path)) {
         return;
     }
-    let dir = permission_dir(path);
-    let pattern = format!("{}/*", display_path(&dir));
+    use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+    let grant = AccessGrant {
+        path: path.to_path_buf(),
+        kind: if path.is_dir() {
+            GrantKind::Subtree
+        } else {
+            GrantKind::File
+        },
+        // Folder eligibility is identical for read and write approvals.
+        operation: AccessOperation::Read,
+    };
+    let scope = crate::subc::directory_scope(&grant);
+    let pattern = match scope.kind {
+        GrantKind::File => display_path(&scope.path),
+        GrantKind::Subtree => format!("{}/*", display_path(&scope.path)),
+    };
     push_ask(
         asks,
         seen,
@@ -821,7 +827,7 @@ mod tests {
     fn partly_quoted_absolute_path_is_not_treated_as_relative() {
         let project = tempfile::tempdir().unwrap();
         let asks = external_asks(r#"rm "/usr"/aft-scan-probe"#, project.path());
-        assert_eq!(asks, vec!["/usr/*".to_string()]);
+        assert_eq!(asks, vec!["/usr/aft-scan-probe".to_string()]);
         assert_eq!(unquote(r#""/etc"/'pass'wd"#), "/etc/passwd");
         assert_eq!(unquote(r#"'a"b'"c'd""#), "a\"bc'd");
     }
@@ -831,7 +837,7 @@ mod tests {
     fn pushd_and_popd_move_the_scan_directory() {
         let project = tempfile::tempdir().unwrap();
         let asks = external_asks("pushd /usr && rm aft-scan-probe", project.path());
-        assert_eq!(asks, vec!["/usr/*".to_string()]);
+        assert_eq!(asks, vec!["/usr/aft-scan-probe".to_string()]);
         let asks = external_asks("pushd /usr && popd && rm aft-scan-probe", project.path());
         assert!(asks.is_empty(), "{asks:?}");
     }
