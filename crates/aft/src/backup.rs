@@ -7759,6 +7759,48 @@ mod tests {
         assert_eq!(store.tracked_files("session_a").len(), 1);
     }
 
+    /// Memory characterization: each UTF-8 regular-file snapshot keeps the
+    /// file's body in process memory twice, as `content_bytes` and as the
+    /// `content` string.
+    /// The only bound is the per-(session, file) depth, so the held total
+    /// grows with sessions times files edited. Nothing drops these in-memory
+    /// stacks when a session ends or its root is idle-evicted (see
+    /// `context::callgraph_store_for_ops_tests::idle_eviction_keeps_in_memory_backup_stacks`),
+    /// and no memory-census plane counts them.
+    #[test]
+    fn backup_store_holds_two_copies_of_every_snapshot_in_memory() {
+        const FILE_BYTES: usize = 64 * 1024;
+        const SESSIONS: usize = 3;
+        let path = temp_file("memory_characterization.txt", "seed");
+        let mut store = BackupStore::new();
+        for session in 0..SESSIONS {
+            for edit in 0..MAX_UNDO_DEPTH {
+                let line = format!("session {session} edit {edit}\n");
+                fs::write(&path, line.repeat(FILE_BYTES / line.len() + 1)).unwrap();
+                store
+                    .snapshot(&format!("session-{session}"), &path, "edit")
+                    .unwrap();
+            }
+        }
+
+        let (entries, held_bytes) = store
+            .entries
+            .values()
+            .flat_map(HashMap::values)
+            .flatten()
+            .fold((0usize, 0usize), |(entries, bytes), entry| {
+                (
+                    entries + 1,
+                    bytes + entry.content.len() + entry.content_bytes.len(),
+                )
+            });
+        assert_eq!(entries, SESSIONS * MAX_UNDO_DEPTH);
+        assert!(
+            held_bytes >= 2 * SESSIONS * MAX_UNDO_DEPTH * FILE_BYTES,
+            "held {held_bytes} bytes for {entries} snapshots of a {FILE_BYTES}-byte file"
+        );
+    }
+
     #[test]
     fn per_session_per_file_cap_is_independent() {
         // Two sessions fill up their own stacks independently; hitting the cap

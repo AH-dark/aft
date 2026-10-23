@@ -19857,6 +19857,34 @@ mod callgraph_store_for_ops_tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_none());
     }
+
+    /// Memory characterization: idle eviction drops index handles and resets
+    /// the symbol cache but leaves the backup store's in-memory undo stacks
+    /// in place (for a UTF-8 regular file, both `content_bytes` and the
+    /// `content` string of every snapshot). The delayed idle release only
+    /// closes the backup store's database pool. A heap profile after evicting
+    /// 80 roots still held about 60 MB of backup content.
+    #[test]
+    fn idle_eviction_keeps_in_memory_backup_stacks() {
+        let root = TempDir::new().expect("project tempdir");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let path = root.path().join("edited.rs");
+        std::fs::write(&path, "fn edited() {}\n".repeat(4096)).unwrap();
+        ctx.backup()
+            .lock()
+            .snapshot("session", &path, "before edit")
+            .unwrap();
+
+        assert!(ctx.evict_idle_artifacts());
+
+        assert_eq!(ctx.backup().lock().history("session", &path).len(), 1);
+    }
 }
 
 #[cfg(test)]
