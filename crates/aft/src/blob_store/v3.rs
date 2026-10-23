@@ -20,7 +20,7 @@ use crate::views::contracts::{observe, DurabilityObserver, DurabilityStep};
 
 pub const FORMAT_VERSION: u32 = 1;
 pub const SCHEMA_VERSION: u32 = 1;
-pub const LAYOUT_TAG: u32 = 1;
+pub const LAYOUT_TAG: u32 = 2;
 pub const REGISTRY_APPLICATION_ID: i64 = 0x41465452;
 pub const PLANE_APPLICATION_ID: i64 = 0x41465450;
 pub const NAMESPACE_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
@@ -28,6 +28,12 @@ const TIMEOUT_MS: i64 = 5_000;
 mod connections;
 mod copy;
 mod initialization;
+#[cfg(test)]
+mod layout_gate;
+#[cfg(test)]
+mod layout_tests;
+#[cfg(test)]
+mod open_tests;
 #[cfg(test)]
 mod read_audit;
 #[cfg(test)]
@@ -62,6 +68,32 @@ CREATE TABLE blob_quarantine (full_key BLOB NOT NULL PRIMARY KEY CHECK(length(fu
 CREATE TRIGGER immutable_payload BEFORE UPDATE OF payload, payload_digest ON blob_payloads
  BEGIN SELECT RAISE(ABORT, 'immutable_payload'); END;
 ";
+
+const ROWID_SCHEMA: &str = "
+CREATE TABLE store_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), plane TEXT NOT NULL, gc_epoch INTEGER NOT NULL);
+CREATE TABLE blob_payloads (id INTEGER PRIMARY KEY,
+ full_key BLOB NOT NULL CHECK(length(full_key)=32),
+ payload BLOB NOT NULL, payload_digest BLOB NOT NULL CHECK(length(payload_digest)=32),
+ payload_schema INTEGER NOT NULL, created_at_ms INTEGER NOT NULL);
+CREATE UNIQUE INDEX blob_locator ON blob_payloads(full_key);
+CREATE TABLE blob_liveness (blob_id INTEGER PRIMARY KEY REFERENCES blob_payloads(id) ON DELETE CASCADE,
+ ref_epoch INTEGER NOT NULL);
+CREATE INDEX blob_membership ON blob_liveness(ref_epoch, blob_id);
+CREATE TABLE blob_quarantine (full_key BLOB NOT NULL PRIMARY KEY CHECK(length(full_key)=32)) WITHOUT ROWID;
+CREATE TRIGGER immutable_payload BEFORE UPDATE OF payload, payload_digest ON blob_payloads
+ BEGIN SELECT RAISE(ABORT, 'immutable_payload'); END;
+";
+
+#[cfg(test)]
+thread_local! { static CREATE_3A_LAYOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+fn plane_layout(c: &Connection) -> rusqlite::Result<u32> {
+    c.query_row(
+        "SELECT layout_tag FROM format_meta WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -302,9 +334,15 @@ impl Kind {
         }
     }
     fn schema(self) -> &'static str {
-        match self {
-            Self::Registry => REGISTRY_SCHEMA,
-            Self::Plane(_) => PLANE_SCHEMA,
+        self.schema_for(self.layout())
+            .expect("compiled creation layout")
+    }
+    fn schema_for(self, layout: u32) -> Option<&'static str> {
+        match (self, layout) {
+            (Self::Registry, 0) => Some(REGISTRY_SCHEMA),
+            (Self::Plane(_), 1) => Some(PLANE_SCHEMA),
+            (Self::Plane(_), 2) => Some(ROWID_SCHEMA),
+            _ => None,
         }
     }
     fn app_id(self) -> i64 {
@@ -316,7 +354,13 @@ impl Kind {
     fn layout(self) -> u32 {
         match self {
             Self::Registry => 0,
-            Self::Plane(_) => LAYOUT_TAG,
+            Self::Plane(_) => {
+                #[cfg(test)]
+                if CREATE_3A_LAYOUT.get() {
+                    return 1;
+                }
+                LAYOUT_TAG
+            }
         }
     }
 }
@@ -363,20 +407,20 @@ fn validate(c: &Connection, path: &Path, kind: Kind) -> Result<()> {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .map_err(|_| incompatible(kind, path, version, IncompatibleReason::SchemaDrift))?;
-    if layout != kind.layout() {
+    let Some(compiled_schema) = kind.schema_for(layout) else {
         return Err(incompatible(
             kind,
             path,
             version,
             IncompatibleReason::LayoutTag(layout),
         ));
-    }
+    };
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(META)?;
-    expected.execute_batch(kind.schema())?;
+    expected.execute_batch(compiled_schema)?;
     if version != u64::from(FORMAT_VERSION)
         || schema != SCHEMA_VERSION
-        || text != format!("{META}{}", kind.schema())
+        || text != format!("{META}{compiled_schema}")
         || schema_rows(c).ok() != Some(schema_rows(&expected)?)
         || !initialization::has_seed(c, kind)
     {
@@ -1127,10 +1171,12 @@ impl Publication<'_, '_> {
             c.pragma_update(None, "synchronous", 0)?;
         }
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let touched = tx.execute(
-            "UPDATE blob_payloads SET ref_epoch=(SELECT gc_epoch FROM store_meta) WHERE full_key=?1 AND payload_digest=?2",
-            params![key.as_bytes().as_slice(), digest],
-        )?;
+        let sql = if plane_layout(&tx)? == 1 {
+            "UPDATE blob_payloads SET ref_epoch=(SELECT gc_epoch FROM store_meta) WHERE full_key=?1 AND payload_digest=?2"
+        } else {
+            "UPDATE blob_liveness SET ref_epoch=(SELECT gc_epoch FROM store_meta) WHERE blob_id=(SELECT id FROM blob_payloads WHERE full_key=?1 AND payload_digest=?2)"
+        };
+        let touched = tx.execute(sql, params![key.as_bytes().as_slice(), digest])?;
         tx.commit()?;
         Ok(touched == 1)
     }
@@ -1160,10 +1206,20 @@ impl Publication<'_, '_> {
             if existing != digest.as_bytes() {
                 return Err(Error::Refused("payload_mismatch"));
             }
-            tx.execute("UPDATE blob_payloads SET ref_epoch=(SELECT gc_epoch FROM store_meta) WHERE full_key=?1",[key.as_bytes().as_slice()])?;
+            let sql = if plane_layout(&tx)? == 1 {
+                "UPDATE blob_payloads SET ref_epoch=(SELECT gc_epoch FROM store_meta) WHERE full_key=?1"
+            } else {
+                "UPDATE blob_liveness SET ref_epoch=(SELECT gc_epoch FROM store_meta) WHERE blob_id=(SELECT id FROM blob_payloads WHERE full_key=?1)"
+            };
+            tx.execute(sql, [key.as_bytes().as_slice()])?;
             false
         } else {
-            tx.execute("INSERT INTO blob_payloads VALUES(?1,?2,?3,?4,(SELECT gc_epoch FROM store_meta),?5)",params![key.as_bytes().as_slice(),payload,digest.as_bytes().as_slice(),payload_schema,crate::pins::now_ms()])?;
+            if plane_layout(&tx)? == 1 {
+                tx.execute("INSERT INTO blob_payloads VALUES(?1,?2,?3,?4,(SELECT gc_epoch FROM store_meta),?5)",params![key.as_bytes().as_slice(),payload,digest.as_bytes().as_slice(),payload_schema,crate::pins::now_ms()])?;
+            } else {
+                tx.execute("INSERT INTO blob_payloads(full_key,payload,payload_digest,payload_schema,created_at_ms) VALUES(?1,?2,?3,?4,?5)",params![key.as_bytes().as_slice(),payload,digest.as_bytes().as_slice(),payload_schema,crate::pins::now_ms()])?;
+                tx.execute("INSERT INTO blob_liveness VALUES(last_insert_rowid(),(SELECT gc_epoch FROM store_meta))",[])?;
+            }
             true
         };
         tx.commit()?;
@@ -1184,6 +1240,41 @@ impl Publication<'_, '_> {
         crate::durability::sync_dir(&self.registry.dir)?;
         Ok(())
     }
+}
+
+/// Per-file metadata; format support advertised by `aft --formats` is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V3FormatReport {
+    pub store_name: &'static str,
+    pub format_version: u32,
+    pub schema_version: u32,
+    pub layout_tag: u32,
+}
+
+/// Validates an existing v3 file through its owning connection, without creating
+/// a store, acquiring a reservation lock, or changing its schema.
+pub fn v3_format_report(path: &Path) -> Result<V3FormatReport> {
+    let kind = match path.file_stem().and_then(|s| s.to_str()) {
+        Some("members") => Kind::Registry,
+        Some("semantic") => Kind::Plane(FamilyPlane::Semantic),
+        Some("callgraph") => Kind::Plane(FamilyPlane::Callgraph),
+        Some("trigram") => Kind::Plane(FamilyPlane::Trigram),
+        _ => return Err(Error::InvalidIdentity),
+    };
+    let database = connections::shared(path, kind, false, true)?;
+    let c = database.connection()?;
+    Ok(c.query_row(
+        "SELECT format_version,schema_version,layout_tag FROM format_meta WHERE singleton=1",
+        [],
+        |r| {
+            Ok(V3FormatReport {
+                store_name: kind.store().name(),
+                format_version: r.get(0)?,
+                schema_version: r.get(1)?,
+                layout_tag: r.get(2)?,
+            })
+        },
+    )?)
 }
 
 pub struct PlaneReader {

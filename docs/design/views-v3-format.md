@@ -168,7 +168,7 @@ Source: `crates/aft/src/blob_store/v3.rs` and `blob_store/v3/initialization.rs`.
 | Persisted store name | `views_v3_registry` | `views_v3_store` |
 | Format version / schema version | 1 / 1 | 1 / 1 |
 | `PRAGMA application_id` | `0x41465452` (`REGISTRY_APPLICATION_ID`, "AFTR") | `0x41465450` (`PLANE_APPLICATION_ID`, "AFTP") |
-| Layout tag (`format_meta.layout_tag`) | 0 | 1 (`LAYOUT_TAG`) |
+| Layout tag (`format_meta.layout_tag`) | 0 | 2 (`LAYOUT_TAG`, new stores); 1 remains readable/writable without conversion |
 
 Both stores carry the same metadata singleton:
 
@@ -200,7 +200,7 @@ CREATE TABLE accounting (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
 `members.view_dir` is always `blobs/v3/<family>/views/<scope>`, never under
 `<storage>/views/`. A member's `root` is the checkout path's bytes, or NULL.
 
-Plane store tables:
+Layout-1 plane store tables (the original v3 layout):
 
 ```sql
 CREATE TABLE store_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -228,7 +228,7 @@ final `format_meta` row. Every open then checks, and refuses through
 - `format_version` readable (0 when not), and not newer than supported (a
   newer version keeps the `Artifact` refusal);
 - `application_id` equals the kind's value (`application_id`);
-- `layout_tag` equals the kind's value (`layout_tag:<value>`);
+- `layout_tag` selects an exact compiled schema (`layout_tag:<value>` for an unknown tag);
 - `schema_version`, the stored `schema_text`, and the live `sqlite_schema`
   rows (type, name, tbl_name, sql, excluding `sqlite_%`) equal this build's
   compiled-in text (`schema_drift`), and the seed rows exist.
@@ -245,6 +245,102 @@ Each value is set and read back; a mismatch refuses as `pragma:<name>`.
 | Bootstrap (creation, before the schema transaction) | `auto_vacuum=2`; `application_id` inside the transaction |
 | Writer open (publication, collector, recovery) | `busy_timeout=5000`, `journal_mode=WAL` (must answer `wal`), `synchronous=2` (FULL), `foreign_keys=1`, `temp_store=2`, `wal_autocheckpoint=0`; `auto_vacuum` must read 2 |
 | Ledger read (read-only) | `busy_timeout=5000`, `query_only=1`; `auto_vacuum` must read 2 |
+
+## Layout tags and rowid payloads
+
+`format_meta.layout_tag` is a per-file integer, not a new persisted format
+name or an `aft --formats` version. `blob_store::v3_format_report(path)`
+validates an existing file through the shared owning connection and returns
+`store_name`, `format_version`, `schema_version` and `layout_tag`. It is a
+read-only open: no lock, measurement, creation, migration or ledger write.
+Registry files keep tag 0; plane files accept tags 1 and 2. Unknown tags are
+refused through `persisted_format` as `layout_tag:<value>` before schema
+comparison. Both layouts retain format version 1 and schema version 1; schema
+identity is compiled for the pair (schema version, layout tag).
+
+Only new plane files under `blobs/v3/<family>/` get tag 2. Existing tag-1 files
+keep their schema and use layout-dispatched inserts and touches. There is no
+converter, including on writer open. V1 and v2 paths, schemas, membership index
+names and production routing are unchanged.
+
+Tag 2 replaces the payload and membership tables above with:
+
+```sql
+CREATE TABLE blob_payloads (id INTEGER PRIMARY KEY,
+ full_key BLOB NOT NULL CHECK(length(full_key)=32),
+ payload BLOB NOT NULL, payload_digest BLOB NOT NULL CHECK(length(payload_digest)=32),
+ payload_schema INTEGER NOT NULL, created_at_ms INTEGER NOT NULL);
+CREATE UNIQUE INDEX blob_locator ON blob_payloads(full_key);
+CREATE TABLE blob_liveness (
+ blob_id INTEGER PRIMARY KEY REFERENCES blob_payloads(id) ON DELETE CASCADE,
+ ref_epoch INTEGER NOT NULL);
+CREATE INDEX blob_membership ON blob_liveness(ref_epoch, blob_id);
+CREATE TRIGGER immutable_payload BEFORE UPDATE OF payload, payload_digest ON blob_payloads
+ BEGIN SELECT RAISE(ABORT, 'immutable_payload'); END;
+```
+
+`store_meta` and `blob_quarantine` are unchanged. The narrow unique locator
+keeps all 32 key bytes but no payload. Mutable liveness (`ref_epoch`) lives
+only in `blob_liveness`: a reuse touch updates that small row, not a payload
+record with overflow pages. Insert and liveness creation share one transaction;
+DELETE of a payload remains allowed and cascades to liveness with the writer's
+verified `foreign_keys=1`. The trigger refuses payload-only and digest-only
+UPDATE, including an UPDATE which assigns the existing value. A ref_epoch
+touch is instead an UPDATE of `blob_liveness` and succeeds.
+
+Copy reuse reserves `TOUCH_RESERVATION` (64 KiB) in tag 2, independent of payload
+length. Tag 1 retains row length plus its 1 MiB margin because its epoch still
+shares the payload record. A row lost before the touch cannot be inserted
+under the small reservation; the copier retries under a full copy reservation.
+The changed reservation assertions replace the original shared-record budget
+contract because the new layout no longer rewrites payloads on reuse.
+
+### Storage-only lookup and open gates
+
+Run `python3 scripts/views-performance-gate.py --rowid-layout --output <new-dir>`
+on Linux. It selects the pinned slice-1 AFT corpus (`05d40ac417db6137a4204521bd3c59853325e968`)
+and runs the ignored `blob_store::v3::layout_gate::rowid_layout_receipt` test.
+The test populates both layouts by copy-on-first-use from a pinned `Cargo.lock`
+payload, repeated to 1 MiB per row, in identical 32-row insert order. This is
+a composition of two fixtures preserved in `ffbbea3e0`: its digest SELECT
+with 256 probes and its shared-31-byte-prefix construction (`[7;32]`, final
+byte 0..63 repeated four times). Each batch has 128 hits and 128 misses.
+It does not reproduce the separate real-snapshot materialization timing
+mentioned in that commit's message.
+
+Each arm is opened fresh after population and byte-parity checks. One warmup
+batch is discarded; the median is taken over 11 batches. Receipts preserve
+process CPU and wall nanoseconds and the lookup statement's VM-step/full-scan
+counters in every batch, physical locator-tree overflow page counts from
+`dbstat`, and SQLite version/source ID. SQLite 3.46.0 is pinned by the baseline.
+The layout-1 primary tree's physical `dbstat` name is `blob_payloads`, not the
+logical `sqlite_autoindex_blob_payloads_1` name.
+
+The first baseline commit records unchanged layout 1 in
+`scripts/views-performance-baselines/slice-3b-linux-x86_64.json`. The paired
+Linux acquisition measured 89.551 ms versus 2.121 ms median wall time (**42.23x**),
+8224 versus 0 locator overflow pages, and 2176 versus 2560 VM steps per batch
+(full-scan steps 0 in both). Every key's `get` returned byte-identical bytes in
+both layouts. This is a storage-only result, not an end-to-end daemon claim.
+
+The harness also runs the ignored
+`blob_store::v3::open_tests::old_store_dispatch_and_copy_readers_never_migrate_on_open`:
+a real, checkpointed v2 database exceeds 1 GiB and has no WAL on entry, and a
+v1 fixture already has `created_at_ms`. Writer/read-only v3 dispatch refuses
+both without migration; the v1/v2 copy-source readers open them unchanged.
+Schema cookies and page counts are equal, and a connection-installing SQLite
+statement tracer reports zero schema-capable statements and zero payload
+writes. It conservatively includes no-op DDL; its control executes real DDL
+and payload writes and must count them. Empty sidecars which SQLite's read-only
+WAL reader can leave are not payload writes.
+
+`layout_tests` cover each immutable column separately, allowed epoch touch and
+GC DELETE, format reporting on both layouts and the registry, and the multi-MiB
+reuse WAL peak. SQLite's WAL hook measures frames before publication checkpoints
+them: an 8 MiB payload in the old shared-record layout peaks at 8,495,472 bytes;
+the rowid layout must stay below 256 KiB. The old-layout control must exceed
+8 MiB, proving that the hook observes the expensive write rather than the
+post-checkpoint empty file.
 
 ## Ledger, lock and open modes
 
@@ -430,8 +526,7 @@ thirteen minutes) and need `AFT_V0_60_0_BINARY`.
 
 The manifest base header with PublishedFrontier, tombstones and
 readiness_overrides, donor seal records, the symbol plane, the v3 import
-ledger, persisted stat evidence, staging names and token rows. The rowid
-layout and its layout-tag section belong to 3b.
+ledger, persisted stat evidence, staging names and token rows.
 
 Slice 4's binder must honour the `evicting` contract above: when it finds its
 member in `evicting`, it never uses that view directory, and either treats the

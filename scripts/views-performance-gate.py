@@ -707,8 +707,59 @@ def run_arm(args, corpus, count, views, out):
     return result
 
 
+def validate_layout_receipt(result, sqlite_version):
+    for name, tag in (("old", 1), ("rowid", 2)):
+        arm = result[name]
+        if arm["sqlite_version"] != sqlite_version or arm["layout_tag"] != tag:
+            raise MeasurementError(f"{name}: SQLite version or layout does not match the pin")
+        if len(arm["batches"]) != 11 or arm["discarded_warmup_batches"] != 1:
+            raise MeasurementError(f"{name}: expected one warmup and eleven measured batches")
+        for batch in arm["batches"]:
+            if not all(isinstance(batch[key], int) and batch[key] >= 0
+                       for key in ("wall_ns", "cpu_ns", "vm_steps", "full_scan_steps")) or batch["vm_steps"] == 0:
+                raise MeasurementError(f"{name}: missing per-statement counters or clocks")
+        if arm["probes_per_batch"] != 256 or arm["present_probes"] != 128 or arm["absent_probes"] != 128:
+            raise MeasurementError(f"{name}: incorrect probe cohort")
+    if result["byte_identical_keys"] != 32 or result["speedup"] < 10:
+        raise MeasurementError("rowid parity or 10x lookup gate failed")
+
+
+def rowid_layout_gate(args):
+    """Acquire the storage-only gate without starting a daemon or changing real storage."""
+    if args.corpus != "aft":
+        raise MeasurementError("rowid layout currently pins the AFT Cargo.lock corpus")
+    args.output.mkdir(parents=True, exist_ok=False)
+    manifest = json.loads(args.manifest.read_text())
+    corpus = manifest["corpora"][args.corpus]
+    # These are Git object reads, not reads of a possibly modified checkout.
+    payload = subprocess.check_output(["git", "-C", str(args.source), "show", f"{corpus['commit']}:Cargo.lock"])
+    with tempfile.TemporaryDirectory(prefix="v3-layout-", dir="target") as scratch:
+        payload_path = Path(scratch).resolve() / "corpus-payload"
+        payload_path.write_bytes(payload)
+        receipt = args.output.resolve() / "lookup.json"
+        env = dict(os.environ, AFT_V3_GATE_PAYLOAD=str(payload_path), AFT_V3_GATE_RECEIPT=str(receipt))
+        command = ["cargo", "test", "-p", "agent-file-tools", "--lib", "--", "--ignored", "--exact",
+                   "blob_store::v3::layout_gate::rowid_layout_receipt", "--nocapture"]
+        subprocess.run(command, env=env, check=True, timeout=600)
+        result = json.loads(receipt.read_text())
+        baseline = json.loads(Path(__file__).with_name("views-performance-baselines").joinpath("slice-3b-linux-x86_64.json").read_text())
+        validate_layout_receipt(result, baseline["sqlite_version"])
+        result["corpus"] = dict(corpus, path="Cargo.lock", payload_sha256=hashlib.sha256(payload).hexdigest(),
+                                payload_bytes=len(payload), row_bytes=1024 * 1024, rows=32)
+        result["composition"] = ("ffbbea3e0 digest SELECT and 256 probes, composed with its shared-31-byte-prefix "
+                                 "key fixture: final byte 0..63 repeated four times, 128 hits and 128 misses; "
+                                 "each payload repeats the pinned slice-1 Cargo.lock to 1 MiB. Identical rows and insert order in both arms.")
+        dump(receipt, result)
+        print(json.dumps(result, sort_keys=True), flush=True)
+        subprocess.run(["cargo", "test", "-p", "agent-file-tools", "--lib", "--", "--ignored", "--exact",
+                        "blob_store::v3::open_tests::old_store_dispatch_and_copy_readers_never_migrate_on_open", "--nocapture"],
+                       env=env, check=True, timeout=600)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--rowid-layout", action="store_true", help="run the ignored v3 storage-layout gate, not daemon arms")
     parser.add_argument("--source", type=Path, default=Path.cwd(), help="local Git repository containing the pinned corpus commit; cloned, never mutated")
     parser.add_argument("--corpus", choices=["aft", "opencode", "kubernetes"], default="aft")
     parser.add_argument("--manifest", type=Path, default=Path(__file__).with_name("views-performance-corpus.json"))
@@ -729,6 +780,8 @@ def main():
     parser.add_argument("--semantic", action="store_true", help="enable real local fastembed, never a fixture/fake backend")
     parser.add_argument("--model", default="all-MiniLM-L6-v2", help="fixed AFT fastembed model name")
     args = parser.parse_args()
+    if args.rowid_layout:
+        return rowid_layout_gate(args)
 
     def interrupted(signum, _frame):
         raise MeasurementError(f"acquisition interrupted by signal {signum}")
