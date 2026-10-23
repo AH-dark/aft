@@ -8611,16 +8611,36 @@ mod policy_tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn tool_policy_keeps_session_grants_that_config_alone_cannot_recover() {
+    fn assert_scoped_profile_grants(profile: &SandboxProfile, write: &Path, read: &Path) {
+        assert!(
+            profile
+                .writable_roots
+                .contains(&write.canonicalize().unwrap()),
+            "{:?}",
+            profile.writable_roots
+        );
+        // Seatbelt uses these read exceptions directly; Landlock also lowers
+        // them into its top-level allowlist during Linux profile construction.
+        assert!(
+            profile
+                .data_policy
+                .read_allow
+                .contains(&read.canonicalize().unwrap()),
+            "{:?}",
+            profile.data_policy.read_allow
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_scoped_tool_grant_fixture(root: &Path, persist_aliases: bool) {
         use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
         use crate::db::access_grants::{self, ScopeKey};
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        let store = root.path().join("store");
-        let write = root.path().join("approved-write");
-        let read = root.path().join("approved-read");
-        for path in [&project, &store, &write, &read] {
+        let project = root.join("project");
+        let store = root.join("store");
+        let write = root.join("approved-write");
+        let read = root.join("approved-read");
+        let common_temp = root.join("common-temp");
+        for path in [&project, &store, &write, &read, &common_temp] {
             std::fs::create_dir(path).unwrap();
         }
         let ctx = context(project);
@@ -8646,28 +8666,82 @@ mod policy_tests {
                 },
             )
             .unwrap();
+            if persist_aliases {
+                // Keep the alias in storage so replay, not just insertion,
+                // must resolve the persisted path to the same directory.
+                assert_ne!(*path, path.canonicalize().unwrap());
+                assert_eq!(conn.execute(
+                    "UPDATE access_grants SET path=?1 WHERE owner=?2 AND scope_ref=?3 AND epoch=?4 AND path=?5",
+                    rusqlite::params![path.to_string_lossy(), scope.owner, scope.scope_ref, scope.epoch.to_string(), path.canonicalize().unwrap().to_string_lossy()],
+                ).unwrap(), 1);
+            }
+        }
+        if persist_aliases {
+            let stored = access_grants::list(&conn, &scope).unwrap();
+            assert!(stored.iter().any(|grant| grant.path == write));
+            assert!(stored.iter().any(|grant| grant.path == read));
         }
         ctx.set_db(Arc::new(std::sync::Mutex::new(conn)));
-        let policy =
-            crate::access_policy::with_scope(Some(scope), || ToolLaunchPolicy::resolve(&ctx));
+        let policy = crate::access_policy::with_scope(Some(scope.clone()), || {
+            ToolLaunchPolicy::resolve(&ctx)
+        });
         let SpawnPlan::Launcher { profile, .. } = &policy.plan else {
             panic!(
                 "a scoped strict tool must get its shell profile: {:?}",
                 policy.plan
             );
         };
-        assert!(
-            profile
-                .writable_roots
-                .contains(&write.canonicalize().unwrap()),
-            "{:?}",
-            profile.writable_roots
-        );
+        assert_scoped_profile_grants(profile, &write, &read);
+        #[cfg(target_os = "linux")]
         assert!(
             profile.read_allow.contains(&read.canonicalize().unwrap()),
             "{:?}",
             profile.read_allow
         );
+        if persist_aliases {
+            // Seatbelt consumes the common profile without Landlock's lowering.
+            let common = crate::access_policy::with_scope(Some(scope), || {
+                ctx.access_policy("")
+                    .unwrap()
+                    .compile_shell(common_temp, Vec::new(), Vec::new())
+                    .unwrap()
+                    .canonicalize_for_launch()
+                    .unwrap()
+            });
+            assert!(common.read_allow.is_empty());
+            let transferred: SandboxProfile =
+                serde_json::from_slice(&serde_json::to_vec(&common).unwrap()).unwrap();
+            assert_scoped_profile_grants(
+                &transferred.canonicalize_for_launch().unwrap(),
+                &write,
+                &read,
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_policy_keeps_session_grants_that_config_alone_cannot_recover() {
+        let root = tempfile::tempdir().unwrap();
+        assert_scoped_tool_grant_fixture(root.path(), false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_policy_keeps_session_grants_stored_under_var_folders_alias() {
+        // Reproduce /var -> /private/var beneath a fixture root on every Unix host.
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = root.path().canonicalize().unwrap();
+        let real = canonical_root.join("private/var/folders");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(
+            canonical_root.join("private/var"),
+            canonical_root.join("var"),
+        )
+        .unwrap();
+        let alias = canonical_root.join("var/folders");
+        assert_eq!(alias.canonicalize().unwrap(), real);
+        assert_scoped_tool_grant_fixture(&alias, true);
     }
 
     #[test]
