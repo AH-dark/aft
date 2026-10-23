@@ -31,6 +31,10 @@ fn native_sqlite_file_sets_have_no_out_of_band_content_access() {
         // Copy tests also read Rust sources as text to find callers.
         ("copy_tests.rs", include_str!("copy_tests.rs"), true),
         ("replay_tests.rs", include_str!("replay_tests.rs"), false),
+        ("layout_tests.rs", include_str!("layout_tests.rs"), false),
+        ("open_tests.rs", include_str!("open_tests.rs"), false),
+        // Acquisition reads the pinned Cargo.lock payload as UTF-8 text only.
+        ("layout_gate.rs", include_str!("layout_gate.rs"), true),
     ] {
         assert!(
             !forbidden(source, text_controls),
@@ -49,7 +53,10 @@ fn native_sqlite_file_sets_have_no_out_of_band_content_access() {
                 "copy_tests",
                 "replay_tests",
                 "tests",
-                "source_guard"
+                "source_guard",
+                "layout_tests",
+                "open_tests",
+                "layout_gate"
             ]
             .contains(&&module[1]),
             "new v3 module must join the source fence: {}",

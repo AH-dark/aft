@@ -31,12 +31,11 @@ use std::time::Instant;
 
 /// The longest a copier waits for a live v2 sweep lease to clear.
 pub const SWEEP_LEASE_WAIT: Duration = Duration::from_secs(120);
-/// Added to the row's length for an attempt that only touches an equal v3
-/// row: room for the index entry, the registry's WAL frames and page slack.
-/// The row length itself is reserved because `ref_epoch` shares a record
-/// with the payload, so SQLite may rewrite the whole record, overflow pages
-/// included, into the WAL to change it.
-const TOUCH_MARGIN: u64 = 1 << 20;
+/// A rowid-layout touch changes only a small liveness row. Reserve room for
+/// its WAL frame and the registry transaction, independent of payload size.
+pub(super) const TOUCH_RESERVATION: u64 = 64 * 1024;
+// The older v3 layout still rewrites the payload record on an epoch touch.
+const SHARED_TOUCH_MARGIN: u64 = 1 << 20;
 const LEASE_RETRY: Duration = Duration::from_millis(20);
 static PIN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -102,17 +101,18 @@ pub fn copy_on_first_use(
     // attempt reserves for that alone. The touch never inserts: if the row
     // is gone by the time the closure runs, that attempt writes nothing and
     // the full copy below runs under its own full-size reservation.
-    if destination_holds(storage, family, &key, length, &digest)?
-        && publish(
-            storage,
-            family,
-            length.saturating_add(TOUCH_MARGIN),
-            observer,
-            |publication| publication.touch_row(&key, &digest),
-        )?
-    {
-        drop(pin);
-        return Ok(CopyOutcome::Reused);
+    if let Some(layout) = destination_holds(storage, family, &key, length, &digest)? {
+        let request = if layout == 1 {
+            length.saturating_add(SHARED_TOUCH_MARGIN)
+        } else {
+            TOUCH_RESERVATION
+        };
+        if publish(storage, family, request, observer, |publication| {
+            publication.touch_row(&key, &digest)
+        })? {
+            drop(pin);
+            return Ok(CopyOutcome::Reused);
+        }
     }
     // Room for the row, its index entry and WAL frames; the commit charges
     // the measured growth instead.
@@ -265,7 +265,7 @@ fn v1_path(storage: &Path, artifact_key: &str, plane: BlobPlane) -> Result<PathB
 
 /// Opens an existing v1 store for reading only: no create, no schema batch,
 /// no `journal_mode` switch and no other persistent pragma.
-fn open_v1(path: &Path) -> Result<Option<IdentityConnection>> {
+pub(super) fn open_v1(path: &Path) -> Result<Option<IdentityConnection>> {
     if !path.is_file() {
         return Ok(None);
     }
@@ -278,7 +278,11 @@ fn open_v1(path: &Path) -> Result<Option<IdentityConnection>> {
     Ok(Some(connection))
 }
 
-fn v2_reader(storage: &Path, family: &str, key: &FamilyKey) -> Result<Option<FamilyStoreReader>> {
+pub(super) fn v2_reader(
+    storage: &Path,
+    family: &str,
+    key: &FamilyKey,
+) -> Result<Option<FamilyStoreReader>> {
     FamilyStoreReader::open_existing(storage, family, key.plane())
         .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))
 }
@@ -320,9 +324,9 @@ fn destination_holds(
     key: &FamilyKey,
     length: u64,
     digest: &[u8],
-) -> Result<bool> {
+) -> Result<Option<u32>> {
     if !plane_path(storage, family, key.plane())?.try_exists()? {
-        return Ok(false);
+        return Ok(None);
     }
     let reader = PlaneReader::open_existing(storage, family, key.plane())?;
     let row: Option<(u64, Vec<u8>)> = reader
@@ -334,9 +338,13 @@ fn destination_holds(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    Ok(row.is_some_and(|(stored_length, stored_digest)| {
+    if row.is_some_and(|(stored_length, stored_digest)| {
         stored_length == length && stored_digest == digest
-    }))
+    }) {
+        Ok(Some(plane_layout(&**reader.database.connection()?)?))
+    } else {
+        Ok(None)
+    }
 }
 
 /// The source payload and its stored `payload_schema`, after checking the

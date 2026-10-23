@@ -800,7 +800,6 @@ fn leave_room_for_one_copy(storage: &Path, payload_len: u64) -> u64 {
 fn a_repeated_copy_reserves_only_a_touch_and_reuses_the_committed_row() {
     let _guard = serial();
     let root = tempdir().unwrap();
-    // Covers the row, as every touch does, but is not a full copy's request.
     let payload = vec![6u8; 4 * 1024 * 1024];
     let (_store, key) = v1_source(root.path(), &payload);
     let held = leave_room_for_one_copy(root.path(), payload.len() as u64);
@@ -829,15 +828,10 @@ fn a_repeated_copy_reserves_only_a_touch_and_reuses_the_committed_row() {
     assert_eq!(flushed.len(), 1, "{flushed:?}");
     let (reserved, present) = flushed[0];
     assert!(present);
-    // The touch may rewrite the whole row into the WAL, so its reservation
-    // covers the row; it stays below a full copy's request, which no longer
-    // fits the budget.
-    let row = payload.len() as u64;
+    // Liveness is a separate row, so reservation size no longer scales with
+    // payload length. A disappearing row still requires a full copy attempt.
     let touch = reserved - held;
-    assert!(
-        touch >= row && touch < 2 * row + (1 << 20),
-        "the reuse attempt reserved {touch} bytes for a {row} byte row"
-    );
+    assert_eq!(touch, copy::TOUCH_RESERVATION);
     assert_eq!(
         LedgerReader::open_existing(root.path(), FAMILY)
             .unwrap()
@@ -886,10 +880,7 @@ fn a_row_that_vanishes_before_its_touch_is_copied_under_a_full_reservation() {
         !after_touch,
         "a row was inserted under the touch-sized reservation"
     );
-    assert!(
-        touch_reserved >= payload.len() as u64 && touch_reserved < 2 * payload.len() as u64,
-        "{flushed:?}"
-    );
+    assert!(touch_reserved == copy::TOUCH_RESERVATION, "{flushed:?}");
     let (full_reserved, after_copy) = flushed[1];
     assert!(after_copy);
     assert!(full_reserved >= 2 * payload.len() as u64, "{flushed:?}");
@@ -931,6 +922,8 @@ fn no_production_path_calls_copy_on_first_use() {
             "src/blob_store/v3.rs",
             "src/blob_store/v3/copy.rs",
             "src/blob_store/v3/copy_tests.rs",
+            "src/blob_store/v3/layout_gate.rs",
+            "src/blob_store/v3/layout_tests.rs",
             "src/blob_store/v3/replay_tests.rs",
         ]
     );

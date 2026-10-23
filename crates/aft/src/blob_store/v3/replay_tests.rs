@@ -102,7 +102,7 @@ fn ref_epoch(storage: &Path, key: &FamilyKey) -> Option<i64> {
         .connection()
         .unwrap()
         .query_row(
-            "SELECT ref_epoch FROM blob_payloads WHERE full_key = ?1",
+            "SELECT ref_epoch FROM blob_liveness JOIN blob_payloads ON blob_id=id WHERE full_key = ?1",
             [key.as_bytes().as_slice()],
             |r| r.get(0),
         )
