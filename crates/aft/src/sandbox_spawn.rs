@@ -1729,7 +1729,7 @@ fn build_native_profile(
                     git_policy
                         .hooks
                         .iter()
-                        .filter(|path| path.is_dir())
+                        .filter(|path| profile_candidate_is_dir(path))
                         .cloned(),
                 );
                 policy
@@ -1741,8 +1741,8 @@ fn build_native_profile(
                     .read_metadata_allow
                     .extend(git_policy.metadata_allow.iter().cloned());
                 for (key, path) in &git_policy.configured_paths {
-                    if (key == "core.excludesFile" && path.is_file())
-                        || (key != "core.excludesFile" && path.is_dir())
+                    if (key == "core.excludesFile" && profile_candidate_is_file(path))
+                        || (key != "core.excludesFile" && profile_candidate_is_dir(path))
                     {
                         policy.private_stores.read_allow.push(path.clone());
                         if key == "core.excludesFile"
@@ -1780,7 +1780,7 @@ fn build_native_profile(
         }
         // Governance injection materializes these before resolving a spawn.
         // Do not grant a missing shim directory or a broad binary parent.
-        managed_paths.retain(|path| path.exists());
+        managed_paths.retain(|path| profile_candidate_exists(path));
         shell_write_deny.extend(managed_paths);
 
         let mut cache_roots = vec![
@@ -1801,7 +1801,9 @@ fn build_native_profile(
             home.join("Library/Caches/uv"),
             home.join("Library/Caches/go-build"),
         ]);
-        cache_roots.retain(|path| path.is_dir());
+        #[cfg(test)]
+        cache_roots.extend(candidate_snapshot::cache_candidates());
+        cache_roots.retain(|path| profile_candidate_is_dir(path));
         // A jailed worker's shell keeps writes to its worktree, plus what normal
         // builds and commits need, all taken from operator configuration.
         let jail = worker_jail_active()
@@ -2057,7 +2059,7 @@ fn build_relaxed_profile(
             {
                 let mut metadata = Vec::new();
                 if let Some((_, path)) = configured_git_path(root, key, &mut metadata)? {
-                    if path.is_dir() {
+                    if profile_candidate_is_dir(&path) {
                         stores.read_allow.push(path);
                     }
                     stores.read_metadata_allow.extend(metadata);
@@ -2088,18 +2090,20 @@ fn build_relaxed_profile(
         storage.join(crate::agent_child_env::SHIMS_DIR_NAME),
         crate::agent_child_env::managed_git_hooks_dir(&storage),
     ] {
-        if path.exists() {
+        if profile_candidate_exists(&path) {
             stores.read_allow.push(path.clone());
         }
         write_deny.push(path);
     }
     if let Ok(binary) = crate::agent_child_env::shim_binary(&ctx.config()) {
-        if binary.exists() {
+        if profile_candidate_exists(&binary) {
             stores.read_allow.push(binary.clone());
         }
         write_deny.push(binary);
     }
-    stores.read_allow.retain(|path| path.exists());
+    stores
+        .read_allow
+        .retain(|path| profile_candidate_exists(path));
     writable.extend(write_grants.iter().cloned());
     stores.write_allow.extend(write_grants);
     stores
@@ -2629,10 +2633,10 @@ fn worker_jail_grants(
     };
 
     let cargo_home = absolute_env_path("CARGO_HOME").unwrap_or_else(|| home.join(".cargo"));
-    if cargo_home.is_dir() {
+    if profile_candidate_is_dir(&cargo_home) {
         for cache in ["registry", "git"] {
             let cache = cargo_home.join(cache);
-            if std::fs::create_dir_all(&cache).is_ok() {
+            if create_profile_candidate_dir(&cache) {
                 grants.caches.push(cache);
             }
         }
@@ -2641,10 +2645,10 @@ fn worker_jail_grants(
             .extend(CARGO_HOME_FILES.iter().map(|name| cargo_home.join(name)));
     }
     let rustup_home = absolute_env_path("RUSTUP_HOME").unwrap_or_else(|| home.join(".rustup"));
-    if rustup_home.is_dir() {
+    if profile_candidate_is_dir(&rustup_home) {
         for cache in ["downloads", "tmp"] {
             let cache = rustup_home.join(cache);
-            if std::fs::create_dir_all(&cache).is_ok() {
+            if create_profile_candidate_dir(&cache) {
                 grants.caches.push(cache);
             }
         }
@@ -2693,10 +2697,10 @@ fn worker_jail_grants(
         if !seen.insert(path.clone()) {
             continue;
         }
-        let Ok(config_path) = path.canonicalize() else {
+        let Ok(config_path) = canonicalize_profile_candidate(&path) else {
             continue;
         };
-        if !config_path.is_file()
+        if !profile_candidate_is_file(&config_path)
             || project_roots
                 .iter()
                 .any(|root| config_path.starts_with(root))
@@ -2737,7 +2741,7 @@ fn worker_jail_grants(
             );
             continue;
         }
-        if std::fs::create_dir_all(&target).is_ok() {
+        if create_profile_candidate_dir(&target) {
             grants.roots.push(target);
         }
     }
@@ -2755,10 +2759,12 @@ fn add_build_slot_grants(
     policy: &crate::access_policy::AccessPolicy,
     grants: &mut WorkerJailGrants,
 ) {
-    let Ok(wrapper) = wrapper.canonicalize() else {
+    let Ok(wrapper) = canonicalize_profile_candidate(wrapper) else {
         return;
     };
-    if wrapper.file_name() != Some(OsStr::new("prefrontal-build-slot")) || !wrapper.is_file() {
+    if wrapper.file_name() != Some(OsStr::new("prefrontal-build-slot"))
+        || !profile_candidate_is_file(&wrapper)
+    {
         return;
     }
     let Some(dir) = wrapper.parent() else {
@@ -2791,7 +2797,7 @@ fn add_build_slot_grants(
     };
     if paths
         .iter()
-        .any(|path| !path.is_file() || !path.starts_with(dir))
+        .any(|path| !profile_candidate_is_file(path) || !path.starts_with(dir))
     {
         return;
     }
@@ -2841,7 +2847,7 @@ fn linked_git_grants(git_policies: &[GitPolicy]) -> Vec<PathBuf> {
             ["objects", "refs", "logs"]
                 .into_iter()
                 .map(|store| common_dir.join(store))
-                .filter(|store| store.is_dir()),
+                .filter(|store| profile_candidate_is_dir(store)),
         );
     }
     roots
@@ -4185,6 +4191,167 @@ mod fixed_read_inventory {
     }
 }
 
+#[cfg(all(test, unix))]
+mod candidate_snapshot {
+    // Both policies make their own decisions against the same optional-path
+    // facts, including file/dir kind, canonicalization and creation outcomes.
+    // No computed profile fields or comparison results are cached here.
+    use super::*;
+
+    struct ObservedPath {
+        exists: bool,
+        directory: bool,
+        file: bool,
+        canonical: Result<PathBuf, (std::io::ErrorKind, String)>,
+    }
+
+    struct Snapshot {
+        candidates: [PathBuf; 2],
+        paths: Mutex<BTreeMap<PathBuf, Arc<ObservedPath>>>,
+        created: Mutex<BTreeMap<PathBuf, bool>>,
+    }
+
+    impl Snapshot {
+        fn path(&self, path: &Path) -> Arc<ObservedPath> {
+            self.paths
+                .lock()
+                .unwrap()
+                .entry(path.to_path_buf())
+                .or_insert_with(|| {
+                    let metadata = std::fs::metadata(path);
+                    let canonical = match &metadata {
+                        Ok(_) => path.canonicalize(),
+                        Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+                    }
+                    .map_err(|error| (error.kind(), error.to_string()));
+                    Arc::new(ObservedPath {
+                        exists: metadata.is_ok(),
+                        directory: metadata.as_ref().is_ok_and(|value| value.is_dir()),
+                        file: metadata.as_ref().is_ok_and(|value| value.is_file()),
+                        canonical,
+                    })
+                })
+                .clone()
+        }
+    }
+
+    thread_local! {
+        static CURRENT: RefCell<Option<Arc<Snapshot>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) struct Scope {
+        previous: Option<Arc<Snapshot>>,
+        _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            CURRENT.with(|slot| slot.replace(self.previous.take()));
+        }
+    }
+
+    pub(super) fn install(root: &Path) -> Scope {
+        let snapshot = Arc::new(Snapshot {
+            candidates: [root.join("fixed-cache-marker"), root.join(".cargo/git")],
+            paths: Mutex::new(BTreeMap::new()),
+            created: Mutex::new(BTreeMap::new()),
+        });
+        for path in &snapshot.candidates {
+            snapshot.path(path);
+        }
+        let previous = CURRENT.with(|slot| slot.replace(Some(snapshot)));
+        Scope {
+            previous,
+            _same_thread: std::marker::PhantomData,
+        }
+    }
+
+    fn current() -> Option<Arc<Snapshot>> {
+        CURRENT.with(|slot| slot.borrow().clone())
+    }
+
+    pub(super) fn cache_candidates() -> Vec<PathBuf> {
+        current()
+            .map(|snapshot| snapshot.candidates.to_vec())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn is_dir(path: &Path) -> Option<bool> {
+        current().map(|snapshot| snapshot.path(path).directory)
+    }
+
+    pub(super) fn is_file(path: &Path) -> Option<bool> {
+        current().map(|snapshot| snapshot.path(path).file)
+    }
+
+    pub(super) fn exists(path: &Path) -> Option<bool> {
+        current().map(|snapshot| snapshot.path(path).exists)
+    }
+
+    pub(super) fn canonicalize(path: &Path) -> Option<std::io::Result<PathBuf>> {
+        current().map(|snapshot| match &snapshot.path(path).canonical {
+            Ok(path) => Ok(path.clone()),
+            Err((kind, message)) => Err(std::io::Error::new(*kind, message.clone())),
+        })
+    }
+
+    pub(super) fn create_dir(path: &Path) -> Option<bool> {
+        current().map(|snapshot| {
+            let mut created = snapshot.created.lock().unwrap();
+            *created
+                .entry(path.to_path_buf())
+                .or_insert_with(|| std::fs::create_dir_all(path).is_ok())
+        })
+    }
+}
+
+// Optional policy inputs share one observation in the parity fixture. Required
+// project/task roots and production launches still use their normal validation.
+#[cfg(unix)]
+fn profile_candidate_is_dir(path: &Path) -> bool {
+    #[cfg(test)]
+    if let Some(value) = candidate_snapshot::is_dir(path) {
+        return value;
+    }
+    path.is_dir()
+}
+
+#[cfg(any(unix, test))]
+fn profile_candidate_is_file(path: &Path) -> bool {
+    #[cfg(all(test, unix))]
+    if let Some(value) = candidate_snapshot::is_file(path) {
+        return value;
+    }
+    path.is_file()
+}
+
+#[cfg(unix)]
+fn profile_candidate_exists(path: &Path) -> bool {
+    #[cfg(test)]
+    if let Some(value) = candidate_snapshot::exists(path) {
+        return value;
+    }
+    path.exists()
+}
+
+#[cfg(unix)]
+fn canonicalize_profile_candidate(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(value) = candidate_snapshot::canonicalize(path) {
+        return value;
+    }
+    path.canonicalize()
+}
+
+#[cfg(unix)]
+fn create_profile_candidate_dir(path: &Path) -> bool {
+    #[cfg(test)]
+    if let Some(value) = candidate_snapshot::create_dir(path) {
+        return value;
+    }
+    std::fs::create_dir_all(path).is_ok()
+}
+
 #[cfg(target_os = "linux")]
 fn build_linux_profile(
     profile: SandboxProfile,
@@ -4286,7 +4453,7 @@ fn compute_linux_profile(
                     .writable_files
                     .iter()
                     .map(PathBuf::as_path)
-                    .filter(|file| file.is_file()),
+                    .filter(|file| profile_candidate_is_file(file)),
             )
             .map(|path| IntendedReadGrant {
                 path: path.to_path_buf(),
@@ -4322,7 +4489,7 @@ fn compute_linux_profile(
         .data_policy
         .read_allow
         .iter()
-        .filter(|path| !profile.writable_files.contains(path) || path.is_file())
+        .filter(|path| !profile.writable_files.contains(path) || profile_candidate_is_file(path))
         .map(|path| IntendedReadGrant {
             path: path.clone(),
             force_children: false,
@@ -8538,6 +8705,9 @@ mod policy_tests {
         let account = root.path().join("account");
         std::fs::create_dir(&account).unwrap();
         std::fs::create_dir(root.path().join("store")).unwrap();
+        let cache_marker = root.path().join("fixed-cache-marker");
+        std::fs::create_dir(&cache_marker).unwrap();
+        let cache_marker = cache_marker.canonicalize().unwrap();
         #[cfg(target_os = "linux")]
         let marker = root.path().join("fixed-inventory-marker");
         #[cfg(target_os = "linux")]
@@ -8561,6 +8731,7 @@ mod policy_tests {
             session_id: "tool-policy".into(),
             principal_id: Some("unverified".into()),
         };
+        let _candidates = candidate_snapshot::install(root.path());
         #[cfg(target_os = "linux")]
         let _inventory = fixed_read_inventory::install(root.path());
         for jailed in [false, true] {
@@ -8615,6 +8786,10 @@ mod policy_tests {
                                             mode
                                         };
                                         assert_eq!(tool.mode, expected);
+                                        if expected == SandboxMode::Strict {
+                                            assert!(tool.cache_roots.contains(&cache_marker));
+                                            assert!(bash.cache_roots.contains(&cache_marker));
+                                        }
                                         #[cfg(target_os = "linux")]
                                         if expected == SandboxMode::Strict {
                                             assert!(tool.read_allow.contains(&marker));
@@ -8669,6 +8844,28 @@ mod policy_tests {
             changes, 12,
             "the hook must run between every pair of builds"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_policy_matches_session_shell_despite_cache_candidate_creation_between_builds() {
+        let mut changes = 0;
+        assert_tool_shell_policy_parity(|root, phase| {
+            let candidate = root.join(".cargo/git");
+            match phase {
+                PolicyParityPhase::BeforeTool => {
+                    if candidate.exists() {
+                        std::fs::remove_dir_all(&candidate).unwrap();
+                    }
+                }
+                PolicyParityPhase::BetweenBuilds => {
+                    std::fs::create_dir_all(&candidate).unwrap();
+                    assert!(candidate.is_dir());
+                    changes += 1;
+                }
+            }
+        });
+        assert_eq!(changes, 12);
     }
 
     #[cfg(unix)]
