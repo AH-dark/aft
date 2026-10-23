@@ -76,7 +76,8 @@ _operator_gh_find() {
     fi
   done
 
-  # These locations cover the supported macOS/Linux package-manager installs.
+  # These fallback locations are Unix package-manager installs (zerobrew,
+  # Homebrew, /usr/local). Any other install must be on PATH, walked above.
   # The override keeps isolated tests independent of host-installed binaries.
   if [[ "${OPERATOR_GH_FALLBACK_PATHS+x}" == x ]]; then
     fallback_paths="$OPERATOR_GH_FALLBACK_PATHS"
