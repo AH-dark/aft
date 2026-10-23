@@ -13967,22 +13967,109 @@ mod tests {
                 .collect::<Vec<_>>());
         }
         let response = handle_configure_for_test(&configure_request_with_params(params), &ctx);
-        assert!(response.success, "{response:?}");
-        super::drain_deferred_configure_maintenance(&ctx);
-        let expected = if failure == "missing" {
-            "cache_dir_unavailable"
+        if matches!(failure, "unparseable" | "unreadable") {
+            // A user document that cannot be read or parsed rejects the whole
+            // candidate: nothing is published, so no default settings and no
+            // cache location replace the last good configuration.
+            assert!(!response.success, "{response:?}");
+            assert_eq!(response.data["code"], "config_rejected", "{response:?}");
+            assert!(
+                response.data["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("invalid_config_document")),
+                "{response:?}"
+            );
         } else {
-            "cache_dir_config_unknown"
-        };
-        assert!(
-            ctx.cache_unavailable_reason()
-                .is_some_and(|reason| reason.contains(expected)),
-            "{response:?}"
-        );
+            assert!(response.success, "{response:?}");
+            super::drain_deferred_configure_maintenance(&ctx);
+            let expected = if failure == "missing" {
+                "cache_dir_unavailable"
+            } else {
+                "cache_dir_config_unknown"
+            };
+            assert!(
+                ctx.cache_unavailable_reason()
+                    .is_some_and(|reason| reason.contains(expected)),
+                "{response:?}"
+            );
+        }
         for domain in crate::root_cache::CACHE_DOMAINS {
             assert!(
                 !storage.join(domain).exists(),
                 "{transport}/{failure} wrote {domain} on primary storage"
+            );
+        }
+    }
+
+    /// A configured context whose user file later becomes unreadable or
+    /// unparseable keeps its last good settings on the next configure, as for
+    /// every other key: the rejected candidate changes nothing, including the
+    /// cache location and its availability.
+    #[test]
+    fn configure_rejected_user_document_keeps_the_last_good_cache_location() {
+        for failure in ["unparseable", "unreadable"] {
+            let _storage_env = crate::test_env::without_storage_override();
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            let storage = temp.path().join("storage");
+            let cache = temp.path().join("cache-volume");
+            let user = temp.path().join("user.jsonc");
+            fs::create_dir(&project).unwrap();
+            fs::create_dir(&cache).unwrap();
+            let _volume = crate::walk_boundary::simulated_volumes::simulate(&cache, u64::MAX - 17);
+            init_git_fixture(&project);
+            fs::write(project.join("needle.rs"), "fn last_good_needle() {}\n").unwrap();
+            fs::write(
+                &user,
+                json!({
+                    "storage": {"cache_dir": cache},
+                    "format_on_edit": true,
+                    "indexes": {"trigram": false, "semantic": false, "callgraph": false},
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+            let request = |id: &str| {
+                let tiers =
+                    crate::subc_config::read_local_cortexkit_config_tiers(Some(&user), &project);
+                let mut request = configure_request_with_params(json!({
+                    "project_root": project, "storage_dir": storage, "harness": "opencode",
+                    "config": tiers
+                        .iter()
+                        .map(|tier| json!({"tier":tier.tier,"source":tier.source,"doc":tier.doc}))
+                        .collect::<Vec<_>>(),
+                }));
+                request.id = id.to_owned();
+                request
+            };
+            let first = handle_configure_for_test(&request("first"), &ctx);
+            assert!(first.success, "{first:?}");
+            super::drain_deferred_configure_maintenance(&ctx);
+            let good = ctx.config();
+            assert!(good.cache_dir.is_some() && good.format_on_edit);
+            assert!(ctx.cache_unavailable_reason().is_none());
+
+            match failure {
+                "unparseable" => fs::write(&user, "{").unwrap(),
+                _ => {
+                    fs::remove_file(&user).unwrap();
+                    fs::create_dir(&user).unwrap();
+                }
+            }
+            let rejected = handle_configure_for_test(&request("rejected"), &ctx);
+            assert_eq!(
+                rejected.data["code"], "config_rejected",
+                "{failure}: {rejected:?}"
+            );
+            let after = ctx.config();
+            assert_eq!(after.cache_dir, good.cache_dir, "{failure}");
+            assert_eq!(after.cache_epoch, good.cache_epoch, "{failure}");
+            assert!(after.format_on_edit, "{failure}");
+            assert!(
+                ctx.cache_unavailable_reason().is_none(),
+                "{failure}: {:?}",
+                ctx.cache_unavailable_reason()
             );
         }
     }
