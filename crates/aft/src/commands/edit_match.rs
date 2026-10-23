@@ -1313,13 +1313,15 @@ mod tests {
         let backup = ctx.backup().lock();
         assert_eq!(
             backup.history(request.session(), &first)[0]
-                .content_bytes
+                .content_bytes()
+                .unwrap()
                 .as_ref(),
             b"first TARGET\n"
         );
         assert_eq!(
             backup.history(request.session(), &second)[0]
-                .content_bytes
+                .content_bytes()
+                .unwrap()
                 .as_ref(),
             b"second TARGET\n"
         );
@@ -2080,7 +2082,7 @@ mod audit_regressions {
         let store = ctx.backup().lock();
         let history = store.history(request.session(), &path);
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].content_bytes.as_ref(), b"before");
+        assert_eq!(history[0].content_bytes().unwrap().as_ref(), b"before");
     }
 
     struct PartialWriter {

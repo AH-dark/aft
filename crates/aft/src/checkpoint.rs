@@ -3570,6 +3570,38 @@ mod tests {
     }
 
     #[test]
+    fn backup_memory_checkpoints_find_released_and_restarted_backup_paths() {
+        let storage = tempfile::tempdir().unwrap();
+        let path = storage.path().join("binary.bin");
+        let bytes = [0, 255, 128, b'\r', b'\n'];
+        for restart in [false, true] {
+            fs::write(&path, bytes).unwrap();
+            let backup_storage = storage.path().join("backup");
+            let mut backup = BackupStore::new();
+            backup.set_storage_dir(backup_storage.clone(), 72);
+            backup
+                .snapshot(DEFAULT_SESSION_ID, &path, "tracked")
+                .unwrap();
+            backup.release_memory();
+            if restart {
+                backup = BackupStore::new();
+                backup.set_storage_dir(backup_storage, 72);
+            }
+            let checkpoint_storage = storage.path().join(format!("checkpoint-{restart}"));
+            let mut checkpoints = fresh_checkpoint_store(&checkpoint_storage);
+            let info = checkpoints
+                .create(DEFAULT_SESSION_ID, "tracked", vec![], &backup)
+                .unwrap();
+            assert_eq!(info.file_count, 1);
+            fs::write(&path, b"changed").unwrap();
+            drop(checkpoints);
+            let mut restarted = fresh_checkpoint_store(&checkpoint_storage);
+            restarted.restore(DEFAULT_SESSION_ID, "tracked").unwrap();
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
     fn restore_recreates_missing_parent_directories() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("deeper").join("file.txt");
@@ -3769,8 +3801,11 @@ mod tests {
             panic!("regular capture must create a regular checkpoint");
         };
         assert_eq!(bytes.as_ref(), b"original bytes");
-        assert_eq!(history[0].content_bytes.as_ref(), b"original bytes");
-        assert!(Arc::ptr_eq(&bytes, &history[0].content_bytes));
+        assert_eq!(
+            history[0].content_bytes().unwrap().as_ref(),
+            b"original bytes"
+        );
+        assert!(Arc::ptr_eq(&bytes, &history[0].content_bytes().unwrap()));
         assert_eq!(crate::backup::capture_read_count(&path), 1);
     }
 
@@ -3798,8 +3833,11 @@ mod tests {
             panic!("regular capture must create a regular checkpoint");
         };
         assert_eq!(bytes.as_ref(), b"fresh disk truth");
-        assert_eq!(history[0].content_bytes.as_ref(), b"fresh disk truth");
-        assert!(Arc::ptr_eq(&bytes, &history[0].content_bytes));
+        assert_eq!(
+            history[0].content_bytes().unwrap().as_ref(),
+            b"fresh disk truth"
+        );
+        assert!(Arc::ptr_eq(&bytes, &history[0].content_bytes().unwrap()));
         assert_eq!(crate::backup::capture_read_count(&path), 2);
     }
 

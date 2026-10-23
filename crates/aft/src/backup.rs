@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -277,10 +276,7 @@ pub const SCHEMA_VERSION: u32 = 5;
 #[derive(Debug, Clone)]
 pub struct BackupEntry {
     pub backup_id: String,
-    /// UTF-8 view of the captured regular-file bytes, kept for API/tests that
-    /// inspect text backups. Restore uses `content_bytes` so binary files round-trip.
-    pub content: String,
-    pub content_bytes: Arc<[u8]>,
+    content: BackupContent,
     pub timestamp: u64,
     pub order: u128,
     pub description: String,
@@ -311,6 +307,77 @@ pub struct BackupEntry {
     /// the deleted tree: undo can restore the content, but only as an
     /// independent copy that no longer shares data with those outside links.
     pub hardlink_detached: bool,
+}
+
+/// Captures stay shared until committed. Durable stacks keep only a blob
+/// reference, so their memory use does not grow with the size of each edit.
+#[derive(Debug, Clone)]
+enum BackupContent {
+    Captured(Arc<[u8]>),
+    OnDisk {
+        path: PathBuf,
+        size: u64,
+        #[cfg(test)]
+        reads: Option<Arc<AtomicU64>>,
+    },
+}
+
+impl BackupContent {
+    fn on_disk(path: PathBuf) -> std::io::Result<Self> {
+        let size = std::fs::metadata(&path)?.len();
+        Ok(Self::OnDisk {
+            path,
+            size,
+            #[cfg(test)]
+            reads: None,
+        })
+    }
+}
+
+impl BackupEntry {
+    /// Load exact bytes on demand without retaining them in the undo store.
+    pub fn content_bytes(&self) -> std::io::Result<Arc<[u8]>> {
+        match &self.content {
+            BackupContent::Captured(bytes) => Ok(Arc::clone(bytes)),
+            BackupContent::OnDisk { path, .. } => {
+                #[cfg(test)]
+                if let BackupContent::OnDisk {
+                    reads: Some(reads), ..
+                } = &self.content
+                {
+                    reads.fetch_add(1, Ordering::Relaxed);
+                }
+                std::fs::read(path).map(Arc::from)
+            }
+        }
+    }
+
+    pub fn content_size(&self) -> u64 {
+        match &self.content {
+            BackupContent::Captured(bytes) => bytes.len() as u64,
+            BackupContent::OnDisk { size, .. } => *size,
+        }
+    }
+
+    /// The lossy UTF-8 view is temporary; binary restoration always uses bytes.
+    pub fn content(&self) -> std::io::Result<String> {
+        match self.kind {
+            BackupEntryKind::Content => {
+                Ok(String::from_utf8_lossy(&self.content_bytes()?).into_owned())
+            }
+            BackupEntryKind::Symlink => Ok(self
+                .link_target
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()),
+            _ => Ok(String::new()),
+        }
+    }
+
+    fn materialize(&mut self) -> std::io::Result<()> {
+        self.content = BackupContent::Captured(self.content_bytes()?);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,7 +442,10 @@ impl PathFingerprint {
     /// mutation it backs up, which is also what restoring it puts back.
     pub fn of_entry(entry: &BackupEntry) -> Self {
         match entry.kind {
-            BackupEntryKind::Content => Self::of_bytes(&entry.content_bytes),
+            BackupEntryKind::Content => entry
+                .content_bytes()
+                .map(|bytes| Self::of_bytes(&bytes))
+                .unwrap_or(Self::Other),
             BackupEntryKind::Symlink => entry
                 .link_target
                 .clone()
@@ -520,12 +590,6 @@ impl DiskFileVersion {
     }
 }
 
-#[derive(Debug, Clone)]
-struct CachedBackupContent {
-    version: DiskFileVersion,
-    bytes: Arc<[u8]>,
-}
-
 fn read_captured_content(path: &Path) -> std::io::Result<Vec<u8>> {
     #[cfg(test)]
     {
@@ -657,26 +721,32 @@ impl TryFrom<BackupRow> for BackupEntry {
                 .as_deref()
                 .and_then(|path| read_entry_disk_metadata(Path::new(path), &row.backup_id))
         });
-        let content_bytes = if kind.has_content_file() {
+        let content = if kind.has_content_file() {
             let backup_path = backup_path.ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     format!("backup DB row {} has no backup_path", row.backup_id),
                 )
             })?;
-            std::fs::read(backup_path)?
+            BackupContent::on_disk(PathBuf::from(backup_path))?
         } else {
-            Vec::new()
+            BackupContent::Captured(Arc::from([]))
         };
         let link_target = if kind == BackupEntryKind::Symlink {
-            restore_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.link_target.clone())
-                .or_else(|| {
-                    Some(PathBuf::from(
-                        String::from_utf8_lossy(&content_bytes).into_owned(),
-                    ))
-                })
+            Some(
+                match restore_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.link_target.clone())
+                {
+                    Some(target) => target,
+                    None => {
+                        let BackupContent::OnDisk { path, .. } = &content else {
+                            unreachable!()
+                        };
+                        PathBuf::from(String::from_utf8_lossy(&std::fs::read(path)?).into_owned())
+                    }
+                },
+            )
         } else {
             None
         };
@@ -692,21 +762,9 @@ impl TryFrom<BackupRow> for BackupEntry {
                 ),
             ));
         }
-        let content = match kind {
-            BackupEntryKind::Content => String::from_utf8_lossy(&content_bytes).into_owned(),
-            BackupEntryKind::Symlink => link_target
-                .as_ref()
-                .map(|target| target.display().to_string())
-                .unwrap_or_default(),
-            BackupEntryKind::Tombstone | BackupEntryKind::Directory | BackupEntryKind::HardLink => {
-                String::new()
-            }
-        };
-
         Ok(BackupEntry {
             backup_id: row.backup_id,
             content,
-            content_bytes: content_bytes.into(),
             timestamp: u64::try_from(row.created_at).unwrap_or_default(),
             order: row.order,
             description: row.description,
@@ -896,8 +954,6 @@ pub struct BackupStore {
     entries: HashMap<String, HashMap<PathBuf, Vec<BackupEntry>>>,
     /// session -> path -> disk metadata
     disk_index: HashMap<String, HashMap<PathBuf, DiskMeta>>,
-    /// Shared blob bytes guarded by file version; metadata is always reloaded.
-    hydrated_entries: Mutex<HashMap<PathBuf, CachedBackupContent>>,
     /// session -> metadata
     session_meta: HashMap<String, SessionMeta>,
     counter: AtomicU64,
@@ -925,12 +981,14 @@ pub struct BackupStore {
     /// not finished yet, as (session, key, backup_id). Once the request has
     /// written, `record_post_mutation_states` stamps each with what it left.
     pending_post_states: Vec<(String, PathBuf, String)>,
+    /// Closed sessions still being annotated by an already-started request.
+    release_after_post_states: HashSet<String>,
     #[cfg(test)]
     enforce_temp_path_policy: bool,
     #[cfg(test)]
     disk_io_count: AtomicU64,
     #[cfg(test)]
-    history_content_reads: AtomicU64,
+    history_content_reads: Arc<AtomicU64>,
     #[cfg(test)]
     history_metadata_reads: AtomicU64,
     #[cfg(test)]
@@ -976,7 +1034,6 @@ impl BackupStore {
         BackupStore {
             entries: HashMap::new(),
             disk_index: HashMap::new(),
-            hydrated_entries: Mutex::new(HashMap::new()),
             session_meta: HashMap::new(),
             counter: AtomicU64::new(0),
             storage_dir: None,
@@ -991,12 +1048,13 @@ impl BackupStore {
             policy: BackupPolicy::default(),
             skipped_backups: HashMap::new(),
             pending_post_states: Vec::new(),
+            release_after_post_states: HashSet::new(),
             #[cfg(test)]
             enforce_temp_path_policy: false,
             #[cfg(test)]
             disk_io_count: AtomicU64::new(0),
             #[cfg(test)]
-            history_content_reads: AtomicU64::new(0),
+            history_content_reads: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             history_metadata_reads: AtomicU64::new(0),
             #[cfg(test)]
@@ -1032,6 +1090,48 @@ impl BackupStore {
 
     pub fn policy(&self) -> BackupPolicy {
         self.policy
+    }
+
+    /// Forget reconstructible stacks, not undo history or unfinished mutation
+    /// annotations. An in-flight request can reload its stack before stamping.
+    pub fn release_session_memory(&mut self, session: &str) {
+        if self.storage_dir.is_none() {
+            return;
+        }
+        if self
+            .pending_post_states
+            .iter()
+            .any(|(pending, _, _)| pending == session)
+        {
+            self.release_after_post_states.insert(session.to_string());
+        }
+        self.entries.remove(session);
+        self.disk_index.remove(session);
+        self.session_meta.remove(session);
+        self.db_mirrored_stacks
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session);
+    }
+
+    /// Release all durable stack metadata; later undo reloads it from disk.
+    pub fn release_memory(&mut self) {
+        if self.storage_dir.is_none() {
+            return;
+        }
+        self.entries = HashMap::new();
+        self.disk_index = HashMap::new();
+        self.session_meta = HashMap::new();
+        self.clear_db_mirror_sync();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_entry_count(&self) -> usize {
+        self.entries
+            .values()
+            .flat_map(HashMap::values)
+            .map(Vec::len)
+            .sum()
     }
 
     #[cfg(test)]
@@ -1101,13 +1201,10 @@ impl BackupStore {
             namespaces.clear();
         }
         self.entries.clear();
-        self.hydrated_entries
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
         self.disk_index.clear();
         self.session_meta.clear();
         self.skipped_backups.clear();
+        self.release_after_post_states.clear();
         self.clear_db_mirror_sync();
     }
 
@@ -1416,8 +1513,7 @@ impl BackupStore {
         let (id, order) = self.next_id_and_order();
         let entry = BackupEntry {
             backup_id: id.clone(),
-            content: String::new(),
-            content_bytes: Arc::from([]),
+            content: BackupContent::Captured(Arc::from([])),
             timestamp: current_timestamp(),
             order,
             description: description.to_string(),
@@ -2201,11 +2297,12 @@ impl BackupStore {
     /// Return the number of on-disk backup entries for `(session, file)`.
     pub fn disk_history_count(&self, session: &str, path: &Path) -> usize {
         let key = canonicalize_key(path);
-        self.disk_index
-            .get(session)
-            .and_then(|s| s.get(&key))
-            .map(|m| m.count)
-            .unwrap_or(0)
+        // Metadata is atomically replaced. Do not take a second stack lock:
+        // snapshot callers may already hold the non-reentrant disk lease.
+        self.read_disk_meta_value(session, &key)
+            .ok()
+            .flatten()
+            .map_or(0, |(meta, _)| meta.count)
     }
 
     /// Return all files that have at least one backup entry in this session
@@ -2219,6 +2316,12 @@ impl BackupStore {
         if let Some(disk) = self.disk_index.get(session) {
             for key in disk.keys() {
                 files.insert(key.clone());
+            }
+        }
+        match self.read_session_disk_index(session) {
+            Ok(disk) => files.extend(disk.into_keys()),
+            Err(error) => {
+                crate::slog_warn!("backup path discovery failed for session {session}: {error}")
             }
         }
         files.into_iter().collect()
@@ -2356,6 +2459,38 @@ impl BackupStore {
         for s in self.disk_index.keys() {
             sessions.insert(s.clone());
         }
+        let mut directories = self.backups_dir().into_iter().collect::<Vec<_>>();
+        if self.effective_storage_harness().is_some() {
+            if let Some(storage) = &self.storage_dir {
+                directories.push(storage.join("backups"));
+            }
+        }
+        for backups in directories
+            .into_iter()
+            .filter_map(|dir| std::fs::read_dir(dir).ok())
+        {
+            for entry in backups.flatten() {
+                let dir = entry.path();
+                let marker = dir.join("session.json");
+                let Some(meta) = std::fs::read(&marker)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                else {
+                    continue;
+                };
+                let Some(session) = meta.get("session_id").and_then(|id| id.as_str()) else {
+                    continue;
+                };
+                if dir.file_name().and_then(|name| name.to_str())
+                    == Some(Self::session_hash(session).as_str())
+                    && self
+                        .read_session_disk_index(session)
+                        .is_ok_and(|index| !index.is_empty())
+                {
+                    sessions.insert(session.to_string());
+                }
+            }
+        }
         sessions.into_iter().collect()
     }
 
@@ -2363,7 +2498,10 @@ impl BackupStore {
     /// Used by `/aft-status` to surface storage footprint.
     pub fn total_disk_bytes(&self) -> u64 {
         let mut total = 0u64;
-        for session_dirs in self.disk_index.values() {
+        for session in self.sessions_with_backups() {
+            let session_dirs = self
+                .read_session_disk_index(&session)
+                .unwrap_or_else(|_| self.disk_index.get(&session).cloned().unwrap_or_default());
             for meta in session_dirs.values() {
                 if let Ok(read_dir) = std::fs::read_dir(&meta.dir) {
                     for entry in read_dir.flatten() {
@@ -2793,6 +2931,22 @@ impl BackupStore {
                 .push((session.to_string(), key.to_path_buf(), new_entry_id));
         }
 
+        if let Some(session_dir) = self.session_dir(session) {
+            let dir = session_dir.join(Self::path_hash(key));
+            for entry in &mut stack {
+                if let Some(name) = content_filename_for_entry(entry) {
+                    // Release captures only after blob and metadata commit.
+                    // A memory-only store still owns its captured bytes.
+                    entry.content = BackupContent::OnDisk {
+                        path: dir.join(name),
+                        size: entry.content_size(),
+                        #[cfg(test)]
+                        reads: Some(Arc::clone(&self.history_content_reads)),
+                    };
+                }
+            }
+        }
+
         self.entries
             .entry(session.to_string())
             .or_default()
@@ -2830,6 +2984,9 @@ impl BackupStore {
                     error
                 );
             }
+        }
+        for session in std::mem::take(&mut self.release_after_post_states) {
+            self.release_session_memory(&session);
         }
     }
 
@@ -3223,12 +3380,18 @@ impl BackupStore {
                 path: path.display().to_string(),
             })?;
 
-        let entry = stack
+        let mut entry = stack
             .last()
             .cloned()
             .ok_or_else(|| AftError::NoUndoHistory {
                 path: path.display().to_string(),
             })?;
+
+        // The returned entry must outlive pruning of its on-disk blob.
+        entry.materialize().map_err(|error| AftError::IoError {
+            path: path.display().to_string(),
+            message: error.to_string(),
+        })?;
 
         match entry.kind {
             BackupEntryKind::Content
@@ -3653,10 +3816,6 @@ impl BackupStore {
                 );
             } else {
                 removed += 1;
-                self.hydrated_entries
-                    .get_mut()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .retain(|path, _| !path.starts_with(&session_dir));
                 crate::slog_debug!(
                     "removed stale backup session {} (last_accessed={})",
                     session_dir.display(),
@@ -4254,13 +4413,26 @@ impl BackupStore {
     }
 
     fn refresh_disk_index_for_session(&mut self, session: &str) -> Result<Vec<PathBuf>, AftError> {
-        let Some(session_dir) = self.session_dir(session) else {
+        let per_session = self.read_session_disk_index(session)?;
+        let keys = per_session.keys().cloned().collect();
+        if per_session.is_empty() {
             self.disk_index.remove(session);
-            return Ok(Vec::new());
+        } else {
+            self.disk_index.insert(session.to_string(), per_session);
+        }
+        Ok(keys)
+    }
+
+    /// Discover durable paths without making their stacks resident again.
+    fn read_session_disk_index(
+        &self,
+        session: &str,
+    ) -> Result<HashMap<PathBuf, DiskMeta>, AftError> {
+        let Some(session_dir) = self.session_dir(session) else {
+            return Ok(HashMap::new());
         };
         if !session_dir.exists() {
-            self.disk_index.remove(session);
-            return Ok(Vec::new());
+            return Ok(HashMap::new());
         }
 
         let path_dirs = std::fs::read_dir(&session_dir).map_err(|error| AftError::IoError {
@@ -4324,13 +4496,7 @@ impl BackupStore {
             }
         }
 
-        let keys = per_session.keys().cloned().collect::<Vec<_>>();
-        if per_session.is_empty() {
-            self.disk_index.remove(session);
-        } else {
-            self.disk_index.insert(session.to_string(), per_session);
-        }
-        Ok(keys)
+        Ok(per_session)
     }
 
     fn restore_operation_candidate_keys(
@@ -4538,59 +4704,21 @@ impl BackupStore {
         } else {
             None
         };
-        let version = content_file.as_deref().and_then(DiskFileVersion::of_path);
-        let cached_bytes = if let (Some(path), Some(version)) = (&content_file, version) {
-            let cache = self
-                .hydrated_entries
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache
-                .get(path)
-                .filter(|cached| cached.version == version)
-                .map(|cached| Arc::clone(&cached.bytes))
-        } else {
-            None
+        #[allow(unused_mut)]
+        let mut content = match content_file {
+            Some(path) => BackupContent::on_disk(path).map_err(|error| error.to_string())?,
+            None => BackupContent::Captured(Arc::from([])),
         };
-        let content_bytes: Arc<[u8]> = if let Some(bytes) = cached_bytes {
-            bytes
-        } else if kind.has_content_file() {
-            let content_path = content_path_from_meta(entry_meta)?;
-            let path = dir.join(content_path);
-            #[cfg(test)]
-            self.history_content_reads.fetch_add(1, Ordering::Relaxed);
-            std::fs::read(&path)
-                .map_err(|error| {
-                    format!(
-                        "failed to read v2 backup content {}: {}",
-                        path.display(),
-                        error
-                    )
-                })?
-                .into()
-        } else {
-            Arc::from([])
-        };
-        let entry = entry_from_meta(Some(entry_meta), index, kind, content_bytes);
+        #[cfg(test)]
+        if let BackupContent::OnDisk { reads, .. } = &mut content {
+            *reads = Some(Arc::clone(&self.history_content_reads));
+        }
+        let entry = entry_from_meta(Some(entry_meta), index, kind, content);
         if kind == BackupEntryKind::HardLink && entry.link_to.is_none() {
             return Err(format!(
                 "v2 backup entry {} is a hard link without link_to",
                 entry.backup_id
             ));
-        }
-        if let (Some(path), Some(version)) = (content_file, version) {
-            // A concurrent change during the read cannot seed a cache entry.
-            if DiskFileVersion::of_path(&path) == Some(version) {
-                self.hydrated_entries
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(
-                        path,
-                        CachedBackupContent {
-                            version,
-                            bytes: Arc::clone(&entry.content_bytes),
-                        },
-                    );
-            }
         }
         Ok(entry)
     }
@@ -4689,7 +4817,10 @@ impl BackupStore {
                 if final_path.exists() {
                     continue;
                 }
-                let bytes = content_bytes_for_disk(entry);
+                let bytes = content_bytes_for_disk(entry).map_err(|error| AftError::IoError {
+                    path: final_path.display().to_string(),
+                    message: error.to_string(),
+                })?;
                 write_temp_fsync_rename(&dir, &content_path, &bytes).map_err(|error| {
                     AftError::IoError {
                         path: final_path.display().to_string(),
@@ -4748,16 +4879,6 @@ impl BackupStore {
                 message: error.to_string(),
             }
         })?;
-        self.hydrated_entries
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|path, _| {
-                path.parent() != Some(dir.as_path())
-                    || path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| referenced_content.contains(name))
-            });
         crate::write_ledger::credit(
             crate::write_ledger::Domain::Backups,
             key.display().to_string(),
@@ -4949,13 +5070,6 @@ impl BackupStore {
     }
 
     fn remove_disk_backups_locked(&mut self, session: &str, key: &Path) -> Result<(), AftError> {
-        if let Some(session_dir) = self.session_dir(session) {
-            let dir = session_dir.join(Self::path_hash(key));
-            self.hydrated_entries
-                .get_mut()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retain(|path, _| path.parent() != Some(dir.as_path()));
-        }
         // Failures are logged inside; disk stays authoritative for this caller.
         let _ = self.remove_db_backups(session, key);
         let removed = self.disk_index.get_mut(session).and_then(|s| s.remove(key));
@@ -5275,15 +5389,14 @@ fn backup_entry_from_path(
     })?;
     let mode = file_mode(&metadata);
 
-    let (kind, content, content_bytes, link_target) = if metadata.file_type().is_symlink() {
+    let (kind, content, link_target) = if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(path).map_err(|error| AftError::IoError {
             path: path.display().to_string(),
             message: error.to_string(),
         })?;
         (
             BackupEntryKind::Symlink,
-            target.display().to_string(),
-            Arc::from([]),
+            BackupContent::Captured(Arc::from([])),
             Some(target),
         )
     } else if metadata.is_file() {
@@ -5295,8 +5408,7 @@ fn backup_entry_from_path(
             .into();
         (
             BackupEntryKind::Content,
-            String::from_utf8_lossy(&bytes).into_owned(),
-            bytes,
+            BackupContent::Captured(bytes),
             None,
         )
     } else {
@@ -5311,7 +5423,6 @@ fn backup_entry_from_path(
     Ok(BackupEntry {
         backup_id,
         content,
-        content_bytes,
         timestamp: current_timestamp(),
         order,
         description: description.to_string(),
@@ -5333,8 +5444,7 @@ fn backup_entry_from_path(
 fn metadata_only_entry(id: String, order: u128, description: &str, op_id: &str) -> BackupEntry {
     BackupEntry {
         backup_id: id,
-        content: String::new(),
-        content_bytes: Arc::from([]),
+        content: BackupContent::Captured(Arc::from([])),
         timestamp: current_timestamp(),
         order,
         description: description.to_string(),
@@ -5360,8 +5470,7 @@ fn backup_entry_from_capture(
 ) -> BackupEntry {
     BackupEntry {
         backup_id,
-        content: String::from_utf8_lossy(capture.bytes()).into_owned(),
-        content_bytes: capture.shared_bytes(),
+        content: BackupContent::Captured(capture.shared_bytes()),
         timestamp: current_timestamp(),
         order,
         description: description.to_string(),
@@ -5512,7 +5621,7 @@ fn capture_path_state(path: &Path) -> Result<RestorePathState, AftError> {
 
 fn restore_entry_to_path(path: &Path, entry: &BackupEntry) -> std::io::Result<()> {
     match entry.kind {
-        BackupEntryKind::Content => restore_regular_file(path, &entry.content_bytes, entry.mode),
+        BackupEntryKind::Content => restore_regular_file(path, &entry.content_bytes()?, entry.mode),
         BackupEntryKind::Symlink => {
             let target = entry.link_target.as_ref().ok_or_else(|| {
                 std::io::Error::new(
@@ -5877,9 +5986,8 @@ fn entry_from_meta(
     entry_meta: Option<&serde_json::Value>,
     index: usize,
     kind: BackupEntryKind,
-    content_bytes: impl Into<Arc<[u8]>>,
+    content: BackupContent,
 ) -> BackupEntry {
-    let content_bytes = content_bytes.into();
     let backup_id = entry_backup_id(entry_meta, index);
     let timestamp = entry_meta
         .and_then(|meta| meta.get("timestamp"))
@@ -5895,27 +6003,18 @@ fn entry_from_meta(
             .and_then(|value| value.as_str())
             .map(PathBuf::from)
             .or_else(|| {
-                Some(PathBuf::from(
-                    String::from_utf8_lossy(&content_bytes).into_owned(),
-                ))
+                let bytes = match &content {
+                    BackupContent::Captured(bytes) => Arc::clone(bytes),
+                    BackupContent::OnDisk { path, .. } => std::fs::read(path).ok()?.into(),
+                };
+                Some(PathBuf::from(String::from_utf8_lossy(&bytes).into_owned()))
             })
     } else {
         None
     };
-    let content = match kind {
-        BackupEntryKind::Content => String::from_utf8_lossy(&content_bytes).into_owned(),
-        BackupEntryKind::Symlink => link_target
-            .as_ref()
-            .map(|target| target.display().to_string())
-            .unwrap_or_default(),
-        BackupEntryKind::Tombstone | BackupEntryKind::Directory | BackupEntryKind::HardLink => {
-            String::new()
-        }
-    };
     BackupEntry {
         backup_id,
         content,
-        content_bytes: content_bytes.into(),
         timestamp,
         order,
         description: entry_meta
@@ -5983,12 +6082,12 @@ fn legacy_entry_from_meta(
     index: usize,
 ) -> Option<BackupEntry> {
     let kind = entry_kind_from_meta(entry_meta);
-    let content_bytes = if kind.has_content_file() {
-        std::fs::read(dir.join(format!("{}.bak", index))).ok()?
+    let content = if kind.has_content_file() {
+        BackupContent::on_disk(dir.join(format!("{index}.bak"))).ok()?
     } else {
-        Vec::new()
+        BackupContent::Captured(Arc::from([]))
     };
-    Some(entry_from_meta(entry_meta, index, kind, content_bytes))
+    Some(entry_from_meta(entry_meta, index, kind, content))
 }
 
 fn content_path_from_meta(entry_meta: &serde_json::Value) -> Result<&str, String> {
@@ -6027,20 +6126,18 @@ fn content_filename_for_entry(entry: &BackupEntry) -> Option<String> {
     })
 }
 
-fn content_bytes_for_disk(entry: &BackupEntry) -> Cow<'_, [u8]> {
-    match entry.kind {
-        BackupEntryKind::Content => Cow::Borrowed(&entry.content_bytes),
-        BackupEntryKind::Symlink => Cow::Owned(
+fn content_bytes_for_disk(entry: &BackupEntry) -> std::io::Result<Arc<[u8]>> {
+    Ok(match entry.kind {
+        BackupEntryKind::Content => return entry.content_bytes(),
+        BackupEntryKind::Symlink => Arc::from(
             entry
                 .link_target
                 .as_ref()
                 .map(|target| target.as_os_str().to_string_lossy().as_bytes().to_vec())
                 .unwrap_or_default(),
         ),
-        BackupEntryKind::Tombstone | BackupEntryKind::Directory | BackupEntryKind::HardLink => {
-            Cow::Borrowed(&[])
-        }
-    }
+        _ => Arc::from([]),
+    })
 }
 
 fn entry_meta_json(entry: &BackupEntry) -> serde_json::Value {
@@ -6880,7 +6977,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn snapshot_history_reads_only_uncached_content() {
+    fn snapshot_history_loads_content_only_on_demand() {
         let (mut store, _storage, path) = durability_store();
         let session = "history-work-count";
         let bytes = vec![0xff; 256 * 1024];
@@ -6895,10 +6992,10 @@ mod tests {
             .snapshot(session, &path, "steady-depth append")
             .unwrap();
         let reads = store.history_content_reads.load(Ordering::Relaxed);
-        assert_eq!(reads, 1, "steady-depth history content reads");
+        assert_eq!(reads, 0, "appending must not load historical bodies");
         for entry in store.history(session, &path) {
-            assert_eq!(&*entry.content_bytes, &bytes);
-            assert_eq!(entry.content, String::from_utf8_lossy(&bytes));
+            assert_eq!(&*entry.content_bytes().unwrap(), &bytes);
+            assert_eq!(entry.content().unwrap(), String::from_utf8_lossy(&bytes));
         }
         std::fs::write(&path, b"edited").unwrap();
         store.restore_latest(session, &path).unwrap();
@@ -6968,7 +7065,8 @@ mod tests {
             assert_eq!(result.restored.len(), 1);
             assert_eq!(
                 store.history_content_reads.load(Ordering::Relaxed),
-                if warm { 0 } else { 640 }
+                1,
+                "only the restored top entry needs its body, even after history"
             );
             assert_eq!(std::fs::read(&paths[0]).unwrap(), bytes);
         }
@@ -6976,7 +7074,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn cached_backup_content_reloads_changed_blob_with_preserved_mtime() {
+    fn lazy_backup_content_reads_changed_blob_with_preserved_mtime() {
         let (mut store, _storage, path) = durability_store();
         store.snapshot("cache-change", &path, "baseline").unwrap();
         let key = canonicalize_key(&path);
@@ -6991,14 +7089,14 @@ mod tests {
         let blob = dir.join(content_filename_for_entry(&first[0]).unwrap());
         let mtime =
             filetime::FileTime::from_last_modification_time(&std::fs::metadata(&blob).unwrap());
-        let changed = vec![b'x'; first[0].content_bytes.len()];
+        let changed = vec![b'x'; first[0].content_bytes().unwrap().len()];
         std::fs::write(&blob, &changed).unwrap();
         filetime::set_file_mtime(&blob, mtime).unwrap();
         let reloaded = store
             .read_stack_from_disk_unlocked("cache-change", &key)
             .unwrap()
             .unwrap();
-        assert_eq!(&*reloaded[0].content_bytes, changed);
+        assert_eq!(&*reloaded[0].content_bytes().unwrap(), changed);
         std::fs::remove_file(&blob).unwrap();
         assert!(store
             .read_stack_from_disk_unlocked("cache-change", &key)
@@ -7214,8 +7312,7 @@ mod tests {
     fn db_mirror_entry(index: u128, kind: BackupEntryKind) -> BackupEntry {
         BackupEntry {
             backup_id: format!("backup-{index}"),
-            content: format!("content-{index}"),
-            content_bytes: format!("content-{index}").into_bytes().into(),
+            content: BackupContent::Captured(format!("content-{index}").into_bytes().into()),
             timestamp: u64::try_from(index + 1).unwrap(),
             order: index + 1,
             description: format!("generated-{index}"),
@@ -7675,7 +7772,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "modified");
 
         let (entry, _) = store.restore_latest(DEFAULT_SESSION_ID, &path).unwrap();
-        assert_eq!(entry.content, "original");
+        assert_eq!(entry.content().unwrap(), "original");
         assert_eq!(fs::read_to_string(&path).unwrap(), "original");
     }
 
@@ -7692,9 +7789,9 @@ mod tests {
 
         let history = store.history(DEFAULT_SESSION_ID, &path);
         assert_eq!(history.len(), 3);
-        assert_eq!(history[0].content, "v1");
-        assert_eq!(history[1].content, "v2");
-        assert_eq!(history[2].content, "v3");
+        assert_eq!(history[0].content().unwrap(), "v1");
+        assert_eq!(history[1].content().unwrap(), "v2");
+        assert_eq!(history[2].content().unwrap(), "v3");
     }
 
     #[test]
@@ -7708,7 +7805,7 @@ mod tests {
 
         let (entry, _) = store.restore_latest(DEFAULT_SESSION_ID, &path).unwrap();
         assert_eq!(entry.description, "second");
-        assert_eq!(entry.content, "v2");
+        assert_eq!(entry.content().unwrap(), "v2");
 
         let history = store.history(DEFAULT_SESSION_ID, &path);
         assert_eq!(history.len(), 1);
@@ -7759,20 +7856,15 @@ mod tests {
         assert_eq!(store.tracked_files("session_a").len(), 1);
     }
 
-    /// Memory characterization: each UTF-8 regular-file snapshot keeps the
-    /// file's body in process memory twice, as `content_bytes` and as the
-    /// `content` string.
-    /// The only bound is the per-(session, file) depth, so the held total
-    /// grows with sessions times files edited. Nothing drops these in-memory
-    /// stacks when a session ends or its root is idle-evicted (see
-    /// `context::callgraph_store_for_ops_tests::idle_eviction_keeps_in_memory_backup_stacks`),
-    /// and no memory-census plane counts them.
+    /// Durable stacks retain metadata, not one or two file bodies per edit.
     #[test]
-    fn backup_store_holds_two_copies_of_every_snapshot_in_memory() {
+    fn backup_memory_stores_only_metadata_for_durable_snapshots() {
         const FILE_BYTES: usize = 64 * 1024;
         const SESSIONS: usize = 3;
         let path = temp_file("memory_characterization.txt", "seed");
         let mut store = BackupStore::new();
+        let storage = tempfile::tempdir().unwrap();
+        store.set_storage_dir(storage.path().to_path_buf(), 72);
         for session in 0..SESSIONS {
             for edit in 0..MAX_UNDO_DEPTH {
                 let line = format!("session {session} edit {edit}\n");
@@ -7791,13 +7883,153 @@ mod tests {
             .fold((0usize, 0usize), |(entries, bytes), entry| {
                 (
                     entries + 1,
-                    bytes + entry.content.len() + entry.content_bytes.len(),
+                    bytes
+                        + std::mem::size_of::<BackupEntry>()
+                        + entry.backup_id.capacity()
+                        + entry.description.capacity()
+                        + entry.op_id.as_ref().map_or(0, String::capacity)
+                        + match &entry.content {
+                            BackupContent::Captured(bytes) => bytes.len(),
+                            BackupContent::OnDisk { path, .. } => path.capacity(),
+                        },
                 )
             });
         assert_eq!(entries, SESSIONS * MAX_UNDO_DEPTH);
+        eprintln!(
+            "backup retained entries: {held_bytes} bytes / {entries} entries (metadata included)"
+        );
         assert!(
-            held_bytes >= 2 * SESSIONS * MAX_UNDO_DEPTH * FILE_BYTES,
+            held_bytes < entries * 1024,
             "held {held_bytes} bytes for {entries} snapshots of a {FILE_BYTES}-byte file"
+        );
+        for entry in store.entries.values().flat_map(HashMap::values).flatten() {
+            assert!(matches!(entry.content, BackupContent::OnDisk { .. }));
+        }
+        assert_eq!(store.history_content_reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn backup_memory_undo_reloads_exact_bytes_after_eviction_and_restart() {
+        let storage = tempfile::tempdir().unwrap();
+        let path = storage.path().join("binary.bin");
+        let original = [0, 255, 254, b'a', b'\r', b'\n', 128, 0];
+        for operation in [false, true] {
+            for restart in [false, true] {
+                let mut store = BackupStore::new();
+                store.set_storage_dir(storage.path().join("storage"), 72);
+                fs::write(&path, original).unwrap();
+                store
+                    .snapshot_with_op("bytes", &path, "binary", Some("op"))
+                    .unwrap();
+                fs::write(&path, b"edited").unwrap();
+                if restart {
+                    drop(store);
+                    store = BackupStore::new();
+                    store.set_storage_dir(storage.path().join("storage"), 72);
+                } else {
+                    store.release_memory();
+                }
+                assert_eq!(store.tracked_files("bytes"), vec![canonicalize_key(&path)]);
+                assert_eq!(store.disk_history_count("bytes", &path), 1);
+                assert!(store.sessions_with_backups().contains(&"bytes".to_string()));
+                assert!(store.total_disk_bytes() > original.len() as u64);
+                if operation {
+                    store.restore_last_operation("bytes").unwrap();
+                } else {
+                    let (entry, _) = store.restore_latest("bytes", &path).unwrap();
+                    assert_eq!(&*entry.content_bytes().unwrap(), &original);
+                }
+                assert_eq!(fs::read(&path).unwrap(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn backup_memory_session_release_keeps_history_and_pending_annotations() {
+        let (mut store, _storage, path) = durability_store();
+        store.snapshot("closed", &path, "first").unwrap();
+        store.snapshot("other", &path, "other session").unwrap();
+        fs::write(&path, b"changed").unwrap();
+        store.release_session_memory("closed");
+        assert!(!store.entries.contains_key("closed"));
+        assert!(!store.disk_index.contains_key("closed"));
+        assert!(store.entries.contains_key("other"));
+        store.record_post_mutation_states();
+        assert!(!store.entries.contains_key("closed"));
+        assert_eq!(
+            store.history("closed", &path)[0].post_state,
+            Some(PathFingerprint::of_bytes(b"changed"))
+        );
+        assert_eq!(store.history("other", &path).len(), 1);
+    }
+
+    #[test]
+    fn backup_memory_history_response_is_byte_identical_after_release_and_restart() {
+        use crate::commands::edit_history::handle_edit_history;
+        use crate::config::Config;
+        use crate::context::AppContext;
+        use crate::parser::TreeSitterProvider;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file.bin");
+        let storage = root.path().join("storage");
+        let make_context = || {
+            let ctx = AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                Config {
+                    project_root: Some(root.path().to_path_buf()),
+                    ..Config::default()
+                },
+            );
+            ctx.backup().lock().set_storage_dir(storage.clone(), 72);
+            ctx
+        };
+        let ctx = make_context();
+        let ids = {
+            let mut store = ctx.backup().lock();
+            fs::write(&path, [0, 255, 128]).unwrap();
+            let first = store
+                .snapshot(DEFAULT_SESSION_ID, &path, "first")
+                .unwrap()
+                .unwrap();
+            fs::write(&path, b"text").unwrap();
+            let second = store
+                .snapshot(DEFAULT_SESSION_ID, &path, "second")
+                .unwrap()
+                .unwrap();
+            let meta_path = store
+                .session_dir(DEFAULT_SESSION_ID)
+                .unwrap()
+                .join(BackupStore::path_hash(&canonicalize_key(&path)))
+                .join("meta.json");
+            let mut meta: serde_json::Value =
+                serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+            for entry in meta["entries"].as_array_mut().unwrap() {
+                entry["timestamp"] = 42.into();
+            }
+            fs::write(meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+            [first, second]
+        };
+        let request = serde_json::from_value(
+            serde_json::json!({"id":"history", "command":"edit_history", "file":"file.bin"}),
+        )
+        .unwrap();
+        let expected = format!("{{\"id\":\"history\",\"success\":true,\"file\":\"file.bin\",\"entries\":[{{\"backup_id\":\"{}\",\"timestamp\":42,\"description\":\"second\",\"markers\":[],\"external_change_checkpoint\":null,\"generation\":0,\"previous_file\":false}},{{\"backup_id\":\"{}\",\"timestamp\":42,\"description\":\"first\",\"markers\":[],\"external_change_checkpoint\":null,\"generation\":0,\"previous_file\":false}}]}}", ids[1], ids[0]);
+        let response_bytes =
+            |ctx: &AppContext| serde_json::to_string(&handle_edit_history(&request, ctx)).unwrap();
+        assert_eq!(response_bytes(&ctx), expected);
+        ctx.backup().lock().release_memory();
+        assert_eq!(response_bytes(&ctx), expected);
+        drop(ctx);
+        let restarted = make_context();
+        assert_eq!(response_bytes(&restarted), expected);
+        assert_eq!(
+            restarted
+                .backup()
+                .lock()
+                .history_content_reads
+                .load(Ordering::Relaxed),
+            0
         );
     }
 
@@ -7869,7 +8101,7 @@ mod tests {
         let restored = store2
             .restore_latest_detailed(DEFAULT_SESSION_ID, &file_path, &mut saved.saver())
             .unwrap();
-        assert_eq!(restored.entry.content, "original");
+        assert_eq!(restored.entry.content().unwrap(), "original");
         assert!(restored.warning.is_some()); // modified externally
         assert_eq!(
             restored.external_change_checkpoint.as_deref(),
@@ -8030,11 +8262,19 @@ mod tests {
         let (entry1, _) = store
             .restore_latest(DEFAULT_SESSION_ID, &file_path)
             .unwrap();
-        assert_eq!(entry1.content, "v1", "first undo should restore v1");
+        assert_eq!(
+            entry1.content().unwrap(),
+            "v1",
+            "first undo should restore v1"
+        );
         let (entry0, _) = store
             .restore_latest(DEFAULT_SESSION_ID, &file_path)
             .unwrap();
-        assert_eq!(entry0.content, "v0", "second undo should restore v0");
+        assert_eq!(
+            entry0.content().unwrap(),
+            "v0",
+            "second undo should restore v0"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -9830,7 +10070,9 @@ mod tests {
         let mut store = BackupStore::new();
         store.set_storage_dir(dir.path().to_path_buf(), 72);
         assert_eq!(
-            store.history(DEFAULT_SESSION_ID, &path)[0].content,
+            store.history(DEFAULT_SESSION_ID, &path)[0]
+                .content()
+                .unwrap(),
             "legacy"
         );
 
@@ -9886,7 +10128,7 @@ mod tests {
         let contents = fresh
             .history(DEFAULT_SESSION_ID, &path)
             .into_iter()
-            .map(|entry| entry.content)
+            .map(|entry| entry.content().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(contents, vec!["v1".to_string(), "v2".to_string()]);
     }
@@ -9907,7 +10149,7 @@ mod tests {
         let mut store_b = BackupStore::new();
         store_b.set_storage_dir(storage.path().to_path_buf(), 72);
         let (restored, _) = store_b.restore_latest(session, &path).unwrap();
-        assert_eq!(restored.content, "v0");
+        assert_eq!(restored.content().unwrap(), "v0");
 
         fs::write(&path, "current after other restore").unwrap();
         let error = store_a.restore_latest(session, &path).unwrap_err();
@@ -9945,7 +10187,7 @@ mod tests {
         let contents = fresh
             .history(session, &snapshot_path)
             .into_iter()
-            .map(|entry| entry.content)
+            .map(|entry| entry.content().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(contents, vec!["snapshot current".to_string()]);
     }
@@ -10303,8 +10545,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![second_id.as_str(), third_id.as_str()]
         );
-        assert_eq!(history[0].content_bytes.as_ref(), b"v1");
-        assert_eq!(history[1].content_bytes.as_ref(), b"v2");
+        assert_eq!(history[0].content_bytes().unwrap().as_ref(), b"v1");
+        assert_eq!(history[1].content_bytes().unwrap().as_ref(), b"v2");
     }
 
     #[test]

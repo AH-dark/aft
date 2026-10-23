@@ -287,7 +287,7 @@ mod audit_regressions {
         let mut store = ctx.backup().lock();
         let history = store.history(request.session(), &path);
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].content_bytes.as_ref(), original);
+        assert_eq!(history[0].content_bytes().unwrap().as_ref(), original);
         store.record_post_mutation_states();
         store.restore_last_operation(request.session()).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), original);

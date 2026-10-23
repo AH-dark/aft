@@ -1026,7 +1026,10 @@ mod a03_tests {
         assert_eq!(hashes, 2);
         let history = store.history(req.session(), &path);
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].content_bytes.as_ref(), "é before\r\n".as_bytes());
+        assert_eq!(
+            history[0].content_bytes().unwrap().as_ref(),
+            "é before\r\n".as_bytes()
+        );
         assert_eq!(
             history[0].post_state,
             Some(crate::backup::PathFingerprint::Content(
