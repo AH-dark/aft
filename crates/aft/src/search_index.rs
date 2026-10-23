@@ -158,8 +158,12 @@ struct ArtifactCacheKeyMemoState {
 }
 
 #[cfg(test)]
+type AfterLegacyMemoRename = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
 thread_local! {
     static LEGACY_MEMO_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LEGACY_MEMO_CANONICALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static AFTER_LEGACY_MEMO_RENAME: std::cell::RefCell<Option<AfterLegacyMemoRename>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Default)]
@@ -7711,6 +7715,12 @@ struct LegacyMemoIndex {
     aliases: BTreeMap<PathBuf, Vec<usize>>,
 }
 
+fn canonical_legacy_memo_spelling(spelling: &str) -> PathBuf {
+    #[cfg(test)]
+    LEGACY_MEMO_CANONICALIZATIONS.with(|count| count.set(count.get() + 1));
+    crate::root_identity::canonical_root(Path::new(spelling))
+}
+
 impl LegacyMemoIndex {
     fn build(
         entries: BTreeMap<String, ArtifactCacheKeyMemoEntry>,
@@ -7723,7 +7733,7 @@ impl LegacyMemoIndex {
             .into_iter()
             .enumerate()
             .map(|(index, (spelling, entry))| {
-                let canonical = crate::root_identity::canonical_root(Path::new(&spelling));
+                let canonical = canonical_legacy_memo_spelling(&spelling);
                 aliases.entry(canonical.clone()).or_default().push(index);
                 (spelling, entry, canonical)
             })
@@ -7734,6 +7744,48 @@ impl LegacyMemoIndex {
             entries,
             aliases,
         }
+    }
+
+    fn apply_write(
+        &mut self,
+        entries: &BTreeMap<String, ArtifactCacheKeyMemoEntry>,
+        stamp: LegacyMemoStamp,
+    ) {
+        let mut previous = std::mem::take(&mut self.entries).into_iter().peekable();
+        let mut aliases: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+        let mut updated = Vec::with_capacity(entries.len());
+        for (spelling, entry) in entries {
+            while previous.peek().is_some_and(|(old, _, _)| old < spelling) {
+                previous.next();
+            }
+            let old = previous
+                .peek()
+                .is_some_and(|(old, _, _)| old == spelling)
+                .then(|| previous.next().unwrap());
+            let canonical = match old {
+                Some((_, old, canonical))
+                    if old.key == entry.key
+                        && old.git_root_commit == entry.git_root_commit
+                        && old.recorded_at_ms == entry.recorded_at_ms =>
+                {
+                    canonical
+                }
+                _ => canonical_legacy_memo_spelling(spelling),
+            };
+            aliases
+                .entry(canonical.clone())
+                .or_default()
+                .push(updated.len());
+            updated.push((spelling.clone(), entry.clone(), canonical));
+        }
+        // Recreate bucket membership in spelling order after removals/changes.
+        // Lookup folds these current entries, so conflict and validation results
+        // are recomputed, not retained from an earlier version of a bucket.
+        self.entries = updated;
+        self.aliases = aliases;
+        self.stamp = Some(stamp);
+        // Keep built_at: writes must not postpone discovery of new aliases among
+        // unchanged spellings by extending their ten-minute lifetime.
     }
 
     fn lookup(
@@ -7790,7 +7842,8 @@ fn legacy_identity_memo_slot(storage: &Path) -> LegacyMemoSlot {
 }
 
 /// Cache canonical spellings by the memo file's identity, length and times;
-/// refresh on AFT writes and after ten minutes even if the file is unchanged.
+/// apply AFT writes incrementally and rebuild after ten minutes even if the file
+/// is unchanged.
 /// Revalidate matched spellings on every lookup so a moved alias cannot return
 /// its former root's identity. Newly matching spellings, including new conflicts,
 /// can be missed until refresh; the age limit bounds that discovery delay.
@@ -8427,19 +8480,51 @@ fn write_artifact_cache_key_memo_file(
             .as_nanos()
     ));
     let bytes = serde_json::to_vec_pretty(entries).map_err(std::io::Error::other)?;
-    {
-        let mut file = crate::private_storage::create(&temp_path)?;
-        file.write_all(&bytes)?;
-    }
+    let mut file = crate::private_storage::create(&temp_path)?;
+    file.write_all(&bytes)?;
+    // Close write handles before sampling the published times: Windows may
+    // defer its last-write timestamp until then. A read handle keeps the same
+    // file's identity available through rename without delaying that update.
+    let identity = crate::file_identity::FileIdentity::of_file(&file);
+    let published_file = File::open(&temp_path).ok().filter(|opened| {
+        identity != crate::file_identity::FileIdentity::Unavailable
+            && crate::file_identity::FileIdentity::of_file(opened) == identity
+    });
+    drop(file);
+    let slot = legacy_identity_memo_slot(storage_root);
+    let mut cached = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous_stamp = LegacyMemoStamp::at(&path);
+    let can_advance = cached.as_ref().is_some_and(|index| {
+        previous_stamp.is_some()
+            && index.stamp == previous_stamp
+            && index.built_at.elapsed() < LEGACY_IDENTITY_MEMO_MAX_AGE
+    });
     if let Err(error) = fs::rename(&temp_path, &path) {
         let _ = fs::remove_file(&temp_path);
         return Err(error);
     }
-    // A same-process write must invalidate aliases even on a filesystem whose
-    // metadata cannot reliably distinguish successive versions of this file.
-    *legacy_identity_memo_slot(storage_root)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    #[cfg(test)]
+    if let Some(hook) = AFTER_LEGACY_MEMO_RENAME.with(|slot| slot.borrow_mut().take()) {
+        hook(&path);
+    }
+    // Keep the written file open across rename. A stamp sampled only from the
+    // destination could belong to another writer's replacement, not these bytes.
+    let published_stamp = published_file.as_ref().and_then(LegacyMemoStamp::of_file);
+    if can_advance && published_stamp.is_some() && published_stamp == LegacyMemoStamp::at(&path) {
+        cached
+            .as_mut()
+            .unwrap()
+            .apply_write(entries, published_stamp.unwrap());
+        if published_stamp != published_file.as_ref().and_then(LegacyMemoStamp::of_file)
+            || published_stamp != LegacyMemoStamp::at(&path)
+        {
+            *cached = None;
+        }
+    } else {
+        *cached = None;
+    }
     Ok(())
 }
 
@@ -10574,27 +10659,145 @@ mod tests {
     }
 
     #[test]
-    fn legacy_identity_memo_own_write_invalidates_snapshot() {
+    fn legacy_identity_memo_own_write_advances_snapshot() {
         let storage = tempfile::tempdir().unwrap();
         let root = storage.path().join("checkout");
         let raw = root.to_string_lossy().into_owned();
         let mut entries = BTreeMap::from([(raw.clone(), legacy_memo_entry("old"))]);
         super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        super::LEGACY_MEMO_BUILDS.with(|count| count.set(0));
+        super::LEGACY_MEMO_CANONICALIZATIONS.with(|count| count.set(0));
         super::legacy_identity_memo(&root, &raw, storage.path()).unwrap();
         let slot = super::legacy_identity_memo_slot(storage.path());
-        assert!(slot.lock().unwrap().is_some());
+        let built_at = slot.lock().unwrap().as_ref().unwrap().built_at;
         entries.get_mut(&raw).unwrap().git_root_commit = "new".into();
         super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
-        assert!(
-            slot.lock().unwrap().is_none(),
-            "a successful AFT memo write must discard canonical aliases"
-        );
         assert_eq!(
             super::legacy_identity_memo(&root, &raw, storage.path())
                 .unwrap()
                 .unwrap()
                 .git_root_commit,
             "new"
+        );
+        assert_eq!(super::LEGACY_MEMO_BUILDS.with(|count| count.get()), 1,
+            "an own write must update the existing index rather than force the next root to rebuild it");
+        assert_eq!(
+            slot.lock().unwrap().as_ref().unwrap().built_at,
+            built_at,
+            "own writes must not extend the age of unchanged canonical spellings"
+        );
+        assert_eq!(
+            super::LEGACY_MEMO_CANONICALIZATIONS.with(|count| count.get()),
+            2
+        );
+        let added = storage.path().join("new-checkout");
+        let added_raw = added.to_string_lossy().into_owned();
+        entries.insert(added_raw.clone(), legacy_memo_entry("added"));
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        assert_eq!(
+            super::legacy_identity_memo(&added, &added_raw, storage.path())
+                .unwrap()
+                .unwrap()
+                .git_root_commit,
+            "added"
+        );
+        assert_eq!(
+            super::LEGACY_MEMO_CANONICALIZATIONS.with(|count| count.get()),
+            3
+        );
+        entries.remove(&raw);
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        assert!(super::legacy_identity_memo(&root, &raw, storage.path())
+            .unwrap()
+            .is_none());
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        assert_eq!(super::LEGACY_MEMO_BUILDS.with(|count| count.get()), 1);
+        assert_eq!(
+            super::LEGACY_MEMO_CANONICALIZATIONS.with(|count| count.get()),
+            3,
+            "removed and unchanged spellings need no canonicalization on own writes"
+        );
+    }
+
+    #[test]
+    fn legacy_identity_memo_own_write_rebuilds_uncertain_or_old_snapshot() {
+        for reason in ["expired", "unknown", "external"] {
+            let storage = tempfile::tempdir().unwrap();
+            let root = storage.path().join("checkout");
+            let raw = root.to_string_lossy().into_owned();
+            let mut entries = BTreeMap::from([(raw.clone(), legacy_memo_entry("old"))]);
+            super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+            super::LEGACY_MEMO_BUILDS.with(|count| count.set(0));
+            super::legacy_identity_memo(&root, &raw, storage.path()).unwrap();
+            let slot = super::legacy_identity_memo_slot(storage.path());
+            match reason {
+                "expired" => {
+                    slot.lock().unwrap().as_mut().unwrap().built_at =
+                        Instant::now() - super::LEGACY_IDENTITY_MEMO_MAX_AGE
+                }
+                "unknown" => slot.lock().unwrap().as_mut().unwrap().stamp = None,
+                _ => {
+                    let external = BTreeMap::from([(raw.clone(), legacy_memo_entry("ext"))]);
+                    crate::file_identity::replace_keeping_times(
+                        &super::artifact_cache_key_memo_path(storage.path()),
+                        &serde_json::to_vec_pretty(&external).unwrap(),
+                    );
+                }
+            }
+            entries.get_mut(&raw).unwrap().git_root_commit = "new".into();
+            super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+            assert!(
+                slot.lock().unwrap().is_none(),
+                "{reason} snapshot must not be advanced"
+            );
+            assert_eq!(
+                super::legacy_identity_memo(&root, &raw, storage.path())
+                    .unwrap()
+                    .unwrap()
+                    .git_root_commit,
+                "new"
+            );
+            assert_eq!(
+                super::LEGACY_MEMO_BUILDS.with(|count| count.get()),
+                2,
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_identity_memo_own_write_does_not_stamp_an_external_replacement() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("checkout");
+        let raw = root.to_string_lossy().into_owned();
+        let mut entries = BTreeMap::from([(raw.clone(), legacy_memo_entry("old"))]);
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        super::legacy_identity_memo(&root, &raw, storage.path()).unwrap();
+        let external = BTreeMap::from([(raw.clone(), legacy_memo_entry("ext"))]);
+        let replacement = serde_json::to_vec_pretty(&external).unwrap();
+        super::AFTER_LEGACY_MEMO_RENAME.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                crate::file_identity::replace_keeping_times(path, &replacement);
+            }))
+        });
+        entries.get_mut(&raw).unwrap().git_root_commit = "own".into();
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        assert!(super::legacy_identity_memo_slot(storage.path())
+            .lock()
+            .unwrap()
+            .is_none());
+        let indexed = super::legacy_identity_memo(&root, &raw, storage.path());
+        assert_eq!(
+            indexed.as_ref().unwrap().as_ref().unwrap().git_root_commit,
+            "ext"
+        );
+        assert_eq!(
+            legacy_memo_value(indexed),
+            legacy_memo_value(super::legacy_identity_memo_full_scan(
+                &root,
+                &raw,
+                storage.path()
+            ))
         );
     }
 
@@ -10788,33 +10991,53 @@ mod tests {
                 2 => second.git_root_commit = " ".into(),
                 _ => second.key = "invalid".into(),
             }
-            entries.insert(alias, second);
-            super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
-            for root in &queries {
-                let raw = root.to_string_lossy();
-                let indexed =
-                    legacy_memo_value(super::legacy_identity_memo(root, &raw, storage.path()));
-                let scanned = legacy_memo_value(super::legacy_identity_memo_full_scan(
-                    root,
-                    &raw,
-                    storage.path(),
-                ));
-                assert_eq!(indexed, scanned, "round={round} root={root:?}");
+            entries.insert(alias.clone(), second);
+            for write in 0..4 {
+                let selected = spellings[next(&mut seed) as usize % spellings.len()]
+                    .to_string_lossy()
+                    .into_owned();
+                match write {
+                    0 => {}
+                    1 => {
+                        entries.insert(selected, legacy_memo_entry("changed-root"));
+                    }
+                    2 => {
+                        entries.remove(&selected);
+                    }
+                    _ => {
+                        entries.insert(alias.clone(), legacy_memo_entry("fixed-root"));
+                    }
+                }
+                super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+                for root in &queries {
+                    let raw = root.to_string_lossy();
+                    let indexed =
+                        legacy_memo_value(super::legacy_identity_memo(root, &raw, storage.path()));
+                    let scanned = legacy_memo_value(super::legacy_identity_memo_full_scan(
+                        root,
+                        &raw,
+                        storage.path(),
+                    ));
+                    assert_eq!(
+                        indexed, scanned,
+                        "round={round} write={write} root={root:?}"
+                    );
+                }
+                let unrelated = storage.path().join("unrelated-query");
+                assert_eq!(
+                    legacy_memo_value(super::legacy_identity_memo(
+                        &unrelated,
+                        &fixed,
+                        storage.path()
+                    )),
+                    legacy_memo_value(super::legacy_identity_memo_full_scan(
+                        &unrelated,
+                        &fixed,
+                        storage.path()
+                    )),
+                    "exact raw spellings must retain the full scan's shortcut"
+                );
             }
-            let unrelated = storage.path().join("unrelated-query");
-            assert_eq!(
-                legacy_memo_value(super::legacy_identity_memo(
-                    &unrelated,
-                    &fixed,
-                    storage.path()
-                )),
-                legacy_memo_value(super::legacy_identity_memo_full_scan(
-                    &unrelated,
-                    &fixed,
-                    storage.path()
-                )),
-                "exact raw spellings must retain the full scan's shortcut"
-            );
         }
     }
 
@@ -10896,6 +11119,75 @@ mod tests {
                     super::LEGACY_MEMO_BUILDS.with(|count| count.get()),
                     started.elapsed().as_micros()
                 );
+            }
+        }
+    }
+
+    /// Model serial lookups of previously unseen checkout roots: warm the alias
+    /// index, record another checkout through the memo writer, then query a new root.
+    /// Storage and checkout spellings are isolated fixtures, never live state.
+    #[test]
+    #[ignore = "manual native own-write and new-root memo timing probe"]
+    fn legacy_identity_memo_own_write_native_probe() {
+        for entries in [2048, 8192] {
+            let storage = tempfile::tempdir().unwrap();
+            let memo: BTreeMap<_, _> = (0..entries)
+                .map(|index| {
+                    (
+                        storage
+                            .path()
+                            .join(format!("removed/checkouts/worker-{index}/project"))
+                            .to_string_lossy()
+                            .into_owned(),
+                        super::ArtifactCacheKeyMemoEntry {
+                            key: "0123456789abcdef".into(),
+                            git_root_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                            recorded_at_ms: crate::pins::now_ms(),
+                        },
+                    )
+                })
+                .collect();
+            fs::write(
+                super::artifact_cache_key_memo_path(storage.path()),
+                serde_json::to_vec(&memo).unwrap(),
+            )
+            .unwrap();
+            super::LEGACY_MEMO_BUILDS.with(|count| count.set(0));
+            super::LEGACY_MEMO_CANONICALIZATIONS.with(|count| count.set(0));
+            let first = storage.path().join("initial-new-root");
+            assert!(
+                super::legacy_identity_memo(&first, &first.to_string_lossy(), storage.path())
+                    .unwrap()
+                    .is_none()
+            );
+            for sample in 0..8 {
+                let bound = storage.path().join(format!("bound-{sample}"));
+                let next = storage.path().join(format!("next-{sample}"));
+                fs::create_dir(&bound).unwrap();
+                fs::create_dir(&next).unwrap();
+                let started = Instant::now();
+                let mut timings = super::ArtifactCacheKeyTimings::default();
+                super::record_artifact_cache_key_memo_profiled(
+                    storage.path(),
+                    &bound.to_string_lossy(),
+                    &format!("{sample:016x}"),
+                    "0123456789abcdef0123456789abcdef01234567",
+                    &mut timings,
+                )
+                .unwrap();
+                let write_elapsed = started.elapsed();
+                let lookup = Instant::now();
+                assert!(super::legacy_identity_memo(
+                    &next,
+                    &next.to_string_lossy(),
+                    storage.path()
+                )
+                .unwrap()
+                .is_none());
+                eprintln!("own_write_probe entries={entries} sample={sample} write_us={} next_lookup_us={} total_us={} builds={} canonicalizations={}",
+                    write_elapsed.as_micros(), lookup.elapsed().as_micros(), started.elapsed().as_micros(),
+                    super::LEGACY_MEMO_BUILDS.with(|count| count.get()),
+                    super::LEGACY_MEMO_CANONICALIZATIONS.with(|count| count.get()));
             }
         }
     }
