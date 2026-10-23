@@ -1644,6 +1644,13 @@ fn completion_matches_session(completion: &BgCompletion, session_id: Option<&str
 }
 
 impl BgTaskRegistry {
+    pub(crate) fn changed_files_budget(
+        &self,
+        task_id: &str,
+        deadline: Option<Instant>,
+    ) -> Option<crate::bash_changed_files::BudgetGuard> {
+        Some(self.task(task_id)?.changed_files.as_ref()?.budget(deadline))
+    }
     fn changed_files_report(&self, task_id: &str) -> Option<crate::bash_changed_files::Report> {
         let task = self.task(task_id)?;
         let mut report = task.changed_files.as_ref()?.finish().clone();
@@ -14183,9 +14190,6 @@ impl BgTask {
     }
 
     fn mark_terminal_now(&self) {
-        if let Some(capture) = &self.changed_files {
-            capture.seal();
-        }
         if let Ok(mut terminal_at) = self.terminal_at.lock() {
             if terminal_at.is_none() {
                 *terminal_at = Some(Instant::now());

@@ -170,7 +170,8 @@ fn admit(path: &Path, file_type: Option<&std::fs::FileType>) -> std::io::Result<
     // Walker types are enough for name/storage exclusions and for entries that
     // cannot alias SQLite. Regular files still need inode checks: a harmless
     // source name may be a hard link to a live database or a newly created sidecar.
-    if is_storage_path(path)
+    if crate::watcher_backend::flush::is_marker_path(path)
+        || is_storage_path(path)
         || match file_type {
             Some(_) => is_excluded_file_with_metadata(path, file_type, None),
             None => {

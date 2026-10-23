@@ -945,16 +945,34 @@ fn bash_changed_files_foreground_and_background_completion_notice() {
         "config": user_config(serde_json::json!({"bash": {"changed_files": "diff", "rewrite": false}, "sandbox": {"profile": "off"}}))
     }).to_string());
     assert_eq!(configured["success"], true, "{configured}");
+    // Establish native service readiness before testing command-exit delivery.
+    // The separate saturation regression deliberately starts without warming up.
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let probe = aft.send(&serde_json::json!({"id":"changed-files-ready", "method":"bash", "params":{"command":":", "notify_on_completion":false}}).to_string());
+        assert_eq!(probe["success"], true, "{probe}");
+        let probe = wait_for_terminal_status(&mut aft, probe["task_id"].as_str().unwrap());
+        if probe["_bash_changed_files"]["incomplete"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < ready_deadline,
+            "watcher did not become ready: {probe}"
+        );
+    }
     for background in [false, true] {
         let name = if background {
             "background.txt"
         } else {
             "foreground.txt"
         };
-        // Leave a delivery window after the write, exercising the real root
-        // watcher rather than manufacturing the command's observed events.
+        // Write as the last shell operation: no sleep gives the watcher a head
+        // start before the completion barrier.
         let result = aft.send(&serde_json::json!({"id": name, "method": "bash", "params": {
-            "command": format!("printf 'hello\\n' > {name}; sleep 0.3; printf done"), "background": background, "wait": !background,
+            "command": format!("printf done; printf 'hello\\n' > {name}"), "background": background, "wait": !background,
             "compressed": false, "notify_on_completion": background
         }}).to_string());
         assert_eq!(result["success"], true, "{result}");
@@ -989,6 +1007,11 @@ fn bash_changed_files_foreground_and_background_completion_notice() {
                             .is_some_and(|diff| diff.contains("+hello"))),
                 "{completion}"
             );
+            assert_eq!(
+                completion["_bash_changed_files"]["incomplete"],
+                serde_json::json!([]),
+                "{completion}"
+            );
             let ack = aft.send(&serde_json::json!({"id":"ack-changes", "command":"bash_ack_completions", "params":{"task_ids":[result["task_id"]]}}).to_string());
             assert_eq!(ack["success"], true);
             let drained = aft.send(&serde_json::json!({"id":"drain-changes-again", "command":"bash_drain_completions"}).to_string());
@@ -998,6 +1021,11 @@ fn bash_changed_files_foreground_and_background_completion_notice() {
             );
         } else {
             let result = wait_for_terminal_status(&mut aft, result["task_id"].as_str().unwrap());
+            assert_eq!(
+                result["_bash_changed_files"]["incomplete"],
+                serde_json::json!([]),
+                "{result}"
+            );
             assert!(
                 result["_bash_changed_files"]["text"]
                     .as_str()
@@ -1018,4 +1046,28 @@ fn bash_changed_files_foreground_and_background_completion_notice() {
             );
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_changed_files_flush_timeout_reports_incomplete() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("AFT_TEST_DISABLE_FILE_WATCHER", std::ffi::OsStr::new("0")),
+        (
+            "AFT_TEST_SYNC_FILE_WATCHER_START",
+            std::ffi::OsStr::new("1"),
+        ),
+        (
+            "AFT_TEST_BASH_CHANGED_FILES_FLUSH_TIMEOUT",
+            std::ffi::OsStr::new("1"),
+        ),
+    ]);
+    let configured = aft.send(&serde_json::json!({"id":"flush-timeout-config", "command":"configure", "harness":"opencode", "project_root":project.path(), "storage_dir":storage.path(), "config":user_config(serde_json::json!({"bash":{"changed_files":"list","rewrite":false},"sandbox":{"profile":"off"}}))}).to_string());
+    assert_eq!(configured["success"], true, "{configured}");
+    let result = aft.send(&serde_json::json!({"id":"flush-timeout-command", "method":"bash", "params":{"command":"printf last > late.txt", "notify_on_completion":false}}).to_string());
+    assert_eq!(result["success"], true, "{result}");
+    let result = wait_for_terminal_status(&mut aft, result["task_id"].as_str().unwrap());
+    assert_eq!(result["_bash_changed_files"]["incomplete"], serde_json::json!(["Incomplete: the file watcher had not caught up when the command ended, so some changes may be missing."]), "{result}");
 }

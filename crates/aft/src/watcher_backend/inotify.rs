@@ -139,11 +139,25 @@ impl ProjectWatcher {
             }
         }
         let mut watched_directories = installed;
+        let git_directory = root.join(".git");
+        let mut git_watched = watched_directories.contains(&git_directory);
         for path in extra_watch_paths {
             if path.exists() {
                 let _ = watch_directory(&mut watcher, &path, &mut watch, &counters)?;
+                if path == git_directory {
+                    git_watched = true;
+                }
             }
         }
+        counters.bash_flush.set_marker_directory(
+            if git_watched
+                && std::fs::symlink_metadata(&git_directory).is_ok_and(|metadata| metadata.is_dir())
+            {
+                git_directory
+            } else {
+                root.clone()
+            },
+        );
 
         let watched_directory_count = Arc::new(AtomicUsize::new(watched_directories.len()));
         let thread_count = Arc::clone(&watched_directory_count);
@@ -321,6 +335,20 @@ impl ProjectWatcher {
 
                     match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
                         Ok(Ok(event)) => {
+                            if counters.bash_changes.get().is_some()
+                                && event
+                                    .paths
+                                    .iter()
+                                    .any(|path| super::flush::is_marker_path(path))
+                            {
+                                // New-directory recovery waits briefly for duplicate kernel
+                                // events. Publish its files before the ordered marker too.
+                                if !new_directory_files.files.is_empty()
+                                    && tx.send(Ok(new_directory_files.take_event())).is_err()
+                                {
+                                    return;
+                                }
+                            }
                             let changed_paths = exclusion_state.refresh_event(&event);
                             if !changed_paths.is_empty() {
                                 exclusion_paths = exclusion_state.paths();

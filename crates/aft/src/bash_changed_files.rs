@@ -20,6 +20,7 @@ const OUTSIDE_GIT: &str =
     "No diffs: the project is not in a git repository, so only paths are listed.";
 const GIT_UNAVAILABLE: &str = "No diffs: git before-images could not be captured within the time/output budget, so only paths are listed.";
 const OVERFLOW: &str = "Incomplete: the file watcher overflowed, so some changes may be missing.";
+pub(crate) const NOT_CAUGHT_UP: &str = "Incomplete: the file watcher had not caught up when the command ended, so some changes may be missing.";
 
 #[derive(Default, Debug)]
 pub(crate) struct Journal {
@@ -93,6 +94,8 @@ pub(crate) struct Capture {
     gaps: u64,
     mode: BashChangedFiles,
     watcher_active: bool,
+    flush: Option<Arc<crate::watcher_backend::flush::FlushControl>>,
+    call_deadline: Mutex<Option<Instant>>,
     git: Option<GitStart>,
     end: OnceLock<(u64, u64)>,
     report: OnceLock<Report>,
@@ -106,6 +109,16 @@ struct GitStart {
 
 thread_local! { static CURRENT: RefCell<Option<Arc<Capture>>> = const { RefCell::new(None) }; }
 pub(crate) struct Scope(Option<Arc<Capture>>);
+pub(crate) struct BudgetGuard(Arc<Capture>);
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        *self
+            .0
+            .call_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
 impl Drop for Scope {
     fn drop(&mut self) {
         CURRENT.with(|current| *current.borrow_mut() = std::mem::take(&mut self.0));
@@ -131,12 +144,9 @@ impl Capture {
             .bash_changes
             .get_or_init(|| Arc::new(Journal::default()))
             .clone();
-        Some(Self::begin(
-            root,
-            journal,
-            mode,
-            ctx.watcher_runtime_active(),
-        ))
+        let mut capture = Self::begin(root, journal, mode, ctx.watcher_runtime_active());
+        Arc::get_mut(&mut capture).unwrap().flush = Some(ctx.watcher_counters().bash_flush.clone());
+        Some(capture)
     }
     fn begin(
         root: PathBuf,
@@ -164,14 +174,36 @@ impl Capture {
             gaps,
             mode,
             watcher_active,
+            flush: None,
+            call_deadline: Mutex::new(None),
             git,
             end: OnceLock::new(),
             report: OnceLock::new(),
         })
     }
     pub(crate) fn finish(&self) -> &Report {
-        self.seal();
-        self.report.get_or_init(|| self.render())
+        self.report.get_or_init(|| {
+            let deadline = Instant::now() + crate::watcher_backend::flush::BASH_FLUSH_LIMIT;
+            let deadline = self
+                .call_deadline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .map_or(deadline, |call| call.min(deadline));
+            let caught_up = self.watcher_active
+                && self
+                    .flush
+                    .as_ref()
+                    .is_none_or(|flush| flush.wait(&self.root, deadline));
+            self.seal();
+            self.render(caught_up)
+        })
+    }
+    pub(crate) fn budget(self: &Arc<Self>, deadline: Option<Instant>) -> BudgetGuard {
+        *self
+            .call_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = deadline;
+        BudgetGuard(self.clone())
     }
     pub(crate) fn seal(&self) {
         self.end.get_or_init(|| {
@@ -183,7 +215,7 @@ impl Capture {
             (state.sequence, state.gaps)
         });
     }
-    fn render(&self) -> Report {
+    fn render(&self, caught_up: bool) -> Report {
         let state = self
             .journal
             .state
@@ -219,12 +251,9 @@ impl Capture {
         if overflow {
             incomplete.push(OVERFLOW.to_string());
         }
-        if !self.watcher_active {
-            incomplete.push("Incomplete: the project file watcher is not running.".to_string());
+        if !caught_up {
+            incomplete.push(NOT_CAUGHT_UP.to_string());
         }
-        // Watcher notifications may still be pending when the command finishes,
-        // so delivered events cannot prove that every change was captured.
-        incomplete.push("Incomplete: file watcher delivery is asynchronous; changes not yet delivered at command completion may be missing.".to_string());
         let total = paths.len();
         let mut files = Vec::new();
         let mut serialized_files_bytes = 0;
@@ -308,7 +337,7 @@ impl Capture {
             files.len(),
             total,
             false,
-            overflow,
+            overflow || !caught_up,
         );
         if cut && list_envelope.reason.is_none() {
             list_envelope.reason = Some(Reason::Cap);

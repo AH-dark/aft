@@ -2241,6 +2241,9 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
             Ok(e) => e,
             Err(_) => continue,
         };
+        if crate::watcher_backend::flush::is_marker_path(&entry.path()) {
+            continue;
+        }
 
         let name = entry.file_name().to_string_lossy().to_string();
         if !include_hidden && name.starts_with('.') {
@@ -2329,6 +2332,22 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bash_flush_markers_are_not_directory_entries() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [".aft-flush-123-1", ".aft-flush-not-private", "visible.rs"] {
+            std::fs::write(root.path().join(name), "").unwrap();
+        }
+        let request = serde_json::from_value(
+            serde_json::json!({"id":"flush-list", "command":"read", "params":{}}),
+        )
+        .unwrap();
+        let result = super::handle_directory(&request, root.path());
+        assert_eq!(
+            result.data["entries"],
+            serde_json::json!([".aft-flush-not-private", "visible.rs"])
+        );
+    }
     use super::*;
     use std::path::{Path, PathBuf};
 

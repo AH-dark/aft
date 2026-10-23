@@ -569,6 +569,11 @@ pub fn build_bash_outcome(
     // A capped blocking wait detaches at its deadline instead of blocking on.
     let block_to_completion =
         (params.block_to_completion || params.wait) && worker_cap_ms.is_none();
+    let flush_budget = (ctx.config().bash.changed_files != crate::config::BashChangedFiles::Off)
+        .then(|| {
+            ctx.bash_background()
+                .changed_files_budget(&task_id, (!block_to_completion).then_some(deadline))
+        });
     let timeout = params.timeout;
     let storage_dir = crate::bash_background::task_storage_dir(ctx);
     let project_root = ctx.config().project_root.clone();
@@ -577,6 +582,7 @@ pub fn build_bash_outcome(
     let session_id_for_poll = session_id.clone();
 
     let mut poll: PendingResponsePoll = Box::new(move |ctx| {
+        let _keep_flush_budget = &flush_budget;
         // All blocking calls have a wait cap, but only delegated workers renew
         // the default hard kill. A primary session keeps its original limit.
         if worker_session && worker_cap_ms.is_some() {

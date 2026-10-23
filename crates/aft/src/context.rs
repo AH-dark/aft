@@ -1526,6 +1526,7 @@ const WATCHER_RESCAN_RERUN: u8 = 2;
 
 #[derive(Debug, Default)]
 pub(crate) struct WatcherCounters {
+    pub(crate) bash_flush: Arc<crate::watcher_backend::flush::FlushControl>,
     pub(crate) bash_changes: std::sync::OnceLock<Arc<crate::bash_changed_files::Journal>>,
     overflow_ignore_evidence: AtomicU8,
     fsevents_stream_creations_total: AtomicU64,

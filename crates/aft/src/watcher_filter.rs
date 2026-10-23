@@ -2337,6 +2337,11 @@ impl WatcherFilterThread {
                     #[cfg(feature = "test-timing-hooks")]
                     hold_watcher_intake_for_test(&self.shutdown);
                     self.config.counters.note_raw_event();
+                    if self.config.counters.bash_changes.get().is_some()
+                        && self.config.counters.bash_flush.observe(&event)
+                    {
+                        continue;
+                    }
                     if let Some(journal) = self.config.counters.bash_changes.get() {
                         journal.event(&event);
                     }
