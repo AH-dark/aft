@@ -2326,6 +2326,8 @@ impl ViewRuntimeState {
             health: crate::path_status::health::Health::for_view(&snapshot.view_dir),
             snapshot,
             pin,
+            // Readiness evidence belongs to this runtime, so even a
+            // same-generation replacement must discard its health projection.
             health_cache: parking_lot::Mutex::new(None),
         }
     }

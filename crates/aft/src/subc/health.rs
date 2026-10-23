@@ -4910,8 +4910,8 @@ mod tests {
         let app = App::default_shared();
         let cache = HealthRollupCache::new();
         assert_eq!(rolled_up_view(&cache, &executor, &app)["pending_paths"], 1);
-        // First make a local write, so an obsolete local projection must not
-        // explain away the later signature change from the child process.
+        // First make a local write and refresh health. The later child-process
+        // signature change must still trigger a SQLite reopen.
         {
             let mut status = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
             status.mark_pending(b"b.rs", "local", 1).unwrap();
@@ -4961,6 +4961,43 @@ mod tests {
         assert_eq!(rolled_up_view(&cache, &executor, &app)["generation"], 2);
         ctx.clear_view_runtime();
         assert!(rolled_up_view(&cache, &executor, &app).is_null());
+    }
+
+    #[test]
+    fn view_health_readiness_replacement_is_in_next_rollup_without_ledger_change() {
+        let (_dir, executor, ctx, _view_dir) = view_health_fixture();
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+        let initial = rolled_up_view(&cache, &executor, &app);
+        assert!(initial["callgraph_readiness_deferred"].is_null());
+        let reads = crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
+        for reason in [
+            crate::views::read::CALLGRAPH_READINESS_BUSY,
+            crate::views::read::CALLGRAPH_READINESS_PROBE_FAILED,
+        ] {
+            let mut next = ctx.view_runtime_snapshot().unwrap();
+            next.pending_inputs.insert(
+                b"a.rs".to_vec(),
+                crate::views::assembly::PendingInput {
+                    plane: "callgraph",
+                    reason,
+                    blob_key: None,
+                },
+            );
+            ctx.install_view_runtime(next, None);
+            let view = rolled_up_view(&cache, &executor, &app);
+            assert_eq!(view["generation"], 1);
+            assert_eq!(
+                view["callgraph_readiness_deferred"], reason,
+                "runtime readiness changes must show on the next tick"
+            );
+        }
+        let mut next = ctx.view_runtime_snapshot().unwrap();
+        next.pending_inputs.clear();
+        ctx.install_view_runtime(next, None);
+        assert!(rolled_up_view(&cache, &executor, &app)["callgraph_readiness_deferred"].is_null());
+        assert_eq!(crate::path_status::HEALTH_READS.with(std::cell::Cell::get), reads,
+            "readiness replacement must invalidate the projection without relying on a ledger change");
     }
 
     fn refresh_until_root_count(
