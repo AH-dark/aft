@@ -1190,6 +1190,25 @@ fn runon_uncaptured_reply_reports_terminal_outcome_not_starting() {
     // reply will never move to queued or running: the in-flight capture
     // warning would be a false instruction here.
     assert!(!output.contains(REMOTE_INPUT_CAPTURE_WARNING), "{output}");
+
+    let recovered = self::registry();
+    // Startup can publish a detach target before replay inserts its task.
+    // The reserved handle must receive the canonical recovered reply too.
+    let reserved = recovered.drain_reply_cache(&task_id, "session");
+    let metadata = task.state.lock().unwrap().metadata.clone();
+    recovered
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    let expected = with_runon_capture_state(&recovered, &task_id, "session", live_reply());
+    let recovered_task = recovered.task(&task_id).unwrap();
+    let _state = recovered_task.state.lock().unwrap();
+    let _no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
+    let cached = reserved
+        .snapshot()
+        .uncaptured_terminal
+        .expect("replayed terminal drain reply");
+    assert_eq!(cached.data, expected.data);
+    assert_eq!(cached.success, expected.success);
 }
 
 #[test]

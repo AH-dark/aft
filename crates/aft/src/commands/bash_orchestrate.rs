@@ -223,14 +223,27 @@ pub(crate) fn kill_deadline_note(
     session_id: &str,
     worker_session: bool,
 ) -> String {
-    if let Some(note) = registry.execution_note(task_id, session_id) {
+    let note = registry.execution_note(task_id, session_id);
+    let deadline = note
+        .is_none()
+        .then(|| registry.hard_kill_deadline_with_start(task_id, session_id))
+        .flatten();
+    kill_deadline_note_from_parts(note.as_deref(), deadline, worker_session)
+}
+
+/// Formats published deadline inputs at reply time so remaining-time wording
+/// stays current without reacquiring the task's state lock.
+pub(crate) fn kill_deadline_note_from_parts(
+    execution_note: Option<&str>,
+    deadline: Option<(HardKillDeadline, u64)>,
+    worker_session: bool,
+) -> String {
+    if let Some(note) = execution_note {
         // Remote timeouts are enforced from run start, not queue entry; AFT
         // cannot infer their remaining wall-clock time or renew the runner.
         return format!("\n{note}");
     }
-    let Some((deadline, started_at_ms)) =
-        registry.hard_kill_deadline_with_start(task_id, session_id)
-    else {
+    let Some((deadline, started_at_ms)) = deadline else {
         return "\nThis task has no kill deadline.".to_string();
     };
     format!(
@@ -1072,7 +1085,7 @@ pub(crate) fn with_runon_capture_state(
 /// A finished task's reply. It never carries the input-capture warning: that
 /// warning asks the caller to wait for queued or running states a finished task
 /// will not reach, even when the runner never confirmed capture.
-fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Response {
+pub(crate) fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Response {
     let task_line = foreground_task_line(&snapshot);
     let (output, foreground_envelope) =
         if let Some(envelope) = snapshot.bash_output_list_envelope.as_ref() {

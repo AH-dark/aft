@@ -290,6 +290,9 @@ mod frame_loop_lock_tests {
             route,
             1,
             drain::BashDetachTarget {
+                reply_cache: ctx
+                    .bash_background()
+                    .drain_reply_cache(&task.task_id, &task.session_id),
                 run_scoped: true,
                 task_id: task.task_id.clone(),
                 session_id: task.session_id.clone(),
@@ -309,6 +312,38 @@ mod frame_loop_lock_tests {
             super::super::test_support::route_identity(&root, &task.session_id),
         )]);
         let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
+        let registry = ctx.bash_background();
+        let initial_note = crate::commands::bash_orchestrate::kill_deadline_note(
+            registry,
+            &task.task_id,
+            &task.session_id,
+            false,
+        );
+        // Renew after registering the detach target: drain must see the new
+        // deadline even when the update did not need a durable metadata write.
+        registry
+            .renew_hard_kill(&task.task_id, &task.session_id, Duration::from_secs(3600))
+            .unwrap();
+        registry
+            .renew_hard_kill(&task.task_id, &task.session_id, Duration::from_secs(3601))
+            .unwrap();
+        let expected = stateful_module_drain_reply_for_test(
+            registry,
+            &task.task_id,
+            &task.session_id,
+            "drain-lock",
+            false,
+            false,
+        );
+        assert_ne!(
+            initial_note,
+            crate::commands::bash_orchestrate::kill_deadline_note(
+                registry,
+                &task.task_id,
+                &task.session_id,
+                false
+            )
+        );
         let _state = task.state.lock().unwrap();
         let _no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
         // The frame loop awaits this function directly. It must be ready even
@@ -328,9 +363,41 @@ mod frame_loop_lock_tests {
         let body: Value = serde_json::from_slice(&frame.body).unwrap();
         assert_eq!(body["structuredContent"]["task_id"], task.task_id);
         assert_eq!(body["structuredContent"]["status"], "running");
+        assert_eq!(
+            body["structuredContent"]["output"], expected.data["output"],
+            "drain must preserve the state-reading reply byte for byte"
+        );
+        assert_eq!(
+            body["content"][0]["text"],
+            bash_result_from_response(expected, &Default::default()).text
+        );
         assert!(claim.claimed_by_module_loop());
         assert!(writer_rx.try_recv().is_err(), "exactly one reply");
     }
+}
+
+#[cfg(test)]
+fn stateful_module_drain_reply_for_test(
+    registry: &crate::bash_background::BgTaskRegistry,
+    task_id: &str,
+    session_id: &str,
+    request_id: &str,
+    worker_session: bool,
+    bash_watch_available: bool,
+) -> Response {
+    let response = Response::success(
+        request_id,
+        json!({
+            "output": format!("{}{}",
+                crate::commands::bash_orchestrate::format_module_drain_detach_message(task_id, worker_session, bash_watch_available),
+                crate::commands::bash_orchestrate::kill_deadline_note(registry, task_id, session_id, worker_session)),
+            "task_id": task_id,
+            "status": "running",
+        }),
+    );
+    crate::commands::bash_orchestrate::with_runon_capture_state(
+        registry, task_id, session_id, response,
+    )
 }
 
 #[cfg(test)]
@@ -591,6 +658,7 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                 )?)
             }
             (drain::BashLoopAnswer::Drain, Some(identity)) => {
+                let cached = target.reply_cache.snapshot();
                 let response = Response::success(
                     &target.request_id,
                     json!({
@@ -604,7 +672,9 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                                 .bash_watch_available
                                 .unwrap_or(target.worker_session),
                         ),
-                         "\nUse bash_status to inspect its output and kill deadline.",
+                        crate::commands::bash_orchestrate::kill_deadline_note_from_parts(
+                            cached.execution_note.as_deref(), cached.deadline, target.worker_session,
+                        ),
                     ),
                         "task_id": target.task_id,
                         "status": "running",
@@ -612,22 +682,17 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                 );
                 // This function is awaited by the module loop itself, not by a
                 // separate wait task. Even awaiting a blocking-pool read here
-                // would stop it serving other routes. Use only the cached
-                // run-on launch reply; task-state reads and deadline details
-                // can wait for a subsequent status call.
-                let response = if target
-                    .registry
-                    .runon_launch_state(&target.task_id, &target.session_id)
-                    .is_some()
-                {
-                    cached_runon_launch_reply(
-                        &target.registry,
-                        &target.task_id,
-                        &target.session_id,
-                        &response,
-                        true,
-                    )
-                    .unwrap_or(response)
+                // would stop it serving other routes. Metadata writers publish
+                // the note and capture inputs before releasing task state;
+                // only pure response formatting happens here.
+                let response = if cached.inputs_captured == Some(false) {
+                    if let Some(terminal) = cached.uncaptured_terminal {
+                        let mut reply = copy_response(&terminal);
+                        reply.id = target.request_id.clone();
+                        reply
+                    } else {
+                        with_capture_warning(&response)
+                    }
                 } else {
                     response
                 };
@@ -1973,6 +2038,9 @@ pub(super) fn submit_deferred_bash(
         let register_capture_target = |response: &Response| {
             let task_id = response.data.get("task_id")?.as_str()?.to_owned();
             let target = drain::BashDetachTarget {
+                reply_cache: spawn_ctx
+                    .bash_background()
+                    .drain_reply_cache(&task_id, &session_id),
                 run_scoped,
                 task_id,
                 session_id: session_id.clone(),
@@ -2185,6 +2253,9 @@ pub(super) fn submit_deferred_bash(
                 }) = spawn_control
                 {
                     let target = drain::BashDetachTarget {
+                        reply_cache: spawn_ctx
+                            .bash_background()
+                            .drain_reply_cache(&task_id, &session_id),
                         run_scoped,
                         task_id,
                         session_id,
@@ -2270,6 +2341,9 @@ pub(super) fn submit_deferred_bash(
                 task_metrics.held_bash_calls.set_phase(route, corr, phase);
                 let _deferred_wait = DeferredBashWaitGuard::new(&task_metrics);
                 let deadline_target = drain::BashDetachTarget {
+                    reply_cache: spawn_ctx
+                        .bash_background()
+                        .drain_reply_cache(&task_id, &session_id),
                     run_scoped,
                     task_id: task_id.clone(),
                     session_id: session_id.clone(),
@@ -2569,6 +2643,7 @@ async fn run_deferred_bash_wait(
         route,
         corr,
         drain::BashDetachTarget {
+            reply_cache: registry.drain_reply_cache(&task_id, &session_id),
             run_scoped,
             task_id: task_id.clone(),
             session_id: session_id.clone(),
@@ -3791,6 +3866,7 @@ mod grant_path_tests {
         let registry = ctx.bash_background();
         registry.register_foreground_task(session, &task_id);
         let target = drain::BashDetachTarget {
+            reply_cache: registry.drain_reply_cache(&task_id, session),
             run_scoped: false,
             task_id: task_id.clone(),
             session_id: session.into(),
@@ -5345,14 +5421,36 @@ mod grant_path_tests {
             let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(8);
             // Simulate the module's restart deadline: its frame loop must answer
             // even though the capture waiter has not observed the drain yet.
+            let expected = stateful_module_drain_reply_for_test(
+                ctx.bash_background(),
+                &task_id,
+                "deadline-session",
+                "deadline-call",
+                false,
+                false,
+            );
+            let task = ctx.bash_background().task_for_test(&task_id).unwrap();
+            let state = task.state.lock().unwrap();
+            let no_task_locks =
+                crate::bash_background::registry::forbid_task_state_locks_for_test();
             assert_eq!(
                 answer_held_bash_calls_from_module_loop(&writer_tx, &routes, &metrics, true)
                     .await
                     .unwrap(),
                 1
             );
+            drop(no_task_locks);
+            drop(state);
             let frame = writer_rx.recv().await.unwrap().frame;
             let body: Value = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(
+                body["structuredContent"]["output"], expected.data["output"],
+                "uncaptured run-on drain reply must keep its original text"
+            );
+            assert_eq!(
+                body["content"][0]["text"],
+                bash_result_from_response(expected, &Default::default()).text
+            );
             assert_eq!(body["structuredContent"]["task_id"], task_id, "{body}");
             assert_eq!(body["structuredContent"]["status"], "starting", "{body}");
             assert!(
@@ -5479,8 +5577,24 @@ mod grant_path_tests {
         })
         .await
         .expect("the foreground call must reach the module loop's held-call table");
+        let expected = stateful_module_drain_reply_for_test(
+            ctx.bash_background(),
+            &task_id,
+            "deadline-session",
+            "deadline-call",
+            false,
+            false,
+        );
         let frame = writer_rx.recv().await.unwrap().frame;
         let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(
+            body["structuredContent"]["output"], expected.data["output"],
+            "accepted run-on drain reply must keep its original text"
+        );
+        assert_eq!(
+            body["content"][0]["text"],
+            bash_result_from_response(expected, &Default::default()).text
+        );
         assert_eq!(body["structuredContent"]["task_id"], task_id, "{body}");
         assert_eq!(body["structuredContent"]["status"], "running", "{body}");
         assert!(
@@ -6048,6 +6162,38 @@ mod grant_path_tests {
                 })
         })
         .await;
+        wait_for_task_state(&ctx, "canonical uncaptured drain reply", |registry| {
+            registry
+                .drain_reply_cache(&task_id, "deadline-session")
+                .snapshot()
+                .uncaptured_terminal
+                .is_some()
+        })
+        .await;
+        let expected = stateful_module_drain_reply_for_test(
+            ctx.bash_background(),
+            &task_id,
+            "deadline-session",
+            "cached-refusal",
+            false,
+            false,
+        );
+        let task = ctx.bash_background().task_for_test(&task_id).unwrap();
+        {
+            let _state = task.state.lock().unwrap();
+            let _no_task_locks =
+                crate::bash_background::registry::forbid_task_state_locks_for_test();
+            let cached = ctx
+                .bash_background()
+                .drain_reply_cache(&task_id, "deadline-session")
+                .snapshot();
+            let terminal = cached.uncaptured_terminal.unwrap();
+            assert_eq!(
+                terminal.data, expected.data,
+                "uncaptured drain must reuse the canonical terminal diagnostics"
+            );
+            assert_eq!(terminal.success, expected.success);
+        }
         assert!(
             rx.try_recv().is_err(),
             "dispatch holds the reply until refusal is saved"
