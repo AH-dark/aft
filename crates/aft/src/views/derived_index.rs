@@ -70,7 +70,8 @@ fn identity_for(
     manifest: &Manifest,
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    // Every field is length-prefixed, so no two field sequences hash alike.
+    // Every field is length-prefixed, so two different field sequences never
+    // encode to the same bytes before hashing.
     let mut field = |bytes: &[u8]| {
         hasher.update(&(bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);

@@ -740,9 +740,10 @@ const QUIESCENT_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 /// Clone `source` with `clonefile(2)` while SQLite proves its main file is
 /// the whole database and cannot change.
 ///
-/// `clonefile` takes paths, so nothing in this process opens (and later
-/// closes) a descriptor on the source's main file, `-wal` or `-shm`. Closing
-/// such a descriptor would drop every POSIX lock this process's SQLite
+/// `clonefile` takes paths, so this code never opens (and later closes) a
+/// raw descriptor of its own on the source's main file, `-wal` or `-shm`;
+/// only SQLite's connection touches them, and SQLite manages its descriptors.
+/// Closing a raw descriptor would drop every POSIX lock this process's SQLite
 /// connections hold on that file. Every step below that touches the source
 /// goes through a SQLite connection; the `-wal` is only `stat`ed.
 ///
@@ -1480,7 +1481,8 @@ mod tests {
     const LOCK_PROBE_ENV: &str = "AFT_TEST_CLONE_LOCK_PROBE_DATABASE";
 
     /// Report, from another process, whether some process holds SQLite's
-    /// shared lock on `database` and the dead-man-switch lock on its `-shm`.
+    /// shared lock on `database` and the read lock every connection keeps on
+    /// its `-shm` (SQLite's dead-man-switch byte).
     /// POSIX locks never conflict within one process, so only a second
     /// process can see whether this process's locks are still in place.
     #[cfg(unix)]
