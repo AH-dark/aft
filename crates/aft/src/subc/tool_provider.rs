@@ -5865,7 +5865,7 @@ mod route_tests {
             };
             let run = PlainToolRun {
                 bare_name: "write".into(),
-                arguments: json!({"filePath": "pin.rs", "content": "pub fn edited() {}\n"}),
+                arguments: json!({"path": "pin.rs", "content": "pub fn edited() {}\n"}),
                 format_context: Default::default(),
                 tool_call_context: ToolCallContext {
                     project_root: identity.project_root.clone(),
@@ -5898,18 +5898,16 @@ mod route_tests {
                 expected == SandboxMode::Strict
                     || (expected == SandboxMode::Relaxed && !cfg!(target_os = "linux")),
             );
-            let response = crate::worker_jail_canary::with_test_preparation_home(
-                storage.path(),
-                reads,
-                || job(&ctx),
-            );
+            crate::worker_jail_canary::with_test_preparation_home(storage.path(), reads, || {
+                let response = job(&ctx);
+                assert_eq!(
+                    response.data["tool_mode"],
+                    expected.to_string(),
+                    "{}",
+                    response.data
+                );
+            });
             completion.await.unwrap();
-            assert_eq!(
-                response.data["tool_mode"],
-                expected.to_string(),
-                "{}",
-                response.data
-            );
             // A later standalone/head request must not inherit the worker policy.
             let head = crate::sandbox_spawn::ToolLaunchPolicy::for_request(&ctx);
             assert_eq!(
