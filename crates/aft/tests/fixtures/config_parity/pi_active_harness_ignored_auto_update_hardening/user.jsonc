@@ -1,0 +1,12 @@
+{
+  "harnesses": {
+    "pi": {
+      "auto_update": "opaque",
+      "sandbox": {
+        "profile": {
+          "worker": "strict"
+        }
+      }
+    }
+  }
+}

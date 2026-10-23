@@ -1,8 +1,9 @@
 {
   "source": "crates/aft/tests/fixtures/config_parity/*/expected.json",
   "gate": "cargo test -p agent-file-tools --test integration config_resolver_matches_typescript_golden_fixtures",
-  "count": 80,
+  "count": 81,
   "fixture_ids": [
+    "pi_active_harness_ignored_auto_update_hardening",
     "malformed_security_sandbox",
     "malformed_security_indexes",
     "malformed_security_remote_exec",

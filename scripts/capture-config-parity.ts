@@ -169,6 +169,7 @@ function captureCase(caseDef: ParityCase, savedOpencodeConfigDir: string | undef
 }
 
 const CASES: ParityCase[] = [
+  { name: "pi_active_harness_ignored_auto_update_hardening", harness: "pi", user: { harnesses: { pi: { auto_update: "opaque", sandbox: { profile: { worker: "strict" } } } } } },
   { name: "malformed_security_sandbox", user: { sandbox: { profile: { worker: 5 } } } },
   { name: "malformed_security_indexes", project: { indexes: { semantic: "off" } } },
   { name: "malformed_security_remote_exec", project: { remote_exec: { enabled: "off" } } },

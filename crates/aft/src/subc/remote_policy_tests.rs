@@ -1492,6 +1492,7 @@ fn exec_remote_catalog_validates_vocabulary_and_rejects_malformed_routing() {
 fn exec_remote_catalog_paramless_and_unscoped_parity() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
+    let sibling = tempfile::tempdir().unwrap();
     let ctx = context(root.path(), storage.path(), None);
     let bind = identity(root.path(), "one", 7, false);
     for preset in ["head", "worker", "reader"] {
@@ -1508,7 +1509,9 @@ fn exec_remote_catalog_paramless_and_unscoped_parity() {
     // A session starter preflights its worker plan on an unscoped route. The
     // plan's params are validated and accepted there, the answer is the same
     // as a paramless fetch, and nothing is frozen without a scope.
-    let planned_fetch = fetch(&plan("broca-worker"));
+    let mut planned_fetch = fetch(&plan("broca-worker"));
+    // The frozen plan uses Unix paths; validation needs a native absolute path.
+    planned_fetch["params"]["siblings"] = json!([sibling.path()]);
     let mut paramless_fetch = planned_fetch.clone();
     paramless_fetch.as_object_mut().unwrap().remove("params");
     let paramless = catalog(paramless_fetch, &bind, &ctx).unwrap();
@@ -2082,7 +2085,11 @@ fn remote_enabled_catalog_is_rendered_once_after_validation() {
 fn malformed_routing_policy_is_refused_before_freeze_and_valid_retry_can_freeze() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
+    let sibling = tempfile::tempdir().unwrap();
     let ctx = context(root.path(), storage.path(), None);
+    let mut valid_fetch = fetch(&plan("broca-worker"));
+    // Keep the plan's policy but replace its Unix sibling path for native validation.
+    valid_fetch["params"]["siblings"] = json!([sibling.path()]);
     for (index, (field, malformed)) in [
         ("remote_exec", json!({"remote_exec":{"enabled":"yes"}})),
         (
@@ -2103,7 +2110,7 @@ fn malformed_routing_policy_is_refused_before_freeze_and_valid_retry_can_freeze(
         let serialized = serde_json::to_value(&error).unwrap();
         assert_eq!(serialized["detail"]["field"], format!("params.{field}"));
         assert!(lookup(&ctx, &RemoteSource::Worker(worker_key.clone())).is_none());
-        catalog(fetch(&plan("broca-worker")), &bind, &ctx).unwrap();
+        catalog(valid_fetch.clone(), &bind, &ctx).unwrap();
         let frozen = lookup(&ctx, &RemoteSource::Worker(worker_key.clone())).unwrap();
         assert!(frozen.params.remote_exec.as_ref().unwrap().enabled);
         let before = serde_json::to_value(&frozen.params).unwrap();

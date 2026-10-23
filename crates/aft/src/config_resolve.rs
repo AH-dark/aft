@@ -998,6 +998,7 @@ fn parse_tier(
         feature_config::DocumentTier::Project
     };
     let translation = feature_config::translate_document(&mut map, document_tier);
+    normalize_config_for_harness(&mut map, harness);
 
     let security_errors = malformed_security_config_errors(&map, harness);
     if !security_errors.is_empty() {
@@ -1011,7 +1012,44 @@ fn parse_tier(
     Ok((raw, translation))
 }
 
+// Mirror the host-owned lists in packages/aft-bridge/src/config-keys.ts.
+const OPENCODE_ONLY_CONFIG_KEYS: &[&str] = &["auto_update"];
+const PI_ONLY_CONFIG_KEYS: &[&str] = &[];
+
+fn harness_ignored_config_keys(harness: Option<&Harness>) -> &'static [&'static str] {
+    match harness {
+        Some(Harness::Pi) => OPENCODE_ONLY_CONFIG_KEYS,
+        Some(Harness::Opencode) => PI_ONLY_CONFIG_KEYS,
+        _ => &[],
+    }
+}
+
+fn normalize_config_for_harness(map: &mut Map<String, Value>, harness: Option<&Harness>) {
+    let ignored = harness_ignored_config_keys(harness);
+    for key in ignored {
+        map.remove(*key);
+    }
+    let Some(harness) = harness else { return };
+    let Some(block) = map
+        .get_mut("harnesses")
+        .and_then(Value::as_object_mut)
+        .and_then(|blocks| blocks.get_mut(&harness.wire_label()))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    // Remove ignored fields before validation so valid security settings in the
+    // same active harness block are preserved.
+    // Other harness blocks remain opaque, just as they do in the host plugins.
+    for key in ignored {
+        block.remove(*key);
+    }
+}
+
 fn security_config_section(key: &str, harness: Option<&Harness>) -> bool {
+    if harness_ignored_config_keys(harness).contains(&key) {
+        return false;
+    }
     matches!(
         key,
         "restrict_to_project_root"
@@ -1029,7 +1067,8 @@ fn security_config_section(key: &str, harness: Option<&Harness>) -> bool {
             | "opencode"
             | "github"
             | "gh_shim"
-    ) || (key == "auto_update" && !matches!(harness, Some(Harness::Pi)))
+            | "auto_update"
+    )
 }
 
 fn malformed_security_config_errors(
@@ -1130,6 +1169,7 @@ pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option
         feature_config::DocumentTier::Project
     };
     feature_config::translate_document(&mut map, document_tier);
+    normalize_config_for_harness(&mut map, harness);
     let raw = match serde_json::from_value::<RawAftConfig>(Value::Object(map)) {
         Ok(raw) => raw,
         Err(error) => {
@@ -1254,6 +1294,8 @@ fn apply_harness_override(
             ),
         });
     }
+
+    normalize_config_for_harness(&mut override_map, Some(harness));
 
     match serde_json::from_value::<RawAftConfig>(Value::Object(override_map)) {
         Ok(mut override_config) => {
@@ -3104,6 +3146,125 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harness_ignored_keys_match_plugin_declarations() {
+        let source = include_str!("../../../packages/aft-bridge/src/config-keys.ts");
+        let declared = |name: &str| -> Vec<String> {
+            let prefix = format!("export const {name} = [");
+            let body = source
+                .split_once(&prefix)
+                .expect("host key declaration")
+                .1
+                .split_once(']')
+                .expect("host key list end")
+                .0;
+            body.split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| serde_json::from_str(entry).expect("literal host key"))
+                .collect()
+        };
+        for (harness, name) in [
+            (Harness::Pi, "OPENCODE_ONLY_KEYS"),
+            (Harness::Opencode, "PI_ONLY_KEYS"),
+        ] {
+            assert_eq!(declared(name), harness_ignored_config_keys(Some(&harness)));
+        }
+        assert!(harness_ignored_config_keys(None).is_empty());
+        assert!(harness_ignored_config_keys(Some(&Harness::Runner)).is_empty());
+    }
+
+    #[test]
+    fn pi_ignored_keys_do_not_discard_active_harness_hardening() {
+        for tier_name in ["user", "project"] {
+            for ignored in [
+                serde_json::json!("opaque"),
+                Value::Null,
+                serde_json::json!(false),
+                serde_json::json!({"unexpected": true}),
+            ] {
+                let input = tier(
+                    tier_name,
+                    &serde_json::json!({"harnesses":{"pi":{
+                        "auto_update": ignored,
+                        "sandbox":{"profile":{"worker":"strict"}}
+                    }}})
+                    .to_string(),
+                );
+                let resolved =
+                    resolve_config_for_harness(std::slice::from_ref(&input), Some(&Harness::Pi));
+                assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
+                assert_eq!(
+                    resolved.config.sandbox.profile.worker,
+                    crate::config::SandboxMode::Strict
+                );
+                assert!(strict_tier_error(&input, Some(&Harness::Pi)).is_none());
+                assert!(!resolved
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.code == "invalid_harness_override"));
+                let (raw, _) = parse_tier(&input, Some(&Harness::Pi), &mut Vec::new()).unwrap();
+                assert!(raw.harnesses.unwrap()["pi"].get("auto_update").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn pi_ignored_keys_do_not_reject_root_hardening_on_reload() {
+        for tier_name in ["user", "project"] {
+            for ignored in [
+                serde_json::json!("opaque"),
+                Value::Null,
+                serde_json::json!(false),
+                serde_json::json!({"unexpected": true}),
+            ] {
+                let input = tier(
+                    tier_name,
+                    &serde_json::json!({
+                        "auto_update": ignored,
+                        "sandbox":{"profile":{"worker":"strict"}}
+                    })
+                    .to_string(),
+                );
+                let resolved =
+                    resolve_config_for_harness(std::slice::from_ref(&input), Some(&Harness::Pi));
+                assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
+                assert_eq!(
+                    resolved.config.sandbox.profile.worker,
+                    crate::config::SandboxMode::Strict
+                );
+                assert!(strict_tier_error(&input, Some(&Harness::Pi)).is_none());
+                let (raw, _) = parse_tier(&input, Some(&Harness::Pi), &mut Vec::new()).unwrap();
+                assert_eq!(raw.auto_update, None);
+            }
+        }
+    }
+
+    #[test]
+    fn opencode_owned_auto_update_remains_security_validated() {
+        let valid = tier("user", r#"{"auto_update":false}"#);
+        let (raw, _) = parse_tier(&valid, Some(&Harness::Opencode), &mut Vec::new()).unwrap();
+        assert_eq!(raw.auto_update, Some(false));
+        for tier_name in ["user", "project"] {
+            let root = tier(
+                tier_name,
+                r#"{"auto_update":"opaque","sandbox":{"profile":{"worker":"strict"}}}"#,
+            );
+            let active = tier(
+                tier_name,
+                r#"{"harnesses":{"opencode":{"auto_update":"opaque","sandbox":{"profile":{"worker":"strict"}}}}}"#,
+            );
+            assert_eq!(
+                resolve_config_for_harness(&[root], Some(&Harness::Opencode)).errors,
+                ["invalid_security_config:auto_update"]
+            );
+            assert_eq!(
+                resolve_config_for_harness(&[active], Some(&Harness::Opencode)).errors,
+                ["invalid_security_config:harnesses.opencode.auto_update"]
+            );
+        }
+    }
 
     #[test]
     fn discarded_nonsecurity_sections_are_named_without_rejecting_valid_settings() {
