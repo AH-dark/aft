@@ -9,8 +9,10 @@ pub(crate) mod disk_facts;
 pub(crate) mod facts;
 pub mod join;
 pub(crate) mod resolution_config;
+mod source_stat;
 use disk_facts::DiskFacts;
 use facts::{byte_path, EntryKind, FactPaths, ProjectFacts};
+use source_stat::{SourceStat, StoredFile, ValidatedStat};
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph::{self, EdgeResolution, FileCallData, TraceToSymbolCandidate};
@@ -4419,8 +4421,11 @@ pub struct DiskReconcileReport {
     pub stored_files: usize,
     /// Files the walk visited, at most `max_examined`.
     pub examined_files: usize,
-    /// Visited files whose size matched and were hashed.
+    /// Visited files whose stat hint required a content hash.
     pub hashed_files: usize,
+    /// Modified paths that need verification, not confirmed content changes.
+    /// They must not turn a missing stat hint into a corpus-drift cold build.
+    pub unverified_files: usize,
     /// The bound the walk ran under.
     pub max_examined: usize,
     /// The walk stopped at the bound, so files past it were not compared and
@@ -4428,7 +4433,7 @@ pub struct DiskReconcileReport {
     pub truncated: bool,
     /// On disk but not in the store.
     pub created: Vec<PathBuf>,
-    /// In the store with a different size or content hash.
+    /// In the store with changed contents or no usable way to verify them.
     pub modified: Vec<PathBuf>,
     /// In the store but gone from disk.
     pub deleted: Vec<PathBuf>,
@@ -4736,6 +4741,7 @@ impl StoreForwardCall {
 struct FileExtract {
     rel_path: String,
     freshness: FileFreshness,
+    source_identity: Option<String>,
     lang: LangId,
     data: FileCallData,
     nodes: Vec<NodeRecord>,
@@ -4852,6 +4858,7 @@ struct NameMatchCandidate {
 struct FileRow {
     surface_fingerprint: String,
     freshness: FileFreshness,
+    source_identity: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -7456,7 +7463,8 @@ impl CallGraphStore {
             }
 
             if let Some(row) = &old_row {
-                match cache_freshness::verify_file(&abs_path, &row.freshness) {
+                let (verdict, source_identity) = source_stat::verify_file(&abs_path, row);
+                match verdict {
                     FreshnessVerdict::HotFresh => {
                         // Content still matches the stored graph. A prior failed
                         // refresh may have left backend_file_state='stale' without
@@ -7471,11 +7479,14 @@ impl CallGraphStore {
                     } => {
                         fresh_metadata.insert(
                             rel_path.clone(),
-                            FileFreshness {
-                                content_hash: row.freshness.content_hash,
-                                mtime: new_mtime,
-                                size: new_size,
-                            },
+                            (
+                                FileFreshness {
+                                    content_hash: row.freshness.content_hash,
+                                    mtime: new_mtime,
+                                    size: new_size,
+                                },
+                                source_identity,
+                            ),
                         );
                         continue;
                     }
@@ -7812,7 +7823,7 @@ impl CallGraphStore {
         for update in &resolution_updates {
             store_resolution_config_fields(&tx, &update.rel_path, update.fields.as_deref())?;
         }
-        for (rel_path, freshness) in fresh_metadata {
+        for (rel_path, (freshness, source_identity)) in fresh_metadata {
             update_file_fresh_metadata(
                 &tx,
                 &self.project_root,
@@ -7820,6 +7831,7 @@ impl CallGraphStore {
                 &freshness.content_hash,
                 freshness.mtime,
                 freshness.size,
+                source_identity.as_deref(),
             )?;
         }
         for rel_path in &confirmed_fresh {
@@ -7942,6 +7954,7 @@ impl CallGraphStore {
                         &extract.freshness.content_hash,
                         extract.freshness.mtime,
                         extract.freshness.size,
+                        extract.source_identity.as_deref(),
                     )?;
                     continue;
                 }
@@ -8198,23 +8211,27 @@ impl CallGraphStore {
             .collect())
     }
 
-    /// Compare the stored per-file size and content hash with the files on
-    /// disk, for when watcher events were lost. At most `max_examined` walked
+    /// Compare stored size, mtime and identity with disk, hashing changed or
+    /// unavailable stat hints, for when watcher events were lost. At most `max_examined` walked
     /// files are compared; the bound is applied to the walk itself, so a huge
     /// tree costs no more than the bound. The returned paths are what an
     /// incremental `refresh_files` needs to catch the store up.
     pub fn reconcile_with_disk(&self, max_examined: usize) -> Result<DiskReconcileReport> {
-        let stored = {
+        let (stored, revision) = {
             let conn = self.conn.lock().expect("callgraph store mutex poisoned");
             self.ensure_ready(&conn)?;
-            stored_file_identities(&conn)?
+            (stored_file_stats(&conn)?, projection_write_revision(&conn)?)
         };
-        Ok(reconcile_stored_files_with_disk(
+        let (report, updates) = reconcile_stored_files_with_disk(
             &self.project_root,
             stored,
             callgraph::walk_project_files(&self.project_root),
             max_examined,
-        ))
+        );
+        if let Err(error) = self.backfill_source_stats(revision, &updates) {
+            crate::slog_debug!("callgraph stat backfill deferred: {}", error);
+        }
+        Ok(report)
     }
     pub fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode> {
         self.refresh_read_marker()?;
@@ -9457,25 +9474,49 @@ fn stored_file_identities(conn: &Connection) -> Result<HashMap<String, (u64, Str
     Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
 }
 
-/// Classify each walked file against the stored identities. A file is compared
-/// by size first and hashed only when the size matches, the same content hash
-/// the store records (files over the hash size cap are stored with a zero hash,
-/// so for them only the size is compared). Stored files the walk did not reach
-/// are reported deleted only when the walk was complete and the file is really
-/// gone: a truncated walk cannot tell a deletion from an unvisited file.
+/// Stored content and optional machine-local stat hint, keyed by relative path.
+fn stored_file_stats(conn: &Connection) -> Result<HashMap<String, StoredFile>> {
+    let identity = if source_stat::has_identity_column(conn)? {
+        "source_identity"
+    } else {
+        "NULL"
+    };
+    let mut statement = conn.prepare(&format!(
+        "SELECT path, size, content_hash, mtime_ns, {identity} FROM files"
+    ))?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            StoredFile {
+                size: row.get::<_, i64>(1)?.max(0) as u64,
+                hash: row.get(2)?,
+                mtime_ns: row.get(3)?,
+                identity: row.get(4)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+}
+
+/// Skip source contents only when size, nanosecond mtime and an available
+/// machine-local identity all match. Unknown or changed stamps need a hash;
+/// hash-equal observations can be recorded without rewriting graph rows.
+/// Files over the hash cap whose stamp is unknown need a conservative refresh,
+/// since their stored zero hash is not evidence of equal contents.
 fn reconcile_stored_files_with_disk(
     project_root: &Path,
-    mut stored: HashMap<String, (u64, String)>,
+    mut stored: HashMap<String, StoredFile>,
     walk: impl Iterator<Item = PathBuf>,
     max_examined: usize,
-) -> DiskReconcileReport {
+) -> (DiskReconcileReport, Vec<ValidatedStat>) {
     let mut report = DiskReconcileReport {
         stored_files: stored.len(),
         max_examined,
         ..DiskReconcileReport::default()
     };
-    // One extra item tells a walk that ended exactly at the bound from one
-    // that was cut off by it.
+    let mut updates = Vec::new();
+    // One extra item distinguishes a complete walk ending at its bound from
+    // a truncated one; an unvisited file is never guessed to be deleted.
     for path in walk.take(max_examined.saturating_add(1)) {
         if report.examined_files == max_examined {
             report.truncated = true;
@@ -9483,28 +9524,49 @@ fn reconcile_stored_files_with_disk(
         }
         report.examined_files += 1;
         let rel_path = relative_path(project_root, &path);
-        let Some((stored_size, stored_hash)) = stored.remove(&rel_path) else {
+        let Some(previous) = stored.remove(&rel_path) else {
             report.created.push(path);
             continue;
         };
-        let Ok(metadata) = std::fs::metadata(&path) else {
+        let Ok(observed) = SourceStat::at(&path) else {
+            report.unverified_files += 1;
             report.modified.push(path);
             continue;
         };
-        if metadata.len() != stored_size {
+        if previous.matches(&observed) {
+            continue;
+        }
+        if observed.size != previous.size {
+            report.modified.push(path);
+            continue;
+        }
+        if observed.size > cache_freshness::CONTENT_HASH_SIZE_CAP
+            || previous.hash == hash_to_hex(cache_freshness::zero_hash())
+        {
+            report.unverified_files += 1;
             report.modified.push(path);
             continue;
         }
         report.hashed_files += 1;
-        let disk_hash = match cache_freshness::hash_file_if_small(&path, stored_size) {
-            Ok(hash) => hash.unwrap_or_else(cache_freshness::zero_hash),
-            Err(_) => {
+        let disk_hash = match cache_freshness::hash_file_if_small(&path, observed.size) {
+            Ok(Some(hash)) => hash,
+            _ => {
+                report.unverified_files += 1;
                 report.modified.push(path);
                 continue;
             }
         };
-        if hash_to_hex(disk_hash) != stored_hash {
+        if hash_to_hex(disk_hash) != previous.hash {
             report.modified.push(path);
+        } else if SourceStat::at(&path).ok().as_ref() != Some(&observed) {
+            report.unverified_files += 1;
+            report.modified.push(path);
+        } else {
+            updates.push(ValidatedStat {
+                rel_path,
+                previous,
+                observed,
+            });
         }
     }
     if !report.truncated {
@@ -9512,10 +9574,8 @@ fn reconcile_stored_files_with_disk(
             .into_keys()
             .map(|rel_path| project_root.join(rel_path))
             .filter(|path| {
-                matches!(
-                    std::fs::symlink_metadata(path),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                )
+                matches!(std::fs::symlink_metadata(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound)
             })
             .collect::<Vec<_>>();
         deleted.sort();
@@ -9523,7 +9583,7 @@ fn reconcile_stored_files_with_disk(
     }
     report.created.sort();
     report.modified.sort();
-    report
+    (report, updates)
 }
 
 fn resolve_node_for_rel(conn: &Connection, rel_path: &str, symbol: &str) -> Result<StoreNode> {
@@ -11536,7 +11596,8 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
             is_dead_code_root   INTEGER NOT NULL DEFAULT 0,
             is_public_api       INTEGER NOT NULL DEFAULT 0,
             surface_fingerprint TEXT NOT NULL,
-            indexed_at          INTEGER NOT NULL
+            indexed_at          INTEGER NOT NULL,
+            source_identity     TEXT
         );
 
         CREATE TABLE IF NOT EXISTS nodes (
@@ -11666,6 +11727,7 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
     if !has_last_segment {
         conn.execute_batch("ALTER TABLE refs ADD COLUMN callee_last_segment TEXT;")?;
     }
+    source_stat::ensure_identity_column(conn)?;
     conn.execute_batch(&create_secondary_indexes_sql())?;
     // Shape initialization is not proof that graph rows were produced by this
     // build. Preserve an existing fingerprint so old identities remain unready.
@@ -13754,8 +13816,7 @@ fn build_file_extract_with_memo(
     let rel_path = relative_path(project_root, &abs_path);
     #[cfg(test)]
     work_counts::note_parse(&abs_path);
-    let source = crate::project_content::read_to_string(&abs_path)?;
-    let freshness = collect_source_freshness(&abs_path, &source)?;
+    let (source, freshness, source_identity) = source_stat::read_source(&abs_path)?;
     let mut data = callgraph::build_file_data_from_source(&abs_path, &source)?;
     let lang = data.lang;
     if lang == LangId::Rust {
@@ -13869,6 +13930,7 @@ fn build_file_extract_with_memo(
     Ok(FileExtract {
         rel_path,
         freshness,
+        source_identity,
         lang,
         data,
         nodes,
@@ -17126,8 +17188,8 @@ impl<'stmt> ColdBuildInsertStatements<'stmt> {
             file: tx.prepare(
                 "INSERT INTO files(
                     path, content_hash, mtime_ns, size, lang, is_dead_code_root,
-                    is_public_api, surface_fingerprint, indexed_at
-                ) VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7)
+                    is_public_api, surface_fingerprint, indexed_at, source_identity
+                ) VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7, ?8)
                 ON CONFLICT(path) DO UPDATE SET
                     content_hash=excluded.content_hash,
                     mtime_ns=excluded.mtime_ns,
@@ -17136,6 +17198,7 @@ impl<'stmt> ColdBuildInsertStatements<'stmt> {
                     is_dead_code_root=excluded.is_dead_code_root,
                     is_public_api=excluded.is_public_api,
                     surface_fingerprint=excluded.surface_fingerprint,
+                    source_identity=excluded.source_identity,
                     indexed_at=excluded.indexed_at
                 WHERE content_hash IS NOT excluded.content_hash
                    OR mtime_ns IS NOT excluded.mtime_ns
@@ -17143,7 +17206,8 @@ impl<'stmt> ColdBuildInsertStatements<'stmt> {
                    OR lang IS NOT excluded.lang
                    OR is_dead_code_root IS NOT excluded.is_dead_code_root
                    OR is_public_api IS NOT excluded.is_public_api
-                   OR surface_fingerprint IS NOT excluded.surface_fingerprint",
+                   OR surface_fingerprint IS NOT excluded.surface_fingerprint
+                   OR source_identity IS NOT excluded.source_identity",
             )?,
             node: tx.prepare(
                 "INSERT INTO nodes(
@@ -17306,6 +17370,7 @@ fn insert_file_graph_rows_prepared(
         lang_label(extract.lang),
         extract.surface_fingerprint,
         unix_seconds_now(),
+        extract.source_identity,
     ])?;
     for node in &extract.nodes {
         statements.node.execute(params![
@@ -17689,8 +17754,8 @@ fn insert_file_extract(
     tx.execute(
         "INSERT OR REPLACE INTO files(
             path, content_hash, mtime_ns, size, lang, is_dead_code_root,
-            is_public_api, surface_fingerprint, indexed_at
-        ) VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7)",
+            is_public_api, surface_fingerprint, indexed_at, source_identity
+        ) VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7, ?8)",
         params![
             extract.rel_path,
             hash_to_hex(extract.freshness.content_hash),
@@ -17699,6 +17764,7 @@ fn insert_file_extract(
             lang_label(extract.lang),
             extract.surface_fingerprint,
             unix_seconds_now(),
+            extract.source_identity,
         ],
     )?;
     for node in &extract.nodes {
@@ -20232,12 +20298,13 @@ fn clear_stale_backend_status_for_file(
 
 fn load_file_row(conn: &Connection, rel_path: &str) -> Result<Option<FileRow>> {
     conn.prepare_cached(
-        "SELECT surface_fingerprint, content_hash, mtime_ns, size FROM files WHERE path = ?1",
+        "SELECT surface_fingerprint, content_hash, mtime_ns, size, source_identity FROM files WHERE path = ?1",
     )?
     .query_row(params![rel_path], |row| {
         let hash_text: String = row.get(1)?;
         Ok(FileRow {
             surface_fingerprint: row.get(0)?,
+            source_identity: row.get(4)?,
             freshness: FileFreshness {
                 content_hash: hash_from_hex(&hash_text).unwrap_or_else(cache_freshness::zero_hash),
                 mtime: ns_to_system_time(row.get::<_, i64>(2)?),
@@ -20544,9 +20611,10 @@ fn update_file_fresh_metadata(
     hash: &blake3::Hash,
     mtime: SystemTime,
     size: u64,
+    source_identity: Option<&str>,
 ) -> Result<()> {
     tx.prepare_cached(
-        "UPDATE files SET content_hash = ?2, mtime_ns = ?3, size = ?4, indexed_at = ?5
+        "UPDATE files SET content_hash = ?2, mtime_ns = ?3, size = ?4, indexed_at = ?5, source_identity = ?6
          WHERE path = ?1",
     )?
     .execute(params![
@@ -20555,6 +20623,7 @@ fn update_file_fresh_metadata(
         system_time_to_ns(mtime),
         size as i64,
         unix_seconds_now()
+        ,source_identity
     ])?;
     tx.prepare_cached(
         "UPDATE backend_file_state SET content_hash = ?3, status = 'fresh', updated_at = ?5
@@ -22862,14 +22931,18 @@ fn bool_int(value: bool) -> i64 {
 }
 
 fn system_time_to_ns(time: SystemTime) -> i64 {
-    time.duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(i64::MAX as u128) as i64
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos().min(i64::MAX as u128) as i64,
+        Err(error) => -(error.duration().as_nanos().min(i64::MAX as u128) as i64),
+    }
 }
 
 fn ns_to_system_time(value: i64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_nanos(value.max(0) as u64)
+    if value >= 0 {
+        UNIX_EPOCH + Duration::from_nanos(value as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_nanos(value.unsigned_abs())
+    }
 }
 
 pub(crate) fn unix_millis_now() -> u64 {
@@ -27871,6 +27944,7 @@ export function leaf() {}
         };
         FileExtract {
             rel_path,
+            source_identity: None,
             freshness: FileFreshness {
                 mtime: UNIX_EPOCH + Duration::from_secs(123),
                 size: 40,

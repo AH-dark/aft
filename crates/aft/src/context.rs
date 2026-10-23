@@ -17384,6 +17384,12 @@ mod callgraph_store_for_ops_tests {
             .unwrap();
         let held_read_wall = held_read_started.elapsed();
         let io_before = std::fs::read_to_string("/proc/self/io").unwrap();
+        let source_bytes_before = crate::views::io::WORK
+            .content_read_bytes
+            .load(Ordering::Relaxed);
+        let hash_bytes_before = crate::views::io::WORK
+            .source_hash_bytes
+            .load(Ordering::Relaxed);
         let scan_started = Instant::now();
         drop(release);
         let mut read_us = Vec::new();
@@ -17407,6 +17413,14 @@ mod callgraph_store_for_ops_tests {
             .finished_at_for_test()
             .duration_since(scan_started);
         let io_after = std::fs::read_to_string("/proc/self/io").unwrap();
+        let source_bytes = crate::views::io::WORK
+            .content_read_bytes
+            .load(Ordering::Relaxed)
+            - source_bytes_before;
+        let hash_bytes = crate::views::io::WORK
+            .source_hash_bytes
+            .load(Ordering::Relaxed)
+            - hash_bytes_before;
         let outcome = ctx.callgraph_reconcile.last().unwrap();
         assert!(matches!(
             outcome.action,
@@ -17414,7 +17428,15 @@ mod callgraph_store_for_ops_tests {
         ));
         let report = outcome.report.unwrap();
         assert_eq!(report.examined_files, file_count);
-        assert_eq!(report.hashed_files, file_count);
+        assert_eq!(report.hashed_files, 0);
+        assert_eq!(
+            source_bytes, 0,
+            "unchanged startup must not read source contents"
+        );
+        assert_eq!(
+            hash_bytes, 0,
+            "unchanged startup must not hash source contents"
+        );
         assert_eq!(report.changed_count(), 0);
         assert!(!ctx.pending_changes_for_query(true).callgraph.whole_store);
         read_us.sort_unstable();
@@ -17423,6 +17445,9 @@ mod callgraph_store_for_ops_tests {
             report.examined_files, report.hashed_files, report.changed_count(), read_us.len(),
             read_us[read_us.len()/2], read_us.last().unwrap());
         println!("startup process io before:\n{io_before}startup process io after:\n{io_after}");
+        println!(
+            "startup source I/O: content_read_bytes={source_bytes} source_hash_bytes={hash_bytes}"
+        );
     }
 
     #[test]

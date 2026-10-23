@@ -332,6 +332,9 @@ fn settle_reconcile(
     }
     let (report, action) = match report {
         Ok(report) => {
+            let confirmed_changes = report
+                .changed_count()
+                .saturating_sub(report.unverified_files);
             let action = if report.truncated {
                 let fallback = format!(
                     "{reason}: reconcile stopped at its bound of {} files",
@@ -339,13 +342,12 @@ fn settle_reconcile(
                 );
                 force.mark(&fallback);
                 CallgraphReconcileAction::ForcedRebuild(fallback)
-            } else if report.changed_count() >= RECONCILE_REBUILD_MIN_CHANGED
-                && report.changed_count().saturating_mul(2) > report.stored_files
+            } else if confirmed_changes >= RECONCILE_REBUILD_MIN_CHANGED
+                && confirmed_changes.saturating_mul(2) > report.stored_files
             {
                 let fallback = format!(
                     "{reason}: {} of {} stored files changed",
-                    report.changed_count(),
-                    report.stored_files
+                    confirmed_changes, report.stored_files
                 );
                 force.mark(&fallback);
                 CallgraphReconcileAction::ForcedRebuild(fallback)
@@ -429,6 +431,43 @@ mod tests {
         assert!(reason.contains("watcher overflow"));
         assert!(state.begin().is_some(), "another job can start");
         assert_eq!(state.completed(), 0);
+    }
+
+    #[test]
+    fn stat_first_unverified_legacy_rows_refresh_without_a_cold_build() {
+        let state = Arc::new(CallgraphReconcileState::default());
+        state.request("startup");
+        let ownership = state.begin().unwrap();
+        let force = CallgraphForceDemand::default();
+        let mut paths = (0..RECONCILE_REBUILD_MIN_CHANGED)
+            .map(|index| PathBuf::from(format!("source{index}.ts")))
+            .collect::<Vec<_>>();
+        paths.sort();
+        let queued = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&queued);
+        let outcome = settle_reconcile(
+            ownership,
+            "startup".into(),
+            Ok(DiskReconcileReport {
+                stored_files: paths.len(),
+                modified: paths.clone(),
+                unverified_files: paths.len(),
+                ..DiskReconcileReport::default()
+            }),
+            std::path::Path::new("workspace"),
+            &force,
+            Box::new(move |paths| *observed.lock().unwrap() = paths),
+        );
+        assert_eq!(
+            force.pending(),
+            None,
+            "missing hints are not proof of corpus drift"
+        );
+        assert_eq!(
+            outcome.action,
+            CallgraphReconcileAction::Refreshed(paths.clone())
+        );
+        assert_eq!(*queued.lock().unwrap(), paths);
     }
 
     #[test]

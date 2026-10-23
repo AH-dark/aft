@@ -14,8 +14,10 @@
 //! with `GetFileInformationByHandle` from a handle that requests no data
 //! access, the same kind of handle `std::fs::metadata` opens internally.
 //!
-//! An identity is only meaningful on the machine that read it, while the
-//! volume stays mounted. Never persist one.
+//! An identity is only meaningful on the machine that read it. Do not use it
+//! as a portable file identifier. A per-machine callgraph cache may persist it
+//! as a stat hint alongside size and mtime; a missing or unavailable identity
+//! must still fall back to checking the contents.
 
 use std::fs::{File, Metadata};
 use std::io;
