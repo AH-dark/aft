@@ -16,7 +16,8 @@
 # naming which ones ran.
 #
 # Why this is the default push path instead of scripts/gated-push.sh:
-# the local full Rust gate takes ~12 minutes on this box and only sees macOS.
+# the local full Rust gate takes ~12 minutes on a developer machine and only
+# sees that machine's operating system.
 # Measured over the last week, about half the red trains failed on Linux or
 # Windows only, so on those the local gate was paid for and could not have
 # caught the failure. It also runs in the one working tree, so trains serialize
@@ -28,7 +29,7 @@
 # on main, not of where the tests ran: nothing lands here except a sha whose CI
 # run concluded success, and it lands by fast-forward only - never a merge,
 # never a force. gated-push.sh stays for the work whose failures only reproduce
-# locally (watcher/fseventsd, macOS exec assessment).
+# on a developer machine (its native file watcher, or its executable assessment).
 #
 # EDIT THIS FILE BY WRITE-TEMP-THEN-RENAME, NEVER IN PLACE. A running bash holds
 # an open fd and reads on by byte offset, so an in-place write (same inode) makes
