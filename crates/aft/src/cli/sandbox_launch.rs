@@ -404,6 +404,12 @@ fn emit_off_worker_gh_warning(profile: &SandboxProfile) {
 
 #[cfg(target_os = "linux")]
 fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::AppliedLandlock) {
+    let signal_scope = if applied.signal_scope_enforced {
+        "same_command"
+    } else {
+        "not_enforced"
+    };
+    eprintln!("sandbox-launch: signal_scope={signal_scope}");
     // Landlock's filesystem rights do not mediate AF_UNIX connect. Removing the
     // address from the environment does not hide predictable session-bus paths.
     let session_bus_reason = if profile.worker_jail {
@@ -532,7 +538,8 @@ fn print_support() -> Result<(), SandboxLaunchError> {
     print_json(serde_json::json!({
         "platform": "macos",
         "supported": true,
-        "backend": "seatbelt"
+        "backend": "seatbelt",
+        "signal_scope": "same_command"
     }))
 }
 
@@ -541,6 +548,10 @@ fn print_support() -> Result<(), SandboxLaunchError> {
     let applied = landlock_backend::probe().map_err(|error| {
         SandboxLaunchError::unavailable(format!("failed to probe Landlock: {error}"))
     })?;
+    let mut unenforced = vec!["sccache_server_unblockable_on_landlock"];
+    if !applied.signal_scope_enforced {
+        unenforced.push("signal_scope");
+    }
     print_json(serde_json::json!({
         "platform": "linux",
         "supported": true,
@@ -550,7 +561,8 @@ fn print_support() -> Result<(), SandboxLaunchError> {
         "required_refer_abi": landlock_backend::abi_label(landlock_backend::REQUIRED_REFER_ABI),
         "required_write_abi": landlock_backend::abi_label(landlock_backend::REQUIRED_WRITE_ABI),
         "partially_enforced": applied.partially_enforced,
-        "unenforced": ["sccache_server_unblockable_on_landlock"]
+        "signal_scope": if applied.signal_scope_enforced { "same_command" } else { "not_enforced" },
+        "unenforced": unenforced
     }))
 }
 

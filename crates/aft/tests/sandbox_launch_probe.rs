@@ -182,6 +182,161 @@ fn shell_path(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
+mod signal_scope {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Child;
+
+    struct Victim(Child);
+
+    fn signal_scope_available() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let output = Command::new(AFT_BIN)
+                .args(["sandbox-launch", "--support"])
+                .output()
+                .expect("probe native signal support");
+            if !output.status.success() {
+                assert!(
+                    std::env::var("AFT_REQUIRE_SIGNAL_SCOPE").as_deref() != Ok("1")
+                        && std::env::var("AFT_REQUIRE_LANDLOCK").as_deref() != Ok("1"),
+                    "Landlock required but unavailable: {output:?}"
+                );
+                eprintln!("signal scope test skipped: Landlock unavailable: {output:?}");
+                return false;
+            }
+            let support: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if support["signal_scope"] != "same_command" {
+                assert_eq!(support["signal_scope"], "not_enforced");
+                assert!(support["unenforced"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("signal_scope")));
+                assert_ne!(
+                    std::env::var("AFT_REQUIRE_SIGNAL_SCOPE").as_deref(),
+                    Ok("1"),
+                    "signal scoping required but unavailable: {support}"
+                );
+                eprintln!("signal scope test skipped: kernel does not support Landlock ABI 6; status={support}");
+                return false;
+            }
+        }
+        true
+    }
+
+    impl Victim {
+        fn new() -> Self {
+            let mut command = Command::new("/bin/sleep");
+            command.arg("60");
+            Self(command.spawn().expect("spawn unrelated fixture"))
+        }
+
+        fn assert_alive(&mut self) {
+            assert!(
+                self.0.try_wait().expect("inspect fixture").is_none(),
+                "sandboxed signal killed an unrelated same-uid fixture"
+            );
+        }
+    }
+
+    impl Drop for Victim {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn attack(fixture: &mut ProbeFixture, target: &str) -> Output {
+        fixture.profile.rewind();
+        let mut command = launcher_command(
+            fixture.profile.fd(),
+            &[
+                "/bin/bash",
+                "--noprofile",
+                "--norc",
+                "-c",
+                &format!("kill -9 -- {target}"),
+            ],
+        );
+        command.env("HOME", &fixture.outside_home);
+        command.output().expect("launch signal probe")
+    }
+
+    fn assert_refused(output: Output, victim: &mut Victim) {
+        victim.assert_alive();
+        assert_eq!(
+            output.status.signal(),
+            None,
+            "attacker was killed: {output:?}"
+        );
+        assert!(
+            !output.status.success(),
+            "kill unexpectedly succeeded: {output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Operation not permitted"),
+            "expected a native signal permission denial, not a launcher error: {output:?}"
+        );
+    }
+
+    #[test]
+    fn native_signal_refuses_unrelated_same_uid() {
+        if !signal_scope_available() {
+            return;
+        }
+        let mut fixture = ProbeFixture::new();
+        let mut victim = Victim::new();
+        let output = attack(&mut fixture, &victim.0.id().to_string());
+        assert_refused(output, &mut victim);
+    }
+
+    #[test]
+    fn native_signal_refuses_separate_identical_sandbox() {
+        if !signal_scope_available() {
+            return;
+        }
+        let mut fixture = ProbeFixture::new();
+        fixture.profile.rewind();
+        let mut command = launcher_command(
+            fixture.profile.fd(),
+            &[
+                "/bin/bash",
+                "--noprofile",
+                "--norc",
+                "-c",
+                "echo ready; exec sleep 60",
+            ],
+        );
+        command.env("HOME", &fixture.outside_home);
+        command.stdout(std::process::Stdio::piped());
+        let mut victim = Victim(command.spawn().expect("spawn separately sandboxed fixture"));
+        let mut ready = String::new();
+        BufReader::new(victim.0.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .expect("wait for sandbox entry");
+        assert_eq!(ready.trim(), "ready", "first sandbox did not start");
+        let output = attack(&mut fixture, &victim.0.id().to_string());
+        assert_refused(output, &mut victim);
+    }
+
+    #[test]
+    fn native_signal_allows_own_children() {
+        if !signal_scope_available() {
+            return;
+        }
+        let mut fixture = ProbeFixture::new();
+        fixture.profile.rewind();
+        let output = launcher_command(fixture.profile.fd(), &[
+            "/bin/bash", "--noprofile", "--norc", "-c",
+            "sleep 2 >/dev/null 2>&1 & p=$!; kill -9 \"$p\" || exit 90; wait \"$p\"; test \"$?\" = 137",
+        ])
+        .env("HOME", &fixture.outside_home)
+        .output()
+        .expect("launch own-child signal probe");
+        assert!(output.status.success(), "own-child kill failed: {output:?}");
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn linux_system_read_allow() -> Vec<PathBuf> {
     [

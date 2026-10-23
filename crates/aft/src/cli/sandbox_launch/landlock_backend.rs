@@ -1,7 +1,7 @@
 use aft::sandbox_profile::SandboxProfile;
 use landlock::{
     AccessFs, BitFlags, CompatLevel, Compatible, LandlockStatus, PathBeneath, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus, ABI,
+    RulesetCreatedAttr, RulesetStatus, Scope, ABI,
 };
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr};
@@ -21,6 +21,7 @@ pub(super) struct AppliedLandlock {
     pub effective_abi: ABI,
     pub partially_enforced: bool,
     pub yama_same_uid_exposed: bool,
+    pub signal_scope_enforced: bool,
 }
 
 pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String> {
@@ -288,7 +289,23 @@ fn apply_paths<'a>(
         effective_abi,
         partially_enforced: false,
         yama_same_uid_exposed,
+        signal_scope_enforced: apply_signal_scope()?,
     })
+}
+
+fn apply_signal_scope() -> Result<bool, String> {
+    // Keep optional ABI 6 signal scoping separate from mandatory filesystem
+    // rights: an older kernel must not downgrade the filesystem enforcement
+    // check merely because it cannot mediate signals.
+    let status = Ruleset::default()
+        .set_compatibility(CompatLevel::BestEffort)
+        .scope(Scope::Signal)
+        .map_err(|error| format!("failed to configure Landlock signal scope: {error}"))?
+        .create()
+        .map_err(|error| format!("failed to create Landlock signal scope: {error}"))?
+        .restrict_self()
+        .map_err(|error| format!("failed to restrict Landlock signals: {error}"))?;
+    Ok(status.ruleset == RulesetStatus::FullyEnforced)
 }
 
 fn access_for_opened_path(access: BitFlags<AccessFs>, is_dir: bool) -> BitFlags<AccessFs> {
