@@ -1139,14 +1139,23 @@ fn assert_edit_then_queued_grep_is_fresh(watcher_enabled: bool) {
 }
 
 fn mutation_freshness_fixture() -> (tempfile::TempDir, tempfile::TempDir, AftProcess) {
+    let mut fixture =
+        mutation_freshness_fixture_with_content("export const value = 'qqqq_before_mutation';\n");
+    assert_mutation_freshness(
+        &mut fixture.2,
+        "qqqq_before_mutation",
+        "zzzz_after_mutation",
+    );
+    fixture
+}
+
+fn mutation_freshness_fixture_with_content(
+    content: &str,
+) -> (tempfile::TempDir, tempfile::TempDir, AftProcess) {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     fs::create_dir(project.path().join("src")).unwrap();
-    fs::write(
-        project.path().join("src/source.ts"),
-        "export const value = 'qqqq_before_mutation';\n",
-    )
-    .unwrap();
+    fs::write(project.path().join("src/source.ts"), content).unwrap();
     let mut aft = AftProcess::spawn_with_env(&[
         ("AFT_STORAGE_DIR", storage.path().as_os_str()),
         ("AFT_TEST_DISABLE_FILE_WATCHER", std::ffi::OsStr::new("1")),
@@ -1171,8 +1180,61 @@ fn mutation_freshness_fixture() -> (tempfile::TempDir, tempfile::TempDir, AftPro
         }
         assert!(Instant::now() < deadline, "index not ready: {status:?}");
     }
-    assert_mutation_freshness(&mut aft, "qqqq_before_mutation", "zzzz_after_mutation");
     (project, storage, aft)
+}
+
+#[test]
+fn standalone_edit_then_grep_regex_does_not_return_replaced_text() {
+    let before = "if unsafe { libc::ioctl(fd, 0xc0045878 as libc::c_ulong, 0) } != 0 {\n";
+    let (project, _storage, mut aft) = mutation_freshness_fixture_with_content(before);
+    let target = project.path().join("src/source.ts");
+    let after = before.replace("libc::c_ulong", "libc::Ioctl");
+    let grep = |aft: &mut AftProcess, pattern: &str| {
+        aft.send(
+            &json!({
+                "id": "regex-grep", "command": "tool_call", "session_id": "regex-freshness",
+                "name": "grep", "arguments": { "pattern": pattern, "path": "src/" }
+            })
+            .to_string(),
+        )
+    };
+    let pattern = r"ioctl\([^;]*as libc::c_ulong";
+    let initial = grep(&mut aft, pattern);
+    assert_eq!(initial["total_matches"], 1, "{initial:?}");
+    assert_eq!(initial["index_status"], "Ready", "{initial:?}");
+    assert_eq!(
+        initial["matches"][0]["line_text"],
+        before.trim_end(),
+        "{initial:?}"
+    );
+    let edit = aft.send(
+        &json!({
+            "id": "regex-edit", "command": "tool_call", "session_id": "regex-freshness",
+            "name": "edit", "arguments": {
+                "path": "src/source.ts",
+                "edits": [{ "oldString": "libc::c_ulong", "newString": "libc::Ioctl" }]
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(edit["success"], true, "{edit:?}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), after);
+    let old = grep(&mut aft, pattern);
+    assert_eq!(old["success"], true, "{old:?}");
+    assert_eq!(
+        old["total_matches"], 0,
+        "replaced regex match survived: {old:?}"
+    );
+    let literal_old = grep(&mut aft, "libc::c_ulong");
+    assert_eq!(literal_old["total_matches"], 0, "{literal_old:?}");
+    let fresh = grep(&mut aft, r"ioctl\([^;]*as libc::Ioctl");
+    assert_eq!(fresh["total_matches"], 1, "{fresh:?}");
+    assert_eq!(
+        fresh["matches"][0]["line_text"],
+        after.trim_end(),
+        "{fresh:?}"
+    );
+    assert!(aft.shutdown().success());
 }
 
 fn assert_mutation_freshness(aft: &mut AftProcess, present: &str, absent: &str) -> Value {
