@@ -414,8 +414,8 @@ fn read_status_artifact_page(
             .read_artifact_page(task_id, session, artifact, offset);
     };
     let read = || -> std::io::Result<_> {
-        let mut file = crate::bash_background::persistence::open_task_artifact(paths, artifact)?;
-        let len = file.len()?;
+        let (mut file, len) =
+            crate::bash_background::persistence::sample_task_artifact(paths, artifact)?;
         let start = offset.min(len);
         let requested = len
             .saturating_sub(start)

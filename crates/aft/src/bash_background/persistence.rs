@@ -1577,10 +1577,16 @@ const METADATA_OPEN_ATTEMPTS: u32 = 8;
 /// would then rename a live task's whole bundle away just because its metadata
 /// was being written at that moment.
 fn open_metadata_through_replacement(dir: &PinnedDir, name: &OsStr) -> io::Result<File> {
+    retry_artifact_read(|| dir.open_file(name, false))
+}
+
+/// Retry a complete read attempt so validation never reuses an unlinked handle.
+/// Other errors, including hard-link and symlink refusals, remain failures.
+pub(crate) fn retry_artifact_read<T>(mut read: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     let mut attempts = 0;
     loop {
         attempts += 1;
-        match dir.open_file(name, false) {
+        match read() {
             Err(error)
                 if attempts < METADATA_OPEN_ATTEMPTS
                     && error.kind() == io::ErrorKind::Interrupted
@@ -1607,6 +1613,10 @@ fn open_metadata_through_replacement(dir: &PinnedDir, name: &OsStr) -> io::Resul
 }
 
 pub fn read_task(path: &Path) -> io::Result<PersistedTask> {
+    retry_artifact_read(|| read_task_once(path))
+}
+
+fn read_task_once(path: &Path) -> io::Result<PersistedTask> {
     #[cfg(all(test, unix))]
     if let Some(error) = take_injected_read_task_replacement_error_for_test() {
         return Err(error);
@@ -1639,28 +1649,6 @@ fn take_injected_read_task_replacement_error_for_test() -> Option<io::Error> {
             ))
         }
     })
-}
-
-#[cfg(all(test, unix))]
-pub(super) fn read_task_retrying_replacement_for_test(path: &Path) -> io::Result<PersistedTask> {
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        match read_task(path) {
-            Err(error)
-                if attempts < METADATA_OPEN_ATTEMPTS
-                    && error.kind() == io::ErrorKind::Interrupted
-                    && error.to_string().contains(ARTIFACT_CONCURRENTLY_REPLACED) =>
-            {
-                if attempts <= 2 {
-                    std::thread::yield_now();
-                } else {
-                    std::thread::sleep(Duration::from_micros(50 << (attempts - 3).min(5)));
-                }
-            }
-            other => return other,
-        }
-    }
 }
 
 #[cfg(all(test, unix))]
@@ -2827,7 +2815,27 @@ pub fn open_task_artifact(
     paths: &TaskPaths,
     artifact: TaskArtifact,
 ) -> io::Result<ValidatedArtifact> {
+    retry_artifact_read(|| open_task_artifact_once(paths, artifact))
+}
+
+pub(super) fn open_task_artifact_once(
+    paths: &TaskPaths,
+    artifact: TaskArtifact,
+) -> io::Result<ValidatedArtifact> {
     open_task_artifact_with_access(paths, artifact, false)
+}
+
+/// Open and sample the same artifact handle, reopening if either validation
+/// races an atomic replacement. Callers calculate offsets only after this step.
+pub(crate) fn sample_task_artifact(
+    paths: &TaskPaths,
+    artifact: TaskArtifact,
+) -> io::Result<(ValidatedArtifact, u64)> {
+    retry_artifact_read(|| {
+        let file = open_task_artifact_once(paths, artifact)?;
+        let len = file.len()?;
+        Ok((file, len))
+    })
 }
 
 /// Like `open_task_artifact`, but the handle can also rewrite the artifact.
@@ -2866,8 +2874,7 @@ pub fn replace_artifact_with_tail(
     artifact: TaskArtifact,
     retain_bytes: u64,
 ) -> io::Result<u64> {
-    let mut source = open_task_artifact(paths, artifact)?;
-    let len = source.len()?;
+    let (mut source, len) = sample_task_artifact(paths, artifact)?;
     if len <= retain_bytes {
         return Ok(0);
     }
@@ -3195,6 +3202,13 @@ fn validate_directory_handle(file: &File) -> io::Result<()> {
 }
 
 fn validate_regular_handle(file: &File) -> io::Result<()> {
+    #[cfg(all(test, unix))]
+    BEFORE_ARTIFACT_VALIDATION.with(|slot| {
+        if let Some(mut hook) = slot.take() {
+            hook(file);
+            slot.replace(Some(hook));
+        }
+    });
     #[cfg(test)]
     work_counts::record_stat();
     let metadata = file.metadata()?;
@@ -3234,6 +3248,11 @@ fn validate_regular_handle(file: &File) -> io::Result<()> {
 /// Marker message for a validated-open that lost a race against an atomic
 /// replacement of the same artifact (see link-count semantics above).
 pub(crate) const ARTIFACT_CONCURRENTLY_REPLACED: &str = "task artifact was concurrently replaced";
+
+#[cfg(all(test, unix))]
+std::thread_local! {
+    static BEFORE_ARTIFACT_VALIDATION: std::cell::RefCell<Option<Box<dyn FnMut(&File)>>> = const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(unix)]
 pub fn set_close_on_exec(fd: RawFd, enabled: bool) -> io::Result<()> {
@@ -4109,21 +4128,230 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn read_task_retry_helper_retries_injected_errors_up_to_attempt_limit() {
+    fn read_task_retries_injected_errors_up_to_attempt_limit() {
         let storage = tempfile::tempdir().unwrap();
         let (task, metadata) = counted_task(storage.path());
         let expected_task_id = metadata.task_id.clone();
 
         inject_read_task_replacement_failures_for_test(3);
-        let read = read_task_retrying_replacement_for_test(&task.paths.json).unwrap();
+        let read = read_task(&task.paths.json).unwrap();
         assert_eq!(read.task_id, expected_task_id);
         assert_eq!(injected_read_task_replacement_failures_for_test(), 0);
 
         inject_read_task_replacement_failures_for_test(METADATA_OPEN_ATTEMPTS);
-        let error = read_task_retrying_replacement_for_test(&task.paths.json).unwrap_err();
+        let error = read_task(&task.paths.json).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(error.to_string(), ARTIFACT_CONCURRENTLY_REPLACED);
         assert_eq!(injected_read_task_replacement_failures_for_test(), 0);
+    }
+
+    #[cfg(unix)]
+    fn with_replacements<T>(
+        path: &Path,
+        validation: u32,
+        replacements: u32,
+        content: Vec<u8>,
+        read: impl FnOnce() -> io::Result<T>,
+    ) -> (io::Result<T>, u32) {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                BEFORE_ARTIFACT_VALIDATION.with(|slot| slot.replace(None));
+            }
+        }
+        let path = path.to_path_buf();
+        let replaced = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = replaced.clone();
+        let mut seen = 0;
+        BEFORE_ARTIFACT_VALIDATION.with(|slot| {
+            assert!(slot.borrow().is_none());
+            slot.replace(Some(Box::new(move |file| {
+                let opened = file.metadata().unwrap();
+                let current = std::fs::metadata(&path).unwrap();
+                if (opened.dev(), opened.ino()) != (current.dev(), current.ino()) {
+                    return;
+                }
+                seen += 1;
+                if seen == validation && count.get() < replacements {
+                    let parent = PinnedDir::open(path.parent().unwrap()).unwrap();
+                    randomized_atomic_replace(&parent, path.file_name().unwrap(), &content)
+                        .unwrap();
+                    count.set(count.get() + 1);
+                    seen = 0;
+                }
+            })));
+        });
+        let _restore = Restore;
+        (read(), replaced.get())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_task_reopens_atomically_replaced_metadata() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, mut metadata) = counted_task(storage.path());
+        metadata.command = "replacement metadata".to_string();
+        let (read, replaced) = with_replacements(
+            &task.paths.json,
+            1,
+            1,
+            serde_json::to_vec(&metadata).unwrap(),
+            || read_task(&task.paths.json),
+        );
+        assert_eq!(
+            replaced, 1,
+            "the rename must land after open, before validation"
+        );
+        assert_eq!(read.unwrap().command, "replacement metadata");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_reads_reopen_after_atomic_replacement() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, _) = counted_task(storage.path());
+        TaskIoHandles::create(&task, BgMode::Pipes, false).unwrap();
+        // The first two checks validate the open; the third samples the length.
+        for validation in 1..=3 {
+            randomized_atomic_replace(
+                &task.dirs.io,
+                &task.paths.artifact_name(TaskArtifact::Stdout),
+                b"original output",
+            )
+            .unwrap();
+            let (read, replaced) = with_replacements(
+                &task.paths.stdout,
+                validation,
+                1,
+                b"replacement output".to_vec(),
+                || {
+                    let (mut file, len) = sample_task_artifact(&task.paths, TaskArtifact::Stdout)?;
+                    file.read_range(0, len)
+                },
+            );
+            assert_eq!(replaced, 1, "validation {validation} must observe a rename");
+            assert_eq!(read.unwrap(), b"replacement output");
+        }
+        for validation in 1..=2 {
+            randomized_atomic_replace(
+                &task.dirs.io,
+                &task.paths.artifact_name(TaskArtifact::Stdout),
+                b"original output",
+            )
+            .unwrap();
+            let (read, replaced) = with_replacements(
+                &task.paths.stdout,
+                validation,
+                1,
+                b"reopened output".to_vec(),
+                || open_task_artifact(&task.paths, TaskArtifact::Stdout)?.read_all(),
+            );
+            assert_eq!(replaced, 1);
+            assert_eq!(read.unwrap(), b"reopened output");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn buffer_reads_reopen_after_atomic_replacement() {
+        use super::super::buffer::{BgBuffer, StreamKind};
+
+        let storage = tempfile::tempdir().unwrap();
+        let (task, _) = counted_task(storage.path());
+        TaskIoHandles::create(&task, BgMode::Pipes, false).unwrap();
+        let buffer = BgBuffer::registered(&task.paths, BgMode::Pipes);
+        for validation in 1..=3 {
+            for operation in ["bounded", "tail", "empty_tail", "len", "notice"] {
+                randomized_atomic_replace(
+                    &task.dirs.io,
+                    &task.paths.artifact_name(TaskArtifact::Stdout),
+                    b"original output",
+                )
+                .unwrap();
+                let (read, replaced) = with_replacements(
+                    &task.paths.stdout,
+                    validation,
+                    1,
+                    b"replacement output".to_vec(),
+                    || {
+                        let text = match operation {
+                            "bounded" => buffer.read_stream_bounded(StreamKind::Stdout, 64).text,
+                            "tail" => buffer.read_tail(64).0,
+                            "empty_tail" => {
+                                let (text, truncated) = buffer.read_tail(0);
+                                assert!(text.is_empty());
+                                assert!(truncated);
+                                return Ok(());
+                            }
+                            "len" => {
+                                assert_eq!(buffer.stream_len(StreamKind::Stdout), 18);
+                                return Ok(());
+                            }
+                            "notice" => buffer.read_complete_for_notice().unwrap().0,
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(text, "replacement output", "{operation}");
+                        Ok(())
+                    },
+                );
+                assert_eq!(replaced, 1, "{operation} validation {validation}");
+                read.unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_read_replacement_retries_are_bounded() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, metadata) = counted_task(storage.path());
+        TaskIoHandles::create(&task, BgMode::Pipes, false).unwrap();
+        for validation in 1..=3 {
+            let (read, replaced) = with_replacements(
+                &task.paths.stdout,
+                validation,
+                METADATA_OPEN_ATTEMPTS + 1,
+                b"repeated replacement".to_vec(),
+                || sample_task_artifact(&task.paths, TaskArtifact::Stdout),
+            );
+            let error = read.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert_eq!(error.to_string(), ARTIFACT_CONCURRENTLY_REPLACED);
+            assert_eq!(replaced, METADATA_OPEN_ATTEMPTS);
+        }
+        let (read, replaced) = with_replacements(
+            &task.paths.json,
+            1,
+            METADATA_OPEN_ATTEMPTS + 1,
+            serde_json::to_vec(&metadata).unwrap(),
+            || read_task(&task.paths.json),
+        );
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(replaced, METADATA_OPEN_ATTEMPTS);
+    }
+
+    #[test]
+    fn artifact_read_retry_preserves_other_errors() {
+        for (kind, message) in [
+            (io::ErrorKind::Interrupted, "unrelated interruption"),
+            (
+                io::ErrorKind::InvalidData,
+                "task artifact has multiple hard links",
+            ),
+            (
+                io::ErrorKind::PermissionDenied,
+                ARTIFACT_CONCURRENTLY_REPLACED,
+            ),
+            (io::ErrorKind::NotFound, "task removed"),
+        ] {
+            let mut calls = 0;
+            let read = retry_artifact_read::<()>(|| {
+                calls += 1;
+                Err(io::Error::new(kind, message))
+            });
+            assert_eq!(read.unwrap_err().kind(), kind);
+            assert_eq!(calls, 1);
+        }
     }
 
     /// Manual check: race real metadata readers against atomic replacement writes.
@@ -4155,7 +4383,7 @@ mod tests {
         let mut plain_reads = 0;
         while replacement_error.is_none() && std::time::Instant::now() < read_deadline {
             plain_reads += 1;
-            if let Err(error) = read_task(&path) {
+            if let Err(error) = read_task_once(&path) {
                 if error.kind() == io::ErrorKind::Interrupted
                     && error.to_string().contains(ARTIFACT_CONCURRENTLY_REPLACED)
                 {
@@ -4168,7 +4396,7 @@ mod tests {
 
         let mut retry_error = None;
         for _ in 0..plain_reads.max(3_000) {
-            if let Err(error) = read_task_retrying_replacement_for_test(&path) {
+            if let Err(error) = read_task(&path) {
                 retry_error.get_or_insert_with(|| error.to_string());
             }
         }
@@ -4181,13 +4409,13 @@ mod tests {
         );
         assert!(
             replacement_error.is_some(),
-            "plain read_task never observed a transient metadata replacement"
+            "single-attempt read never observed a transient metadata replacement"
         );
         assert!(
             retry_error.is_none(),
             "retrying metadata read failed: {retry_error:?}"
         );
-        eprintln!("plain read_task observed {replacement_error:?}; retrying reads succeeded");
+        eprintln!("single-attempt read observed {replacement_error:?}; read_task succeeded");
     }
 
     #[test]

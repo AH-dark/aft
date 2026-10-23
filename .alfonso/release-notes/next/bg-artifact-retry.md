@@ -1,0 +1,1 @@
+- Reading a background task's saved state or output no longer fails with "task artifact was concurrently replaced" when AFT rewrites that file at the same moment; the read retries a bounded number of times.
