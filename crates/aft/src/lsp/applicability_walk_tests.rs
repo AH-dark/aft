@@ -310,12 +310,16 @@ fn applicability_walk_fifty_content_batches_do_zero_full_walks() {
 
 #[test]
 fn applicability_walk_cache_cap_keeps_recently_used_snapshots() {
+    // The product hands the cache and the walk roots in
+    // `canonicalize_normalized` form (see `walk_applicable_area`); a bare
+    // `fs::canonicalize` gives a verbatim `\\?\C:\...` root on Windows,
+    // which no production caller passes.
     let warm = tempfile::tempdir().unwrap();
-    let warm_root = warm.path().canonicalize().unwrap();
+    let warm_root = crate::inspect::job::canonicalize_normalized(warm.path());
     std::fs::write(warm_root.join("main.py"), "").unwrap();
     let warm_config = config(&warm_root);
     let other = tempfile::tempdir().unwrap();
-    let other_root = other.path().canonicalize().unwrap();
+    let other_root = crate::inspect::job::canonicalize_normalized(other.path());
     // Each configuration is its own cache key for the same root.
     let other_config = |n: usize| {
         let mut config = config(&other_root);
