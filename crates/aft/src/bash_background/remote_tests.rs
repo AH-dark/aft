@@ -1048,6 +1048,7 @@ fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
         unknown_len: 0,
         cancel_requested: false,
         terminal: None,
+        pre_start_refusal: None,
         fallback_digest: None,
         env_not_forwarded: None,
         queue_position: None,
