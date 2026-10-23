@@ -334,6 +334,158 @@ fn worker_seed_uses_freshest_ready_sibling_and_repairs_unusable_own_base() {
     assert_cold_parity(&main, &report);
 }
 
+/// A separate clone of `main`'s repository: the same family, but not one of
+/// its Git worktrees, so the worktree census never offers `main` as a donor.
+fn separate_clone(main: &AssemblyRequest) -> (tempfile::TempDir, AssemblyRequest) {
+    let clone = tempfile::tempdir().unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["-c", "core.autocrlf=false", "clone", "--quiet"])
+        .arg(&main.project_root)
+        .arg(clone.path())
+        .status()
+        .unwrap()
+        .success());
+    let mut request = main.clone();
+    request.project_root = clone.path().to_path_buf();
+    request.scope = crate::path_identity::project_scope_key(clone.path());
+    request.family = crate::search_index::artifact_cache_key(clone.path());
+    assert_eq!(request.family, main.family, "a clone stays in its family");
+    request.desired_head = head_tree_fingerprint(&head_tree_entries(clone.path()).unwrap());
+    (clone, request)
+}
+
+fn index_of(request: &AssemblyRequest) -> PathBuf {
+    let blobs = BlobStore::open(&request.storage, &request.family, BlobPlane::Callgraph).unwrap();
+    derived_index::index_path(blobs.path())
+}
+
+#[test]
+fn identical_scope_outside_the_worktree_census_reuses_the_indexed_graph() {
+    let (_dirs, main, _worker) = checkouts(24);
+    let published = publish_checkout(&main).unwrap();
+    assert_eq!(
+        derived_index::recorded_identity(&index_of(&main), &main.scope),
+        Some(derived_index::identity(
+            &main.family,
+            published.manifest.as_ref().unwrap()
+        )),
+        "a published ready derived database must be indexed"
+    );
+    let (_clone, clone) = separate_clone(&main);
+
+    let mut prepared = prepare_checkout(&clone, &mut |_| Ok(())).unwrap();
+
+    assert_eq!(prepared.profile.seed_source, "sibling");
+    assert_eq!(prepared.profile.seed_lookup, "index_exact");
+    assert_eq!(prepared.profile.cold_build_reason, "none");
+    assert!(prepared.profile.derived_cloned);
+    let report = prepared.commit().unwrap();
+    assert_eq!(report.blob_puts, 0);
+    assert_cold_parity(&clone, &report);
+}
+
+#[test]
+fn seeding_prefers_an_identical_donor_over_a_newer_divergent_one() {
+    let (_dirs, main, mut worker) = checkouts(128);
+    publish_checkout(&main).unwrap();
+    // The newest publication in the family diverges past the incremental
+    // cutoff, which the worktree census would offer first.
+    for i in 0..128 {
+        fs::write(
+            worker.project_root.join(format!("file_{i}.ts")),
+            format!("export function replaced_{i}() {{}} "),
+        )
+        .unwrap();
+        worker
+            .changed_paths
+            .insert(format!("file_{i}.ts").into_bytes());
+    }
+    publish_checkout(&worker).unwrap();
+    let third = tempfile::tempdir().unwrap();
+    git(
+        &main.project_root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            third.path().to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let mut third_request = main.clone();
+    third_request.project_root = third.path().to_path_buf();
+    third_request.scope = crate::path_identity::project_scope_key(third.path());
+
+    let mut prepared = prepare_checkout(&third_request, &mut |_| Ok(())).unwrap();
+
+    assert_eq!(prepared.profile.seed_source, "sibling");
+    assert_eq!(prepared.profile.seed_lookup, "index_exact");
+    assert_eq!(prepared.profile.cold_build_reason, "none");
+    let report = prepared.commit().unwrap();
+    assert_cold_parity(&third_request, &report);
+}
+
+#[test]
+fn near_identical_scope_patches_the_nearest_indexed_donor() {
+    let (_dirs, main, _worker) = checkouts(24);
+    publish_checkout(&main).unwrap();
+    let (_clone, mut clone) = separate_clone(&main);
+    fs::write(
+        clone.project_root.join("file_0.ts"),
+        "export function target_0() { return 5; }",
+    )
+    .unwrap();
+    clone.changed_paths.insert(b"file_0.ts".to_vec());
+
+    let mut prepared = prepare_checkout(&clone, &mut |_| Ok(())).unwrap();
+
+    assert_eq!(prepared.profile.seed_source, "sibling");
+    assert_eq!(prepared.profile.seed_lookup, "index_nearest");
+    assert!(prepared.profile.derived_cloned);
+    let report = prepared.commit().unwrap();
+    assert_eq!(report.blob_puts, 1);
+    assert_cold_parity(&clone, &report);
+}
+
+#[test]
+fn indexed_donor_from_an_older_build_output_is_forgotten_not_reused() {
+    let (_dirs, main, _worker) = checkouts(24);
+    let published = publish_checkout(&main).unwrap();
+    let main_view = ViewStore::open(&main.storage, &main.scope).unwrap();
+    crate::views::generation::wait_for_derived_checkpoint_for_test(main_view.view_dir());
+    let derived = main_view
+        .derived_path(published.generation.as_deref().unwrap())
+        .unwrap();
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while crate::db::file_identity::open_connections(&derived) != 0 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // What a donor published by an older binary looks like to this one: the
+    // same manifest, but another build-output fingerprint.
+    Connection::open(&derived)
+        .unwrap()
+        .execute(
+            "UPDATE meta SET v = 'older-build' WHERE k = 'fingerprint'",
+            [],
+        )
+        .unwrap();
+    let (_clone, clone) = separate_clone(&main);
+
+    let mut prepared = prepare_checkout(&clone, &mut |_| Ok(())).unwrap();
+
+    assert_eq!(prepared.profile.seed_source, "cold");
+    assert_eq!(prepared.profile.seed_lookup, "none");
+    assert_eq!(
+        derived_index::recorded_identity(&index_of(&main), &main.scope),
+        None,
+        "a donor that fails readiness must leave the index"
+    );
+    let report = prepared.commit().unwrap();
+    assert_cold_parity(&clone, &report);
+}
+
 #[test]
 fn worker_seed_copy_that_fails_readiness_is_rebuilt_cold_not_served() {
     // A copy that is well-formed SQLite but whose build never finished, and a

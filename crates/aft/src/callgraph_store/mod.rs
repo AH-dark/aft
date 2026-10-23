@@ -11870,6 +11870,12 @@ fn schema_fingerprint() -> String {
     schema_fingerprint_for(BUILD_OUTPUT_VERSION)
 }
 
+/// The schema and build-output fingerprint a ready derived database carries,
+/// for keying derived outputs that are interchangeable across checkouts.
+pub(crate) fn derived_build_fingerprint() -> String {
+    schema_fingerprint()
+}
+
 fn schema_fingerprint_for(build_output_version: &str) -> String {
     // The version string names the latest change to what a build stores; older
     // changes (scoped aliases, inline modules, re-exports, turbofish calls) are

@@ -124,6 +124,9 @@ pub struct PreparedAssembly {
     publication: Option<super::PreparedPublication>,
     files: Option<(ViewStore, String)>,
     derived_checkpoint: Option<(PathBuf, crate::db::file_identity::IdentityConnection)>,
+    /// The family index row this generation's ready derived database earns
+    /// once published: the index path, this scope and the output identity.
+    derived_index_entry: Option<(PathBuf, String, [u8; 32])>,
     pin: Option<AssemblyPin>,
     _base_pin: Option<crate::pins::QueryPin>,
     profile: PublicationProfile,
@@ -258,6 +261,18 @@ impl PreparedAssembly {
                 PublishOutcome::Published => {
                     self.report.published = true;
                     self.files = None;
+                    if let (Some((index, scope, identity)), Some(generation)) = (
+                        self.derived_index_entry.take(),
+                        self.report.generation.as_deref(),
+                    ) {
+                        // A hint for other scopes' seeding; losing it only
+                        // costs a missed reuse, so it never fails publication.
+                        if let Err(error) =
+                            derived_index::record(&index, &scope, generation, &identity)
+                        {
+                            log::warn!("view derived index not updated: {error}");
+                        }
+                    }
                     if retires_legacy_plane {
                         log::info!(
                             "views: root={} legacy plane retired at generation={}",
@@ -789,6 +804,7 @@ pub fn prepare_checkout_deferring(
         publication: None,
         files: Some((view.clone(), next_generation.clone())),
         derived_checkpoint: None,
+        derived_index_entry: None,
         pin: Some(pin),
         _base_pin: base_pin,
         profile,
@@ -1029,10 +1045,32 @@ pub fn prepare_checkout_deferring(
         // derived rows use manifest-relative paths,
         // and the ordinary cutoff/fingerprint checks still gate the patch.
         let sibling = if base.is_none() && request.callgraph {
-            worker_seed::sibling_checkout_seed(
+            let deadline = Instant::now() + crate::db::STEADY_BUSY_TIMEOUT;
+            // The family index finds an interchangeable or the nearest donor
+            // in any scope of the family. Donors published before the index
+            // existed are still found through the checkout's Git worktrees.
+            match worker_seed::indexed_seed(
                 request,
-                Instant::now() + crate::db::STEADY_BUSY_TIMEOUT,
-            )?
+                &derived_index::index_path(callgraph.path()),
+                &manifest,
+                deadline,
+            )? {
+                Some(seed) => {
+                    prepared.profile.seed_lookup = if seed.exact {
+                        "index_exact"
+                    } else {
+                        "index_nearest"
+                    };
+                    Some(seed)
+                }
+                None => {
+                    let seed = worker_seed::sibling_checkout_seed(request, deadline)?;
+                    if seed.is_some() {
+                        prepared.profile.seed_lookup = "worktrees";
+                    }
+                    seed
+                }
+            }
         } else {
             None
         };
@@ -1174,6 +1212,14 @@ pub fn prepare_checkout_deferring(
         prepared.profile.materialization_call_ms = materialization_started.elapsed().as_millis();
         timing.phase("derived_materialization");
     }
+    if !defer_derived && request.callgraph {
+        // Reused, patched or built cold, the derived database is ready here.
+        prepared.derived_index_entry = Some((
+            derived_index::index_path(callgraph.path()),
+            request.scope.clone(),
+            derived_index::identity(&request.family, &manifest),
+        ));
+    }
     prepared.profile.io.enter(super::io::Phase::DerivedOther);
     let trigram = view.trigram_path(&next_generation)?;
     crate::private_storage::write(&trigram, [])
@@ -1266,6 +1312,9 @@ struct PublicationProfile {
     /// How a seeded derived database was copied (`clonefile`,
     /// `sqlite_backup`), or `none` when nothing was copied.
     clone_mechanism: &'static str,
+    /// Where a sibling donor was found (`index_exact`, `index_nearest`,
+    /// `worktrees`), or `none`.
+    seed_lookup: &'static str,
     #[cfg(test)]
     derived_cloned: bool,
     materialization_call_ms: u128,
@@ -1300,6 +1349,7 @@ impl PublicationProfile {
             seed_source: "cold",
             cold_build_reason: "no_base",
             clone_mechanism: "none",
+            seed_lookup: "none",
             #[cfg(test)]
             derived_cloned: false,
             materialization_call_ms: 0,
@@ -1358,7 +1408,7 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
     // pointer transaction is a subset of the cas phase, which also includes
     // waiting to acquire the actor barrier.
     format!(
-        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_dispatch_ms={} materialize_commit_ms={} materialize_cleanup_memory_ms={} materialize_cleanup_connections_ms={} pointer_ms={} total_ms={} derived_bytes={} semantic_fill={} generation={} concurrent_publications={} seed_source={} cold_build_reason={} clone_mechanism={} {}",
+        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_dispatch_ms={} materialize_commit_ms={} materialize_cleanup_memory_ms={} materialize_cleanup_connections_ms={} pointer_ms={} total_ms={} derived_bytes={} semantic_fill={} generation={} concurrent_publications={} seed_source={} cold_build_reason={} clone_mechanism={} seed_lookup={} {}",
         profile.root.display(), profile.outcome, profile.candidates, profile.blob_puts,
         profile.pending_paths, profile.phase_ms[0], profile.phase_ms[1],
         profile.phase_ms[2], profile.phase_ms[3], profile.head_ms, profile.assembly_ms,
@@ -1383,7 +1433,7 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
         profile.materialization.cleanup_memory_ms,
         profile.materialization.cleanup_connections_ms,
         profile.pointer_ms, profile.total_ms, profile.derived_bytes,
-        profile.semantic_fill, profile.generation, profile.concurrent_publications, profile.seed_source, profile.cold_build_reason, profile.clone_mechanism, profile.io.fields(),
+        profile.semantic_fill, profile.generation, profile.concurrent_publications, profile.seed_source, profile.cold_build_reason, profile.clone_mechanism, profile.seed_lookup, profile.io.fields(),
     )
 }
 
@@ -2870,6 +2920,8 @@ mod payload_heal_tests {
 #[path = "cold_fallback_tests.rs"]
 mod cold_fallback_tests;
 
+#[path = "derived_index.rs"]
+pub(super) mod derived_index;
 #[path = "assembly_seed.rs"]
 pub(super) mod worker_seed;
 

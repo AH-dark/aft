@@ -196,6 +196,11 @@ pub const SQLITE_UNINSTRUMENTED_OPENERS: &[SqliteUninstrumentedOpener] = &[
         reason: "its only write is a TRUNCATE checkpoint of the donor's WAL; the enclosing publication clone phase credits its process-I/O delta to views_derived",
     },
     SqliteUninstrumentedOpener {
+        seam: "views::assembly::derived_index",
+        class: UninstrumentedOpenerClass::AttributedElsewhere,
+        reason: "the family derived-output index is read in the publication clone phase and written in its cas phase, which credit their process-I/O deltas to the publication",
+    },
+    SqliteUninstrumentedOpener {
         seam: "views::generation::checkpoint_derived",
         class: UninstrumentedOpenerClass::Unmeasurable,
         reason: "a successful TRUNCATE checkpoint returns zero frame counts and the raw connection has no earlier WAL-hook baseline",
@@ -1510,6 +1515,10 @@ mod tests {
                 ),
                 (
                     "views::generation::clone_quiescent source",
+                    UninstrumentedOpenerClass::AttributedElsewhere
+                ),
+                (
+                    "views::assembly::derived_index",
                     UninstrumentedOpenerClass::AttributedElsewhere
                 ),
                 (
