@@ -1668,3 +1668,70 @@ fn applicability_walk_create_remove_burst_measurement() {
         }
     }
 }
+
+/// A fresh walk counts every directory it enters as well as every file, and
+/// reports an incomplete result past [`APPLICABILITY_WALK_ENTRY_LIMIT`]
+/// entries. A covered file kept without a walk must count its new parent
+/// directories too, even when the watcher reported only the file.
+#[test]
+fn applicability_walk_entry_estimate_counts_new_parent_directories_at_the_limit() {
+    let fixture = WatcherWalkFixture::new();
+    let real_entries = scan(&fixture.root, &fixture.config).entries;
+    let create = notify::EventKind::Create(notify::event::CreateKind::File);
+    for (walked_entries, file, walks_again) in [
+        // One past the limit: a fresh walk reports an incomplete result.
+        (
+            APPLICABILITY_WALK_ENTRY_LIMIT - 2,
+            "fresh/deeper/extra.py",
+            true,
+        ),
+        (APPLICABILITY_WALK_ENTRY_LIMIT - 1, "fresh/extra.py", true),
+        // Exactly at the limit: a fresh walk still completes.
+        (
+            APPLICABILITY_WALK_ENTRY_LIMIT - 3,
+            "fresh/deeper/extra.py",
+            false,
+        ),
+        (APPLICABILITY_WALK_ENTRY_LIMIT - 1, "extra.py", false),
+    ] {
+        let cache = ApplicabilityCache::default();
+        // Pretend the tree already held all but a few entries of the limit.
+        let walk = || {
+            cache
+                .walk(
+                    &fixture.root,
+                    &fixture.config,
+                    Instant::now() + Duration::from_secs(10),
+                    || {
+                        let mut walk = scan(&fixture.root, &fixture.config);
+                        walk.entries = walk.entries - real_entries + walked_entries;
+                        Ok(walk)
+                    },
+                )
+                .unwrap()
+        };
+        walk();
+        let path = fixture.root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+        let added = Path::new(file).components().count();
+        assert_eq!(
+            scan(&fixture.root, &fixture.config).entries,
+            real_entries + added,
+            "a fresh walk counts the file and each new directory"
+        );
+        cache.invalidate_batch(
+            &fixture.root,
+            std::slice::from_ref(&path),
+            crate::watcher_filter::watcher_event_is_content_only(&create),
+        );
+        walk();
+        assert_eq!(
+            cache.metrics(&fixture.root).full_walks,
+            1 + u64::from(walks_again),
+            "{file} with {walked_entries} walked entries"
+        );
+        std::fs::remove_dir_all(fixture.root.join("fresh")).ok();
+        std::fs::remove_file(fixture.root.join("extra.py")).ok();
+    }
+}

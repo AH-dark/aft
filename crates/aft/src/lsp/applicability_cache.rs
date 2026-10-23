@@ -299,10 +299,11 @@ struct State {
     /// In-root directories that hold a recorded input. They include every
     /// directory the walk visited, because each one records its ignore files.
     input_dirs: Arc<HashSet<PathBuf>>,
-    /// Present files reported by batches kept since the walk. Some may have
-    /// existed already; counting them all against the walk's entry limit
-    /// errs toward walking again.
-    absorbed_files: usize,
+    /// Entries that batches kept since the walk may have added: each present
+    /// file they reported and each unvisited parent directory of one. Some
+    /// existed already or are counted twice; counting them all against the
+    /// walk's entry limit errs toward walking again.
+    absorbed_entries: usize,
 }
 
 /// What a create, remove or rename batch is checked against for one cached
@@ -315,7 +316,7 @@ struct TopologyBasis {
     walk: ApplicabilityWalk,
     config: Arc<Config>,
     input_dirs: Arc<HashSet<PathBuf>>,
-    absorbed_files: usize,
+    absorbed_entries: usize,
 }
 
 /// Ignore-rule files and repository markers the walker reads by itself. Those
@@ -508,7 +509,7 @@ impl ApplicabilityCache {
                             walk: walk.clone(),
                             config: Arc::clone(config),
                             input_dirs: Arc::clone(&state.input_dirs),
-                            absorbed_files: state.absorbed_files,
+                            absorbed_entries: state.absorbed_entries,
                         });
                     }
                 }
@@ -582,7 +583,11 @@ impl ApplicabilityCache {
                 &basis.root,
                 &basis.config,
             );
+            // Entries a fresh walk would add: each present file, plus each of
+            // its parent directories the walk has not visited. A watcher may
+            // report a new directory's files without the directory itself.
             let mut present_files = 0;
+            let mut new_dirs = HashSet::new();
             for (path, state) in normalized_paths.iter().zip(&states) {
                 if !path.starts_with(&basis.root) {
                     if basis.root.starts_with(path) {
@@ -599,6 +604,15 @@ impl ApplicabilityCache {
                             return false;
                         }
                         present_files += 1;
+                        for dir in path.ancestors().skip(1) {
+                            // Visited directories form a tree up to the root.
+                            if dir == basis.root
+                                || basis.input_dirs.contains(dir)
+                                || !new_dirs.insert(dir.to_path_buf())
+                            {
+                                break;
+                            }
+                        }
                     }
                     // A directory may hold files missing from the batch, and an
                     // unreadable path cannot be classified: walk again. A walk
@@ -615,17 +629,20 @@ impl ApplicabilityCache {
                     }
                 }
             }
-            let entries = basis.walk.entries() + basis.absorbed_files + present_files;
-            if entries >= super::manager::APPLICABILITY_WALK_ENTRY_LIMIT {
+            let added = present_files + new_dirs.len();
+            // A walk completes with exactly the limit and fails past it.
+            if basis.walk.entries() + basis.absorbed_entries + added
+                > super::manager::APPLICABILITY_WALK_ENTRY_LIMIT
+            {
                 return false;
             }
-            absorbed.push(present_files);
+            absorbed.push(added);
         }
-        for (basis, present_files) in bases.iter().zip(absorbed) {
+        for (basis, added) in bases.iter().zip(absorbed) {
             let mut state = basis.flight.state.lock();
             // A newer generation was invalidated or walked after these events.
             if state.generation == basis.generation {
-                state.absorbed_files += present_files;
+                state.absorbed_entries += added;
             }
         }
         true
@@ -793,7 +810,7 @@ impl ApplicabilityCache {
                 if let Ok(walk) = &result {
                     state.input_dirs = input_dirs;
                     state.config = Some(Arc::new(config.clone()));
-                    state.absorbed_files = 0;
+                    state.absorbed_entries = 0;
                     state.result = Some(walk.clone());
                     state.dependencies = dependencies;
                     state.inputs = inputs;
