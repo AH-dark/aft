@@ -165,19 +165,33 @@ pub fn build_changed_files_envelope(
     lines: bool,
     incomplete: bool,
 ) -> ListEnvelope {
+    build_changed_files_envelope_with_time_limit(shown, total, lines, incomplete, false)
+}
+
+/// A reply deadline can stop path enumeration before the full total is known.
+pub fn build_changed_files_envelope_with_time_limit(
+    shown: usize,
+    total: usize,
+    lines: bool,
+    incomplete: bool,
+    time_limit: bool,
+) -> ListEnvelope {
+    let mut causes = Vec::new();
+    if shown < total {
+        causes.push(Reason::Cap);
+    }
+    if time_limit {
+        causes.push(Reason::TimeLimit);
+    }
     ListEnvelope::new(
         shown,
-        if incomplete {
+        if incomplete || time_limit {
             Total::AtLeast(total)
         } else {
             Total::Exact(total)
         },
         if lines { Unit::Lines } else { Unit::Files },
-        if shown < total {
-            vec![Reason::Cap]
-        } else {
-            vec![]
-        },
+        causes,
         &[],
     )
 }

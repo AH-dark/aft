@@ -686,3 +686,60 @@ fn bash_changed_files_flush_inherits_reply_budget_before_spawn_and_clears_on_han
         crate::bash_background::with_spawn_receipt(receipt, || Capture::start(&ctx).unwrap());
     assert!(late.call_deadline.lock().unwrap().is_none());
 }
+
+#[test]
+fn bash_changed_files_diff_rendering_respects_reply_deadline() {
+    let root = repo();
+    let (journal, mut capture) = capture(root.path(), BashChangedFiles::Diff);
+    assert!(capture.git.is_some(), "real git before-images are required");
+    Arc::get_mut(&mut capture).unwrap().diff_delay_for_test = Duration::from_millis(200);
+    for name in ["clean.txt", "deleted.txt"] {
+        std::fs::write(root.path().join(name), "changed\n").unwrap();
+        event(
+            &journal,
+            root.path(),
+            name,
+            notify::EventKind::Modify(ModifyKind::Any),
+        );
+    }
+    let started = Instant::now();
+    let _budget = capture.budget(Some(started + Duration::from_millis(30)));
+    let report = capture.finish();
+    assert!(
+        started.elapsed() < Duration::from_millis(120),
+        "render overran reply budget: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        report.files.len(),
+        2,
+        "remaining paths should still be listed"
+    );
+    assert!(report.files.iter().all(|file| file.diff.is_none()));
+    assert!(
+        report.incomplete.is_empty(),
+        "a complete path list needs no new caveat"
+    );
+}
+
+#[test]
+fn bash_changed_files_expired_render_budget_marks_cut_list_incomplete() {
+    let root = tempfile::tempdir().unwrap();
+    let (journal, capture) = capture(root.path(), BashChangedFiles::List);
+    std::fs::write(root.path().join("changed.txt"), "changed").unwrap();
+    event(
+        &journal,
+        root.path(),
+        "changed.txt",
+        notify::EventKind::Create(CreateKind::File),
+    );
+    let _budget = capture.budget(Some(Instant::now() - Duration::from_millis(1)));
+    let report = capture.finish();
+    assert!(report.files.is_empty());
+    assert_eq!(report.incomplete, vec![NOT_CAUGHT_UP]);
+    assert_eq!(
+        report.changed_files_list_envelope.reason,
+        Some(Reason::TimeLimit)
+    );
+    assert!(report.changed_files_list_envelope.total.is_at_least());
+}

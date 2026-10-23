@@ -86,6 +86,16 @@ const CAP_SELECTING: &[ReasonSpec] = &[ReasonSpec {
     reason: Reason::Cap,
     kind: ReasonKind::Selecting,
 }];
+const TIME_CAP: &[ReasonSpec] = &[
+    ReasonSpec {
+        reason: Reason::Cap,
+        kind: ReasonKind::Selecting,
+    },
+    ReasonSpec {
+        reason: Reason::TimeLimit,
+        kind: ReasonKind::Bounding,
+    },
+];
 const DEPTH_BOUNDING: &[ReasonSpec] = &[ReasonSpec {
     reason: Reason::Depth,
     kind: ReasonKind::Bounding,
@@ -304,7 +314,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         list_id: "bash.changed_files",
         unit: Unit::Files,
         narrow: &[],
-        reasons: CAP_SELECTING,
+        reasons: TIME_CAP,
     },
     SurfaceSpec {
         command: "bash",
@@ -438,14 +448,15 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
             has(Reason::Walk),
         ),
         ("inspect", "") => build_inspect_envelope(2, 4),
-        ("bash", "changed_files" | "diff_lines") => {
-            Some(aft::list_surfaces::bash::build_changed_files_envelope(
+        ("bash", "changed_files" | "diff_lines") => Some(
+            aft::list_surfaces::bash::build_changed_files_envelope_with_time_limit(
                 2,
                 if has(Reason::Cap) { 4 } else { 2 },
                 surface.mode == "diff_lines",
                 false,
-            ))
-        }
+                has(Reason::TimeLimit),
+            ),
+        ),
         ("bash", "") => build_bash_output_envelope(61, 4000),
         other => panic!("no conformance builder for {other:?}"),
     }
@@ -508,7 +519,12 @@ fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
         }
         ("inspect", "") => Total::Exact(4),
         ("bash", "changed_files" | "diff_lines") => {
-            Total::Exact(if has(Reason::Cap) { 4 } else { 2 })
+            let total = if has(Reason::Cap) { 4 } else { 2 };
+            if has(Reason::TimeLimit) {
+                Total::AtLeast(total)
+            } else {
+                Total::Exact(total)
+            }
         }
         ("bash", "") => Total::Exact(4000),
         other => panic!("no expected total for {other:?}"),

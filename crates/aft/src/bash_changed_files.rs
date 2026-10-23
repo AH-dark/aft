@@ -13,6 +13,7 @@ pub(crate) const MAX_FILES: usize = 40;
 pub(crate) const MAX_DIFF_LINES: usize = 200;
 pub(crate) const MAX_REPORT_BYTES: usize = 64 * 1024;
 const MAX_FILE_BYTES: usize = 256 * 1024;
+const MAX_RENDER_TIME: Duration = Duration::from_secs(2);
 const HEADER: &str =
     "Files changed while the command ran (changes by other processes may be included):";
 const DIRTY: &str = "no diff: it had uncommitted changes before the command";
@@ -99,6 +100,8 @@ pub(crate) struct Capture {
     git: Option<GitStart>,
     end: OnceLock<(u64, u64)>,
     report: OnceLock<Report>,
+    #[cfg(test)]
+    diff_delay_for_test: Duration,
 }
 #[derive(Debug)]
 struct GitStart {
@@ -193,23 +196,29 @@ impl Capture {
             git,
             end: OnceLock::new(),
             report: OnceLock::new(),
+            #[cfg(test)]
+            diff_delay_for_test: Duration::ZERO,
         })
     }
     pub(crate) fn finish(&self) -> &Report {
         self.report.get_or_init(|| {
-            let deadline = Instant::now() + crate::watcher_backend::flush::BASH_FLUSH_LIMIT;
+            let started = Instant::now();
             let deadline = self
                 .call_deadline
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .map_or(deadline, |call| call.min(deadline));
+                .map_or(started + MAX_RENDER_TIME, |call| {
+                    call.min(started + MAX_RENDER_TIME)
+                });
+            let flush_deadline =
+                deadline.min(started + crate::watcher_backend::flush::BASH_FLUSH_LIMIT);
             let caught_up = self.watcher_active
                 && self
                     .flush
                     .as_ref()
-                    .is_none_or(|flush| flush.wait(&self.root, deadline));
+                    .is_none_or(|flush| flush.wait(&self.root, flush_deadline));
             self.seal();
-            self.render(caught_up)
+            self.render(caught_up, deadline)
         })
     }
     pub(crate) fn budget(self: &Arc<Self>, deadline: Option<Instant>) -> BudgetGuard {
@@ -229,7 +238,7 @@ impl Capture {
             (state.sequence, state.gaps)
         });
     }
-    fn render(&self, caught_up: bool) -> Report {
+    fn render(&self, caught_up: bool, deadline: Instant) -> Report {
         let state = self
             .journal
             .state
@@ -242,8 +251,13 @@ impl Capture {
                 .front()
                 .is_some_and(|(sequence, _, _)| *sequence > self.sequence + 1);
         let mut paths = BTreeMap::new();
+        let mut list_deadline_cut = false;
         for (sequence, path, created) in &state.events {
             if *sequence > self.sequence && *sequence <= end_sequence {
+                if Instant::now() >= deadline {
+                    list_deadline_cut = true;
+                    break;
+                }
                 if let Ok(relative) = path.strip_prefix(&self.root) {
                     if !relative.as_os_str().is_empty()
                         && !relative.components().any(|c| {
@@ -261,22 +275,19 @@ impl Capture {
             }
         }
         drop(state);
-        let mut incomplete = Vec::new();
-        if overflow {
-            incomplete.push(OVERFLOW.to_string());
-        }
-        if !caught_up {
-            incomplete.push(NOT_CAUGHT_UP.to_string());
-        }
         let total = paths.len();
         let mut files = Vec::new();
         let mut serialized_files_bytes = 0;
         let mut text = HEADER.to_string();
         let mut cut = false;
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut pending = Vec::new();
         for (path, created) in paths {
-            if files.len() == MAX_FILES {
+            if pending.len() == MAX_FILES {
                 cut = true;
+                break;
+            }
+            if Instant::now() >= deadline {
+                list_deadline_cut = true;
                 break;
             }
             let absolute = self.root.join(&path);
@@ -284,7 +295,7 @@ impl Capture {
                 continue;
             }
             let exists = absolute.symlink_metadata().is_ok();
-            let mut file = ChangedFile {
+            let file = ChangedFile {
                 path: path.to_string_lossy().into_owned(),
                 status: if !exists {
                     "deleted"
@@ -297,9 +308,16 @@ impl Capture {
                 reason: None,
                 diff_lines_list_envelope: None,
             };
-            if self.mode == BashChangedFiles::Diff {
+            pending.push((path, created, exists, file));
+        }
+        // Collect the bounded path list before spending its remaining budget on
+        // diffs, so a slow diff never hides later files we can already list.
+        let diff_deadline = deadline
+            - Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now()) / 10);
+        for (path, created, exists, mut file) in pending {
+            if self.mode == BashChangedFiles::Diff && Instant::now() < diff_deadline {
                 if let Some(git) = &self.git {
-                    self.diff_file(git, &path, created, exists, deadline, &mut file);
+                    self.diff_file(git, &path, created, exists, diff_deadline, &mut file);
                 }
             }
             let mut rendered = format!(
@@ -343,16 +361,25 @@ impl Capture {
                 },
             );
         }
+        let mut incomplete = Vec::new();
+        if overflow {
+            incomplete.push(OVERFLOW.to_string());
+        }
+        if !caught_up || list_deadline_cut {
+            incomplete.push(NOT_CAUGHT_UP.to_string());
+        }
         for reason in &incomplete {
             text.push('\n');
             text.push_str(reason);
         }
-        let mut list_envelope = crate::list_surfaces::bash::build_changed_files_envelope(
-            files.len(),
-            total,
-            false,
-            overflow || !caught_up,
-        );
+        let mut list_envelope =
+            crate::list_surfaces::bash::build_changed_files_envelope_with_time_limit(
+                files.len(),
+                total,
+                false,
+                overflow || !caught_up || list_deadline_cut,
+                list_deadline_cut,
+            );
         if cut && list_envelope.reason.is_none() {
             list_envelope.reason = Some(Reason::Cap);
             list_envelope.causes.push(Reason::Cap);
@@ -378,6 +405,17 @@ impl Capture {
         deadline: Instant,
         file: &mut ChangedFile,
     ) {
+        if Instant::now() >= deadline {
+            return;
+        }
+        #[cfg(test)]
+        std::thread::sleep(
+            self.diff_delay_for_test
+                .min(deadline.saturating_duration_since(Instant::now())),
+        );
+        if Instant::now() >= deadline {
+            return;
+        }
         let absolute = self.root.join(path);
         if path.to_str().is_none() {
             file.reason = Some("no diff: path is not valid UTF-8".into());
@@ -403,6 +441,9 @@ impl Capture {
             deadline,
             MAX_FILE_BYTES,
         );
+        if Instant::now() >= deadline {
+            return;
+        }
         let before = match before {
             Some(before) => {
                 file.status = if exists { "modified" } else { "deleted" };
@@ -434,12 +475,21 @@ impl Capture {
             file.status = if exists { "modified" } else { "deleted" };
         }
         let after = if exists {
+            if Instant::now() >= deadline {
+                return;
+            }
             if !std::fs::canonicalize(&absolute).is_ok_and(|path| path.starts_with(&self.root)) {
                 file.reason = Some("no diff: path resolves outside the project".into());
                 return;
             }
+            if Instant::now() >= deadline {
+                return;
+            }
             match std::fs::symlink_metadata(&absolute) {
                 Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_FILE_BYTES as u64 => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
                     use std::io::Read;
                     let mut bytes = Vec::new();
                     if std::fs::File::open(&absolute)
@@ -461,6 +511,9 @@ impl Capture {
         } else {
             Vec::new()
         };
+        if Instant::now() >= deadline {
+            return;
+        }
         let (Ok(before), Ok(after)) = (std::str::from_utf8(&before), std::str::from_utf8(&after))
         else {
             file.reason = Some("no diff: binary file".into());
@@ -472,8 +525,13 @@ impl Capture {
         }
         let name = file.path.replace(['\n', '\r', '\t'], "?");
         let diff = similar::TextDiff::configure()
-            .timeout(Duration::from_millis(50))
+            .timeout(
+                Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+            )
             .diff_lines(before, after);
+        if Instant::now() >= deadline {
+            return;
+        }
         let rendered = diff
             .unified_diff()
             .header(
@@ -489,10 +547,16 @@ impl Capture {
                 },
             )
             .to_string();
+        if Instant::now() >= deadline {
+            return;
+        }
         let total = rendered.lines().count();
         let mut shown = 0;
         let mut capped = String::new();
         for line in rendered.lines() {
+            if Instant::now() >= deadline {
+                return;
+            }
             if shown == MAX_DIFF_LINES || capped.len() + line.len() + 1 > MAX_REPORT_BYTES / 2 {
                 break;
             }
