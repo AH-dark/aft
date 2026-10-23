@@ -2234,6 +2234,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     paths.push(source_dir.join("run_tool_call.rs"));
     paths.push(source_dir.join("subc_format.rs"));
     paths.push(source_dir.join("runtime_drain.rs"));
+    paths.push(source_dir.join("bash_permissions/scan.rs"));
     paths.extend(collect_rs_files(&source_dir.join("compress")));
     let primitives = [
         "budget.exhausted()",
@@ -2247,6 +2248,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
         "skipped_foreign_mounts",
         "collection_truncated",
         "MAX_DISPLAY_",
+        "MAX_CWD_PATHS",
     ];
     let mut discovered = Vec::new();
     for path in paths {

@@ -30,6 +30,7 @@ import {
   handlePushedBgCompletion,
   sessionBgStates,
 } from "../bg-notifications.js";
+import { BridgeError } from "../tools/_shared.js";
 import {
   __parseWaitPatternForTests,
   __trimWaitScanBufferForTests,
@@ -1359,6 +1360,62 @@ describe("bash tool adapter", () => {
 
     expect(captured).toBe(original);
     expect((captured as Error).message).toBe("byte-identical transport error");
+  });
+
+  test("runon cd refusal message is surfaced unchanged without host fallback", async () => {
+    const message =
+      "runon refused: the command changes into /Users/agent/other, which is outside the checkout the build server copies (/Users/agent/project); the command did not run. Set the bash tool's workdir to that folder instead of using cd.";
+    const tools = new Map<string, MockToolDef>();
+    const calls: Array<[string, Record<string, unknown>]> = [];
+    const confirmations: unknown[] = [];
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown>) => {
+        calls.push([command, params]);
+        return { success: false, code: "runon_cd_outside_checkout", message };
+      },
+    } as unknown as BinaryBridge;
+    registerBashTool(
+      makeMockApi(tools),
+      makeMockContext(bridge, {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+        bash: { runon_enabled: true, host_fallback: true },
+      } as PluginContext["config"]),
+    );
+    let captured: unknown;
+    try {
+      await tools
+        .get("bash")!
+        .execute(
+          "call",
+          { command: "cd /Users/agent/other", runon: "linux" },
+          undefined,
+          undefined,
+          {
+            cwd: projectRoot,
+            hasUI: true,
+            ui: {
+              confirm: async (...args) => {
+                confirmations.push(args);
+                return true;
+              },
+            },
+          },
+        );
+    } catch (error) {
+      captured = error;
+    }
+    expect(captured).toBeInstanceOf(BridgeError);
+    expect((captured as BridgeError).message).toBe(message);
+    expect((captured as BridgeError).code).toBe("runon_cd_outside_checkout");
+    expect((captured as BridgeError).response).toMatchObject({
+      success: false,
+      code: "runon_cd_outside_checkout",
+      message,
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.[1]).toMatchObject({ runon: "linux" });
+    expect(confirmations).toHaveLength(0);
   });
 
   test("engine-alive errors never engage host fallback", async () => {

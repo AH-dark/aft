@@ -614,6 +614,36 @@ describe("OpenCode bash adapter", () => {
     expect(ask).not.toHaveBeenCalled();
   });
 
+  test("runon cd refusal message is surfaced unchanged without host fallback", async () => {
+    const message =
+      "runon refused: the command changes into /Users/agent/other, which is outside the checkout the build server copies (/Users/agent/project); the command did not run. Set the bash tool's workdir to that folder instead of using cd.";
+    const ask = mockAsk();
+    const { calls, tool: bash } = createHarness(
+      () => ({ success: false, code: "runon_cd_outside_checkout", message }),
+      undefined,
+      false,
+      {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+        bash: { runon_enabled: true, host_fallback: true },
+      } as PluginContext["config"],
+    );
+    let captured: unknown;
+    try {
+      await bash.execute(
+        { command: "cd /Users/agent/other", runon: "linux" },
+        createMockSdkContext({ ask }),
+      );
+    } catch (error) {
+      captured = error;
+    }
+    expect(captured).toBeInstanceOf(Error);
+    expect((captured as Error).message).toBe(message);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.params).toMatchObject({ runon: "linux" });
+    expect(ask).not.toHaveBeenCalled();
+  });
+
   test("engine-alive errors never engage host fallback", async () => {
     const ask = mockAsk();
     const { tool: bash } = createHarness(

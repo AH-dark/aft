@@ -562,8 +562,15 @@ export async function callBridge(
     throw adaptToolError(command, error);
   }
   if (response.success === false) {
+    const pathRefusal =
+      command === "bash" &&
+      response.code === "runon_cd_outside_checkout" &&
+      typeof response.message === "string" &&
+      response.message.length > 0;
     throw new BridgeError(
-      formatBridgeErrorMessage(command, response, merged),
+      pathRefusal
+        ? (response.message as string)
+        : formatBridgeErrorMessage(command, response, merged),
       typeof response.code === "string" ? response.code : "",
       response,
     );

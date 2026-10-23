@@ -1119,6 +1119,7 @@ fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
         cancel_pending: false,
         owner_pause_cancel: None,
         terminal: None,
+        pre_start_refusal: None,
         fallback_digest: None,
         env_not_forwarded: None,
         queue_position: None,
@@ -2324,6 +2325,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         cancel_pending: false,
         owner_pause_cancel: None,
         terminal: None,
+        pre_start_refusal: None,
         fallback_digest: None,
         env_not_forwarded: None,
         queue_position: None,
@@ -3618,6 +3620,7 @@ fn persist_accepted_with_snapshot(
         cancel_pending: false,
         owner_pause_cancel: None,
         terminal: None,
+        pre_start_refusal: None,
         fallback_digest: Some(digest),
         env_not_forwarded: None,
         queue_position: None,
@@ -3816,7 +3819,7 @@ async fn exec_remote_bash_post_spawn_persistence_failure_never_claims_no_run() {
                 .start_remote_worker(
                     task,
                     Some((
-                        request,
+                        request.map_err(RemoteRequestError::Build),
                         LocalFallback {
                             plan,
                             shell_path,
@@ -5551,6 +5554,7 @@ fn remote_phase_comes_from_acceptance_started_or_output() {
         cancel_pending: false,
         owner_pause_cancel: None,
         terminal: None,
+        pre_start_refusal: None,
         fallback_digest: None,
         env_not_forwarded: None,
         queue_position: None,
@@ -5667,6 +5671,7 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
         cancel_pending: false,
         owner_pause_cancel: None,
         terminal: None,
+        pre_start_refusal: None,
         fallback_digest: None,
         env_not_forwarded: None,
         queue_position: None,
@@ -6060,6 +6065,7 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
         cancel_pending: false,
         owner_pause_cancel: None,
         terminal: None,
+        pre_start_refusal: None,
         fallback_digest: None,
         env_not_forwarded: None,
         queue_position: None,
@@ -8513,6 +8519,875 @@ async fn runon_non_git_workdir_is_refused_by_name_before_dispatch() {
         exec_runs(&daemon).is_empty(),
         "a non-git cwd must never dispatch"
     );
+}
+
+#[tokio::test]
+async fn runon_cd_refusal_has_distinct_code_and_no_execution() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let checkout = dir.path().join("checkout");
+    let other = dir.path().join("other");
+    fs::create_dir_all(&checkout).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    git_fixture(&other);
+    let ctx = remote_test_context(&checkout);
+    let marker = checkout.join("must-not-run-locally");
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({
+            "command": format!("cd '{}'; printf local-proof > '{}'", other.display(), marker.display()),
+            "runon": "linux", "compressed": false,
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap();
+    let done = terminal(ctx.bash_background(), task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    assert_eq!(
+        done.exit_code, None,
+        "refused before start, not a process exit"
+    );
+    assert_eq!(done.child_pid, None);
+    let refusal = refusal_response(done);
+    assert_eq!(
+        refusal.data["code"], "runon_cd_outside_checkout",
+        "{refusal:?}"
+    );
+    let expected = format!(
+        "runon refused: the command changes into {}, which is outside the checkout the build server copies ({}); the command did not run. Set the bash tool's workdir to that folder instead of using cd.",
+        other.canonicalize().unwrap().display(), checkout.canonicalize().unwrap().display()
+    );
+    assert_eq!(refusal.data["message"], expected);
+    assert_eq!(
+        crate::subc_format::format_response("bash", &refusal, false),
+        expected
+    );
+    let task = ctx.bash_background().task(task_id).unwrap();
+    let state = task.state.lock().unwrap();
+    let persisted = serde_json::to_value(&state.metadata).unwrap();
+    assert_eq!(
+        persisted["remote"]["pre_start_refusal"]["code"],
+        "runon_cd_outside_checkout"
+    );
+    assert_eq!(persisted["remote"]["pre_start_refusal"]["ran"], "none");
+    assert!(persisted["remote"]["terminal"].is_null());
+    assert!(persisted["remote"]["job_id"].is_null());
+    let restored: PersistedTask = serde_json::from_value(persisted).unwrap();
+    let restored_refusal = remote_refusal(&restored).unwrap();
+    assert_eq!(restored_refusal.code, "runon_cd_outside_checkout");
+    assert_eq!(restored_refusal.message, expected);
+    assert!(!restored.local_fallback_started);
+    let storage = crate::bash_background::task_storage_dir(&ctx);
+    let persisted_path = task.paths.json.clone();
+    drop(state);
+    drop(task);
+    let restarted = registry();
+    assert!(restarted.task(task_id).is_none());
+    assert!(persisted_path.exists());
+    restarted.replay_session(&storage, "session").unwrap();
+    let replayed = terminal(&restarted, task_id).await;
+    let replayed_refusal = refusal_response(replayed);
+    assert_eq!(replayed_refusal.data["code"], "runon_cd_outside_checkout");
+    assert_eq!(replayed_refusal.data["message"], expected);
+    assert!(exec_runs(&daemon).is_empty(), "a refusal must never submit");
+    assert!(!marker.exists(), "a refusal must never spawn locally");
+}
+
+#[tokio::test]
+async fn runon_cd_declared_siblings_are_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let checkout = dir.path().join("checkout");
+    let commons = dir.path().join("commons");
+    fs::create_dir_all(&checkout).unwrap();
+    fs::create_dir_all(commons.join("nested")).unwrap();
+    git_fixture(&commons);
+    let ctx = remote_test_context(&checkout);
+    let commons = commons.canonicalize().unwrap();
+    for line in [
+        "cd ../commons && printf remote",
+        "pushd ../commons/nested; printf remote",
+    ] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let mut policy = launch(daemon.connection.clone());
+        policy.params.siblings = vec![commons.to_str().unwrap().to_owned()];
+        let response = handle_with_policy(
+            &ctx,
+            Some(policy),
+            serde_json::json!({"command": line, "runon": "linux", "compressed": false}),
+        );
+        assert!(response.success, "{line}: {response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        assert_eq!(
+            done.info.status,
+            BgTaskStatus::Completed,
+            "{line}: {done:?}"
+        );
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0]["command"], line);
+        assert_eq!(runs[0]["siblings"], serde_json::json!([commons]));
+    }
+}
+
+#[tokio::test]
+async fn runon_cd_linked_worktree_sibling_alias_is_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main");
+    let commons = dir.path().join("commons");
+    git_fixture(&main);
+    git_fixture(&commons);
+    let worktree = dir.path().join("worktrees/worker");
+    add_git_worktree(&main, &worktree, "cd-sibling-alias");
+    let ctx = remote_test_context(&worktree);
+    let worktree = worktree.canonicalize().unwrap();
+    let commons = commons.canonicalize().unwrap();
+    assert!(!worktree.parent().unwrap().join("commons").exists());
+    for line in [
+        "cd ../commons && printf remote",
+        "cd ../commons/nested && printf remote",
+    ] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let mut policy = launch(daemon.connection.clone());
+        policy.params.siblings = vec![commons.to_str().unwrap().to_owned()];
+        let response = handle_with_policy(
+            &ctx,
+            Some(policy),
+            serde_json::json!({
+                "command": line, "runon": "linux", "compressed": false,
+            }),
+        );
+        assert!(response.success, "{response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        assert_eq!(
+            done.info.status,
+            BgTaskStatus::Completed,
+            "{line}: {done:?}"
+        );
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0]["workspace_key"], worktree.to_str().unwrap());
+        assert_eq!(runs[0]["siblings"], serde_json::json!([commons]));
+        assert_eq!(runs[0]["command"], line);
+    }
+}
+
+#[tokio::test]
+async fn runon_cd_windows_absolute_targets_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let checkout = dir.path().join("checkout");
+    let commons = dir.path().join("commons");
+    git_fixture(&checkout);
+    git_fixture(&commons);
+    let ctx = remote_test_context(&checkout);
+    let checkout = checkout.canonicalize().unwrap();
+    let commons = commons.canonicalize().unwrap();
+    let marker = checkout.join("must-not-run-locally");
+    for target in [&checkout, &commons, &PathBuf::from("/tmp")] {
+        let daemon = windows_daemon(Some(0), true).await;
+        let mut policy = launch(daemon.connection.clone());
+        policy.params.siblings = vec![commons.to_str().unwrap().to_owned()];
+        let response = handle_with_policy(
+            &ctx,
+            Some(policy),
+            serde_json::json!({
+                "command": format!("cd '{}'; printf local-proof > '{}'", target.display(), marker.display()),
+                "runon": "windows", "compressed": false,
+            }),
+        );
+        assert!(response.success, "{response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        assert_eq!(
+            done.info.status,
+            BgTaskStatus::Failed,
+            "{target:?}: {done:?}"
+        );
+        let refusal = refusal_response(done);
+        assert_eq!(refusal.data["code"], "runon_cd_outside_checkout");
+        let expected = format!(
+            "runon refused: the command changes into {}, which is not valid on the Windows runner because absolute command paths are not translated (checkout {}); the command did not run. Set the bash tool's workdir to that folder instead of using cd.",
+            target.canonicalize().unwrap().display(), checkout.display()
+        );
+        assert_eq!(refusal.data["message"], expected);
+        assert!(exec_runs(&daemon).is_empty(), "a refusal must never submit");
+        assert!(!marker.exists(), "a refusal must never spawn locally");
+    }
+}
+
+#[tokio::test]
+async fn runon_cd_windows_relative_targets_are_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let checkout = dir.path().join("checkout");
+    let commons = dir.path().join("commons");
+    git_fixture(&checkout);
+    git_fixture(&commons);
+    fs::create_dir(checkout.join("nested")).unwrap();
+    let ctx = remote_test_context(&checkout);
+    let commons = commons.canonicalize().unwrap();
+    for line in [
+        "cd nested && printf remote",
+        "cd ../commons && printf remote",
+    ] {
+        let daemon = windows_daemon(Some(0), true).await;
+        let mut policy = launch(daemon.connection.clone());
+        policy.params.siblings = vec![commons.to_str().unwrap().to_owned()];
+        let response = handle_with_policy(
+            &ctx,
+            Some(policy),
+            serde_json::json!({
+                "command": line, "runon": "windows", "compressed": false,
+            }),
+        );
+        assert!(response.success, "{response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        assert_eq!(
+            done.info.status,
+            BgTaskStatus::Completed,
+            "{line}: {done:?}"
+        );
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0]["command"], line);
+        assert_eq!(runs[0]["platform"], "windows");
+    }
+}
+
+#[tokio::test]
+async fn runon_cd_system_and_missing_non_home_paths_are_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(dir.path());
+    let outside = tempfile::Builder::new()
+        .prefix("aft-runon-system-")
+        .tempdir_in("/var/tmp")
+        .unwrap();
+    let outside = outside.path().canonicalize().unwrap();
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    assert!(!outside.starts_with(home));
+    assert!(crate::root_identity::nearest_git_marker(&outside)
+        .unwrap()
+        .is_none());
+    for target in [
+        PathBuf::from("/tmp"),
+        PathBuf::from("/usr"),
+        outside.join("missing"),
+    ] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let line = format!("cd '{}' && printf remote", target.display());
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({"command": line, "runon": "linux", "compressed": false}),
+        );
+        assert!(response.success, "{response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        assert_eq!(
+            done.info.status,
+            BgTaskStatus::Completed,
+            "{target:?}: {done:?}"
+        );
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0]["command"], line);
+    }
+}
+
+#[tokio::test]
+async fn runon_cd_other_local_checkout_outside_home_is_refused() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(dir.path());
+    let outside = tempfile::Builder::new()
+        .prefix("aft-runon-other-repo-")
+        .tempdir_in("/var/tmp")
+        .unwrap();
+    let outside = outside.path().canonicalize().unwrap();
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    assert!(!outside.starts_with(home));
+    git_fixture(&outside);
+    let marker = dir.path().join("must-not-run-locally");
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({
+            "command": format!("cd '{}'; printf local-proof > '{}'", outside.join("missing").display(), marker.display()),
+            "runon": "linux", "compressed": false,
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let done = terminal(
+        ctx.bash_background(),
+        response.data["task_id"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    let refusal = refusal_response(done);
+    assert_eq!(refusal.data["code"], "runon_cd_outside_checkout");
+    assert!(exec_runs(&daemon).is_empty(), "a refusal must never submit");
+    assert!(!marker.exists(), "a refusal must never spawn locally");
+}
+
+#[tokio::test]
+async fn runon_cd_outside_checkout_is_refused_before_submit() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let checkout = dir.path().join("checkout");
+    let sibling = dir.path().join("sibling-repo");
+    fs::create_dir_all(&checkout).unwrap();
+    fs::create_dir_all(&sibling).unwrap();
+    git_fixture(&sibling);
+    let ctx = remote_test_context(&checkout);
+    let checkout = checkout.canonicalize().unwrap();
+    let sibling = sibling.canonicalize().unwrap();
+    let marker = checkout.join("must-not-run-locally");
+    let home_target =
+        PathBuf::from(std::env::var_os("HOME").unwrap()).join("aft-runon-outside-checkout");
+    let cases = [
+        (format!("cd '{}'", sibling.display()), sibling.clone()),
+        ("cd ~/aft-runon-outside-checkout".into(), home_target),
+        ("cd ../sibling-repo".into(), sibling.clone()),
+        (
+            "cd ../sibling-repo && printf remote; printf continuation".into(),
+            sibling.clone(),
+        ),
+        (format!("pushd '{}'", sibling.display()), sibling),
+    ];
+    for (line, target) in cases {
+        let command = format!("{line}; printf local-proof > '{}'", marker.display());
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({"command": command, "runon": "linux", "compressed": false}),
+        );
+        assert!(response.success, "{line}: {response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        assert_eq!(done.info.status, BgTaskStatus::Failed, "{line}: {done:?}");
+        let refusal = refusal_response(done);
+        assert_eq!(
+            refusal.data["code"], "runon_cd_outside_checkout",
+            "{refusal:?}"
+        );
+        let expected = format!(
+            "runon refused: the command changes into {}, which is outside the checkout the build server copies ({}); the command did not run. Set the bash tool's workdir to that folder instead of using cd.",
+            target.display(), checkout.display()
+        );
+        assert!(
+            refusal.data["message"]
+                .as_str()
+                .unwrap()
+                .contains(&expected),
+            "{line}: {refusal:?}"
+        );
+        assert!(
+            exec_runs(&daemon).is_empty(),
+            "{line}: a refused command reached the runner"
+        );
+        assert!(!marker.exists(), "a refused runon must never spawn locally");
+    }
+}
+
+#[tokio::test]
+async fn runon_cd_unknown_set_keeps_known_folder_for_definite_exits() {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    let checkout = tempfile::Builder::new()
+        .prefix("aft-runon-unknown-set-")
+        .tempdir_in(&home)
+        .unwrap();
+    let ctx = remote_test_context(checkout.path());
+    fs::create_dir(checkout.path().join("nested")).unwrap();
+    let marker = checkout.path().join("must-not-run-locally");
+    for line in [
+        "set \"$OPTS\"; cd ..",
+        "set -P; set \"$OPTS\"; cd ..",
+        "set -o \"$OPT\"; cd ..",
+        "set \"$OPTS\"; cd nested && cd .. && cd ..",
+        "set \"$OPTS\" && cd ..",
+        "set \"$OPTS\" || cd ..",
+    ] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({
+                "command": format!("{line}; printf local-proof > '{}'", marker.display()), "runon": "linux", "compressed": false,
+            }),
+        );
+        assert!(response.success, "{line}: {response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        assert_eq!(done.info.status, BgTaskStatus::Failed, "{line}: {done:?}");
+        let refusal = refusal_response(done);
+        assert_eq!(refusal.data["code"], "runon_cd_outside_checkout");
+        assert!(
+            refusal.data["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("changes into {},", home.display())),
+            "{line}: {refusal:?}"
+        );
+        assert!(exec_runs(&daemon).is_empty(), "a refusal must never submit");
+        assert!(!marker.exists(), "runon must never spawn locally");
+    }
+}
+
+#[tokio::test]
+async fn runon_cd_unknown_mode_requires_both_resolutions_to_be_invalid() {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    let checkout = tempfile::Builder::new()
+        .prefix("aft-runon-mode-pair-")
+        .tempdir_in(&home)
+        .unwrap();
+    let outside = tempfile::Builder::new()
+        .prefix("aft-runon-mode-target-")
+        .tempdir_in(&home)
+        .unwrap();
+    let deep = checkout.path().join("deep");
+    fs::create_dir(&deep).unwrap();
+    fs::create_dir_all(outside.path().join("a/b/c")).unwrap();
+    fs::create_dir_all(deep.join("a/b/c")).unwrap();
+    std::os::unix::fs::symlink("..", deep.join("link")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("a/b/c"), deep.join("jump")).unwrap();
+    std::os::unix::fs::symlink("a/b/c", deep.join("reenter")).unwrap();
+    let ctx = remote_test_context(checkout.path());
+    for (line, refused) in [
+        ("set \"$OPTS\"; cd link/..", false),
+        ("set \"$OPTS\"; cd link/.. && cd ../..", false),
+        ("set \"$OPTS\"; cd reenter/../../..", false),
+        ("set \"$OPTS\"; cd reenter/../../.. && cd ../../..", false),
+        ("set \"$OPTS\"; cd jump/../../..", true),
+        ("set \"$OPTS\"; cd -P link/..", true),
+        ("set \"$OPTS\"; cd -L link/..", false),
+    ] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({
+                "command": line, "runon": "linux", "workdir": deep, "compressed": false,
+            }),
+        );
+        assert!(response.success, "{line}: {response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        if refused {
+            assert_eq!(done.info.status, BgTaskStatus::Failed, "{line}: {done:?}");
+            assert_eq!(
+                refusal_response(done).data["code"],
+                "runon_cd_outside_checkout"
+            );
+            assert!(exec_runs(&daemon).is_empty(), "a refusal must never submit");
+        } else {
+            assert_eq!(
+                done.info.status,
+                BgTaskStatus::Completed,
+                "{line}: {done:?}"
+            );
+            let runs = exec_runs(&daemon);
+            assert_eq!(runs.len(), 1, "{line}: {runs:?}");
+            assert_eq!(runs[0]["command"], line);
+        }
+    }
+}
+
+#[tokio::test]
+async fn runon_cd_background_jobs_preserve_foreground_directory() {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    let checkout = tempfile::Builder::new()
+        .prefix("aft-runon-background-")
+        .tempdir_in(&home)
+        .unwrap();
+    let ctx = remote_test_context(checkout.path());
+    fs::create_dir(checkout.path().join("nested")).unwrap();
+    let marker = checkout.path().join("must-not-run-locally");
+    for (line, refused) in [
+        ("sleep 1 & cd ..", true),
+        ("cd nested & cd ..", true),
+        ("cd nested && sleep 1 & cd ..", true),
+        ("false && cd nested & cd ..", true),
+        ("source ./script & cd ..", true),
+        ("set \"$OPTS\" & cd ..", true),
+        ("set -- \"$OPTS\"; sleep 1 & cd ..", true),
+        ("sleep 1 & cd nested && cd ..", false),
+        ("cd nested && { sleep 1 & cd ..; }", false),
+        ("false & cd ..", true),
+        ("sleep 1 & false && cd ..", false),
+        ("cd nested; sleep 1 & cd ..", true),
+    ] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let command = format!("{line}; printf local-proof > '{}'", marker.display());
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({
+                "command": command, "runon": "linux", "compressed": false,
+            }),
+        );
+        assert!(response.success, "{line}: {response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        if refused {
+            assert_eq!(done.info.status, BgTaskStatus::Failed, "{line}: {done:?}");
+            let refusal = refusal_response(done);
+            assert_eq!(refusal.data["code"], "runon_cd_outside_checkout");
+            assert!(exec_runs(&daemon).is_empty(), "a refusal must never submit");
+        } else {
+            assert_eq!(
+                done.info.status,
+                BgTaskStatus::Completed,
+                "{line}: {done:?}"
+            );
+            let runs = exec_runs(&daemon);
+            assert_eq!(runs.len(), 1, "{line}: {runs:?}");
+            assert_eq!(runs[0]["command"], command);
+        }
+        assert!(!marker.exists(), "runon must never spawn locally");
+    }
+}
+
+#[tokio::test]
+async fn runon_cd_shell_physical_option_tracks_later_changes() {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    let checkout = tempfile::Builder::new()
+        .prefix("aft-runon-set-mode-")
+        .tempdir_in(&home)
+        .unwrap();
+    let deep = checkout.path().join("deep");
+    fs::create_dir(&deep).unwrap();
+    std::os::unix::fs::symlink("..", deep.join("link")).unwrap();
+    let ctx = remote_test_context(checkout.path());
+    let marker = checkout.path().join("must-not-run-locally");
+    for (line, refused) in [
+        ("set -P; cd link && cd ..", true),
+        ("set -o physical; cd link && cd ..", true),
+        ("set -P; set +P; cd link && cd ..", false),
+        ("set -o physical; set +o physical; cd link && cd ..", false),
+        ("set -P; cd -L link && cd ..", true),
+        ("set -P; cd -L link && cd -L ..", false),
+        ("set +P; cd -P link && cd ..", true),
+        ("set -- -P; cd link && cd ..", false),
+        ("set value -P; cd link && cd ..", false),
+        ("set -eP; cd link && cd ..", true),
+        ("set -P +P; cd link && cd ..", false),
+        ("set +P -P; cd link && cd ..", true),
+        ("false && set -P; cd link && cd ..", false),
+        ("true || set -P; cd link && cd ..", false),
+        ("maybe && set -P; cd link && cd ..", true),
+        ("false || set -P; cd link && cd ..", true),
+        ("set -P & cd link && cd ..", false),
+        ("set -P; set +P & cd link && cd ..", true),
+        ("source ./script; cd link && cd ..", false),
+        ("set \"$OPTS\"; cd link && cd ..", false),
+        ("set -P; set \"$OPTS\"; cd link && cd ..", false),
+    ] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let command = format!("{line}; printf local-proof > '{}'", marker.display());
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({
+                "command": command, "runon": "linux", "workdir": deep, "compressed": false,
+            }),
+        );
+        assert!(response.success, "{line}: {response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        if refused {
+            assert_eq!(done.info.status, BgTaskStatus::Failed, "{line}: {done:?}");
+            let refusal = refusal_response(done);
+            assert_eq!(refusal.data["code"], "runon_cd_outside_checkout");
+            assert!(exec_runs(&daemon).is_empty(), "a refusal must never submit");
+        } else {
+            assert_eq!(
+                done.info.status,
+                BgTaskStatus::Completed,
+                "{line}: {done:?}"
+            );
+            let runs = exec_runs(&daemon);
+            assert_eq!(runs.len(), 1, "{line}: {runs:?}");
+            assert_eq!(runs[0]["command"], command);
+        }
+        assert!(!marker.exists(), "runon must never spawn locally");
+    }
+}
+
+#[tokio::test]
+async fn runon_cd_logical_symlinks_and_physical_mode_are_distinct() {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    let checkout = tempfile::Builder::new()
+        .prefix("aft-runon-logical-")
+        .tempdir_in(&home)
+        .unwrap();
+    let deep = checkout.path().join("deep");
+    fs::create_dir(&deep).unwrap();
+    std::os::unix::fs::symlink("..", deep.join("link")).unwrap();
+    let ctx = remote_test_context(checkout.path());
+    let marker = checkout.path().join("must-not-run-locally");
+    for (line, refused) in [
+        ("cd link && cd ..", false),
+        ("pushd link && cd ..", false),
+        ("cd link/..", false),
+        ("cd -L link && cd ..", false),
+        ("cd -P link && cd ..", true),
+        ("cd -P link/..", true),
+        ("cd -P -L link && cd ..", false),
+        ("cd -L -P link && cd ..", true),
+        ("cd -PL link && cd ..", false),
+        ("cd -LP link && cd ..", true),
+        ("cd '-P' link && cd ..", true),
+        ("cd -- link && cd ..", false),
+        ("maybe && cd link; cd ..", false),
+        ("cd link || cd .; cd ..", false),
+        ("cd -P link || cd .; cd ..", true),
+    ] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let command = format!("{line}; printf local-proof > '{}'", marker.display());
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({
+                "command": command, "runon": "linux", "workdir": deep, "compressed": false,
+            }),
+        );
+        assert!(response.success, "{line}: {response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        if refused {
+            assert_eq!(done.info.status, BgTaskStatus::Failed, "{line}: {done:?}");
+            let refusal = refusal_response(done);
+            assert_eq!(refusal.data["code"], "runon_cd_outside_checkout");
+            assert!(
+                refusal.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("changes into {},", home.display())),
+                "{line}: {refusal:?}"
+            );
+            assert!(exec_runs(&daemon).is_empty(), "a refusal must never submit");
+        } else {
+            assert_eq!(
+                done.info.status,
+                BgTaskStatus::Completed,
+                "{line}: {done:?}"
+            );
+            let runs = exec_runs(&daemon);
+            assert_eq!(runs.len(), 1, "{line}: {runs:?}");
+            assert_eq!(runs[0]["command"], command);
+        }
+        assert!(!marker.exists(), "runon must never spawn locally");
+    }
+}
+
+#[tokio::test]
+async fn runon_cd_skipped_changes_do_not_hide_checkout_exits() {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    let checkout = tempfile::Builder::new()
+        .prefix("aft-runon-branches-")
+        .tempdir_in(&home)
+        .unwrap();
+    let ctx = remote_test_context(checkout.path());
+    fs::create_dir(checkout.path().join("nested")).unwrap();
+    let marker = checkout.path().join("must-not-run-locally");
+    for (line, refused) in [
+        ("false && cd nested; cd ..", true),
+        ("maybe && cd nested; cd ..", true),
+        ("cd nested; cd ..", true),
+        ("true || cd nested; cd ..", true),
+        ("cd \"$X\" || cd ..", true),
+        ("cd nested && cd ..", false),
+        ("false || cd nested && cd ..", false),
+        ("false && cd nested || cd nested && cd ..", false),
+        ("false && cd ../must-not-execute", false),
+        ("true || cd ..", false),
+        ("cd \"$X\" && cd ..", false),
+    ] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let command = format!("{line}; printf local-proof > '{}'", marker.display());
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({
+                "command": command, "runon": "linux", "compressed": false,
+            }),
+        );
+        assert!(response.success, "{line}: {response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        if refused {
+            assert_eq!(done.info.status, BgTaskStatus::Failed, "{line}: {done:?}");
+            let refusal = refusal_response(done);
+            assert_eq!(refusal.data["code"], "runon_cd_outside_checkout");
+            assert!(
+                refusal.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("changes into {},", home.display())),
+                "{line}: {refusal:?}"
+            );
+            assert!(exec_runs(&daemon).is_empty(), "a refusal must never submit");
+        } else {
+            assert_eq!(
+                done.info.status,
+                BgTaskStatus::Completed,
+                "{line}: {done:?}"
+            );
+            let runs = exec_runs(&daemon);
+            assert_eq!(runs.len(), 1, "{line}: {runs:?}");
+            assert_eq!(runs[0]["command"], command);
+        }
+        assert!(!marker.exists(), "runon must never spawn locally");
+    }
+}
+
+#[tokio::test]
+async fn runon_cd_sequential_targets_follow_the_shell_cwd() {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    let checkout = tempfile::Builder::new()
+        .prefix("aft-runon-cwd-")
+        .tempdir_in(&home)
+        .unwrap();
+    let ctx = remote_test_context(checkout.path());
+    fs::create_dir(checkout.path().join("nested")).unwrap();
+    let marker = checkout.path().join("must-not-run-locally");
+    for (line, refused) in [
+        ("cd nested && cd .. && printf remote", false),
+        ("pushd nested && cd .. && printf remote", false),
+        ("cd nested && cd ../.. && printf remote", true),
+        ("cd \"$X\" && cd .. && printf remote", false),
+        ("cd - && cd .. && printf remote", false),
+        ("popd && cd .. && printf remote", false),
+        ("(cd nested) && cd .. && printf remote", false),
+    ] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let command = format!("{line}; printf local-proof > '{}'", marker.display());
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({"command": command, "runon": "linux", "compressed": false}),
+        );
+        assert!(response.success, "{line}: {response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        if refused {
+            assert_eq!(done.info.status, BgTaskStatus::Failed, "{line}: {done:?}");
+            let refusal = refusal_response(done);
+            assert_eq!(refusal.data["code"], "runon_cd_outside_checkout");
+            let expected = format!(
+                "runon refused: the command changes into {}, which is outside the checkout the build server copies ({}); the command did not run. Set the bash tool's workdir to that folder instead of using cd.",
+                home.display(), checkout.path().canonicalize().unwrap().display()
+            );
+            assert_eq!(refusal.data["message"], expected);
+            assert!(exec_runs(&daemon).is_empty(), "a refusal must never submit");
+        } else {
+            assert_eq!(
+                done.info.status,
+                BgTaskStatus::Completed,
+                "{line}: {done:?}"
+            );
+            let runs = exec_runs(&daemon);
+            assert_eq!(runs.len(), 1, "{line}: {runs:?}");
+            assert_eq!(runs[0]["command"], command);
+        }
+        assert!(!marker.exists(), "runon must never spawn locally");
+    }
+}
+
+#[tokio::test]
+async fn runon_cd_inside_checkout_and_unresolved_or_nested_targets_are_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(dir.path());
+    fs::create_dir(dir.path().join("nested")).unwrap();
+    let lines = [
+        "cd nested && printf remote",
+        "cd ./nested/..; printf remote",
+        "cd \"$OTHER_CHECKOUT\"; printf remote",
+        "cd -; printf remote",
+        "printf '%s' \"$(cd /outside-checkout; pwd)\"",
+        "(cd /outside-checkout; printf remote)",
+    ];
+    for line in lines {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({"command": line, "runon": "linux", "compressed": false}),
+        );
+        assert!(response.success, "{line}: {response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        assert_eq!(
+            done.info.status,
+            BgTaskStatus::Completed,
+            "{line}: {done:?}"
+        );
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0]["command"], line);
+    }
 }
 
 #[tokio::test]
