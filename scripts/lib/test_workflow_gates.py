@@ -215,13 +215,23 @@ class CISpeedWorkflowTests(unittest.TestCase):
         self.assertEqual(len(caches), 1)
         cache = caches[0]
         self.assertEqual(cache["uses"], "actions/cache/restore@v4")
-        self.assertEqual(cache["with"]["path"], "target/release/aft")
+        self.assertEqual(cache["with"]["path"], "target/ci-storm/aft")
         self.assertIn("${{ github.sha }}", cache["with"]["key"])
         self.assertIn("${{ steps.rust.outputs.cachekey }}", cache["with"]["key"])
         self.assertNotIn("restore-keys", cache["with"])
-        build = next(step for step in producer["steps"] if step.get("name") == "Build shared release AFT")
+        build = next(step for step in producer["steps"] if step.get("name") == "Build shared search-quality AFT")
         self.assertIn("release-binary.outputs.cache-hit", build["if"])
-        self.assertEqual(build["run"], "cargo build --release --locked -p agent-file-tools --bin aft")
+        self.assertEqual(build["run"], "cargo build --profile ci-storm --locked -p agent-file-tools --bin aft")
+        # The gate must read the same profile's binary it downloads, and its
+        # fallback build must produce it, or the benchmark would score a
+        # binary of a different build than the producer measured.
+        gate = workflow["jobs"]["search-quality-gate"]
+        download = next(step for step in gate["steps"] if step.get("id") == "download-release-aft")
+        self.assertEqual(download["with"]["path"], "target/ci-storm")
+        fallback = next(step for step in gate["steps"] if step.get("name") == "Build the product binary when the artifact is absent")
+        self.assertEqual(fallback["run"], build["run"])
+        evaluate = next(step for step in gate["steps"] if step.get("name") == "Evaluate committed search-quality reference")
+        self.assertEqual(evaluate["env"]["AFT_BINARY_PATH"], "${{ github.workspace }}/target/ci-storm/aft")
 
     def test_direct_ci_storm_nextest_run_keeps_all_failures(self) -> None:
         root = Path(__file__).resolve().parents[2]
