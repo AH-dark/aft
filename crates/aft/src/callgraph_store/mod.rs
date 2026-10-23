@@ -13247,7 +13247,8 @@ fn sweep_orphaned_build_temps_older_than(callgraph_dir: &Path, min_age: Duration
     let Ok(entries) = std::fs::read_dir(callgraph_dir) else {
         return;
     };
-    let mut removed_any = false;
+    let mut removed_files = 0u64;
+    let mut removed_bytes = 0u64;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         // Build-temporary shape: `<key>.g...sqlite.tmp.<pid>.<ts>`. The
@@ -13270,13 +13271,29 @@ fn sweep_orphaned_build_temps_older_than(callgraph_dir: &Path, min_age: Duration
         // this overlap practically impossible, but treat a missing file as success
         // (the rename won) rather than an error, and never touch a path that does
         // not match the temporary shape above.
+        let bytes = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
         match std::fs::remove_file(entry.path()) {
-            Ok(()) => removed_any = true,
+            Ok(()) => {
+                removed_files += 1;
+                removed_bytes += bytes;
+                crate::slog_debug!(
+                    "removed orphaned callgraph build temporary {} ({} bytes)",
+                    entry.path().display(),
+                    bytes
+                );
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => {}
         }
     }
-    if removed_any {}
+    if removed_files > 0 {
+        crate::slog_info!(
+            "callgraph orphaned build temp sweep: removed_files={} removed_bytes={} directory={}",
+            removed_files,
+            removed_bytes,
+            callgraph_dir.display()
+        );
+    }
 }
 
 /// Bound the cold-build's tree-sitter pass to half the cores (cap 8) instead of
@@ -25837,6 +25854,40 @@ mod cold_build_insert_tests {
         assert!(
             !dead_dir.join(orphan).exists(),
             "another key's orphan on the mounted callgraph folder must be reclaimed"
+        );
+    }
+
+    #[test]
+    fn orphan_temp_sweep_logs_successful_removal_count_bytes_and_directory() {
+        let dir = tempdir().unwrap();
+        let orphan = "project.g100.1.sqlite.tmp.1.200";
+        let journal = format!("{orphan}-journal");
+        let fresh = "project.g300.1.sqlite.tmp.1.400";
+        for name in [orphan, journal.as_str()] {
+            write_build_temp_with_age(
+                dir.path(),
+                name,
+                ORPHANED_BUILD_TEMP_MIN_AGE + Duration::from_secs(60),
+            );
+        }
+        write_build_temp_with_age(dir.path(), fresh, Duration::ZERO);
+        let bytes = fs::metadata(dir.path().join(orphan)).unwrap().len()
+            + fs::metadata(dir.path().join(&journal)).unwrap().len();
+        let (_, lines) =
+            crate::logging::capture_log_lines(|| sweep_orphaned_build_temps(dir.path()));
+        let expected = format!("callgraph orphaned build temp sweep: removed_files=2 removed_bytes={bytes} directory={}", dir.path().display());
+        assert!(
+            lines.iter().any(|line| line.contains(&expected)),
+            "missing removal log: {lines:?}"
+        );
+        assert!(!dir.path().join(orphan).exists());
+        assert!(!dir.path().join(journal).exists());
+        assert!(dir.path().join(fresh).exists());
+        let (_, lines) =
+            crate::logging::capture_log_lines(|| sweep_orphaned_build_temps(dir.path()));
+        assert!(
+            !lines.iter().any(|line| line.contains("removed_files=")),
+            "a no-op sweep must not claim removals: {lines:?}"
         );
     }
 
