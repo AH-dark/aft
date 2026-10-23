@@ -1932,7 +1932,12 @@ impl BgTaskRegistry {
         }
         layout_cleanup.disarm();
         self.dual_write_task(&layout.paths, &metadata);
-        self.insert_rehydrated_task(metadata, layout.paths, false)?;
+        self.insert_registered_task(
+            metadata,
+            layout.paths,
+            false,
+            crate::bash_changed_files::current(),
+        )?;
         let task = self.task(&task_id).unwrap();
         task.holds_background_slot
             .store(slot.holds_slot(), Ordering::SeqCst);

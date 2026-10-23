@@ -10419,9 +10419,19 @@ impl BgTaskRegistry {
 
     fn insert_rehydrated_task(
         &self,
+        metadata: PersistedTask,
+        paths: TaskPaths,
+        detached: bool,
+    ) -> Result<(), String> {
+        self.insert_registered_task(metadata, paths, detached, None)
+    }
+
+    fn insert_registered_task(
+        &self,
         mut metadata: PersistedTask,
         paths: TaskPaths,
         detached: bool,
+        changed_files: Option<Arc<crate::bash_changed_files::Capture>>,
     ) -> Result<(), String> {
         let task_id = metadata.task_id.clone();
         let session_id = metadata.session_id.clone();
@@ -10451,7 +10461,7 @@ impl BgTaskRegistry {
         #[cfg(test)]
         wait_on_rehydrated_registration_gate_for_test(&task_id);
         let mut task = BgTask {
-            changed_files: None,
+            changed_files,
             completion_secrets: Mutex::new(
                 metadata
                     .has_safe_completion_redaction_after_restart()

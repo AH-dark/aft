@@ -688,6 +688,113 @@ async fn exec_remote_bash_refusal_runs_local_with_disclosure() {
     }
 }
 
+#[tokio::test]
+async fn bash_changed_files_new_runon_completion_keeps_local_window() {
+    assert_new_remote_changed_files(false).await;
+}
+
+#[tokio::test]
+async fn bash_changed_files_runon_local_fallback_completion_keeps_local_window() {
+    assert_new_remote_changed_files(true).await;
+}
+
+async fn assert_new_remote_changed_files(fallback: bool) {
+    let daemon = daemon(
+        if fallback {
+            Script::KnownRefused
+        } else {
+            Script::GatedStages { position: 1 }
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    ensure_git_fixture(project.path());
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(project.path().into()),
+            storage_dir: Some(storage.path().into()),
+            bash: crate::config::BashConfig {
+                changed_files: crate::config::BashChangedFiles::List,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let capture = crate::bash_changed_files::Capture::start(&ctx).unwrap();
+    let mut launch = launch(daemon.connection.clone());
+    launch.explicit_runon = !fallback;
+    let task_id = {
+        let _capture = crate::bash_changed_files::scope(Some(capture.clone()));
+        ctx.bash_background()
+            .spawn_remote(
+                launch,
+                SpawnPlan::Unsandboxed,
+                "printf local-change > local.txt; while [ ! -e \"$CHANGED_FILES_RELEASE\" ]; do sleep 0.01; done",
+                resolve_posix_shell(),
+                "session".into(),
+                project.path().into(),
+                HashMap::from([(
+                    "CHANGED_FILES_RELEASE".into(),
+                    storage.path().join("release").display().to_string(),
+                )]),
+                crate::bash_background::HardKill::from_timeout_ms(Some(20_000)),
+                storage.path().into(),
+                crate::bash_background::TaskSlot::Background { max: 10 },
+                true,
+                false,
+                Some(project.path().into()),
+            )
+            .unwrap()
+    };
+    if fallback {
+        wait_for("local fallback must write the project file", || {
+            project.path().join("local.txt").exists().then_some(())
+        })
+        .await;
+    } else {
+        std::fs::write(project.path().join("local.txt"), "local observer change\n").unwrap();
+    }
+    // Inject a file-create event into the project's changed-files tracker while
+    // the remote stream or fallback shell is held open, independently of OS delivery timing.
+    ctx.watcher_counters().bash_changes.get().unwrap().event(
+        &notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+            .add_path(project.path().canonicalize().unwrap().join("local.txt")),
+    );
+    std::fs::write(storage.path().join("release"), "").unwrap();
+    daemon.output_gate.notify_one();
+    daemon.completion_gate.notify_one();
+    let done = terminal(ctx.bash_background(), &task_id).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    let completion = wait_for("completion must retain its local change report", || {
+        ctx.bash_background()
+            .drain_completions_for_session(Some("session"))
+            .into_iter()
+            .find(|completion| completion.task_id == task_id)
+    })
+    .await;
+    let report = completion
+        .changed_files
+        .as_ref()
+        .expect("capture lost at remote registration");
+    assert!(
+        report.files.iter().any(|file| file.path == "local.txt"),
+        "{report:?}"
+    );
+    assert!(serde_json::to_value(&completion).unwrap()["_bash_changed_files"].is_object());
+
+    let task = ctx.bash_background().task(&task_id).unwrap();
+    let metadata = task.state.lock().unwrap().metadata.clone();
+    let replay = registry();
+    let _capture = crate::bash_changed_files::scope(Some(capture));
+    replay
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    assert!(replay.task(&task_id).unwrap().changed_files.is_none());
+}
+
 fn refusal_response(snapshot: BgTaskSnapshot) -> crate::protocol::Response {
     let now = std::time::Instant::now();
     match crate::commands::bash_orchestrate::decide_bash_step(
