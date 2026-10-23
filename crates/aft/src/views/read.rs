@@ -209,6 +209,8 @@ pub(crate) fn callgraph_paths_match_cached(
 
 /// Why a view generation published with the call graph off is not served.
 pub(crate) const CALLGRAPH_DISABLED: &str = "call graph is disabled (indexes.callgraph=false): this view generation was published without call graph data";
+pub(crate) const CALLGRAPH_READINESS_BUSY: &str = "callgraph_readiness_busy";
+pub(crate) const CALLGRAPH_READINESS_PROBE_FAILED: &str = "callgraph_readiness_probe_failed";
 
 /// Open exactly the selected generation. The caller decides whether its snapshot
 /// is acceptable; opening a reader must never replace a pinned generation with a

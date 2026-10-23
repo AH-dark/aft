@@ -904,6 +904,10 @@ pub struct ViewHealthSnapshot {
     /// it is set, the served generation is not following checkout changes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub publication_failure: Option<ViewPublicationFailure>,
+    /// A readiness probe could not determine whether the call graph is usable.
+    /// Publication must revalidate it; this is not evidence of a missing graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callgraph_readiness_deferred: Option<&'static str>,
 }
 
 /// Why a root's view publications keep failing; see
@@ -9107,6 +9111,18 @@ impl AppContext {
                 .unwrap_or_default(),
             cold_builds: crate::views::assembly::cold_build_counts(&state.snapshot.view_dir),
             publication_failure,
+            callgraph_readiness_deferred: state
+                .snapshot
+                .pending_inputs
+                .values()
+                .map(|input| input.reason)
+                .find(|reason| {
+                    matches!(
+                        *reason,
+                        crate::views::read::CALLGRAPH_READINESS_BUSY
+                            | crate::views::read::CALLGRAPH_READINESS_PROBE_FAILED
+                    )
+                }),
         })
     }
 
@@ -10262,11 +10278,14 @@ impl AppContext {
                     let generation = view.generation.as_deref().expect("pinned generation");
                     // A restart can leave HEAD unchanged while source bytes have
                     // changed. Do not answer from the old graph during that refresh.
-                    if view
-                        .pending_inputs
-                        .values()
-                        .any(|input| input.plane == "checkout")
-                    {
+                    if view.pending_inputs.values().any(|input| {
+                        input.plane == "checkout"
+                            || matches!(
+                                input.reason,
+                                crate::views::read::CALLGRAPH_READINESS_BUSY
+                                    | crate::views::read::CALLGRAPH_READINESS_PROBE_FAILED
+                            )
+                    }) {
                         return building();
                     }
                     if !crate::views::generation_matches_head(generation, &view.head_fingerprint) {

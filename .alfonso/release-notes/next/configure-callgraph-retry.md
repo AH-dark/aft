@@ -1,0 +1,1 @@
+- Call graphs now retry readiness checks blocked by database locks instead of leaving an older graph unrepaired after restart.

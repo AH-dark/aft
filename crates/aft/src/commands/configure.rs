@@ -8400,8 +8400,15 @@ fn open_view_runtime_for_configure(
     // Existing keys do not imply a usable graph: a binary upgrade can change
     // extraction or resolution without changing HEAD or checkout membership.
     // Schedule a replacement before the warm reader rejects the old output.
-    let callgraph_unready = input.callgraph
-        && generation.as_deref().is_some_and(|generation| {
+    enum GraphReadiness {
+        Ready,
+        Rebuild,
+        Retry(&'static str),
+    }
+    let callgraph_readiness = generation
+        .as_deref()
+        .filter(|_| input.callgraph)
+        .map_or(GraphReadiness::Ready, |generation| {
             // While the call graph is deferred (a linked worktree that no query
             // has needed the graph of yet), a missing derived graph is expected:
             // do not count it as unready. A republish would defer again; the
@@ -8409,29 +8416,35 @@ fn open_view_runtime_for_configure(
             if input.defer_callgraph
                 && !crate::views::read::derived_built(view.view_dir(), generation)
             {
-                return false;
+                return GraphReadiness::Ready;
             }
             match crate::callgraph_store::manifest_view_database_ready(
                 view.view_dir(), generation, Instant::now() + crate::db::TOOL_RETRY_BUSY_WAIT,
             ) {
-                Ok(ready) => !ready,
-                Err(error) if error.is_unreadable_database() => true,
+                Ok(true) => GraphReadiness::Ready,
+                Ok(false) => GraphReadiness::Rebuild,
+                Err(error) if error.is_unreadable_database() => GraphReadiness::Rebuild,
                 Err(error) if error.is_transient_lock_contention() => {
                     slog_info!(
                         "content-addressed view callgraph readiness unknown (busy) root={} generation={} reason=busy",
                         job.canonical_cache_root.display(), generation
                     );
-                    false
+                    GraphReadiness::Retry(crate::views::read::CALLGRAPH_READINESS_BUSY)
                 }
                 Err(error) => {
                     slog_warn!(
                         "content-addressed view callgraph readiness unknown root={} generation={} reason=probe_failed error={}",
                         job.canonical_cache_root.display(), generation, error
                     );
-                    false
+                    GraphReadiness::Retry(crate::views::read::CALLGRAPH_READINESS_PROBE_FAILED)
                 }
             }
         });
+    let callgraph_unready = matches!(callgraph_readiness, GraphReadiness::Rebuild);
+    let retry_reason = match callgraph_readiness {
+        GraphReadiness::Retry(reason) => Some(reason),
+        _ => None,
+    };
     if callgraph_unready {
         slog_info!(
             "content-addressed view callgraph rebuild scheduled root={} generation={} reason=derived_not_ready",
@@ -8439,7 +8452,10 @@ fn open_view_runtime_for_configure(
             generation.as_deref().unwrap_or_default()
         );
     }
-    let mut pending_paths = if callgraph_missing || callgraph_unready {
+    // An inconclusive probe must be revalidated by publication, not recorded as
+    // a ready graph. Assembly will wait within its own budget or retain a
+    // publication failure with a retry deadline if the lock persists.
+    let mut pending_paths = if callgraph_missing || callgraph_unready || retry_reason.is_some() {
         head_paths.clone()
     } else if generation_matches_head {
         BTreeSet::new()
@@ -8455,6 +8471,18 @@ fn open_view_runtime_for_configure(
             .collect::<BTreeSet<_>>()
     };
     let mut pending_inputs = BTreeMap::new();
+    if let Some(reason) = retry_reason {
+        for path in &head_paths {
+            pending_inputs.insert(
+                path.clone(),
+                crate::views::assembly::PendingInput {
+                    plane: "callgraph",
+                    reason,
+                    blob_key: None,
+                },
+            );
+        }
+    }
     if input.callgraph {
         if let Some(manifest) = manifest.as_ref() {
             if let Some(path) = view_verification_publication_path(
@@ -10367,7 +10395,7 @@ mod tests {
     }
 
     #[test]
-    fn busy_readiness_does_not_schedule_a_configure_rebuild() {
+    fn busy_readiness_defers_revalidation_without_a_cold_rebuild() {
         let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -10389,7 +10417,7 @@ mod tests {
             desired_head: crate::views::assembly::head_tree_fingerprint(
                 &crate::alias::head_tree_entries(&root).unwrap(),
             ),
-            project_root: root,
+            project_root: root.clone(),
             changed_paths: BTreeSet::new(),
             semantic_keys: Default::default(),
             require_semantic: false,
@@ -10418,13 +10446,24 @@ mod tests {
             .success
         );
         super::drain_deferred_configure_maintenance(&ctx);
-        assert!(
-            ctx.view_runtime_snapshot()
-                .unwrap()
-                .pending_paths
-                .is_empty(),
-            "busy readiness must not schedule a configure rebuild"
+        let pending = ctx.view_runtime_snapshot().unwrap();
+        assert!(!pending.pending_paths.is_empty());
+        assert!(pending
+            .pending_inputs
+            .values()
+            .any(|input| { input.reason == crate::views::read::CALLGRAPH_READINESS_BUSY }));
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Building
+        ));
+        let health = ctx.view_health_snapshot().unwrap();
+        assert_eq!(
+            health.callgraph_readiness_deferred,
+            Some(crate::views::read::CALLGRAPH_READINESS_BUSY)
         );
+        let failure = health.publication_failure.expect("publication will retry");
+        assert_eq!(failure.reason, "publication_failed");
+        assert!(failure.next_retry_ms.is_some(), "{failure:?}");
         assert_eq!(view.current_generation().unwrap(), initial);
         assert_eq!(
             crate::views::assembly::cold_build_counts(view.view_dir()),
@@ -10432,6 +10471,11 @@ mod tests {
         );
         writer.execute_batch("ROLLBACK").unwrap();
         drop(writer);
+
+        // Drive the retry without waiting for its one-second backoff. The
+        // invariant here is reuse of the healthy graph, not timer scheduling.
+        ctx.view_publication_retry().lock().reset(&root);
+        crate::executor::view_publication::schedule(&ctx, BTreeSet::new(), true).unwrap();
 
         assert!(
             handle_configure_for_test(
@@ -10489,7 +10533,7 @@ mod tests {
         let generation = seeded.generation.unwrap();
         let view = crate::views::ViewStore::open(&storage, &scope).unwrap();
         let derived = view.derived_path(&generation).unwrap();
-        crate::views::wait_for_derived_checkpoint_for_test(&derived);
+        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
         // An older binary published the same HEAD with callgraph keys, but its
         // extraction producer and derived build output are no longer readable.
         let source = fs::read_to_string(main.join("tracked.rs")).unwrap();
@@ -10555,6 +10599,7 @@ mod tests {
         }
         assert!(owner.callgraph_writer());
         super::drain_deferred_configure_maintenance(&owner);
+        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
         match owner.callgraph_store_for_ops() {
             CallgraphStoreAccess::Ready(store) => {
                 assert_eq!(store.reader_kind(), "view");
@@ -10596,6 +10641,7 @@ mod tests {
             assert_eq!(response.data["artifact_owner"]["mode"], "read_only");
             assert!(!borrower.callgraph_writer());
             super::drain_deferred_configure_maintenance(&borrower);
+            crate::views::wait_for_derived_checkpoint_for_test(&lazy_view_dir(&storage, &linked));
             match borrower.callgraph_store_for_ops() {
                 CallgraphStoreAccess::Ready(store) => {
                     assert_eq!(store.reader_kind(), "view");
@@ -10659,7 +10705,7 @@ mod tests {
         let old = view
             .derived_path(seeded.generation.as_deref().unwrap())
             .unwrap();
-        crate::views::wait_for_derived_checkpoint_for_test(&old);
+        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
         {
             let conn = rusqlite::Connection::open(&old).unwrap();
             crate::callgraph_store::position_identity_tests::seed_old_dispatch_hint(&conn);
@@ -10671,6 +10717,7 @@ mod tests {
             handle_configure_for_test(&configure_request_with_session(params, "s4-owner"), &owner);
         assert!(response.success, "{}", response.data);
         super::drain_deferred_configure_maintenance(&owner);
+        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
         match owner.callgraph_store_for_ops() {
             CallgraphStoreAccess::Ready(store) => assert!(
                 !crate::callgraph_store::CallGraphRead::edge_snapshot(&store)
@@ -10688,7 +10735,7 @@ mod tests {
         let current = view.current_generation().unwrap().unwrap();
         assert_ne!(Some(current.as_str()), seeded.generation.as_deref());
         let database = view.derived_path(&current).unwrap();
-        crate::views::wait_for_derived_checkpoint_for_test(&database);
+        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
         crate::callgraph_store::position_identity_tests::assert_current_graph(
             &rusqlite::Connection::open(&database).unwrap(),
         );
@@ -11016,6 +11063,11 @@ mod tests {
     }
 
     fn blob_removal_answers(ctx: &AppContext) -> (String, String) {
+        let view = ctx.view_runtime_snapshot().expect("published fixture view");
+        // Wait for the detached checkpoint to finish before reading: it can
+        // still lock the database after publication. A live query can instead
+        // return the retryable callgraph_building response.
+        crate::views::wait_for_derived_checkpoint_for_test(&view.view_dir);
         let store = lazy_ready(ctx.callgraph_store_for_ops());
         let lib = Path::new("lib.rs");
         (
@@ -11029,6 +11081,92 @@ mod tests {
             .unwrap()
             .current_generation()
             .unwrap()
+    }
+
+    #[test]
+    fn configure_busy_callgraph_readiness_revalidates_after_unlock() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("main");
+        let storage = temp.path().join("storage");
+        init_git_fixture(&root);
+        lazy_commit(&root, LAZY_LIB, "lib");
+        let root = root.canonicalize().unwrap();
+        let first = lazy_bind(&root, &storage, "before-lock");
+        let view_dir = lazy_view_dir(&storage, &root);
+        crate::views::wait_for_derived_checkpoint_for_test(&view_dir);
+        let generation = blob_removal_generation(&storage, &root).unwrap();
+        drop(first);
+        let database = crate::views::resolve_derived_path(&view_dir, &generation).unwrap();
+        let writer = crate::db::file_identity::IdentityConnection::open(
+            &database,
+            "busy configure readiness fixture",
+        )
+        .unwrap();
+        writer
+            .execute(
+                "UPDATE meta SET v = 'stale-build-output' WHERE k = 'fingerprint'",
+                [],
+            )
+            .unwrap();
+        let journal: String = writer
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "delete");
+        writer.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let probe = crate::callgraph_store::manifest_view_database_ready(
+            &view_dir,
+            &generation,
+            Instant::now() + crate::db::TOOL_RETRY_BUSY_WAIT,
+        )
+        .unwrap_err();
+        assert!(probe.is_transient_lock_contention(), "{probe}");
+
+        let owner = test_context();
+        let params = json!({
+            "project_root": root, "storage_dir": storage, "harness": "opencode",
+            "config": [user_tier(json!({"views":{"enabled":true},
+                "indexes":{"trigram":false,"semantic":false,"callgraph":true}}))]
+        });
+        assert!(
+            handle_configure_for_test(
+                &configure_request_with_session(params, "after-lock"),
+                &owner,
+            )
+            .success
+        );
+        let (gate, probe_done, release) =
+            super::gate_configure_tail_stage_for_test(root.clone(), "view_payload_check");
+        std::thread::scope(|scope| {
+            let tail = scope.spawn(|| super::drain_deferred_configure_maintenance(&owner));
+            probe_done.recv_timeout(Duration::from_secs(30)).unwrap();
+            writer
+                .execute_batch("ROLLBACK; PRAGMA journal_mode=WAL;")
+                .unwrap();
+            drop(writer);
+            drop(gate);
+            release.send(()).unwrap();
+            tail.join().unwrap();
+        });
+        crate::views::wait_for_derived_checkpoint_for_test(&view_dir);
+        let store = lazy_ready(owner.callgraph_store_for_ops());
+        assert_eq!(store.reader_kind(), "view");
+        assert_ne!(
+            blob_removal_generation(&storage, &root).as_deref(),
+            Some(generation.as_str())
+        );
+        assert!(owner
+            .view_runtime_snapshot()
+            .unwrap()
+            .pending_paths
+            .is_empty());
+        assert!(format!(
+            "{:?}",
+            store.callers_of(Path::new("lib.rs"), "target", 3).unwrap()
+        )
+        .contains("caller"));
     }
 
     /// Models a stopped daemon before the store is removed: once this returns,
@@ -11671,6 +11809,47 @@ mod tests {
         let view_dir = lazy_view_dir(storage, root);
         fs::remove_dir_all(&view_dir).unwrap();
 
+        // Pause checkpoint completion with a real SQLite writer on its file.
+        // An exclusive rollback-journal transaction makes short-lived lock
+        // contention observable without racing the scheduler.
+        enum CheckpointObservation {
+            Waiting,
+            Answer(std::thread::Result<(String, String)>),
+        }
+        let (begin_tx, begin_rx) = std::sync::mpsc::channel();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (observation_tx, observation_rx) = std::sync::mpsc::channel();
+        let waiting_tx = observation_tx.clone();
+        crate::views::checkpoint_test_hooks()
+            .lock()
+            .unwrap()
+            .insert(
+                view_dir.clone(),
+                crate::views::CheckpointTestHooks {
+                    before_settled: Some(Box::new(move |path| {
+                        begin_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+                        let connection = crate::db::file_identity::IdentityConnection::open(
+                            path,
+                            "checkpoint contention fixture",
+                        )
+                        .unwrap();
+                        let journal: String = connection
+                            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+                            .unwrap();
+                        assert_eq!(journal, "delete");
+                        connection.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+                        locked_tx.send(path.to_path_buf()).unwrap();
+                        let _ = release_rx.recv_timeout(Duration::from_secs(60));
+                        connection
+                            .execute_batch("ROLLBACK; PRAGMA journal_mode=WAL;")
+                            .unwrap();
+                    })),
+                    before_wait: Some(Box::new(move || {
+                        waiting_tx.send(CheckpointObservation::Waiting).unwrap();
+                    })),
+                },
+            );
         let ctx = lazy_bind(root, storage, "after-removal");
         let generation = blob_removal_generation(storage, root).expect("republished at bind");
         assert!(crate::views::read::derived_built(&view_dir, &generation));
@@ -11682,8 +11861,52 @@ mod tests {
             2,
             "both files were extracted again"
         );
+        begin_tx.send(()).unwrap();
+        let locked_path = locked_rx.recv_timeout(Duration::from_secs(60)).unwrap();
         assert_eq!(
-            blob_removal_answers(&ctx),
+            locked_path,
+            crate::views::resolve_derived_path(&view_dir, &generation).unwrap()
+        );
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "checkpoint-busy", "command": "callers", "session_id": "after-removal",
+            "file": "lib.rs", "symbol": "target"
+        }))
+        .unwrap();
+        let busy = crate::commands::callers::handle_callers(&request, &ctx);
+        assert!(!busy.success, "{busy:?}");
+        assert_eq!(busy.data["code"], "callgraph_building", "{busy:?}");
+        let reader_ctx = Arc::clone(&ctx);
+        let reader = std::thread::spawn(move || {
+            let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                blob_removal_answers(&reader_ctx)
+            }));
+            observation_tx
+                .send(CheckpointObservation::Answer(answer))
+                .unwrap();
+        });
+        assert!(
+            matches!(
+                observation_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .unwrap(),
+                CheckpointObservation::Waiting
+            ),
+            "the fixture read before the checkpoint completion event"
+        );
+        release_tx.send(()).unwrap();
+        let CheckpointObservation::Answer(answer) = observation_rx
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap()
+        else {
+            panic!("checkpoint waiter did not answer");
+        };
+        reader.join().unwrap();
+        crate::views::checkpoint_test_hooks()
+            .lock()
+            .unwrap()
+            .remove(&view_dir);
+        assert_eq!(
+            answer.unwrap(),
             (
                 fixture.callers_before.clone(),
                 fixture.call_tree_before.clone()

@@ -299,7 +299,31 @@ static CHECKPOINT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = On
 static CHECKPOINT_SETTLED: std::sync::Condvar = std::sync::Condvar::new();
 
 #[cfg(test)]
+#[derive(Default)]
+pub(crate) struct CheckpointTestHooks {
+    pub before_settled: Option<Box<dyn FnOnce(&Path) + Send>>,
+    pub before_wait: Option<Box<dyn FnOnce() + Send>>,
+}
+
+#[cfg(test)]
+static CHECKPOINT_TEST_HOOKS: OnceLock<Mutex<HashMap<PathBuf, CheckpointTestHooks>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn checkpoint_test_hooks() -> &'static Mutex<HashMap<PathBuf, CheckpointTestHooks>> {
+    CHECKPOINT_TEST_HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
 pub(crate) fn wait_for_derived_checkpoint_for_test(view_dir: &Path) {
+    let before_wait = checkpoint_test_hooks()
+        .lock()
+        .unwrap()
+        .get_mut(view_dir)
+        .and_then(|hooks| hooks.before_wait.take());
+    if let Some(before_wait) = before_wait {
+        before_wait();
+    }
     let jobs = DEFERRED_CHECKPOINTS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -446,6 +470,17 @@ pub(super) fn schedule_derived_checkpoint(
             }
             // Include the keeper close: it may checkpoint even a superseded job.
             drop(connection);
+            #[cfg(test)]
+            {
+                let before_settled = checkpoint_test_hooks()
+                    .lock()
+                    .unwrap()
+                    .get_mut(&key)
+                    .and_then(|hooks| hooks.before_settled.take());
+                if let Some(before_settled) = before_settled {
+                    before_settled(&path);
+                }
+            }
             crate::slog_info!(
                 "index_event kind=view_checkpoint root={} generation={} skipped={} {}",
                 root.display(),
