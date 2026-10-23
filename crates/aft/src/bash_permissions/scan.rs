@@ -225,6 +225,7 @@ fn parse_failed_ask() -> PermissionAsk {
         kind: PermissionKind::Bash,
         patterns: vec!["*".to_string()],
         always: Vec::new(),
+        targets: Vec::new(),
     }
 }
 
@@ -575,6 +576,7 @@ fn push_bash_ask(
             kind: PermissionKind::Bash,
             patterns: vec![pattern],
             always: vec![format!("{stable} *")],
+            targets: Vec::new(),
         },
     );
 }
@@ -646,6 +648,7 @@ fn push_external_path(
             kind: PermissionKind::ExternalDirectory,
             patterns: vec![pattern.clone()],
             always: vec![pattern],
+            targets: vec![grant],
         },
     );
 }
@@ -654,6 +657,18 @@ fn push_ask(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, ask: Perm
     let key = format!("{:?}:{:?}:{:?}", ask.kind, ask.patterns, ask.always);
     if seen.insert(key) {
         asks.push(ask);
+    } else if let Some(existing) = asks.iter_mut().find(|existing| {
+        existing.kind == ask.kind
+            && existing.patterns == ask.patterns
+            && existing.always == ask.always
+    }) {
+        // A single displayed folder ask may represent several files. Keep all
+        // of them so approving one file cannot authorize its unapproved sibling.
+        for target in ask.targets {
+            if !existing.targets.contains(&target) {
+                existing.targets.push(target);
+            }
+        }
     }
 }
 

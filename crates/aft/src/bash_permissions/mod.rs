@@ -17,9 +17,13 @@ pub struct PermissionAsk {
     pub kind: PermissionKind,
     pub patterns: Vec<String>,
     pub always: Vec<String>,
+    /// Actual command targets, before an optional parent-folder scope is
+    /// offered. Retry coverage must not depend on whether that probe succeeded.
+    #[serde(skip)]
+    pub targets: Vec<crate::access_policy::AccessGrant>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PermissionKind {
     #[serde(rename = "external_directory")]
     ExternalDirectory,
