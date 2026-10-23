@@ -583,6 +583,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "optional sibling donor discovery bounds Git topology bytes, records and worktrees at their iterators; an incomplete or malformed enumeration disables reuse rather than claiming a freshest donor",
     },
     ExclusionEntry {
+        file: "views/derived_index.rs",
+        enclosing_item: "candidates, record",
+        location_or_primitive: "SQL LIMIT CANDIDATES_PER_KIND, LIMIT RETAINED_ROWS",
+        reason: "internal donor hints for derived-database seeding, not an agent-visible list; a candidate outside the bound or a trimmed row only means a seedless publication falls back to the worktree census or a cold build",
+    },
+    ExclusionEntry {
         file: "views/generation.rs",
         enclosing_item: "generation_directory_entries, blob_references_by_generation, sweep_generations_bounded, remove_generation_files",
         location_or_primitive: "take(limit.saturating_add(1)), take(GENERATION_DIRECTORY_LIMIT)",

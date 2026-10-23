@@ -124,6 +124,12 @@ pub struct PreparedAssembly {
     publication: Option<super::PreparedPublication>,
     files: Option<(ViewStore, String)>,
     derived_checkpoint: Option<(PathBuf, crate::db::file_identity::IdentityConnection)>,
+    /// The family index row this generation's ready derived database earns
+    /// once published: the index path, this scope and the output identity.
+    derived_index_entry: Option<(PathBuf, String, [u8; 32])>,
+    /// That row once the generation is published, waiting for
+    /// `settle_status` to write it outside the publisher's commit barrier.
+    committed_index_entry: Option<IndexEntry>,
     pin: Option<AssemblyPin>,
     _base_pin: Option<crate::pins::QueryPin>,
     profile: PublicationProfile,
@@ -242,6 +248,138 @@ fn run_before_settle_write(view_dir: &Path) {
     }
 }
 
+/// A derived-output index row for a published generation, written after the
+/// publisher leaves its commit barrier.
+struct IndexEntry {
+    view: ViewStore,
+    index: PathBuf,
+    scope: String,
+    generation: String,
+    identity: [u8; 32],
+}
+
+/// What became of an [`IndexEntry`], for tests.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IndexWrite {
+    Recorded,
+    /// Another generation is served by now, so the row would name a
+    /// generation nobody serves.
+    Superseded,
+    /// The write failed (for example the index stayed locked) and was logged.
+    Failed,
+}
+
+impl IndexEntry {
+    /// Record the row unless the view no longer serves this generation. The
+    /// row is a hint for other scopes' seeding: losing it only costs a missed
+    /// reuse, so a failure is logged and never fails the publication.
+    ///
+    /// The view's settle gate serializes the check with the write, so an
+    /// older publication cannot overwrite the row of a newer one that
+    /// published between the check and the write.
+    fn write(self) {
+        let gate = settle_gate(self.view.view_dir());
+        let _serial = gate
+            .serial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(test)]
+        run_before_index_write(self.view.view_dir());
+        let outcome = match self.view.current_generation() {
+            Ok(Some(served)) if served == self.generation => {
+                match derived_index::record(
+                    &self.index,
+                    &self.scope,
+                    &self.generation,
+                    &self.identity,
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            Ok(_) => {
+                log::info!(
+                    "view derived index skipped: scope={} generation={} is no longer served",
+                    self.scope,
+                    self.generation
+                );
+                #[cfg(test)]
+                note_index_write(self.view.view_dir(), IndexWrite::Superseded);
+                return;
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        match outcome {
+            Ok(()) => {
+                #[cfg(test)]
+                note_index_write(self.view.view_dir(), IndexWrite::Recorded);
+            }
+            Err(error) => {
+                log::warn!(
+                    "view derived index not updated: scope={} generation={} error={error}",
+                    self.scope,
+                    self.generation
+                );
+                #[cfg(test)]
+                note_index_write(self.view.view_dir(), IndexWrite::Failed);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+static BEFORE_INDEX_WRITE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, SettleHook>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+static INDEX_WRITES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<IndexWrite>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Runs `hook` each time a derived-index row for `view_dir` is about to be
+/// written, before the served generation is checked.
+#[cfg(test)]
+pub(crate) fn before_index_write_for_test(
+    view_dir: &Path,
+    hook: impl Fn() + Send + Sync + 'static,
+) {
+    BEFORE_INDEX_WRITE
+        .lock()
+        .unwrap()
+        .insert(view_dir.to_path_buf(), std::sync::Arc::new(hook));
+}
+
+/// The outcomes of every derived-index write for `view_dir` so far.
+#[cfg(test)]
+pub(crate) fn index_writes_for_test(view_dir: &Path) -> Vec<IndexWrite> {
+    INDEX_WRITES
+        .lock()
+        .unwrap()
+        .get(view_dir)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn run_before_index_write(view_dir: &Path) {
+    let hook = BEFORE_INDEX_WRITE.lock().unwrap().get(view_dir).cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn note_index_write(view_dir: &Path, outcome: IndexWrite) {
+    INDEX_WRITES
+        .lock()
+        .unwrap()
+        .entry(view_dir.to_path_buf())
+        .or_default()
+        .push(outcome);
+}
+
 impl PreparedAssembly {
     pub fn report(&self) -> &AssemblyReport {
         &self.report
@@ -257,6 +395,23 @@ impl PreparedAssembly {
             match outcome? {
                 PublishOutcome::Published => {
                     self.report.published = true;
+                    // Only moved aside here: the commit runs under the root's
+                    // write gate and the process-wide job table, and the
+                    // index is a shared SQLite file another process may hold.
+                    // `settle_status` writes it after both are released.
+                    if let (Some((index, scope, identity)), Some((view, _)), Some(generation)) = (
+                        self.derived_index_entry.take(),
+                        self.files.as_ref(),
+                        self.report.generation.as_ref(),
+                    ) {
+                        self.committed_index_entry = Some(IndexEntry {
+                            view: view.clone(),
+                            index,
+                            scope,
+                            generation: generation.clone(),
+                            identity,
+                        });
+                    }
                     self.files = None;
                     if retires_legacy_plane {
                         log::info!(
@@ -327,7 +482,21 @@ impl PreparedAssembly {
     /// generation is already current, so a write that fails does not fail
     /// the publication: it is logged, the transaction rolls back, and the next
     /// publication of the view (a no-op included) computes the changes again.
+    ///
+    /// It also writes the derived-output index row a published generation
+    /// earned (see [`IndexEntry::write`]), for the same reason: that write
+    /// opens a shared SQLite file and may wait on another process.
     pub fn settle_status(&mut self) -> SettleOutcome {
+        if let Some(entry) = self.committed_index_entry.take() {
+            // `commit` has already closed the publication's I/O phases, so this
+            // write is measured as its own interval and added to the same
+            // record, which is logged when the assembly is dropped.
+            let started = Instant::now();
+            let before = super::io::Bytes::capture();
+            entry.write();
+            self.profile
+                .record_derived_index_write(before, super::io::Bytes::capture(), started);
+        }
         let Some(settlement) = self.committed_settlement.take() else {
             return SettleOutcome::Nothing;
         };
@@ -789,6 +958,8 @@ pub fn prepare_checkout_deferring(
         publication: None,
         files: Some((view.clone(), next_generation.clone())),
         derived_checkpoint: None,
+        derived_index_entry: None,
+        committed_index_entry: None,
         pin: Some(pin),
         _base_pin: base_pin,
         profile,
@@ -1029,10 +1200,32 @@ pub fn prepare_checkout_deferring(
         // derived rows use manifest-relative paths,
         // and the ordinary cutoff/fingerprint checks still gate the patch.
         let sibling = if base.is_none() && request.callgraph {
-            worker_seed::sibling_checkout_seed(
+            let deadline = Instant::now() + crate::db::STEADY_BUSY_TIMEOUT;
+            // The family index finds an interchangeable or the nearest donor
+            // in any scope of the family. Donors published before the index
+            // existed are still found through the checkout's Git worktrees.
+            match worker_seed::indexed_seed(
                 request,
-                Instant::now() + crate::db::STEADY_BUSY_TIMEOUT,
-            )?
+                &derived_index::index_path(callgraph.path()),
+                &manifest,
+                deadline,
+            )? {
+                Some(seed) => {
+                    prepared.profile.seed_lookup = if seed.exact {
+                        "index_exact"
+                    } else {
+                        "index_nearest"
+                    };
+                    Some(seed)
+                }
+                None => {
+                    let seed = worker_seed::sibling_checkout_seed(request, deadline)?;
+                    if seed.is_some() {
+                        prepared.profile.seed_lookup = "worktrees";
+                    }
+                    seed
+                }
+            }
         } else {
             None
         };
@@ -1055,11 +1248,26 @@ pub fn prepare_checkout_deferring(
                     ),
                 ));
             } else {
-                match super::generation::clone_derived(&base_path, &derived) {
-                    Ok(_) => {
+                let cloned =
+                    super::generation::clone_derived(&base_path, &derived).and_then(|mechanism| {
+                        run_after_derived_clone_for_test(&derived);
+                        clone_readiness(view.view_dir(), &next_generation)
+                            .map(|ready| (mechanism, ready))
+                    });
+                match cloned {
+                    Ok((mechanism, Err((reason, detail)))) => {
+                        log::warn!(
+                            "view derived clone failed readiness: generation={next_generation} mechanism={} {detail}",
+                            mechanism.as_str()
+                        );
+                        cold_build = Some((reason, detail));
+                        super::generation::remove_unpublished_derived(&derived)?;
+                    }
+                    Ok((mechanism, Ok(()))) => {
                         prepared.profile.seed_source =
                             if sibling.is_some() { "sibling" } else { "own" };
                         prepared.profile.cold_build_reason = "none";
+                        prepared.profile.clone_mechanism = mechanism.as_str();
                         #[cfg(test)]
                         {
                             prepared.profile.derived_cloned = true;
@@ -1159,6 +1367,14 @@ pub fn prepare_checkout_deferring(
         prepared.profile.materialization_call_ms = materialization_started.elapsed().as_millis();
         timing.phase("derived_materialization");
     }
+    if !defer_derived && request.callgraph {
+        // Reused, patched or built cold, the derived database is ready here.
+        prepared.derived_index_entry = Some((
+            derived_index::index_path(callgraph.path()),
+            request.scope.clone(),
+            derived_index::identity(&request.family, &manifest),
+        ));
+    }
     prepared.profile.io.enter(super::io::Phase::DerivedOther);
     let trigram = view.trigram_path(&next_generation)?;
     crate::private_storage::write(&trigram, [])
@@ -1248,6 +1464,14 @@ struct PublicationProfile {
     derived_clone_ms: u128,
     seed_source: &'static str,
     cold_build_reason: &'static str,
+    /// How a seeded derived database was copied (`clonefile`,
+    /// `sqlite_backup`), or `none` when nothing was copied.
+    clone_mechanism: &'static str,
+    /// Time spent writing the derived-output index row after the commit.
+    derived_index_ms: u128,
+    /// Where a sibling donor was found (`index_exact`, `index_nearest`,
+    /// `worktrees`), or `none`.
+    seed_lookup: &'static str,
     #[cfg(test)]
     derived_cloned: bool,
     materialization_call_ms: u128,
@@ -1281,6 +1505,9 @@ impl PublicationProfile {
             derived_clone_ms: 0,
             seed_source: "cold",
             cold_build_reason: "no_base",
+            clone_mechanism: "none",
+            seed_lookup: "none",
+            derived_index_ms: 0,
             #[cfg(test)]
             derived_cloned: false,
             materialization_call_ms: 0,
@@ -1321,6 +1548,23 @@ impl PublicationProfile {
     }
 }
 
+impl PublicationProfile {
+    /// Add the derived-index write, measured after `commit` closed the
+    /// publication's I/O phases. Its bytes join the derived and total I/O,
+    /// and its time is added to the total.
+    fn record_derived_index_write(
+        &mut self,
+        before: Option<super::io::Bytes>,
+        after: Option<super::io::Bytes>,
+        started: Instant,
+    ) {
+        self.io.credit_derived_index(before, after);
+        let elapsed = started.elapsed().as_millis();
+        self.derived_index_ms += elapsed;
+        self.total_ms += elapsed;
+    }
+}
+
 impl Drop for PublicationProfile {
     fn drop(&mut self) {
         if self.active_phase.is_some() {
@@ -1339,7 +1583,7 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
     // pointer transaction is a subset of the cas phase, which also includes
     // waiting to acquire the actor barrier.
     format!(
-        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_dispatch_ms={} materialize_commit_ms={} materialize_cleanup_memory_ms={} materialize_cleanup_connections_ms={} pointer_ms={} total_ms={} derived_bytes={} semantic_fill={} generation={} concurrent_publications={} seed_source={} cold_build_reason={} {}",
+        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_dispatch_ms={} materialize_commit_ms={} materialize_cleanup_memory_ms={} materialize_cleanup_connections_ms={} pointer_ms={} total_ms={} derived_bytes={} semantic_fill={} generation={} concurrent_publications={} seed_source={} cold_build_reason={} clone_mechanism={} seed_lookup={} derived_index_ms={} {}",
         profile.root.display(), profile.outcome, profile.candidates, profile.blob_puts,
         profile.pending_paths, profile.phase_ms[0], profile.phase_ms[1],
         profile.phase_ms[2], profile.phase_ms[3], profile.head_ms, profile.assembly_ms,
@@ -1364,7 +1608,7 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
         profile.materialization.cleanup_memory_ms,
         profile.materialization.cleanup_connections_ms,
         profile.pointer_ms, profile.total_ms, profile.derived_bytes,
-        profile.semantic_fill, profile.generation, profile.concurrent_publications, profile.seed_source, profile.cold_build_reason, profile.io.fields(),
+        profile.semantic_fill, profile.generation, profile.concurrent_publications, profile.seed_source, profile.cold_build_reason, profile.clone_mechanism, profile.seed_lookup, profile.derived_index_ms, profile.io.fields(),
     )
 }
 
@@ -1557,6 +1801,59 @@ fn cold_build_reason_for_diff_error(
             Some(ColdBuildReason::BaseUnreadable)
         }
         _ => None,
+    }
+}
+
+/// Run the reader's readiness query on a freshly copied derived database
+/// before anything patches or publishes it. The donor passed the same query
+/// before the copy. Checking the copy as well means a torn, truncated or
+/// unfinished file is rebuilt cold, never served. The inner error is the
+/// cold-build reason; the outer error is contention the scheduler retries.
+fn clone_readiness(
+    view_dir: &Path,
+    generation: &str,
+) -> Result<std::result::Result<(), (ColdBuildReason, String)>> {
+    match crate::callgraph_store::manifest_view_database_ready(
+        view_dir,
+        generation,
+        Instant::now() + crate::db::STEADY_BUSY_TIMEOUT,
+    ) {
+        Ok(true) => Ok(Ok(())),
+        Ok(false) => Ok(Err((
+            ColdBuildReason::BaseNotReady,
+            "cloned derived graph fails the build-output readiness check".to_string(),
+        ))),
+        Err(crate::callgraph_store::CallGraphStoreError::Sqlite(error))
+            if crate::db::is_busy_error(&error) =>
+        {
+            Err(ViewError::Sqlite(error))
+        }
+        Err(crate::callgraph_store::CallGraphStoreError::Sqlite(error))
+            if sqlite_error_is_unreadable_database(&error) =>
+        {
+            Ok(Err((ColdBuildReason::BaseUnreadable, error.to_string())))
+        }
+        Err(error) => Err(ViewError::InvalidManifest(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_DERIVED_CLONE: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` on the next derived copy this thread makes, before its
+/// readiness check, to simulate a copy that was torn or left unfinished.
+#[cfg(test)]
+pub(super) fn after_derived_clone_for_test(hook: impl FnOnce(&Path) + 'static) {
+    AFTER_DERIVED_CLONE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+fn run_after_derived_clone_for_test(_derived: &Path) {
+    #[cfg(test)]
+    if let Some(hook) = AFTER_DERIVED_CLONE.with(|slot| slot.borrow_mut().take()) {
+        hook(_derived);
     }
 }
 
@@ -2798,6 +3095,8 @@ mod payload_heal_tests {
 #[path = "cold_fallback_tests.rs"]
 mod cold_fallback_tests;
 
+#[path = "derived_index.rs"]
+pub(super) mod derived_index;
 #[path = "assembly_seed.rs"]
 pub(super) mod worker_seed;
 

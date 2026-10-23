@@ -158,9 +158,14 @@ pub(crate) enum Phase {
 }
 /// Disjoint intervals use the same sample at each boundary. Nested derived
 /// subtotals are aliases, not additional bytes to add to the top-level sum.
+///
+/// The derived-output index row is written after the publication's phases,
+/// once the publisher has left its commit barrier. That separate interval is
+/// `derived_index`; it is part of the derived subtotal and of the total.
 pub(crate) struct PublicationIo {
     previous: Option<Bytes>,
     buckets: [Bytes; 7],
+    derived_index: Bytes,
     available: bool,
     phase: Phase,
     blob_counter: crate::write_ledger::Counter,
@@ -176,6 +181,7 @@ impl PublicationIo {
         Self {
             previous: sample,
             buckets: [Bytes::default(); 7],
+            derived_index: Bytes::default(),
             available: sample.is_some(),
             phase: Phase::Manifest,
             blob_counter: crate::write_ledger::register(
@@ -218,16 +224,27 @@ impl PublicationIo {
     pub(crate) fn finish(&mut self) {
         self.advance(Bytes::capture());
     }
+    /// Add the deferred derived-index write, sampled from `before` to `after`
+    /// after [`Self::finish`], and credit it to the derived write ledger.
+    pub(crate) fn credit_derived_index(&mut self, before: Option<Bytes>, after: Option<Bytes>) {
+        match before.zip(after).and_then(|(a, b)| b.delta(a)) {
+            Some(delta) => {
+                self.derived_index = self.derived_index.add(delta);
+                self.derived_counter.credit(delta.logical, delta.written);
+            }
+            None => self.available = false,
+        }
+    }
     pub(crate) fn fields(&self) -> String {
         let derived = self.buckets[2..6]
             .iter()
             .copied()
-            .fold(Bytes::default(), Bytes::add);
+            .fold(self.derived_index, Bytes::add);
         let total = self
             .buckets
             .iter()
             .copied()
-            .fold(Bytes::default(), Bytes::add);
+            .fold(self.derived_index, Bytes::add);
         let mut fields = format!("io_scope=process io_available={}", self.available);
         for (name, value) in [
             ("manifest", self.buckets[0]),
@@ -238,6 +255,7 @@ impl PublicationIo {
             ("materialize", self.buckets[3]),
             ("closure", self.buckets[4]),
             ("derived_other", self.buckets[5]),
+            ("derived_index", self.derived_index),
             ("total", total),
         ] {
             fields.push(' ');
@@ -389,6 +407,38 @@ mod tests {
             "ledger uses the exact blobs + derived publication byte buckets"
         );
     }
+    #[test]
+    fn deferred_derived_index_write_counts_in_derived_total_and_ledger() {
+        let bytes = |n| Bytes {
+            written: n,
+            logical: n * 2,
+            read: n * 3,
+        };
+        let root = std::path::Path::new("/ledger-derived-index-fixture");
+        let mut p = PublicationIo::from_sample(Some(bytes(100)), root);
+        p.phase = Phase::Materialize;
+        p.advance(Some(bytes(110)));
+        p.credit_derived_index(Some(bytes(500)), Some(bytes(507)));
+        let fields = p.fields();
+        for expected in [
+            "derived_index_physical_bytes_written=7 ",
+            "derived_physical_bytes_written=17 ",
+            "total_physical_bytes_written=17 ",
+            "total_logical_bytes_written=34 ",
+        ] {
+            assert!(fields.contains(expected), "{expected}: {fields}");
+        }
+        assert_eq!(
+            crate::write_ledger::pending_for_test(
+                crate::write_ledger::Domain::ViewsDerived,
+                &root.display().to_string()
+            ),
+            (34, 17)
+        );
+        p.credit_derived_index(None, Some(bytes(600)));
+        assert!(p.fields().contains("io_available=false"));
+    }
+
     #[test]
     fn missing_counters_are_unknown_not_zero() {
         let mut p = PublicationIo::from_sample(None, std::path::Path::new("/missing"));
