@@ -148,16 +148,16 @@ struct DeferredWaitObservation {
     target_finished: bool,
     /// A `wait: true` call's session asked to detach the wait.
     detach_pending: bool,
+    remote_handback_due: bool,
 }
 
 /// Reads a deferred bash wait's task state on the blocking pool.
 ///
 /// The wait loop runs on the subc frame loop's single-threaded runtime. The
-/// registry snapshot takes the task's state mutex, which the bash watchdog can
-/// hold while it persists the task (a file write plus an aft.db upsert), and a
-/// terminal snapshot may render cached output from disk. Doing either inline
-/// stops the frame loop, so no route's frames are read or written until the
-/// lock frees. Here the frame loop only awaits.
+/// registry poll takes the task's state mutex, which other threads can hold
+/// while persisting JSON or spawning a local fallback. Doing that inline stops
+/// the frame loop, so no route's frames are read or written until the lock frees.
+/// Here the frame loop only awaits, including when classifying a remote task.
 ///
 /// For a delegated worker's capped blocking wait, `renew_window` keeps the
 /// task's default hard kill at least that far away. Primary sessions also have
@@ -169,6 +169,7 @@ async fn observe_deferred_bash_wait(
     wait_mode: bool,
     worker_session: bool,
     renew_window: Option<Duration>,
+    remote_handback_at: Option<Instant>,
 ) -> DeferredWaitObservation {
     tokio::task::spawn_blocking(move || {
         if let Some(window) = renew_window.filter(|_| worker_session) {
@@ -178,9 +179,12 @@ async fn observe_deferred_bash_wait(
         // that answers the call builds the full snapshot once.
         let target_finished = registry.wait_target_finished(&task_id, &session_id);
         let detach_pending = wait_mode && registry.wait_mode_detach_pending(&session_id);
+        let remote_handback_due = remote_handback_at.is_some_and(|at| Instant::now() >= at)
+            && registry.is_remote_task(&task_id, &session_id);
         DeferredWaitObservation {
             target_finished,
             detach_pending,
+            remote_handback_due,
         }
     })
     .await
@@ -189,7 +193,144 @@ async fn observe_deferred_bash_wait(
     .unwrap_or(DeferredWaitObservation {
         target_finished: true,
         detach_pending: false,
+        remote_handback_due: false,
     })
+}
+
+#[cfg(all(test, unix))]
+mod frame_loop_lock_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn due_remote_handback_check_never_locks_task_state_on_frame_loop() {
+        let (_dir, ctx, task) =
+            crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+        let root = ProjectRootId::from_path(_dir.path()).unwrap();
+        let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 2,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        }));
+        executor.register_actor(root.clone(), Arc::new(ctx));
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (completion_tx, mut completion_rx) = mpsc::channel(4);
+        let (poll_touch_tx, _poll_touch_rx) = mpsc::channel(4);
+        let _no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
+        // A local task still has to be classified when the remote hand-back
+        // deadline is due. That classification must stay on a worker thread.
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            run_deferred_bash_wait(
+                executor,
+                completion_tx,
+                poll_touch_tx,
+                metrics,
+                RouteChannel {
+                    channel: 1,
+                    epoch: 1,
+                },
+                1,
+                Flags::new(false, Priority::Passive, false),
+                PROTOCOL_VERSION,
+                root,
+                "remote-handback-lock".into(),
+                task.task_id.clone(),
+                task.session_id.clone(),
+                Some(_dir.path().into()),
+                _dir.path().into(),
+                Instant::now(),
+                false,
+                None,
+                1,
+                false,
+                false,
+                None,
+                Some((Instant::now(), 0)),
+                crate::subc_format::FormatContext::default(),
+                BashWaitCancel {
+                    run_scope: None,
+                    scope: None,
+                    late_results: false,
+                    ledger_carrier: None,
+                    connection: PersistentCancelSignal::new(),
+                    route: PersistentCancelSignal::new(),
+                    drain: drain::ModuleDrainWindow::default(),
+                },
+                Arc::new(drain::BashCallClaim::default()),
+                None,
+                false,
+            ),
+        )
+        .await
+        .expect("deferred wait hung");
+        let completion = completion_rx.recv().await.unwrap();
+        let response = completion.result.unwrap().response;
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["task_id"], task.task_id);
+        assert_eq!(response.data["status"], "running");
+    }
+
+    #[tokio::test]
+    async fn module_drain_reply_never_locks_task_state_on_frame_loop() {
+        let (_dir, ctx, task) =
+            crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+        let root = ProjectRootId::from_path(_dir.path()).unwrap();
+        let metrics = DispatchPathMetrics::new();
+        let route = RouteChannel {
+            channel: 1,
+            epoch: 1,
+        };
+        let claim = metrics.held_bash_calls.insert(route, 1);
+        metrics
+            .held_bash_calls
+            .set_phase(route, 1, drain::BashHoldPhase::Wait);
+        metrics.held_bash_calls.set_detach_target(
+            route,
+            1,
+            drain::BashDetachTarget {
+                run_scoped: true,
+                task_id: task.task_id.clone(),
+                session_id: task.session_id.clone(),
+                wait_mode: false,
+                worker_session: false,
+                server_completion: false,
+                late_results: false,
+                registry: ctx.bash_background().clone(),
+                request_id: "drain-lock".into(),
+                ver: PROTOCOL_VERSION,
+                flags: Flags::new(false, Priority::Passive, false),
+                format_context: crate::subc_format::FormatContext::default(),
+            },
+        );
+        let routes = HashMap::from([(
+            route,
+            super::super::test_support::route_identity(&root, &task.session_id),
+        )]);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
+        let _state = task.state.lock().unwrap();
+        let _no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
+        // The frame loop awaits this function directly. It must be ready even
+        // while task state is unavailable, not merely offload a blocking read
+        // and leave the module loop waiting for that worker.
+        let reply = answer_held_bash_calls_from_module_loop(&writer_tx, &routes, &metrics, true);
+        tokio::pin!(reply);
+        let answered = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(reply.as_mut(), cx))
+        })
+        .await;
+        assert!(
+            matches!(answered, std::task::Poll::Ready(Ok(1))),
+            "drain reply waited on task state: {answered:?}"
+        );
+        let frame = writer_rx.recv().await.unwrap().frame;
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["structuredContent"]["task_id"], task.task_id);
+        assert_eq!(body["structuredContent"]["status"], "running");
+        assert!(claim.claimed_by_module_loop());
+        assert!(writer_rx.try_recv().is_err(), "exactly one reply");
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +356,7 @@ mod default_kill_tests {
             task.session_id.clone(),
             false,
             false,
+            None,
             None,
         )
         .await;
@@ -260,6 +402,7 @@ mod default_kill_tests {
                 false,
                 false,
                 None,
+                None,
             )
             .await;
             finished += u64::from(observation.target_finished);
@@ -286,6 +429,7 @@ mod default_kill_tests {
             false,
             false,
             None,
+            None,
         )
         .await;
         let missing = observe_deferred_bash_wait(
@@ -294,6 +438,7 @@ mod default_kill_tests {
             task.session_id.clone(),
             false,
             false,
+            None,
             None,
         )
         .await;
@@ -323,6 +468,7 @@ mod default_kill_tests {
             true,
             worker_session,
             Some(Duration::from_millis(1_800_000)),
+            None,
         )
         .await;
         assert!(!observation.target_finished);
@@ -458,19 +604,33 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                                 .bash_watch_available
                                 .unwrap_or(target.worker_session),
                         ),
-                        crate::commands::bash_orchestrate::kill_deadline_note(&target.registry, &target.task_id, &target.session_id, target.worker_session),
+                         "\nUse bash_status to inspect its output and kill deadline.",
                     ),
                         "task_id": target.task_id,
                         "status": "running",
                     }),
                 );
-                let response = warn_if_runon_capture_missing(
-                    target.registry.clone(),
-                    target.task_id.clone(),
-                    target.session_id.clone(),
-                    response,
-                )
-                .await;
+                // This function is awaited by the module loop itself, not by a
+                // separate wait task. Even awaiting a blocking-pool read here
+                // would stop it serving other routes. Use only the cached
+                // run-on launch reply; task-state reads and deadline details
+                // can wait for a subsequent status call.
+                let response = if target
+                    .registry
+                    .runon_launch_state(&target.task_id, &target.session_id)
+                    .is_some()
+                {
+                    cached_runon_launch_reply(
+                        &target.registry,
+                        &target.task_id,
+                        &target.session_id,
+                        &response,
+                        true,
+                    )
+                    .unwrap_or(response)
+                } else {
+                    response
+                };
                 let result = bash_result_from_response(response, &target.format_context);
                 Some(build_tool_response_frame(
                     target.ver,
@@ -2500,14 +2660,12 @@ async fn run_deferred_bash_wait(
                     detach_on_user_message,
                     worker_session,
                     worker_cap_ms.map(|_| Duration::from_millis(crate::commands::bash_orchestrate::worker_wait_max_ms(&wait_ctx))),
+                    remote_handback.map(|(at, _)| at),
                 )
                 .await
             } => {
-                let DeferredWaitObservation { target_finished, detach_pending } = observation;
+                let DeferredWaitObservation { target_finished, detach_pending, remote_handback_due } = observation;
                 let promotion_due = !block_to_completion && Instant::now() >= deadline;
-                let remote_handback_due = remote_handback
-                    .is_some_and(|(at, _)| Instant::now() >= at)
-                    && registry.is_remote_task(&task_id, &session_id);
                 // While the module drains, every foreground wait (wait:true,
                 // block_to_completion, or a plain wait window) is detached into
                 // a background task so its request can answer before the drain
@@ -8326,11 +8484,9 @@ mod grant_path_tests {
     }
 
     /// A deferred bash wait runs on the frame loop's single-threaded runtime.
-    /// While another thread holds its task's state mutex (the bash watchdog
-    /// does, while it persists the task to disk and aft.db), the wait's
-    /// periodic task check must not park that thread: every other route's
-    /// frames are read and written by it. The timer ticks below stand in for
-    /// those routes, because they only run when the runtime thread is free.
+    /// Reject task-state lock acquisitions on that thread, even if uncontended:
+    /// another thread may be persisting JSON or spawning a fallback under the
+    /// same lock. Scheduler delays are not evidence of a lock acquisition.
     #[tokio::test]
     async fn deferred_bash_wait_does_not_block_the_frame_loop_on_task_state_lock() {
         assert_deferred_wait_entrypoint("sleep 2", None).await;
@@ -8353,6 +8509,7 @@ mod grant_path_tests {
         let (_dir, root) = super::super::test_support::test_root("bash-wait-lock");
         executor.register_actor(root.clone(), super::super::test_support::test_ctx());
         let hang_timeout = Duration::from_secs(120);
+        let _no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
 
         submit_deferred_bash(
             &executor,
@@ -8404,9 +8561,8 @@ mod grant_path_tests {
         );
 
         drop(completion_tx);
-        // Measure responsiveness only after the wait has actually entered, not
-        // against a shell-startup deadline. An early terminal reply would skip
-        // the held-lock observation and must not count as exercising the wait.
+        // Require a real deferred wait before releasing a gated command. Its
+        // terminal reply below also requires the wait's observation/poll path.
         tokio::time::timeout(hang_timeout, async {
             while metrics
                 .deferred_bash_waits_in_flight
@@ -8415,7 +8571,7 @@ mod grant_path_tests {
             {
                 tokio::select! {
                     _ = completion_rx.recv() => panic!(
-                        "bash completed before the deferred wait entered; task-state lock contention was not exercised"
+                        "bash completed before the deferred wait entered"
                     ),
                     _ = tokio::time::sleep(Duration::from_millis(5)) => {}
                 }
@@ -8423,55 +8579,7 @@ mod grant_path_tests {
         })
         .await
         .expect("bash startup hung before the deferred wait entered");
-        let registry = executor
-            .actor_context(&root)
-            .expect("actor context")
-            .bash_background()
-            .clone();
-        let task_id = registry
-            .list(0)
-            .into_iter()
-            .next()
-            .expect("running bash task")
-            .info
-            .task_id;
-        let task = registry.task_for_test(&task_id).expect("registered task");
-
-        let hold = Duration::from_millis(1_200);
-        let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            let state = task.state.lock().expect("task state");
-            held_tx
-                .send(state.metadata.status.is_terminal())
-                .expect("held signal");
-            std::thread::sleep(hold);
-        });
-        let already_terminal = held_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("holder took the task state lock");
-        assert!(
-            !already_terminal,
-            "bash completed before task-state lock contention could be exercised"
-        );
-
-        // Tick the runtime through several of the wait's poll intervals while
-        // the lock is held. An inline snapshot parks the thread for the whole
-        // hold, which shows up as one tick taking ~1.2 s.
-        let ticking_until = Instant::now() + Duration::from_millis(800);
-        let mut longest_tick = Duration::ZERO;
-        while Instant::now() < ticking_until {
-            let tick = Instant::now();
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            longest_tick = longest_tick.max(tick.elapsed());
-        }
-        assert!(
-            longest_tick < Duration::from_millis(300),
-            "the frame loop stalled for {longest_tick:?} behind a held task state lock"
-        );
-        holder.join().expect("holder thread");
         if let Some(release) = release {
-            // Keep a gated command alive until lock contention has actually
-            // been exercised, then let it finish without a fixed run duration.
             std::fs::write(release, b"release").unwrap();
         }
 

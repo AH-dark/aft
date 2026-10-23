@@ -13602,12 +13602,48 @@ fn remote_job_id(metadata: &PersistedTask) -> Option<String> {
         .map(|job_id| job_id.to_string())
 }
 
+#[cfg(test)]
+thread_local! {
+    static TASK_STATE_LOCKS_FORBIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Checks frame-loop lock ownership directly, without treating scheduler latency
+/// as evidence of a blocking lock. This guard must stay on its creating thread.
+#[cfg(test)]
+pub(crate) struct TaskStateLockBanForTest {
+    previous: bool,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+pub(crate) fn forbid_task_state_locks_for_test() -> TaskStateLockBanForTest {
+    TaskStateLockBanForTest {
+        previous: TASK_STATE_LOCKS_FORBIDDEN.with(|flag| flag.replace(true)),
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+#[cfg(test)]
+impl Drop for TaskStateLockBanForTest {
+    fn drop(&mut self) {
+        TASK_STATE_LOCKS_FORBIDDEN.with(|flag| flag.set(self.previous));
+    }
+}
+
 impl BgTask {
     /// Unwinding does not make a process terminal. Recover the same state used
     /// by snapshots so timeout, marker and reap paths can settle the task.
     pub(crate) fn lock_state(
         &self,
     ) -> std::sync::LockResult<std::sync::MutexGuard<'_, BgTaskState>> {
+        #[cfg(test)]
+        TASK_STATE_LOCKS_FORBIDDEN.with(|flag| {
+            assert!(
+                !flag.get(),
+                "task state lock attempted on the frame-loop thread for {}",
+                self.task_id
+            );
+        });
         match self.state.lock() {
             Ok(state) => Ok(state),
             Err(poison) => {

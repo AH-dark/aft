@@ -413,7 +413,7 @@ async fn every_local_spawn_entrypoint_executes_command_once() {
                 "deferred wait must run its command once"
             );
             eprintln!(
-                "spawn entrypoint deferred-wait: command executed and held-lock wait completed"
+                "spawn entrypoint deferred-wait: command executed and frame-loop lock check completed"
             );
             continue;
         }
