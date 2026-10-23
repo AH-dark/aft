@@ -884,6 +884,7 @@ fn registration_and_publication_during_a_sweep_are_safe() {
         .register_view("scope-a", &storage.path().join("root-a"))
         .unwrap();
     publish(&a, &[("a.txt", b"a")], None);
+    put_garbage(&a, b"unreferenced sweep candidate");
 
     let mut late = None;
     with_sweep_paused_after_marking(storage.path(), || {

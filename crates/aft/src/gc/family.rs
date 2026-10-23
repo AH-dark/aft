@@ -42,10 +42,11 @@
 //! mark could miss a protected key; a deletion walk that reaches one simply
 //! stops, which only leaves garbage for the next sweep.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rusqlite::{params, OptionalExtension};
@@ -175,6 +176,8 @@ pub trait SweepObserver {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FamilySweepReport {
     pub epoch: u64,
+    /// No epoch was advanced. The reason distinguishes cadence from preflight.
+    pub skipped: Option<&'static str>,
     pub marked_keys: usize,
     pub deleted_blobs: usize,
     pub deleted_bytes: u64,
@@ -249,6 +252,11 @@ pub fn sweep_family_bounded(
 
 /// [`sweep_family_bounded`] for a caller that sweeps a family on a schedule
 /// and usually finds it small, such as disk-limit enforcement.
+///
+/// A lease-held preflight first checks whether any row, segment or missing
+/// root can be collected. A negative result leaves blob epochs unchanged and skips blob deletion,
+/// while retaining dead-owner cleanup, free-page reclaim and missing-root
+/// bookkeeping. A positive result always runs the complete marking protocol.
 ///
 /// After marking, with the lease held and every store's epoch raised, it
 /// adds up the sizes of the files under `blobs/v2/<family>/` with the same
@@ -355,25 +363,134 @@ fn sweep_with_maintenance(
     small: SmallFamilyCheck,
     set_up_totals: bool,
 ) -> Result<FamilySweepReport, FamilySweepError> {
+    sweep_pass(
+        registry,
+        requested_by,
+        policy,
+        bounds,
+        observer,
+        small,
+        set_up_totals,
+        None,
+    )
+}
+
+/// Periodic disk enforcement and retention share one lease-held due clock and
+/// the retention policy (collect unreferenced rows). Otherwise a disk pass with
+/// a looser budget could indefinitely postpone retention's zero-byte budget.
+/// Hard-limit admission and newly evicted views bypass the clock.
+pub(crate) fn sweep_family_scheduled(
+    registry: &FamilyRegistry,
+    bounds: SweepBounds,
+    force: bool,
+) -> Result<FamilySweepReport, FamilySweepError> {
+    sweep_pass(
+        registry,
+        None,
+        FamilySweepPolicy { byte_budget: 0 },
+        bounds,
+        None,
+        SmallFamilyCheck::FileWalk,
+        true,
+        Some(force),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sweep_pass(
+    registry: &FamilyRegistry,
+    requested_by: Option<&str>,
+    policy: FamilySweepPolicy,
+    bounds: SweepBounds,
+    observer: Option<&dyn SweepObserver>,
+    small: SmallFamilyCheck,
+    set_up_totals: bool,
+    scheduled: Option<bool>,
+) -> Result<FamilySweepReport, FamilySweepError> {
     let _ = requested_by;
-    let lease = registry.begin_sweep()?.ok_or(FamilySweepError::Busy)?;
+    let Some(mut lease) = registry.acquire_sweep()? else {
+        update_stats(registry.path(), registry.family(), |stats| {
+            stats.skipped += 1
+        });
+        return Err(FamilySweepError::Busy);
+    };
+    let mut flight = SweepFlight::new(registry);
+    if let Some(force) = scheduled {
+        if !lease.due(force)? {
+            flight.finish(Some("interval"));
+            return Ok(FamilySweepReport {
+                epoch: lease.epoch(),
+                skipped: Some("interval"),
+                ..Default::default()
+            });
+        }
+    }
+    let members = registry.members_bounded(8192)?;
+    let access = StoreWriteAccess::for_registered_view(registry.storage(), registry.family());
+    let mut stores = Vec::new();
+    for plane in FamilyPlane::ALL {
+        if plane_path(registry.storage(), registry.family(), plane)?.is_file() {
+            stores.push(FamilyStore::open(&access, plane)?);
+        }
+    }
+    if !may_collect(
+        registry,
+        &members,
+        &stores,
+        policy,
+        &bounds,
+        small,
+        set_up_totals,
+    )? {
+        // Dead-owner metadata and already-free pages can be reclaimed without
+        // changing any blob's deletion epoch.
+        let mut report = FamilySweepReport {
+            epoch: lease.epoch(),
+            skipped: Some("nothing to collect"),
+            ..Default::default()
+        };
+        report.reclaimed_readers = registry.reclaim_dead_readers()?;
+        for member in &members {
+            if bounds.past_deadline() {
+                return Err(FamilySweepError::Bounded(
+                    "deadline reached during metadata cleanup".into(),
+                ));
+            }
+            let reclaimed =
+                reclaim_member_metadata(member, registry.family(), &bounds).map_err(|failure| {
+                    match failure {
+                        MarkFailure::Uncertain(reason) => FamilySweepError::Uncertain(reason),
+                        MarkFailure::Bounded(reason) => FamilySweepError::Bounded(reason),
+                    }
+                })?;
+            report.reclaimed_pins += reclaimed;
+        }
+        for member in &members {
+            deregister_if_missing(registry, member, observer, &bounds, &mut report)?;
+        }
+        for store in &stores {
+            reclaim_free_pages(store, &bounds, &mut report)?;
+        }
+        if scheduled.is_some() && !report.stopped_early && !report.reclaim_deferred {
+            lease.completed()?;
+        }
+        flight.finish(report.skipped);
+        return Ok(report);
+    }
+    lease.advance_epoch()?;
     let epoch = lease.epoch();
     let mut report = FamilySweepReport {
         epoch,
         ..FamilySweepReport::default()
     };
-    let access = StoreWriteAccess::for_registered_view(registry.storage(), registry.family());
-    let mut stores = Vec::new();
-    for plane in FamilyPlane::ALL {
-        if plane_path(registry.storage(), registry.family(), plane)?.is_file() {
-            let store = FamilyStore::open(&access, plane)?;
-            store.raise_epoch(epoch)?;
-            stores.push(store);
-        }
+    for store in &stores {
+        store.raise_epoch(epoch)?;
     }
     observe(observer, SweepStep::EpochRaised);
 
     report.reclaimed_readers = registry.reclaim_dead_readers()?;
+    // Membership can change during preflight. Never reuse its reference set:
+    // a deleting pass must mark a fresh snapshot after raising every epoch.
     let members = registry.members_bounded(8192)?;
     let mut marked = BTreeSet::new();
     for member in &members {
@@ -437,6 +554,10 @@ fn sweep_with_maintenance(
         }
         deregister_if_missing(registry, member, observer, &bounds, &mut report)?;
     }
+    if scheduled.is_some() && !report.stopped_early && !report.reclaim_deferred {
+        lease.completed()?;
+    }
+    flight.finish(None);
     lease.release();
     Ok(report)
 }
@@ -689,10 +810,33 @@ fn mark_member(
         store.as_ref(),
         bounds,
         reclaim,
+        true,
         &mut marks,
     )?;
     mark_readers(view_dir, store.as_ref(), bounds, reclaim, &mut marks)?;
     Ok(marks)
+}
+
+/// Reclaims dead-owner pin and reader files without loading references. A
+/// non-collecting pass needs only owner metadata, not manifests or live pin
+/// key lists whose contents would be discarded.
+fn reclaim_member_metadata(
+    member: &MemberRecord,
+    family: &str,
+    bounds: &SweepBounds,
+) -> Result<usize, MarkFailure> {
+    let mut cleanup = MemberMarks::default();
+    mark_pins(
+        &member.view_dir,
+        family,
+        None,
+        bounds,
+        true,
+        false,
+        &mut cleanup,
+    )?;
+    mark_readers(&member.view_dir, None, bounds, true, &mut cleanup)?;
+    Ok(cleanup.reclaimed_pins)
 }
 
 /// The entries of a protection directory, at most `bounds` of them. More
@@ -749,6 +893,7 @@ fn mark_pins(
     store: Option<&ViewStore>,
     bounds: &SweepBounds,
     reclaim: bool,
+    collect_keys: bool,
     marks: &mut MemberMarks,
 ) -> Result<(), MarkFailure> {
     let pins_dir = view_dir.join("pins");
@@ -776,6 +921,9 @@ fn mark_pins(
                 let _ = fs::remove_file(&keys_path);
                 marks.reclaimed_pins += 1;
             }
+            continue;
+        }
+        if !collect_keys {
             continue;
         }
         let keys = pins::read_keys(&keys_path).map_err(|error: PinError| {
@@ -1087,4 +1235,299 @@ enum Deregistration {
     Due {
         recorded: i64,
     },
+}
+
+/// A false result is only an optimization: concurrent puts or dropped
+/// references may leave garbage for the next pass, but cannot delete live data.
+/// Uncertain references or a bounded scan take the ordinary full-mark path.
+#[allow(clippy::too_many_arguments)]
+fn may_collect(
+    registry: &FamilyRegistry,
+    members: &[MemberRecord],
+    stores: &[FamilyStore],
+    policy: FamilySweepPolicy,
+    bounds: &SweepBounds,
+    small: SmallFamilyCheck,
+    set_up_totals: bool,
+) -> Result<bool, FamilySweepError> {
+    for member in members {
+        if member.missing_sweeps > 0
+            || (root_is_missing(member)
+                && member.root.as_ref().is_some_and(|root| {
+                    crate::storage_retention::missing_root_eligibility(
+                        registry.storage(),
+                        root,
+                        member.last_bind_ms,
+                    ) == crate::storage_retention::RootEligibility::Due
+                }))
+        {
+            return Ok(true);
+        }
+    }
+    let fits = match small {
+        SmallFamilyCheck::FileWalk => matches!(
+            crate::views::eviction::family_files_within(
+                registry.storage(),
+                registry.family(),
+                bounds.deadline,
+                policy.byte_budget
+            ),
+            Ok(true)
+        ),
+        SmallFamilyCheck::Never => false,
+        #[cfg(test)]
+        SmallFamilyCheck::Assumed(bytes) => bytes <= policy.byte_budget,
+    };
+    if fits {
+        return Ok(false);
+    }
+    let mut candidates = Vec::new();
+    for store in stores {
+        if bounds.past_deadline() {
+            return Ok(true);
+        }
+        let segments = store.segments()?;
+        let segment_bytes = segments.iter().map(|row| row.byte_len).sum::<u64>();
+        if store
+            .payload_bytes_upper_bound()?
+            .saturating_add(segment_bytes)
+            <= policy.byte_budget
+        {
+            continue;
+        }
+        if policy.byte_budget > 0 {
+            if set_up_totals {
+                ensure_payload_totals(store, bounds);
+            }
+            if store.usage()?.payload_bytes.saturating_add(segment_bytes) <= policy.byte_budget {
+                continue;
+            }
+        }
+        candidates.push((store, segments));
+    }
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+    let mut marked = BTreeSet::new();
+    for member in members {
+        if bounds.past_deadline() {
+            return Ok(true);
+        }
+        match member_references(member, registry.family(), bounds) {
+            Ok(keys) => marked.extend(keys),
+            Err(_) => return Ok(true),
+        }
+    }
+    for (store, segments) in candidates {
+        if bounds.past_deadline() {
+            return Ok(true);
+        }
+        if segments.iter().any(|row| !marked.contains(&row.segment_id))
+            || store.may_have_unmarked(&marked, bounds.deadline)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Process-lifetime work counters, grouped by family directory. They are
+/// observational only; the durable lease and due clock decide collection.
+#[derive(Clone, Default, serde::Serialize)]
+pub(crate) struct SweepStats {
+    family: String,
+    family_directory: String,
+    acquired: u64,
+    skipped: u64,
+    aborted: u64,
+    stale_rows_touched: u64,
+    last_outcome: String,
+}
+
+fn stats() -> &'static Mutex<BTreeMap<PathBuf, SweepStats>> {
+    static STATS: OnceLock<Mutex<BTreeMap<PathBuf, SweepStats>>> = OnceLock::new();
+    STATS.get_or_init(Mutex::default)
+}
+
+fn update_stats<T>(path: &Path, family: &str, update: impl FnOnce(&mut SweepStats) -> T) -> T {
+    let mut stats = stats()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = stats
+        .entry(path.parent().unwrap_or(path).to_path_buf())
+        .or_default();
+    entry.family = family.to_owned();
+    entry.family_directory = path.parent().unwrap_or(path).display().to_string();
+    update(entry)
+}
+
+pub(crate) fn record_stale_rows(path: &Path, family: &str, count: u64) {
+    if count > 0 {
+        update_stats(path, family, |stats| stats.stale_rows_touched += count);
+    }
+}
+
+pub(crate) fn sweep_stats() -> serde_json::Value {
+    let stats = stats()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    serde_json::to_value(stats.values().collect::<Vec<_>>()).unwrap_or_default()
+}
+
+struct SweepFlight<'a> {
+    registry: &'a FamilyRegistry,
+    finished: bool,
+}
+impl<'a> SweepFlight<'a> {
+    fn new(registry: &'a FamilyRegistry) -> Self {
+        update_stats(registry.path(), registry.family(), |stats| {
+            stats.acquired += 1
+        });
+        Self {
+            registry,
+            finished: false,
+        }
+    }
+    fn finish(&mut self, skipped: Option<&str>) {
+        self.record_outcome(skipped, false, |stats| {
+            crate::slog_info!("v2 sweep family={} outcome={} acquired={} skipped={} aborted={} stale_rows_touched={}", stats.family, stats.last_outcome, stats.acquired, stats.skipped, stats.aborted, stats.stale_rows_touched);
+        });
+    }
+
+    fn record_outcome(
+        &mut self,
+        skipped: Option<&str>,
+        aborted: bool,
+        emit: impl FnOnce(&SweepStats),
+    ) {
+        self.finished = true;
+        let snapshot = update_stats(self.registry.path(), self.registry.family(), |stats| {
+            stats.skipped += u64::from(skipped.is_some());
+            stats.aborted += u64::from(aborted);
+            stats.last_outcome = if aborted {
+                "aborted".to_owned()
+            } else {
+                skipped.map_or_else(
+                    || "completed".to_owned(),
+                    |reason| format!("skipped: {reason}"),
+                )
+            };
+            stats.clone()
+        });
+        // A slow synchronous sink must not hold the statistics lock: touches
+        // in unrelated families also update these counters.
+        emit(&snapshot);
+    }
+}
+impl Drop for SweepFlight<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.record_outcome(None, true, |stats| {
+                crate::slog_warn!("v2 sweep family={} outcome=aborted acquired={} skipped={} aborted={} stale_rows_touched={}", stats.family, stats.acquired, stats.skipped, stats.aborted, stats.stale_rows_touched);
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod sweep_stats_tests {
+    use super::*;
+
+    #[test]
+    fn sweep_logging_does_not_block_other_family_touches() {
+        for aborted in [false, true] {
+            let log_dir = tempfile::tempdir().unwrap();
+            let touch_dir = tempfile::tempdir().unwrap();
+            let logger = crate::gc::family_read_tests::build(log_dir.path(), 1, |_| true);
+            let touched = crate::gc::family_read_tests::build(touch_dir.path(), 1, |_| true);
+            touched.store.raise_epoch(1).unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let registry = logger.registry.clone();
+            let logging = std::thread::spawn(move || {
+                let mut flight = SweepFlight::new(&registry);
+                flight.record_outcome(None, aborted, |_| {
+                    // Block at the synchronous emission boundary; the normal
+                    // file sink is asynchronous and cannot model this stall.
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let store = touched.store.clone();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let touching = std::thread::spawn(move || {
+                let report = store
+                    .touch(&[crate::gc::family_read_tests::chunk_key(0)])
+                    .unwrap();
+                done_tx.send(report.touched).unwrap();
+            });
+            let completed_while_log_held = done_rx.recv_timeout(Duration::from_secs(2)).ok();
+            release_tx.send(()).unwrap();
+            logging.join().unwrap();
+            touching.join().unwrap();
+            assert_eq!(
+                completed_while_log_held,
+                Some(1),
+                "a blocked sweep log must not stall another family's touch (aborted={aborted})"
+            );
+        }
+    }
+
+    #[test]
+    fn health_counts_skipped_aborted_and_actual_stale_row_updates_per_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = crate::gc::family_read_tests::build(dir.path(), 2, |_| true);
+        sweep_family_remeasured(
+            &fixture.registry,
+            None,
+            FamilySweepPolicy {
+                byte_budget: u64::MAX,
+            },
+            SweepBounds::default(),
+            None,
+        )
+        .unwrap();
+        let error = sweep_family_remeasured(
+            &fixture.registry,
+            None,
+            FamilySweepPolicy { byte_budget: 0 },
+            SweepBounds {
+                deadline: Some(Instant::now()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, FamilySweepError::Bounded(_)));
+        fixture
+            .store
+            .raise_epoch(fixture.store.gc_epoch().unwrap() + 1)
+            .unwrap();
+        let keys = [
+            crate::gc::family_read_tests::chunk_key(0),
+            crate::gc::family_read_tests::chunk_key(1),
+        ];
+        fixture.store.touch(&keys).unwrap();
+        fixture.store.touch(&keys).unwrap();
+        let snapshot = sweep_stats();
+        let family_dir = fixture
+            .registry
+            .path()
+            .parent()
+            .unwrap()
+            .display()
+            .to_string();
+        let entry = snapshot
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["family_directory"] == family_dir)
+            .unwrap();
+        assert_eq!(entry["acquired"], 2);
+        assert_eq!(entry["skipped"], 1);
+        assert_eq!(entry["aborted"], 1);
+        assert_eq!(entry["stale_rows_touched"], 2);
+        assert_eq!(entry["last_outcome"], "aborted");
+    }
 }

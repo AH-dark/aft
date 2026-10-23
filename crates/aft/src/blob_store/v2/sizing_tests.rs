@@ -13,6 +13,7 @@ struct ReadCounts {
     overflow_pages: BTreeSet<i64>,
     page_size: i64,
     reads: usize,
+    read_bytes: u64,
     overflow_reads: usize,
 }
 
@@ -30,6 +31,7 @@ unsafe extern "C" fn counted_read(
     let original = COUNTS.with_borrow_mut(|counts| {
         let counts = counts.as_mut().expect("read probe installed");
         counts.reads += 1;
+        counts.read_bytes += amount.max(0) as u64;
         if amount > 0 {
             let first = offset / counts.page_size + 1;
             let last = (offset + i64::from(amount) - 1) / counts.page_size + 1;
@@ -88,6 +90,7 @@ impl ReadProbe {
                 overflow_pages,
                 page_size,
                 reads: 0,
+                read_bytes: 0,
                 overflow_reads: 0,
             });
         });
@@ -100,6 +103,10 @@ impl ReadProbe {
             original,
             _methods: methods,
         }
+    }
+
+    fn read_bytes(&self) -> u64 {
+        COUNTS.with_borrow(|counts| counts.as_ref().unwrap().read_bytes)
     }
 
     fn counts(&self) -> (usize, usize) {
@@ -293,4 +300,348 @@ fn disk_limit_pass_deleting_28000_rows_probe() {
             );
         }
     }
+}
+
+fn probe_wal(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push("-wal");
+    name.into()
+}
+
+fn probe_checkpoint(store: &FamilyStore) {
+    lock(&store.inner.connection)
+        .execute_batch("PRAGMA wal_autocheckpoint=0; PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+}
+
+/// Counts SQLite main-file reads and WAL appends separately from kernel I/O.
+/// A cold SQLite cache is not a cold OS cache; physical reads may still be zero.
+fn probe_touch(store: &FamilyStore, keys: &[FamilyKey], label: &str, split: bool) -> u64 {
+    use crate::process_io::Bytes;
+
+    probe_checkpoint(store);
+    let probe = ReadProbe::install(&lock(&store.inner.connection));
+    let before = Bytes::capture().unwrap();
+    if split {
+        let mut connection = lock(&store.inner.connection);
+        let tx = connection.transaction().unwrap();
+        for key in keys {
+            tx.execute(
+                "UPDATE probe_refs SET ref_epoch=ref_epoch+1 WHERE full_key=?1",
+                params![key.as_bytes().as_slice()],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    } else {
+        assert_eq!(store.touch(keys).unwrap().touched, keys.len());
+    }
+    let reads = probe.read_bytes();
+    assert!(reads > 0, "cold SQLite cache must reach the byte counter");
+    let overflow_reads = probe.counts().1;
+    drop(probe);
+    let wal_bytes = std::fs::metadata(probe_wal(store.path())).map_or(0, |m| m.len());
+    let operation_io = Bytes::capture().unwrap().delta(before).unwrap();
+    let checkpoint: (u64, u64, u64) = lock(&store.inner.connection)
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(checkpoint.0, 0);
+    let total_io = Bytes::capture().unwrap().delta(before).unwrap();
+    eprintln!(
+        "IO_PROBE {}",
+        serde_json::json!({
+            "kind": "touch", "label": label, "rows": keys.len(),
+            "sqlite_main_read_bytes": reads, "overflow_reads": overflow_reads,
+            "wal_append_bytes": wal_bytes, "operation_io": operation_io,
+            "including_checkpoint_io": total_io,
+        })
+    );
+    wal_bytes
+}
+
+#[test]
+#[ignore = "offline SQLite I/O characterization; run single-threaded with isolated HOME/XDG"]
+fn io_amplification_v2_touch_probe() {
+    let base =
+        PathBuf::from(std::env::var_os("AFT_IO_PROBE_DIR").expect("set isolated probe directory"));
+    std::fs::create_dir_all(&base).unwrap();
+    for payload_size in [4096, 16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024] {
+        let dir = tempfile::tempdir_in(&base).unwrap();
+        let store = populate(dir.path(), 32, payload_size);
+        let keys: Vec<_> = store.rows().unwrap().into_iter().map(|r| r.key).collect();
+        // Normalize the populate helper's varying epochs before measuring a no-op.
+        store.touch(&keys).unwrap();
+        let label = format!("payload_{payload_size}");
+        let unchanged = probe_touch(&store, &keys, &format!("{label}_same_epoch"), false);
+        assert_eq!(unchanged, 0, "current epochs must not open a writer");
+        let epoch = store.gc_epoch().unwrap();
+        store.raise_epoch(epoch + 1).unwrap();
+        let updated = probe_touch(&store, &keys, &format!("{label}_advanced_epoch"), false);
+        assert!(updated > 0, "epoch change must produce WAL frames");
+        assert_eq!(
+            probe_touch(&store, &keys, &format!("{label}_repeat"), false),
+            0
+        );
+        // This side table is an experimental control, never a production migration.
+        lock(&store.inner.connection).execute_batch(
+            "CREATE TABLE probe_refs(full_key BLOB PRIMARY KEY, ref_epoch INTEGER NOT NULL) WITHOUT ROWID;
+             INSERT INTO probe_refs SELECT full_key, ref_epoch FROM blob_payloads;",
+        ).unwrap();
+        let split = probe_touch(&store, &keys, &format!("{label}_split_control"), true);
+        assert!(split > 0, "split control must also perform a real update");
+    }
+}
+
+fn probe_inventory(path: &Path) {
+    if path.is_dir() {
+        let mut entries = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for entry in entries {
+            probe_inventory(&entry);
+        }
+    } else if path.extension().is_some_and(|ext| ext == "sqlite") {
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let objects: Vec<(String, u64)> = connection
+            .prepare("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY SUM(pgsize) DESC")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        eprintln!(
+            "IO_PROBE {}",
+            serde_json::json!({
+                "kind": "database", "path": path,
+                "file_bytes": std::fs::metadata(path).unwrap().len(), "objects": objects,
+            })
+        );
+    }
+}
+
+#[test]
+#[ignore = "builds a real checkout's views; run single-threaded with isolated HOME/XDG"]
+fn io_amplification_checkout_probe() {
+    use crate::process_io::Bytes;
+    use crate::views::assembly::{head_tree_fingerprint, publish_checkout, AssemblyRequest};
+    use crate::write_ledger::{pending_for_test, Domain};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let base =
+        PathBuf::from(std::env::var_os("AFT_IO_PROBE_DIR").expect("set isolated probe directory"));
+    std::fs::create_dir_all(&base).unwrap();
+    let root = PathBuf::from(std::env::var_os("AFT_IO_PROBE_ROOT").expect("set checkout root"))
+        .canonicalize()
+        .unwrap();
+    let storage = base.join("checkout-store");
+    assert!(!storage.exists(), "use an empty directory for a cold run");
+    let mut request = AssemblyRequest {
+        storage: storage.clone(),
+        project_root: root.clone(),
+        family: "io-probe".into(),
+        scope: "probe-a".into(),
+        desired_head: head_tree_fingerprint(&crate::alias::head_tree_entries(&root).unwrap()),
+        changed_paths: BTreeSet::new(),
+        semantic_keys: BTreeMap::new(),
+        require_semantic: false,
+        allow_blob_put: true,
+        callgraph: true,
+    };
+    let root_id = root.display().to_string();
+    for label in ["cold", "unchanged", "second_checkout"] {
+        if label == "second_checkout" {
+            request.scope = "probe-b".into();
+        }
+        let domains = [
+            Domain::ViewsBlob,
+            Domain::ViewsDerived,
+            Domain::ViewsClosure,
+        ];
+        let before_domains = domains.map(|domain| pending_for_test(domain, &root_id));
+        let before = Bytes::capture().unwrap();
+        let started = std::time::Instant::now();
+        let report = publish_checkout(&request).unwrap();
+        let io = Bytes::capture().unwrap().delta(before).unwrap();
+        assert!(report.pending_paths.is_empty());
+        assert_eq!(report.published, label != "unchanged");
+        for (domain, baseline) in domains.into_iter().zip(before_domains) {
+            let after = pending_for_test(domain, &root_id);
+            let delta = (after.0 - baseline.0, after.1 - baseline.1);
+            eprintln!(
+                "IO_PROBE {}",
+                serde_json::json!({
+                    "kind": "domain", "label": label, "domain": domain.as_str(),
+                    "logical_bytes": delta.0, "physical_bytes": delta.1,
+                })
+            );
+            if label == "cold" && domain == Domain::ViewsDerived {
+                assert!(
+                    delta.0 > 0,
+                    "cold build must reach derived write accounting"
+                );
+            }
+        }
+        eprintln!(
+            "IO_PROBE {}",
+            serde_json::json!({
+                "kind": "publication", "label": label, "io": io,
+                "elapsed_ms": started.elapsed().as_millis(),
+                "blob_puts": report.blob_puts, "generation": report.generation,
+            })
+        );
+    }
+    probe_inventory(&storage);
+}
+
+#[test]
+#[ignore = "copies extracted callgraph payloads into an isolated v2 store for touch profiling"]
+fn io_amplification_real_payload_touch_probe() {
+    let base =
+        PathBuf::from(std::env::var_os("AFT_IO_PROBE_DIR").expect("set isolated probe directory"));
+    std::fs::create_dir_all(&base).unwrap();
+    let input = PathBuf::from(
+        std::env::var_os("AFT_IO_PROBE_BLOBS").expect("set extracted callgraph SQLite input"),
+    );
+    let source =
+        rusqlite::Connection::open_with_flags(input, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let dir = tempfile::tempdir_in(&base).unwrap();
+    let access = StoreWriteAccess::for_registered_view(dir.path(), "io-probe");
+    let store = FamilyStore::open(&access, FamilyPlane::Callgraph).unwrap();
+    let mut statement = source
+        .prepare("SELECT full_key, payload FROM blob_payloads")
+        .unwrap();
+    let mut source_rows = statement.query([]).unwrap();
+    while let Some(row) = source_rows.next().unwrap() {
+        let key: Vec<u8> = row.get(0).unwrap();
+        let payload: Vec<u8> = row.get(1).unwrap();
+        store
+            .put_or_touch(
+                &FamilyKey::new(FamilyPlane::Callgraph, key.try_into().unwrap()),
+                &payload,
+            )
+            .unwrap();
+    }
+    let rows = store.rows().unwrap();
+    assert!(
+        !rows.is_empty(),
+        "input must contain real serialized callgraph payloads"
+    );
+    let mut sizes = rows.iter().map(|r| r.payload_bytes).collect::<Vec<_>>();
+    sizes.sort_unstable();
+    eprintln!(
+        "IO_PROBE {}",
+        serde_json::json!({
+            "kind": "payload_distribution", "rows": sizes.len(),
+            "total_bytes": sizes.iter().sum::<u64>(), "p50": sizes[sizes.len()/2],
+            "p95": sizes[sizes.len()*95/100], "max": sizes.last(),
+            "gc_epoch_before_touch": store.gc_epoch().unwrap(),
+        })
+    );
+    let keys = rows.into_iter().map(|r| r.key).collect::<Vec<_>>();
+    probe_touch(&store, &keys, "real_callgraph_same_epoch", false);
+    store.raise_epoch(store.gc_epoch().unwrap() + 1).unwrap();
+    probe_touch(&store, &keys, "real_callgraph_advanced_epoch", false);
+    let registry = crate::views::registry::FamilyRegistry::open(dir.path(), "io-probe").unwrap();
+    let epoch = store.gc_epoch().unwrap();
+    let sweep = crate::gc::family::sweep_family_remeasured(
+        &registry,
+        None,
+        crate::gc::family::FamilySweepPolicy {
+            byte_budget: u64::MAX,
+        },
+        crate::gc::family::SweepBounds::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(sweep.skipped, Some("nothing to collect"));
+    assert_eq!(store.gc_epoch().unwrap(), epoch);
+    probe_touch(
+        &store,
+        &keys,
+        "real_callgraph_under_budget_after_preflight",
+        false,
+    );
+    lock(&store.inner.connection)
+        .execute_batch(
+            "CREATE TABLE probe_refs(full_key BLOB PRIMARY KEY, ref_epoch INTEGER NOT NULL) WITHOUT ROWID;
+             INSERT INTO probe_refs SELECT full_key, ref_epoch FROM blob_payloads;",
+        )
+        .unwrap();
+    probe_touch(&store, &keys, "real_callgraph_split_control", true);
+
+    // A zero-budget all-live pass must inspect references to establish that
+    // collection is unnecessary; measure its manifest and SQLite read demand.
+    use crate::views::manifest_v2::{
+        EntryPlanes, EntryV2, GenerationName, ManifestHeader, ManifestReadProbe, ManifestV2,
+        Producers, PublishV2,
+    };
+    use crate::views::readiness::PlaneState;
+    use crate::views::RelPath;
+    let checkout = dir.path().join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let view = registry.register_view("probe-live", &checkout).unwrap();
+    crate::views::eviction::wait_for_background_enforcement(&registry);
+    let mut manifest = ManifestV2::new(ManifestHeader {
+        producers: Producers {
+            trigram: "trigram-v1".into(),
+            semantic: None,
+            callgraph: "callgraph-v1".into(),
+        },
+        head_tree: None,
+        ignore_fingerprint: None,
+        segment: None,
+    });
+    for (index, key) in keys.iter().enumerate() {
+        manifest
+            .insert(
+                RelPath::new(format!("src/file-{index}.rs").into_bytes()).unwrap(),
+                EntryV2::regular(
+                    ContentHash::of(key.as_bytes()),
+                    0,
+                    EntryPlanes {
+                        trigram: None,
+                        semantic: None,
+                        callgraph: Some(PlaneState::ready(key)),
+                    },
+                ),
+            )
+            .unwrap();
+    }
+    let view_store = view.view_store().unwrap();
+    let name = GenerationName::for_manifest(&manifest).unwrap();
+    let prepared = view_store.prepare_v2(&name, None, &manifest, None).unwrap();
+    assert_eq!(
+        view_store.commit_v2(prepared, None).unwrap(),
+        PublishV2::Published
+    );
+    let manifests = ManifestReadProbe::start();
+    let sqlite = ReadProbe::install(&lock(&store.inner.connection));
+    let report = crate::gc::family::sweep_family_remeasured(
+        &registry,
+        None,
+        crate::gc::family::FamilySweepPolicy { byte_budget: 0 },
+        crate::gc::family::SweepBounds::default(),
+        None,
+    )
+    .unwrap();
+    let manifest_reads = manifests.finish();
+    let loads = manifest_reads.values().map(|(loads, _)| loads).sum::<u64>();
+    let bytes = manifest_reads.values().map(|(_, bytes)| bytes).sum::<u64>();
+    eprintln!(
+        "IO_PROBE {}",
+        serde_json::json!({
+            "kind": "all_live_sweep", "rows": keys.len(), "manifest_loads": loads,
+            "manifest_read_bytes": bytes, "sqlite_main_read_bytes": sqlite.read_bytes(),
+            "overflow_reads": sqlite.counts().1,
+        })
+    );
+    assert_eq!(report.skipped, Some("nothing to collect"));
+    assert_eq!(loads, 1, "skip cleanup must not reload the live manifest");
 }

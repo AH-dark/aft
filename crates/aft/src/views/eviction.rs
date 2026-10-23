@@ -1083,6 +1083,14 @@ pub fn enforce(
     registry: &FamilyRegistry,
     options: EnforceOptions<'_>,
 ) -> Result<EnforcementReport, EvictionError> {
+    enforce_with_schedule(registry, options, None)
+}
+
+fn enforce_with_schedule(
+    registry: &FamilyRegistry,
+    options: EnforceOptions<'_>,
+    scheduled: Option<bool>,
+) -> Result<EnforcementReport, EvictionError> {
     let budget = registry.disk_budget();
     let deadline = options.deadline;
     let _ = registry.reclaim_dead_sessions();
@@ -1153,7 +1161,16 @@ pub fn enforce(
     if !past(deadline) {
         #[cfg(test)]
         LAST_SWEEP_BUDGET.with(|last| last.set(Some(policy.byte_budget)));
-        match family::sweep_family_remeasured(registry, None, policy, walk_bounds(deadline), None) {
+        let swept = if let Some(force) = scheduled {
+            family::sweep_family_scheduled(
+                registry,
+                walk_bounds(deadline),
+                force || !report.evicted.is_empty(),
+            )
+        } else {
+            family::sweep_family_remeasured(registry, None, policy, walk_bounds(deadline), None)
+        };
+        match swept {
             Ok(sweep) => {
                 report.stopped_early |= sweep.stopped_early;
                 report.sweep = Some(sweep);
@@ -1502,7 +1519,9 @@ struct Scheduler {
     /// Families with a pass running or waiting in `queue`, each once.
     pending: BTreeSet<PathBuf>,
     /// Passes waiting for the running one to finish, oldest first.
-    queue: VecDeque<FamilyRegistry>,
+    queue: VecDeque<(FamilyRegistry, bool)>,
+    /// A hard-limit request arriving during a pass must not be lost to cadence.
+    forced: BTreeSet<PathBuf>,
     /// True while the enforcement thread exists. It drains `queue` before
     /// it clears this under the same lock, so a queued pass is never left
     /// without a thread to run it.
@@ -1584,24 +1603,28 @@ fn spawn_enforcement(registry: FamilyRegistry, force: bool) -> Scheduled {
     {
         let mut scheduler = lock_scheduler();
         if !scheduler.pending.insert(key.clone()) {
+            if force {
+                scheduler.forced.insert(key.clone());
+            }
             return Scheduled::AlreadyPending;
         }
         if scheduler.runner {
-            scheduler.queue.push_back(registry);
+            scheduler.queue.push_back((registry, force));
             return Scheduled::Queued;
         }
         scheduler.runner = true;
     }
     let spawned = std::thread::Builder::new()
         .name("aft-view-disk-limits".to_string())
-        .spawn(move || run_enforcement_queue(registry));
+        .spawn(move || run_enforcement_queue(registry, force));
     if let Err(error) = spawned {
         let mut scheduler = lock_scheduler();
         scheduler.pending.remove(&key);
         // Passes queued while the spawn was attempted have no thread either;
         // release them so their next request can start one.
-        for queued in std::mem::take(&mut scheduler.queue) {
+        for (queued, _) in std::mem::take(&mut scheduler.queue) {
             scheduler.pending.remove(queued.path());
+            scheduler.forced.remove(queued.path());
         }
         scheduler.runner = false;
         drop(scheduler);
@@ -1613,13 +1636,21 @@ fn spawn_enforcement(registry: FamilyRegistry, force: bool) -> Scheduled {
 
 /// The body of the one enforcement thread: runs `first`, then every queued
 /// pass in order, and exits when the queue is empty.
-fn run_enforcement_queue(first: FamilyRegistry) {
-    let mut next = Some(first);
-    while let Some(registry) = next.take() {
+fn run_enforcement_queue(first: FamilyRegistry, force: bool) {
+    run_enforcement_queue_with(first, force, run_enforcement_pass);
+}
+
+fn run_enforcement_queue_with(
+    first: FamilyRegistry,
+    force: bool,
+    mut run_pass: impl FnMut(&FamilyRegistry, bool),
+) {
+    let mut next = Some((first, force));
+    while let Some((registry, force)) = next.take() {
+        let force = lock_scheduler().forced.remove(registry.path()) || force;
         // A panicking pass must not take the queued passes with it.
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_enforcement_pass(&registry)
-        }));
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_pass(&registry, force)));
         if outcome.is_err() {
             crate::slog_warn!(
                 "view disk limits check panicked family={}",
@@ -1627,6 +1658,18 @@ fn run_enforcement_queue(first: FamilyRegistry) {
             );
         }
         let mut scheduler = lock_scheduler();
+        if scheduler.forced.remove(registry.path()) {
+            let key = registry.path().to_path_buf();
+            if scheduler.pending.insert(key.clone()) {
+                // Repeated admission failures must not jump ahead of families
+                // that were already waiting for disk maintenance.
+                scheduler.queue.push_back((registry, true));
+            } else {
+                // A request queued this family after its pass released the
+                // pending slot. Upgrade that entry rather than duplicating it.
+                scheduler.forced.insert(key);
+            }
+        }
         next = scheduler.queue.pop_front();
         if next.is_none() {
             scheduler.runner = false;
@@ -1645,7 +1688,7 @@ static MOST_CONCURRENT_PASSES: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 static PASS_TEST_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn run_enforcement_pass(registry: &FamilyRegistry) {
+fn run_enforcement_pass(registry: &FamilyRegistry, force: bool) {
     // Unwinding must release the family as well as normal completion, or
     // this family's disk limits would never run again.
     let _flight = EnforcementFlight(registry.path().to_path_buf());
@@ -1673,7 +1716,7 @@ fn run_enforcement_pass(registry: &FamilyRegistry) {
         deadline: Some(Instant::now() + ENFORCEMENT_DEADLINE),
         observer: None,
     };
-    match enforce(registry, options) {
+    match enforce_with_schedule(registry, options, Some(force)) {
         Ok(report) => log_report(registry, &report),
         Err(error) => crate::slog_warn!(
             "view disk limits check failed family={} error={}",
@@ -3125,6 +3168,39 @@ mod tests {
         assert!(report.over_hard.is_empty());
     }
     #[test]
+    fn disk_limits_and_retention_share_cadence_and_admission_bypasses_it() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = two_view_family(storage.path());
+        // Establish retention's completion clock even if registration already
+        // requested background enforcement for this family.
+        family::sweep_family_scheduled(&registry, SweepBounds::default(), true).unwrap();
+        let disk =
+            enforce_with_schedule(&registry, EnforceOptions::default(), Some(false)).unwrap();
+        assert_eq!(disk.sweep.unwrap().skipped, Some("interval"));
+        let access =
+            crate::blob_store::v2::StoreWriteAccess::for_registered_view(storage.path(), FAMILY);
+        let store =
+            crate::blob_store::v2::FamilyStore::open(&access, FamilyPlane::Semantic).unwrap();
+        let garbage = crate::blob_store::v2::FamilyKey::new(FamilyPlane::Semantic, [99; 32]);
+        store.put_or_touch(&garbage, b"unreferenced").unwrap();
+        let before = store.gc_epoch().unwrap();
+        registry.set_disk_budget(budget(u64::MAX, 1));
+        assert!(matches!(
+            admit_new_view(&registry),
+            Err(RegistryError::AdmissionQueued(_))
+        ));
+        wait_for_background_enforcement(&registry);
+        assert!(store.gc_epoch().unwrap() > before);
+        assert!(
+            !store.contains(&garbage).unwrap(),
+            "hard-limit admission must force collection inside the interval"
+        );
+        let retention =
+            family::sweep_family_scheduled(&registry, SweepBounds::default(), false).unwrap();
+        assert_eq!(retention.skipped, Some("interval"));
+    }
+
+    #[test]
     fn enforcement_flight_is_released_when_worker_unwinds() {
         let directory = tempfile::tempdir().unwrap();
         let key = directory.path().join("registry.sqlite");
@@ -3135,6 +3211,83 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(!is_running(&key));
+    }
+
+    #[test]
+    fn repeated_hard_limit_admissions_do_not_starve_a_queued_family() {
+        if std::env::var_os("AFT_TEST_FAIR_SWEEP_CHILD").is_none() {
+            // The queue is process-global. Run this ordering fixture alone so
+            // unrelated tests cannot start a worker against its seeded queue.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "views::eviction::tests::repeated_hard_limit_admissions_do_not_starve_a_queued_family", "--nocapture", "--test-threads=1"])
+                .env("AFT_TEST_FAIR_SWEEP_CHILD", "1")
+                .output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                "isolated fairness test failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let stuck_storage = tempfile::tempdir().unwrap();
+        let queued_storage = tempfile::tempdir().unwrap();
+        let stuck = FamilyRegistry::open(stuck_storage.path(), FAMILY).unwrap();
+        let queued = FamilyRegistry::open(queued_storage.path(), FAMILY).unwrap();
+        let root = stuck_storage.path().join("held-root");
+        fs::create_dir_all(&root).unwrap();
+        let held = stuck.register_view("held", &root).unwrap();
+        publish(&held, &[("held.txt", text(1, 2_000))], 8);
+        idle_view(&queued, "idle", 2, 8);
+        wait_for_background_enforcement(&stuck);
+        wait_for_background_enforcement(&queued);
+        stuck.set_disk_budget(budget(0, 1));
+        queued.set_disk_budget(budget(0, 1));
+        assert!(measure(&stuck, None).unwrap().view_store_bytes > 1);
+        assert!(measure(&queued, None).unwrap().view_store_bytes > 1);
+        {
+            let mut scheduler = lock_scheduler();
+            assert!(!scheduler.runner && scheduler.queue.is_empty());
+            scheduler.runner = true;
+            scheduler.pending.insert(stuck.path().to_path_buf());
+            scheduler.pending.insert(queued.path().to_path_buf());
+            scheduler.queue.push_back((queued.clone(), true));
+        }
+        let mut passes = 0;
+        let mut retries = 0;
+        let mut queued_pass = None;
+        run_enforcement_queue_with(stuck.clone(), true, |registry, force| {
+            passes += 1;
+            if registry.path() == stuck.path() && retries < 4 {
+                // Retry while this family is pending, as a caller can during
+                // a slow enforcement pass. The held session cannot be evicted.
+                assert!(matches!(
+                    admit_new_view(registry),
+                    Err(RegistryError::AdmissionQueued(_))
+                ));
+                retries += 1;
+            }
+            run_enforcement_pass(registry, force);
+            if registry.path() == queued.path() {
+                queued_pass = Some(passes);
+            }
+        });
+        assert_eq!(retries, 4);
+        assert!(recorded_totals(&stuck).unwrap().unwrap().view_store_bytes > 1);
+        assert!(
+            queued.member("idle").unwrap().is_none(),
+            "the queued family's over-limit view must be removed"
+        );
+        assert_eq!(
+            family_payload_bytes(&queued).unwrap(),
+            0,
+            "the queued family must also be swept"
+        );
+        assert_eq!(
+            queued_pass,
+            Some(2),
+            "an older queued family must run before a forced retry"
+        );
     }
 
     /// Background passes of many families run one at a time, process-wide:
@@ -3465,7 +3618,8 @@ mod tests {
     /// 4 KiB page, the payload totals table that pass sets up in the trigram
     /// store. Every family file size then grew by one more 4 KiB page, the
     /// deletion counter table a writer sets up when it first opens a family
-    /// store. File
+    /// store. Skipping the below-limit epoch update removes one 4,120-byte
+    /// WAL frame from that pass and the next pass's starting file bytes. File
     /// sizes depend on the platform's SQLite page and write-ahead-log
     /// behaviour, so other platforms only run the fixture.
     const GOLDEN_VALUES: &[&str] = &[
@@ -3482,16 +3636,16 @@ mod tests {
         "admission default admitted",
         "below-limit evicted=[] sweep_byte_budget=Some(2147483648) deleted_blobs=Some(0) \
          deleted_bytes=Some(0) deleted_segments=Some(0) sweep_error=None \
-         before_file_bytes=503565 after_file_bytes=532405 after_complete=true over_hard=[] \
+         before_file_bytes=503565 after_file_bytes=528285 after_complete=true over_hard=[] \
          stopped_early=false",
         "recorded view_usage scope=a bytes=41568 held=false",
         "recorded view_usage scope=b bytes=41568 held=false",
         "recorded view_usage scope=c bytes=41568 held=false",
-        "recorded family_usage file_bytes=532405",
+        "recorded family_usage file_bytes=528285",
         "recorded usage_record complete=true",
         "collect-all evicted=[(\"b\", 41568), (\"c\", 41568)] sweep_byte_budget=Some(0) \
          deleted_blobs=Some(5) deleted_bytes=Some(171409) deleted_segments=Some(2) \
-         sweep_error=None before_file_bytes=548885 after_file_bytes=522673 \
+         sweep_error=None before_file_bytes=544765 after_file_bytes=522673 \
          after_complete=true over_hard=[] stopped_early=false",
         "recorded view_usage scope=a bytes=41568 held=false",
         "recorded family_usage file_bytes=522673",
@@ -3513,7 +3667,7 @@ mod tests {
             15,
             "collect-all evicted=[(\"b\", 41568), (\"c\", 41568)] sweep_byte_budget=Some(0) \
              deleted_blobs=Some(5) deleted_bytes=Some(171409) deleted_segments=Some(2) \
-             sweep_error=None before_file_bytes=548885 after_file_bytes=518553 \
+             sweep_error=None before_file_bytes=544765 after_file_bytes=518553 \
              after_complete=true over_hard=[] stopped_early=false",
         ),
         (17, "recorded family_usage file_bytes=518553"),
@@ -3657,15 +3811,11 @@ mod tests {
             .count()
     }
 
-    /// A pass below every limit sweeps without any per-plane check: the
-    /// family's files already fit in the payload budget. Every other pass
-    /// runs them once per plane: file bytes over the payload budget but under
-    /// the soft limit, a walk of the family's files that could not finish,
-    /// and a pass that evicted a view and so collects every unreferenced row.
-    /// Of those, the incomplete walk is still settled by the plane's page
-    /// capacity. The first pass that needs a plane's exact payload sums its
-    /// rows once to set up the plane's payload totals; the later collect-all
-    /// pass reads those totals and sums nothing.
+    /// A pass below every limit skips before marking or per-plane checks:
+    /// the family's files fit in the payload budget. An all-live family over
+    /// that budget is settled by preflight, so only the collect-all pass after
+    /// eviction reaches the deletion aggregates. Exact totals are initialized
+    /// once by preflight and reused by deletion.
     #[test]
     fn a_below_limit_sweep_reads_no_logical_totals_and_every_other_pass_reads_them() {
         let storage = tempfile::tempdir().unwrap();
@@ -3681,7 +3831,11 @@ mod tests {
             Some(FAMILY_PAYLOAD_BUDGET_BYTES)
         );
         assert_eq!(report.sweep.as_ref().unwrap().deleted_blobs, 0);
-        assert!(report.sweep.as_ref().unwrap().marked_keys > 0);
+        assert_eq!(report.sweep.as_ref().unwrap().marked_keys, 0);
+        assert_eq!(
+            report.sweep.as_ref().unwrap().skipped,
+            Some("nothing to collect")
+        );
         assert_eq!((checked, sums), (0, 0), "below-limit pass");
 
         // Over a payload budget of one byte, far under the soft limit.
@@ -3693,7 +3847,11 @@ mod tests {
         assert!(report.evicted.is_empty());
         assert!(report.before.family_store.file_bytes < FAMILY_STORE_SOFT_BYTES);
         assert_eq!(LAST_SWEEP_BUDGET.with(|last| last.replace(None)), Some(1));
-        assert_eq!((checked, sums), (planes, planes), "over the payload budget");
+        assert_eq!(
+            (checked, sums),
+            (0, planes),
+            "preflight settles an all-live family before deletion"
+        );
 
         // A directory deeper than the walk goes leaves it incomplete.
         registry.set_disk_budget(DiskBudget::default());
@@ -3707,7 +3865,11 @@ mod tests {
             LAST_SWEEP_BUDGET.with(|last| last.replace(None)),
             Some(FAMILY_PAYLOAD_BUDGET_BYTES)
         );
-        assert_eq!((checked, sums), (planes, 0), "incomplete walk");
+        assert_eq!(
+            (checked, sums),
+            (0, 0),
+            "preflight settles the incomplete walk by page capacity"
+        );
         fs::remove_dir_all(family_dir(storage.path(), FAMILY).unwrap().join("deeper")).unwrap();
 
         registry.set_disk_budget(budget(0, u64::MAX));

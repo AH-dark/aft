@@ -3604,6 +3604,10 @@ fn build_health_report_with_indexing(
     );
     metrics.insert("views_work".to_string(), crate::views::io::work_snapshot());
     metrics.insert(
+        "v2_family_sweeps".to_string(),
+        crate::gc::family::sweep_stats(),
+    );
+    metrics.insert(
         "filesystem_helpers".to_string(),
         crate::bounded_io::helper_health(),
     );

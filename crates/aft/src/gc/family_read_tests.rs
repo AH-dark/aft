@@ -1081,3 +1081,188 @@ fn free_pages_only_pass_receipt() {
     }
     drop(fixture.view);
 }
+
+#[test]
+fn under_budget_sweep_keeps_epoch_and_touches_no_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = build(dir.path(), 8, |_| true);
+    let before = fixture.store.gc_epoch().unwrap();
+    let probe = ReadProbe::start(&fixture.store);
+    let report = sweep_family_remeasured(
+        &fixture.registry,
+        None,
+        FamilySweepPolicy {
+            byte_budget: u64::MAX,
+        },
+        SweepBounds::default(),
+        None,
+    )
+    .unwrap();
+    let reads = probe.finish();
+    assert_eq!(
+        fixture.store.gc_epoch().unwrap(),
+        before,
+        "a non-collecting sweep must not stale live rows"
+    );
+    assert_eq!(report.epoch, before);
+    assert_eq!(report.marked_keys, 0);
+    assert_eq!(report.deleted_blobs, 0);
+    assert!(reads
+        .statements
+        .keys()
+        .all(|sql| !sql.contains("UPDATE blob_payloads")));
+}
+
+#[test]
+fn scheduled_sweeps_coalesce_but_force_collects_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = build(dir.path(), 8, |_| true);
+    let first = super::family::sweep_family_scheduled(
+        &fixture.registry,
+        SweepBounds {
+            max_rows_per_store: 1,
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(first.skipped, Some("nothing to collect"));
+    let epoch = fixture.store.gc_epoch().unwrap();
+    let garbage = chunk_key(99);
+    fixture.store.put_or_touch(&garbage, b"garbage").unwrap();
+    let second =
+        super::family::sweep_family_scheduled(&fixture.registry, SweepBounds::default(), false)
+            .unwrap();
+    assert_eq!(second.skipped, Some("interval"));
+    assert_eq!(fixture.store.gc_epoch().unwrap(), epoch);
+    let forced =
+        super::family::sweep_family_scheduled(&fixture.registry, SweepBounds::default(), true)
+            .unwrap();
+    assert_eq!(forced.skipped, None);
+    assert_eq!(forced.marked_keys, 8);
+    assert_eq!(forced.deleted_blobs, 1);
+    assert!(!fixture.store.contains(&garbage).unwrap());
+    for index in 0..8 {
+        assert!(fixture.store.contains(&chunk_key(index)).unwrap());
+    }
+}
+
+#[test]
+fn deleting_pass_marks_every_live_key_before_deletion() {
+    struct Check<'a> {
+        store: &'a FamilyStore,
+    }
+    impl SweepObserver for Check<'_> {
+        fn reached(&self, step: SweepStep) {
+            if step == SweepStep::Marked {
+                for index in 0..9 {
+                    assert!(self.store.contains(&chunk_key(index)).unwrap());
+                }
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = build(dir.path(), 9, |index| index != 8);
+    let report = sweep_family_remeasured(
+        &fixture.registry,
+        None,
+        FamilySweepPolicy { byte_budget: 0 },
+        SweepBounds::default(),
+        Some(&Check {
+            store: &fixture.store,
+        }),
+    )
+    .unwrap();
+    assert_eq!(report.marked_keys, 8);
+    assert_eq!(report.deleted_blobs, 1);
+    for index in 0..8 {
+        assert!(fixture.store.contains(&chunk_key(index)).unwrap());
+    }
+    assert!(!fixture.store.contains(&chunk_key(8)).unwrap());
+}
+
+#[test]
+fn all_live_preflight_reads_each_manifest_once_and_reclaims_dead_owners() {
+    use crate::views::manifest_v2::ManifestReadProbe;
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = build(dir.path(), 4, |_| true);
+    let view_store = fixture.view.view_store().unwrap();
+    let protected_generation = view_store.current_generation().unwrap().unwrap();
+    publish_marks(&fixture.view, 0..3);
+    let current_generation = view_store.current_generation().unwrap().unwrap();
+    assert_ne!(current_generation, protected_generation);
+    let live_reader =
+        crate::root_cache::ReadMarker::create(fixture.view.view_dir(), &protected_generation)
+            .unwrap();
+    let live_pin =
+        crate::pins::AssemblyPin::create_v2(&fixture.view, "live-assembly", &[chunk_key(0)])
+            .unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--list")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let dead_pid = child.id();
+    child.wait().unwrap();
+    let (dead_pin, dead_keys) = crate::pins::pin_paths(fixture.view.view_dir(), "dead-assembly");
+    let metadata = crate::pins::PinMetadata {
+        family: FAMILY.to_owned(),
+        view: fixture.view.scope().to_owned(),
+        generation: "dead-assembly".to_owned(),
+        owner: crate::pins::PinOwner {
+            pid: dead_pid,
+            start_time: 0,
+        },
+        created_at: 0,
+        renewed_at: 0,
+    };
+    fs::write(&dead_pin, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    fs::write(&dead_keys, b"").unwrap();
+    let dead_marker =
+        crate::root_cache::ReadMarker::create(fixture.view.view_dir(), "dead-reader").unwrap();
+    let dead_marker_path = dead_marker.path().to_path_buf();
+    let mut dead_metadata = dead_marker.metadata().clone();
+    drop(dead_marker);
+    dead_metadata.pid = dead_pid;
+    fs::write(
+        &dead_marker_path,
+        serde_json::to_vec(&dead_metadata).unwrap(),
+    )
+    .unwrap();
+    let before = fixture.store.gc_epoch().unwrap();
+    let probe = ManifestReadProbe::start();
+    let report = sweep_family_remeasured(
+        &fixture.registry,
+        None,
+        FamilySweepPolicy { byte_budget: 0 },
+        SweepBounds::default(),
+        None,
+    )
+    .unwrap();
+    let reads = probe.finish();
+    assert_eq!(report.skipped, Some("nothing to collect"));
+    assert_eq!(fixture.store.gc_epoch().unwrap(), before);
+    assert_eq!(report.reclaimed_pins, 1);
+    assert!(!dead_pin.exists() && !dead_keys.exists() && !dead_marker_path.exists());
+    assert!(live_reader.path().exists());
+    assert!(
+        crate::pins::pin_paths(fixture.view.view_dir(), "live-assembly")
+            .0
+            .exists()
+    );
+    assert_eq!(
+        reads.len(),
+        2,
+        "current and distinct reader-protected generations must be inspected"
+    );
+    for generation in [&current_generation, &protected_generation] {
+        let path = view_store.manifest_path(generation).unwrap();
+        assert_eq!(
+            reads.get(&path),
+            Some(&(1, fs::metadata(&path).unwrap().len())),
+            "cleanup must not reload {generation}"
+        );
+    }
+    drop(live_pin);
+}

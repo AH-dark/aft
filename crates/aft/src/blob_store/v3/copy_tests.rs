@@ -587,6 +587,7 @@ fn a_copier_waits_out_a_live_sweep_lease_before_pinning() {
     let pins = source.registration.view_dir().join("pins");
     let reference =
         AssemblyPin::create_v2(&source.registration, "fixture-reference", &[source.key]).unwrap();
+    let garbage = v2_source(root.path(), b"unreferenced sweep candidate");
     let sweep = PausedSweep::after_marking(&source.registry);
     drop(reference);
     let copier = Copier::spawn(
@@ -600,6 +601,7 @@ fn a_copier_waits_out_a_live_sweep_lease_before_pinning() {
     );
     assert_no_pin_while_lease_is_live(&pins, &copier);
     sweep.finish();
+    assert!(!garbage.store.contains(&garbage.key).unwrap());
     assert!(source.store.contains(&source.key).unwrap());
     copier.wait_parked();
     assert_eq!(copy_pins(&pins).len(), 1);
