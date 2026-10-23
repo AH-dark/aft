@@ -130,7 +130,7 @@ fn bind_observed(
                 &mut pending,
                 &mut installed,
                 &mut routes,
-                &mut HashSet::new(),
+                &mut HashMap::new(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),
@@ -324,6 +324,28 @@ fn scope_workdir_repeated_binds_keep_one_stuck_diagnostic_in_flight() {
 #[cfg(unix)]
 #[test]
 fn scope_workdir_full_diagnostic_capacity_preserves_shared_file_reads() {
+    const CHILD_ENV: &str = "AFT_SCOPE_WORKDIR_READ_POOL_CHILD";
+    const TEST: &str = "subc::scope_workdir_tests::scope_workdir_full_diagnostic_capacity_preserves_shared_file_reads";
+    if std::env::var_os(CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        // The read pool is process-wide. Reexec only this measurement so unrelated
+        // parallel tests can neither occupy its workers nor be starved by it.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("start isolated read-pool measurement");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated read-pool measurement failed:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed;"),
+            "isolated read-pool measurement did not run exactly one test:\n{stdout}\n{stderr}"
+        );
+        return;
+    }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
