@@ -1,4 +1,14 @@
 import { Effect, Exit } from "effect";
+import { warn } from "../logger.js";
+
+export const MAX_ADMITTED_WAKES = 4096;
+
+export class WakeDeliveryOverflow extends Error {
+  readonly type = "wake_delivery_overflow";
+  constructor() {
+    super(`wake_delivery_overflow: ${MAX_ADMITTED_WAKES} unretired wake keys; admission deferred`);
+  }
+}
 
 /**
  * The `metadata.source` marker for AFT-written session input. Synthetic wakes
@@ -48,6 +58,14 @@ export interface CompletionWake {
   readonly notificationID?: string;
 }
 
+export type WakeAdmission = "delivered" | "already-delivered" | "not-delivered";
+
+export interface PatternMatchWake extends CompletionWake {
+  readonly watchID: string;
+  readonly matchOffset: number;
+  readonly reason?: string;
+}
+
 export interface StatusOnlyUpdate {
   readonly sessionID: string;
   readonly text: string;
@@ -57,48 +75,112 @@ export interface StatusOnlyUpdate {
 
 /**
  * Admit V2 session updates as synthetic input so machine-written notices are
- * not rendered as user turns. Completions wake execution; status does not.
+ * not rendered as user turns. Completions and pattern matches wake execution;
+ * status does not.
  */
 export class V2SessionDelivery {
-  private readonly admittedCompletions = new Set<string>();
+  private readonly admittedWakes = new Map<string, "pending" | "delivered">();
   private disposed = false;
 
-  constructor(private readonly session: V2SessionAdmission) {}
+  constructor(
+    private readonly session: V2SessionAdmission,
+    private readonly retainedWakeLimit = MAX_ADMITTED_WAKES,
+  ) {}
 
-  completion(input: CompletionWake): Effect.Effect<boolean, unknown> {
-    return Effect.suspend(() => {
-      if (this.disposed) return Effect.succeed(false);
-      const keys = [...new Set(input.taskIDs)].map(
+  completion(input: CompletionWake): Effect.Effect<WakeAdmission, unknown> {
+    return this.admitWake(
+      input,
+      [...new Set(input.taskIDs)].map(
         (taskID) => `${input.sessionID}\0${taskID}\0${input.notificationID ?? "completion"}`,
+      ),
+      "Background bash completed",
+    );
+  }
+
+  patternMatch(input: PatternMatchWake): Effect.Effect<WakeAdmission, unknown> {
+    // A sticky watch can match repeatedly before the task completes. Neither
+    // its later offsets nor the task's completion may share a delivery key.
+    return this.admitWake(input, [this.patternKey(input)], "Background bash pattern matched");
+  }
+
+  private patternKey(input: PatternMatchWake): string {
+    return JSON.stringify([
+      "pattern",
+      input.sessionID,
+      input.taskIDs,
+      input.watchID,
+      input.matchOffset,
+      input.reason,
+    ]);
+  }
+
+  // The consumer checks durable pending matches before admitting a replay, so
+  // an acknowledged or superseded match needs no permanent in-memory tombstone.
+  retirePatternMatch(input: PatternMatchWake): void {
+    this.admittedWakes.delete(this.patternKey(input));
+  }
+
+  retireCompletion(input: Pick<CompletionWake, "sessionID" | "taskIDs" | "notificationID">): void {
+    for (const taskID of input.taskIDs)
+      this.admittedWakes.delete(
+        `${input.sessionID}\0${taskID}\0${input.notificationID ?? "completion"}`,
       );
-      if (keys.length === 0 || keys.every((key) => this.admittedCompletions.has(key))) {
-        return Effect.succeed(false);
+  }
+
+  private admitWake(
+    input: CompletionWake,
+    keys: string[],
+    description: string,
+  ): Effect.Effect<WakeAdmission, unknown> {
+    return Effect.suspend(() => {
+      if (this.disposed || keys.length === 0) return Effect.succeed("not-delivered");
+      if (keys.every((key) => this.admittedWakes.get(key) === "delivered")) {
+        return Effect.succeed("already-delivered");
       }
-      const reserved = keys.filter((key) => !this.admittedCompletions.has(key));
-      for (const key of reserved) this.admittedCompletions.add(key);
+      // An in-flight reservation is not proof that synthetic input was admitted.
+      if (keys.some((key) => this.admittedWakes.get(key) === "pending")) {
+        return Effect.succeed("not-delivered");
+      }
+      const reserved = keys.filter((key) => !this.admittedWakes.has(key));
+      if (this.admittedWakes.size + reserved.length > this.retainedWakeLimit) {
+        const error = new WakeDeliveryOverflow();
+        warn(
+          JSON.stringify({
+            type: error.type,
+            cap: MAX_ADMITTED_WAKES,
+            session_id: input.sessionID,
+          }),
+        );
+        // Evicting an existing key could admit the same pattern or completion twice.
+        return Effect.fail(error);
+      }
+      for (const key of reserved) this.admittedWakes.set(key, "pending");
 
       return Effect.suspend(() =>
         this.session.get({ sessionID: input.sessionID }).pipe(
           Effect.flatMap((session) => {
-            // A committed revert deletes synthetic input admitted after its
-            // boundary. Keep the completion unacknowledged and retryable instead.
+            if (this.disposed) return Effect.succeed("not-delivered" as const);
+            // A staged revert can later delete synthetic input after its
+            // boundary. Keep the wake unacknowledged and retryable instead.
             if (session.revert) {
               return Effect.fail(
-                new Error("Background bash completion deferred: session has a staged revert"),
+                new Error("Background bash wake deferred: session has a staged revert"),
               );
             }
-            return this.session.synthetic({
-              sessionID: input.sessionID,
-              text: input.text,
-              description: "Background bash completed",
-              delivery: "steer",
-              metadata: {
-                ...input.metadata,
-                // Keep the origin marker even if the caller supplies its own source.
-                source: AFT_PROMPT_SOURCE,
-                task_ids: [...new Set(input.taskIDs)],
-              },
-            });
+            return this.session
+              .synthetic({
+                sessionID: input.sessionID,
+                text: input.text,
+                description,
+                delivery: "steer",
+                metadata: {
+                  ...input.metadata,
+                  // Keep the origin marker even if the caller supplies its own source.
+                  source: AFT_PROMPT_SOURCE,
+                  task_ids: [...new Set(input.taskIDs)],
+                },
+              })
+              .pipe(Effect.as("delivered" as const));
           }),
         ),
       ).pipe(
@@ -106,11 +188,13 @@ export class V2SessionDelivery {
           Effect.sync(() => {
             // Reserve while admission is in flight, but a failed or interrupted
             // admission must not suppress the bridge's next delivery attempt.
-            if (Exit.isFailure(exit))
-              for (const key of reserved) this.admittedCompletions.delete(key);
+            if (Exit.isFailure(exit) || exit.value === "not-delivered") {
+              for (const key of reserved) this.admittedWakes.delete(key);
+            } else if (!this.disposed) {
+              for (const key of reserved) this.admittedWakes.set(key, "delivered");
+            }
           }),
         ),
-        Effect.map(() => true),
       );
     });
   }
@@ -133,6 +217,6 @@ export class V2SessionDelivery {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.admittedCompletions.clear();
+    this.admittedWakes.clear();
   }
 }

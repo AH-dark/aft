@@ -940,6 +940,122 @@ pub(crate) fn servers_for_file_with_mode(
         .collect()
 }
 
+/// A walk owns one resolved registry. Files in the same directory reuse the
+/// selected server definition, workspace root and Biome configuration, but
+/// extensions and Biome include patterns are still checked for each file.
+pub(crate) struct WalkServerResolver<'a> {
+    config: &'a Config,
+    mode: RootPathMode,
+    servers: Vec<ServerDef>,
+    extensions: HashMap<String, Vec<usize>>,
+    markers: HashMap<String, Vec<usize>>,
+    directories: HashMap<PathBuf, HashMap<usize, Option<WalkDirectoryServer>>>,
+}
+
+struct WalkDirectoryServer {
+    definition: ServerDef,
+    root: PathBuf,
+    biome: BiomeFileSelection,
+}
+
+impl<'a> WalkServerResolver<'a> {
+    pub(crate) fn new(config: &'a Config, mode: RootPathMode) -> Self {
+        let servers: Vec<_> = resolved_servers(config)
+            .into_iter()
+            .filter(|server| !is_disabled(server, config))
+            .filter(|server| config.experimental_lsp_ty || server.kind != ServerKind::Ty)
+            .collect();
+        let mut extensions = HashMap::<String, Vec<usize>>::new();
+        let mut markers = HashMap::<String, Vec<usize>>::new();
+        for (index, server) in servers.iter().enumerate() {
+            for extension in &server.extensions {
+                let indices = extensions
+                    .entry(extension.to_ascii_lowercase())
+                    .or_default();
+                if !indices.contains(&index) {
+                    indices.push(index);
+                }
+            }
+            for marker in server
+                .root_markers
+                .iter()
+                .chain(&server.priority_root_markers)
+            {
+                if marker_signals_language(marker, server) {
+                    let indices = markers.entry(marker.clone()).or_default();
+                    if !indices.contains(&index) {
+                        indices.push(index);
+                    }
+                }
+            }
+        }
+        Self {
+            config,
+            mode,
+            servers,
+            extensions,
+            markers,
+            directories: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn marker_servers(&self, path: &Path) -> impl Iterator<Item = &ServerDef> {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| self.markers.get(name))
+            .into_iter()
+            .flatten()
+            .map(|index| &self.servers[*index])
+    }
+
+    pub(crate) fn for_each_file_server(
+        &mut self,
+        path: &Path,
+        mut visit: impl FnMut(&ServerDef, &Path),
+    ) {
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default();
+        let Some(indices) = self.extensions.get(&extension.to_ascii_lowercase()) else {
+            return;
+        };
+        let directory = self
+            .directories
+            .entry(path.parent().unwrap_or(path).to_path_buf())
+            .or_default();
+        for index in indices {
+            let facts = directory.entry(*index).or_insert_with(|| {
+                let definition = select_typescript_server(
+                    self.servers[*index].clone(),
+                    path,
+                    self.config,
+                    self.mode,
+                );
+                if is_disabled(&definition, self.config) {
+                    return None;
+                }
+                let root = definition.workspace_root_with_mode(
+                    path,
+                    self.config.project_root.as_deref(),
+                    self.mode,
+                )?;
+                let biome = biome_file_selection(&definition, path, self.mode);
+                Some(WalkDirectoryServer {
+                    definition,
+                    root,
+                    biome,
+                })
+            });
+            if let Some(facts) = facts {
+                if !facts.biome.excludes(path, self.mode) {
+                    visit(&facts.definition, &facts.root);
+                }
+            }
+        }
+    }
+}
+
 /// Biome applies only when a project configuration governs the file, and
 /// analyzes only the files that configuration's `files.includes` lists.
 /// Treating it as a producer for an excluded file (this repository's
@@ -952,11 +1068,34 @@ pub(crate) fn servers_for_file_with_mode(
 /// boundary workspace-root discovery uses. A configuration without
 /// `files.includes`, or one that cannot be read, includes every file.
 fn biome_config_excludes(server: &ServerDef, path: &Path, mode: RootPathMode) -> bool {
+    biome_file_selection(server, path, mode).excludes(path, mode)
+}
+
+enum BiomeFileSelection {
+    Missing,
+    All,
+    Includes(PathBuf, Arc<BiomeIncludes>),
+}
+
+impl BiomeFileSelection {
+    fn excludes(&self, path: &Path, mode: RootPathMode) -> bool {
+        match self {
+            Self::Missing => true,
+            Self::All => false,
+            Self::Includes(config_dir, includes) => mode
+                .resolve(path)
+                .strip_prefix(config_dir)
+                .is_ok_and(|relative| !includes.includes(relative)),
+        }
+    }
+}
+
+fn biome_file_selection(server: &ServerDef, path: &Path, mode: RootPathMode) -> BiomeFileSelection {
     if server.kind != ServerKind::Biome {
-        return false;
+        return BiomeFileSelection::All;
     }
     let Some(root) = server.workspace_root_with_mode(path, None, mode) else {
-        return true;
+        return BiomeFileSelection::Missing;
     };
     let mut reached_repository_root = false;
     let Some(config_path) = root
@@ -972,20 +1111,16 @@ fn biome_config_excludes(server: &ServerDef, path: &Path, mode: RootPathMode) ->
             candidate.is_file()
         })
     else {
-        return true;
+        return BiomeFileSelection::Missing;
     };
     let Some(includes) = biome_includes(&config_path) else {
-        return false;
+        return BiomeFileSelection::All;
     };
-    let path = mode.resolve(path);
     // `files.includes` patterns are relative to the configuration's directory.
     let Some(config_dir) = config_path.parent() else {
-        return false;
+        return BiomeFileSelection::All;
     };
-    let Ok(relative) = path.strip_prefix(config_dir) else {
-        return false;
-    };
-    !includes.includes(relative)
+    BiomeFileSelection::Includes(config_dir.to_path_buf(), includes)
 }
 
 /// A Biome `files.includes` list: a file is included when a positive pattern

@@ -321,6 +321,19 @@ async fn draining_retry_sleep(_root: &Path, _now: u64, delay: u64) {
     tokio::time::sleep(Duration::from_millis(delay)).await;
 }
 
+/// Shown for a remote task cancelled after it was submitted but before the
+/// build server accepted it: with no job id, nothing can confirm whether the
+/// command ran.
+#[cfg(unix)]
+pub(crate) const PRE_ACCEPTANCE_CANCELLED: &str =
+    "cancelled before the build server accepted the job; whether it ran is unknown";
+
+/// Prefix shown, followed by `: <error>`, when cancelling such a task
+/// failed.
+#[cfg(unix)]
+pub(crate) const PRE_ACCEPTANCE_CANCEL_FAILED: &str =
+    "could not cancel before the build server accepted the job; whether it ran is unknown";
+
 /// The remote runner AFT dispatches to; named in every remote reply header.
 #[cfg(unix)]
 const RUNNER_ID: &str = "ck-motor";
@@ -735,6 +748,18 @@ pub(crate) struct RemoteTask {
     #[serde(default)]
     pub unknown_len: u64,
     pub cancel_requested: bool,
+    /// A cancellation the runner still has to be sent (or to answer): set,
+    /// with `cancel_requested`, before an owner pause marks the task
+    /// finished, and cleared once the runner acknowledges the cancel or
+    /// reports a terminal for the job, or no job remains that it could reach.
+    /// A task saved finished with this still set gets a worker on replay. If
+    /// a runner job id is saved, that worker sends the cancel, so a restart
+    /// cannot drop it; without one there is nothing it can reach, and the
+    /// worker records the cancellation as failed and clears this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancel_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_pause_cancel: Option<String>,
     pub terminal: Option<TerminalRecord>,
     #[serde(default)]
     pub fallback_digest: Option<String>,
@@ -1491,6 +1516,8 @@ impl OutputSink for TaskSink {
         self.commit(|r| {
             r.job_id = Some(record.job_id);
             r.terminal = Some(record.clone());
+            // The runner has finished with the job: no cancellation is owed.
+            r.cancel_pending = false;
             r.gap_recovery = None;
             if retries_draining(r, verdict) {
                 if let Some(retry) = r.retry.as_mut() {
@@ -1505,7 +1532,10 @@ impl OutputSink for TaskSink {
                         )));
                 }
             }
-        })
+        })?;
+        // The saved record no longer owes a cancel; drop its index entry.
+        remove_owed_cancel_marker(&self.task.paths);
+        Ok(())
     }
 }
 
@@ -1600,6 +1630,19 @@ struct LocalFallback {
     env: HashMap<String, String>,
     capture_pipeline: bool,
     linux_scope: bool,
+}
+
+/// How `attach_remote` ended when it did not fail.
+#[cfg(unix)]
+enum Attached {
+    /// Re-attached to the job; its records continue on this stream.
+    Stream(exec::RemoteStream),
+    /// The scope's owner paused it through `bash.kill_scope`, which stopped
+    /// this task locally and was waiting for this worker to send the runner's
+    /// cancellation. That cancel result is now recorded, so the worker must end
+    /// here: another reconnect would only send the cancel again, and giving up
+    /// later would overwrite the recorded result with a recovery failure.
+    OwnerPauseSettled,
 }
 
 #[cfg(unix)]
@@ -1714,6 +1757,8 @@ impl BgTaskRegistry {
             stderr_len: 0,
             unknown_len: 0,
             cancel_requested: false,
+            cancel_pending: false,
+            owner_pause_cancel: None,
             terminal: None,
             fallback_digest: None,
             env_not_forwarded: None,
@@ -1860,7 +1905,63 @@ impl BgTaskRegistry {
         task: Arc<BgTask>,
         initial: Option<(Result<RunRequest, exec::Error>, LocalFallback)>,
     ) -> Result<(), String> {
+        {
+            // A finished task whose owed runner cancel the startup pass
+            // (`start_owed_cancel_pass`) sends or has sent gets no worker:
+            // the cancel goes out once per job.
+            let mut owed = owed_cancels()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let owes_cancel = task.state.lock().is_ok_and(|state| {
+                state.metadata.is_terminal()
+                    && state
+                        .metadata
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.cancel_pending)
+            });
+            if owes_cancel {
+                if let Some(outcome) = owed.settled.get(&task.task_id) {
+                    // This registry read the record before the pass saved
+                    // the outcome, and may have rewritten it since: save the
+                    // outcome again with the task's own record.
+                    apply_owed_cancel_outcome(&task, outcome);
+                    let mut db = DeferredDbWrites::new(self, &task);
+                    if let Ok(state) = task.state.lock() {
+                        let saved = self.persist_task_locked(&task, &state.metadata, &mut db);
+                        let still_owed = state
+                            .metadata
+                            .remote
+                            .as_ref()
+                            .is_some_and(|remote| remote.cancel_pending);
+                        if saved.is_ok() && !still_owed {
+                            remove_owed_cancel_marker(&task.paths);
+                        }
+                    }
+                    return Ok(());
+                }
+                if let Some(OwedCancelOwner::Pass { adopters }) = owed.claims.get_mut(&task.task_id)
+                {
+                    adopters.push(Arc::downgrade(&task));
+                    return Ok(());
+                }
+            }
+            // Two recovery paths can restore the same saved task (see
+            // `SavedRemoteTaskClaim`); a second worker would act on the task
+            // without seeing what the first one decided, so only one may run.
+            if task.remote_worker_running.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
+            // While this worker runs, the startup pass leaves the task's
+            // cancel to it.
+            owed.claims
+                .entry(task.task_id.clone())
+                .or_insert(OwedCancelOwner::Worker);
+        }
+        #[cfg(test)]
+        tests::note_remote_worker_start(&task.task_id);
         let registry = self.clone();
+        let spawned = Arc::clone(&task);
         std::thread::Builder::new()
             .name(format!("aft-remote-{}", task.task_id))
             .spawn(move || {
@@ -1870,6 +1971,14 @@ impl BgTaskRegistry {
                     .map_err(|e| e.to_string())
                     .and_then(|rt| rt.block_on(registry.run_remote_task(task.clone(), initial)));
                 if let Err(error) = result {
+                    if registry.finish_owner_pause_cancel(&task, Err(error.clone())) {
+                        task.remote_launch_ready.store(true, Ordering::Release);
+                        release_worker_owed_cancel_claim(&task.task_id);
+                        task.remote_worker_running.store(false, Ordering::Release);
+                        #[cfg(test)]
+                        tests::note_remote_worker_exit(&task.task_id);
+                        return;
+                    }
                     let point = task
                         .state
                         .lock()
@@ -1896,8 +2005,18 @@ impl BgTaskRegistry {
                 // Refusals must be rendered from their settled terminal state,
                 // not raced against the worker that is still recording them.
                 task.remote_launch_ready.store(true, Ordering::Release);
+                release_worker_owed_cancel_claim(&task.task_id);
+                task.remote_worker_running.store(false, Ordering::Release);
+                #[cfg(test)]
+                tests::note_remote_worker_exit(&task.task_id);
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                release_worker_owed_cancel_claim(&spawned.task_id);
+                spawned
+                    .remote_worker_running
+                    .store(false, Ordering::Release);
+                e.to_string()
+            })?;
         Ok(())
     }
 
@@ -1950,14 +2069,24 @@ impl BgTaskRegistry {
                         .as_str()
                         .unwrap_or("unknown")
                         .to_owned();
-                    return self.restored_remote_fallback(
+                    let result = self.restored_remote_fallback(
                         &task,
                         &remote,
                         &reason,
                         refusal_detail.as_deref(),
                     );
+                    // An owner pause recorded before this worker started already
+                    // ended the task, and the fallback above declined to launch.
+                    // The runner refused the job, so withholding the local run
+                    // is the whole cancellation; record it, as `bash.kill_scope`
+                    // waits for it.
+                    self.settle_owner_pause_without_resubmit(&task);
+                    return result;
                 }
                 self.remote_terminal(&task, exec::grade(record), None);
+                // The runner had already finished the job; there is nothing
+                // left to cancel for an owner pause recorded before this worker.
+                self.settle_owner_pause_without_resubmit(&task);
                 return Ok(());
             }
         }
@@ -1994,7 +2123,11 @@ impl BgTaskRegistry {
                 Ok(c) => break c,
                 Err(error) => {
                     if retry_request.is_some() {
-                        return self.refuse_remote_before_dispatch(&task, &error);
+                        self.refuse_remote_before_dispatch(&task, &error)?;
+                        // A pause that landed while reconnecting already ended
+                        // the task; the refusal changed nothing.
+                        self.settle_owner_pause_without_resubmit(&task);
+                        return Ok(());
                     }
                     if let Some((_, fallback)) = initial.take() {
                         return if remote.explicit_runon {
@@ -2061,6 +2194,20 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
                 hinted = Some(HintedRetry::start(&root, request.clone()));
             }
+            if task
+                .state
+                .lock()
+                .map_err(|_| "task lock poisoned")?
+                .metadata
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.cancel_requested)
+            {
+                if !self.finish_owner_pause_cancel(&task, Ok(())) {
+                    self.remote_terminal(&task, Verdict::Cancelled, None);
+                }
+                return Ok(());
+            }
             match client.run(&request).await {
                 Ok(stream) => stream,
                 Err(error) if proves_no_start(&error) => {
@@ -2081,8 +2228,13 @@ impl BgTaskRegistry {
             }
         } else {
             let point = remote.point().ok_or("remote outcome unknown: acceptance job ID was not persisted; command was not resubmitted")?;
-            self.attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
+            match self
+                .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
                 .await?
+            {
+                Attached::Stream(stream) => stream,
+                Attached::OwnerPauseSettled => return Ok(()),
+            }
         };
         let mut cancelled = false;
         loop {
@@ -2098,11 +2250,41 @@ impl BgTaskRegistry {
                 .is_some_and(|r| r.cancel_requested);
             if cancel && !cancelled {
                 if let Some(point) = stream.resume_point() {
-                    let _ = client.cancel_job(point.job_id).await;
-                    stream = self
+                    // Stands in for the daemon stopping before it sent the
+                    // cancellation to the runner.
+                    #[cfg(test)]
+                    if tests::stop_draining_worker(&root) {
+                        return Ok(());
+                    }
+                    let result = client
+                        .cancel_job(point.job_id)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string());
+                    if self.finish_owner_pause_cancel(&task, result) {
+                        return Ok(());
+                    }
+                    stream = match self
                         .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
-                        .await?;
+                        .await?
+                    {
+                        Attached::Stream(stream) => stream,
+                        Attached::OwnerPauseSettled => return Ok(()),
+                    };
                     cancelled = true;
+                } else {
+                    // Before the runner accepts the submission, there is no job
+                    // ID for exec.cancel or attach. Cancel the active call instead.
+                    // The SDK closes its receiver, so this cannot prove the job stopped.
+                    let result = client
+                        .cancel_submission(&stream)
+                        .await
+                        .map_err(|error| format!("{PRE_ACCEPTANCE_CANCEL_FAILED}: {error}"));
+                    if self.finish_owner_pause_cancel(&task, result.clone()) {
+                        return Ok(());
+                    }
+                    result?;
+                    return Err(PRE_ACCEPTANCE_CANCELLED.into());
                 }
             }
             let result = tokio::select! {
@@ -2182,27 +2364,37 @@ impl BgTaskRegistry {
                             HintedRetryStep::Surface => {}
                         }
                     }
+                    #[cfg(test)]
+                    tests::draining_gate(&root, tests::DrainingGate::BeforeRefusalReport).await;
                     let reason = serde_json::to_value(reason)
                         .unwrap()
                         .as_str()
                         .unwrap_or("unknown")
                         .to_owned();
-                    if let Some(fallback) = fallback.take() {
+                    let result = if let Some(fallback) = fallback.take() {
                         // A live refusal uses the launch plan captured before
                         // dispatch. The private disk snapshot is for restarts.
-                        return self.remote_fallback(
+                        self.remote_fallback(&task, fallback, &reason, refusal_detail.as_deref())
+                    } else {
+                        self.restored_remote_fallback(
                             &task,
-                            fallback,
+                            &remote,
                             &reason,
                             refusal_detail.as_deref(),
-                        );
+                        )
+                    };
+                    // If the owner's pause landed after this refusal arrived
+                    // but before the lines above reported it, the pause had
+                    // already ended the task (so the report changed nothing)
+                    // and the fallback declined to run the command locally.
+                    // The runner refused the job, so nothing is left running:
+                    // record the pause's outcome, which `bash.kill_scope`
+                    // waits for. (A failed fallback is recorded as failed
+                    // when this worker exits.)
+                    if result.is_ok() {
+                        self.settle_owner_pause_without_resubmit(&task);
                     }
-                    return self.restored_remote_fallback(
-                        &task,
-                        &remote,
-                        &reason,
-                        refusal_detail.as_deref(),
-                    );
+                    return result;
                 }
                 Ok(StreamProgress::Complete(verdict)) => {
                     if !platform_ok {
@@ -2223,9 +2415,13 @@ impl BgTaskRegistry {
                     // A known accepted job is recovered only by attach. Never
                     // convert a lost stream into another run or local fallback.
                     recovery.pause(point.job_id).await?;
-                    stream = self
+                    stream = match self
                         .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
-                        .await?;
+                        .await?
+                    {
+                        Attached::Stream(stream) => stream,
+                        Attached::OwnerPauseSettled => return Ok(()),
+                    };
                 }
             }
         }
@@ -2263,13 +2459,15 @@ impl BgTaskRegistry {
                 (remote, now)
             };
             if remote.cancel_requested {
-                self.remote_terminal(task, Verdict::Cancelled, None);
+                self.cancel_draining_retry(task);
                 return Ok(None);
             }
             #[cfg(test)]
             if tests::stop_draining_worker(root) {
                 return Ok(None);
             }
+            #[cfg(test)]
+            tests::draining_gate(root, tests::DrainingGate::BeforeBudgetCheck).await;
             let retry = remote.retry.as_ref().unwrap();
             let first = retry.first_refusal_at_ms.unwrap();
             let elapsed = now.saturating_sub(first);
@@ -2282,9 +2480,11 @@ impl BgTaskRegistry {
                 else {
                     return Err("draining refusal absent".into());
                 };
-                return self
-                    .refuse_remote_executor(task, "runner_draining", refusal_detail.as_deref())
-                    .map(|_| None);
+                self.refuse_remote_executor(task, "runner_draining", refusal_detail.as_deref())?;
+                // An owner pause that landed after the cancellation check above
+                // already ended the task, so the refusal changed nothing.
+                self.settle_owner_pause_without_resubmit(task);
+                return Ok(None);
             }
             if now >= retry.next_retry_at_ms.unwrap_or(now) {
                 return restore_retry_request(task, &retry.request_digest).map(Some);
@@ -2314,6 +2514,8 @@ impl BgTaskRegistry {
         let Some(request) = self.wait_draining_retry(task, root).await? else {
             return Ok(None);
         };
+        #[cfg(test)]
+        tests::draining_gate(root, tests::DrainingGate::BeforeResubmit).await;
         {
             let mut db = DeferredDbWrites::new(self, task);
             let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
@@ -2324,7 +2526,7 @@ impl BgTaskRegistry {
                 .ok_or("remote record absent")?;
             if remote.cancel_requested {
                 drop(state);
-                self.remote_terminal(task, Verdict::Cancelled, None);
+                self.cancel_draining_retry(task);
                 return Ok(None);
             }
             // Clear the no-start proof before dispatch. A crash after this write
@@ -2349,10 +2551,15 @@ impl BgTaskRegistry {
         }
         // A fresh submission gets its own signer-retry allowance, counted from now.
         let hinted = HintedRetry::start(root, request);
-        match client.run(&hinted.request).await {
+        match resubmit(client, &hinted.request, root).await {
             Ok(stream) => Ok(Some((stream, hinted))),
             Err(error) if proves_no_start(&error) => {
+                #[cfg(test)]
+                tests::draining_gate(root, tests::DrainingGate::BeforeNoStartRefusal).await;
                 self.refuse_remote_before_dispatch(task, &error.to_string())?;
+                // A pause that landed meanwhile already ended the task; the
+                // resubmission never reached the runner, so nothing runs.
+                self.settle_owner_pause_without_resubmit(task);
                 Ok(None)
             }
             Err(error) => Err(format!("remote outcome unknown; not resubmitted: {error}")),
@@ -2411,6 +2618,12 @@ impl BgTaskRegistry {
             retry.resubmits + 1,
         );
         let until = now.saturating_add(hint);
+        // Stands in for the daemon stopping while it waits: the worker ends
+        // and leaves only the refusal it has already saved.
+        #[cfg(test)]
+        if tests::stop_draining_worker(root) {
+            return Ok(HintedRetryStep::Ended);
+        }
         loop {
             let cancel = task
                 .state
@@ -2421,7 +2634,9 @@ impl BgTaskRegistry {
                 .as_ref()
                 .is_some_and(|remote| remote.cancel_requested);
             if cancel {
-                self.remote_terminal(task, Verdict::Cancelled, None);
+                // The runner refused this submission, so for an owner pause
+                // withholding the resubmission is the whole cancellation.
+                self.cancel_draining_retry(task);
                 return Ok(HintedRetryStep::Ended);
             }
             let now = draining_now_ms(root);
@@ -2436,6 +2651,8 @@ impl BgTaskRegistry {
                 _ = draining_retry_sleep(root, now, until - now) => {},
             }
         }
+        #[cfg(test)]
+        tests::draining_gate(root, tests::DrainingGate::BeforeHintedResubmit).await;
         {
             let mut db = DeferredDbWrites::new(self, task);
             let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
@@ -2447,7 +2664,7 @@ impl BgTaskRegistry {
             if remote.cancel_requested {
                 drop(state);
                 drop(db);
-                self.remote_terminal(task, Verdict::Cancelled, None);
+                self.cancel_draining_retry(task);
                 return Ok(HintedRetryStep::Ended);
             }
             // The wait can end late, and a zero hint does not wait at all, so
@@ -2470,10 +2687,15 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
         }
         retry.resubmits += 1;
-        match client.run(&retry.request).await {
+        match resubmit(client, &retry.request, root).await {
             Ok(stream) => Ok(HintedRetryStep::Resubmitted(stream)),
             Err(error) if proves_no_start(&error) => {
+                #[cfg(test)]
+                tests::draining_gate(root, tests::DrainingGate::BeforeNoStartRefusal).await;
                 self.refuse_remote_before_dispatch(task, &error.to_string())?;
+                // A pause that landed meanwhile already ended the task; the
+                // resubmission never reached the runner, so nothing runs.
+                self.settle_owner_pause_without_resubmit(task);
                 Ok(HintedRetryStep::Ended)
             }
             Err(error) => Err(format!("remote outcome unknown; not resubmitted: {error}")),
@@ -2489,7 +2711,7 @@ impl BgTaskRegistry {
         root: &Path,
         task: &Arc<BgTask>,
         recovery: &mut ReattachBudget,
-    ) -> Result<exec::RemoteStream, String> {
+    ) -> Result<Attached, String> {
         point.attach_request().map_err(|e| e.to_string())?;
         loop {
             let cancel = task
@@ -2503,13 +2725,24 @@ impl BgTaskRegistry {
             let attempt = recovery
                 .wait(point.job_id, async {
                     if cancel {
-                        let _ = client.cancel_job(point.job_id).await;
+                        let result = client
+                            .cancel_job(point.job_id)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| e.to_string());
+                        if self.finish_owner_pause_cancel(task, result) {
+                            return Some(Attached::OwnerPauseSettled);
+                        }
                     }
-                    client.attach(point.clone()).await
+                    client
+                        .attach(point.clone())
+                        .await
+                        .ok()
+                        .map(Attached::Stream)
                 })
                 .await?;
-            if let Ok(stream) = attempt {
-                return Ok(stream);
+            if let Some(attached) = attempt {
+                return Ok(attached);
             }
             // The route may have closed with the runner (a ck-motor restart).
             // Back off, then reconnect and attach again; never resubmit.
@@ -2555,12 +2788,26 @@ impl BgTaskRegistry {
         let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)
             .map_err(|e| e.to_string())?;
         let durable = read_task_at(&layout).map_err(|e| e.to_string())?;
-        if durable.remote.as_ref().is_some_and(|r| r.cancel_requested) {
+        // Checked under the state lock that every cancellation intent is
+        // recorded under, so an intent recorded first always prevents the
+        // local start.
+        let cancel_requested = state
+            .metadata
+            .remote
+            .as_ref()
+            .is_some_and(|r| r.cancel_requested)
+            || durable.remote.as_ref().is_some_and(|r| r.cancel_requested);
+        if cancel_requested {
             if let Some(remote) = state.metadata.remote.as_mut() {
                 remote.cancel_requested = true;
             }
             drop(state);
             drop(db);
+            // For an owner pause, not starting the command is the whole
+            // cancellation: the runner refused the job.
+            if self.finish_owner_pause_cancel(task, Ok(())) {
+                return Ok(());
+            }
             self.remote_terminal(
                 task,
                 Verdict::RunLocally {
@@ -2907,6 +3154,21 @@ impl BgTaskRegistry {
     }
 
     fn record_remote_cancel(&self, task: &Arc<BgTask>) -> Result<bool, String> {
+        self.record_remote_cancel_owed(task, false)
+    }
+
+    /// Record the cancellation intent on a remote task that is not finished
+    /// yet, and wake its worker. With `owed`, also record that the runner
+    /// is still owed the cancel (`RemoteTask::cancel_pending`), in the same
+    /// write: a caller about to mark the task finished before the worker has
+    /// sent it must leave that debt in the saved record. Nothing is owed for
+    /// a job the runner already reported a terminal for. Returns false when
+    /// the task runs locally.
+    pub(super) fn record_remote_cancel_owed(
+        &self,
+        task: &Arc<BgTask>,
+        owed: bool,
+    ) -> Result<bool, String> {
         {
             let mut db = DeferredDbWrites::new(self, task);
             let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
@@ -2915,6 +3177,12 @@ impl BgTaskRegistry {
                     return Ok(false);
                 };
                 remote.cancel_requested = true;
+                if owed && remote.terminal.is_none() {
+                    // Indexed before the record says so (see
+                    // `write_owed_cancel_marker`).
+                    write_owed_cancel_marker(&task.paths);
+                    remote.cancel_pending = true;
+                }
                 self.persist_task_locked(task, &state.metadata, &mut db)
                     .map_err(|e| e.to_string())?;
             }
@@ -2940,6 +3208,112 @@ impl BgTaskRegistry {
         }
         drop(state);
         Ok(self.snapshot_with_terminal_cache(task, 8 * 1024))
+    }
+
+    /// Record an owner's pause on a remote task before `bash.kill_scope`
+    /// stops anything: the pause reason, the cancellation intent and the
+    /// cancel the runner is owed, in one write. From then on its worker
+    /// cancels the job and settles the pause, and a refusal can no longer
+    /// turn it into a local command (`remote_fallback` checks the intent).
+    /// A task already finished or running locally is left alone.
+    pub(super) fn record_owner_pause_intent(&self, task: &Arc<BgTask>) -> Result<(), String> {
+        {
+            let mut db = DeferredDbWrites::new(self, task);
+            let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
+            if state.metadata.is_terminal() || state.metadata.remote.is_none() {
+                return Ok(());
+            }
+            state.metadata.status_reason = Some(super::OWNER_PAUSED_REASON.into());
+            let remote = state.metadata.remote.as_mut().unwrap();
+            remote.cancel_requested = true;
+            if remote.terminal.is_none() {
+                write_owed_cancel_marker(&task.paths);
+                remote.cancel_pending = true;
+            }
+            self.persist_task_locked(task, &state.metadata, &mut db)
+                .map_err(|e| e.to_string())?;
+        }
+        task.remote_cancel_notify.notify_one();
+        Ok(())
+    }
+
+    pub(super) fn record_owner_pause_remote(&self, task: &Arc<BgTask>) -> Result<(), String> {
+        // The task is marked finished below, before its worker can have sent
+        // the cancellation; the saved record keeps it owed until then.
+        self.record_remote_cancel_owed(task, true)?;
+        self.remote_terminal(task, Verdict::Cancelled, None);
+        Ok(())
+    }
+
+    /// Stop a draining retry, or a retry after a hinted signer refusal, that
+    /// has a cancellation intent instead of resubmitting it. The runner refused
+    /// the job, so there is no runner job to cancel: for an owner pause,
+    /// withholding the resubmission is the whole cancellation, and it is
+    /// recorded as sent.
+    fn cancel_draining_retry(&self, task: &Arc<BgTask>) {
+        if !self.finish_owner_pause_cancel(task, Ok(())) {
+            self.remote_terminal(task, Verdict::Cancelled, None);
+        }
+    }
+
+    /// A draining-retry worker that stops without resubmitting is the last
+    /// thing that can record an owner pause's cancellation outcome, which
+    /// `bash.kill_scope` waits for. Record it as sent unless the worker
+    /// recorded one already; a task that was not paused is left alone.
+    fn settle_owner_pause_without_resubmit(&self, task: &Arc<BgTask>) {
+        let unsettled = task.state.lock().is_ok_and(|state| {
+            state
+                .metadata
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.owner_pause_cancel.is_none())
+        });
+        if unsettled {
+            self.finish_owner_pause_cancel(task, Ok(()));
+        }
+    }
+
+    // A pause ends AFT's local task even if the runner cannot be reached. Store
+    // the remote cancellation result separately so the owner can see failures
+    // without reporting the expected local stop as a command failure.
+    fn finish_owner_pause_cancel(&self, task: &Arc<BgTask>, result: Result<(), String>) -> bool {
+        let terminal = {
+            let mut db = DeferredDbWrites::new(self, task);
+            let Ok(mut state) = task.state.lock() else {
+                return false;
+            };
+            if state.metadata.status_reason.as_deref() != Some(super::OWNER_PAUSED_REASON) {
+                return false;
+            }
+            let terminal = state.metadata.is_terminal();
+            if let Some(remote) = state.metadata.remote.as_mut() {
+                // A failed cancel stays owed, so a replay after a restart
+                // tries again, unless no runner job id is known: then no
+                // later worker could reach the job either.
+                if result.is_ok() || remote.job_id.is_none() {
+                    remote.cancel_pending = false;
+                }
+                remote.owner_pause_cancel = Some(match result {
+                    Ok(()) => "sent".into(),
+                    Err(error) => format!("failed: {error}"),
+                });
+            }
+            let saved = self.persist_task_locked(task, &state.metadata, &mut db);
+            let still_owed = state
+                .metadata
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.cancel_pending);
+            if saved.is_ok() && !still_owed {
+                remove_owed_cancel_marker(&task.paths);
+            }
+            terminal
+        };
+        task.kill_settled.notify_all();
+        if !terminal {
+            self.remote_terminal(task, Verdict::Cancelled, None);
+        }
+        true
     }
 }
 
@@ -2976,6 +3350,545 @@ fn remote_kill_settle_bound() -> Duration {
             .saturating_sub(REMOTE_KILL_REPLY_MARGIN)
             .min(REMOTE_KILL_SETTLE_CAP)
     })
+}
+
+/// Who in this process is sending a saved remote task's owed runner cancel
+/// (`RemoteTask::cancel_pending`).
+#[cfg(unix)]
+enum OwedCancelOwner {
+    /// The task's remote worker is running; it sends the cancel itself.
+    Worker,
+    /// The startup pass (`start_owed_cancel_pass`) is sending it. Registries
+    /// that restore the task meanwhile register here as adopters instead of
+    /// starting a worker; the pass gives them its outcome when it is done.
+    Pass {
+        adopters: Vec<std::sync::Weak<BgTask>>,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct OwedCancels {
+    /// At most one sender per task id, so the cancel goes out once per job.
+    claims: HashMap<String, OwedCancelOwner>,
+    /// Owed cancels the startup pass settled, by task id, with the outcome it
+    /// recorded. A replay that read the task's record before the pass saved
+    /// it takes the outcome from here instead of sending the cancel again.
+    settled: HashMap<String, String>,
+}
+
+/// The one claim table for owed cancels in this process. Taken with no lock
+/// held except, in `start_remote_worker`, the saved-task claim lock (which is
+/// always outermost); a task's `state` may be taken while it is held.
+#[cfg(unix)]
+fn owed_cancels() -> &'static Mutex<OwedCancels> {
+    static OWED: std::sync::OnceLock<Mutex<OwedCancels>> = std::sync::OnceLock::new();
+    OWED.get_or_init(Default::default)
+}
+
+/// A remote worker stopped: the startup pass may send the task's cancel if
+/// it is still owed.
+#[cfg(unix)]
+fn release_worker_owed_cancel_claim(task_id: &str) {
+    let mut owed = owed_cancels()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if matches!(owed.claims.get(task_id), Some(OwedCancelOwner::Worker)) {
+        owed.claims.remove(task_id);
+    }
+}
+
+/// Record in a task held in memory the outcome of the startup pass's
+/// attempt to send its owed cancel.
+#[cfg(unix)]
+fn apply_owed_cancel_outcome(task: &BgTask, outcome: &str) {
+    if let Ok(mut state) = task.state.lock() {
+        if let Some(remote) = state.metadata.remote.as_mut() {
+            if !outcome.starts_with("failed") || remote.job_id.is_none() {
+                remote.cancel_pending = false;
+            }
+            remote.owner_pause_cancel = Some(outcome.to_owned());
+        }
+    }
+    task.kill_settled.notify_all();
+}
+
+/// The owed-cancel index: next to each storage directory's `bash-tasks`
+/// (the storage root's own and each harness directory's), one marker file
+/// per saved remote task that owes its runner a cancel
+/// (`RemoteTask::cancel_pending`), named by task id and holding its session
+/// directory. It sits beside `bash-tasks`, not inside it, because the
+/// persisted-task sweep treats every directory in `bash-tasks` as a session.
+///
+/// A marker is written before the record that sets `cancel_pending` and
+/// removed after the record that clears it is saved, so a crash leaves at
+/// worst a marker whose record owes nothing, which the startup pass removes.
+/// If writing a marker fails (logged), that cancel is not indexed: replay of
+/// its project still sends it, but the startup pass will not find it. The
+/// pass lists only these markers.
+#[cfg(unix)]
+const OWED_CANCEL_MARKERS: &str = "bash-owed-cancels";
+
+/// The owed-cancel marker for a task, beside its storage directory's
+/// `bash-tasks` (see `OWED_CANCEL_MARKERS`).
+#[cfg(unix)]
+fn owed_cancel_marker(paths: &TaskPaths) -> Option<PathBuf> {
+    let storage_dir = paths.session_dir.parent()?.parent()?;
+    Some(storage_dir.join(OWED_CANCEL_MARKERS).join(&paths.task_id))
+}
+
+/// Index a cancel the task's record is about to owe. A failure is logged:
+/// the record still owes the cancel, and replay still sends it, but the
+/// startup pass will not find it.
+#[cfg(unix)]
+fn write_owed_cancel_marker(paths: &TaskPaths) {
+    let Some(marker) = owed_cancel_marker(paths) else {
+        return;
+    };
+    let written = marker
+        .parent()
+        .map_or(Ok(()), crate::private_storage::create_dir_all)
+        .and_then(|()| {
+            crate::private_storage::write(&marker, paths.session_dir.as_os_str().as_encoded_bytes())
+        });
+    if let Err(error) = written {
+        crate::slog_warn!(
+            "owed runner cancel for task {} not indexed at {}: {error}",
+            paths.task_id,
+            marker.display()
+        );
+    }
+}
+
+/// Drop a task's owed-cancel marker once its saved record owes nothing.
+#[cfg(unix)]
+fn remove_owed_cancel_marker(paths: &TaskPaths) {
+    if let Some(marker) = owed_cancel_marker(paths) {
+        remove_marker_file(&marker);
+    }
+}
+
+#[cfg(unix)]
+fn remove_marker_file(marker: &Path) {
+    match fs::remove_file(marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => crate::slog_warn!(
+            "owed runner cancel marker {} not removed: {error}",
+            marker.display()
+        ),
+    }
+}
+
+/// Connection attempts per owed cancel, and the first wait between them; the
+/// wait doubles after each failed attempt: 1, 2, 4, 8 and 16 seconds in
+/// production, from 50 ms in test builds.
+#[cfg(unix)]
+const OWED_CANCEL_ATTEMPTS: u32 = 6;
+#[cfg(all(unix, not(test)))]
+const OWED_CANCEL_FIRST_BACKOFF: Duration = Duration::from_secs(1);
+#[cfg(all(unix, test))]
+const OWED_CANCEL_FIRST_BACKOFF: Duration = Duration::from_millis(50);
+
+/// What one startup pass did, for its log line and for tests.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub(crate) struct OwedCancelReport {
+    /// Owed-cancel markers read; no other task record is opened.
+    pub examined: usize,
+    pub sent: usize,
+    pub failed: usize,
+    pub cleared_without_job: usize,
+    /// Left to a remote worker of this process, or to the replay of a task
+    /// saved unfinished, which sends the cancel itself.
+    pub left_to_worker: usize,
+    /// Markers whose record owed nothing (or was gone), removed unsent.
+    pub stale_markers: usize,
+}
+
+#[cfg(unix)]
+impl BgTaskRegistry {
+    /// Send the runner cancels that saved, finished remote tasks under
+    /// `storage_root` still owe, without waiting for their projects to bind.
+    ///
+    /// An owner pause marks a task finished before its worker sends the
+    /// runner its cancel. If the module stops in between, the record keeps
+    /// the cancel owed (`RemoteTask::cancel_pending`); replay sends it, but a
+    /// paused worker's checkout may never bind again, and its runner job then
+    /// holds a runner slot until its own deadline. This pass lists the
+    /// owed-cancel index (`OWED_CANCEL_MARKERS`) of the storage root and of
+    /// each harness directory beneath it, so its cost follows the number of
+    /// owed cancels, not the task history, reads only the indexed records,
+    /// and sends their cancels one after another on one dedicated background
+    /// thread, never on the request loop. It starts no project, binds no
+    /// root and restores no task. Runs once per storage root per process
+    /// (see `note_storage_root`); later calls return `None`.
+    pub(crate) fn start_owed_cancel_pass(
+        storage_root: &Path,
+    ) -> Option<std::thread::JoinHandle<OwedCancelReport>> {
+        static STARTED: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+        let key = canonicalized_path(storage_root);
+        if !STARTED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key)
+        {
+            return None;
+        }
+        let storage_root = storage_root.to_path_buf();
+        std::thread::Builder::new()
+            .name("aft-owed-cancels".into())
+            .spawn(move || {
+                let report = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(send_owed_cancels(&storage_root)),
+                    Err(error) => {
+                        crate::slog_warn!("owed runner cancels not sent: {error}");
+                        OwedCancelReport::default()
+                    }
+                };
+                crate::slog_info!(
+                    "owed runner cancels under {}: examined={} sent={} failed={} cleared_without_job={} left_to_worker={} stale_markers={}",
+                    storage_root.display(),
+                    report.examined,
+                    report.sent,
+                    report.failed,
+                    report.cleared_without_job,
+                    report.left_to_worker,
+                    report.stale_markers
+                );
+                report
+            })
+            .map_err(|error| crate::slog_warn!("owed runner cancel pass not started: {error}"))
+            .ok()
+    }
+}
+
+/// One indexed owed cancel: its marker, the task's session directory and
+/// its task id.
+#[cfg(unix)]
+struct OwedCancelMarker {
+    marker: PathBuf,
+    session_dir: PathBuf,
+    task_id: String,
+}
+
+/// The owed-cancel markers under `storage_root`: its own index and each
+/// harness directory's (see `OWED_CANCEL_MARKERS`). A marker whose name is
+/// not a task id, or that cannot be read, is skipped and logged.
+#[cfg(unix)]
+fn owed_cancel_markers(storage_root: &Path) -> Vec<OwedCancelMarker> {
+    let mut index_dirs = vec![storage_root.join(OWED_CANCEL_MARKERS)];
+    if let Ok(entries) = fs::read_dir(storage_root) {
+        let mut harness_indexes = entries
+            .flatten()
+            .map(|entry| entry.path().join(OWED_CANCEL_MARKERS))
+            .filter(|index| index.is_dir())
+            .collect::<Vec<_>>();
+        harness_indexes.sort();
+        index_dirs.extend(harness_indexes);
+    }
+    let mut markers = Vec::new();
+    for index in index_dirs {
+        let Ok(entries) = fs::read_dir(&index) else {
+            continue;
+        };
+        let mut entries = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for marker in entries {
+            let Some(task_id) = marker
+                .file_name()
+                .and_then(OsStr::to_str)
+                .filter(|name| validate_task_id(name).is_ok())
+                .map(str::to_owned)
+            else {
+                crate::slog_warn!(
+                    "owed runner cancel index entry {} ignored",
+                    marker.display()
+                );
+                continue;
+            };
+            match fs::read(&marker) {
+                Ok(bytes) => markers.push(OwedCancelMarker {
+                    session_dir: PathBuf::from(String::from_utf8_lossy(&bytes).into_owned()),
+                    marker,
+                    task_id,
+                }),
+                Err(error) => crate::slog_warn!(
+                    "owed runner cancel marker {} unreadable: {error}",
+                    marker.display()
+                ),
+            }
+        }
+    }
+    markers
+}
+
+#[cfg(unix)]
+async fn send_owed_cancels(storage_root: &Path) -> OwedCancelReport {
+    let markers = owed_cancel_markers(storage_root);
+    let mut report = OwedCancelReport {
+        examined: markers.len(),
+        ..Default::default()
+    };
+    for OwedCancelMarker {
+        marker,
+        session_dir,
+        task_id,
+    } in markers
+    {
+        {
+            let mut owed = owed_cancels()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if owed.claims.contains_key(&task_id) || owed.settled.contains_key(&task_id) {
+                report.left_to_worker += 1;
+                continue;
+            }
+            owed.claims.insert(
+                task_id.clone(),
+                OwedCancelOwner::Pass {
+                    adopters: Vec::new(),
+                },
+            );
+        }
+        #[cfg(test)]
+        tests::draining_gate(storage_root, tests::DrainingGate::OwedCancelClaimed).await;
+        let sent = send_owed_cancel(&session_dir, &task_id).await;
+        // Saved under the claim table's lock: a registry restoring the task
+        // meanwhile either adopts the claim (and gets the outcome below) or
+        // finds the outcome settled and saves it again over the older record
+        // it read.
+        let mut owed = owed_cancels()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let adopters = match owed.claims.remove(&task_id) {
+            Some(OwedCancelOwner::Pass { adopters }) => adopters,
+            _ => Vec::new(),
+        };
+        // Registries holding the task get the outcome before the record is
+        // saved: their own later save of the task writes what they hold, and
+        // must not put the cancel back as owed.
+        if let OwedCancelSend::Done { outcome, .. } = &sent {
+            for task in adopters.iter().filter_map(std::sync::Weak::upgrade) {
+                apply_owed_cancel_outcome(&task, outcome);
+            }
+        }
+        let outcome = save_owed_cancel_outcome(&session_dir, &task_id, &marker, sent);
+        match outcome {
+            OwedCancelOutcome::Stale => report.stale_markers += 1,
+            OwedCancelOutcome::Kept => report.left_to_worker += 1,
+            OwedCancelOutcome::Settled(outcome) => {
+                if outcome == "sent" {
+                    report.sent += 1;
+                } else {
+                    report.cleared_without_job += 1;
+                }
+                owed.settled.insert(task_id, outcome);
+            }
+            OwedCancelOutcome::Failed => report.failed += 1,
+        }
+    }
+    report
+}
+
+#[cfg(unix)]
+enum OwedCancelOutcome {
+    /// Nothing was sent, and the marker was removed: the record is gone, or
+    /// owes no cancel (a worker settled it first, or a crash left the marker
+    /// after its record was cleared).
+    Stale,
+    /// Nothing was sent, and the marker stays: the record could not be read,
+    /// or the task was saved unfinished, so its replay sends the cancel.
+    Kept,
+    /// No longer owed: the runner acknowledged the cancel, or no job id was
+    /// saved for any cancel to reach. Writing the outcome to the record is
+    /// best effort; a failed write is logged.
+    Settled(String),
+    /// The send failed and the cancel stays owed, so the next process start
+    /// tries again (the pass runs once per storage root per process).
+    Failed,
+}
+
+/// What sending one owed cancel did, before it is saved.
+#[cfg(unix)]
+enum OwedCancelSend {
+    /// The record is gone or owes no cancel.
+    NotOwed,
+    /// The record could not be read, or the task is saved unfinished.
+    Kept,
+    /// Whether the record stops owing the cancel, and the outcome to save.
+    Done { cleared: bool, outcome: String },
+}
+
+/// Save one owed cancel's outcome to the task's record: `cancel_pending` and
+/// `owner_pause_cancel`, merged into the latest record under its write lock;
+/// no other field is written back. The record is finished, so it is written
+/// directly: `update_task_at` keeps a finished record's fields unchanged.
+#[cfg(unix)]
+fn save_owed_cancel_outcome(
+    session_dir: &Path,
+    task_id: &str,
+    marker: &Path,
+    sent: OwedCancelSend,
+) -> OwedCancelOutcome {
+    let (cleared, outcome) = match sent {
+        OwedCancelSend::NotOwed => {
+            remove_marker_file(marker);
+            return OwedCancelOutcome::Stale;
+        }
+        OwedCancelSend::Kept => return OwedCancelOutcome::Kept,
+        OwedCancelSend::Done { cleared, outcome } => (cleared, outcome),
+    };
+    let saved = resolve_task_layout(session_dir, task_id).and_then(|layout| {
+        let session_id = read_task_at(&layout)?.session_id;
+        // The task's record write lock, the one a registry holding the task
+        // takes for every save of it (shared through `DbWriteOrder`): the
+        // record is read again under it and only this pass's two fields are
+        // changed, so a save that landed meanwhile (a cleared cancelled-call
+        // notice, say) is kept, never written back to its older value.
+        let order = DbWriteOrder::for_task(&session_id, task_id);
+        let mut json_writes = order.lock_json_writes();
+        let mut record = read_task_at(&layout)?;
+        #[cfg(test)]
+        tests::owed_cancel_save_gate(task_id);
+        if let Some(remote) = record.remote.as_mut() {
+            if cleared {
+                remote.cancel_pending = false;
+            }
+            remote.owner_pause_cancel = Some(outcome.clone());
+        }
+        write_task_at(&layout, &record)?;
+        // A checkpoint snapshot taken before this write must not replace it.
+        *json_writes += 1;
+        Ok(())
+    });
+    match saved {
+        // The marker goes only once the record says nothing is owed.
+        Ok(()) if cleared => remove_marker_file(marker),
+        Ok(()) => {}
+        Err(error) => crate::slog_warn!(
+            "owed runner cancel for task {task_id}: outcome {outcome} not saved: {error}"
+        ),
+    }
+    if cleared {
+        OwedCancelOutcome::Settled(outcome)
+    } else {
+        OwedCancelOutcome::Failed
+    }
+}
+
+/// Send one saved task's owed cancel.
+#[cfg(unix)]
+async fn send_owed_cancel(session_dir: &Path, task_id: &str) -> OwedCancelSend {
+    // Read under the claim: a worker that stopped before the claim was
+    // taken may have sent the cancel already.
+    let metadata = match resolve_task_layout(session_dir, task_id)
+        .and_then(|layout| read_task_at(&layout))
+    {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return OwedCancelSend::NotOwed,
+        Err(error) => {
+            crate::slog_warn!(
+                "owed runner cancel for task {task_id}: record unreadable, left owed: {error}"
+            );
+            return OwedCancelSend::Kept;
+        }
+    };
+    let Some(remote) = metadata
+        .remote
+        .as_ref()
+        .filter(|remote| remote.cancel_pending && metadata.task_id == task_id)
+    else {
+        return OwedCancelSend::NotOwed;
+    };
+    if !metadata.is_terminal() {
+        // Saved unfinished: the replay of its project restores the task and
+        // its worker cancels the job.
+        return OwedCancelSend::Kept;
+    }
+    let (cleared, outcome) = match remote.job_id {
+        None => {
+            crate::slog_info!(
+                "owed runner cancel for task {task_id}: no runner job id was saved, so no cancel can reach it"
+            );
+            (
+                true,
+                "failed: no runner job id was saved, so the runner could not be asked to cancel"
+                    .to_string(),
+            )
+        }
+        Some(job_id) => match cancel_with_backoff(&metadata, remote, task_id, job_id).await {
+            Ok(()) => (true, "sent".to_string()),
+            Err(error) => (false, format!("failed: {error}")),
+        },
+    };
+    OwedCancelSend::Done { cleared, outcome }
+}
+
+/// Connect to the task's runner and send `exec.cancel` for `job_id`,
+/// retrying a failed connection or call with doubling waits.
+#[cfg(unix)]
+async fn cancel_with_backoff(
+    metadata: &PersistedTask,
+    remote: &RemoteTask,
+    task_id: &str,
+    job_id: Uuid,
+) -> Result<(), String> {
+    let Some(connection) = remote.connection_file.as_ref() else {
+        crate::slog_warn!(
+            "owed runner cancel for task {task_id} job {job_id}: no runner connection was saved"
+        );
+        return Err("no runner connection was saved".into());
+    };
+    let root = metadata
+        .project_root
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let mut wait = OWED_CANCEL_FIRST_BACKOFF;
+    let mut last_error = String::new();
+    for attempt in 1..=OWED_CANCEL_ATTEMPTS {
+        let result = match ExecRemoteClient::connect(
+            connection,
+            subc_protocol::BindIdentity::new(
+                root.display().to_string(),
+                remote.harness.clone(),
+                remote.session.clone(),
+            ),
+        )
+        .await
+        {
+            Ok(client) => client.cancel_job(job_id).await.map(|_| ()),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => {
+                crate::slog_info!(
+                    "owed runner cancel for task {task_id} job {job_id}: sent (attempt {attempt})"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                last_error = error.to_string();
+                crate::slog_warn!(
+                    "owed runner cancel for task {task_id} job {job_id}: attempt {attempt} of {OWED_CANCEL_ATTEMPTS} failed: {last_error}"
+                );
+                #[cfg(test)]
+                tests::note_owed_cancel_attempt_failed(task_id);
+            }
+        }
+        if attempt < OWED_CANCEL_ATTEMPTS {
+            tokio::time::sleep(wait).await;
+            wait = wait.saturating_mul(2);
+        }
+    }
+    Err(last_error)
 }
 
 #[cfg(unix)]
@@ -3286,6 +4199,23 @@ fn append_executor_environment_disclosure(metadata: &mut PersistedTask) {
     if !note.contains(&disclosure) {
         note.push_str(&format!("\n{disclosure}"));
     }
+}
+
+/// Send a retry's resubmission. Tests can make it fail as a call that never
+/// reached the runner (see `tests::refuse_resubmission`).
+#[cfg(unix)]
+async fn resubmit(
+    client: &ExecRemoteClient,
+    request: &RunRequest,
+    _root: &Path,
+) -> Result<exec::RemoteStream, exec::Error> {
+    #[cfg(test)]
+    if tests::refuse_resubmission(_root) {
+        return Err(exec::Error::Protocol(
+            "test: resubmission failed before it was sent".into(),
+        ));
+    }
+    client.run(request).await
 }
 
 #[cfg(unix)]

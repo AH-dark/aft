@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { fileURLToPath } from "node:url";
 import { Effect } from "effect";
-
+import { drainEntry } from "../../src/__tests__/helpers/drain-wire.js";
 import * as logger from "../../src/logger.js";
 import { __resetV2WakeRoutesForTests } from "../../src/wakes/runtime-consumer.js";
 import type {
@@ -44,7 +44,8 @@ function recordingSession() {
   };
 }
 
-function recordingBridge() {
+function recordingBridge(completions: ReturnType<typeof completion>[]) {
+  const pending = new Map(completions.map((entry) => [entry.task_id, entry]));
   const sends: Array<{ command: string; params: unknown }> = [];
   return {
     sends,
@@ -52,7 +53,14 @@ function recordingBridge() {
       getCwd: () => "/work/first",
       send: async (command: string, params: unknown) => {
         sends.push({ command, params });
-        return { success: true };
+        if (command === "bash_drain_completions")
+          return {
+            success: true,
+            bg_completions: [...pending.values()].map(drainEntry),
+            pending_matches: [],
+          };
+        const ids = (params as { task_ids?: string[] }).task_ids ?? [];
+        return { success: true, acked_task_ids: ids.filter((id) => pending.delete(id)) };
       },
     },
   };
@@ -122,7 +130,7 @@ describe("V2 wake routing across Locations", () => {
 
     // The shared bridge pool keeps the callbacks of the Location that created
     // it, so every push arrives through the first copy.
-    const { bridge, sends } = recordingBridge();
+    const { bridge, sends } = recordingBridge([completion("session-second", "bash-second")]);
     await firstConsumer.bridgeOptions.onBashCompletion?.(
       completion("session-second", "bash-second"),
       bridge as never,
@@ -136,6 +144,7 @@ describe("V2 wake routing across Locations", () => {
       metadata: { kind: "bash_completion", task_ids: ["bash-second"] },
     });
     expect(sends).toEqual([
+      { command: "bash_drain_completions", params: { session_id: "session-second" } },
       { command: "bash_wait_detach", params: { session_id: "session-second" } },
       {
         command: "bash_ack_completions",
@@ -171,14 +180,18 @@ describe("V2 wake routing across Locations", () => {
     await runBash(secondConsumer, "session-second", "/work/second");
 
     firstConsumer.dispose();
-    const { bridge, sends } = recordingBridge();
+    const { bridge, sends } = recordingBridge([completion("session-second", "bash-after-dispose")]);
     await firstConsumer.bridgeOptions.onBashCompletion?.(
       completion("session-second", "bash-after-dispose"),
       bridge as never,
     );
 
     expect(secondHost.synthetic).toHaveLength(1);
-    expect(sends.map((send) => send.command)).toEqual(["bash_wait_detach", "bash_ack_completions"]);
+    expect(sends.map((send) => send.command)).toEqual([
+      "bash_drain_completions",
+      "bash_wait_detach",
+      "bash_ack_completions",
+    ]);
     secondConsumer.dispose();
   });
 
@@ -188,7 +201,10 @@ describe("V2 wake routing across Locations", () => {
     const firstConsumer = first.createV2RuntimeConsumer({ session: recordingSession().session });
     const warn = spyOn(logger, "warn");
     try {
-      const { bridge, sends } = recordingBridge();
+      const { bridge, sends } = recordingBridge([
+        completion("session-late", "bash-late-1"),
+        completion("session-late", "bash-late-2"),
+      ]);
       await firstConsumer.bridgeOptions.onBashCompletion?.(
         completion("session-late", "bash-late-1"),
         bridge as never,
@@ -221,7 +237,9 @@ describe("V2 wake routing across Locations", () => {
       const secondConsumer = second.createV2RuntimeConsumer({ session: secondHost.session });
       await runBash(secondConsumer, "session-late", "/work/second");
       // Each delivered completion detaches the session's waits, then is acknowledged.
-      await until(() => sends.length === 4);
+      await until(
+        () => sends.filter((send) => send.command === "bash_ack_completions").length === 2,
+      );
 
       expect(secondHost.synthetic.map((entry) => entry.metadata?.task_ids)).toEqual([
         ["bash-late-1"],

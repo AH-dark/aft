@@ -1541,6 +1541,35 @@ impl StoragePlatform {
 /// compare the ordered variables, platform gates, and empty-value guards below with
 /// `subc-core/src/daemon_config.rs::default_data_home`, resolve its named constants,
 /// then preserve the documented Windows cache-class divergence.
+/// AFT now uses `storage_root` for background tasks: start this process's
+/// one pass over it that sends runner cancels saved paused tasks still owe
+/// (`BgTaskRegistry::start_owed_cancel_pass`), on its own thread. Called
+/// where each mode first learns its storage root: as a SubC module starts
+/// (before any project binds) and by `configure` (the first configure of a
+/// standalone process; later and SubC configures find the pass started).
+/// Repeated calls for the same root do nothing.
+pub(crate) fn note_storage_root(storage_root: &std::path::Path) {
+    // A test process must never send cancels for a developer's real store:
+    // test builds start the pass only for temporary storage roots.
+    #[cfg(test)]
+    {
+        let temp = std::env::temp_dir();
+        let temp = temp.canonicalize().unwrap_or(temp);
+        let root = storage_root
+            .canonicalize()
+            .unwrap_or_else(|_| storage_root.to_path_buf());
+        if !root.starts_with(&temp) {
+            return;
+        }
+    }
+    #[cfg(unix)]
+    {
+        let _ = registry::BgTaskRegistry::start_owed_cancel_pass(storage_root);
+    }
+    #[cfg(not(unix))]
+    let _ = storage_root;
+}
+
 pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
     let lookup = |name: &str| std::env::var_os(name);
     let fallback_home = std::env::home_dir();

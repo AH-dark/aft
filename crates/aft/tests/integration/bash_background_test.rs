@@ -1945,3 +1945,79 @@ fn piped_terminal_preview_normalizes_crlf_and_overprints_without_changing_artifa
 
     assert!(aft.shutdown().success());
 }
+
+/// The OpenCode plugin's drain doubles, and a reply it keeps captured from this
+/// daemon, assume `bash_drain_completions` entries carry no `session_id`: the
+/// reply is scoped by its request, and only `bash_completed` push frames name
+/// the session. A plugin check that required the field once dropped every
+/// standalone OpenCode 2 completion wake. Pin the shape on both sides.
+#[test]
+fn drain_completion_entries_match_the_plugin_wire_fixture() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "../../packages/opencode-plugin/src/__tests__/fixtures/bash-drain-completions-reply.json",
+    );
+    let fixture: Value =
+        serde_json::from_str(&std::fs::read_to_string(&fixture_path).unwrap()).unwrap();
+    let fixture_entry = &fixture["bg_completions"][0];
+    assert!(fixture_entry.is_object(), "fixture lists no completion");
+
+    let mut aft = AftProcess::spawn();
+    let _dir = configure_background(&mut aft);
+    let session = "drain-wire-session";
+    let response = aft.send(
+        &json!({
+            "id": "drain-wire-spawn",
+            "session_id": session,
+            "command": "bash",
+            "params": { "command": quick_success_command(), "background": true }
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "spawn failed: {response:?}");
+    let task_id = response["task_id"].as_str().unwrap().to_string();
+
+    let started = Instant::now();
+    let entry = loop {
+        let drained = aft.send(
+            &json!({
+                "id": "drain-wire-drain",
+                "session_id": session,
+                "command": "bash_drain_completions"
+            })
+            .to_string(),
+        );
+        assert_eq!(drained["success"], true, "drain failed: {drained:?}");
+        if let Some(entry) = drained["bg_completions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["task_id"] == task_id.as_str())
+        {
+            break entry.clone();
+        }
+        // A hang guard only; the task exits at once.
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "completion never queued: {drained:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    for (label, value) in [("daemon", &entry), ("fixture", fixture_entry)] {
+        assert!(
+            value.get("session_id").is_none(),
+            "{label} drain entry carries session_id: {value:?}"
+        );
+        assert!(
+            value.get("type").is_none(),
+            "{label} drain entry carries type: {value:?}"
+        );
+        for key in ["task_id", "status", "exit_code", "command"] {
+            assert!(
+                value.get(key).is_some(),
+                "{label} drain entry lacks {key}: {value:?}"
+            );
+        }
+    }
+    assert!(aft.shutdown().success());
+}

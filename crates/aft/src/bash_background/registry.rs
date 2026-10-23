@@ -195,17 +195,19 @@ pub const ROOT_RECLAIMED_REASON: &str = "root_reclaimed";
 /// Status reason of a task killed because its caller withdrew the call.
 pub const WITHDRAWN_REASON: &str = "withdrawn";
 pub const SCOPE_REVOKED_REASON: &str = "scope_revoked";
+pub(crate) const OWNER_PAUSED_REASON: &str = "paused_by_owner";
 /// Status reason of a task a codemode program started, killed because the
 /// daemon confirmed the program's run scope ended.
 pub const RUN_ENDED_REASON: &str = "run_ended";
 
-/// How a task killed at the end of its daemon scope is labelled to the agent:
-/// `run ended` for a codemode program's task, `scope revoked` otherwise.
+/// How an owner-directed stop is labelled to the agent: a run or scope end,
+/// or a cancellation that leaves the scope usable.
 /// `None` for any other status reason.
 pub(crate) fn scope_end_label(reason: Option<&str>) -> Option<&'static str> {
     match reason {
         Some(SCOPE_REVOKED_REASON | "scope revoked") => Some("scope revoked"),
         Some(RUN_ENDED_REASON) => Some("run ended"),
+        Some(OWNER_PAUSED_REASON) => Some("cancelled by owner"),
         _ => None,
     }
 }
@@ -706,6 +708,12 @@ pub struct BgTaskSnapshot {
     pub remote_phase_note: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct PatternMatchAckResult {
+    pub watch_removed: bool,
+    pub task_settled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct BgTaskHealthCounts {
     pub running: usize,
@@ -880,6 +888,30 @@ pub struct BgTaskRegistry {
     pub(crate) inner: Arc<RegistryInner>,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct ScopeKilledTask {
+    pub task_id: String,
+    pub session_id: String,
+    pub remote: Option<ScopeRemoteCancel>,
+    /// The task was in no live project registry: an earlier module instance
+    /// saved it, and it was recovered from that saved record and stopped now
+    /// rather than left running until its project binds again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub from_saved_record: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ScopeRemoteCancel {
+    pub job_id: Option<String>,
+    pub cancel: String,
+}
+
+#[derive(Default)]
+pub(crate) struct ScopeKillReport {
+    pub killed: Vec<ScopeKilledTask>,
+    pub already_finished: usize,
+}
+
 #[path = "scratch_retention.rs"]
 mod scratch_retention;
 
@@ -1045,6 +1077,18 @@ pub(crate) struct RegistryInner {
     /// delete time, keyed by task id. See `scratch_retention`.
     retained_scratch: Mutex<HashMap<String, scratch_retention::RetainedScratch>>,
     revoked_scopes: Mutex<HashSet<(String, String, u64)>>,
+    /// While `Some`, restored unfinished remote tasks are not handed to a
+    /// remote worker; their ids are collected here instead. Used by
+    /// `recover_saved_scope_tasks`, whose caller must record the owner's
+    /// pause before any restored command can reach the runner again, and
+    /// then starts the workers with `start_held_remote_workers`.
+    held_remote_workers: Mutex<Option<Vec<String>>>,
+    /// Set on a registry built by `recover_saved_scope_tasks` only to stop a
+    /// scope's saved tasks. It has no session to deliver to and is detached
+    /// afterwards, so it never queues a completion or cancelled-call notice:
+    /// those go to a project registry that registered the task, or are left
+    /// in the task's record for its project's later replay.
+    saved_task_recovery: AtomicBool,
     pub(crate) completions: Mutex<VecDeque<BgCompletion>>,
     pub(crate) progress_sender: SharedProgressSender,
     watchdog_started: AtomicBool,
@@ -1185,6 +1229,12 @@ pub(crate) struct BgTask {
     /// Serialize terminal notification routing, including watch safety nets.
     /// Delivery acknowledgement remains separate so pending results can replay.
     terminal_notification_routed: Mutex<bool>,
+    /// The project registry whose sessions receive this task's completion
+    /// and cancelled-call notices, when the task is shared between registries
+    /// (see `SavedRemoteTaskClaim`): the first registry that is not a
+    /// `bash.kill_scope` recovery registry to restore or register it. `None`
+    /// for a task only one registry holds; that registry publishes its notices.
+    notice_registry: Mutex<Option<std::sync::Weak<RegistryInner>>>,
     #[cfg(unix)]
     adopted_exit: Mutex<super::exit_observer::AdoptedExit>,
     pub(crate) state: Mutex<BgTaskState>,
@@ -1195,6 +1245,11 @@ pub(crate) struct BgTask {
     /// that lock. Reply deadlines must not confuse a queued state read with a
     /// runner that has not accepted the job.
     runon_launch_state: Mutex<Option<RunonLaunchState>>,
+    /// A remote worker thread is running for this task. At most one may run
+    /// per task: `start_remote_worker` claims this flag before spawning one,
+    /// and the worker clears it as its last step.
+    #[cfg(unix)]
+    pub(crate) remote_worker_running: AtomicBool,
     /// Cache construction is serialized independently of task state: renderers
     /// can read artifacts and invoke callbacks without holding the state lock.
     terminal_render: Mutex<()>,
@@ -1539,6 +1594,8 @@ impl BgTaskRegistry {
                 watchdog_tasks: Mutex::new(HashMap::new()),
                 retained_scratch: Mutex::new(HashMap::new()),
                 revoked_scopes: Mutex::new(HashSet::new()),
+                held_remote_workers: Mutex::new(None),
+                saved_task_recovery: AtomicBool::new(false),
                 completions: Mutex::new(VecDeque::new()),
                 progress_sender,
                 watchdog_started: AtomicBool::new(false),
@@ -3584,7 +3641,78 @@ impl BgTaskRegistry {
         (stdout, stderr, pty)
     }
 
-    /// Ack path for pattern watches: once-watches (and any terminal-task watches)
+    /// Acknowledge only the durable match admitted by the host. A stale offset
+    /// must not clear a newer sticky match, or a sibling watch on the same task.
+    pub fn ack_pattern_match_for_session(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        watch_id: &str,
+        match_offset: u64,
+    ) -> Result<Option<PatternMatchAckResult>, String> {
+        let terminal = self
+            .persisted_task_is_terminal(session_id, task_id)
+            .unwrap_or(false);
+        let (harness, pool) = self
+            .db_harness_and_pool_for_session(session_id)
+            .ok_or_else(|| "watch persistence unavailable".to_string())?;
+        let (removed, settled) = {
+            let conn = pool.lock().map_err(|error| error.to_string())?;
+            let Some(mut row) = crate::db::bash_watches::get_bash_pattern_watch(
+                &conn, &harness, session_id, task_id, watch_id,
+            )
+            .map_err(|error| error.to_string())?
+            else {
+                return Ok(None);
+            };
+            if !row.pending_match
+                || row.match_offset.map(|offset| offset.max(0) as u64) != Some(match_offset)
+            {
+                return Ok(None);
+            }
+            let removed = row.once || terminal;
+            if removed {
+                crate::db::bash_watches::delete_bash_pattern_watch(
+                    &conn, &harness, session_id, task_id, watch_id,
+                )
+                .map_err(|error| error.to_string())?;
+            } else {
+                row.pending_match = false;
+                row.match_text = None;
+                row.match_offset = None;
+                row.match_context = None;
+                crate::db::bash_watches::upsert_bash_pattern_watch(&conn, &row)
+                    .map_err(|error| error.to_string())?;
+            }
+            let settled = terminal
+                && !crate::db::bash_watches::list_bash_pattern_watches_for_task(
+                    &conn, &harness, session_id, task_id,
+                )
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|row| row.pending_match);
+            (removed, settled)
+        };
+        self.sync_memory_watches_from_persistence(task_id);
+        // Terminal watched tasks suppress their generic completion. Only after
+        // the last pending match is acknowledged is that completion settled.
+        if settled {
+            if let Some(task) = self.task_for_session(task_id, session_id) {
+                task.set_completion_delivered(true, self)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                self.mark_persisted_completion_delivered(session_id, task_id);
+            }
+            let _ = self.remove_pending_completion(task_id);
+            self.clear_task_watch_state(task_id);
+        }
+        Ok(Some(PatternMatchAckResult {
+            watch_removed: removed,
+            task_settled: settled,
+        }))
+    }
+
+    /// Task-wide ack: once-watches (and any terminal-task watches)
     /// are dropped after delivery is confirmed; sticky watches clear pending only.
     fn ack_persisted_watches_for_task(&self, session_id: &str, task_id: &str, task_terminal: bool) {
         let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
@@ -4021,6 +4149,7 @@ impl BgTaskRegistry {
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
             terminal_notification_routed: Mutex::new(false),
+            notice_registry: Mutex::new(None),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             terminal_persist_dirty: AtomicBool::new(false),
@@ -4030,6 +4159,8 @@ impl BgTaskRegistry {
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
+            #[cfg(unix)]
+            remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -4379,6 +4510,7 @@ impl BgTaskRegistry {
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
             terminal_notification_routed: Mutex::new(false),
+            notice_registry: Mutex::new(None),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             terminal_persist_dirty: AtomicBool::new(false),
@@ -4388,6 +4520,8 @@ impl BgTaskRegistry {
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
+            #[cfg(unix)]
+            remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -4634,6 +4768,7 @@ impl BgTaskRegistry {
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
             terminal_notification_routed: Mutex::new(false),
+            notice_registry: Mutex::new(None),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             terminal_persist_dirty: AtomicBool::new(false),
@@ -4643,6 +4778,8 @@ impl BgTaskRegistry {
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
+            #[cfg(unix)]
+            remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -5725,11 +5862,18 @@ impl BgTaskRegistry {
         }
         #[cfg(unix)]
         if metadata.remote.is_some() && !metadata.is_terminal() {
-            let task_id = metadata.task_id.clone();
-            self.insert_rehydrated_task(metadata, paths, true)?;
-            self.resume_remote_task(&task_id)?;
-            return Ok(());
+            return self.restore_claimed_remote_task(metadata, paths);
         }
+        // A finished remote task can still owe its runner a cancellation (an
+        // owner pause marks the task finished before its worker sends it).
+        // Its worker is started once the task is registered below.
+        #[cfg(unix)]
+        let owed_cancel = (metadata.is_terminal()
+            && metadata
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.cancel_pending))
+        .then(|| metadata.task_id.clone());
         let (marker, process_alive) = if matches!(
             metadata.status,
             BgTaskStatus::Starting | BgTaskStatus::Running | BgTaskStatus::Killing
@@ -5873,6 +6017,12 @@ impl BgTaskRegistry {
                 self.insert_rehydrated_task(metadata, paths, true)?;
             }
             _ => {}
+        }
+        #[cfg(unix)]
+        if let Some(task_id) = owed_cancel {
+            if !self.hold_remote_worker(&task_id) {
+                self.resume_remote_task(&task_id)?;
+            }
         }
         Ok(())
     }
@@ -7925,6 +8075,18 @@ impl BgTaskRegistry {
     }
 
     fn index_cancelled_call(&self, session_id: &str, task_id: &str) {
+        match self.notice_target(task_id) {
+            NoticeTarget::Here => self.index_cancelled_call_here(session_id, task_id),
+            NoticeTarget::Elsewhere(registry) => {
+                registry.index_cancelled_call_here(session_id, task_id)
+            }
+            // The notice stays in the task's record, which a later replay of
+            // its project indexes.
+            NoticeTarget::Nowhere => {}
+        }
+    }
+
+    fn index_cancelled_call_here(&self, session_id: &str, task_id: &str) {
         if let Ok(mut tasks) = self.inner.cancelled_call_tasks.lock() {
             tasks
                 .entry(session_id.to_string())
@@ -7933,12 +8095,31 @@ impl BgTaskRegistry {
         }
     }
 
-    /// One line for each task of `session_id` whose waiting call was
-    /// cancelled while the task kept running, naming the task (and its
-    /// build-server job for a remote task) and how to check or stop it. Each
-    /// task is named once: taking a notice clears the task's flag on disk. A
-    /// task that has finished since is not named, because its completion
-    /// notice reports it.
+    /// Which registry publishes `task_id`'s completion and cancelled-call
+    /// notices when this registry records them (see `BgTask::notice_registry`).
+    fn notice_target(&self, task_id: &str) -> NoticeTarget {
+        let publisher = self.task(task_id).and_then(|task| {
+            task.notice_registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+        });
+        match publisher {
+            Some(inner) if !Arc::ptr_eq(&inner, &self.inner) => {
+                NoticeTarget::Elsewhere(BgTaskRegistry { inner })
+            }
+            Some(_) => NoticeTarget::Here,
+            None if self.inner.saved_task_recovery.load(Ordering::Acquire) => NoticeTarget::Nowhere,
+            None => NoticeTarget::Here,
+        }
+    }
+
+    /// Name unannounced cancelled calls and owner-cancelled tasks once on the
+    /// session's next bash-family reply. Running tasks include how to check or
+    /// stop them; owner-cancelled tasks explain their expected terminal status.
+    /// Taking a notice clears its flag on disk. Other finished tasks are left
+    /// to their completion notices.
     pub(crate) fn take_cancelled_call_notices(&self, session_id: &str) -> Vec<String> {
         let mut task_ids = match self.inner.cancelled_call_tasks.lock() {
             Ok(mut tasks) => match tasks.remove(session_id) {
@@ -7965,6 +8146,12 @@ impl BgTaskRegistry {
                 crate::slog_warn!(
                     "cancelled-call notice for task {task_id} was not cleared on disk: {error}"
                 );
+            }
+            if state.metadata.status_reason.as_deref() == Some(OWNER_PAUSED_REASON)
+                && state.metadata.status == BgTaskStatus::Killed
+            {
+                lines.push(format!("task {task_id}: killed (cancelled by owner)"));
+                continue;
             }
             if state.metadata.status.is_terminal() {
                 continue;
@@ -9309,33 +9496,552 @@ impl BgTaskRegistry {
                 scope.scope_ref.clone(),
                 scope.scope_epoch,
             ));
-        for task in self.running_tasks() {
-            let stamp = task
+        if let Err(error) = self.stop_scope_tasks(scope, false, None, None) {
+            log::warn!("scope revocation kill failed: {error}");
+        }
+        // Finished commands of the ended scope keep no scratch for later reads.
+        self.release_scope_scratch(scope);
+    }
+
+    /// Cancel this scope's current tasks without ending its authority to spawn.
+    ///
+    /// `bash.kill_scope` calls this once for local tasks and once for remote
+    /// ones, after [`Self::begin_scope_pause`] chose `members`, the tasks the
+    /// pause covers. A member already finished by the pause itself (its
+    /// worker settled the recorded intent first) is reported as stopped.
+    pub(crate) fn pause_scope(
+        &self,
+        scope: &subc_protocol::scope::ScopeStamp,
+        remote: bool,
+        members: &HashSet<String>,
+    ) -> Result<ScopeKillReport, String> {
+        self.stop_scope_tasks(scope, true, Some(remote), Some(members))
+    }
+
+    /// Choose the tasks an owner's pause of `scope` covers, its unfinished
+    /// tasks, and record the pause on each remote one before any task is
+    /// stopped. `bash.kill_scope` then stops local and remote tasks in two
+    /// passes, each deciding by where a task runs. Without the recorded
+    /// intent a remote task the runner refuses between the passes could fall
+    /// back to a local command that neither pass stops; with it, the fallback
+    /// does not start and the task ends as paused.
+    pub(crate) fn begin_scope_pause(
+        &self,
+        scope: &subc_protocol::scope::ScopeStamp,
+    ) -> Result<HashSet<String>, String> {
+        let mut members = HashSet::new();
+        for task in self.task_arcs() {
+            let in_scope = task
                 .lock_state()
                 .ok()
                 .and_then(|state| state.metadata.scope.clone())
+                .is_some_and(|stamp| {
+                    stamp.owner == scope.owner
+                        && stamp.scope_ref == scope.scope_ref
+                        && stamp.scope_epoch == scope.scope_epoch
+                });
+            if !in_scope || task.is_terminal() {
+                continue;
+            }
+            #[cfg(unix)]
+            self.record_owner_pause_intent(&task)?;
+            members.insert(task.task_id.clone());
+        }
+        Ok(members)
+    }
+
+    /// The members of an owner's pause (see [`Self::begin_scope_pause`])
+    /// that are still running, which the pause must not report as done.
+    pub(crate) fn unstopped_pause_members(&self, members: &HashSet<String>) -> Vec<String> {
+        let mut running = members
+            .iter()
+            .filter(|task_id| self.task(task_id).is_some_and(|task| !task.is_terminal()))
+            .cloned()
+            .collect::<Vec<_>>();
+        running.sort();
+        running
+    }
+
+    /// Recover this scope's unfinished tasks that an earlier module instance
+    /// saved under `storage_root`, so that an owner's pause can stop them.
+    ///
+    /// After a module restart, saved tasks come back only when their project
+    /// binds and replays them, yet their processes (and runner jobs) keep
+    /// running meanwhile. Each task already held by a `live` registry is left
+    /// to that registry. Every other unfinished record stamped with this exact
+    /// scope is restored through the same rules a replay applies, into a
+    /// private registry per storage directory. The caller pauses the scope in
+    /// the returned registries, then calls `start_held_remote_workers` on each,
+    /// and finally detaches them.
+    ///
+    /// Restored remote tasks get no worker here. A worker started now could
+    /// act before the caller records the pause: a saved draining retry that is
+    /// already due would send `exec.run` again, and a refused job would start
+    /// its local fallback, which is the very command the owner meant to stop.
+    ///
+    /// The storage root's own task directory (the layout before harness
+    /// namespaces) and every harness directory beneath it are searched.
+    /// Records that cannot be read are skipped, as replay skips them; a
+    /// record of this scope that cannot be restored is returned as an error.
+    pub(crate) fn recover_saved_scope_tasks(
+        storage_root: &Path,
+        scope: &subc_protocol::scope::ScopeStamp,
+        live: &[BgTaskRegistry],
+    ) -> (Vec<BgTaskRegistry>, Vec<String>) {
+        let mut storage_dirs = vec![storage_root.to_path_buf()];
+        if let Ok(entries) = fs::read_dir(storage_root) {
+            let mut harness_dirs = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.join("bash-tasks").is_dir())
+                .collect::<Vec<_>>();
+            harness_dirs.sort();
+            storage_dirs.extend(harness_dirs);
+        }
+        let mut recovered = Vec::new();
+        let mut errors = Vec::new();
+        for storage_dir in storage_dirs {
+            let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+            registry
+                .inner
+                .saved_task_recovery
+                .store(true, Ordering::Release);
+            *registry
+                .inner
+                .held_remote_workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Vec::new());
+            for metadata in saved_scope_task_records(&storage_dir, scope) {
+                if live
+                    .iter()
+                    .chain(&recovered)
+                    .any(|other| other.task(&metadata.task_id).is_some())
+                {
+                    continue;
+                }
+                if let Err(error) = registry.recover_watch_task(
+                    &storage_dir,
+                    &metadata.session_id,
+                    &metadata.task_id,
+                    metadata.project_root.as_deref(),
+                    metadata.harness.as_deref(),
+                ) {
+                    errors.push(format!(
+                        "{}: saved task could not be recovered: {error}",
+                        metadata.task_id
+                    ));
+                }
+            }
+            if registry.task_arcs().is_empty() {
+                registry.detach();
+            } else {
+                recovered.push(registry);
+            }
+        }
+        (recovered, errors)
+    }
+
+    /// Keep a restored remote task without a worker while this registry
+    /// holds them (see `recover_saved_scope_tasks`). Returns false when the
+    /// worker should start now.
+    #[cfg(unix)]
+    fn hold_remote_worker(&self, task_id: &str) -> bool {
+        match self
+            .inner
+            .held_remote_workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            Some(held) => {
+                held.push(task_id.to_string());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Start the remote workers that recovery held back, once the owner's
+    /// pause has been recorded. Each such worker then finds the pause and
+    /// settles it (cancelling a runner job, or withholding a resubmission or
+    /// local fallback) without running anything.
+    ///
+    /// A held task with no recorded cancellation (its pause failed part way)
+    /// gets no worker here; starting one would run a command of a scope its
+    /// owner is stopping. If a project's replay already registered the same
+    /// task (see [`SavedRemoteTaskClaim`]), that project registry runs its
+    /// worker, as its replay would have. Otherwise the task's saved record
+    /// stays unfinished, so a later replay of its project resumes it.
+    pub(crate) fn start_held_remote_workers(&self) {
+        let held = self
+            .inner
+            .held_remote_workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
+        #[cfg(unix)]
+        for task_id in held {
+            let cancel_recorded = self.task(&task_id).is_some_and(|task| {
+                task.lock_state().is_ok_and(|state| {
+                    state
+                        .metadata
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.cancel_requested)
+                })
+            });
+            // Settled under the claim lock, so a replay registering the task
+            // at the same moment sees either the hold or its outcome.
+            let mut claims = saved_remote_task_claims()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let started = if cancel_recorded {
+                if let Some(claim) = claims.get_mut(&task_id) {
+                    claim.held = false;
+                }
+                self.resume_remote_task(&task_id)
+            } else {
+                let adopter = claims.get(&task_id).and_then(|claim| {
+                    claim
+                        .adopters
+                        .iter()
+                        .filter_map(std::sync::Weak::upgrade)
+                        .map(|inner| BgTaskRegistry { inner })
+                        .find(|registry| {
+                            registry.task(&task_id).is_some() && !registry.holds_remote_workers()
+                        })
+                });
+                match adopter {
+                    Some(adopter) => {
+                        if let Some(claim) = claims.get_mut(&task_id) {
+                            claim.held = false;
+                        }
+                        adopter.resume_remote_task(&task_id)
+                    }
+                    None => {
+                        // This registry is detached next, which drops the
+                        // task; a later replay builds it again from its record.
+                        claims.remove(&task_id);
+                        log::warn!(
+                            "saved remote task {task_id} was not paused; left for its project's replay"
+                        );
+                        Ok(())
+                    }
+                }
+            };
+            drop(claims);
+            if let Err(error) = started {
+                log::warn!("saved remote task {task_id}: worker could not start: {error}");
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = held;
+    }
+
+    /// Whether this registry is holding restored remote tasks without
+    /// workers for an owner's pause (see `recover_saved_scope_tasks`).
+    #[cfg(unix)]
+    fn holds_remote_workers(&self) -> bool {
+        self.inner
+            .held_remote_workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Restore an unfinished saved remote task into this registry, sharing
+    /// one in-memory task with any other registry that restored it (see
+    /// [`SavedRemoteTaskClaim`]).
+    ///
+    /// The first registry to restore the task builds it from `metadata` and
+    /// owns its worker: it starts the worker now, or holds it back for a
+    /// pause. A later registry registers that same task instead, so a stop
+    /// recorded through either registry reaches the one state every worker
+    /// check reads, and it starts no worker of its own while the owner holds
+    /// the task or a worker runs.
+    #[cfg(unix)]
+    fn restore_claimed_remote_task(
+        &self,
+        metadata: PersistedTask,
+        paths: TaskPaths,
+    ) -> Result<(), String> {
+        let task_id = metadata.task_id.clone();
+        // Held while the task is built and its worker started, so another
+        // registry can neither build a second copy nor start a worker first.
+        // Released before this registry publishes the task's pending
+        // notices below (see the lock order at `saved_remote_task_claims`).
+        let mut claims = saved_remote_task_claims()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        claims.retain(|_, claim| claim.task.strong_count() > 0);
+        if let Some(claim) = claims.get_mut(&task_id) {
+            if let Some(task) = claim.task.upgrade() {
+                claim.adopters.push(Arc::downgrade(&self.inner));
+                let held = claim.held;
+                let publishes = self.register_claimed_task(&task)?;
+                // The owner's worker stopped without finishing the task: run
+                // it here, unless this registry is itself holding tasks for a
+                // pause, which must reach a task before its worker does.
+                if !held
+                    && !self.holds_remote_workers()
+                    && !task.remote_worker_running.load(Ordering::Acquire)
+                    && !task.is_terminal()
+                {
+                    self.resume_remote_task(&task_id)?;
+                }
+                drop(claims);
+                if publishes {
+                    self.publish_registered_task_notices(&task)?;
+                }
+                return Ok(());
+            }
+        }
+        self.insert_rehydrated_task(metadata, paths, true)?;
+        let task = self
+            .task(&task_id)
+            .ok_or_else(|| format!("{task_id}: restored remote task missing"))?;
+        let held = self.hold_remote_worker(&task_id);
+        if !self.inner.saved_task_recovery.load(Ordering::Acquire) {
+            *task
+                .notice_registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Arc::downgrade(&self.inner));
+        }
+        claims.insert(
+            task_id.clone(),
+            SavedRemoteTaskClaim {
+                task: Arc::downgrade(&task),
+                held,
+                adopters: Vec::new(),
+            },
+        );
+        if !held {
+            self.resume_remote_task(&task_id)?;
+        }
+        Ok(())
+    }
+
+    /// Make a task another registry restored addressable here too, as
+    /// `insert_rehydrated_task` registers a task it builds. Returns whether
+    /// this registry has just become the task's notice publisher, in which
+    /// case the caller must publish its pending notices with
+    /// `publish_registered_task_notices` once the claim lock is released.
+    #[cfg(unix)]
+    fn register_claimed_task(&self, task: &Arc<BgTask>) -> Result<bool, String> {
+        self.record_live_delivery_session(&task.session_id);
+        self.remember_session_harness(task);
+        {
+            let mut tasks = self
+                .inner
+                .tasks
+                .lock()
+                .map_err(|_| "background task registry lock poisoned".to_string())?;
+            if tasks.contains_key(&task.task_id) {
+                return Ok(false);
+            }
+            tasks.insert(task.task_id.clone(), Arc::clone(task));
+        }
+        self.inner
+            .cleanup_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(task.task_id.clone());
+        if task.is_running() {
+            self.inner
+                .watchdog_tasks
+                .lock()
+                .map_err(|_| "background watchdog lock poisoned")?
+                .insert(task.task_id.clone(), Arc::clone(task));
+        }
+        if self.inner.saved_task_recovery.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        // A project registry publishes the task's notices from now on, unless
+        // another project registry already does.
+        let mut publisher = task
+            .notice_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken = publisher
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some();
+        if !taken {
+            *publisher = Some(Arc::downgrade(&self.inner));
+        }
+        Ok(!taken)
+    }
+
+    /// Publish the notices of a task this registry has just become the
+    /// publisher of. A `bash.kill_scope` recovery registry may have stopped
+    /// the task before this registry registered it, and kept no notice of
+    /// it. The publisher was set before the task's state is read here, and a
+    /// stop sets its state before it looks up the publisher, so each notice
+    /// is published by this call, by the stop, or by both; the task's routed
+    /// flag keeps the completion from being queued twice, and the
+    /// cancelled-call index is a set.
+    #[cfg(unix)]
+    fn publish_registered_task_notices(&self, task: &Arc<BgTask>) -> Result<(), String> {
+        let metadata = task
+            .lock_state()
+            .map_err(|_| "background task lock poisoned")?
+            .metadata
+            .clone();
+        if metadata.cancelled_call_unannounced {
+            self.index_cancelled_call_here(&task.session_id, &task.task_id);
+        }
+        self.enqueue_completion_if_needed(&metadata, Some(&task.paths), false);
+        Ok(())
+    }
+
+    pub(crate) fn wait_owner_pause_cancel(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        deadline: Instant,
+    ) -> ScopeRemoteCancel {
+        let failed = |reason: &str| ScopeRemoteCancel {
+            job_id: None,
+            cancel: format!("failed: {reason}"),
+        };
+        let Some(task) = self.task_for_session(task_id, session_id) else {
+            return failed("task not found");
+        };
+        let Ok(state) = task.lock_state() else {
+            return failed("task lock poisoned");
+        };
+        let Ok((state, _)) = task.kill_settled.wait_timeout_while(
+            state,
+            deadline.saturating_duration_since(Instant::now()),
+            |state| {
+                state
+                    .metadata
+                    .remote
+                    .as_ref()
+                    .is_some_and(|remote| remote.owner_pause_cancel.is_none())
+            },
+        ) else {
+            return failed("task lock poisoned");
+        };
+        let Some(remote) = state.metadata.remote.as_ref() else {
+            return failed("remote task no longer available");
+        };
+        ScopeRemoteCancel {
+            job_id: remote.job_id.map(|id| id.to_string()),
+            cancel: remote
+                .owner_pause_cancel
+                .clone()
+                .unwrap_or_else(|| "failed: did not settle within 10 seconds".into()),
+        }
+    }
+
+    fn stop_scope_tasks(
+        &self,
+        scope: &subc_protocol::scope::ScopeStamp,
+        paused: bool,
+        remote: Option<bool>,
+        pause_members: Option<&HashSet<String>>,
+    ) -> Result<ScopeKillReport, String> {
+        let mut report = ScopeKillReport::default();
+        let mut errors = Vec::new();
+        for task in self.task_arcs() {
+            let stamp = task
+                .lock_state()
+                .ok()
+                .and_then(|state| {
+                    if remote.is_some_and(|remote| remote != state.metadata.remote.is_some()) {
+                        return None;
+                    }
+                    state.metadata.scope.clone()
+                })
                 .filter(|stamp| {
                     stamp.owner == scope.owner
                         && stamp.scope_ref == scope.scope_ref
                         && stamp.scope_epoch == scope.scope_epoch
                 });
             if let Some(stamp) = stamp {
+                if task.is_terminal() {
+                    // A member the pause's own recorded intent already ended
+                    // (its worker settled the pause first) was stopped by this
+                    // pause, not finished before it.
+                    let stopped_by_pause = pause_members
+                        .is_some_and(|members| members.contains(&task.task_id))
+                        && task.lock_state().is_ok_and(|state| {
+                            state.metadata.status == BgTaskStatus::Killed
+                                && state.metadata.status_reason.as_deref()
+                                    == Some(OWNER_PAUSED_REASON)
+                        });
+                    if stopped_by_pause {
+                        self.report_paused_task(&task, &mut report)?;
+                    } else {
+                        report.already_finished += 1;
+                    }
+                    continue;
+                }
                 // A run scope's tasks were started by a codemode program.
-                let killed = if stamp.attributes.run_id.is_some() {
+                let killed = if paused {
+                    self.kill_with_status_reason(
+                        &task.task_id,
+                        &task.session_id,
+                        BgTaskStatus::Killed,
+                        Some(OWNER_PAUSED_REASON.into()),
+                    )
+                    .map_err(|error| error.to_string())
+                } else if stamp.attributes.run_id.is_some() {
                     self.kill_for_run_end(&task.task_id, &task.session_id)
                 } else {
                     self.kill_for_scope_revocation(&task.task_id, &task.session_id)
                 };
-                if let Err(error) = killed {
-                    log::warn!(
-                        "scope revocation kill failed task={}: {error}",
-                        task.task_id
-                    );
+                match killed {
+                    Ok(snapshot) if snapshot.info.status == BgTaskStatus::Killed => {
+                        if paused {
+                            self.report_paused_task(&task, &mut report)?;
+                        } else {
+                            report.killed.push(ScopeKilledTask {
+                                task_id: task.task_id.clone(),
+                                session_id: task.session_id.clone(),
+                                remote: scope_remote_cancel(&task),
+                                from_saved_record: false,
+                            });
+                        }
+                    }
+                    Ok(_) => report.already_finished += 1,
+                    Err(error) => errors.push(format!("{}: {error}", task.task_id)),
                 }
             }
         }
-        // Finished commands of the ended scope keep no scratch for later reads.
-        self.release_scope_scratch(scope);
+        if errors.is_empty() {
+            Ok(report)
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    /// Report a task an owner's pause stopped, and leave the session one
+    /// notice that its call was cancelled.
+    fn report_paused_task(
+        &self,
+        task: &Arc<BgTask>,
+        report: &mut ScopeKillReport,
+    ) -> Result<(), String> {
+        {
+            let mut db = DeferredDbWrites::new(self, task);
+            let mut state = task.lock_state().map_err(|_| "task lock poisoned")?;
+            // Saved after the stop's terminal record: a replay reading between the two writes misses this notice until its next replay.
+            state.metadata.cancelled_call_unannounced = true;
+            self.persist_task_locked(task, &state.metadata, &mut db)
+                .map_err(|e| e.to_string())?;
+        }
+        self.index_cancelled_call(&task.session_id, &task.task_id);
+        report.killed.push(ScopeKilledTask {
+            task_id: task.task_id.clone(),
+            session_id: task.session_id.clone(),
+            remote: scope_remote_cancel(task),
+            from_saved_record: false,
+        });
+        Ok(())
     }
 
     pub(crate) fn kill_scope_if_revoked(&self, scope: &subc_protocol::scope::ScopeStamp) {
@@ -9466,6 +10172,7 @@ impl BgTaskRegistry {
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.finished_at.map(started_instant_from_unix_millis)),
             terminal_notification_routed: Mutex::new(false),
+            notice_registry: Mutex::new(None),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             terminal_persist_dirty: AtomicBool::new(false),
@@ -9475,6 +10182,8 @@ impl BgTaskRegistry {
             remote_cancel_notify: tokio::sync::Notify::new(),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
+            #[cfg(unix)]
+            remote_worker_running: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -9824,6 +10533,11 @@ impl BgTaskRegistry {
                     self.persist_task_locked(&task, &state.metadata, &mut db)
                         .map_err(|e| e.to_string())?;
                 }
+            }
+            if reason.as_deref() == Some(OWNER_PAUSED_REASON) {
+                self.record_owner_pause_remote(&task)
+                    .map_err(RegistryError::from)?;
+                return Ok(self.snapshot_with_terminal_cache(&task, RUNNING_OUTPUT_PREVIEW_BYTES));
             }
             return self.kill_remote_task(&task).map_err(RegistryError::from);
         }
@@ -10441,6 +11155,23 @@ impl BgTaskRegistry {
         // safe; the dedupe-by-queue check stays for the push frame side.
         if !metadata.status.is_terminal() {
             return;
+        }
+        // A task shared with a project registry publishes through it, and a
+        // `bash.kill_scope` recovery registry publishes nothing: it has no
+        // session and is detached afterwards, so a notice queued there (and
+        // the routed flag below, which it would set) would be lost.
+        match self.notice_target(&metadata.task_id) {
+            NoticeTarget::Here => {}
+            NoticeTarget::Elsewhere(registry) => {
+                return registry.enqueue_completion_from_parts(
+                    metadata,
+                    buffer,
+                    paths,
+                    emit_frame,
+                    terminal_render,
+                );
+            }
+            NoticeTarget::Nowhere => return,
         }
 
         let owned_buffer = if buffer.is_none() && metadata.mode != BgMode::Pty {
@@ -12292,6 +13023,45 @@ fn session_recovery_key(storage_dir: &Path, session_id: &str) -> Option<String> 
         .map(str::to_string)
 }
 
+/// Unfinished saved task records under `storage_dir` that carry exactly this
+/// scope stamp (owner, reference and epoch), from every session directory.
+fn saved_scope_task_records(
+    storage_dir: &Path,
+    scope: &subc_protocol::scope::ScopeStamp,
+) -> Vec<PersistedTask> {
+    let Ok(sessions) = fs::read_dir(storage_dir.join("bash-tasks")) else {
+        return Vec::new();
+    };
+    let mut session_dirs = sessions
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    session_dirs.sort();
+    let mut records = Vec::new();
+    for session_dir in session_dirs {
+        let Ok((task_ids, _invalid)) = discover_task_ids(&session_dir) else {
+            continue;
+        };
+        for task_id in task_ids {
+            let Ok(metadata) =
+                resolve_task_layout(&session_dir, &task_id).and_then(|task| read_task_at(&task))
+            else {
+                continue;
+            };
+            let same_scope = metadata.scope.as_ref().is_some_and(|stamp| {
+                stamp.owner == scope.owner
+                    && stamp.scope_ref == scope.scope_ref
+                    && stamp.scope_epoch == scope.scope_epoch
+            });
+            if same_scope && !metadata.is_terminal() && metadata.task_id == task_id {
+                records.push(metadata);
+            }
+        }
+    }
+    records
+}
+
 /// True when a validated open lost its race against an atomic replacement
 /// of the same artifact for every attempt it was allowed. The persistence
 /// layer reports that case distinctly so the sweep can tell a busy writer
@@ -12328,6 +13098,83 @@ type PersistedGcSlots = HashMap<PathBuf, PersistedGcSlot>;
 fn persisted_gc_slots() -> &'static Mutex<PersistedGcSlots> {
     static SLOTS: std::sync::OnceLock<Mutex<PersistedGcSlots>> = std::sync::OnceLock::new();
     SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The remote cancellation outcome `bash.kill_scope` reports for a stopped
+/// task, or `None` for a local one.
+fn scope_remote_cancel(task: &BgTask) -> Option<ScopeRemoteCancel> {
+    task.lock_state().ok().and_then(|state| {
+        state
+            .metadata
+            .remote
+            .as_ref()
+            .map(|remote| ScopeRemoteCancel {
+                job_id: remote.job_id.map(|id| id.to_string()),
+                cancel: remote
+                    .owner_pause_cancel
+                    .clone()
+                    .unwrap_or_else(|| "failed: cancellation outcome unavailable".into()),
+            })
+    })
+}
+
+/// Where a registry sends a task's completion and cancelled-call notices.
+enum NoticeTarget {
+    /// This registry's own queue and index.
+    Here,
+    /// The project registry that shares the task.
+    Elsewhere(BgTaskRegistry),
+    /// Nowhere now: a `bash.kill_scope` recovery registry that shares the
+    /// task with no project registry. The notice stays in the task's record.
+    Nowhere,
+}
+
+/// The one in-memory task for an unfinished saved remote task, shared by
+/// every registry in this process that restores it.
+///
+/// Two paths restore saved remote tasks: a project's replay when it binds,
+/// and `recover_saved_scope_tasks` when the owner pauses a scope whose
+/// project has not bound since the module restarted. Both can run at once.
+/// If each built its own copy of a task, the copy the pause did not reach
+/// would have its own worker, which reads its own uncancelled state and can
+/// send the command to the runner after the owner stopped it. Instead the
+/// first path to restore a task builds it and owns its worker, and the other
+/// path registers the same task (see `restore_claimed_remote_task`).
+#[cfg(unix)]
+struct SavedRemoteTaskClaim {
+    task: std::sync::Weak<BgTask>,
+    /// The owning registry holds the task without a worker until an owner's
+    /// pause is recorded (see `hold_remote_worker`).
+    held: bool,
+    /// Registries that registered the task after it was built.
+    adopters: Vec<std::sync::Weak<RegistryInner>>,
+}
+
+/// Claims by task id. An entry lives while some registry or worker still
+/// holds its task; dead entries are dropped on the next restore.
+///
+/// Lock order. This mutex is always taken first, with no other lock held:
+/// by `restore_claimed_remote_task` (from a project's replay, a watch's
+/// single-task recovery, or `recover_saved_scope_tasks`) and by
+/// `start_held_remote_workers`. While it is held, code registers or builds
+/// a task, which takes registry-inner locks (`tasks`, `cleanup_queue`,
+/// `watchdog_tasks`, `held_remote_workers`, and `cancelled_call_tasks` when
+/// a saved cancelled-call flag is indexed), the task's `state`, and the
+/// database pool and progress sender when a built task's saved watches are
+/// re-armed; it sets the task's `notice_registry` and may spawn a remote
+/// worker thread, which runs without this mutex. It never renders or
+/// queues a completion: `publish_registered_task_notices` and every
+/// `enqueue_completion_from_parts` (which nests a task's
+/// `terminal_notification_routed`, then its `state`, then the registry's
+/// `completions`) run without it. Since no path takes this mutex while
+/// holding another lock, it is outermost in every nesting and cannot be
+/// part of a lock cycle. `notice_registry` is a leaf: no other lock is
+/// taken while it is held.
+#[cfg(unix)]
+fn saved_remote_task_claims() -> &'static Mutex<HashMap<String, SavedRemoteTaskClaim>> {
+    static CLAIMS: std::sync::OnceLock<Mutex<HashMap<String, SavedRemoteTaskClaim>>> =
+        std::sync::OnceLock::new();
+    CLAIMS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn modified_within(path: &Path, grace: Duration) -> bool {
@@ -13563,11 +14410,22 @@ fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
         .as_ref()
         .and_then(|remote| remote.output_incomplete.as_ref())
         .map(remote::RemoteOutputIncomplete::warning_line);
-    match (warning, metadata.execution_note.as_deref()) {
+    let note = match (warning, metadata.execution_note.as_deref()) {
         (Some(warning), Some(note)) if !note.is_empty() => Some(format!("{warning}\n{note}")),
         (Some(warning), _) => Some(warning),
         (None, Some(note)) => Some(note.to_owned()),
         (None, None) => None,
+    };
+    if metadata.status == BgTaskStatus::Killed
+        && metadata.status_reason.as_deref() == Some(OWNER_PAUSED_REASON)
+    {
+        let cancellation = "[killed (cancelled by owner); expected stop, not a command failure]";
+        Some(match note {
+            Some(note) => format!("{cancellation}\n{note}"),
+            None => cancellation.to_owned(),
+        })
+    } else {
+        note
     }
 }
 
@@ -21776,6 +22634,78 @@ mod tests {
         assert!(refusal
             .to_string()
             .starts_with(crate::persisted_format::CODE));
+    }
+
+    #[test]
+    fn per_match_ack_settles_terminal_completion_only_after_last_watch() {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let task_id = "bash-0000000000000198";
+        install_delivered_terminal_with_pending_watch(&registry, &db, storage.path(), task_id);
+        let task = registry.task_for_session(task_id, "session").unwrap();
+        task.set_completion_delivered(false, &registry).unwrap();
+        {
+            let conn = db.lock().unwrap();
+            let mut sibling = crate::db::bash_watches::get_bash_pattern_watch(
+                &conn,
+                "opencode",
+                "session",
+                task_id,
+                "watch-00000001",
+            )
+            .unwrap()
+            .unwrap();
+            sibling.watch_id = "watch-00000002".into();
+            sibling.once = false;
+            crate::db::bash_watches::upsert_bash_pattern_watch(&conn, &sibling).unwrap();
+        }
+        assert_eq!(
+            registry
+                .ack_pattern_match_for_session("foreign", task_id, "watch-00000001", 756_237)
+                .unwrap(),
+            None
+        );
+        let first_ack = registry
+            .ack_pattern_match_for_session("session", task_id, "watch-00000001", 756_237)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&first_ack).unwrap()["task_settled"],
+            false
+        );
+        assert_eq!(
+            serde_json::to_value(&first_ack).unwrap()["watch_removed"],
+            true
+        );
+        assert!(!task.lock_state().unwrap().metadata.completion_delivered);
+        assert_eq!(
+            registry
+                .pending_pattern_matches_for_session("session")
+                .len(),
+            1
+        );
+        let last_ack = registry
+            .ack_pattern_match_for_session("session", task_id, "watch-00000002", 756_237)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&last_ack).unwrap()["task_settled"],
+            true
+        );
+        assert_eq!(
+            serde_json::to_value(&last_ack).unwrap()["watch_removed"],
+            true
+        );
+        assert!(task.lock_state().unwrap().metadata.completion_delivered);
+        assert!(registry
+            .pending_pattern_matches_for_session("session")
+            .is_empty());
+        assert_eq!(
+            registry
+                .ack_pattern_match_for_session("session", task_id, "watch-00000002", 756_237)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Effect } from "effect";
-
+import { drainEntry } from "../../src/__tests__/helpers/drain-wire.js";
 import type { AftConfig } from "../../src/config.js";
 import { __resetSyncWatchAbortForTests, isSyncWatchAborted } from "../../src/sync-watch-abort.js";
 import { createV2RuntimeConsumer } from "../../src/wakes/runtime-consumer.js";
@@ -97,11 +97,19 @@ describe("V2 session delivery", () => {
       session: host.session,
     });
     const sends: Array<{ command: string; params: unknown }> = [];
+    let pendingCompletion = true;
     const bridge = {
       getCwd: () => "/work/project",
       send: async (command: string, params: unknown) => {
         sends.push({ command, params });
-        return { success: true };
+        if (command === "bash_drain_completions")
+          return {
+            success: true,
+            bg_completions: pendingCompletion ? [drainEntry(completion)] : [],
+            pending_matches: [],
+          };
+        if (command === "bash_ack_completions") pendingCompletion = false;
+        return { success: true, acked_task_ids: ["bash-1"] };
       },
     };
     const completion = {
@@ -149,14 +157,15 @@ describe("V2 session delivery", () => {
         task_ids: ["bash-1"],
       },
     });
-    // Admitted once: the session's waits are detached once and the task is
-    // acknowledged once; the duplicate push changes nothing.
+    // The duplicate push only validates durable state; it cannot wake or ACK again.
     expect(sends).toEqual([
+      { command: "bash_drain_completions", params: { session_id: "session-v2" } },
       { command: "bash_wait_detach", params: { session_id: "session-v2" } },
       {
         command: "bash_ack_completions",
         params: { session_id: "session-v2", task_ids: ["bash-1"] },
       },
+      { command: "bash_drain_completions", params: { session_id: "session-v2" } },
     ]);
     consumer.dispose();
   });
@@ -238,7 +247,7 @@ describe("V2 completion wakes end the session's waits", () => {
     output_preview: "done",
   });
 
-  function bridge() {
+  function bridge(frame: ReturnType<typeof completion>) {
     const sends: Array<{ command: string; params: unknown }> = [];
     return {
       sends,
@@ -246,7 +255,13 @@ describe("V2 completion wakes end the session's waits", () => {
         getCwd: () => "/work/project",
         send: async (command: string, params: unknown) => {
           sends.push({ command, params });
-          return { success: true, detached: command === "bash_wait_detach" };
+          if (command === "bash_drain_completions")
+            return { success: true, bg_completions: [drainEntry(frame)], pending_matches: [] };
+          return {
+            success: true,
+            detached: command === "bash_wait_detach",
+            acked_task_ids: [frame.task_id],
+          };
         },
       },
     };
@@ -256,7 +271,7 @@ describe("V2 completion wakes end the session's waits", () => {
     const host = recordingSession();
     const consumer = createV2RuntimeConsumer({ session: host.session }, () => config);
     consumer.registerSession?.(sessionID);
-    const pushed = bridge();
+    const pushed = bridge(completion(sessionID, "bash-wake"));
     await consumer.bridgeOptions.onBashCompletion?.(
       completion(sessionID, "bash-wake"),
       pushed.bridge as never,
@@ -285,7 +300,10 @@ describe("V2 completion wakes end the session's waits", () => {
       "session-kept",
     );
     expect(host.synthetic).toHaveLength(1);
-    expect(sends.map((send) => send.command)).toEqual(["bash_ack_completions"]);
+    expect(sends.map((send) => send.command)).toEqual([
+      "bash_drain_completions",
+      "bash_ack_completions",
+    ]);
     expect(isSyncWatchAborted("session-kept")).toBe(false);
   });
 });

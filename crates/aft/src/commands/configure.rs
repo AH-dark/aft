@@ -3432,6 +3432,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // so a build below the floor refuses the affected components by name.
     ctx.begin_configure_ack_step("reader_floor");
     crate::reader_floor::prepare(&resolved_storage_dir);
+    // Owed runner cancels of saved paused tasks go out now, on their own
+    // thread, whether or not their projects ever bind.
+    crate::bash_background::note_storage_root(&resolved_storage_dir);
     ctx.begin_configure_ack_step("validate_runtime_params");
     next_config.storage_dir = Some(resolved_storage_dir);
     if let Some(raw) = params.get("max_background_bash_tasks") {

@@ -95,6 +95,7 @@ pub(crate) enum Script {
     Refused,
     Restart,
     Cancel,
+    CancelRefused,
     MissingTerminal,
     KnownRefused,
     WorkspaceSetupRefused,
@@ -166,6 +167,12 @@ pub(crate) enum Script {
     /// Like `GatedAcceptance`, but once released the runner accepts the inputs
     /// and then refuses before the command starts.
     GatedAcceptanceThenRefused,
+    /// Hold admission until released, then complete or refuse without running.
+    GatedAdmission {
+        refuse: bool,
+    },
+    /// Delay route opening before the client can submit exec.run.
+    GatedRoute,
     /// Drop the connection on the first `exec.run`, before any stream record:
     /// the runner never sends `Accepted`, so the caller cannot know the outcome.
     DropBeforeAccepted,
@@ -306,6 +313,15 @@ pub(crate) async fn daemon_with_capabilities(
                 FrameType::Request if header.channel == 0 => match body["op"].as_str() {
                     Some("catalog.list") => replies.push(reply(FrameType::Response, json!({"op":"catalog.list", "generation":1, "subc_ops":["catalog.list"],
                         "modules":[{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":claims, "requires":[]}}]}))),
+                    Some("route.open") if matches!(script, Script::GatedRoute) => {
+                        let frame = reply(FrameType::Response, json!({"op":"route.open", "route_channel":40, "route_epoch":1}));
+                        let writer = writer.clone();
+                        let gate = server_acceptance_gate.clone();
+                        producers.push(tokio::spawn(async move {
+                            gate.notified().await;
+                            let _ = subc_transport::write_frame(&mut *writer.lock().await, &frame).await;
+                        }));
+                    },
                     Some("route.open") => replies.push(reply(FrameType::Response, json!({"op":"route.open", "route_channel":40, "route_epoch":1}))),
                     _ => panic!("unexpected control request {body}"),
                 },
@@ -325,7 +341,7 @@ pub(crate) async fn daemon_with_capabilities(
                                 // Drop the connection and listener with the run in flight.
                                 return;
                             }
-                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::DrainingGatedAcceptance) {
+                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) {
                                 let mut accepted = Accepted::new(id(), if let Script::Staged { position, .. } | Script::GatedStages { position } = script { position } else { 1 });
                                 if matches!(script, Script::Windows { acknowledge: true, .. }) {
                                     accepted = accepted.with_platform(Platform::Windows);
@@ -361,7 +377,7 @@ pub(crate) async fn daemon_with_capabilities(
                                     Script::Windows { code: None, .. } => Outcome::OutcomeUnknown,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
-                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
+                            if matches!(script, Script::Cancel | Script::CancelRefused | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
                             else if attaching && matches!(script, Script::GappedAttach | Script::GappedCancel) { /* output is sent below; completion waits for the test's release */ }
                             else {
                                 if matches!(script, Script::Restart) {
@@ -432,6 +448,7 @@ pub(crate) async fn daemon_with_capabilities(
                                 replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
                             }
                         },
+                        "exec.cancel" if matches!(script, Script::CancelRefused) => replies.push(reply(FrameType::Error, json!({"code":"cancel_refused","message":"runner unavailable"}))),
                         "exec.cancel" => { cancelled = true; stop.store(true,std::sync::atomic::Ordering::SeqCst); replies.push(reply(FrameType::Response, serde_json::to_value(CancelReply::new(id())).unwrap())); },
                         "exec.status" => replies.push(reply(FrameType::Response, serde_json::to_value(StatusReply::new(0, vec![], true, vec![], "rustc test")).unwrap())),
                         _ => panic!("unexpected caller operation {body}"),
@@ -444,6 +461,76 @@ pub(crate) async fn daemon_with_capabilities(
                     subc_transport::write_frame(&mut *writer.lock().await, &response)
                         .await
                         .unwrap();
+                }
+                if let Script::GatedAdmission { refuse } = script {
+                    if body["method"] == "exec.run" {
+                        let writer = writer.clone();
+                        let gate = server_acceptance_gate.clone();
+                        let stop = stop.clone();
+                        producers.push(tokio::spawn(async move {
+                            gate.notified().await;
+                            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                                return;
+                            }
+                            let records = if refuse {
+                                vec![StreamRecord::Terminal(TerminalRecord::new(
+                                    id(),
+                                    Outcome::RefusedBeforeStart {
+                                        reason: RefusalReason::QueueWaitExceeded,
+                                    },
+                                    0,
+                                    0,
+                                    0,
+                                ))]
+                            } else {
+                                vec![
+                                    StreamRecord::Accepted(Accepted::new(id(), 7)),
+                                    StreamRecord::Output(Output::new(
+                                        0,
+                                        OutputStream::Stdout,
+                                        BytePayload(b"admitted\n".to_vec()),
+                                    )),
+                                    StreamRecord::Terminal(TerminalRecord::new(
+                                        id(),
+                                        Outcome::Exit { code: 0 },
+                                        1,
+                                        0,
+                                        0,
+                                    )),
+                                ]
+                            };
+                            let mut writer = writer.lock().await;
+                            for record in records {
+                                let frame = Frame::build_with_version(
+                                    header.ver,
+                                    FrameType::StreamData,
+                                    header.flags,
+                                    header.channel,
+                                    header.epoch,
+                                    header.corr,
+                                    serde_json::to_vec(&record).unwrap(),
+                                )
+                                .unwrap();
+                                if subc_transport::write_frame(&mut *writer, &frame)
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            let end = Frame::build_with_version(
+                                header.ver,
+                                FrameType::StreamEnd,
+                                header.flags,
+                                header.channel,
+                                header.epoch,
+                                header.corr,
+                                vec![],
+                            )
+                            .unwrap();
+                            let _ = subc_transport::write_frame(&mut *writer, &end).await;
+                        }));
+                    }
                 }
                 if (matches!(
                     script,
@@ -729,6 +816,12 @@ pub(crate) struct OutageDaemon {
     pub(crate) log: Arc<Mutex<Vec<Value>>>,
     /// Connections that asked for the catalog while the provider was away.
     pub(crate) refused_connects: Arc<tokio::sync::watch::Sender<usize>>,
+    /// Every authenticated connection, whether or not the provider was there.
+    pub(crate) connects: Arc<tokio::sync::watch::Sender<usize>>,
+    /// Catalog requests currently held by [`OutageDaemon::hold_next_connect`].
+    held_connects: Arc<tokio::sync::watch::Sender<usize>>,
+    hold_next: Arc<std::sync::atomic::AtomicBool>,
+    release_held: Arc<tokio::sync::Notify>,
     up: Arc<std::sync::atomic::AtomicBool>,
     server: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
@@ -739,6 +832,29 @@ impl OutageDaemon {
     /// Bring the provider back, as when ck-motor finishes restarting.
     pub(crate) fn restore(&self) {
         self.up.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Hold the next connection's catalog request unanswered until
+    /// [`OutageDaemon::release_held_connect`], so a test can act while the
+    /// reconnecting client waits for its catalog reply. The held reply reports
+    /// the provider as it is at release time.
+    pub(crate) fn hold_next_connect(&self) {
+        self.hold_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Wait until a reconnect is held by [`OutageDaemon::hold_next_connect`].
+    pub(crate) async fn after_held_connect(&self) {
+        let mut held = self.held_connects.subscribe();
+        tokio::time::timeout(Duration::from_secs(30), held.wait_for(|n| *n >= 1))
+            .await
+            .expect("the caller must reconnect into the held catalog request")
+            .unwrap();
+    }
+
+    /// Answer the catalog request held by [`OutageDaemon::hold_next_connect`].
+    pub(crate) fn release_held_connect(&self) {
+        self.release_held.notify_one();
     }
 
     /// Wait until at least `count` connections found the provider away.
@@ -795,12 +911,22 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
     let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
     let log = Arc::new(Mutex::new(Vec::new()));
     let refused_connects = Arc::new(tokio::sync::watch::channel(0).0);
+    let connects = Arc::new(tokio::sync::watch::channel(0).0);
+    let held_connects = Arc::new(tokio::sync::watch::channel(0).0);
+    let hold_next = Arc::new(AtomicBool::new(false));
+    let release_held = Arc::new(tokio::sync::Notify::new());
     let up = Arc::new(AtomicBool::new(true));
     let (server_log, server_refused, server_up, server_key) = (
         log.clone(),
         refused_connects.clone(),
         up.clone(),
         key.clone(),
+    );
+    let (server_connects, server_held, server_hold_next, server_release) = (
+        connects.clone(),
+        held_connects.clone(),
+        hold_next.clone(),
+        release_held.clone(),
     );
     let server = tokio::spawn(async move {
         let mut connections = tokio::task::JoinSet::new();
@@ -813,6 +939,12 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
                 server_refused.clone(),
                 server_up.clone(),
                 server_key.clone(),
+            );
+            let (connects, held, hold_next, release) = (
+                server_connects.clone(),
+                server_held.clone(),
+                server_hold_next.clone(),
+                server_release.clone(),
             );
             connections.spawn(async move {
                 if subc_transport::authenticate_server(
@@ -827,6 +959,7 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
                 {
                     return;
                 }
+                connects.send_modify(|count| *count += 1);
                 let (mut reader, mut writer) = tokio::io::split(socket);
                 while let Ok(Some(frame)) = subc_transport::read_frame(&mut reader).await {
                     let header = frame.header;
@@ -863,6 +996,11 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
                         )),
                         FrameType::Request if header.channel == 0 => match body["op"].as_str() {
                             Some("catalog.list") => {
+                                if hold_next.swap(false, Ordering::SeqCst) {
+                                    held.send_modify(|count| *count += 1);
+                                    release.notified().await;
+                                    held.send_modify(|count| *count -= 1);
+                                }
                                 // A provider that is restarting is absent from the catalog.
                                 let modules = if up.load(Ordering::SeqCst) {
                                     json!([{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":["exec-remote/v1"], "requires":[]}}])
@@ -962,6 +1100,10 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
         connection,
         log,
         refused_connects,
+        connects,
+        held_connects,
+        hold_next,
+        release_held,
         up,
         server,
         _dir: dir,

@@ -150,6 +150,66 @@ fn registry() -> BgTaskRegistry {
     BgTaskRegistry::new(Arc::new(Mutex::new(None)))
 }
 
+fn exited_remote_workers() -> &'static Mutex<HashSet<String>> {
+    static TASKS: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    TASKS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Called by a remote task's worker thread as its last step.
+pub(super) fn note_remote_worker_exit(task: &str) {
+    exited_remote_workers()
+        .lock()
+        .unwrap()
+        .insert(task.to_owned());
+    remote_worker_counts()
+        .lock()
+        .unwrap()
+        .entry(task.to_owned())
+        .or_default()
+        .1 += 1;
+}
+
+/// Per task id: remote worker threads started, and those that reached their
+/// last step.
+fn remote_worker_counts() -> &'static Mutex<HashMap<String, (usize, usize)>> {
+    static COUNTS: std::sync::OnceLock<Mutex<HashMap<String, (usize, usize)>>> =
+        std::sync::OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Called as a remote worker thread for `task` is about to be spawned.
+pub(super) fn note_remote_worker_start(task: &str) {
+    remote_worker_counts()
+        .lock()
+        .unwrap()
+        .entry(task.to_owned())
+        .or_default()
+        .0 += 1;
+}
+
+/// How many remote workers were started for `task`, and how many stopped.
+fn remote_workers(task: &str) -> (usize, usize) {
+    remote_worker_counts()
+        .lock()
+        .unwrap()
+        .get(task)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Wait until the task's remote worker reaches its last step, so a test can
+/// assert what the worker did not do afterwards without sleeping.
+async fn remote_worker_exited(task: &str) {
+    wait_for("the remote worker must stop", || {
+        exited_remote_workers()
+            .lock()
+            .unwrap()
+            .contains(task)
+            .then_some(())
+    })
+    .await
+}
+
 pub(crate) fn launch(connection: PathBuf) -> crate::bash_background::RemoteLaunch {
     crate::bash_background::RemoteLaunch {
         explicit_runon: false,
@@ -184,10 +244,19 @@ fn start_with_hard_kill(
     connection: PathBuf,
     hard_kill: crate::bash_background::HardKill,
 ) -> String {
+    start_with_launch(registry, dir, launch(connection), hard_kill)
+}
+
+fn start_with_launch(
+    registry: &BgTaskRegistry,
+    dir: &Path,
+    launch: crate::bash_background::RemoteLaunch,
+    hard_kill: crate::bash_background::HardKill,
+) -> String {
     ensure_git_fixture(dir);
     registry
         .spawn_remote(
-            launch(connection),
+            launch,
             SpawnPlan::Unsandboxed,
             "printf local-proof",
             resolve_posix_shell(),
@@ -1047,6 +1116,8 @@ fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        cancel_pending: false,
+        owner_pause_cancel: None,
         terminal: None,
         fallback_digest: None,
         env_not_forwarded: None,
@@ -2250,6 +2321,8 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        cancel_pending: false,
+        owner_pause_cancel: None,
         terminal: None,
         fallback_digest: None,
         env_not_forwarded: None,
@@ -3542,6 +3615,8 @@ fn persist_accepted_with_snapshot(
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        cancel_pending: false,
+        owner_pause_cancel: None,
         terminal: None,
         fallback_digest: Some(digest),
         env_not_forwarded: None,
@@ -5473,6 +5548,8 @@ fn remote_phase_comes_from_acceptance_started_or_output() {
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        cancel_pending: false,
+        owner_pause_cancel: None,
         terminal: None,
         fallback_digest: None,
         env_not_forwarded: None,
@@ -5587,6 +5664,8 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        cancel_pending: false,
+        owner_pause_cancel: None,
         terminal: None,
         fallback_digest: None,
         env_not_forwarded: None,
@@ -5978,6 +6057,8 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
         stderr_len: 0,
         unknown_len: 0,
         cancel_requested: false,
+        cancel_pending: false,
+        owner_pause_cancel: None,
         terminal: None,
         fallback_digest: None,
         env_not_forwarded: None,
@@ -6559,6 +6640,1721 @@ async fn runon_draining_network_retry_preserves_outbound_and_vcpu_request() {
         let request: RunRequest = serde_json::from_value(request).unwrap();
         assert_eq!(request.network, Some(Network::Outbound));
         assert_eq!(request.weight_hint, Some(4));
+    }
+}
+
+/// Points in a draining-retry worker where a test can hold it, so a pause can
+/// land exactly between two of the worker's own decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum DrainingGate {
+    /// After the worker found no cancellation intent, before it checks the
+    /// retry budget and decides whether to resubmit.
+    BeforeBudgetCheck,
+    /// After the worker decided to resubmit, before it records the dispatch.
+    BeforeResubmit,
+    /// After a signer-refusal retry finished waiting out the runner's hint,
+    /// before it rechecks for cancellation and records the resubmission.
+    BeforeHintedResubmit,
+    /// After the runner refused a submission that AFT will not retry, before
+    /// the worker reports the refusal.
+    BeforeRefusalReport,
+    /// After a retry's resubmission failed without reaching the runner
+    /// (see `refuse_resubmission`), before the worker reports that.
+    BeforeNoStartRefusal,
+    /// After the startup pass claimed a saved task's owed runner cancel,
+    /// before it sends it. Keyed by the pass's storage root.
+    OwedCancelClaimed,
+}
+
+fn refused_resubmission_roots() -> &'static Mutex<HashSet<PathBuf>> {
+    static ROOTS: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Make the next retry resubmission under `root` fail as a call that never
+/// reached the runner.
+fn refuse_next_resubmission(root: &Path) {
+    refused_resubmission_roots()
+        .lock()
+        .unwrap()
+        .insert(test_clock_key(root));
+}
+
+/// Called by a retry worker as it resubmits: true once after
+/// `refuse_next_resubmission` for its root.
+pub(super) fn refuse_resubmission(root: &Path) -> bool {
+    refused_resubmission_roots()
+        .lock()
+        .unwrap()
+        .remove(&test_clock_key(root))
+}
+
+type DrainingGateKey = (PathBuf, DrainingGate);
+
+fn draining_gates() -> &'static Mutex<
+    HashMap<
+        DrainingGateKey,
+        (
+            tokio::sync::watch::Sender<bool>,
+            tokio::sync::watch::Receiver<bool>,
+        ),
+    >,
+> {
+    static GATES: std::sync::OnceLock<
+        Mutex<
+            HashMap<
+                DrainingGateKey,
+                (
+                    tokio::sync::watch::Sender<bool>,
+                    tokio::sync::watch::Receiver<bool>,
+                ),
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Called by the draining-retry worker at each `DrainingGate` point. A gate
+/// holds the worker once, then is gone; unarmed points return at once.
+pub(super) async fn draining_gate(root: &Path, gate: DrainingGate) {
+    let armed = draining_gates()
+        .lock()
+        .unwrap()
+        .remove(&(test_clock_key(root), gate));
+    if let Some((reached, mut release)) = armed {
+        reached.send_replace(true);
+        let _ = release.wait_for(|released| *released).await;
+    }
+}
+
+struct HeldDrainingGate {
+    key: DrainingGateKey,
+    reached: tokio::sync::watch::Receiver<bool>,
+    release: tokio::sync::watch::Sender<bool>,
+}
+
+impl HeldDrainingGate {
+    fn arm(root: &Path, gate: DrainingGate) -> Self {
+        let key = (test_clock_key(root), gate);
+        let (reached_tx, reached) = tokio::sync::watch::channel(false);
+        let (release, release_rx) = tokio::sync::watch::channel(false);
+        assert!(draining_gates()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), (reached_tx, release_rx))
+            .is_none());
+        Self {
+            key,
+            reached,
+            release,
+        }
+    }
+
+    async fn reached(&mut self) {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            self.reached.wait_for(|reached| *reached),
+        )
+        .await
+        .expect("draining worker must reach the gate")
+        .expect("draining gate dropped");
+    }
+
+    fn release(&self) {
+        self.release.send_replace(true);
+    }
+}
+
+impl Drop for HeldDrainingGate {
+    fn drop(&mut self) {
+        draining_gates().lock().unwrap().remove(&self.key);
+        // Release a held worker even when an assertion failed.
+        self.release.send_replace(true);
+    }
+}
+
+fn owner_scope(scope_ref: &str) -> subc_protocol::scope::ScopeStamp {
+    subc_protocol::scope::ScopeStamp::new(
+        subc_protocol::Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        },
+        scope_ref,
+        1,
+        subc_protocol::scope::ScopeKind::Worker,
+    )
+}
+
+/// Start the owner's `bash.kill_scope` off the test runtime. It blocks until
+/// every paused remote task settles its cancellation, or its own 10-second
+/// deadline passes.
+fn start_kill_scope(
+    registry: &BgTaskRegistry,
+    scope: &subc_protocol::scope::ScopeStamp,
+) -> tokio::task::JoinHandle<crate::protocol::Response> {
+    let registry = registry.clone();
+    let scope = scope.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::commands::bash_kill_scope::handle_bash_kill_scope(
+            serde_json::json!({"scope":scope}),
+            Some(&scope.owner),
+            &[registry],
+        )
+    })
+}
+
+/// The pause has ended the task: it recorded its cancellation intent and the
+/// paused terminal state. A worker held at a gate can be released from here on
+/// to observe it. Releasing it earlier would let the worker race the pause to
+/// the task's terminal state.
+async fn pause_recorded(registry: &BgTaskRegistry, task: &str) {
+    wait_for("the pause must end the task", || {
+        let task = registry.task(task)?;
+        let state = task.state.lock().unwrap();
+        (state.metadata.remote.as_ref()?.cancel_requested
+            && state.metadata.is_terminal()
+            && state.metadata.status_reason.as_deref()
+                == Some(crate::bash_background::registry::OWNER_PAUSED_REASON))
+        .then_some(())
+    })
+    .await
+}
+
+/// A worker that settles the owner's pause answers `bash.kill_scope` at once.
+/// One that never settles it leaves the reply waiting out its whole 10-second
+/// deadline and then reporting a failed cancellation. Half that deadline tells
+/// the two apart without depending on machine speed, and the reply text must
+/// also show the settled outcome rather than the deadline's.
+async fn assert_pause_settles_promptly(
+    registry: &BgTaskRegistry,
+    operation: tokio::task::JoinHandle<crate::protocol::Response>,
+    task: &str,
+) {
+    let reply = tokio::time::timeout(Duration::from_secs(5), operation)
+        .await
+        .expect("bash.kill_scope must settle well before its 10-second deadline")
+        .unwrap();
+    assert!(reply.success, "{reply:?}");
+    let killed = reply.data["killed"].as_array().unwrap();
+    assert_eq!(
+        killed.len(),
+        1,
+        "{reply:?}; task: {:?}",
+        registry.status(task, "session", None, None, 0)
+    );
+    assert_eq!(killed[0]["task_id"], task, "{reply:?}");
+    // A refused submission leaves no runner job to cancel, so withholding the
+    // retry is the whole cancellation and is reported as sent.
+    assert_eq!(killed[0]["remote"]["cancel"], "sent", "{reply:?}");
+}
+
+fn assert_paused(registry: &BgTaskRegistry, task: &str) {
+    let done = registry.status(task, "session", None, None, 0).unwrap();
+    assert_eq!(done.info.status, BgTaskStatus::Killed, "{done:?}");
+    assert_eq!(done.info.status_reason.as_deref(), Some("paused_by_owner"));
+}
+
+fn start_scoped_runon_retry(
+    registry: &BgTaskRegistry,
+    dir: &Path,
+    connection: PathBuf,
+    scope: &subc_protocol::scope::ScopeStamp,
+) -> String {
+    super::super::with_scope_spawn(Some(scope.clone()), || {
+        start_runon_retry(registry, dir, connection)
+    })
+}
+
+/// The owner pauses a worker whose `runon` task sleeps before retrying a
+/// draining runner. The worker wakes, sees the cancellation, and must settle
+/// the pause itself: nothing else ever will.
+#[tokio::test]
+async fn bash_kill_scope_settles_while_draining_retry_sleeps() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: u32::MAX,
+            retry_after_ms: Some(10_000),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("draining-sleep");
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let first = clock.now();
+    clock.expect_sleep(first, first + 1000).await;
+    assert_pause_settles_promptly(&registry, start_kill_scope(&registry, &scope), &task).await;
+    // The retry clock never moved: cancellation, not a retry deadline, woke
+    // the worker.
+    assert_eq!(clock.now(), first);
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
+/// The pause lands after the worker decided to resubmit but before it records
+/// the dispatch. Its recheck there must settle the pause.
+#[tokio::test]
+async fn bash_kill_scope_settles_when_paused_just_before_draining_resubmit() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: 1,
+            retry_after_ms: Some(200),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("draining-resubmit");
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let first = clock.now();
+    clock.expect_sleep(first, first + 200).await;
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeResubmit);
+    clock.advance(200);
+    gate.reached().await;
+    let operation = start_kill_scope(&registry, &scope);
+    pause_recorded(&registry, &task).await;
+    gate.release();
+    assert_pause_settles_promptly(&registry, operation, &task).await;
+    assert_eq!(clock.now(), first + 200);
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
+/// The pause lands just before the worker finds its retry budget spent. The
+/// worker then records the draining refusal, which cannot replace the pause's
+/// terminal state, and must still settle the pause.
+#[tokio::test]
+async fn bash_kill_scope_settles_when_paused_as_draining_budget_runs_out() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: u32::MAX,
+            retry_after_ms: Some(10_000),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_draining_budget(dir.path(), 600);
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("draining-budget");
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let first = clock.now();
+    clock.expect_sleep(first, first + 600).await;
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeBudgetCheck);
+    clock.advance(600);
+    gate.reached().await;
+    let operation = start_kill_scope(&registry, &scope);
+    pause_recorded(&registry, &task).await;
+    gate.release();
+    assert_pause_settles_promptly(&registry, operation, &task).await;
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
+/// After a restart, a draining retry is due and the worker must reconnect to
+/// resubmit. The pause lands before that reconnect fails; the worker records
+/// that it could not dispatch and must still settle the pause.
+#[tokio::test]
+async fn bash_kill_scope_settles_when_restored_draining_retry_cannot_reconnect() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: u32::MAX,
+            retry_after_ms: Some(200),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    let original = registry();
+    let scope = owner_scope("draining-reconnect");
+    let task_id =
+        start_scoped_runon_retry(&original, dir.path(), daemon.connection.clone(), &scope);
+    clock.expect_event(DrainingClockEvent::Stopped).await;
+    // The runner's connection file is gone by the time the module restarts.
+    let json = original.task(&task_id).unwrap().paths.json.clone();
+    let mut saved = read_task(&json).unwrap();
+    saved.remote.as_mut().unwrap().connection_file = Some(dir.path().join("missing.json"));
+    write_task(&json, &saved).unwrap();
+    clock.advance(200);
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeBudgetCheck);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    gate.reached().await;
+    let operation = start_kill_scope(&restarted, &scope);
+    pause_recorded(&restarted, &task_id).await;
+    gate.release();
+    assert_pause_settles_promptly(&restarted, operation, &task_id).await;
+    assert_paused(&restarted, &task_id);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
+/// Start a command of `scope` that ignores SIGTERM, saved under `storage` as
+/// the module saves its tasks, then let its registry go without stopping it,
+/// as a module restart does. `bash.kill_scope` stops local tasks before
+/// remote ones, and stopping this one takes the whole termination grace
+/// period. A remote worker that recovery started before the pause therefore
+/// has that long to act on its own. Returns the task id and the command's
+/// process id.
+async fn start_saved_term_ignoring_task(
+    storage: &Path,
+    scope: &subc_protocol::scope::ScopeStamp,
+) -> (String, u32) {
+    let previous = registry();
+    let pid_file = storage.join("term-ignoring-pid");
+    let task = super::super::with_scope_spawn(Some(scope.clone()), || {
+        previous.spawn_with_shell_in_slot(
+            SpawnPlan::Unsandboxed,
+            &format!(
+                "trap '' TERM; echo $$ > '{}'; while :; do /bin/sleep 0.05; done",
+                pid_file.display()
+            ),
+            crate::bash_background::BashShell::Bash,
+            resolve_posix_shell(),
+            "local-session".into(),
+            storage.into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            storage.into(),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(storage.into()),
+        )
+    })
+    .unwrap();
+    let pid = wait_for("the saved local command must start", || {
+        fs::read_to_string(&pid_file)
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()
+    })
+    .await;
+    previous.detach();
+    (task, pid)
+}
+
+/// Run the owner's `bash.kill_scope` as the module's frame loop does after a
+/// restart: no live registry holds the scope's tasks, which are found in
+/// their saved records under `storage`.
+async fn kill_scope_with_saved_tasks(
+    storage: &Path,
+    scope: &subc_protocol::scope::ScopeStamp,
+) -> crate::protocol::Response {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        start_kill_scope_with_saved_tasks(storage, scope),
+    )
+    .await
+    .expect("bash.kill_scope must reply")
+    .unwrap()
+}
+
+/// Start the owner's `bash.kill_scope` as `kill_scope_with_saved_tasks`
+/// runs it, off the test runtime, without waiting for its reply.
+fn start_kill_scope_with_saved_tasks(
+    storage: &Path,
+    scope: &subc_protocol::scope::ScopeStamp,
+) -> tokio::task::JoinHandle<crate::protocol::Response> {
+    let storage = storage.to_path_buf();
+    let scope = scope.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::commands::bash_kill_scope::handle_bash_kill_scope_with_saved_tasks(
+            serde_json::json!({"scope": scope}),
+            Some(&scope.owner),
+            &[],
+            Some(&storage),
+        )
+    })
+}
+
+/// The reply names both stopped tasks, the remote one settled as sent, and
+/// the saved local command is gone.
+async fn assert_saved_pause_reply(
+    reply: &crate::protocol::Response,
+    remote_task: &str,
+    local_task: &str,
+    local_pid: u32,
+) {
+    assert!(reply.success, "{reply:?}");
+    let killed = reply.data["killed"].as_array().unwrap();
+    assert_eq!(killed.len(), 2, "{reply:?}");
+    let remote = killed
+        .iter()
+        .find(|entry| entry["task_id"] == remote_task)
+        .unwrap_or_else(|| panic!("{reply:?}"));
+    assert_eq!(remote["from_saved_record"], true, "{reply:?}");
+    // The pause was recorded before any worker ran, so the worker withheld
+    // the command (or cancelled the runner job) and reported it as sent.
+    assert_eq!(remote["remote"]["cancel"], "sent", "{reply:?}");
+    let local = killed
+        .iter()
+        .find(|entry| entry["task_id"] == local_task)
+        .unwrap_or_else(|| panic!("{reply:?}"));
+    assert!(local["remote"].is_null(), "{reply:?}");
+    wait_for("the saved local command must be stopped", || {
+        (!crate::bash_background::process::is_process_alive(local_pid)).then_some(())
+    })
+    .await;
+}
+
+fn assert_saved_paused(json: &Path) {
+    let saved = read_task(json).unwrap();
+    assert_eq!(saved.status, BgTaskStatus::Killed, "{saved:?}");
+    assert_eq!(saved.status_reason.as_deref(), Some("paused_by_owner"));
+    assert!(!saved.local_fallback_started, "{saved:?}");
+    assert_eq!(
+        saved.remote.unwrap().owner_pause_cancel.as_deref(),
+        Some("sent")
+    );
+}
+
+fn exec_cancels(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_json::Value> {
+    daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.cancel")
+        .map(|(_, body)| body["params"].clone())
+        .collect()
+}
+
+/// A `runon` task of a fresh owner scope whose job the runner (accepting up
+/// to `clients` connections) has accepted, paused while its worker was
+/// stopped right before it would send the cancel, and saved by a registry
+/// that is then dropped, as a module restart leaves it. Returns the runner,
+/// the task id, the job id and the path of the saved record, which is
+/// finished and still owes the runner the cancel.
+async fn saved_task_owing_a_cancel(
+    dir: &Path,
+    clients: usize,
+) -> (
+    crate::exec_remote::wire_tests::Daemon,
+    String,
+    Uuid,
+    PathBuf,
+) {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+        Script::Cancel,
+        "exec-remote/v1",
+        clients,
+    )
+    .await;
+    let scope = owner_scope("owed-cancel");
+    let original = registry();
+    let task_id = start_scoped_runon_retry(&original, dir, daemon.connection.clone(), &scope);
+    let job_id = wait_for("the runner must accept the job", || {
+        let task = original.task(&task_id)?;
+        let state = task.state.lock().unwrap();
+        state.metadata.remote.as_ref()?.job_id
+    })
+    .await;
+    stopped_draining_roots().lock().unwrap().insert(dir.into());
+    let members = original.begin_scope_pause(&scope).unwrap();
+    original.pause_scope(&scope, true, &members).unwrap();
+    remote_worker_exited(&task_id).await;
+    let json = original.task(&task_id).unwrap().paths.json.clone();
+    original.detach();
+    let saved = read_task(&json).unwrap();
+    assert_eq!(saved.status, BgTaskStatus::Killed, "{saved:?}");
+    assert!(
+        saved.remote.unwrap().cancel_pending,
+        "the cancel must be owed"
+    );
+    assert!(
+        owed_marker(dir, &task_id).is_file(),
+        "the owed cancel must be indexed"
+    );
+    assert!(exec_cancels(&daemon).is_empty(), "the cancel was sent");
+    (daemon, task_id, job_id, json)
+}
+
+/// The owed-cancel index entry for a task saved under storage `dir`.
+fn owed_marker(dir: &Path, task_id: &str) -> PathBuf {
+    dir.join("bash-owed-cancels").join(task_id)
+}
+
+/// Run the startup pass that sends owed cancels under `storage` to its end,
+/// off the test runtime that serves the fake runner.
+async fn run_owed_cancel_pass(storage: &Path) -> super::OwedCancelReport {
+    let handle = BgTaskRegistry::start_owed_cancel_pass(storage).expect("first pass for this root");
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || handle.join().unwrap()),
+    )
+    .await
+    .expect("the owed cancel pass must finish")
+    .unwrap()
+}
+
+/// The saved record shows the owed cancel sent once and nothing owed.
+fn assert_owed_cancel_sent_once(
+    daemon: &crate::exec_remote::wire_tests::Daemon,
+    job_id: Uuid,
+    json: &Path,
+) {
+    let cancels = exec_cancels(daemon);
+    assert_eq!(cancels.len(), 1, "{cancels:?}");
+    assert!(
+        cancels[0].to_string().contains(&job_id.to_string()),
+        "{cancels:?}"
+    );
+    let saved = read_task(json).unwrap();
+    assert_eq!(saved.status, BgTaskStatus::Killed, "{saved:?}");
+    assert_eq!(saved.status_reason.as_deref(), Some("paused_by_owner"));
+    let remote = saved.remote.unwrap();
+    assert!(!remote.cancel_pending, "{remote:?}");
+    assert_eq!(remote.owner_pause_cancel.as_deref(), Some("sent"));
+    assert_eq!(exec_runs(daemon).len(), 1, "never resubmitted");
+    let storage = json
+        .ancestors()
+        .find(|dir| dir.join("bash-tasks").is_dir())
+        .unwrap();
+    assert!(
+        !owed_marker(storage, &saved.task_id).exists(),
+        "the settled cancel must leave the index"
+    );
+}
+
+/// A paused worker's checkout may never bind again after a restart, so its
+/// task's owed runner cancel must not wait for a replay. The startup pass
+/// finds it in the saved records and sends it, with no project bound and no
+/// task restored.
+#[tokio::test]
+async fn an_owed_runner_cancel_is_sent_at_startup_without_a_bind() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, task_id, job_id, json) = saved_task_owing_a_cancel(dir.path(), 2).await;
+    // A new module starts; no project binds.
+    let restarted = registry();
+    let report = run_owed_cancel_pass(dir.path()).await;
+    assert_eq!(report.sent, 1, "{report:?}");
+    assert_owed_cancel_sent_once(&daemon, job_id, &json);
+    assert!(
+        restarted.task(&task_id).is_none(),
+        "the pass restores no task"
+    );
+    assert_eq!(
+        remote_workers(&task_id),
+        (1, 1),
+        "the pass starts no worker"
+    );
+}
+
+fn failed_owed_cancel_attempts() -> &'static Mutex<HashMap<String, usize>> {
+    static ATTEMPTS: std::sync::OnceLock<Mutex<HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    ATTEMPTS.get_or_init(Default::default)
+}
+
+/// Called by the owed cancel pass after each attempt that failed to reach
+/// the runner.
+pub(super) fn note_owed_cancel_attempt_failed(task: &str) {
+    *failed_owed_cancel_attempts()
+        .lock()
+        .unwrap()
+        .entry(task.to_owned())
+        .or_default() += 1;
+}
+
+/// The runner's connection is not available when the startup pass first
+/// tries to send an owed cancel. The pass waits and tries again, and the
+/// cancel is sent once the runner can be reached.
+#[tokio::test]
+async fn the_owed_cancel_pass_retries_until_the_runner_is_reachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, task_id, job_id, json) = saved_task_owing_a_cancel(dir.path(), 2).await;
+    let hidden = daemon.connection.with_extension("hidden");
+    fs::rename(&daemon.connection, &hidden).unwrap();
+    let pass = {
+        let handle = BgTaskRegistry::start_owed_cancel_pass(dir.path()).unwrap();
+        tokio::task::spawn_blocking(move || handle.join().unwrap())
+    };
+    wait_for("the first attempt must fail", || {
+        (failed_owed_cancel_attempts()
+            .lock()
+            .unwrap()
+            .get(&task_id)
+            .copied()
+            .unwrap_or_default()
+            >= 1)
+            .then_some(())
+    })
+    .await;
+    fs::rename(&hidden, &daemon.connection).unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(60), pass)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.sent, 1, "{report:?}");
+    assert_owed_cancel_sent_once(&daemon, job_id, &json);
+}
+
+/// The production entry point: `configure` of a standalone process (here
+/// for another project) starts the owed cancel pass for its storage root.
+/// The runner gets the paused task's cancel although the task's own project
+/// never binds.
+#[tokio::test]
+async fn configure_sends_an_owed_runner_cancel_without_binding_its_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, task_id, job_id, json) = saved_task_owing_a_cancel(dir.path(), 2).await;
+    let other = tempfile::tempdir().unwrap();
+    let ctx = Arc::new(restarted_context(other.path()));
+    let configure = {
+        let (ctx, other, storage) = (
+            ctx.clone(),
+            other.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
+        tokio::task::spawn_blocking(move || {
+            // The configured storage root, not a worker-wide override.
+            let _storage = crate::test_env::without_storage_override();
+            crate::commands::configure::handle_configure(
+                &crate::protocol::RawRequest {
+                    id: "configure-other-project".into(),
+                    command: "configure".into(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: serde_json::json!({
+                        "project_root": other,
+                        "storage_dir": storage,
+                        "harness": "opencode",
+                    }),
+                },
+                &ctx,
+            )
+        })
+    };
+    daemon.wait_for_requests("exec.cancel", 1).await;
+    let configured = configure.await.unwrap();
+    assert!(configured.success, "{configured:?}");
+    wait_for("the sent cancel must be saved", || {
+        let remote = read_task(&json).ok()?.remote?;
+        (!remote.cancel_pending).then_some(())
+    })
+    .await;
+    assert_owed_cancel_sent_once(&daemon, job_id, &json);
+    assert!(
+        ctx.bash_background().task_for_test(&task_id).is_none(),
+        "the task's project was not bound"
+    );
+    assert_eq!(remote_workers(&task_id), (1, 1), "no worker was started");
+}
+
+/// The pass reads only the owed-cancel index, not the task history: with 200
+/// other finished records saved beside the one owing a cancel, it examines
+/// one marker.
+#[tokio::test]
+async fn the_owed_cancel_pass_reads_only_owed_markers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, _task_id, job_id, json) = saved_task_owing_a_cancel(dir.path(), 2).await;
+    let finished = read_task(&json).unwrap();
+    for n in 0..200u64 {
+        let mut record = finished.clone();
+        record.task_id = format!("bash-{:016x}", 0xabc000 + n);
+        record.remote.as_mut().unwrap().cancel_pending = false;
+        let layout = crate::bash_background::persistence::create_task_layout(
+            dir.path(),
+            &record.session_id,
+            &record.task_id,
+        )
+        .unwrap();
+        write_task_at(&layout, &record).unwrap();
+    }
+    let report = run_owed_cancel_pass(dir.path()).await;
+    assert_eq!(report.examined, 1, "{report:?}");
+    assert_eq!(report.sent, 1, "{report:?}");
+    assert_owed_cancel_sent_once(&daemon, job_id, &json);
+}
+
+/// A marker left behind after its record stopped owing the cancel (a crash
+/// between the record write and the marker's removal) is removed by the
+/// pass, which sends nothing.
+#[tokio::test]
+async fn a_stale_owed_cancel_marker_is_removed_without_sending() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, task_id, _job_id, json) = saved_task_owing_a_cancel(dir.path(), 2).await;
+    let mut saved = read_task(&json).unwrap();
+    saved.remote.as_mut().unwrap().cancel_pending = false;
+    write_task(&json, &saved).unwrap();
+    let report = run_owed_cancel_pass(dir.path()).await;
+    assert_eq!(
+        (report.examined, report.stale_markers, report.sent),
+        (1, 1, 0),
+        "{report:?}"
+    );
+    assert!(exec_cancels(&daemon).is_empty());
+    assert!(!owed_marker(dir.path(), &task_id).exists());
+}
+
+type OwedCancelSaveGate = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+fn owed_cancel_save_gates() -> &'static Mutex<HashMap<String, OwedCancelSaveGate>> {
+    static GATES: std::sync::OnceLock<Mutex<HashMap<String, OwedCancelSaveGate>>> =
+        std::sync::OnceLock::new();
+    GATES.get_or_init(Default::default)
+}
+
+/// Called by the owed cancel pass between reading a task's record and
+/// writing its outcome; holds the pass there once if a test armed it.
+pub(super) fn owed_cancel_save_gate(task: &str) {
+    let armed = owed_cancel_save_gates().lock().unwrap().remove(task);
+    if let Some((reached, release)) = armed {
+        let _ = reached.send(());
+        let _ = release.recv_timeout(Duration::from_secs(30));
+    }
+}
+
+/// While the startup pass saves a paused task's owed-cancel outcome, the
+/// task's project (which replayed it meanwhile) takes the session's
+/// cancelled-call notices, clearing the record's notice flag. The pass must
+/// keep that change: the session gets the owner-cancellation notice once,
+/// and not again after another replay.
+#[tokio::test]
+async fn the_owed_cancel_pass_keeps_a_cancelled_call_notice_taken_during_its_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, task_id, job_id, json) = saved_task_owing_a_cancel(dir.path(), 3).await;
+    assert!(read_task(&json).unwrap().cancelled_call_unannounced);
+    let mut claimed = HeldDrainingGate::arm(dir.path(), DrainingGate::OwedCancelClaimed);
+    let (save_reached, release_save) = {
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        owed_cancel_save_gates()
+            .lock()
+            .unwrap()
+            .insert(task_id.clone(), (reached_tx, release_rx));
+        (reached, release)
+    };
+    let pass = {
+        let handle = BgTaskRegistry::start_owed_cancel_pass(dir.path()).unwrap();
+        tokio::task::spawn_blocking(move || handle.join().unwrap())
+    };
+    claimed.reached().await;
+    // The project replays the task while the pass holds its claim.
+    let project = registry();
+    project.replay_session(dir.path(), "session").unwrap();
+    claimed.release();
+    tokio::time::timeout(Duration::from_secs(30), save_reached)
+        .await
+        .expect("the pass must reach its save")
+        .unwrap();
+    // The session takes its notices between the pass's read and its write.
+    let taking = {
+        let project = project.clone();
+        tokio::task::spawn_blocking(move || project.take_cancelled_call_notices("session"))
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    release_save.send(()).unwrap();
+    let notices = taking.await.unwrap();
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|notice| notice.contains(&task_id))
+            .count(),
+        1,
+        "{notices:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(60), pass)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_owed_cancel_sent_once(&daemon, job_id, &json);
+    let saved = read_task(&json).unwrap();
+    assert!(!saved.cancelled_call_unannounced, "{saved:?}");
+    project.detach();
+    // Another replay must not announce the cancelled call again.
+    let again = registry();
+    again.replay_session(dir.path(), "session").unwrap();
+    let repeated = again.take_cancelled_call_notices("session");
+    assert!(
+        !repeated.iter().any(|notice| notice.contains(&task_id)),
+        "the notice was delivered again: {repeated:?}"
+    );
+}
+
+/// The startup pass has claimed a saved task's owed cancel when its project
+/// binds and replays the task. The replay must not start a worker that sends
+/// the cancel a second time; it takes the pass's outcome instead.
+#[tokio::test]
+async fn a_replay_during_the_owed_cancel_pass_sends_no_second_cancel() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, task_id, job_id, json) = saved_task_owing_a_cancel(dir.path(), 3).await;
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::OwedCancelClaimed);
+    let pass = {
+        let handle = BgTaskRegistry::start_owed_cancel_pass(dir.path()).unwrap();
+        tokio::task::spawn_blocking(move || handle.join().unwrap())
+    };
+    gate.reached().await;
+    let project = registry();
+    project.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        remote_workers(&task_id),
+        (1, 1),
+        "the replay started a worker"
+    );
+    gate.release();
+    let report = tokio::time::timeout(Duration::from_secs(60), pass)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.sent, 1, "{report:?}");
+    assert_owed_cancel_sent_once(&daemon, job_id, &json);
+    let task = project.task(&task_id).unwrap();
+    let remote = task.state.lock().unwrap().metadata.remote.clone().unwrap();
+    assert!(!remote.cancel_pending, "{remote:?}");
+    assert_eq!(remote.owner_pause_cancel.as_deref(), Some("sent"));
+    assert_eq!(remote_workers(&task_id), (1, 1));
+}
+
+/// The startup pass and a project's replay of the same saved task run at the
+/// same moment, ten times. Whichever claims the owed cancel first sends it;
+/// the runner must receive it exactly once each time.
+#[tokio::test]
+async fn the_owed_cancel_pass_and_a_replay_racing_send_one_cancel() {
+    for round in 0..10 {
+        let dir = tempfile::tempdir().unwrap();
+        let (daemon, _task_id, job_id, json) = saved_task_owing_a_cancel(dir.path(), 3).await;
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let pass = {
+            let (start, storage) = (start.clone(), dir.path().to_path_buf());
+            tokio::task::spawn_blocking(move || {
+                start.wait();
+                BgTaskRegistry::start_owed_cancel_pass(&storage)
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            })
+        };
+        let project = registry();
+        let replay = {
+            let (project, storage) = (project.clone(), dir.path().to_path_buf());
+            tokio::task::spawn_blocking(move || {
+                start.wait();
+                project.replay_session(&storage, "session").unwrap();
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(60), pass)
+            .await
+            .unwrap()
+            .unwrap();
+        replay.await.unwrap();
+        wait_for(
+            &format!("round {round}: the owed cancel must be saved"),
+            || {
+                let remote = read_task(&json).ok()?.remote?;
+                (!remote.cancel_pending && remote.owner_pause_cancel.as_deref() == Some("sent"))
+                    .then_some(())
+            },
+        )
+        .await;
+        // Give a second sender the time it would need to reach the runner.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            exec_cancels(&daemon).len(),
+            1,
+            "round {round}: {:?}",
+            exec_cancels(&daemon)
+        );
+        assert_owed_cancel_sent_once(&daemon, job_id, &json);
+        project.detach();
+    }
+}
+
+/// `bash.kill_scope` stops a scope's local tasks in one pass and its remote
+/// tasks in a second. Here the runner refuses a remote task between the two
+/// passes, and its worker would run the command locally instead: the first
+/// pass saw it remote, the second would see it local, so neither would stop
+/// it. The pause must cover it anyway: its local fallback never starts, and
+/// the reply names it as stopped.
+#[tokio::test]
+async fn bash_kill_scope_stops_a_task_that_falls_back_to_local_between_its_passes() {
+    let daemon = daemon(Script::GatedAdmission { refuse: true }, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("local-fallback-ran");
+    let registry = registry();
+    let scope = owner_scope("fallback-between-passes");
+    ensure_git_fixture(dir.path());
+    let task_id = super::super::with_scope_spawn(Some(scope.clone()), || {
+        registry.spawn_remote(
+            launch(daemon.connection.clone()),
+            SpawnPlan::Unsandboxed,
+            &format!("printf x > '{}'", marker.display()),
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            dir.path().into(),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+    })
+    .unwrap();
+    daemon.wait_for_requests("exec.run", 1).await;
+    // The runner refuses the job; hold the worker after it received the
+    // refusal, before it decides on the local fallback.
+    let mut refusal = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeRefusalReport);
+    daemon.acceptance_gate.notify_one();
+    refusal.reached().await;
+    let (between_passes, release_remote_pass) =
+        crate::commands::bash_kill_scope::saved_recovery_gate::arm(
+            dir.path(),
+            crate::commands::bash_kill_scope::saved_recovery_gate::Point::BetweenPasses,
+        );
+    let operation = {
+        let registry = registry.clone();
+        let scope = scope.clone();
+        let storage = dir.path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::commands::bash_kill_scope::handle_bash_kill_scope_with_saved_tasks(
+                serde_json::json!({"scope": scope}),
+                Some(&scope.owner),
+                &[registry],
+                Some(&storage),
+            )
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(30), between_passes)
+        .await
+        .expect("bash.kill_scope must finish its local pass")
+        .unwrap();
+    // Between the passes, the worker acts on the refusal.
+    refusal.release();
+    remote_worker_exited(&task_id).await;
+    release_remote_pass.send(()).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(30), operation)
+        .await
+        .expect("bash.kill_scope must reply")
+        .unwrap();
+    // Give a local child that wrongly started the time to write its marker.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!marker.exists(), "the local fallback ran: {reply:?}");
+    assert!(reply.success, "{reply:?}");
+    let killed = reply.data["killed"].as_array().unwrap();
+    assert!(
+        killed
+            .iter()
+            .any(|entry| entry["task_id"] == task_id.as_str()),
+        "the stopped task must be reported: {reply:?}"
+    );
+    assert_paused(&registry, &task_id);
+}
+
+/// The owner pauses a scope whose `runon` job the runner has accepted, and
+/// the module stops before its worker sends the cancellation. The pause
+/// already saved the task as stopped, so the saved record must also say the
+/// runner is still owed that cancellation: replaying it after the restart
+/// sends it, and the runner job does not keep running unnoticed.
+#[tokio::test]
+async fn a_paused_runon_jobs_unsent_cancel_is_sent_after_a_restart() {
+    let daemon =
+        crate::exec_remote::wire_tests::daemon_with_clients(Script::Cancel, "exec-remote/v1", 2)
+            .await;
+    let dir = tempfile::tempdir().unwrap();
+    let scope = owner_scope("unsent-cancel");
+    let original = registry();
+    let task_id =
+        start_scoped_runon_retry(&original, dir.path(), daemon.connection.clone(), &scope);
+    let job_id = wait_for("the runner must accept the job", || {
+        let task = original.task(&task_id)?;
+        let state = task.state.lock().unwrap();
+        state.metadata.remote.as_ref()?.job_id
+    })
+    .await;
+    // The worker stops right before it would send the cancellation.
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    let members = original.begin_scope_pause(&scope).unwrap();
+    original.pause_scope(&scope, true, &members).unwrap();
+    remote_worker_exited(&task_id).await;
+    assert!(exec_cancels(&daemon).is_empty(), "the cancel was sent");
+    let json = original.task(&task_id).unwrap().paths.json.clone();
+    let saved = read_task(&json).unwrap();
+    assert_eq!(saved.status, BgTaskStatus::Killed, "{saved:?}");
+    original.detach();
+
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    daemon.wait_for_requests("exec.cancel", 1).await;
+    let cancels = exec_cancels(&daemon);
+    assert_eq!(cancels.len(), 1, "{cancels:?}");
+    assert!(
+        cancels[0].to_string().contains(&job_id.to_string()),
+        "{cancels:?}"
+    );
+    let settled = wait_for("the sent cancellation must be saved", || {
+        let saved = read_task(&json).ok()?;
+        let remote = saved.remote.clone()?;
+        (!remote.cancel_pending && remote.owner_pause_cancel.is_some()).then_some(saved)
+    })
+    .await;
+    assert_eq!(settled.status, BgTaskStatus::Killed, "{settled:?}");
+    assert_eq!(
+        settled.status_reason.as_deref(),
+        Some("paused_by_owner"),
+        "{settled:?}"
+    );
+    assert_eq!(
+        settled.remote.unwrap().owner_pause_cancel.as_deref(),
+        Some("sent")
+    );
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
+/// After a module restart, the owner pauses a worker whose saved draining
+/// retry is already due. Recovering that saved task for the pause must not
+/// let it resubmit: the resubmitted command is the one the owner is stopping.
+/// The scope's saved local command keeps the pause busy long enough for a
+/// worker started during recovery to reach the runner.
+#[tokio::test]
+async fn bash_kill_scope_never_resubmits_a_due_saved_draining_retry() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+        Script::Draining {
+            refusals: u32::MAX,
+            retry_after_ms: Some(200),
+        },
+        "exec-remote/v1",
+        2,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    let scope = owner_scope("saved-draining-retry");
+    let original = registry();
+    let task_id =
+        start_scoped_runon_retry(&original, dir.path(), daemon.connection.clone(), &scope);
+    clock.expect_event(DrainingClockEvent::Stopped).await;
+    let json = original.task(&task_id).unwrap().paths.json.clone();
+    original.detach();
+    let (local_task, local_pid) = start_saved_term_ignoring_task(dir.path(), &scope).await;
+    // The retry is due by the time the owner pauses the restarted module.
+    clock.advance(200);
+    let reply = kill_scope_with_saved_tasks(dir.path(), &scope).await;
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        1,
+        "the paused draining retry was resubmitted: {reply:?}"
+    );
+    assert_saved_pause_reply(&reply, &task_id, &local_task, local_pid).await;
+    assert_saved_paused(&json);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
+/// A `runon` task of `scope` whose draining retry is saved and due, as a
+/// module restart leaves it: its worker stopped and its registry is gone.
+/// Returns the runner, the paused retry clock, the task id and the path of
+/// its saved record. The runner refuses the first `refusals` runs as
+/// draining and accepts the rest, which exit 0. It accepts a second
+/// connection, so a worker started after the restart can reach it.
+async fn saved_due_draining_retry(
+    dir: &Path,
+    scope: &subc_protocol::scope::ScopeStamp,
+    refusals: u32,
+) -> (
+    crate::exec_remote::wire_tests::Daemon,
+    PausedDrainingClock,
+    String,
+    PathBuf,
+) {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+        Script::Draining {
+            refusals,
+            retry_after_ms: Some(200),
+        },
+        "exec-remote/v1",
+        2,
+    )
+    .await;
+    let mut clock = PausedDrainingClock::new(dir);
+    stopped_draining_roots().lock().unwrap().insert(dir.into());
+    let original = registry();
+    let task_id = start_scoped_runon_retry(&original, dir, daemon.connection.clone(), scope);
+    clock.expect_event(DrainingClockEvent::Stopped).await;
+    wait_for("the original worker must stop", || {
+        (remote_workers(&task_id) == (1, 1)).then_some(())
+    })
+    .await;
+    let json = original.task(&task_id).unwrap().paths.json.clone();
+    original.detach();
+    clock.advance(200);
+    (daemon, clock, task_id, json)
+}
+
+/// The reply of a pause that stopped the saved task `task` and settled it.
+fn assert_one_saved_task_paused(reply: &crate::protocol::Response, task: &str) {
+    assert!(reply.success, "{reply:?}");
+    let killed = reply.data["killed"].as_array().unwrap();
+    assert_eq!(killed.len(), 1, "{reply:?}");
+    assert_eq!(killed[0]["task_id"], task, "{reply:?}");
+    assert_eq!(killed[0]["from_saved_record"], true, "{reply:?}");
+    assert_eq!(killed[0]["remote"]["cancel"], "sent", "{reply:?}");
+}
+
+/// The bound project's session hears of the owner's stop exactly once: one
+/// completion for `task`, and one cancelled-call notice naming it, which is
+/// not repeated. The `bash.kill_scope` recovery registry that recorded the
+/// stop has no session of its own and is detached afterwards.
+fn assert_project_told_of_the_stop_once(project: &BgTaskRegistry, task: &str) {
+    let completions = project
+        .drain_completions_for_session(Some("session"))
+        .into_iter()
+        .filter(|completion| completion.task_id == task)
+        .collect::<Vec<_>>();
+    assert_eq!(completions.len(), 1, "{completions:?}");
+    assert_eq!(completions[0].status, BgTaskStatus::Killed);
+    let notices = project.take_cancelled_call_notices("session");
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|notice| notice.contains(task))
+            .count(),
+        1,
+        "{notices:?}"
+    );
+    assert!(
+        project.take_cancelled_call_notices("session").is_empty(),
+        "the cancelled-call notice was repeated"
+    );
+}
+
+/// After a module restart, the owner pauses a scope whose saved draining
+/// retry is due, and the task's project binds while `bash.kill_scope` holds
+/// the copy it recovered, not yet paused. The bind must register that same
+/// task, held without a worker, not build a second copy whose worker would
+/// resubmit the command the owner is stopping.
+#[tokio::test]
+async fn bash_kill_scope_recovery_then_a_bind_share_one_saved_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = owner_scope("saved-recovery-then-bind");
+    let (daemon, _clock, task_id, json) =
+        saved_due_draining_retry(dir.path(), &scope, u32::MAX).await;
+    let (reached, release) = crate::commands::bash_kill_scope::saved_recovery_gate::arm(
+        dir.path(),
+        crate::commands::bash_kill_scope::saved_recovery_gate::Point::AfterRecovery,
+    );
+    let operation = start_kill_scope_with_saved_tasks(dir.path(), &scope);
+    tokio::time::timeout(Duration::from_secs(30), reached)
+        .await
+        .expect("bash.kill_scope must recover the saved task")
+        .unwrap();
+    let project = registry();
+    project.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        remote_workers(&task_id),
+        (1, 1),
+        "the bind started a worker before the pause"
+    );
+    release.send(()).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(30), operation)
+        .await
+        .expect("bash.kill_scope must reply")
+        .unwrap();
+    assert_one_saved_task_paused(&reply, &task_id);
+    // One worker since the restart: the one the pause started to settle it.
+    assert_eq!(remote_workers(&task_id).0, 2, "{reply:?}");
+    wait_for("the paused task's worker must stop", || {
+        (remote_workers(&task_id) == (2, 2)).then_some(())
+    })
+    .await;
+    // The bound project sees the owner's stop on the task it registered.
+    assert_paused(&project, &task_id);
+    assert_saved_paused(&json);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_project_told_of_the_stop_once(&project, &task_id);
+}
+
+/// After a module restart, the task's project binds and its worker is about
+/// to resubmit the saved, due draining retry when the owner's
+/// `bash.kill_scope` recovers the scope's saved tasks, before the module
+/// lists the project's registry as live. The pause must register the bound
+/// project's task, so that its worker sees the stop; a private copy would be
+/// paused while that worker resubmits.
+#[tokio::test]
+async fn a_bind_then_bash_kill_scope_recovery_share_one_saved_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = owner_scope("saved-bind-then-recovery");
+    let (daemon, _clock, task_id, json) =
+        saved_due_draining_retry(dir.path(), &scope, u32::MAX).await;
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeBudgetCheck);
+    let project = registry();
+    project.replay_session(dir.path(), "session").unwrap();
+    gate.reached().await;
+    assert_eq!(remote_workers(&task_id), (2, 1));
+    let operation = start_kill_scope_with_saved_tasks(dir.path(), &scope);
+    wait_for("the pause must be saved", || {
+        let saved = read_task(&json).ok()?;
+        (saved.status == BgTaskStatus::Killed
+            && saved.status_reason.as_deref()
+                == Some(crate::bash_background::registry::OWNER_PAUSED_REASON))
+        .then_some(())
+    })
+    .await;
+    gate.release();
+    let reply = tokio::time::timeout(Duration::from_secs(30), operation)
+        .await
+        .expect("bash.kill_scope must reply")
+        .unwrap();
+    assert_one_saved_task_paused(&reply, &task_id);
+    // The bound project's worker is the only one since the restart.
+    assert_eq!(remote_workers(&task_id).0, 2, "{reply:?}");
+    wait_for("the paused task's worker must stop", || {
+        (remote_workers(&task_id) == (2, 2)).then_some(())
+    })
+    .await;
+    assert_paused(&project, &task_id);
+    assert_saved_paused(&json);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_project_told_of_the_stop_once(&project, &task_id);
+}
+
+/// After a module restart, `bash.kill_scope` recovers and stops a saved
+/// task. The task's project binds just as the stop is saved: its replay read
+/// the task's record from before the stop, so it registers the task the
+/// recovery registry holds, which is already stopped. The stop's notices,
+/// which the recovery registry could not deliver, must reach the project's
+/// session once.
+#[tokio::test]
+async fn a_bind_racing_a_saved_tasks_stop_gets_its_notices() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = owner_scope("saved-stop-then-bind");
+    let (daemon, _clock, task_id, json) =
+        saved_due_draining_retry(dir.path(), &scope, u32::MAX).await;
+    let before_stop = fs::read(&json).unwrap();
+    let (reached, release) = crate::commands::bash_kill_scope::saved_recovery_gate::arm(
+        dir.path(),
+        crate::commands::bash_kill_scope::saved_recovery_gate::Point::BeforeDetach,
+    );
+    let operation = start_kill_scope_with_saved_tasks(dir.path(), &scope);
+    tokio::time::timeout(Duration::from_secs(30), reached)
+        .await
+        .expect("bash.kill_scope must stop the saved task")
+        .unwrap();
+    assert_saved_paused(&json);
+    // Stand in for a replay that read the record just before the stop
+    // saved it.
+    fs::write(&json, &before_stop).unwrap();
+    let project = registry();
+    project.replay_session(dir.path(), "session").unwrap();
+    release.send(()).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(30), operation)
+        .await
+        .expect("bash.kill_scope must reply")
+        .unwrap();
+    assert_one_saved_task_paused(&reply, &task_id);
+    wait_for("the paused task's worker must stop", || {
+        (remote_workers(&task_id) == (2, 2)).then_some(())
+    })
+    .await;
+    assert_eq!(
+        remote_workers(&task_id),
+        (2, 2),
+        "the bind started a worker"
+    );
+    assert_paused(&project, &task_id);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_project_told_of_the_stop_once(&project, &task_id);
+}
+
+/// What the threads of a stress round that has not finished are doing.
+struct RoundSnapshot {
+    /// Which of the shared task's main locks are held, and what each
+    /// relevant thread is blocked in, by syscall and (for a lock wait) by
+    /// the lock's name.
+    report: String,
+    /// A round thread is in a syscall other than a lock wait (on the build
+    /// servers, typically an `fsync` of a task record that is slow under
+    /// load, made while holding the task's state lock), or a background-task
+    /// thread is in a disk syscall: the round may still be making progress.
+    /// Always true where threads cannot be inspected.
+    progressing: bool,
+}
+
+/// Disk syscalls (read, write, open, openat, fsync, fdatasync, rename,
+/// renameat2, unlink, unlinkat, newfstatat, getdents64, ftruncate) by number.
+#[cfg(target_arch = "x86_64")]
+const DISK_SYSCALLS: &[&str] = &[
+    "0", "1", "2", "257", "74", "75", "82", "316", "87", "263", "262", "217", "77",
+];
+#[cfg(target_arch = "aarch64")]
+const DISK_SYSCALLS: &[&str] = &[
+    "63", "64", "56", "82", "83", "38", "276", "35", "79", "61", "46",
+];
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const DISK_SYSCALLS: &[&str] = &[];
+
+/// Snapshot the round's threads. On Linux, a thread blocked on a std mutex
+/// or condvar waits in `futex` (syscall 202 on x86_64, 98 on aarch64) with
+/// the address of that mutex or condvar as its first argument; the snapshot
+/// compares it with the named locks below and labels each waiter it matches.
+fn round_snapshot(
+    task: &BgTask,
+    recovery: &BgTaskRegistry,
+    project: &BgTaskRegistry,
+) -> RoundSnapshot {
+    fn held<T>(lock: &Mutex<T>) -> bool {
+        matches!(lock.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+    }
+    fn addr<T>(lock: &T) -> usize {
+        lock as *const T as usize
+    }
+    let mut named: Vec<(String, usize)> = vec![
+        ("claims".into(), addr(saved_remote_task_claims())),
+        ("task.state".into(), addr(&task.state)),
+        ("task.notice_registry".into(), addr(&task.notice_registry)),
+        (
+            "task.routed".into(),
+            addr(&task.terminal_notification_routed),
+        ),
+        ("task.terminal_render".into(), addr(&task.terminal_render)),
+        ("task.terminal_at".into(), addr(&task.terminal_at)),
+        (
+            "task.completion_secrets".into(),
+            addr(&task.completion_secrets),
+        ),
+        ("task.kill_settled".into(), addr(&task.kill_settled)),
+        (
+            "task.json_writes".into(),
+            addr(&task.db_write_order.json_writes),
+        ),
+        ("task.db_pending".into(), addr(&task.db_write_order.pending)),
+        ("task.db_written".into(), addr(&task.db_write_order.written)),
+        ("db_write_orders".into(), addr(db_write_orders())),
+    ];
+    for (name, registry) in [("recovery", recovery), ("project", project)] {
+        let inner = &registry.inner;
+        named.extend([
+            (format!("{name}.tasks"), addr(&inner.tasks)),
+            (
+                format!("{name}.watchdog_tasks"),
+                addr(&inner.watchdog_tasks),
+            ),
+            (format!("{name}.cleanup_queue"), addr(&inner.cleanup_queue)),
+            (format!("{name}.completions"), addr(&inner.completions)),
+            (
+                format!("{name}.watch_registry"),
+                addr(&inner.watch_registry),
+            ),
+            (
+                format!("{name}.session_harnesses"),
+                addr(&inner.session_harnesses),
+            ),
+            (
+                format!("{name}.live_delivery_sessions"),
+                addr(&inner.live_delivery_sessions),
+            ),
+            (
+                format!("{name}.cancelled_call_tasks"),
+                addr(&inner.cancelled_call_tasks),
+            ),
+            (
+                format!("{name}.held_remote_workers"),
+                addr(&inner.held_remote_workers),
+            ),
+        ]);
+    }
+    let held_now = [
+        ("claims", held(saved_remote_task_claims())),
+        ("task.state", held(&task.state)),
+        ("task.notice_registry", held(&task.notice_registry)),
+        ("task.routed", held(&task.terminal_notification_routed)),
+        ("task.terminal_render", held(&task.terminal_render)),
+    ]
+    .into_iter()
+    .filter(|(_, held)| *held)
+    .map(|(name, _)| name)
+    .collect::<Vec<_>>();
+    let Ok(entries) = fs::read_dir("/proc/self/task") else {
+        return RoundSnapshot {
+            report: format!("held: {held_now:?}; threads cannot be inspected here"),
+            progressing: true,
+        };
+    };
+    let mut threads = Vec::new();
+    let mut progressing = false;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let comm = fs::read_to_string(dir.join("comm")).unwrap_or_default();
+        let comm = comm.trim();
+        let syscall = fs::read_to_string(dir.join("syscall")).unwrap_or_default();
+        let mut fields = syscall.split_whitespace();
+        let number = fields.next().unwrap_or("").to_string();
+        let lock_wait = number == "202" || number == "98";
+        let target = fields
+            .next()
+            .and_then(|arg| usize::from_str_radix(arg.trim_start_matches("0x"), 16).ok());
+        let lock = target
+            .filter(|_| lock_wait)
+            .and_then(|target| {
+                named
+                    .iter()
+                    .find(|(_, start)| target >= *start && target < *start + 64)
+            })
+            .map(|(name, _)| name.as_str());
+        // A round thread outside a futex wait may still be making progress;
+        // so may a background-task thread (watchdog, scratch cleanup) in a
+        // disk syscall, possibly while holding a lock a round thread waits for.
+        if (comm.starts_with("stress-") && !lock_wait)
+            || (comm.starts_with("aft-bash") && DISK_SYSCALLS.contains(&number.as_str()))
+        {
+            progressing = true;
+        }
+        if lock.is_some() || comm.starts_with("stress-") {
+            let wchan = fs::read_to_string(dir.join("wchan")).unwrap_or_default();
+            threads.push(format!(
+                "{comm}: syscall {number} ({}){}",
+                wchan.trim(),
+                lock.map(|lock| format!(" waiting on {lock}"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    RoundSnapshot {
+        report: format!("held: {held_now:?}; threads: {threads:?}"),
+        progressing,
+    }
+}
+
+/// The owner's stop of a saved task that `bash.kill_scope` recovered, and
+/// the task's project registering the same task, run at the same moment on
+/// two threads, 200 times. Each round must finish (a lock-order deadlock
+/// between the two paths would hang one of them) and must queue exactly one
+/// completion for the project's session, whichever path gets there first.
+/// Both paths write the task's record while holding its state lock, and on
+/// a loaded build server one such disk sync can take several seconds; a
+/// round is therefore failed as deadlocked once it has run five seconds with
+/// its threads only waiting on locks, and otherwise after thirty.
+#[tokio::test]
+async fn concurrent_stop_and_registration_of_a_shared_task_never_deadlock() {
+    const ROUNDS: usize = 200;
+    // A round unfinished this long whose threads only wait on locks is
+    // deadlocked, and fails at once.
+    const DEADLOCK_DEADLINE: Duration = Duration::from_secs(5);
+    // A round whose threads are still doing disk I/O (slow syncs under load)
+    // gets this long in all, so a stuck round can never hang the suite.
+    const ROUND_CAP: Duration = Duration::from_secs(30);
+    for round in 0..ROUNDS {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = owner_scope(&format!("stop-registration-race-{round}"));
+        let (_daemon, _clock, task_id, _json) =
+            saved_due_draining_retry(dir.path(), &scope, u32::MAX).await;
+        let (recovered, errors) =
+            BgTaskRegistry::recover_saved_scope_tasks(dir.path(), &scope, &[]);
+        assert!(errors.is_empty(), "round {round}: {errors:?}");
+        let recovery = recovered.into_iter().next().unwrap();
+        let shared = recovery.task(&task_id).unwrap();
+        let project = registry();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let (finished, results) = std::sync::mpsc::channel::<(&str, Result<(), String>)>();
+        {
+            let (start, finished, recovery, scope) = (
+                start.clone(),
+                finished.clone(),
+                recovery.clone(),
+                scope.clone(),
+            );
+            std::thread::Builder::new()
+                .name("stress-stop".into())
+                .spawn(move || {
+                    start.wait();
+                    let result = recovery
+                        .begin_scope_pause(&scope)
+                        .and_then(|members| recovery.pause_scope(&scope, true, &members))
+                        .map(|_| ());
+                    let _ = finished.send(("stop", result));
+                })
+                .unwrap();
+        }
+        {
+            let (project, storage) = (project.clone(), dir.path().to_path_buf());
+            std::thread::Builder::new()
+                .name("stress-register".into())
+                .spawn(move || {
+                    start.wait();
+                    let result = project.replay_session(&storage, "session");
+                    let _ = finished.send(("registration", result));
+                })
+                .unwrap();
+        }
+        let started = Instant::now();
+        let mut finished_paths = Vec::new();
+        while finished_paths.len() < 2 {
+            let deadline = if started.elapsed() < DEADLOCK_DEADLINE {
+                DEADLOCK_DEADLINE
+            } else {
+                // Past the deadlock deadline, keep waiting while the snapshot
+                // reports possible progress; look again each second.
+                started.elapsed() + Duration::from_secs(1)
+            };
+            match results.recv_timeout(deadline.saturating_sub(started.elapsed())) {
+                Ok((path, result)) => {
+                    result.unwrap_or_else(|error| panic!("round {round}: {path} failed: {error}"));
+                    finished_paths.push(path);
+                }
+                Err(_) => {
+                    let snapshot = round_snapshot(&shared, &recovery, &project);
+                    if !snapshot.progressing {
+                        panic!(
+                            "round {round}: DEADLOCK: a concurrent stop and project registration of one shared task did not both finish within {:?}, and their threads only wait on locks (finished: {finished_paths:?}); {}",
+                            started.elapsed(),
+                            snapshot.report
+                        );
+                    }
+                    if started.elapsed() >= ROUND_CAP {
+                        panic!(
+                            "round {round}: a concurrent stop and project registration of one shared task did not both finish within {ROUND_CAP:?} (finished: {finished_paths:?}); {}",
+                            snapshot.report
+                        );
+                    }
+                }
+            }
+        }
+        let completions = project
+            .drain_completions_for_session(Some("session"))
+            .into_iter()
+            .filter(|completion| completion.task_id == task_id)
+            .count();
+        assert_eq!(completions, 1, "round {round}: completions for {task_id}");
+        assert_paused(&project, &task_id);
+        recovery.detach();
+        project.detach();
+    }
+}
+
+/// `bash.kill_scope` recovered a saved task and holds it without a worker.
+/// The task's project then binds and registers that same task. The pause
+/// records no cancellation (as when it fails part way), so the held task must
+/// go to the project's registry, whose one worker resumes it as the project's
+/// replay would have.
+#[tokio::test]
+async fn an_unpaused_held_task_is_handed_to_the_project_that_registered_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = owner_scope("held-handoff");
+    let (daemon, _clock, task_id, _json) = saved_due_draining_retry(dir.path(), &scope, 1).await;
+    let (recovered, errors) = BgTaskRegistry::recover_saved_scope_tasks(dir.path(), &scope, &[]);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(recovered.len(), 1);
+    let project = registry();
+    project.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        remote_workers(&task_id),
+        (1, 1),
+        "nothing may run while the task is held"
+    );
+    recovered[0].start_held_remote_workers();
+    recovered[0].detach();
+    let done = terminal(&project, &task_id).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    wait_for("the project's worker must stop", || {
+        (remote_workers(&task_id) == (2, 2)).then_some(())
+    })
+    .await;
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        2,
+        "the first, refused run and one resubmission after the restart"
+    );
+}
+
+/// A registry restored a saved task, and its worker stopped without finishing
+/// it. Another registry that restores the same task registers it and must run
+/// it with one worker of its own; both registries see the outcome.
+#[tokio::test]
+async fn a_later_registry_runs_a_restored_task_whose_worker_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = owner_scope("late-restore");
+    let (daemon, mut clock, task_id, _json) = saved_due_draining_retry(dir.path(), &scope, 1).await;
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    let first = registry();
+    first.replay_session(dir.path(), "session").unwrap();
+    clock.expect_event(DrainingClockEvent::Stopped).await;
+    wait_for("the first restored worker must stop", || {
+        (remote_workers(&task_id) == (2, 2)).then_some(())
+    })
+    .await;
+    assert!(!first.task(&task_id).unwrap().is_terminal());
+    let later = registry();
+    later.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&later, &task_id).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    wait_for("the later registry's worker must stop", || {
+        (remote_workers(&task_id) == (3, 3)).then_some(())
+    })
+    .await;
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        2,
+        "the first, refused run and one resubmission after the restart"
+    );
+    assert!(first.task(&task_id).unwrap().is_terminal());
+}
+
+/// After a module restart, the owner pauses a worker whose saved remote job
+/// the runner refused, which a restored worker runs locally instead. Covers
+/// a refusal the worker learns when it reattaches and one saved before the
+/// restart. Recovering that saved task for the pause must not start the
+/// local run.
+#[tokio::test]
+async fn bash_kill_scope_never_starts_a_saved_tasks_local_fallback() {
+    for saved_refusal in [false, true] {
+        let daemon = daemon(Script::AttachRefused, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("local-fallback-ran");
+        let (original, task_id, paths) = persist_accepted_with_snapshot(
+            dir.path(),
+            daemon.connection.clone(),
+            &format!("printf x >> '{}'", marker.display()),
+        );
+        let scope = owner_scope("saved-local-fallback");
+        let mut saved = read_task(&paths.json).unwrap();
+        saved.scope = Some(scope.clone());
+        if saved_refusal {
+            saved.remote.as_mut().unwrap().terminal = Some(TerminalRecord::new(
+                id(),
+                Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::Unknown("future_refusal".into()),
+                },
+                1,
+                0,
+                0,
+            ));
+        }
+        write_task(&paths.json, &saved).unwrap();
+        original.detach();
+        let (local_task, local_pid) = start_saved_term_ignoring_task(dir.path(), &scope).await;
+        let reply = kill_scope_with_saved_tasks(dir.path(), &scope).await;
+        assert!(
+            !marker.exists(),
+            "saved_refusal={saved_refusal}: the paused task ran locally: {reply:?}"
+        );
+        assert_saved_pause_reply(&reply, &task_id, &local_task, local_pid).await;
+        assert_saved_paused(&paths.json);
+        assert!(!marker.exists(), "saved_refusal={saved_refusal}");
     }
 }
 
@@ -7258,4 +9054,683 @@ fn precommit_remote_handle_failure_removes_layout() {
         "uncommitted remote layout leaked"
     );
     assert!(registry.list(0).is_empty());
+}
+
+fn signer_retry_script(refusals: u32) -> Script {
+    Script::SignerRefused {
+        refusals,
+        detail: "runner_sign_unavailable",
+        retry_after_ms: Some(2000),
+    }
+}
+
+/// The saved record of a task the owner paused while AFT held back a signer
+/// refusal's resubmission: paused, the pause's cancellation recorded as sent
+/// (the runner had refused the job, so withholding the resubmission was the
+/// whole cancellation), and the runner's refusal kept as the proof that the
+/// command never started.
+fn assert_signer_retry_pause_saved(json: &Path) {
+    assert_refused_pause_saved(json, "runner_sign_unavailable");
+}
+
+/// The saved record of a task the owner paused after the runner refused it
+/// with `detail`: paused, the cancellation recorded as sent, no sign that the
+/// command started, and the runner's refusal (`ran: none`) kept as the proof
+/// that it never did.
+fn assert_refused_pause_saved(json: &Path, detail: &str) {
+    assert_saved_paused(json);
+    let remote = read_task(json).unwrap().remote.unwrap();
+    assert!(
+        remote.started.is_none() && !remote.output_received,
+        "{remote:?}"
+    );
+    let refusal = remote
+        .terminal
+        .as_ref()
+        .unwrap_or_else(|| panic!("{remote:?}"));
+    assert_eq!(refusal.ran, Some(Ran::None), "{remote:?}");
+    assert_eq!(refusal.refusal_detail(), Some(detail));
+}
+
+/// The owner pauses a worker whose `runon` task waits out a signer refusal's
+/// retry hint. The worker wakes, sees the cancellation, and must settle the
+/// pause itself without resubmitting, as a draining retry does.
+#[tokio::test]
+async fn bash_kill_scope_settles_while_signer_retry_waits() {
+    let daemon = daemon(signer_retry_script(u32::MAX), "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("signer-wait");
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let first = clock.now();
+    clock.expect_sleep(first, first + 2000).await;
+    assert_pause_settles_promptly(&registry, start_kill_scope(&registry, &scope), &task).await;
+    // The retry clock never moved: cancellation, not the hint, woke the worker.
+    assert_eq!(clock.now(), first);
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    // Give a worker that wrongly kept waiting its chance to resubmit.
+    clock.advance(2000);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_signer_retry_pause_saved(&registry.task(&task).unwrap().paths.json);
+}
+
+/// The pause lands after the signer-retry wait ended but before the worker
+/// records the resubmission. Its recheck there must settle the pause.
+#[tokio::test]
+async fn bash_kill_scope_settles_when_paused_just_before_signer_resubmit() {
+    let daemon = daemon(signer_retry_script(1), "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("signer-resubmit");
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let first = clock.now();
+    clock.expect_sleep(first, first + 2000).await;
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeHintedResubmit);
+    clock.advance(2000);
+    gate.reached().await;
+    let operation = start_kill_scope(&registry, &scope);
+    pause_recorded(&registry, &task).await;
+    gate.release();
+    assert_pause_settles_promptly(&registry, operation, &task).await;
+    assert_eq!(clock.now(), first + 2000);
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_signer_retry_pause_saved(&registry.task(&task).unwrap().paths.json);
+}
+
+/// A signer-refusal retry is not resumable: its wait lives only in the worker,
+/// so a daemon that stops during the wait saves just the runner's refusal.
+/// After a module restart, the owner pauses that saved task. Recovering it
+/// for the pause must neither resubmit it nor leave the pause unsettled. The
+/// scope's saved local command keeps the pause busy long enough for a worker
+/// started during recovery to reach the runner.
+#[tokio::test]
+async fn bash_kill_scope_never_resubmits_a_saved_signer_refusal() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+        signer_retry_script(1),
+        "exec-remote/v1",
+        2,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    let scope = owner_scope("saved-signer-refusal");
+    let original = registry();
+    let task_id =
+        start_scoped_runon_retry(&original, dir.path(), daemon.connection.clone(), &scope);
+    clock.expect_event(DrainingClockEvent::Stopped).await;
+    remote_worker_exited(&task_id).await;
+    let json = original.task(&task_id).unwrap().paths.json.clone();
+    // What survives the stop: the refusal, and no saved retry wait to resume.
+    let saved = read_task(&json).unwrap();
+    assert!(!saved.status.is_terminal(), "{saved:?}");
+    let remote = saved.remote.as_ref().unwrap();
+    assert_eq!(
+        remote
+            .terminal
+            .as_ref()
+            .and_then(|refusal| refusal.ran.clone()),
+        Some(Ran::None),
+        "{saved:?}"
+    );
+    let retry = remote.retry.as_ref().unwrap();
+    assert_eq!(
+        (retry.first_refusal_at_ms, retry.next_retry_at_ms),
+        (None, None),
+        "{saved:?}"
+    );
+    original.detach();
+    let (local_task, local_pid) = start_saved_term_ignoring_task(dir.path(), &scope).await;
+    // The hint has passed by the time the owner pauses the restarted module.
+    clock.advance(2000);
+    let reply = kill_scope_with_saved_tasks(dir.path(), &scope).await;
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        1,
+        "the paused signer refusal was resubmitted: {reply:?}"
+    );
+    assert_saved_pause_reply(&reply, &task_id, &local_task, local_pid).await;
+    assert_signer_retry_pause_saved(&json);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+}
+
+/// The runner refuses a job in a way AFT does not retry, and the owner's pause
+/// lands after the refusal arrived but before the worker reports it. The
+/// worker's report cannot replace the pause's terminal state, and it must
+/// still settle the pause: the runner refused the job, so nothing runs.
+#[tokio::test]
+async fn bash_kill_scope_settles_when_paused_as_a_refusal_is_reported() {
+    let daemon = daemon(
+        Script::SignerRefused {
+            refusals: u32::MAX,
+            detail: "runner_sign_missing",
+            retry_after_ms: None,
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("refusal-report");
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeRefusalReport);
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    gate.reached().await;
+    let operation = start_kill_scope(&registry, &scope);
+    pause_recorded(&registry, &task).await;
+    gate.release();
+    assert_pause_settles_promptly(&registry, operation, &task).await;
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_refused_pause_saved(
+        &registry.task(&task).unwrap().paths.json,
+        "runner_sign_missing",
+    );
+    assert_no_retry_sleep(&mut clock);
+}
+
+/// The saved record of a task the owner paused while its retry's resubmission
+/// failed without reaching the runner: paused, the cancellation recorded as
+/// sent, and no runner job or sign that the command started.
+fn assert_unsent_pause_saved(json: &Path) {
+    assert_saved_paused(json);
+    let remote = read_task(json).unwrap().remote.unwrap();
+    assert!(
+        remote.started.is_none() && !remote.output_received && remote.job_id.is_none(),
+        "{remote:?}"
+    );
+}
+
+/// A signer refusal's resubmission fails without reaching the runner, and the
+/// owner's pause lands before the worker reports that. The worker must still
+/// settle the pause: no submission of the command is left that could run.
+#[tokio::test]
+async fn bash_kill_scope_settles_when_paused_as_a_signer_resubmit_fails_unsent() {
+    let daemon = daemon(signer_retry_script(1), "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("signer-unsent");
+    refuse_next_resubmission(dir.path());
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeNoStartRefusal);
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let first = clock.now();
+    clock.expect_sleep(first, first + 2000).await;
+    clock.advance(2000);
+    gate.reached().await;
+    let operation = start_kill_scope(&registry, &scope);
+    pause_recorded(&registry, &task).await;
+    gate.release();
+    assert_pause_settles_promptly(&registry, operation, &task).await;
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_unsent_pause_saved(&registry.task(&task).unwrap().paths.json);
+    assert_no_retry_sleep(&mut clock);
+}
+
+/// The same for a draining retry: its resubmission fails without reaching the
+/// runner, and the pause lands before the worker reports that.
+#[tokio::test]
+async fn bash_kill_scope_settles_when_paused_as_a_draining_resubmit_fails_unsent() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: 1,
+            retry_after_ms: Some(200),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
+    let registry = registry();
+    let scope = owner_scope("draining-unsent");
+    refuse_next_resubmission(dir.path());
+    let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeNoStartRefusal);
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let first = clock.now();
+    clock.expect_sleep(first, first + 200).await;
+    clock.advance(200);
+    gate.reached().await;
+    let operation = start_kill_scope(&registry, &scope);
+    pause_recorded(&registry, &task).await;
+    gate.release();
+    assert_pause_settles_promptly(&registry, operation, &task).await;
+    remote_worker_exited(&task).await;
+    assert_paused(&registry, &task);
+    assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
+    assert_unsent_pause_saved(&registry.task(&task).unwrap().paths.json);
+    assert_no_retry_sleep(&mut clock);
+}
+
+#[tokio::test]
+async fn bash_kill_scope_runon_cancels_remote_job_and_releases_local_task() {
+    assert_bash_kill_scope_runon_cancel(Script::Cancel, "sent").await;
+}
+
+#[tokio::test]
+async fn bash_kill_scope_runon_cancel_failure_still_kills_local_task() {
+    assert_bash_kill_scope_runon_cancel(Script::CancelRefused, "failed:").await;
+}
+
+async fn assert_bash_kill_scope_runon_cancel(script: Script, expected: &str) {
+    let daemon = daemon(script, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let scope = subc_protocol::scope::ScopeStamp::new(
+        subc_protocol::Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        },
+        "worker",
+        1,
+        subc_protocol::scope::ScopeKind::Worker,
+    );
+    let task = super::super::with_scope_spawn(Some(scope.clone()), || {
+        let mut launch = launch(daemon.connection.clone());
+        launch.explicit_runon = true;
+        start_with_launch(
+            &registry,
+            dir.path(),
+            launch,
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+        )
+    });
+    let job = wait_for("runner acceptance before pause", || {
+        registry
+            .status(&task, "session", None, None, 0)
+            .unwrap()
+            .remote_job_id
+    })
+    .await;
+    let paused_registry = registry.clone();
+    let reply = tokio::task::spawn_blocking(move || {
+        crate::commands::bash_kill_scope::handle_bash_kill_scope(
+            serde_json::json!({"scope":scope}),
+            Some(&scope.owner),
+            &[paused_registry],
+        )
+    })
+    .await
+    .unwrap();
+    assert!(reply.success, "{reply:?}");
+    assert_eq!(reply.data["killed"][0]["remote"]["job_id"], job);
+    assert!(
+        reply.data["killed"][0]["remote"]["cancel"]
+            .as_str()
+            .unwrap()
+            .starts_with(expected),
+        "{reply:?}"
+    );
+    if expected == "failed:" {
+        assert!(
+            reply.data["killed"][0]["remote"]["cancel"]
+                .as_str()
+                .unwrap()
+                .contains("runner unavailable"),
+            "{reply:?}"
+        );
+    }
+    assert_eq!(
+        daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, body)| body["method"] == "exec.cancel")
+            .count(),
+        1
+    );
+    let done = registry.status(&task, "session", None, None, 0).unwrap();
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+    assert_eq!(done.info.status_reason.as_deref(), Some("paused_by_owner"));
+}
+
+/// The scope's owner calls `bash.kill_scope` while the worker of an accepted
+/// job in that scope is reconnecting after the runner's route closed. The worker sends the cancel
+/// once it is connected again, and that settles the pause. From then on the
+/// worker must stop: no further reconnect or `exec.cancel`, and the recorded
+/// `sent` must still stand after the whole recovery deadline has passed.
+#[tokio::test]
+async fn bash_kill_scope_during_reconnect_settles_once_and_stops_the_worker() {
+    let daemon = crate::exec_remote::wire_tests::outage_daemon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = PausedReattachClock::new(dir.path());
+    let registry = registry();
+    let scope = subc_protocol::scope::ScopeStamp::new(
+        subc_protocol::Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        },
+        "worker",
+        1,
+        subc_protocol::scope::ScopeKind::Worker,
+    );
+    let task = super::super::with_scope_spawn(Some(scope.clone()), || {
+        let mut launch = launch(daemon.connection.clone());
+        launch.explicit_runon = true;
+        start_with_launch(
+            &registry,
+            dir.path(),
+            launch,
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+        )
+    });
+    // The route closed after acceptance and the runner is away, so the worker
+    // is reconnecting. Hold one reconnect open and call `bash.kill_scope` as
+    // the scope's owner during it.
+    daemon.after_refused_connects(1).await;
+    daemon.hold_next_connect();
+    daemon.after_held_connect().await;
+    let pausing = registry.clone();
+    let pause_scope = scope.clone();
+    let operation = tokio::task::spawn_blocking(move || {
+        crate::commands::bash_kill_scope::handle_bash_kill_scope(
+            serde_json::json!({"scope":pause_scope}),
+            Some(&pause_scope.owner),
+            &[pausing],
+        )
+    });
+    wait_for("the pause must record its cancellation intent", || {
+        registry
+            .task(&task)
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .metadata
+            .remote
+            .as_ref()
+            .unwrap()
+            .cancel_requested
+            .then_some(())
+    })
+    .await;
+    // The runner is back when the held reconnect completes, so the worker's
+    // `exec.cancel` reaches it and the pause records `sent`.
+    daemon.restore();
+    daemon.release_held_connect();
+    let reply = tokio::time::timeout(Duration::from_secs(30), operation)
+        .await
+        .expect("the pause must settle once the cancel is sent")
+        .unwrap();
+    assert!(reply.success, "{reply:?}");
+    assert_eq!(
+        reply.data["killed"][0]["remote"]["cancel"], "sent",
+        "{reply:?}"
+    );
+    let connects_at_settlement = *daemon.connects.borrow();
+    // Pass the job's own limits plus grace: a worker still trying to re-attach
+    // gives up here and records its recovery failure.
+    clock.advance(Duration::from_secs(12 * 60));
+    remote_worker_exited(&task).await;
+    assert_eq!(
+        daemon.methods("exec.cancel").len(),
+        1,
+        "the settled pause must not send the cancel again"
+    );
+    assert_eq!(
+        *daemon.connects.borrow(),
+        connects_at_settlement,
+        "the worker must not reconnect after the pause settled"
+    );
+    assert!(daemon.methods("exec.attach").is_empty());
+    assert_eq!(daemon.methods("exec.run").len(), 1, "never resubmitted");
+    let recorded = registry
+        .task(&task)
+        .unwrap()
+        .state
+        .lock()
+        .unwrap()
+        .metadata
+        .remote
+        .as_ref()
+        .unwrap()
+        .owner_pause_cancel
+        .clone();
+    assert_eq!(recorded.as_deref(), Some("sent"));
+    let done = registry.status(&task, "session", None, None, 0).unwrap();
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+    assert_eq!(done.info.status_reason.as_deref(), Some("paused_by_owner"));
+    drop(clock);
+}
+
+/// Without an owner pause, a reconnect that still finds the runner away is an
+/// ordinary transport failure: the worker keeps reconnecting, never sends a
+/// cancel, and delivers the job's result once the runner is back.
+#[tokio::test]
+async fn exec_remote_reconnect_failure_without_owner_pause_keeps_retrying() {
+    let daemon = crate::exec_remote::wire_tests::outage_daemon().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = PausedReattachClock::new(dir.path());
+    let registry = registry();
+    let task = start(&registry, dir.path(), daemon.connection.clone());
+    daemon.after_refused_connects(1).await;
+    daemon.hold_next_connect();
+    daemon.after_held_connect().await;
+    let refused = *daemon.refused_connects.borrow();
+    // The held reconnect is answered while the runner is still away.
+    daemon.release_held_connect();
+    daemon.after_refused_connects(refused + 3).await;
+    daemon.restore();
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert_eq!(done.exit_code, Some(0));
+    let stdout = registry.task(&task).unwrap().paths.stdout.clone();
+    assert_eq!(fs::read(stdout).unwrap(), b"AB");
+    remote_worker_exited(&task).await;
+    assert!(daemon.methods("exec.cancel").is_empty());
+    assert_eq!(daemon.methods("exec.run").len(), 1, "never resubmitted");
+    drop(clock);
+}
+
+#[tokio::test]
+async fn bash_kill_scope_unaccepted_tasks_share_one_deadline_and_local_kills_are_first() {
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    // Prepare repositories before either remote worker connects: synchronous
+    // Git setup must not starve the fake daemon's authentication handshake.
+    for dir in &dirs {
+        ensure_git_fixture(dir.path());
+    }
+    let first = daemon(Script::GatedRoute, "exec-remote/v1").await;
+    let second = daemon(Script::GatedRoute, "exec-remote/v1").await;
+    let registries = [registry(), registry()];
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/bash-kill-scope/wire.json"
+    ))
+    .unwrap();
+    let scope: subc_protocol::scope::ScopeStamp =
+        serde_json::from_value(fixture["unaccepted"]["request"]["params"]["scope"].clone())
+            .unwrap();
+    let mut tasks = Vec::new();
+    for (index, connection) in [first.connection.clone(), second.connection.clone()]
+        .into_iter()
+        .enumerate()
+    {
+        let task = super::super::with_scope_spawn(Some(scope.clone()), || {
+            let mut launch = launch(connection);
+            launch.explicit_runon = true;
+            start_with_launch(
+                &registries[index],
+                dirs[index].path(),
+                launch,
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            )
+        });
+        tasks.push(task);
+    }
+    for daemon in [&first, &second] {
+        wait_for("remote route setup must be in flight", || {
+            daemon
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, body)| body["op"] == "route.open")
+                .then_some(())
+        })
+        .await;
+    }
+    let local = super::super::with_scope_spawn(Some(scope.clone()), || {
+        registries[1].spawn(
+            SpawnPlan::Unsandboxed,
+            "sleep 30",
+            "local".into(),
+            dirs[1].path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            dirs[1].path().into(),
+            10,
+            true,
+            false,
+            Some(dirs[1].path().into()),
+        )
+    })
+    .unwrap();
+    let pausing = registries.clone();
+    let started = Instant::now();
+    let operation = tokio::task::spawn_blocking(move || {
+        crate::commands::bash_kill_scope::handle_bash_kill_scope(
+            serde_json::json!({"scope":scope}),
+            Some(&scope.owner),
+            &pausing,
+        )
+    });
+    wait_for("local kill must not wait for remote cancellation", || {
+        (registries[1]
+            .status(&local, "local", None, None, 0)
+            .unwrap()
+            .info
+            .status
+            == BgTaskStatus::Killed)
+            .then_some(())
+    })
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "local kill waited for a runner: {:?}",
+        started.elapsed()
+    );
+    let reply = tokio::time::timeout(Duration::from_secs(12), operation)
+        .await
+        .expect("both unaccepted tasks must share one 10-second deadline")
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(12));
+    assert!(reply.success, "{reply:?}");
+    assert_eq!(reply.data["killed"].as_array().unwrap().len(), 3);
+    for (index, task) in tasks.iter().enumerate() {
+        let entry = reply.data["killed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["task_id"] == *task)
+            .unwrap();
+        assert_eq!(
+            entry["remote"],
+            fixture["unaccepted"]["reply"]["data"]["killed"][0]["remote"]
+        );
+        assert_eq!(
+            registries[index]
+                .status(&task, "session", None, None, 0)
+                .unwrap()
+                .info
+                .status,
+            BgTaskStatus::Killed
+        );
+    }
+    first.acceptance_gate.notify_one();
+    second.acceptance_gate.notify_one();
+    for (registry, task) in registries.iter().zip(&tasks) {
+        wait_for(
+            "paused submission must be withdrawn after route setup",
+            || {
+                registry
+                    .task(task)
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .metadata
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .owner_pause_cancel
+                    .clone()
+            },
+        )
+        .await;
+    }
+    assert!(exec_runs(&first).is_empty());
+    assert!(exec_runs(&second).is_empty());
+}
+
+#[tokio::test]
+async fn bash_kill_scope_withdraws_submission_before_acceptance() {
+    let daemon = daemon(Script::GatedAcceptance, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/bash-kill-scope/wire.json"
+    ))
+    .unwrap();
+    let case = &fixture["withdrawn_before_acceptance"];
+    let scope: subc_protocol::scope::ScopeStamp =
+        serde_json::from_value(case["request"]["params"]["scope"].clone()).unwrap();
+    let task = super::super::with_scope_spawn(Some(scope.clone()), || {
+        let mut launch = launch(daemon.connection.clone());
+        launch.explicit_runon = true;
+        start_with_launch(
+            &registry,
+            dir.path(),
+            launch,
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+        )
+    });
+    daemon.wait_for_requests("exec.run", 1).await;
+    let pausing = registry.clone();
+    let reply = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            crate::commands::bash_kill_scope::handle_bash_kill_scope(
+                serde_json::json!({"scope":scope}),
+                Some(&scope.owner),
+                &[pausing],
+            )
+        }),
+    )
+    .await
+    .expect("withdrawal must not wait for acceptance")
+    .unwrap();
+    assert!(reply.success, "{reply:?}");
+    let mut expected = case["reply"]["data"].clone();
+    expected["killed"][0]["task_id"] = serde_json::json!(task);
+    assert_eq!(reply.data, expected);
+    wait_for("call-key Cancel must reach the runner", || {
+        daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(header, _)| header.ty == subc_protocol::FrameType::Cancel)
+            .then_some(())
+    })
+    .await;
+    assert!(
+        !daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, body)| body["method"] == "exec.cancel"),
+        "no job ID was known for exec.cancel"
+    );
+    daemon.acceptance_gate.notify_one();
 }

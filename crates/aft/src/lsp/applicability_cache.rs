@@ -604,12 +604,13 @@ impl ApplicabilityCache {
             let start = Instant::now();
             let capture = Capture::start(root);
             observe_ancestor_ignores(root);
-            {
+            let root_walk_number = {
                 let mut metrics = self.metrics.lock();
                 let metrics = metrics.entry(root.into()).or_default();
                 metrics.misses += 1;
                 metrics.full_walks += 1;
-            }
+                metrics.full_walks
+            };
             let result = scan();
             let elapsed = start.elapsed();
             let (dependencies, inputs, input_identities) = capture.finish();
@@ -619,9 +620,9 @@ impl ApplicabilityCache {
                 metrics.full_walk_micros += elapsed.as_micros() as u64;
                 metrics.dependency_count = inputs.len();
             }
-            log::debug!(
-                "LSP applicability full walk root={} cause={} duration_micros={} dependencies={} success={}",
-                root.display(), cause, elapsed.as_micros(), inputs.len(), result.is_ok()
+            crate::slog_info!(
+                "LSP applicability full walk root={} cause={} root_walk_number={} duration_micros={} dependencies={} success={}",
+                root.display(), cause, root_walk_number, elapsed.as_micros(), inputs.len(), result.is_ok()
             );
             let mut state = flight.state.lock();
             // Under continuous edits, returning one uncached scan preserves the

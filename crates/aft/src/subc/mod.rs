@@ -3679,7 +3679,7 @@ async fn teardown_installed_route(
     replacement_root: Option<&ProjectRootId>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    management_routes: &mut HashSet<RouteChannel>,
+    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
@@ -4038,6 +4038,9 @@ fn run_subc_mode_inner(
         // Stall captures land under `<storage>/diagnostics`.
         let storage_dir = ctx.storage_dir();
         drop(ctx);
+        // Saved paused tasks may still owe their runner a cancel; send those
+        // now rather than when (if ever) their projects bind again.
+        crate::bash_background::note_storage_root(&storage_dir);
         let stream =
             connect_and_authenticate(connection_file_path, lifecycle_probe.as_ref()).await?;
         log::info!(
@@ -4933,7 +4936,7 @@ where
     let connection_cancel = PersistentCancelSignal::new();
     let mut installed_route_epochs: HashMap<u16, u32> = HashMap::new();
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
-    let mut management_routes: HashSet<RouteChannel> = HashSet::new();
+    let mut management_routes: HashMap<RouteChannel, Option<Principal>> = HashMap::new();
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
     let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
     let mut bg_wake_pending = BgWakePending::new();
@@ -5453,7 +5456,7 @@ where
                                 Err(decoded) => decoded,
                             }
                         } else { decoded };
-                        let decoded = if !database_waited && !management_routes.contains(&route) && !tool_provider::keyed_route_frame(&decoded, routes_for_call) {
+                        let decoded = if !database_waited && !management_routes.contains_key(&route) && !tool_provider::keyed_route_frame(&decoded, routes_for_call) {
                             match database_waits.defer(decoded, routes_for_call, &executor) {
                                 Ok(()) => continue,
                                 Err(decoded) => decoded,
@@ -5465,7 +5468,7 @@ where
                         // a blocking thread, never here; the call comes back carrying
                         // it, then passes the ledger and admission. Calls the ledger
                         // hands back already went through this step.
-                        let decoded = if !ledger_waited && !management_routes.contains(&route) {
+                        let decoded = if !ledger_waited && !management_routes.contains_key(&route) {
                             match database_waits.read_confinement(decoded, routes_for_call, &executor) {
                                 Ok(()) => continue,
                                 Err(decoded) => decoded,
@@ -5473,7 +5476,7 @@ where
                         } else {
                             decoded
                         };
-                        let decoded = if !ledger_waited && !management_routes.contains(&route) {
+                        let decoded = if !ledger_waited && !management_routes.contains_key(&route) {
                             match database_waits.restore_launch(decoded, routes_for_call, &executor) {
                                 Ok(()) => continue,
                                 Err(decoded) => decoded,
@@ -5482,7 +5485,7 @@ where
                         // Unrestored grants do not block unrelated tools or shells.
                         // Path checks refuse grant-dependent access; shells disclose
                         // the missing grants and use only currently effective authority.
-                        let decoded = if !ledger_waited && !management_routes.contains(&route) {
+                        let decoded = if !ledger_waited && !management_routes.contains_key(&route) {
                             match ledger_edge.defer(decoded, routes_for_call, &executor, &writer_tx, &dispatch_path_metrics) {
                                 Ok(()) => continue,
                                 Err(decoded) => decoded,
@@ -5525,7 +5528,7 @@ where
                             }
                             continue;
                         }
-                        let result = if management_routes.contains(&route)
+                        let result = if management_routes.contains_key(&route)
                             && gh_relay_operation(&frame).is_some()
                         {
                             // Management routes are bound only for first-party
@@ -5540,7 +5543,7 @@ where
                                 gh_relay_route_scopes(&routes),
                             );
                             Ok(())
-                        } else if management_routes.contains(&route) {
+                        } else if management_routes.contains_key(&route) {
                             handle_management_request(
                                 &writer_tx,
                                 &frame,
@@ -5550,6 +5553,8 @@ where
                                 &root_channels,
                                 &health_rollup_cache,
                                 &dispatch_path_metrics,
+                                management_routes.get(&route).and_then(Option::as_ref),
+                                storage_dir,
                             )
                             .await
                         } else {
@@ -7225,7 +7230,7 @@ async fn handle_control_request(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    management_routes: &mut HashSet<RouteChannel>,
+    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
@@ -7375,7 +7380,7 @@ async fn handle_control_request(
                 }
 
                 installed_route_epochs.insert(route_channel, epoch);
-                management_routes.insert(route_id);
+                management_routes.insert(route_id, principal);
                 return send_route_bind_ack(
                     tx,
                     frame.header.ver,
@@ -7715,6 +7720,7 @@ async fn handle_control_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_management_request(
     tx: &WriterSender,
     frame: &Frame,
@@ -7724,6 +7730,8 @@ async fn handle_management_request(
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     health_rollup_cache: &Arc<HealthRollupCache>,
     metrics: &Arc<DispatchPathMetrics>,
+    principal: Option<&Principal>,
+    storage_dir: &Path,
 ) -> Result<(), SubcError> {
     let decoded = serde_json::from_slice::<Value>(&frame.body).ok();
     let operation = decoded
@@ -7744,6 +7752,23 @@ async fn handle_management_request(
     };
 
     let result = match operation {
+        crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION => {
+            let params = decoded
+                .as_ref()
+                .and_then(|v| v.get("params"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            spawn_bash_kill_scope(
+                tx,
+                frame,
+                executor,
+                metrics,
+                principal.cloned(),
+                params,
+                storage_dir.to_path_buf(),
+            );
+            return Ok(());
+        }
         crate::backup::purge::BACKUPS_PURGE_OPERATION => {
             let params = decoded
                 .as_ref()
@@ -8109,6 +8134,59 @@ fn spawn_gh_relay(
             send_reliable_writer_frame(&tx, &metrics, response, "gh shim relay response").await
         {
             log::warn!("gh_shim relay: could not queue the reply: {error}");
+        }
+    });
+}
+
+fn spawn_bash_kill_scope(
+    tx: &WriterSender,
+    frame: &Frame,
+    executor: &Arc<Executor>,
+    metrics: &Arc<DispatchPathMetrics>,
+    principal: Option<Principal>,
+    params: Value,
+    storage_dir: PathBuf,
+) {
+    let tx = tx.clone();
+    let frame = frame.clone();
+    let executor = Arc::clone(executor);
+    let metrics = Arc::clone(metrics);
+    // Signal grace periods and remote cancellation must not hold the frame loop.
+    tokio::spawn(async move {
+        let _response_task = ResponseTaskGuard::new(&metrics);
+        let result = tokio::task::spawn_blocking(move || {
+            let registries = executor
+                .actor_contexts()
+                .iter()
+                .map(|ctx| ctx.bash_background().clone())
+                .collect::<Vec<_>>();
+            // Projects not bound since the module started hold their saved
+            // tasks only on disk, under the module's storage root.
+            crate::commands::bash_kill_scope::handle_bash_kill_scope_with_saved_tasks(
+                params,
+                principal.as_ref(),
+                &registries,
+                Some(&storage_dir),
+            )
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Response::error(
+                "management-bash-kill-scope",
+                "internal_error",
+                error.to_string(),
+            )
+        });
+        if let Err(error) = send_management_response(
+            &tx,
+            &frame,
+            crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION,
+            result,
+            &metrics,
+        )
+        .await
+        {
+            log::warn!("bash.kill_scope: could not queue the reply: {error}");
         }
     });
 }
@@ -13764,7 +13842,7 @@ mod tests {
                 &mut pending_binds,
                 &mut HashMap::new(),
                 &mut HashMap::new(),
-                &mut HashSet::new(),
+                &mut HashMap::new(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),
@@ -16711,6 +16789,213 @@ mod tests {
         );
         assert_eq!(due_jobs, vec![(root, MaintenanceDrainKind::Watcher)]);
         assert!(!deferred);
+    }
+
+    async fn assert_quiet_view_publication_wake(edit_count: usize) {
+        use crate::context::ViewRuntimeSnapshot;
+        use crate::watcher_filter::WatcherDispatchEvent;
+        use std::collections::BTreeSet;
+
+        let (_dir, root) = test_root("maintenance-view-deadline");
+        let root_path = std::fs::canonicalize(root.as_path()).unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.name", "Publication test"],
+            vec!["config", "user.email", "publication@example.invalid"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root_path)
+                .status()
+                .unwrap()
+                .success());
+        }
+        for name in ["first.rs", "second.rs"] {
+            std::fs::write(root_path.join(name), "pub fn original() {}\n").unwrap();
+        }
+        for args in [
+            vec!["add", "."],
+            vec![
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root_path)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let ctx = test_ctx();
+        ctx.update_config(|config| {
+            config.project_root = Some(root_path.clone());
+            config.storage_dir = Some(storage.path().to_owned());
+            config.views.enabled = true;
+            config.indexes.trigram = false;
+            config.indexes.semantic = false;
+            config.indexes.callgraph = true;
+        });
+        ctx.set_canonical_cache_root(root_path.clone());
+        let scope = crate::path_identity::project_scope_key(&root_path);
+        let view = crate::views::ViewStore::open(storage.path(), &scope).unwrap();
+        ctx.install_view_runtime(
+            ViewRuntimeSnapshot {
+                query_pin: None,
+                storage: storage.path().to_owned(),
+                family: "maintenance-view-fixture".to_owned(),
+                scope,
+                view_dir: view.view_dir().to_owned(),
+                generation: None,
+                manifest: None,
+                head_fingerprint: String::new(),
+                head_metadata: crate::alias::capture_git_head_metadata(&root_path, None).unwrap(),
+                pending_paths: BTreeSet::new(),
+                pending_inputs: Default::default(),
+            },
+            None,
+        );
+        let initial = ctx
+            .publish_view_paths(BTreeSet::new(), true)
+            .unwrap()
+            .generation;
+        runtime_drain::drain_build_completions(&ctx);
+        runtime_drain::drain_inspect_events(&ctx);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        *ctx.watcher_rx().lock() = Some(rx);
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (completion_tx, mut completion_rx) = mpsc::channel(8);
+        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        let mut jobs = async || {
+            let (jobs, deferred) = due_maintenance_jobs(
+                &mut live_roots,
+                Some(&executor),
+                &BgSubsBySession::new(),
+                &BgWakePending::new(),
+                MAINTENANCE_SUBMIT_BUDGET,
+                &HashSet::new(),
+            );
+            assert!(!deferred);
+            for (job_root, kind) in &jobs {
+                assert_eq!((job_root, *kind), (&root, MaintenanceDrainKind::Watcher));
+                submit_maintenance_job(
+                    &executor,
+                    job_root.clone(),
+                    *kind,
+                    Vec::new(),
+                    &completion_tx,
+                    &metrics,
+                );
+                let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+                    .await
+                    .expect("watcher maintenance must finish")
+                    .unwrap();
+                assert!(completion.response.success);
+                note_maintenance_completion(
+                    live_roots.get_mut(job_root).unwrap(),
+                    completion.requeue_kind,
+                    false,
+                    false,
+                );
+            }
+            jobs
+        };
+        assert!(jobs().await.is_empty());
+        let baseline = ctx.view_publication_attempts_for_test();
+        let mut changed = BTreeSet::new();
+        let mut previous_due = None;
+        let mut last_edit = Instant::now();
+        for edit in 0..edit_count {
+            let path = root_path.join(if edit % 2 == 0 {
+                "first.rs"
+            } else {
+                "second.rs"
+            });
+            last_edit = Instant::now();
+            std::fs::write(&path, format!("pub fn changed_{edit}() {{}}\n")).unwrap();
+            changed.insert(path.clone());
+            tx.send(WatcherDispatchEvent::Paths(vec![path])).unwrap();
+            assert_eq!(jobs().await.len(), 1);
+            let slice = ctx.watcher_drain_slice().lock();
+            let state = slice.as_ref().unwrap();
+            assert_eq!(state.view_publication_paths, changed);
+            let due = state.view_publication_due.unwrap();
+            assert!(due > last_edit);
+            if let Some(previous) = previous_due {
+                assert!(due > previous, "each batch extends the quiet window");
+            }
+            previous_due = Some(due);
+            drop(slice);
+            assert!(
+                ctx.view_publication_attempts_for_test() == baseline,
+                "the debounce must not publish early"
+            );
+            assert!(
+                jobs().await.is_empty(),
+                "a future deadline must not spin the dispatcher"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let due = previous_due.unwrap();
+        let deadline = last_edit + Duration::from_secs(2);
+        while ctx.view_publication_attempts_for_test() == baseline && Instant::now() < deadline {
+            assert!(
+                !ctx.tier2_refresh_dispatch_due(),
+                "no Tier-2 rescue wake is due"
+            );
+            jobs().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            ctx.view_publication_attempts_for_test() - baseline,
+            1,
+            "view publication did not start within 2s of the edit without other maintenance due"
+        );
+        let started = Instant::now();
+        assert!(started >= due, "publication must respect the quiet window");
+        assert!(started <= due + Duration::from_secs(1));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ctx.view_runtime_snapshot().unwrap().generation == initial {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the started publication must install its generation");
+        runtime_drain::drain_build_completions(&ctx);
+        runtime_drain::drain_inspect_events(&ctx);
+        let slice = ctx.watcher_drain_slice().lock();
+        assert!(slice.as_ref().unwrap().view_publication_due.is_none());
+        assert!(slice.as_ref().unwrap().view_publication_paths.is_empty());
+        drop(slice);
+        for _ in 0..10 {
+            assert!(
+                jobs().await.is_empty(),
+                "an unchanged root must return to idle"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            ctx.view_publication_attempts_for_test() - baseline,
+            1,
+            "a burst publishes exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_publication_quiet_root_wakes_without_other_maintenance() {
+        assert_quiet_view_publication_wake(1).await;
+    }
+
+    #[tokio::test]
+    async fn view_publication_burst_coalesces_and_returns_idle() {
+        assert_quiet_view_publication_wake(3).await;
     }
 
     /// The maintenance probes run on the frame loop, which also answers
@@ -20223,6 +20508,14 @@ mod tests {
         }
     }
 
+    /// Caller deadline for a bash call that must run once the database opens.
+    /// It covers the open itself plus bash startup, which the product budgets at
+    /// 15 s; a loaded test host regularly needs more than a few seconds for
+    /// both. A bash call that never got the database would still be refused
+    /// with `database_initializing` when this expires, so the bound proves
+    /// nothing weaker than a short one.
+    const BASH_AFTER_OPEN_BUDGET: Duration = Duration::from_secs(15);
+
     fn database_wire_tool(
         executor: &Arc<Executor>,
         fixture: &ConfiguredRoot,
@@ -20234,7 +20527,10 @@ mod tests {
             fixture,
             name,
             wait_budget,
-            (Duration::from_millis(500), Duration::from_secs(3)),
+            (
+                Duration::from_millis(500),
+                Duration::from_secs(3).max(wait_budget),
+            ),
             |req, ctx| {
                 assert!(
                     ctx.database_runtime_refusal(&req.id, &req.command)
@@ -20400,7 +20696,11 @@ mod tests {
             );
         let started = Instant::now();
         let mut first = fixture.submit_bind(&executor, fixture.bind_request(0, "opencode"));
-        let deadline = started + Duration::from_secs(2);
+        // The database open stays gated until `release` is sent, so a bind that
+        // waited for it would never answer within any deadline. Polling up to the
+        // product's own bind deadline proves the ordering without failing a
+        // correct bind that a loaded host merely slowed down.
+        let deadline = started + ROUTE_BIND_DEADLINE;
         let first_response = loop {
             if let Ok(response) = first.try_recv() {
                 break Some(response);
@@ -20445,7 +20745,7 @@ mod tests {
         assert!(!fixture.storage.path().join("aft.db").exists());
         let mut second = fixture.submit_bind(&executor, fixture.bind_request(1, "opencode"));
         let started = Instant::now();
-        let deadline = started + Duration::from_secs(2);
+        let deadline = started + ROUTE_BIND_DEADLINE;
         let second_response = loop {
             if let Ok(response) = second.try_recv() {
                 break Some(response);
@@ -20460,7 +20760,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(150));
             let _ = release.send(());
         });
-        let bash = database_wire_tool(&executor, &fixture, "bash", Duration::from_secs(3));
+        let bash = database_wire_tool(&executor, &fixture, "bash", BASH_AFTER_OPEN_BUDGET);
         release_thread.join().unwrap();
         assert_eq!(
             bash["success"], true,
@@ -20843,7 +21143,7 @@ mod tests {
         );
         // ...and a waiting bash call schedules the open itself instead of
         // waiting for the configure tail, so it runs rather than being refused.
-        let bash = database_wire_tool(&executor, &fixture, "bash", Duration::from_secs(3));
+        let bash = database_wire_tool(&executor, &fixture, "bash", BASH_AFTER_OPEN_BUDGET);
         assert_eq!(bash["success"], true, "{bash}");
         crate::commands::configure::drain_deferred_configure_maintenance(&fixture.ctx);
         assert!(fixture
