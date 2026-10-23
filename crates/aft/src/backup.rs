@@ -55,6 +55,22 @@ const V2_FORMAT_VERSION: &str = "v2";
 /// fields are absent or optional and read as unset.
 const DB_RESTORE_META_VERSION: u32 = 2;
 const MAX_RESTORE_OPERATION_LOCK_RETRIES: usize = 32;
+const MAX_SESSION_DISCOVERY_ENTRIES: usize = 100_000;
+
+fn backup_discovery_deadline() -> Instant {
+    let deadline = Instant::now() + crate::bounded_io::IO_BUDGET;
+    crate::bounded_io::current().map_or(deadline, |budget| budget.deadline.min(deadline))
+}
+
+fn check_backup_discovery_deadline(path: &Path, deadline: Instant) -> Result<(), AftError> {
+    if crate::executor::current_job_cancelled() || Instant::now() >= deadline {
+        return Err(AftError::IoError {
+            path: path.display().to_string(),
+            message: "backup stack discovery cancelled or deadline exceeded; retry".to_string(),
+        });
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 type RestoreBeforeLockHook = Box<dyn FnMut(usize) -> bool + Send>;
@@ -995,6 +1011,10 @@ pub struct BackupStore {
     fail_next_disk_write: bool,
     #[cfg(test)]
     release_after_next_snapshot: bool,
+    #[cfg(test)]
+    discovery_entry_limit: usize,
+    #[cfg(test)]
+    discovery_entries_examined: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -1062,6 +1082,10 @@ impl BackupStore {
             fail_next_disk_write: false,
             #[cfg(test)]
             release_after_next_snapshot: false,
+            #[cfg(test)]
+            discovery_entry_limit: MAX_SESSION_DISCOVERY_ENTRIES,
+            #[cfg(test)]
+            discovery_entries_examined: AtomicU64::new(0),
         }
     }
 
@@ -2388,14 +2412,14 @@ impl BackupStore {
                 for (key, head) in db_heads {
                     heads_by_path.insert(key, head);
                 }
-                self.merge_disk_stack_heads(session, &mut heads_by_path);
+                self.merge_disk_stack_heads(session, &mut heads_by_path)?;
             }
             Some(Ok(_)) => {
                 crate::slog_info!(
                     "backup latest operation preview DB miss for session {}; falling back to disk",
                     session
                 );
-                self.merge_disk_stack_heads(session, &mut heads_by_path);
+                self.merge_disk_stack_heads(session, &mut heads_by_path)?;
             }
             Some(Err(error)) => {
                 crate::slog_warn!(
@@ -2403,14 +2427,14 @@ impl BackupStore {
                     session,
                     error
                 );
-                self.merge_disk_stack_heads(session, &mut heads_by_path);
+                self.merge_disk_stack_heads(session, &mut heads_by_path)?;
             }
             None => {
                 crate::slog_info!(
                     "backup latest operation preview DB unavailable for session {}; falling back to disk",
                     session
                 );
-                self.merge_disk_stack_heads(session, &mut heads_by_path);
+                self.merge_disk_stack_heads(session, &mut heads_by_path)?;
             }
         }
 
@@ -2614,20 +2638,28 @@ impl BackupStore {
         &self,
         session: &str,
         heads_by_path: &mut HashMap<PathBuf, BackupEntryHead>,
-    ) {
-        let disk_keys: Vec<PathBuf> = self
-            .disk_index
-            .get(session)
-            .map(|files| files.keys().cloned().collect())
-            .unwrap_or_default();
-        for key in disk_keys {
-            if let Some(head) = self
-                .read_stack_heads_from_disk(session, &key)
-                .and_then(|stack| stack.last().cloned())
-            {
+    ) -> Result<(), AftError> {
+        let deadline = backup_discovery_deadline();
+        let disk_index = self.read_session_disk_index(session)?;
+        if !disk_index.is_empty() {
+            // A durable stack is authoritative over resident or SQLite heads,
+            // including stale mirror rows for files no longer in the operation.
+            heads_by_path.clear();
+        }
+        for key in disk_index.into_keys() {
+            check_backup_discovery_deadline(&key, deadline)?;
+            let _disk_lock = self.acquire_stack_disk_lock(session, &key)?;
+            let heads = self
+                .read_stack_heads_from_disk_unlocked(session, &key)
+                .map_err(|message| AftError::IoError {
+                    path: key.display().to_string(),
+                    message,
+                })?;
+            if let Some(head) = heads.and_then(|stack| stack.last().cloned()) {
                 heads_by_path.insert(key, head);
             }
         }
+        Ok(())
     }
 
     fn read_stack_heads_from_db(
@@ -4414,12 +4446,34 @@ impl BackupStore {
             return Ok(HashMap::new());
         }
 
-        let path_dirs = std::fs::read_dir(&session_dir).map_err(|error| AftError::IoError {
+        let deadline = backup_discovery_deadline();
+        #[cfg(not(test))]
+        let entry_limit = MAX_SESSION_DISCOVERY_ENTRIES;
+        #[cfg(test)]
+        let entry_limit = self.discovery_entry_limit;
+        let mut path_dirs = std::fs::read_dir(&session_dir).map_err(|error| AftError::IoError {
             path: session_dir.display().to_string(),
             message: error.to_string(),
         })?;
         let mut per_session = HashMap::new();
-        for path_entry in path_dirs {
+        let mut examined = 0;
+        loop {
+            // Check before advancing ReadDir, including entries that will be
+            // ignored. An incomplete scan must never certify absent history.
+            check_backup_discovery_deadline(&session_dir, deadline)?;
+            if examined >= entry_limit {
+                return Err(AftError::IoError {
+                    path: session_dir.display().to_string(),
+                    message: format!("backup stack discovery reached its {entry_limit}-entry limit; use per-file undo or retry"),
+                });
+            }
+            let Some(path_entry) = path_dirs.next() else {
+                break;
+            };
+            examined += 1;
+            #[cfg(test)]
+            self.discovery_entries_examined
+                .fetch_add(1, Ordering::Relaxed);
             let path_entry = path_entry.map_err(|error| AftError::IoError {
                 path: session_dir.display().to_string(),
                 message: error.to_string(),
@@ -7986,6 +8040,107 @@ mod tests {
         for path in &paths {
             assert_eq!(fs::read(path).unwrap(), b"original");
         }
+    }
+
+    #[test]
+    fn backup_preview_rediscovers_released_operation_without_sqlite_rows() {
+        for empty_sqlite in [false, true] {
+            for release in [0, 1, 2] {
+                let (mut store, storage, first) = durability_store();
+                let paths = [first, storage.path().join("second.bin")];
+                for path in &paths {
+                    fs::write(path, [0, 255, 128]).unwrap();
+                    store
+                        .snapshot_with_op("preview", path, "before edit", Some("operation"))
+                        .unwrap();
+                    fs::write(path, b"changed").unwrap();
+                }
+                match release {
+                    0 => store.release_memory(),
+                    1 => store.release_session_memory("preview"),
+                    _ => store.record_post_mutation_states(),
+                }
+                if empty_sqlite {
+                    store.set_db_harness(crate::harness::Harness::Opencode);
+                    store.set_db_project_key("preview-project".to_string());
+                    store.set_db_pool(Arc::new(Mutex::new(
+                        crate::db::open(&storage.path().join("empty.db")).unwrap(),
+                    )));
+                } else {
+                    store.clear_db_pool();
+                }
+                if empty_sqlite {
+                    assert!(store
+                        .read_latest_operation_heads_from_db("preview")
+                        .unwrap()
+                        .unwrap()
+                        .is_empty());
+                } else {
+                    assert!(store
+                        .read_latest_operation_heads_from_db("preview")
+                        .is_none());
+                }
+                assert_eq!(store.resident_entry_count(), 0);
+                assert!(store.disk_index.get("preview").is_none());
+                let mut expected = paths
+                    .iter()
+                    .map(|path| canonicalize_key(path))
+                    .collect::<Vec<_>>();
+                expected.sort();
+                assert_eq!(
+                    store.preview_last_operation_paths("preview").unwrap(),
+                    expected
+                );
+                let restored = store.restore_last_operation("preview").unwrap();
+                assert_eq!(restored.op_id, "operation");
+                assert_eq!(restored.restored.len(), 2);
+                for path in &paths {
+                    assert_eq!(fs::read(path).unwrap(), [0, 255, 128]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn backup_preview_discovery_cap_refuses_partial_history() {
+        let (mut store, storage, first) = durability_store();
+        for path in [first, storage.path().join("second.txt")] {
+            fs::write(&path, b"original").unwrap();
+            store
+                .snapshot_with_op("preview", &path, "before", Some("operation"))
+                .unwrap();
+        }
+        store.release_memory();
+        store.discovery_entry_limit = 2;
+        store.discovery_entries_examined.store(0, Ordering::Relaxed);
+        let error = store.preview_last_operation_paths("preview").unwrap_err();
+        assert!(matches!(error, AftError::IoError { .. }), "{error:?}");
+        assert!(error.to_string().contains("entry limit"), "{error}");
+        assert_eq!(store.discovery_entries_examined.load(Ordering::Relaxed), 2);
+        let error = store.restore_last_operation("preview").unwrap_err();
+        assert!(matches!(error, AftError::IoError { .. }), "{error:?}");
+        assert!(error.to_string().contains("entry limit"), "{error}");
+    }
+
+    #[test]
+    fn backup_preview_discovery_deadline_is_checked_before_advancing() {
+        let (mut store, _storage, path) = durability_store();
+        store
+            .snapshot_with_op("preview", &path, "before", Some("operation"))
+            .unwrap();
+        store.release_memory();
+        store.discovery_entries_examined.store(0, Ordering::Relaxed);
+        crate::bounded_io::with_budget(
+            Some(crate::bounded_io::Budget::after(Duration::ZERO)),
+            || {
+                let error = store.preview_last_operation_paths("preview").unwrap_err();
+                assert!(matches!(error, AftError::IoError { .. }), "{error:?}");
+                assert!(error.to_string().contains("deadline"), "{error}");
+                assert_eq!(store.discovery_entries_examined.load(Ordering::Relaxed), 0);
+                let error = store.restore_last_operation("preview").unwrap_err();
+                assert!(matches!(error, AftError::IoError { .. }), "{error:?}");
+            },
+        );
     }
 
     #[test]
