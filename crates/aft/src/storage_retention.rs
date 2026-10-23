@@ -356,6 +356,78 @@ pub(crate) fn record_bind(storage: &Path, root: &Path, artifact_key: &str) -> io
     )
 }
 
+// Queueing, sweep admission and durable publication have different remedies.
+// Keep their wall times separate without changing lock or sync boundaries.
+struct BindProfile<'a> {
+    storage: &'a Path,
+    root: &'a Path,
+    started: Instant,
+    step_started: Instant,
+    step: &'static str,
+    phases: Vec<(&'static str, std::time::Duration)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_BIND_PROFILE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+impl<'a> BindProfile<'a> {
+    fn new(storage: &'a Path, root: &'a Path) -> Self {
+        let started = Instant::now();
+        Self {
+            storage,
+            root,
+            started,
+            step_started: started,
+            step: "metadata",
+            phases: Vec::new(),
+        }
+    }
+
+    fn begin(&mut self, step: &'static str) {
+        let now = Instant::now();
+        self.phases.push((self.step, now - self.step_started));
+        self.step_started = now;
+        self.step = step;
+    }
+
+    fn line(&self, total: std::time::Duration) -> String {
+        let phases = self
+            .phases
+            .iter()
+            .copied()
+            .chain(std::iter::once((self.step, self.step_started.elapsed())))
+            .map(|(name, duration)| format!("{name}={}", duration.as_micros()))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "retention_bind_profile storage={} root={} total_ms={} phases_us=[{}]",
+            self.storage.display(),
+            self.root.display(),
+            total.as_millis(),
+            phases
+        )
+    }
+}
+
+impl Drop for BindProfile<'_> {
+    fn drop(&mut self) {
+        let total = self.started.elapsed();
+        if total >= std::time::Duration::from_secs(1) {
+            crate::slog_info!("{}", self.line(total));
+        }
+        #[cfg(test)]
+        {
+            let line = self.line(total);
+            LAST_BIND_PROFILE.with(|slot| *slot.borrow_mut() = Some(line.clone()));
+            if std::env::var_os("AFT_TEST_BIND_PROFILE").is_some() {
+                eprintln!("{line}");
+            }
+        }
+    }
+}
+
 // Budget one active publication plus this caller's publication, allowing five
 // seconds for each and two seconds for collection/scheduling overhead. All
 // checks use the caller's original deadline, avoiding a separate, shorter
@@ -551,6 +623,7 @@ pub(crate) fn record_bind_until(
     artifact_key: &str,
     deadline: Instant,
 ) -> io::Result<()> {
+    let mut profile = BindProfile::new(storage, root);
     #[cfg(test)]
     test_hook(root, "bind-waiting");
     let started = Instant::now();
@@ -580,6 +653,7 @@ pub(crate) fn record_bind_until(
         return Err(bind_timeout(&path, started));
     }
     let queue = bind_queue(storage)?;
+    profile.begin("queue_wait");
     {
         let mut state = queue.state.lock().unwrap();
         state.pending.push(member.clone());
@@ -602,6 +676,7 @@ pub(crate) fn record_bind_until(
             return Err(error.into_io());
         }
         if !state.active {
+            profile.begin("collect_wait");
             state.active = true;
             drop(state);
             let mut leader = BindLeader {
@@ -635,6 +710,7 @@ pub(crate) fn record_bind_until(
             // One marker covers the entire publication round, including the
             // wait for a sweeper to release admission. Followers share it rather
             // than serializing on a marker owned by an individual caller.
+            profile.begin("admission_wait");
             let admission = bind_lock_until(
                 &storage.join("retention/bind-pending.lock"),
                 round_deadline,
@@ -655,6 +731,7 @@ pub(crate) fn record_bind_until(
                 test_hook(storage, "bind-round-admitted");
             }
             state = queue.state.lock().unwrap();
+            profile.begin("freeze_round");
             // Include arrivals during cross-process admission, then freeze the
             // publication snapshot. Later arrivals belong to the next round.
             leader.members.append(&mut state.pending);
@@ -672,6 +749,7 @@ pub(crate) fn record_bind_until(
                             round_started,
                             round_deadline,
                             barrier,
+                            &mut profile,
                         );
                         drop(pending);
                         result
@@ -707,7 +785,9 @@ fn publish_bind_round(
     started: Instant,
     deadline: Instant,
     barrier: crate::fs_lock::LockGuard,
+    profile: &mut BindProfile<'_>,
 ) -> io::Result<()> {
+    profile.begin("prepare_directory");
     let lock_path = storage.join("retention/sweep.lock");
     #[cfg(test)]
     for member in members {
@@ -726,6 +806,7 @@ fn publish_bind_round(
     check_deadline()?;
     let directory = storage.join("retention/roots");
     crate::backup::create_private_durable_dir(&directory)?;
+    profile.begin("stage_files");
     let mut staged = Vec::new();
     for member in members {
         check_deadline()?;
@@ -761,6 +842,7 @@ fn publish_bind_round(
     test_hook(storage, "bind-round-staged");
     // Each data file needs its own sync; syncing a directory cannot flush file
     // contents. Group the shared directory commit instead of doing it per root.
+    profile.begin("sync_files");
     for binding in &staged {
         check_deadline()?;
         let file = fs::OpenOptions::new()
@@ -768,6 +850,7 @@ fn publish_bind_round(
             .open(&binding.temporary)?;
         crate::durability::sync_file(&file, &binding.destination)?;
     }
+    profile.begin("replace_files");
     for binding in &staged {
         check_deadline()?;
         crate::fs_lock::rename_over(&binding.temporary, &binding.destination)?;
@@ -776,10 +859,12 @@ fn publish_bind_round(
             &binding.destination,
         );
     }
+    profile.begin("sync_directory");
     crate::durability::sync_dir(&directory)?;
     #[cfg(test)]
     test_hook(storage, "bind-round-durable");
 
+    profile.begin("clear_unknown");
     let mut cleared = false;
     let keys: HashSet<_> = members
         .iter()
@@ -3912,6 +3997,24 @@ fn record_v3_removal(domain: &mut DomainReport, bytes: Option<u64>) {
 
 #[cfg(test)]
 mod storage_retention_tests {
+    #[test]
+    fn bind_profile_separates_waits_from_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        super::record_bind(storage.path(), root.path(), "0123456789abcdef").unwrap();
+        let line = super::LAST_BIND_PROFILE.with(|slot| slot.borrow_mut().take().unwrap());
+        assert!(line.starts_with("retention_bind_profile storage="));
+        assert!(line.contains("phases_us=[metadata="));
+        for phase in [
+            "queue_wait",
+            "admission_wait",
+            "sync_files",
+            "sync_directory",
+        ] {
+            assert!(line.contains(&format!(",{phase}=")), "{line}");
+        }
+    }
+
     use super::*;
 
     fn expired_pending_bind(root: &Path) -> Arc<PendingBind> {

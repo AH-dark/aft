@@ -7601,6 +7601,7 @@ pub(crate) struct ArtifactCacheKeyTimings {
     pub(crate) memo_load: Duration,
     pub(crate) memo_prune: Duration,
     pub(crate) memo_write: Duration,
+    pub(crate) legacy_memo: Duration,
     pub(crate) context_memo_wait: Duration,
     pub(crate) context_cache_hit: bool,
 }
@@ -7802,7 +7803,9 @@ pub(crate) fn resolve_root_identity_for_bind(
         let memo = if cached.is_some() && !pinned_path {
             cached
         } else {
-            match legacy_identity_memo(probe_root, &memo_root_key, storage_root) {
+            match time_cache_key_work(&mut timings.legacy_memo, || {
+                legacy_identity_memo(probe_root, &memo_root_key, storage_root)
+            }) {
                 Ok(memo) => memo,
                 Err(error) if crate::developer_tools::git_usable() && !pinned_path => {
                     crate::slog_warn!(
@@ -10340,6 +10343,49 @@ pub(crate) fn audit_work() -> AuditWork {
 
 #[cfg(test)]
 mod tests {
+    /// Measures the compatibility lookup independently of Git and durable writes.
+    /// Missing checkout spellings exercise the canonical-ancestor fallback used
+    /// when old worktrees have been removed. No live cache memo is read.
+    #[test]
+    #[ignore = "manual native legacy identity memo timing probe"]
+    fn legacy_identity_memo_native_probe() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        let raw_key = super::artifact_cache_key_memo_root_key(&root);
+        for entries in [0, 256, 2048, 8192] {
+            let memo: BTreeMap<_, _> = (0..entries)
+                .map(|index| {
+                    (
+                        fixture
+                            .path()
+                            .join(format!("removed/checkouts/worker-{index}/project"))
+                            .to_string_lossy()
+                            .into_owned(),
+                        super::ArtifactCacheKeyMemoEntry {
+                            key: "0123456789abcdef".into(),
+                            git_root_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                            recorded_at_ms: crate::pins::now_ms(),
+                        },
+                    )
+                })
+                .collect();
+            let bytes = serde_json::to_vec(&memo).unwrap();
+            fs::write(super::artifact_cache_key_memo_path(fixture.path()), &bytes).unwrap();
+            for sample in 0..8 {
+                let started = std::time::Instant::now();
+                assert!(super::legacy_identity_memo(&root, &raw_key, fixture.path())
+                    .unwrap()
+                    .is_none());
+                eprintln!(
+                    "legacy_memo_probe entries={entries} bytes={} sample={sample} elapsed_us={}",
+                    bytes.len(),
+                    started.elapsed().as_micros()
+                );
+            }
+        }
+    }
+
     fn publication_records(count: usize) -> Vec<SpillRecord> {
         (0..count as u32)
             .rev()
