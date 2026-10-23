@@ -654,3 +654,35 @@ fn bash_changed_files_flush_native_no_false_complete_during_50k_activity() {
         assert_eq!(report.incomplete, vec![NOT_CAUGHT_UP], "{report:?}");
     }
 }
+
+#[test]
+fn bash_changed_files_flush_inherits_reply_budget_before_spawn_and_clears_on_handoff() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(root.path().into());
+    config.bash.changed_files = BashChangedFiles::List;
+    let ctx =
+        crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let deadline = Instant::now() + Duration::from_millis(20);
+    let budget = BudgetGuard::new(deadline);
+    let receipt = Arc::new(crate::bash_background::SpawnReceipt::new(
+        Instant::now() + Duration::from_secs(30),
+    ));
+    receipt.bind_changed_files_deadline(budget.shared());
+    let capture = crate::bash_background::with_spawn_receipt(receipt.clone(), || {
+        Capture::start(&ctx).unwrap()
+    });
+    assert_eq!(*capture.call_deadline.lock().unwrap(), Some(deadline));
+    receipt.limit_changed_files_deadline(deadline + Duration::from_secs(1));
+    assert_eq!(*capture.call_deadline.lock().unwrap(), Some(deadline));
+    drop(budget);
+    assert!(capture.call_deadline.lock().unwrap().is_none());
+    receipt.limit_changed_files_deadline(deadline);
+    assert!(
+        capture.call_deadline.lock().unwrap().is_none(),
+        "handoff cannot revive a caller budget"
+    );
+    let late =
+        crate::bash_background::with_spawn_receipt(receipt, || Capture::start(&ctx).unwrap());
+    assert!(late.call_deadline.lock().unwrap().is_none());
+}

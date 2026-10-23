@@ -95,7 +95,7 @@ pub(crate) struct Capture {
     mode: BashChangedFiles,
     watcher_active: bool,
     flush: Option<Arc<crate::watcher_backend::flush::FlushControl>>,
-    call_deadline: Mutex<Option<Instant>>,
+    call_deadline: SharedCallDeadline,
     git: Option<GitStart>,
     end: OnceLock<(u64, u64)>,
     report: OnceLock<Report>,
@@ -109,14 +109,25 @@ struct GitStart {
 
 thread_local! { static CURRENT: RefCell<Option<Arc<Capture>>> = const { RefCell::new(None) }; }
 pub(crate) struct Scope(Option<Arc<Capture>>);
-pub(crate) struct BudgetGuard(Arc<Capture>);
-impl Drop for BudgetGuard {
-    fn drop(&mut self) {
+pub(crate) type SharedCallDeadline = Arc<Mutex<Option<Instant>>>;
+pub(crate) struct BudgetGuard(SharedCallDeadline);
+impl BudgetGuard {
+    pub(crate) fn new(deadline: Instant) -> Self {
+        Self(Arc::new(Mutex::new(Some(deadline))))
+    }
+    pub(crate) fn shared(&self) -> SharedCallDeadline {
+        self.0.clone()
+    }
+    pub(crate) fn clear(&self) {
         *self
             .0
-            .call_deadline
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 impl Drop for Scope {
@@ -146,6 +157,9 @@ impl Capture {
             .clone();
         let mut capture = Self::begin(root, journal, mode, ctx.watcher_runtime_active());
         Arc::get_mut(&mut capture).unwrap().flush = Some(ctx.watcher_counters().bash_flush.clone());
+        if let Some(deadline) = crate::bash_background::changed_files_deadline_for_spawn() {
+            Arc::get_mut(&mut capture).unwrap().call_deadline = deadline;
+        }
         Some(capture)
     }
     fn begin(
@@ -175,7 +189,7 @@ impl Capture {
             mode,
             watcher_active,
             flush: None,
-            call_deadline: Mutex::new(None),
+            call_deadline: Arc::new(Mutex::new(None)),
             git,
             end: OnceLock::new(),
             report: OnceLock::new(),
@@ -203,7 +217,7 @@ impl Capture {
             .call_deadline
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = deadline;
-        BudgetGuard(self.clone())
+        BudgetGuard(self.call_deadline.clone())
     }
     pub(crate) fn seal(&self) {
         self.end.get_or_init(|| {
