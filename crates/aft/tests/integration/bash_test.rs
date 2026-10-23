@@ -980,16 +980,25 @@ fn bash_changed_files_foreground_and_background_completion_notice() {
         if background {
             assert!(result.get("_bash_changed_files").is_none(), "{result}");
             wait_for_terminal_status(&mut aft, result["task_id"].as_str().unwrap());
-            let completions = aft.send(
-                &serde_json::json!({"id":"drain-changes", "command":"bash_drain_completions"})
-                    .to_string(),
-            );
-            let completion = completions["bg_completions"]
-                .as_array()
-                .expect("completion array")
-                .iter()
-                .find(|item| item["task_id"] == result["task_id"])
-                .unwrap();
+            // Terminal status can be published before its completion notice is
+            // queued, so wait for delivery rather than assuming both happen together.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let completion = loop {
+                let completions = aft.send(
+                    &serde_json::json!({"id":"drain-changes", "command":"bash_drain_completions"})
+                        .to_string(),
+                );
+                if let Some(completion) = completions["bg_completions"]
+                    .as_array()
+                    .expect("completion array")
+                    .iter()
+                    .find(|item| item["task_id"] == result["task_id"])
+                {
+                    break completion.clone();
+                }
+                assert!(std::time::Instant::now() < deadline, "{completions}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
             let files = completion["_bash_changed_files"]["files"]
                 .as_array()
                 .unwrap();

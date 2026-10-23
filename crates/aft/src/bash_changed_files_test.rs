@@ -157,6 +157,85 @@ fn bash_changed_files_deleted_new_binary_and_large() {
     );
     assert!(find("large").reason.as_ref().unwrap().contains("too large"));
 }
+
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn bash_changed_files_git_aliases_preserve_dirty_untracked_and_deleted_paths() {
+    let root = repo();
+    let canonical = root.path().canonicalize().unwrap();
+    #[cfg(target_os = "macos")]
+    let alias_parent = tempfile::tempdir().unwrap();
+    #[cfg(target_os = "macos")]
+    let capture_root = if let Ok(relative) = canonical.strip_prefix("/private") {
+        Path::new("/").join(relative)
+    } else {
+        let alias = alias_parent.path().join("project-alias");
+        std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+        alias
+    };
+    #[cfg(windows)]
+    let capture_root = root.path().to_path_buf();
+    std::fs::write(root.path().join("clean.txt"), "dirty before\n").unwrap();
+    std::fs::write(root.path().join("existing.txt"), "untracked before\n").unwrap();
+    let (journal, mut capture) = capture(&capture_root, BashChangedFiles::Diff);
+    let git = Arc::get_mut(&mut capture).unwrap().git.as_mut().unwrap();
+    #[cfg(windows)]
+    {
+        let original = git.directory.clone();
+        git.directory = PathBuf::from(canonical.to_string_lossy().to_ascii_uppercase());
+        git.dirty = git
+            .dirty
+            .iter()
+            .map(|path| git.directory.join(path.strip_prefix(&original).unwrap()))
+            .collect();
+    }
+    let original_directory = git.directory.clone();
+    let original_dirty = git.dirty.clone();
+    for (name, contents) in [
+        ("clean.txt", "dirty after\n"),
+        ("existing.txt", "untracked after\n"),
+        ("new.txt", "new file\n"),
+    ] {
+        std::fs::write(root.path().join(name), contents).unwrap();
+        event(
+            &journal,
+            &capture_root,
+            name,
+            notify::EventKind::Modify(ModifyKind::Any),
+        );
+    }
+    std::fs::remove_file(root.path().join("deleted.txt")).unwrap();
+    event(
+        &journal,
+        &capture_root,
+        "deleted.txt",
+        notify::EventKind::Remove(RemoveKind::File),
+    );
+    let report = capture.finish();
+    let find = |name| report.files.iter().find(|file| file.path == name).unwrap();
+    for name in ["clean.txt", "existing.txt"] {
+        assert_eq!(find(name).reason.as_deref(), Some(DIRTY), "{report:?}");
+        assert!(find(name).diff.is_none());
+    }
+    assert!(
+        find("new.txt")
+            .diff
+            .as_ref()
+            .is_some_and(|diff| diff.contains("+new file")),
+        "{report:?}"
+    );
+    assert!(
+        find("deleted.txt")
+            .diff
+            .as_ref()
+            .is_some_and(|diff| diff.contains("-gone")),
+        "{report:?}"
+    );
+    assert_eq!(capture.root, capture_root);
+    assert_eq!(capture.git.as_ref().unwrap().directory, original_directory);
+    assert_eq!(capture.git.as_ref().unwrap().dirty, original_dirty);
+}
+
 #[test]
 fn bash_changed_files_caps_files_lines_bytes_and_overflow() {
     let root = repo();

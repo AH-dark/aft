@@ -38,6 +38,14 @@ fn comparison_path(path: &Path) -> Cow<'_, Path> {
     }
 }
 
+fn git_comparison_path(path: &Path) -> PathBuf {
+    // Git and the watcher can use different filesystem aliases for the same
+    // path. Resolve comparison copies, including missing leaves, without
+    // changing stored paths or the descriptor checks used to authorize reads.
+    let resolved = crate::context::canonicalize_lenient(path).unwrap_or_else(|| path.to_path_buf());
+    comparison_path(&resolved).into_owned()
+}
+
 fn relative_path_text(path: &Path) -> String {
     #[cfg(windows)]
     {
@@ -531,7 +539,10 @@ impl Capture {
         if self.mode == BashChangedFiles::Diff && self.git.is_none() {
             text.push('\n');
             text.push_str(
-                if self.root.ancestors().any(|path| path.join(".git").exists()) {
+                if git_comparison_path(&self.root)
+                    .ancestors()
+                    .any(|path| path.join(".git").exists())
+                {
                     GIT_UNAVAILABLE
                 } else {
                     OUTSIDE_GIT
@@ -645,7 +656,7 @@ impl Capture {
             return;
         }
         let absolute = self.root.join(path);
-        let absolute_key = comparison_path(&absolute);
+        let absolute_key = git_comparison_path(&absolute);
         if path.to_str().is_none() {
             file.reason = Some("no diff: path is not valid UTF-8".into());
             return;
@@ -658,16 +669,18 @@ impl Capture {
             }
         };
         let exists = checked.is_some();
-        if git
-            .dirty
-            .iter()
-            .any(|dirty| absolute_key.starts_with(dirty))
-        {
-            file.status = if exists { "modified" } else { "deleted" };
-            file.reason = Some(DIRTY.into());
-            return;
+        for dirty in &git.dirty {
+            if Instant::now() >= deadline {
+                return;
+            }
+            if absolute_key.starts_with(git_comparison_path(dirty)) {
+                file.status = if exists { "modified" } else { "deleted" };
+                file.reason = Some(DIRTY.into());
+                return;
+            }
         }
-        let Ok(relative) = absolute_key.strip_prefix(&git.directory) else {
+        let git_root = git_comparison_path(&git.directory);
+        let Ok(relative) = absolute_key.strip_prefix(&git_root) else {
             file.reason = Some("no diff: path is outside the git root".into());
             return;
         };
@@ -809,7 +822,6 @@ impl GitStart {
                 .ok()?
                 .trim_end(),
         );
-        let directory = comparison_path(&directory).into_owned();
         let head = String::from_utf8(run(&["rev-parse", "--verify", "HEAD"])?)
             .ok()?
             .trim()

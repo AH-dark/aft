@@ -251,7 +251,7 @@ thread_local! {
 /// component (the store falls back to the raw spelling for those, which
 /// `relative_path` keeps as an absolute out-of-root key), and `..` traversal
 /// through a non-directory (realpath ENOTDIR).
-fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
+pub(crate) fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
     use std::path::Component;
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return Some(canonical);
