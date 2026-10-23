@@ -7218,6 +7218,27 @@ async fn send_cached_health_response(
     send_frame(tx, metrics, response).await
 }
 
+fn normalized_scope_workdir(workdir: &Path) -> Option<PathBuf> {
+    let mut ancestor = workdir;
+    let mut missing = Vec::new();
+    loop {
+        match ProjectRootId::from_path(ancestor) {
+            Ok(root) => {
+                let mut normalized = root.into_path_buf();
+                for component in missing.iter().rev() {
+                    normalized.push(component);
+                }
+                return Some(normalized);
+            }
+            Err(crate::path_identity::IdentityError::NonExistentPath { .. }) => {
+                missing.push(ancestor.file_name()?.to_os_string());
+                ancestor = ancestor.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 fn log_scope_workdir_mismatch(
     identity: &subc_protocol::BindIdentity,
     scope: Option<&subc_protocol::scope::ScopeStamp>,
@@ -7226,19 +7247,20 @@ fn log_scope_workdir_mismatch(
     let Some(workdir) = stamp.workdir.as_deref() else {
         return;
     };
-    // The session folder is diagnostic only. Use the routing root's normalization
-    // for the comparison, without changing bind admission or any project state.
-    let (Ok(project_root), Ok(workdir)) = (
+    // A stamped folder can have a missing tail. Normalize its existing prefix
+    // like a routing root, including Windows path spelling, then append that tail.
+    // This comparison is diagnostic only and does not change project state.
+    let (Ok(project_root), Some(workdir)) = (
         ProjectRootId::from_path(&identity.project_root),
-        ProjectRootId::from_path(workdir),
+        normalized_scope_workdir(Path::new(workdir)),
     ) else {
         return;
     };
-    if workdir != project_root {
+    if workdir.as_path() != project_root.as_path() {
         crate::slog_info!(
             "subc scope workdir differs: project_root={} workdir={} session={} project_id={}",
             project_root.as_path().display(),
-            workdir.as_path().display(),
+            workdir.display(),
             identity.session,
             stamp.project_id.as_deref().unwrap_or("none"),
         );
