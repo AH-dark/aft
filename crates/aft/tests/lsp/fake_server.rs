@@ -1775,9 +1775,15 @@ pub(crate) fn main() -> io::Result<()> {
                     // AFT_FAKE_LSP_CLOSE_PUBLISHES=1: answer the close with real
                     // diagnostics instead of the usual clearing empty list.
                     // A pull-only server (AFT_FAKE_LSP_PULL_FROM_CONTENT=1, as
-                    // `tsc --lsp`) publishes nothing for a closed source file.
+                    // `tsc --lsp`) publishes nothing for a closed source file,
+                    // unless AFT_FAKE_LSP_PULL_CONTENT_CLEARS_ON_CLOSE=1 makes
+                    // it send the usual clearing empty list.
                     if std::env::var("AFT_FAKE_LSP_PULL_FROM_CONTENT").ok().as_deref()
                         == Some("1")
+                        && std::env::var("AFT_FAKE_LSP_PULL_CONTENT_CLEARS_ON_CLOSE")
+                            .ok()
+                            .as_deref()
+                            != Some("1")
                     {
                         continue;
                     }
