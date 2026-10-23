@@ -894,6 +894,16 @@ fn route_scopes_answer_only_when_the_sessions_routes_agree() {
 struct DaemonScript {
     /// Refuse every route.open that carries a scope with this code.
     refuse_scoped_opens: Option<String>,
+    /// Before writing each scoped route.open refusal, wait this long in real
+    /// time, as a slow runner would. The wait runs on a blocking thread, so
+    /// it neither stalls the runtime nor moves a paused test clock.
+    scoped_refusal_delay: Option<std::time::Duration>,
+    /// After each scoped route.open refusal, push a channel-0 notice with op
+    /// `test.route_open_refused`. The client reads one connection's frames in
+    /// order and hands each refusal to its waiting route open as it reads it,
+    /// so a test that receives this notice from `SubcConsumer::control_pushes`
+    /// knows the client already holds the refusal sent just before it.
+    announce_scoped_refusals: bool,
     /// After answering the first request on a scoped route, push a
     /// `route.closed` for plexus with reason `scope_ended`, and refuse every
     /// later scoped route.open with `scope_ended`, as the daemon does once a
@@ -951,7 +961,11 @@ impl FakeDaemon {
         &self,
         route_open_deadline: Option<std::time::Duration>,
     ) -> SubcRelayTransport {
-        let consumer = subc_client_rs::SubcConsumer::connect(
+        SubcRelayTransport::with_consumer(self.consumer().await, route_open_deadline)
+    }
+
+    async fn consumer(&self) -> subc_client_rs::SubcConsumer {
+        subc_client_rs::SubcConsumer::connect(
             &self.connection_file,
             subc_client_rs::ConsumerOptions {
                 call_timeout: std::time::Duration::from_secs(5),
@@ -959,8 +973,7 @@ impl FakeDaemon {
             },
         )
         .await
-        .expect("the fake daemon accepts the relay's connection");
-        SubcRelayTransport::with_consumer(consumer, route_open_deadline)
+        .expect("the fake daemon accepts the relay's connection")
     }
 }
 
@@ -1110,23 +1123,49 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                                                 scope_ended.then(|| "scope_ended".to_string())
                                             });
                                         match refusal.as_deref() {
-                                            Some(code) if scoped => replies.push(
-                                                Frame::build(
-                                                    FrameType::Error,
-                                                    flags,
-                                                    0,
-                                                    0,
-                                                    header.corr,
-                                                    serde_json::to_vec(
-                                                        &subc_protocol::ErrorBody::new(
-                                                            code,
-                                                            "refused by the fake daemon",
-                                                        ),
+                                            Some(code) if scoped => {
+                                                if let Some(delay) = script.scoped_refusal_delay {
+                                                    let _ =
+                                                        tokio::task::spawn_blocking(move || {
+                                                            std::thread::sleep(delay)
+                                                        })
+                                                        .await;
+                                                }
+                                                replies.push(
+                                                    Frame::build(
+                                                        FrameType::Error,
+                                                        flags,
+                                                        0,
+                                                        0,
+                                                        header.corr,
+                                                        serde_json::to_vec(
+                                                            &subc_protocol::ErrorBody::new(
+                                                                code,
+                                                                "refused by the fake daemon",
+                                                            ),
+                                                        )
+                                                        .unwrap(),
                                                     )
                                                     .unwrap(),
-                                                )
-                                                .unwrap(),
-                                            ),
+                                                );
+                                                if script.announce_scoped_refusals {
+                                                    replies.push(
+                                                        Frame::build(
+                                                            FrameType::Push,
+                                                            flags,
+                                                            0,
+                                                            0,
+                                                            0,
+                                                            serde_json::to_vec(&json!({
+                                                                "op": "test.route_open_refused",
+                                                                "code": code,
+                                                            }))
+                                                            .unwrap(),
+                                                        )
+                                                        .unwrap(),
+                                                    );
+                                                }
+                                            }
                                             _ => {
                                                 next_channel += 1;
                                                 if scoped {
@@ -1374,27 +1413,62 @@ async fn overlapping_writes_for_one_session_keep_their_shared_route_until_both_f
 /// When the daemon keeps refusing a scoped open for a reason the client
 /// retries (`scope_not_synced`, `scope_changed`) until the deadline runs out,
 /// the shim gets that code, marked retryable.
-#[tokio::test]
+///
+/// The subc client measures that deadline on tokio's clock, so the test
+/// pauses it and moves it by hand. The deadline then passes only after the
+/// refusal has reached the client, while the client waits to retry, which is
+/// the case this test is about. On the real clock a slow runner can let the
+/// deadline pass while a route open is still waiting for its answer; the
+/// client then reports that open's outcome as unknown, and the relay answers
+/// `relay_unavailable`, which is right for that case but is not the outcome
+/// asserted here. The fake daemon delays each refusal by more than the
+/// deadline in real time, so the test also shows that real elapsed time no
+/// longer decides the outcome.
+#[tokio::test(start_paused = true)]
 async fn a_retried_scope_refusal_that_outlasts_the_deadline_keeps_its_code() {
+    const DEADLINE: std::time::Duration = std::time::Duration::from_millis(300);
+    // A paused clock still jumps to the next timer whenever the runtime has
+    // nothing to run, which includes waiting on a socket. A running blocking
+    // task stops those jumps (see `tokio::time::pause`), so the clock moves
+    // only through `advance` below. Dropping `_release`, also on a panic, ends
+    // the blocking task.
+    let (_release, held) = std::sync::mpsc::channel::<()>();
+    let _hold_clock = tokio::task::spawn_blocking(move || {
+        let _ = held.recv();
+    });
     for code in ["scope_not_synced", "scope_changed"] {
         let daemon = fake_daemon(DaemonScript {
             refuse_scoped_opens: Some(code.to_string()),
+            scoped_refusal_delay: Some(DEADLINE + std::time::Duration::from_millis(100)),
+            announce_scoped_refusals: true,
             ..DaemonScript::default()
         })
         .await;
-        let transport = daemon
-            .transport_with_deadline(Some(std::time::Duration::from_millis(300)))
-            .await;
-        let (reply, _) = relay_stamped(&transport, "ses-scope-retried", "nonce-retried").await;
+        let consumer = daemon.consumer().await;
+        let mut announced = consumer.control_pushes(8);
+        let transport = SubcRelayTransport::with_consumer(consumer, Some(DEADLINE));
+        let expire = async {
+            // The channel closes without a notice only when a failed call
+            // has dropped the client's connection; the assertions on the
+            // reply below then name the failure.
+            if let Some(push) = announced.recv().await {
+                assert_eq!(push.op, "test.route_open_refused", "{code}");
+                tokio::time::advance(DEADLINE).await;
+            }
+        };
+        let ((reply, _), ()) = tokio::join!(
+            relay_stamped(&transport, "ses-scope-retried", "nonce-retried"),
+            expire
+        );
         assert!(!reply.ok, "{code}");
         assert_eq!(reply.data["refusal_code"], code, "{:?}", reply.data);
         assert_eq!(reply.data["retryable"], true, "{code}");
         assert_eq!(reply.data["stage"], "plexus", "{code}");
         let opens = daemon.opens();
-        assert!(
-            !opens.is_empty() && opens.iter().all(is_scoped_open),
-            "{code}: {opens:?}"
-        );
+        // One open reached the daemon: the retry after its refusal came due
+        // only once the deadline had passed, so the client never sent it.
+        assert_eq!(opens.len(), 1, "{code}: {opens:?}");
+        assert!(is_scoped_open(&opens[0]), "{code}: {opens:?}");
         assert!(daemon.requests().is_empty(), "{code}: nothing was sent");
     }
 }
