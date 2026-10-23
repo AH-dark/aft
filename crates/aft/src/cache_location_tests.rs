@@ -2076,9 +2076,13 @@ fn never_split_storage_without_cache_dir_keeps_the_single_root_layout() {
 
 #[test]
 fn cache_location_unrelated_invalid_user_setting_keeps_caches_on() {
-    // A typo outside storage does not hide where caches belong.
-    let result =
-        resolve_user_doc(r#"{"semantic":{"backend":"openai-compatible"},"format_on_edit":true}"#);
+    // A typo outside storage does not hide where caches belong. The invalid
+    // section is a non-security one, which is discarded while the rest loads;
+    // an invalid security section rejects the whole candidate instead.
+    let result = resolve_user_doc(
+        r#"{"inspect":{"categories":{"diagnostics":"off"}},"format_on_edit":true}"#,
+    );
+    assert!(result.errors.is_empty(), "{result:?}");
     assert!(
         !result
             .warnings

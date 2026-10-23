@@ -740,12 +740,16 @@ pub fn resolve_config_for_harness(
         let outcome = match parse_tier(tier, harness, &mut warnings) {
             Ok(outcome) => outcome,
             Err(errors) => {
+                // A rejected candidate still records where caches belong, or
+                // that the user file leaves it unknown, so caches stay off
+                // rather than falling back to the storage root.
+                let config = cache_location_checked_config(tiers, &mut warnings);
                 return ResolveResult {
-                    config: Config::default(),
+                    config: rejected_cache_config(tiers, config, &errors),
                     dropped,
                     warnings,
                     errors,
-                }
+                };
             }
         };
         let (raw, translation) = outcome;
@@ -833,18 +837,7 @@ pub fn resolve_config_for_harness(
         }
     }
 
-    let mut config = Config::default();
-    config.cache_config_unknown = tiers
-        .iter()
-        .filter(|tier| tier.tier == "user")
-        .find_map(cache_location_config_error);
-    if let Some(reason) = &config.cache_config_unknown {
-        warnings.push(ConfigWarning {
-            code: "cache_dir_config_unknown", key: "storage.cache_dir", tier: "user".into(),
-            value: "unknown".into(),
-            message: format!("User configuration is unreadable or invalid ({reason}); AFT is running without its caches until the configuration is valid."),
-        });
-    }
+    let mut config = cache_location_checked_config(tiers, &mut warnings);
     if let Err(missing) = apply_resolved_config(&merged, &mut config, &mut warnings) {
         return ResolveResult {
             config: rejected_cache_config(tiers, config, &missing),
@@ -907,14 +900,45 @@ pub fn resolve_config_for_harness(
     }
 }
 
+/// A default config carrying the user tier's cache-location verdict: when the
+/// user file is unreadable or its storage section invalid, the cache location
+/// is unknown and a `cache_dir_config_unknown` warning says so.
+fn cache_location_checked_config(
+    tiers: &[ConfigTier],
+    warnings: &mut Vec<ConfigWarning>,
+) -> Config {
+    let mut config = Config::default();
+    config.cache_config_unknown = tiers
+        .iter()
+        .filter(|tier| tier.tier == "user")
+        .find_map(cache_location_config_error);
+    if let Some(reason) = &config.cache_config_unknown {
+        warnings.push(ConfigWarning {
+            code: "cache_dir_config_unknown", key: "storage.cache_dir", tier: "user".into(),
+            value: "unknown".into(),
+            message: format!("User configuration is unreadable or invalid ({reason}); AFT is running without its caches until the configuration is valid."),
+        });
+    }
+    config
+}
+
 fn rejected_cache_config(tiers: &[ConfigTier], mut config: Config, errors: &[String]) -> Config {
     if config.cache_dir.is_none() {
+        // Read only `storage.cache_dir` from the user document itself: the
+        // candidate was rejected, possibly for another section, so the tier
+        // as a whole may not parse.
         if let Some(raw) = tiers
             .iter()
             .filter(|tier| tier.tier == "user")
-            .filter_map(|tier| parse_tier(tier).and_then(|(raw, _)| raw.storage))
+            .filter_map(|tier| {
+                serde_json::from_str::<Value>(&strip_jsonc(&tier.doc))
+                    .ok()?
+                    .get("storage")?
+                    .get("cache_dir")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
             .last()
-            .and_then(|storage| storage.cache_dir)
         {
             let home = std::env::var_os("HOME")
                 .or_else(|| std::env::var_os("USERPROFILE"))
@@ -1137,6 +1161,8 @@ fn normalize_config_for_harness(map: &mut Map<String, Value>, harness: Option<&H
     }
 }
 
+// `storage` is deliberately not listed: a malformed `storage.cache_dir` weakens
+// no protection; it turns caches off (`cache_config_unknown`) and warns.
 fn security_config_section(key: &str, harness: Option<&Harness>) -> bool {
     if harness_ignored_config_keys(harness).contains(&key) {
         return false;

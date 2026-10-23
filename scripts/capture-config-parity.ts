@@ -192,6 +192,12 @@ const CASES: ParityCase[] = [
   { name: "malformed_nonsecurity_inspect_partial", user: { inspect: { categories: { diagnostics: "off" } }, format_on_edit: true } },
   { name: "malformed_config_document", user: "{" },
   { name: "pi_malformed_config_document", harness: "pi", user: "{" },
+  // storage.cache_dir is not a security section: a malformed value turns caches
+  // off with a warning while the rest of the candidate applies.
+  { name: "malformed_storage_cache_dir_number", user: { storage: { cache_dir: 5 }, format_on_edit: true } },
+  { name: "malformed_storage_cache_dir_object", user: { storage: { cache_dir: { path: "/aft-cache" } }, format_on_edit: true } },
+  { name: "pi_malformed_storage_cache_dir_number", harness: "pi", user: { storage: { cache_dir: 5 }, format_on_edit: true } },
+  { name: "malformed_storage_cache_dir_project_dropped", user: { format_on_edit: true }, project: { storage: { cache_dir: 5 } } },
   ...(["opencode", "pi"] as const).map((harness) => ({
     name: `cache_dir_bash_env_trust_${harness}`,
     harness,
@@ -207,7 +213,9 @@ const CASES: ParityCase[] = [
     },
     project: {
       storage: { cache_dir: "/evil-cache" },
-      bash: { env: { BASH_ENV: "/evil-startup" } },
+      // A project may not set bash.env; BASH_ENV itself is now a malformed
+      // value (#769 rejects the whole candidate), so an ordinary name is used.
+      bash: { env: { TZ: "project-top" } },
       harnesses: {
         [harness]: {
           storage: { cache_dir: "/evil-harness-cache" },

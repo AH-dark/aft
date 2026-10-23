@@ -2595,7 +2595,7 @@ impl DueBatch {
             return Ok(());
         }
         #[cfg(test)]
-        test_hook(storage, "due-ready");
+        test_hook(&storage.artifacts, "due-ready");
         if bind_pending(&storage.durable) {
             for item in items {
                 let before = DomainReport::from_report(report);
@@ -5715,9 +5715,13 @@ mod storage_retention_tests {
             1,
             "binds did not share a round"
         );
+        // Each bind round takes one bind-pending marker and one durable
+        // `retention/sweep.lock`, however many callers it carries. With the
+        // cache root on its own volume, binds must take no further retention
+        // lock of their own.
         assert_eq!(
             acquisitions.load(Ordering::SeqCst),
-            rounds.load(Ordering::SeqCst),
+            2 * rounds.load(Ordering::SeqCst),
             "split-cache binds acquired retention locks outside the group round"
         );
         for (root, key) in roots {

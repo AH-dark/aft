@@ -254,11 +254,12 @@ describe("loadAftConfig", () => {
   });
 
   test("cache-location load failures still relay the native path and raw tiers", () => {
-    for (const failure of ["number", "missing", "unparseable", "unreadable"]) {
+    // Unparseable and unreadable user documents now reject the whole load
+    // (invalid_config_document); the tests above cover that.
+    for (const failure of ["number", "missing"]) {
       const fixture = createConfigFixture();
-      const raw = failure === "number" ? '{"storage":{"cache_dir":123}}' : "{";
-      if (failure === "unreadable") mkdirSync(fixture.userConfigPath);
-      else if (failure !== "missing") writeFileSync(fixture.userConfigPath, raw);
+      const raw = '{"storage":{"cache_dir":123}}';
+      if (failure === "number") writeFileSync(fixture.userConfigPath, raw);
       const result = spawnConfigLoader(
         fixture.projectDirectory,
         { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome },
@@ -272,8 +273,7 @@ describe("loadAftConfig", () => {
       const value = JSON.parse(result.stdout);
       expect(value.merged.storage).toBeUndefined();
       expect(value.params.cortexkit_user_config_path).toBe(fixture.userConfigPath);
-      if (failure === "number" || failure === "unparseable")
-        expect(value.params.config[0].doc).toBe(raw);
+      if (failure === "number") expect(value.params.config[0].doc).toBe(raw);
       else expect(value.params.config).toEqual([]);
     }
   });

@@ -23702,18 +23702,14 @@ mod tests {
                 );
                 let started = Instant::now();
                 crate::storage_retention::record_bind(
-                    &crate::root_cache::StoragePaths::same(storage.path()),
+                    &crate::root_cache::StoragePaths::same(&storage),
                     &root,
                     &key,
                 )
                 .unwrap();
                 profile.retention_bind = started.elapsed();
                 let started = Instant::now();
-                crate::persisted_format::preflight_project_artifacts(
-                    storage.path(),
-                    storage.path(),
-                    &key,
-                );
+                crate::persisted_format::preflight_project_artifacts(&storage, &storage, &key);
                 profile.format_preflight = started.elapsed();
                 eprintln!("cache_key_probe sample={sample} mode={label} total_us={} timings={:?} retention_us={} preflight_us={}",
                     profile.started.elapsed().as_micros(), profile.key,
