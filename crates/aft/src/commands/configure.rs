@@ -11028,22 +11028,31 @@ mod tests {
             .unwrap()
     }
 
-    /// The daemon has stopped once nothing in this process holds the family's
-    /// call-graph database open. Deleting a file that a connection still holds
-    /// would leave that connection reading the unlinked file, which would hide
-    /// the effect being tested.
-    fn blob_removal_stop(ctx: Arc<AppContext>, storage: &Path, family: &str) {
+    /// Models a stopped daemon before the store is removed: once this returns,
+    /// no tracked database connection under `storage` is open in this process.
+    /// Deleting a file that a connection still holds would leave that
+    /// connection reading the unlinked file on Unix, which would hide the effect
+    /// being tested, and fails on Windows.
+    ///
+    /// Dropping the last context closes the connections it owns. The view
+    /// publication, however, handed its keeper connection on the new
+    /// `derived-*.sqlite` to the detached `aft-view-checkpoint` worker (see
+    /// `views::generation::schedule_derived_checkpoint`). The context does not
+    /// own that worker; it waits at least 250 ms, attempts a checkpoint unless
+    /// a later publication superseded it, then closes the connection either
+    /// way. Wait for it here. A real daemon stop ends the process, which closes
+    /// that handle as well.
+    fn blob_removal_stop(ctx: Arc<AppContext>, storage: &Path, root: &Path) {
+        let Ok(ctx) = Arc::try_unwrap(ctx) else {
+            panic!("another owner kept the context alive past the stop");
+        };
         drop(ctx);
-        let database = blob_removal_callgraph_db(storage, family);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while crate::db::file_identity::open_connections(&database) > 0 {
-            assert!(
-                Instant::now() < deadline,
-                "a connection to {} outlived the stopped context",
-                database.display()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        crate::views::wait_for_derived_checkpoint_for_test(&lazy_view_dir(storage, root));
+        let held = crate::db::file_identity::open_connections_under_for_test(storage);
+        assert!(
+            held.is_empty(),
+            "connections outlived the stopped context: {held:#?}"
+        );
     }
 
     /// Removes the family's call-graph blob store and asserts that the alias and
@@ -11088,7 +11097,7 @@ mod tests {
         // lib.rs and tracked.rs each have one extracted payload.
         assert_eq!(blob_removal_payload_rows(&storage, &family), 2);
 
-        blob_removal_stop(ctx, &storage, &family);
+        blob_removal_stop(ctx, &storage, &root);
         blob_removal_delete_store(&storage, &family);
         BlobRemovalFixture {
             _temp: temp,
