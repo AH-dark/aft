@@ -51,11 +51,55 @@ pub fn project_scope_key(project_root: &Path) -> String {
 }
 
 /// Inputs are canonical policy identities, including home aliases and native
-/// volume roots. Exclude root-level system directories and all home ancestors.
+/// volume roots. Exclude system trees, root-level folders and all home ancestors.
 pub(crate) fn directory_scope_is_narrow(directory: &Path, home: &Path, volume: &Path) -> bool {
     project_root_path_is_narrow(directory, home, volume)
         && directory.parent().and_then(Path::parent).is_some()
         && directory.parent() != Some(volume)
+        && !directory_is_system_tree(directory)
+}
+
+/// These trees may contain unrelated users' or system data even several levels
+/// below their root. Only macOS's per-user temporary tree is exempt; component
+/// comparisons keep similarly named ordinary folders eligible.
+#[cfg(unix)]
+fn directory_is_system_tree(directory: &Path) -> bool {
+    if ["/var/folders", "/private/var/folders"]
+        .iter()
+        .any(|root| directory.starts_with(root))
+    {
+        return false;
+    }
+    [
+        "/usr",
+        "/etc",
+        "/bin",
+        "/sbin",
+        "/opt",
+        "/var",
+        "/System",
+        "/Library",
+        "/private/etc",
+        "/private/var",
+    ]
+    .iter()
+    .any(|root| directory.starts_with(root))
+        || directory
+            .strip_prefix("/")
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .is_some_and(|component| component.as_os_str().to_string_lossy().starts_with("lib"))
+}
+
+#[cfg(windows)]
+fn directory_is_system_tree(directory: &Path) -> bool {
+    directory
+        .components()
+        .find_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .is_some_and(|name| name == "windows" || name.starts_with("program files"))
 }
 
 /// Decide whether a canonical project root admits watching and indexing.
