@@ -185,6 +185,7 @@ mod tests {
             skipped_path_sample: Vec::new(),
             cold_builds: Default::default(),
             publication_failure: None,
+            callgraph_readiness_deferred: None,
         };
         assert_eq!(ticket_current_view(Some(snapshot.clone()), None), None);
         assert_eq!(

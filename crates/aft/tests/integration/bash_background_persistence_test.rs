@@ -2082,6 +2082,16 @@ fn spawn_detached_survives_parent_restart() {
 
 #[test]
 fn configure_replays_background_tasks_from_default_storage_dir() {
+    assert_configure_replays_from_default_storage(false);
+}
+
+#[cfg(feature = "test-timing-hooks")]
+#[test]
+fn configure_replays_disk_only_completion_after_initial_batch() {
+    assert_configure_replays_from_default_storage(true);
+}
+
+fn assert_configure_replays_from_default_storage(disk_only: bool) {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let storage = cache.path().join("aft");
@@ -2102,10 +2112,42 @@ fn configure_replays_background_tasks_from_default_storage_dir() {
         task_id
     };
 
-    let mut aft = AftProcess::spawn_with_env(&[("AFT_CACHE_DIR", cache.path().as_os_str())]);
+    if disk_only {
+        erase_persisted_task_row(&storage, "opencode", SESSION, &task_id);
+    }
+    let mut env = vec![("AFT_CACHE_DIR", cache.path().as_os_str())];
+    if disk_only {
+        // Opening the session directory consumes the first scan entry. Its task
+        // is recovered in a later maintenance pass, not configure's first
+        // bounded disk batch.
+        env.push((
+            "AFT_TEST_BASH_REPLAY_SCAN_ENTRY_BUDGET",
+            std::ffi::OsStr::new("1"),
+        ));
+    }
+    let mut aft = AftProcess::spawn_with_env(&env);
     configure_background_without_storage(&mut aft, project.path(), SESSION);
-    let drained = drain(&mut aft, SESSION);
-    assert_eq!(drained["success"], true, "drain failed: {drained:?}");
+    // Configure replays one bounded disk batch before dispatch resumes. Observe
+    // the completion queue itself: status would recover the task on demand and
+    // could hide a broken configure continuation.
+    let started = Instant::now();
+    let drained = loop {
+        let drained = drain(&mut aft, SESSION);
+        assert_eq!(drained["success"], true, "drain failed: {drained:?}");
+        if drained["bg_completions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|completion| completion["task_id"] == task_id)
+        {
+            break drained;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "replay did not publish completion for {task_id}: {drained:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
     let completion = drained["bg_completions"]
         .as_array()
         .unwrap()
@@ -2126,6 +2168,11 @@ fn configure_replays_background_tasks_from_default_storage_dir() {
         .contains("default-replay"));
     let acked = ack(&mut aft, SESSION, &task_id);
     assert_eq!(acked["success"], true, "ack failed: {acked:?}");
+    assert!(drain(&mut aft, SESSION)["bg_completions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|completion| completion["task_id"] != task_id));
     assert!(aft.shutdown().success());
 }
 

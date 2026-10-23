@@ -13,7 +13,9 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 pub mod assembly;
 mod generation;
 #[cfg(test)]
-pub(crate) use generation::wait_for_derived_checkpoint_for_test;
+pub(crate) use generation::{
+    checkpoint_test_hooks, wait_for_derived_checkpoint_for_test, CheckpointTestHooks,
+};
 pub(crate) mod io;
 #[cfg(aft_views_lazy_benchmark)]
 pub mod lazy_read_benchmark;
