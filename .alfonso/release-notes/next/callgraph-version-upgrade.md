@@ -1,0 +1,1 @@
+- After an upgrade changes the call-graph format, a project that isn't a Git repository now rebuilds its call graph in the background and removes the old unreadable copy instead of keeping it forever (#771).
