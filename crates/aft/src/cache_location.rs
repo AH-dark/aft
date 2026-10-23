@@ -18,9 +18,13 @@ use serde::{Deserialize, Serialize};
 
 pub const CACHE_DIR_UNAVAILABLE: &str = "cache_dir_unavailable";
 pub const CACHE_DIR_ON_STORAGE_DEVICE: &str = "cache_dir_on_storage_device";
+/// `storage.cache_dir` contains the durable storage root or sits inside it.
+pub const CACHE_DIR_OVERLAPS_STORAGE: &str = "cache_dir_overlaps_storage";
 pub(crate) fn unavailable_code(reason: &str) -> &'static str {
     if reason.starts_with(CACHE_DIR_ON_STORAGE_DEVICE) {
         CACHE_DIR_ON_STORAGE_DEVICE
+    } else if reason.starts_with(CACHE_DIR_OVERLAPS_STORAGE) {
+        CACHE_DIR_OVERLAPS_STORAGE
     } else {
         CACHE_DIR_UNAVAILABLE
     }
@@ -48,6 +52,36 @@ impl std::error::Error for ForeignCacheOwner {}
 fn foreign_owner_error() -> io::Error {
     io::Error::other(ForeignCacheOwner)
 }
+/// `storage.cache_dir` and the durable storage root overlap: the cache
+/// folder contains durable storage or sits inside it. A configuration error,
+/// never recorded as an unavailable cache root: with cache `/data` and storage
+/// `/data/aft` the cache root would be the storage root itself, and recording
+/// it would refuse every durable write.
+#[derive(Debug)]
+struct StorageOverlap(String);
+impl std::fmt::Display for StorageOverlap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for StorageOverlap {}
+fn storage_overlap_error(cache_dir: &Path, storage: &Path) -> io::Error {
+    io::Error::other(StorageOverlap(format!(
+        "{CACHE_DIR_OVERLAPS_STORAGE}: storage.cache_dir {} overlaps the storage root {}; the cache folder must neither contain durable storage nor sit inside it",
+        cache_dir.display(),
+        storage.display()
+    )))
+}
+/// Whether `a` and `b` are the same folder or one contains the other, under
+/// any of their spellings (see [`path_spellings`]).
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    let b_spellings = path_spellings(b);
+    path_spellings(a).iter().any(|a| {
+        b_spellings
+            .iter()
+            .any(|b| a.starts_with(b) || b.starts_with(a))
+    })
+}
 const OWNER: &str = ".aft-owner.json";
 const IN_USE: &str = ".aft-in-use.lock";
 const DAEMON_USE: &str = "daemon-use.lock";
@@ -63,6 +97,9 @@ struct AccessRegistry {
     // whether or not that cache root is currently available. New rebuildable
     // cache folders must never appear under these roots.
     split_durable: HashSet<PathBuf>,
+    // Cache roots refused because they overlap durable storage. They are
+    // never given a location entry, not even the "not prepared" placeholder.
+    storage_overlaps: HashSet<PathBuf>,
 }
 static STATUS: OnceLock<Mutex<AccessRegistry>> = OnceLock::new();
 #[cfg(test)]
@@ -303,19 +340,27 @@ pub fn cache_root(config: &crate::config::Config) -> PathBuf {
         .map(|root| root.join("aft"))
         .unwrap_or_else(|| crate::bash_background::storage_dir(config.storage_dir.as_deref()));
     if config.cache_dir.is_some() {
-        STATUS
+        // A root that is, contains or sits inside durable storage never gets a
+        // location entry: an entry denies every path under it, durable
+        // writes included.
+        let storage = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        let mut registry = STATUS
             .get_or_init(Default::default)
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .locations
-            .entry(root.clone())
-            .or_insert_with(|| {
-                (
-                    Some("configured cache root has not been prepared".into()),
-                    0,
-                    None,
-                )
-            });
+            .unwrap_or_else(|error| error.into_inner());
+        if registry.storage_overlaps.contains(&root)
+            || root.starts_with(&storage)
+            || storage.starts_with(&root)
+        {
+            return root;
+        }
+        registry.locations.entry(root.clone()).or_insert_with(|| {
+            (
+                Some("configured cache root has not been prepared".into()),
+                0,
+                None,
+            )
+        });
     }
     root
 }
@@ -884,6 +929,11 @@ pub fn prepare_cache_root(
             if !parent.is_absolute() {
                 return Err(io::Error::other("path must be absolute after ~ expansion"));
             }
+            // Refuse an overlap with durable storage before anything about
+            // this cache folder is registered or created.
+            if paths_overlap(parent, &storage) {
+                return Err(storage_overlap_error(parent, &storage));
+            }
             // A configured path may run through symlinks the user chose (macOS
             // /var, a symlinked home, an alias of a /Volumes mount). Resolve it
             // once here; the resolved directory is then pinned by device and
@@ -919,13 +969,15 @@ pub fn prepare_cache_root(
             } else {
                 PinnedDir::pin_unregistered_root(existing)?
             };
+            // The same check by directory identity, which also catches an
+            // overlap through a bind mount or another alias.
             if storage_exists {
                 if overlap(&parent, durable_pin.path())? {
-                    return Err(io::Error::other("cache root overlaps the storage root"));
+                    return Err(storage_overlap_error(configured, &storage));
                 }
             } else {
                 if has_ancestor(durable_pin.path(), expected_parent)? {
-                    return Err(io::Error::other("cache root overlaps the storage root"));
+                    return Err(storage_overlap_error(configured, &storage));
                 }
             }
             let roots = STATUS
@@ -1193,11 +1245,29 @@ pub fn prepare_cache_root(
             // It is never recorded in the process-wide registry, which would
             // refuse every later path under the root until a restart.
             let busy = error.kind() == io::ErrorKind::WouldBlock;
-            config.cache_epoch = if requested.is_none() {
+            let storage_overlap = error
+                .get_ref()
+                .is_some_and(|error| error.is::<StorageOverlap>())
+                || paths_overlap(&root, &storage);
+            if storage_overlap && requested.is_some() {
+                // Drop the "not prepared" placeholders `cache_root` may have
+                // added, and keep it from adding them again.
+                let mut registry = STATUS
+                    .get_or_init(Default::default)
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                for refused in std::iter::once(&root).chain(configured_root.as_ref()) {
+                    registry.locations.remove(refused);
+                    registry.storage_overlaps.insert(refused.clone());
+                }
+            }
+            config.cache_epoch = if requested.is_none() || storage_overlap {
                 // Without `storage.cache_dir` the "cache root" is the durable
-                // storage root itself. The registry only describes separate
-                // cache roots; recording durable storage there would block
-                // backups, bash task records and every other durable write.
+                // storage root itself, and an overlapping cache root contains
+                // durable storage or sits inside it. The registry only
+                // describes separate cache roots; recording either there
+                // would block backups, bash task records and every other
+                // durable write.
                 0
             } else if foreign_owner || busy {
                 status(&root).1

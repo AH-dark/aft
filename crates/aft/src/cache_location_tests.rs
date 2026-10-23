@@ -2389,6 +2389,61 @@ fn cache_location_preflight_failure_preserves_all_inventory() {
 }
 
 #[test]
+fn cache_location_overlapping_cache_dir_is_refused_without_blocking_durable_writes() {
+    // `storage.cache_dir` that contains durable storage (cache /data, storage
+    // /data/aft: the cache root would be the storage root itself), or sits
+    // inside it, is a configuration error. Durable writes keep working, and
+    // setting cache_dir back to null recovers with no restart.
+    let temp = tempfile::tempdir().unwrap();
+    let data = fs::canonicalize(temp.path()).unwrap().join("data");
+    let storage = data.join("aft");
+    fs::create_dir_all(&storage).unwrap();
+    for parent in [data.clone(), storage.join("cache")] {
+        fs::create_dir_all(&parent).unwrap();
+        let mut config = Config {
+            storage_dir: Some(storage.clone()),
+            cache_dir: Some(parent.clone()),
+            ..Default::default()
+        };
+        let warning = prepare_cache_root(&mut config).expect("overlap must be refused");
+        assert_eq!(warning.code, CACHE_DIR_OVERLAPS_STORAGE, "{warning:?}");
+        assert!(
+            warning.message.contains(&parent.display().to_string())
+                && warning.message.contains(&storage.display().to_string()),
+            "{warning:?}"
+        );
+        let reason = cache_unavailable(&config).expect("caches stay off");
+        assert_eq!(unavailable_code(&reason), CACHE_DIR_OVERLAPS_STORAGE);
+        // A refused cache setting still yields the cache root path; using it
+        // must not register durable storage either.
+        let _ = cache_root(&config);
+
+        crate::private_storage::open_root(&storage).expect("durable root refused");
+        for durable in [
+            "opencode/backups/session/entry",
+            "opencode/bash-tasks/task.json",
+        ] {
+            let path = storage.join(durable);
+            crate::private_storage::create_dir_all(path.parent().unwrap())
+                .unwrap_or_else(|error| panic!("{durable}: {error}"));
+            crate::private_storage::write(&path, b"kept")
+                .unwrap_or_else(|error| panic!("{durable}: {error}"));
+        }
+
+        let mut back = Config {
+            storage_dir: Some(storage.clone()),
+            cache_dir_opt_out: true,
+            ..Default::default()
+        };
+        let warning = prepare_cache_root(&mut back);
+        assert!(warning.is_none(), "{warning:?}");
+        assert!(cache_unavailable(&back).is_none());
+        crate::private_storage::write(storage.join("opencode/backups/session/after"), b"kept")
+            .expect("durable write refused after cache_dir was set back to null");
+    }
+}
+
+#[test]
 fn cache_location_rejects_storage_overlap_and_nested_artifact_roots() {
     let temp = tempfile::tempdir().unwrap();
     let storage = temp.path().join("storage");
