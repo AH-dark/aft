@@ -110,6 +110,11 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
+    // The shadowed reader retains the generation pins until this answer ends.
+    let store = match store.read_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return store_error_response(&req.id, "trace_to_symbol", error),
+    };
     if let Err(error) = ensure_symbol_resolves(&store, &file_path, symbol) {
         return store_error_response(&req.id, "trace_to_symbol", error);
     }

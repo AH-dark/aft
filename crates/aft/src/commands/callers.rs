@@ -95,9 +95,14 @@ fn answer_callers(req: &RawRequest, ctx: &AppContext) -> Response {
         return response;
     }
 
+    // Retain the pinned reader while a separate transaction builds the answer.
+    let snapshot = match store.read_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return store_error_response(&req.id, "callers", error),
+    };
     let started = Instant::now();
     let include_tests = include_tests_param(req);
-    let outcome = callers_result(&store, &file_path, symbol, depth, include_tests);
+    let outcome = callers_result(&snapshot, &file_path, symbol, depth, include_tests);
     let elapsed_ms = started.elapsed().as_millis();
 
     match outcome {

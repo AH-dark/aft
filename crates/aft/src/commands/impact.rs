@@ -93,7 +93,18 @@ fn answer_impact(req: &RawRequest, ctx: &AppContext) -> Response {
         return response;
     }
 
-    match impact_result(&store, &file_path, symbol, depth, include_tests_param(req)) {
+    // Retain the pinned reader while a separate transaction builds the answer.
+    let snapshot = match store.read_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return store_error_response(&req.id, "impact", error),
+    };
+    match impact_result(
+        &snapshot,
+        &file_path,
+        symbol,
+        depth,
+        include_tests_param(req),
+    ) {
         Ok(result) => {
             note_callgraph_served(ctx, "impact", 0, "ok");
             serialized_response(&req.id, "impact", &result)

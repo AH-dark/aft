@@ -96,7 +96,18 @@ fn answer_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
         return response;
     }
 
-    match trace_to_result(&store, &file_path, symbol, depth, include_tests_param(req)) {
+    // The pinned reader remains in scope until the snapshot answer is built.
+    let snapshot = match store.read_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return store_error_response(&req.id, "trace_to", error),
+    };
+    match trace_to_result(
+        &snapshot,
+        &file_path,
+        symbol,
+        depth,
+        include_tests_param(req),
+    ) {
         Ok(result) => {
             note_callgraph_served(ctx, "trace_to", 0, "ok");
             let envelope = trace::build_trace_to_envelope(

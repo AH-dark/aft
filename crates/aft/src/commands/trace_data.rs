@@ -128,8 +128,13 @@ fn answer_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
         return response;
     }
 
+    // The pinned reader remains in scope until the snapshot answer is built.
+    let snapshot = match store.read_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return store_error_response(&req.id, "trace_data", error),
+    };
     match trace_data_result(
-        &store,
+        &snapshot,
         &file_path,
         symbol,
         expression,

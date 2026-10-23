@@ -73,13 +73,13 @@ pub fn strict_walk(root: &Path, policy: &TrigramPolicy, seq: u64) -> Walk {
     for result in crate::search_index::project_walk_builder(root).build() {
         let item = match result {
             Ok(item) => item,
-            Err(_) => {
-                walk.gaps.push(root.to_path_buf());
+            Err(error) => {
+                record_walk_error(&mut walk, &error, root);
                 continue;
             }
         };
-        if item.error().is_some() {
-            walk.gaps.push(item.path().to_path_buf());
+        if let Some(error) = item.error() {
+            record_walk_error(&mut walk, error, item.path());
         }
         if !item.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
@@ -99,6 +99,22 @@ pub fn strict_walk(root: &Path, policy: &TrigramPolicy, seq: u64) -> Walk {
     walk.gaps.sort();
     walk.gaps.dedup();
     walk
+}
+
+fn record_walk_error(walk: &mut Walk, error: &ignore::Error, fallback: &Path) {
+    match error {
+        ignore::Error::WithPath { path, err } => record_walk_error(walk, err, path),
+        ignore::Error::WithLineNumber { err, .. } | ignore::Error::WithDepth { err, .. } => {
+            record_walk_error(walk, err, fallback);
+        }
+        ignore::Error::Partial(errors) if !errors.is_empty() => {
+            for error in errors {
+                record_walk_error(walk, error, fallback);
+            }
+        }
+        ignore::Error::Loop { child, .. } => walk.gaps.push(child.clone()),
+        _ => walk.gaps.push(fallback.to_path_buf()),
+    }
 }
 
 /// Initial checkout loading, branch switches, lost watcher events and ignore
@@ -178,4 +194,54 @@ pub fn apply_event(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn walker_error_keeps_the_named_culprit_instead_of_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        let culprit = root.path().join("nested/.gitignore");
+        let error = ignore::Error::WithPath {
+            path: culprit.clone(),
+            err: Box::new(ignore::Error::Io(std::io::Error::other("unreadable rules"))),
+        };
+        let mut walk = Walk::default();
+        record_walk_error(&mut walk, &error, root.path());
+        assert_eq!(walk.gaps, vec![culprit]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_walker_errors_keep_raw_paths_distinct_from_lossy_aliases() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = tempfile::tempdir().unwrap();
+        let raw = root
+            .path()
+            .join(std::ffi::OsString::from_vec(b"rules-\xff".to_vec()));
+        let replacement = root.path().join("rules-\u{fffd}");
+        let named = |path: PathBuf| ignore::Error::WithPath {
+            path,
+            err: Box::new(ignore::Error::Io(std::io::Error::other("unreadable"))),
+        };
+        let error = ignore::Error::Partial(vec![named(raw.clone()), named(replacement.clone())]);
+        let mut walk = Walk::default();
+        record_walk_error(&mut walk, &error, root.path());
+        assert_eq!(walk.gaps, vec![raw, replacement]);
+        assert_ne!(walk.gaps[0], walk.gaps[1]);
+    }
+
+    #[test]
+    fn unnamed_walker_errors_keep_a_conservative_root_gap() {
+        let root = tempfile::tempdir().unwrap();
+        let mut walk = Walk::default();
+        record_walk_error(
+            &mut walk,
+            &ignore::Error::Io(std::io::Error::other("unknown traversal failure")),
+            root.path(),
+        );
+        assert_eq!(walk.gaps, vec![root.path().to_path_buf()]);
+    }
 }

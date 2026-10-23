@@ -131,6 +131,7 @@ impl PlaneOracle for Oracle<'_> {
             membership: paths.into_iter().collect(),
             matches,
             gaps: Vec::new(),
+            relative_gaps: Vec::new(),
         }
     }
 }
@@ -689,7 +690,7 @@ fn trigram_driver_rejects_obsolete_install_and_reports_actual_gaps() {
     let open: Arc<Opener> = Arc::new(move |_, snapshot| {
         GenerationIndex::new(shared.clone(), snapshot, policy(), &Default::default()).map_err(
             |reason| aft::views::contracts::PlaneError {
-                plane: FamilyPlane::Trigram,
+                plane: Some(FamilyPlane::Trigram),
                 reason,
             },
         )

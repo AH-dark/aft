@@ -230,6 +230,23 @@ fn empty_desired_head_does_not_take_the_no_op_path() {
 }
 
 #[test]
+fn competing_publication_is_reported_as_conflict_not_corruption() {
+    let project = repository(2);
+    let storage = tempfile::tempdir().unwrap();
+    publish_checkout(&request(project.path(), storage.path(), "base", &[])).unwrap();
+    let next = request(project.path(), storage.path(), "next", &[]);
+    let mut first = prepare_checkout(&next, &mut |_| Ok(())).unwrap();
+    let mut second = prepare_checkout(&next, &mut |_| Ok(())).unwrap();
+    let winner = first.commit().unwrap().generation.unwrap();
+    let error = second.commit().unwrap_err();
+    assert!(error.to_string().starts_with("view publication conflict:"));
+    assert!(error.to_string().contains(&winner));
+    assert!(
+        matches!(error, ViewError::PublicationConflict { current_generation: Some(current), .. } if current == winner)
+    );
+}
+
+#[test]
 fn candidate_bytes_are_released_before_derived_materialization() {
     let project = repository(3);
     let storage = tempfile::tempdir().unwrap();

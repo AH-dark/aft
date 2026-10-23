@@ -299,7 +299,7 @@ impl ManifestV2 {
     }
 }
 
-fn fingerprint_bytes(bytes: &[u8]) -> [u8; 32] {
+pub(super) fn fingerprint_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"aft/view-manifest/v2");
     hasher.update(bytes);

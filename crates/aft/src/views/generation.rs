@@ -12,8 +12,175 @@ use std::{
 };
 
 use rusqlite::Connection;
+use serde::{
+    de::{Error as _, SeqAccess, Visitor},
+    Deserialize, Deserializer,
+};
 
 use super::{Result, ViewError, ViewStore};
+
+// Protection scans must finish within one common allowance before any unlink.
+const GENERATION_DIRECTORY_LIMIT: usize = 65_536;
+
+fn generation_directory_entries(directory: &Path, limit: usize) -> Result<Vec<fs::DirEntry>> {
+    let entries = fs::read_dir(directory)?
+        .take(limit.saturating_add(1))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    if entries.len() > limit {
+        return Err(ViewError::InvalidManifest(format!(
+            "generation directory scan exceeded {limit} entries"
+        )));
+    }
+    Ok(entries)
+}
+
+#[derive(Deserialize)]
+struct ReferenceCensus {
+    path_identity_version: u8,
+    #[serde(default)]
+    format_version: Option<u8>,
+    #[serde(deserialize_with = "reference_entries")]
+    entries: ReferenceEntries,
+}
+
+#[derive(Default)]
+struct ReferenceEntries {
+    keys: std::collections::BTreeSet<[u8; 32]>,
+    legacy_seen: bool,
+    states_seen: bool,
+    synthetic_without_key: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ReferenceKey {
+    Legacy(String),
+    State { state: String, key: Option<String> },
+}
+
+#[derive(Deserialize)]
+struct ReferenceMember {
+    kind: String,
+    planes: Option<std::collections::BTreeMap<String, Option<ReferenceKey>>>,
+}
+
+fn reference_entries<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<ReferenceEntries, D::Error> {
+    struct EntriesVisitor;
+    impl<'de> Visitor<'de> for EntriesVisitor {
+        type Value = ReferenceEntries;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("manifest entries")
+        }
+        fn visit_seq<S: SeqAccess<'de>>(
+            self,
+            mut sequence: S,
+        ) -> std::result::Result<Self::Value, S::Error> {
+            let mut result = ReferenceEntries::default();
+            while let Some(member) = sequence.next_element::<ReferenceMember>()? {
+                let planes = match member.kind.as_str() {
+                    "regular" | "synthetic" => member
+                        .planes
+                        .ok_or_else(|| S::Error::missing_field("planes"))?,
+                    "symlink" | "gitlink" => member.planes.unwrap_or_default(),
+                    _ => {
+                        return Err(S::Error::custom(
+                            "unsupported member kind in reference census",
+                        ))
+                    }
+                };
+                if member.kind == "synthetic"
+                    && !planes.get("callgraph").is_some_and(Option::is_some)
+                {
+                    result.synthetic_without_key = true;
+                }
+                for key in planes.into_values().flatten() {
+                    let key = match key {
+                        ReferenceKey::Legacy(key) => {
+                            result.legacy_seen = true;
+                            Some(key)
+                        }
+                        ReferenceKey::State { state, key } => {
+                            result.states_seen = true;
+                            match state.as_str() {
+                                "ready" => Some(key.ok_or_else(|| S::Error::missing_field("key"))?),
+                                "pending" | "failed" => None,
+                                _ => {
+                                    return Err(S::Error::custom(
+                                        "unsupported plane state in reference census",
+                                    ))
+                                }
+                            }
+                        }
+                    };
+                    if let Some(key) = key.and_then(|key| crate::blob_store::v2::parse_hex32(&key))
+                    {
+                        result.keys.insert(key);
+                    }
+                }
+            }
+            Ok(result)
+        }
+    }
+    deserializer.deserialize_seq(EntriesVisitor)
+}
+
+fn manifest_reference_keys(
+    generation: &str,
+    bytes: &[u8],
+) -> Result<std::collections::BTreeSet<[u8; 32]>> {
+    let census: ReferenceCensus = match serde_json::from_slice(bytes) {
+        Ok(census) => census,
+        Err(error) => {
+            if let Some(name) = super::manifest_v2::GenerationName::parse(generation) {
+                return validated_v2_reference_keys(&name, bytes);
+            }
+            return Err(error.into());
+        }
+    };
+    if census.path_identity_version != super::PATH_IDENTITY_VERSION {
+        return Err(ViewError::InvalidManifest(
+            "unsupported path identity in reference census".into(),
+        ));
+    }
+    match census.format_version {
+        None if !census.entries.states_seen && !census.entries.synthetic_without_key => {
+            Ok(census.entries.keys)
+        }
+        None => Err(ViewError::InvalidManifest(
+            "invalid legacy reference encoding".into(),
+        )),
+        Some(super::manifest_v2::MANIFEST_FORMAT_VERSION) if !census.entries.legacy_seen => {
+            let name = super::manifest_v2::GenerationName::parse(generation).ok_or_else(|| {
+                ViewError::GenerationMismatch("invalid v2 reference generation name".into())
+            })?;
+            // Writers use canonical bytes with one trailing newline. Compatible
+            // noncanonical inputs must still match the generation name's content fingerprint.
+            let canonical = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+            if super::manifest_v2::fingerprint_bytes(canonical) != *name.content() {
+                return validated_v2_reference_keys(&name, bytes);
+            }
+            Ok(census.entries.keys)
+        }
+        Some(version) => Err(ViewError::InvalidManifest(format!(
+            "unsupported reference manifest format {version}"
+        ))),
+    }
+}
+
+fn validated_v2_reference_keys(
+    name: &super::manifest_v2::GenerationName,
+    bytes: &[u8],
+) -> Result<std::collections::BTreeSet<[u8; 32]>> {
+    let manifest = super::manifest_v2::ManifestV2::from_json_bytes(bytes)?;
+    if manifest.content_fingerprint()? != *name.content() {
+        return Err(ViewError::GenerationMismatch(
+            "reference manifest does not match its generation".into(),
+        ));
+    }
+    Ok(manifest.ready_keys().map(|key| *key.as_bytes()).collect())
+}
 
 impl ViewStore {
     pub fn derived_path(&self, generation: &str) -> Result<PathBuf> {
@@ -65,13 +232,7 @@ impl ViewStore {
         &self,
     ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<[u8; 32]>>> {
         let mut result = std::collections::BTreeMap::new();
-        for (index, entry) in fs::read_dir(self.view_dir())?.take(4097).enumerate() {
-            if index == 4096 {
-                return Err(ViewError::InvalidManifest(
-                    "blob reference scan exceeded 4096 entries".into(),
-                ));
-            }
-            let entry = entry?;
+        for entry in generation_directory_entries(self.view_dir(), GENERATION_DIRECTORY_LIMIT)? {
             let name = entry.file_name();
             let Some(generation) = name
                 .to_str()
@@ -80,11 +241,7 @@ impl ViewStore {
             else {
                 continue;
             };
-            let manifest = self.load_manifest(generation)?;
-            let keys = manifest
-                .plane_keys()
-                .filter_map(|(_, key)| crate::blob_store::v2::parse_hex32(key))
-                .collect();
+            let keys = manifest_reference_keys(generation, &fs::read(entry.path())?)?;
             result.insert(generation.to_owned(), keys);
         }
         Ok(result)
@@ -101,6 +258,10 @@ impl ViewStore {
     }
 
     fn sweep_generations_impl(&self, admission_locked: bool) -> Result<usize> {
+        self.sweep_generations_bounded(admission_locked, GENERATION_DIRECTORY_LIMIT)
+    }
+
+    fn sweep_generations_bounded(&self, admission_locked: bool, limit: usize) -> Result<usize> {
         // A publisher cannot add a reference after the ownership snapshot and
         // release its base pin before the sweep checks that pin.
         let mut pointer = self.open_pointer_connection()?;
@@ -117,14 +278,7 @@ impl ViewStore {
         let mut temporaries: HashMap<String, Vec<PathBuf>> = HashMap::new();
         // A partial ownership snapshot could omit a reference to a shared
         // derived file. Fail closed at the iterator bound, before any deletion.
-        let entries = fs::read_dir(self.view_dir())?
-            .take(65537)
-            .collect::<std::io::Result<Vec<_>>>()?;
-        if entries.len() > 65536 {
-            return Err(ViewError::InvalidManifest(
-                "generation sweep exceeded 65536 entries".into(),
-            ));
-        }
+        let entries = generation_directory_entries(self.view_dir(), limit)?;
         for entry in entries {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -215,7 +369,7 @@ impl ViewStore {
     pub(super) fn remove_generation_files(&self, generation: &str) {
         let temporary_prefix = format!(".manifest-{generation}.json.tmp.");
         if let Ok(entries) = fs::read_dir(self.view_dir()) {
-            for entry in entries.take(65536).flatten() {
+            for entry in entries.take(GENERATION_DIRECTORY_LIMIT).flatten() {
                 if entry
                     .file_name()
                     .to_str()
@@ -647,6 +801,133 @@ mod tests {
         )
         .unwrap();
         assert!(view.blob_references_by_generation().unwrap()["bad"].is_empty());
+    }
+
+    fn reference_fixture(view: &ViewStore, generation: &str) {
+        let manifest = crate::views::Manifest::new([(
+            crate::views::RelPath::new(b"a.rs".to_vec()).unwrap(),
+            crate::views::ManifestEntry::Regular {
+                mode: 0o100644,
+                resolution_input: false,
+                planes: crate::views::RegularPlanes {
+                    semantic: None,
+                    callgraph: Some("11".repeat(32)),
+                },
+            },
+        )])
+        .unwrap();
+        fs::write(
+            view.manifest_path(generation).unwrap(),
+            manifest.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reference_scan_accepts_a_complete_directory_above_the_previous_bound() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "many-generations").unwrap();
+        for index in 0..4097 {
+            fs::write(view.view_dir().join(format!("retained-{index}")), []).unwrap();
+        }
+        reference_fixture(&view, "retained");
+        assert_eq!(
+            view.blob_references_by_generation().unwrap()["retained"],
+            std::collections::BTreeSet::from([[0x11; 32]])
+        );
+    }
+
+    #[test]
+    fn reference_scan_extracts_keys_without_deserializing_membership() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "keys-only").unwrap();
+        reference_fixture(&view, "keys");
+        crate::views::take_manifest_decodes();
+        assert_eq!(
+            view.blob_references_by_generation().unwrap()["keys"],
+            std::collections::BTreeSet::from([[0x11; 32]])
+        );
+        assert_eq!(crate::views::take_manifest_decodes(), 0);
+    }
+
+    #[test]
+    fn generation_scan_refuses_an_incomplete_census_before_unlink() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "incomplete-census").unwrap();
+        let artifact = view.trigram_path("unpublished").unwrap();
+        fs::write(&artifact, []).unwrap();
+        fs::write(view.view_dir().join("another-entry"), []).unwrap();
+        assert!(view.sweep_generations_bounded(false, 1).is_err());
+        assert!(artifact.exists());
+    }
+
+    #[test]
+    fn reference_scan_preserves_v2_content_fencing_and_noncanonical_compatibility() {
+        use crate::views::manifest_v2::{
+            EntryPlanes, EntryV2, GenerationName, ManifestHeader, ManifestV2, Producers,
+        };
+        use crate::views::readiness::PlaneState;
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "v2-reference-fence").unwrap();
+        let mut manifest = ManifestV2::new(ManifestHeader {
+            producers: Producers {
+                trigram: "t".into(),
+                semantic: Some("s".into()),
+                callgraph: "c".into(),
+            },
+            head_tree: None,
+            ignore_fingerprint: None,
+            segment: None,
+        });
+        manifest
+            .insert(
+                crate::views::RelPath::new(b"a.rs".to_vec()).unwrap(),
+                EntryV2::regular(
+                    crate::blob_store::v2::ContentHash::of(b"a"),
+                    1,
+                    EntryPlanes {
+                        semantic: Some(PlaneState::Ready {
+                            key: "22".repeat(32),
+                        }),
+                        trigram: None,
+                        callgraph: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let name = GenerationName::for_manifest(&manifest).unwrap().to_string();
+        let path = view.manifest_path(&name).unwrap();
+        let bytes = manifest.to_json_bytes().unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let expected = std::collections::BTreeSet::from([[0x22; 32]]);
+        assert_eq!(
+            view.blob_references_by_generation().unwrap()[&name],
+            expected
+        );
+        let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        assert_eq!(
+            view.blob_references_by_generation().unwrap()[&name],
+            expected
+        );
+        json["entries"][0]["planes"]["semantic"]["key"] = "33".repeat(32).into();
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(view.blob_references_by_generation().is_err());
+    }
+
+    #[test]
+    fn reference_scan_refuses_unknown_formats_instead_of_ignoring_their_keys() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "future-references").unwrap();
+        fs::write(
+            view.manifest_path("future").unwrap(),
+            format!(
+                r#"{{"format_version":255,"path_identity_version":{},"entries":[]}}"#,
+                crate::views::PATH_IDENTITY_VERSION,
+            ),
+        )
+        .unwrap();
+        assert!(view.blob_references_by_generation().is_err());
     }
 
     #[test]
