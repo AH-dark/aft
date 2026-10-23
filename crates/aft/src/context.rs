@@ -1979,6 +1979,7 @@ pub struct CallgraphUnappliedChanges {
     pub store_paths: BTreeSet<String>,
     /// A disk comparison has not yet established which store files changed.
     pub whole_store: bool,
+    pub(crate) reconcile_query: Option<crate::callgraph_maintenance::CallgraphReconcileQuery>,
     /// Files whose changes the checkout's published view has not installed.
     pub view_paths: BTreeSet<String>,
     /// The view is republishing the whole checkout, so which files changed
@@ -1987,6 +1988,20 @@ pub struct CallgraphUnappliedChanges {
 }
 
 impl CallgraphUnappliedChanges {
+    pub(crate) fn observe_reconciles(&self) -> bool {
+        self.reconcile_query.is_some()
+    }
+
+    pub(crate) fn resolved(&self) -> Self {
+        let mut resolved = self.clone();
+        if let Some(query) = resolved.reconcile_query.take() {
+            let (whole_store, paths) = query.pending();
+            resolved.whole_store |= whole_store;
+            resolved.store_paths.extend(paths);
+        }
+        resolved
+    }
+
     pub fn is_empty(&self) -> bool {
         self.store_paths.is_empty()
             && self.view_paths.is_empty()
@@ -6632,16 +6647,15 @@ impl AppContext {
         }
         let project_root = self.callgraph_project_root();
         if !self.config().views.enabled && self.callgraph_writer() {
-            // Capture the comparison before its downstream refresh queue. The
-            // first query can itself install the reused reader, so an unopened
-            // configured store also needs a conservative whole-store gap.
-            changes.whole_store = self.callgraph_reconcile.outstanding()
-                || (self.configure_generation() > 0
-                    && self
-                        .callgraph_store
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .is_none());
+            if let Some(root) = project_root.clone() {
+                // Observe real comparisons, including one this command starts
+                // when it installs a reused generation. An unopened store is
+                // not itself pending: a first cold build needs no reconcile.
+                changes.reconcile_query = Some(
+                    self.callgraph_reconcile
+                        .observe_query(self.configure_generation(), root),
+                );
+            }
         }
         let mut store_paths: BTreeSet<PathBuf> = self.pending_callgraph_store_paths.lock().clone();
         #[cfg(test)]
@@ -9555,7 +9569,8 @@ impl AppContext {
     /// a read-only root follows the owner's published store.
     pub(crate) fn request_callgraph_reconcile(&self, reason: &str) {
         if self.callgraph_writer() && self.config().indexes.callgraph {
-            self.callgraph_reconcile.request(reason);
+            self.callgraph_reconcile
+                .request_for_generation(reason, self.configure_generation());
         }
     }
 
@@ -17248,12 +17263,16 @@ mod callgraph_store_for_ops_tests {
         (dirs, restarted)
     }
 
-    fn finalized_restart_callers(ctx: &AppContext) -> crate::protocol::Response {
-        let request: RawRequest = serde_json::from_value(json!({
+    fn restart_callers_request(ctx: &AppContext) -> RawRequest {
+        serde_json::from_value(json!({
             "id": "restart-callers", "command": "callers",
             "file": ctx.callgraph_project_root().unwrap().join("src/lib.rs"), "symbol": "callee"
         }))
-        .unwrap();
+        .unwrap()
+    }
+
+    fn finalized_restart_callers(ctx: &AppContext) -> crate::protocol::Response {
+        let request = restart_callers_request(ctx);
         let (watcher, pending) = crate::response_finalize::query_pending(ctx, "callers");
         let mut response = crate::commands::callers::handle_callers(&request, ctx);
         crate::response_finalize::attach_watcher_query_gap(&mut response, watcher);
@@ -17262,14 +17281,93 @@ mod callgraph_store_for_ops_tests {
     }
 
     fn wait_for_restart_comparison(ctx: &AppContext) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while ctx.callgraph_reconcile.completed() == 0 || ctx.callgraph_reconcile.outstanding() {
-            assert!(
-                Instant::now() < deadline,
-                "startup comparison did not complete"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        assert!(
+            ctx.callgraph_reconcile
+                .wait_for_idle_for_test(Duration::from_secs(10)),
+            "startup comparison did not complete"
+        );
+    }
+
+    #[test]
+    fn cold_build_first_query_has_no_startup_pending() {
+        let (_dirs, ctx) = cold_build_context();
+        let root = ctx.callgraph_project_root().unwrap();
+        let directory = ctx.callgraph_store_dir();
+        crate::root_cache::configure_artifact_access(
+            &root,
+            directory.file_name().unwrap().to_str().unwrap(),
+            false,
+        );
+        ctx.advance_configure_generation();
+        let _wait = callgraph_build_wait_ms(&ctx, 30_000);
+        let response = finalized_restart_callers(&ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["total_callers"], 1);
+        assert_ne!(
+            response.data["complete"], false,
+            "freshly built graph is current: {response:?}"
+        );
+        assert!(response.data["gaps"].is_null(), "{response:?}");
+        assert_eq!(ctx.callgraph_reconcile.completed(), 0);
+        assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 1);
+    }
+
+    #[test]
+    fn startup_reconcile_unchanged_before_reply_clears_captured_uncertainty() {
+        let (_dirs, ctx) = restarted_callgraph_context();
+        let _wait = force_async_callgraph_builds(&ctx);
+        let (entered, release) = ctx.callgraph_reconcile.hold_next_for_test();
+        let (_, pending) = crate::response_finalize::query_pending(&ctx, "callers");
+        let mut response =
+            crate::commands::callers::handle_callers(&restart_callers_request(&ctx), &ctx);
+        assert!(response.success, "{response:?}");
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("held startup comparison");
+        drop(release);
+        wait_for_restart_comparison(&ctx);
+        crate::response_finalize::attach_callgraph_pending_gaps(&mut response, pending.as_ref());
+        assert_ne!(
+            response.data["complete"], false,
+            "unchanged comparison settled before this reply: {response:?}"
+        );
+        assert!(response.data["gaps"].is_null(), "{response:?}");
+    }
+
+    #[test]
+    fn startup_reconcile_changes_applied_before_reply_still_name_the_old_answers_gap() {
+        let (_dirs, ctx) = restarted_callgraph_context();
+        let _wait = force_async_callgraph_builds(&ctx);
+        let root = ctx.callgraph_project_root().unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn caller() { callee(); }\npub fn callee() {}\npub fn offline() { callee(); }\n",
+        )
+        .unwrap();
+        let worker =
+            crate::callgraph_store::isolated_callgraph_refresh_worker_for_test(root.clone());
+        let (refresh_entered, refresh_release) =
+            crate::callgraph_store::install_callgraph_refresh_worker_test_gate(root);
+        let (entered, release) = ctx.callgraph_reconcile.hold_next_for_test();
+        let (_, pending) = crate::response_finalize::query_pending(&ctx, "callers");
+        let mut response =
+            crate::commands::callers::handle_callers(&restart_callers_request(&ctx), &ctx);
+        assert_eq!(response.data["total_callers"], 1);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(release);
+        wait_for_restart_comparison(&ctx);
+        refresh_entered
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        drop(refresh_release);
+        assert!(worker.wait(Duration::from_secs(30)));
+        crate::response_finalize::attach_callgraph_pending_gaps(&mut response, pending.as_ref());
+        assert_eq!(
+            response.data["complete"], false,
+            "the old answer must retain the edits it missed: {response:?}"
+        );
+        assert!(names_pending_file(&response, "src/lib.rs"), "{response:?}");
+        assert_eq!(finalized_restart_callers(&ctx).data["total_callers"], 2);
     }
 
     #[test]
@@ -17283,6 +17381,10 @@ mod callgraph_store_for_ops_tests {
             "the first query must serve the reused graph: {response:?}"
         );
         assert_eq!(response.data["total_callers"], 1);
+        assert_eq!(
+            response.data["complete"], false,
+            "the first reused answer overlaps a held comparison: {response:?}"
+        );
         entered
             .recv_timeout(Duration::from_secs(5))
             .expect("held startup comparison");
@@ -17438,7 +17540,12 @@ mod callgraph_store_for_ops_tests {
             "unchanged startup must not hash source contents"
         );
         assert_eq!(report.changed_count(), 0);
-        assert!(!ctx.pending_changes_for_query(true).callgraph.whole_store);
+        assert!(
+            !ctx.pending_changes_for_query(true)
+                .callgraph
+                .resolved()
+                .whole_store
+        );
         read_us.sort_unstable();
         println!("startup measurement: bind_us={} install_us={} held_read_us={} scan_ms={} examined={} hashed={} changed={} read_samples={} read_p50_us={} read_max_us={}",
             bind_wall.as_micros(), install_wall.as_micros(), held_read_wall.as_micros(), scan_wall.as_millis(),
@@ -17460,11 +17567,10 @@ mod callgraph_store_for_ops_tests {
             "pub fn caller() { callee(); }\npub fn callee() {}\npub fn offline() { callee(); }\n",
         )
         .unwrap();
-        let held_writer = crate::fs_lock::try_acquire(
-            &crate::root_cache::writer_lease_path(&ctx.callgraph_store_dir()),
-            Duration::ZERO,
-        )
-        .unwrap();
+        let worker =
+            crate::callgraph_store::isolated_callgraph_refresh_worker_for_test(root.clone());
+        let (refresh_entered, refresh_release) =
+            crate::callgraph_store::install_callgraph_refresh_worker_test_gate(root.clone());
         let (entered, release) = ctx.callgraph_reconcile.hold_next_for_test();
         // Install the reused generation before capturing pending state, so the
         // held-job assertion also covers queries after the first one.
@@ -17493,24 +17599,21 @@ mod callgraph_store_for_ops_tests {
         );
         drop(release);
         wait_for_restart_comparison(&ctx);
+        refresh_entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("refresh reached its pre-apply gate");
         let response = finalized_restart_callers(&ctx);
         assert!(response.success, "{response:?}");
         assert_eq!(response.data["complete"], false, "{response:?}");
         assert!(names_pending_file(&response, "src/lib.rs"), "{response:?}");
-        drop(held_writer);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let response = finalized_restart_callers(&ctx);
-            if response.data["complete"] != false {
-                assert_eq!(response.data["total_callers"], 2, "{response:?}");
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "refresh did not settle: {response:?}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        drop(refresh_release);
+        assert!(
+            worker.wait(Duration::from_secs(30)),
+            "refresh did not settle after releasing its gate"
+        );
+        let response = finalized_restart_callers(&ctx);
+        assert_ne!(response.data["complete"], false, "{response:?}");
+        assert_eq!(response.data["total_callers"], 2, "{response:?}");
     }
 
     #[test]

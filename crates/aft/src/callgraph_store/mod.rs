@@ -8,6 +8,8 @@
 pub(crate) mod disk_facts;
 pub(crate) mod facts;
 pub mod join;
+#[cfg(target_os = "macos")]
+mod readiness_watch_macos;
 pub(crate) mod resolution_config;
 mod source_stat;
 use disk_facts::DiskFacts;
@@ -2413,33 +2415,47 @@ fn refresh_writer_available(root: &RefreshRoot, fallback: bool) -> std::io::Resu
 
 pub(crate) fn refresh_lease_release_event(event: &notify::Event, lease: &Path) -> bool {
     use notify::{event::ModifyKind, EventKind};
+    let Some(directory) = lease.parent() else {
+        return false;
+    };
+    let same_directory = |path: &Path| {
+        path == directory
+            || match (fs_canonicalize(path), fs_canonicalize(directory)) {
+                (Ok(path), Ok(directory)) => path == directory,
+                _ => false,
+            }
+    };
     let named_release = matches!(
         event.kind,
         EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
-    ) && event.paths.iter().any(|path| path == lease);
-    // Native watchers can report SQLite sidecar writes without the adjacent
-    // lease deletion. Those writes are readiness hints only if the lease is
-    // gone; the worker still checks writer liveness before reopening the store.
+    ) && event.paths.iter().any(|path| {
+        path.file_name() == lease.file_name() && path.parent().is_some_and(&same_directory)
+    });
+    // Native watchers can coalesce a deletion into directory/sidecar activity,
+    // and spell the watched directory through an alias (/var vs /private/var).
+    // Activity is a hint only when the lease is gone; the worker still checks
+    // writer liveness before reopening the store.
     let sibling_change = matches!(
         event.kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    ) && event
-        .paths
-        .iter()
-        .any(|path| path.parent() == lease.parent())
-        && !lease.exists();
+        EventKind::Any | EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) && !lease.exists()
+        && event
+            .paths
+            .iter()
+            .any(|path| same_directory(path) || path.parent().is_some_and(&same_directory));
     named_release || sibling_change
 }
 
-/// The watcher a readiness watch keeps on a callgraph directory. Windows uses
-/// AFT's own directory watcher: notify's Windows watcher can leave a read
-/// re-armed on a closed handle when a watch stops, and that read can then
-/// block another thread's file I/O forever (see the Windows
-/// `DirectoryWatcher`). macOS and Linux keep notify's watcher.
-#[cfg(not(windows))]
+/// Readiness notifications for one cache directory. macOS uses a vnode watch
+/// so unlinking a lease wakes the waiter even if FSEvents coalesces it away.
+/// Windows uses AFT's directory watcher to avoid re-arming notify reads on
+/// closed handles. Other platforms keep notify's watcher.
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) type ReadinessWatcher = notify::RecommendedWatcher;
 #[cfg(windows)]
 pub(crate) type ReadinessWatcher = ForwardingDirectoryWatcher;
+#[cfg(target_os = "macos")]
+pub(crate) type ReadinessWatcher = readiness_watch_macos::DirectoryWatch;
 
 /// Watches `dir`, without its subdirectories, and hands every event to
 /// `handler` until the returned watcher is dropped.
@@ -2450,7 +2466,7 @@ pub(crate) fn watch_readiness_directory<F>(
 where
     F: FnMut(notify::Result<notify::Event>) + Send + 'static,
 {
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         use notify::{RecursiveMode, Watcher};
         let mut watcher = notify::recommended_watcher(handler)?;
@@ -2461,12 +2477,15 @@ where
     {
         ForwardingDirectoryWatcher::start(dir, handler)
     }
+    #[cfg(target_os = "macos")]
+    {
+        readiness_watch_macos::DirectoryWatch::start(dir, handler)
+    }
 }
 
-/// A Windows `DirectoryWatcher` whose events go to a callback rather than a
-/// channel. `DirectoryWatcher` only sends to a channel, so a thread of its
-/// own drains that channel into the callback, as notify's watcher thread
-/// called it directly.
+/// A native `DirectoryWatcher` whose events go to a callback rather than a
+/// channel. A forwarding thread drains its channel without running callback
+/// work on the native watcher thread.
 #[cfg(windows)]
 pub(crate) struct ForwardingDirectoryWatcher {
     watcher: Option<crate::watcher_backend::DirectoryWatcher>,
@@ -2516,11 +2535,41 @@ impl Drop for ForwardingDirectoryWatcher {
     }
 }
 
+fn refresh_pointer_publication_event(
+    event: &notify::Event,
+    pointer: &Path,
+    known: &mut Option<String>,
+) -> bool {
+    if !matches!(
+        event.kind,
+        notify::EventKind::Any
+            | notify::EventKind::Create(_)
+            | notify::EventKind::Modify(_)
+            | notify::EventKind::Remove(_)
+    ) {
+        return false;
+    }
+    let named = event.paths.iter().any(|path| path == pointer);
+    if !named
+        && !pointer
+            .parent()
+            .is_some_and(|directory| event.paths.iter().any(|path| path == directory))
+    {
+        return false;
+    }
+    // A directory-level vnode event has no child filename. Compare the small
+    // pointer so publication still wakes a liveness check while a writer holds
+    // its lease, without reopening the database for unrelated directory writes.
+    let current = std::fs::read_to_string(pointer).ok();
+    let changed = current != *known;
+    *known = current;
+    named || changed
+}
+
 fn refresh_readiness_watch(
     shared: &Arc<RefreshWorkerShared>,
     root: &RefreshRoot,
 ) -> notify::Result<ReadinessWatcher> {
-    use notify::EventKind;
     #[cfg(test)]
     if refresh_worker_test_seam(&root.project_root).fail_watch {
         return Err(notify::Error::generic(
@@ -2534,16 +2583,14 @@ fn refresh_readiness_watch(
     let project_key = project_key_for_store(&root.callgraph_dir, &root.project_root)
         .map_err(|error| notify::Error::generic(&error.to_string()))?;
     let pointer = pointer_path(&watch_dir, &project_key);
+    let mut known_pointer = std::fs::read_to_string(&pointer).ok();
     watch_readiness_directory(&watch_dir, move |event: notify::Result<notify::Event>| {
         let Ok(event) = event else { return };
         let lease_released = refresh_lease_release_event(&event, &lease);
         #[cfg(test)]
         let lease_released =
             lease_released && !refresh_worker_test_seam(&root.project_root).ignore_lease_release;
-        let published = matches!(
-            event.kind,
-            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-        ) && event.paths.contains(&pointer);
+        let published = refresh_pointer_publication_event(&event, &pointer, &mut known_pointer);
         if lease_released || published {
             if let Some(shared) = shared.upgrade() {
                 let mut queue = shared
@@ -23473,6 +23520,32 @@ mod refresh_worker_tests {
     }
 
     #[test]
+    fn directory_readiness_hint_detects_publication_while_writer_lease_is_live() {
+        let temp = tempfile::tempdir().unwrap();
+        let pointer = temp.path().join("key.current");
+        let lease = temp.path().join("writer.lease");
+        fs::write(&pointer, "old.sqlite\n").unwrap();
+        fs::write(&lease, "live writer").unwrap();
+        let mut known = fs::read_to_string(&pointer).ok();
+        let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(temp.path().to_path_buf());
+        assert!(!refresh_pointer_publication_event(
+            &event, &pointer, &mut known
+        ));
+        fs::write(&pointer, "new.sqlite\n").unwrap();
+        assert!(refresh_pointer_publication_event(
+            &event, &pointer, &mut known
+        ));
+        assert!(
+            !refresh_lease_release_event(&event, &lease),
+            "publication is not lease release"
+        );
+        assert!(!refresh_pointer_publication_event(
+            &event, &pointer, &mut known
+        ));
+    }
+
+    #[test]
     fn sibling_write_signals_released_lease_but_not_live_writer() {
         use notify::{
             event::{DataChange, ModifyKind},
@@ -23489,9 +23562,35 @@ mod refresh_worker_tests {
         let access = Event::new(EventKind::Access(notify::event::AccessKind::Any))
             .add_path(temp.path().join("generation.sqlite-shm"));
         assert!(!refresh_lease_release_event(&access, &lease));
+        let coarse = Event::new(EventKind::Any).add_path(temp.path().join("writer.lease"));
+        assert!(refresh_lease_release_event(&coarse, &lease));
+        fs::write(&lease, b"live writer").unwrap();
+        assert!(!refresh_lease_release_event(&coarse, &lease));
         let unrelated = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
             .add_path(temp.path().join("another-cache/generation.sqlite-shm"));
         assert!(!refresh_lease_release_event(&unrelated, &lease));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn aliased_directory_activity_signals_release_without_waking_a_live_holder() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("cache");
+        fs::create_dir(&directory).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&directory, &alias).unwrap();
+        let lease = directory.join("writer.lease");
+        fs::write(&lease, b"live").unwrap();
+        let directory_event =
+            notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
+                .add_path(alias.clone());
+        assert!(!refresh_lease_release_event(&directory_event, &lease));
+        fs::remove_file(&lease).unwrap();
+        assert!(refresh_lease_release_event(&directory_event, &lease));
+        let removed =
+            notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::File))
+                .add_path(alias.join("writer.lease"));
+        assert!(refresh_lease_release_event(&removed, &lease));
     }
 
     #[test]
