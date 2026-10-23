@@ -260,10 +260,15 @@ async function main() {
                     return `${i}: ${ts} ${p}`;
                 })
                 .join("\n");
+            // Write a temporary file and rename it over the journal so the
+            // harness never reads a truncated or half-written journal: on
+            // Windows a reader racing writeFileSync can see an empty file.
+            const tmp = `${journalFile}.tmp`;
             fs.writeFileSync(
-                journalFile,
+                tmp,
                 `aimock journal — ${reqs.length} requests\n${summary}\n`
             );
+            fs.renameSync(tmp, journalFile);
         } catch (_e) {
             // Best-effort — don't crash if getRequests changes.
         }

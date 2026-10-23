@@ -983,9 +983,18 @@ WarnCheck "search index started" { LogContains $PluginLog "watcher started|searc
 # proof opencode talked to the mock.
 $AimockJournal = Join-Path $env:TEMP "aimock-journal.txt"
 Check "aimock received chat-completion requests" {
-    if (-not (Test-Path $AimockJournal)) { return $false }
-    $content = Get-Content $AimockJournal -Raw
-    return ($content -match "(\d+) requests" -and [int]$Matches[1] -gt 0)
+    # The journal is replaced once a second; a read can land while the file is
+    # being swapped (missing or locked on Windows). Retry briefly before failing.
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        if (Test-Path $AimockJournal) {
+            $content = Get-Content $AimockJournal -Raw -ErrorAction SilentlyContinue
+            if ($content -and $content -match "(\d+) requests" -and [int]$Matches[1] -gt 0) {
+                return $true
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
 }
 Check "opencode reached scripted turns (not fallback)" {
     -not (LogContains $Result1 "AIMOCK_FALLBACK")
