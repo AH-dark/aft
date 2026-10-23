@@ -709,7 +709,7 @@ fn applicability_walk_directory_event_invalidates() {
     fixture.assert_one_new_walk();
 }
 
-/// An event without a kind is classified by what is on disk: an existing
+/// A modify event with no more specific subtype is classified from disk: an existing
 /// source file whose server is already selected cannot change the result,
 /// whatever the event was.
 #[test]
@@ -1298,9 +1298,9 @@ fn forget_typescript_selection_for(paths: &[PathBuf]) {
     }
 }
 
-/// Creating, renaming and removing source files of languages the walk already
-/// selected, in directories it visited, keeps the cached result without a walk.
-/// So does a file in a hidden directory the walk never enters.
+/// Creating source files of languages the walk already selected, in
+/// directories it visited, keeps the cached result without a walk. So does a
+/// file in a hidden directory the walk never enters.
 #[test]
 fn applicability_walk_plain_source_creates_cause_no_full_walk() {
     let fixture = WatcherWalkFixture::new();
@@ -1316,7 +1316,9 @@ fn applicability_walk_plain_source_creates_cause_no_full_walk() {
             fixture.root.join(format!("extra{n}.py")),
             fixture.root.join(format!("lib/extra{n}.go")),
             fixture.root.join(format!("notes{n}.txt")),
-            fixture.root.join(format!(".cache/scratch{n}.rb")),
+            // A shell script would select the Bash server, which no walked file
+            // selects; the walk never enters the hidden directory.
+            fixture.root.join(format!(".cache/scratch{n}.sh")),
         ];
         for path in &paths {
             std::fs::write(path, "").unwrap();

@@ -299,8 +299,9 @@ struct State {
     /// In-root directories that hold a recorded input. They include every
     /// directory the walk visited, because each one records its ignore files.
     input_dirs: Arc<HashSet<PathBuf>>,
-    /// Present files accepted into the cached result since its walk, counted
-    /// against the walk's entry limit.
+    /// Present files reported by batches kept since the walk. Some may have
+    /// existed already; counting them all against the walk's entry limit
+    /// errs toward walking again.
     absorbed_files: usize,
 }
 
@@ -599,8 +600,10 @@ impl ApplicabilityCache {
                         }
                         present_files += 1;
                     }
-                    // A directory may hold files nobody reported; a walk
-                    // skips other file types, so they change nothing.
+                    // A directory may hold files missing from the batch, and an
+                    // unreadable path cannot be classified: walk again. A walk
+                    // skips other file types (sockets, pipes), so they change
+                    // nothing.
                     PathState::Present { is_dir: true, .. } | PathState::Unreadable => {
                         return false;
                     }
