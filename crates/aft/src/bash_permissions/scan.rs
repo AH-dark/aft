@@ -415,6 +415,37 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
         (parsed.args.len() == 1 && parsed.appends_to.is_none() && parsed.heredoc.is_none())
             .then(|| parsed.args.remove(0))
     }
+    fn followable_pushd(parts: &[Part]) -> bool {
+        let mut args = parts.iter().skip(1);
+        let Some(first) = args.next() else {
+            return false;
+        };
+        let options_ended = literal_word(&first.text).as_deref() == Some("--");
+        let operand = if options_ended {
+            args.next()
+        } else {
+            Some(first)
+        };
+        let Some(operand) = operand.filter(|_| args.next().is_none()) else {
+            return false;
+        };
+        let raw = &operand.text;
+        let word = if raw == "~" || raw.starts_with("~/") {
+            literal_word(&format!("\\{raw}"))
+        } else {
+            literal_word(raw)
+        };
+        let Some(word) = word else {
+            return false;
+        };
+        let negative_index = word.strip_prefix('-').is_some_and(|index| {
+            !index.is_empty() && index.chars().all(|character| character.is_ascii_digit())
+        });
+        word != "-"
+            && !word.starts_with('+')
+            && !negative_index
+            && (options_ended || !word.starts_with('-'))
+    }
     /// Non-literal arguments while parsing `set` options may change physical mode.
     fn set_mode_change(parts: &[Part]) -> SetModeChange {
         let mut change = SetModeChange::Unchanged;
@@ -563,6 +594,14 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
         incoming: Paths,
         targets: &mut Vec<DirectoryTarget>,
     ) -> Flow {
+        if head == "pushd" && !followable_pushd(parts) {
+            // Stack rotation or an unmodeled stack edit cannot establish a
+            // successful cwd. Failure still leaves the incoming folder intact.
+            return Flow {
+                success: Paths::Unknown(incoming.mode()),
+                failure: incoming,
+            };
+        }
         let mut success = Paths::empty();
         let mut emitted: Vec<DirectoryTarget> = Vec::new();
         let mut resolve = |cwd, mode| {
@@ -985,9 +1024,8 @@ fn track_cwd_change(
         }
         "pushd" => {
             let rotates = options_only
-                || args
-                    .clone()
-                    .any(|arg| arg.starts_with('+') || arg.starts_with('-'));
+                || args.clone().any(|arg| unquote(arg).starts_with(['+', '-']))
+                || path_args(parts).count() != 1;
             let next = if rotates {
                 None
             } else {
@@ -1415,6 +1453,10 @@ mod tests {
             directory_paths("pushd nested && cd ../..", &cwd),
             vec![cwd.join("nested"), cwd.parent().unwrap().to_path_buf()]
         );
+        assert_eq!(
+            directory_paths("pushd -- nested && cd ../..", &cwd),
+            vec![cwd.join("nested"), cwd.parent().unwrap().to_path_buf()]
+        );
     }
 
     #[test]
@@ -1434,6 +1476,65 @@ mod tests {
                 directory_paths(&command, &cwd),
                 vec![cwd.clone(), cwd.join("nested")],
                 "{prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_targets_unfollowable_pushd_forgets_successful_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        for change in [
+            "pushd +1",
+            "pushd -1",
+            "pushd -- -1",
+            "pushd",
+            "pushd -n /usr",
+            "pushd -1 ignored",
+            "pushd /usr extra",
+            "pushd \"$UNKNOWN\"",
+        ] {
+            for separator in [";", "&&"] {
+                let command = format!("{change} {separator} cd child");
+                assert!(directory_paths(&command, &cwd).is_empty(), "{command}");
+            }
+            // A failed pushd leaves the cwd unchanged; a background pushd must
+            // not change the foreground shell's cwd.
+            for command in [
+                format!("{change} || cd child"),
+                format!("{change} & cd child"),
+            ] {
+                assert_eq!(
+                    directory_paths(&command, &cwd),
+                    vec![cwd.join("child")],
+                    "{command}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_targets_stack_unknown_preserves_physical_mode_and_absolute_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let deep = root.join("deep");
+        std::fs::create_dir(&deep).unwrap();
+        std::os::unix::fs::symlink("..", deep.join("link")).unwrap();
+        for (option, last) in [
+            ("-P", root.parent().unwrap().to_path_buf()),
+            ("-o physical", root.parent().unwrap().to_path_buf()),
+            ("+P", deep.clone()),
+            ("+o physical", deep.clone()),
+        ] {
+            let command = format!(
+                "set {option}; pushd -1 ignored; cd '{}' && cd link && cd ..",
+                deep.display()
+            );
+            assert_eq!(
+                directory_paths(&command, &deep),
+                vec![deep.clone(), root.clone(), last],
+                "{command}"
             );
         }
     }
@@ -1463,11 +1564,16 @@ mod tests {
     #[test]
     fn rotated_directory_stack_cannot_restore_a_stale_project_directory() {
         let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("+1")).unwrap();
+        std::fs::create_dir(project.path().join("-1")).unwrap();
         let project_path = project.path().display();
         for change in [
             "pushd +1",
             "pushd -1",
+            "pushd '+1'",
+            "pushd '-1'",
             "pushd",
+            "pushd /usr extra",
             "pushd missing-directory",
             "pushd \"$UNKNOWN\"",
             "popd +1",
