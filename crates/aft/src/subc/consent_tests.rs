@@ -906,14 +906,142 @@ async fn consent_answer_within_the_budget_runs_the_held_call() {
     assert_eq!(f.worker_grants().len(), 1);
 }
 
+struct FinishGate {
+    request: String,
+    after_claim: bool,
+    entered: AtomicBool,
+    released: StdMutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+static FINISH_GATE: StdMutex<Option<Arc<FinishGate>>> = StdMutex::new(None);
+
+#[cfg(unix)]
+struct FinishGateOverride(Arc<FinishGate>);
+
+#[cfg(unix)]
+impl FinishGateOverride {
+    fn install(request: &str, after_claim: bool) -> Self {
+        let gate = Arc::new(FinishGate {
+            request: request.into(),
+            after_claim,
+            entered: AtomicBool::new(false),
+            released: StdMutex::new(false),
+            wake: std::sync::Condvar::new(),
+        });
+        assert!(FINISH_GATE
+            .lock()
+            .unwrap()
+            .replace(Arc::clone(&gate))
+            .is_none());
+        Self(gate)
+    }
+
+    fn release(&self) {
+        *self.0.released.lock().unwrap() = true;
+        self.0.wake.notify_all();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FinishGateOverride {
+    fn drop(&mut self) {
+        self.release();
+        FINISH_GATE.lock().unwrap().take();
+    }
+}
+
+pub(super) fn wait_at_finish(request: &str, after_claim: bool) {
+    let gate = FINISH_GATE.lock().unwrap().clone();
+    if let Some(gate) =
+        gate.filter(|gate| gate.request == request && gate.after_claim == after_claim)
+    {
+        gate.entered.store(true, Ordering::SeqCst);
+        let released = gate.released.lock().unwrap();
+        let (_released, timeout) = gate
+            .wake
+            .wait_timeout_while(released, Duration::from_secs(10), |released| !*released)
+            .unwrap();
+        assert!(!timeout.timed_out(), "finish gate must be released");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_cancelled_finish_releases_claim_for_identical_retry() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    for after_claim in [false, true] {
+        cancel_finish_at(after_claim).await;
+    }
+}
+
+#[cfg(unix)]
+async fn cancel_finish_at(after_claim: bool) {
+    let mut f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_secs(8)));
+    let gate = FinishGateOverride::install("subc-41-761", after_claim);
+    let target = f.head_root.join("shared.txt");
+    let _first = f.send_read(&f.worker, &target, 761).await;
+    wait_for(|| !f.fake.calls("consent.request").is_empty()).await;
+    let request = &f.fake.calls("consent.request")[0];
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_once", "answered_by":"user"}),
+    );
+    wait_for(|| gate.0.entered.load(Ordering::SeqCst)).await;
+    assert_eq!(f.asks()[0].holder_is_live(), after_claim);
+
+    // Losing the caller drops the receipt future while its blocking database
+    // work is still completing. No tool rerun can take ownership of this claim.
+    f.connection_cancel.cancel();
+    wait_for(|| HELD.lock().unwrap().get(&route_key(41, 1)).is_none()).await;
+    gate.release();
+    assert_claim_cleared_then_retry(&mut f, &target, 762).await;
+}
+
+#[cfg(unix)]
+async fn assert_claim_cleared_then_retry(f: &mut Fixture, target: &Path, corr: u64) {
+    let cleared = tokio::time::timeout(Duration::from_secs(3), async {
+        while !f.asks().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        cleared.is_ok(),
+        "cancelled finish left a live holder: {:?}",
+        f.asks()
+    );
+
+    f.connection_cancel = PersistentCancelSignal::new();
+    install_test_transport(Some(Arc::new(SharedFake(Arc::clone(&f.fake)))));
+    let mut retry = f.send_read(&f.worker, target, corr).await;
+    wait_for(|| f.fake.calls("consent.request").len() == 2).await;
+    let request = &f.fake.calls("consent.request")[1];
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_once", "answered_by":"user"}),
+    );
+    let frame = tokio::time::timeout(Duration::from_secs(5), retry.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let reply: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert!(text(&reply).contains("head-owned contents"), "{reply}");
+    assert!(f.asks().is_empty());
+    assert!(f.worker_grants().is_empty());
+}
+
 /// Models route cleanup after a consent reply has arrived but before the
 /// transport returns it to the held tool call.
+#[cfg(unix)]
 struct ReceiptGate {
     fake: Arc<FakeCingulate>,
     received: Arc<Notify>,
     release: Arc<Notify>,
 }
 
+#[cfg(unix)]
 impl ConsentTransport for ReceiptGate {
     fn call(&self, call: ConsentCall) -> ConsentFuture {
         self.call_with_receipt(call, Box::new(|record| Box::pin(async { Ok(record) })))
@@ -934,6 +1062,37 @@ impl ConsentTransport for ReceiptGate {
             Ok(result)
         })
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_cancelled_receipt_releases_claim_before_handoff() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let mut f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_secs(8)));
+    let received = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    install_test_transport(Some(Arc::new(ReceiptGate {
+        fake: Arc::clone(&f.fake),
+        received: Arc::clone(&received),
+        release: Arc::clone(&release),
+    })));
+    let target = f.head_root.join("shared.txt");
+    let _first = f.send_read(&f.worker, &target, 771).await;
+    wait_for(|| !f.fake.calls("consent.request").is_empty()).await;
+    let request = &f.fake.calls("consent.request")[0];
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_once", "answered_by":"user"}),
+    );
+    tokio::time::timeout(Duration::from_secs(5), received.notified())
+        .await
+        .unwrap();
+    assert!(f.asks()[0].holder_is_live());
+    f.connection_cancel.cancel();
+    wait_for(|| HELD.lock().unwrap().get(&route_key(41, 1)).is_none()).await;
+    release.notify_one();
+    assert_claim_cleared_then_retry(&mut f, &target, 772).await;
 }
 
 #[cfg(unix)]
@@ -4330,22 +4489,53 @@ async fn consent_head_policy_resolves_with_database_unlocked() {
     let asked = probes.borrow().len();
     assert!(asked > 0, "preparing the ask resolved the head's policy");
 
-    let applied = apply_allow(
-        &db,
-        &f.ctx,
-        &f.worker,
+    asks::set_elicitation(
+        &db.lock().unwrap(),
         &prep.key,
         &prep.call_key,
-        &asks::new_holder(),
-        &prep.grant,
-        false,
-        false,
+        "acc_log_granted",
     )
     .unwrap();
+    let (applied, lines) = crate::logging::capture_log_lines(|| {
+        apply_allow(
+            &db,
+            &f.ctx,
+            &f.worker,
+            &prep.key,
+            &prep.call_key,
+            &asks::new_holder(),
+            &prep.grant,
+            true,
+            false,
+        )
+    });
+    let applied = applied.unwrap();
     assert!(
         matches!(applied, Applied::Run(_)),
         "the head's answer applies"
     );
+    let inserted: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("consent grant inserted"))
+        .collect();
+    assert_eq!(inserted.len(), 1, "{lines:?}");
+    let line = inserted[0];
+    assert!(
+        line.starts_with("INFO ") && line.contains("[ses_worker]"),
+        "{line}"
+    );
+    assert!(
+        line.contains("ask=acc_log_granted kind=file scope_epoch=7"),
+        "{line}"
+    );
+    let hash = line.split_once("path_hash=").unwrap().1;
+    assert_eq!(hash.len(), 12, "{line}");
+    assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()), "{line}");
+    assert!(
+        !line.contains(target.to_str().unwrap()) && !line.contains("shared.txt"),
+        "{line}"
+    );
+    assert_eq!(f.worker_grants(), vec![grant]);
     drop(hook);
     let probes = probes.borrow();
     assert!(
@@ -4572,6 +4762,49 @@ async fn authenticated_consent_transport(
     let transport = Arc::new(SubcConsentTransport::new(daemon.path.clone()));
     *transport.consumer.lock().await = Some(Arc::new(consumer));
     transport
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consent_real_transport_applies_receipt_before_releasing_lease() {
+    let daemon = crate::synapse_embed::route_tests::Daemon::start(1, false);
+    let transport = authenticated_consent_transport(&daemon).await;
+    let call = transport_consent_call("receipt-worker", "consent.await");
+    let bind = subc_protocol::BindIdentity::new(
+        call.project_root.clone(),
+        "aft-consent",
+        call.session.clone(),
+    );
+    let route = transport.route_identity(ConsentRouteKey::new(&bind, &call.scope));
+    let state = Arc::clone(&route.state);
+    let observed = Arc::new(AtomicBool::new(false));
+    let received = Arc::clone(&observed);
+    let reply = transport
+        .clone()
+        .send_with_receipt(
+            call,
+            Some(Box::new(move |record| {
+                Box::pin(async move {
+                    // Inspect the production lease, not a stand-in's cleanup ordering.
+                    // release_route removes it before closing the scoped daemon handle.
+                    assert_eq!(
+                        state.leases.lock().unwrap().len(),
+                        1,
+                        "receipt must precede route release"
+                    );
+                    received.store(true, Ordering::SeqCst);
+                    Ok(record)
+                })
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, json!({"ok":true}));
+    assert!(observed.load(Ordering::SeqCst));
+    assert!(route.state.leases.lock().unwrap().is_empty());
+    drop(route);
+    daemon.wait_closed();
+    assert!(transport.routes.lock().unwrap().is_empty());
+    daemon.finish();
 }
 
 async fn wait_consent_counts(
