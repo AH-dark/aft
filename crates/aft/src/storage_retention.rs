@@ -356,14 +356,27 @@ fn yield_to_bind(storage: &Path) -> io::Result<()> {
 
 /// V1 has no ref-epoch handoff. Serialize pin admission with its marking pass.
 /// V2 pins use the family registry's epoch/barrier protocol instead.
-pub(crate) fn pin_barrier(view_dir: &Path) -> io::Result<Option<crate::fs_lock::LockGuard>> {
-    let Some(views) = view_dir
+///
+/// Pin creation takes both retention locks, through [`cache_barrier`]: the
+/// durable root's `retention/sweep.lock` first, then the artifact root's
+/// `.retention-sweep.lock`, the one order every path that takes both uses.
+/// Older AFT releases sharing the storage root collect blobs holding only
+/// `retention/sweep.lock`; a pin written without it could land after such a
+/// collector read the pins and before it deleted blobs. With no separate
+/// cache root both names are under the same root but are different files, so
+/// nothing is locked twice.
+pub(crate) fn pin_barrier(view_dir: &Path) -> io::Result<Option<Barrier>> {
+    let Some(artifacts) = view_dir
         .parent()
         .filter(|parent| parent.file_name().is_some_and(|name| name == "views"))
+        .and_then(Path::parent)
     else {
         return Ok(None);
     };
-    views.parent().map(artifact_barrier).transpose()
+    // A prepared cache root resolves to the durable root that owns it; any
+    // other root is its own durable root.
+    let durable = crate::root_cache::identity_storage_root(artifacts).into_owned();
+    cache_barrier(&StoragePaths::new(durable, artifacts.to_path_buf())).map(Some)
 }
 
 fn atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
@@ -6736,6 +6749,99 @@ mod storage_retention_tests {
         assert_eq!(report.removed_generations, 1, "{report:?}");
         assert!(!old.exists());
         assert!(crate::pins::QueryPin::acquire(view.view_dir(), "next").is_ok());
+    }
+
+    /// An older AFT release on the same storage collects blobs holding only
+    /// the durable `retention/sweep.lock`. A new assembly pin must wait for
+    /// that collector, with and without a separate cache root.
+    #[test]
+    fn assembly_pin_waits_for_an_old_collector_holding_only_the_durable_lock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for split in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let durable = temp.path().join("storage");
+            fs::create_dir_all(durable.join("retention")).unwrap();
+            let mut prepared = None;
+            let artifacts = if split {
+                let parent = temp.path().join("cache-volume");
+                fs::create_dir(&parent).unwrap();
+                let mut config = crate::config::Config {
+                    storage_dir: Some(durable.clone()),
+                    cache_dir: Some(parent),
+                    ..Default::default()
+                };
+                assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+                let artifacts = crate::root_cache::cache_root(&config);
+                prepared = Some(config);
+                artifacts
+            } else {
+                durable.clone()
+            };
+            let view_dir = artifacts.join("views").join("scope");
+            crate::private_storage::create_dir_all(&view_dir).unwrap();
+            let metadata = view_dir.join("pins/generation.json");
+
+            // The old collector takes only the durable lock.
+            let old_collector = crate::fs_lock::try_acquire(
+                &durable.join("retention/sweep.lock"),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            let waits = Arc::new(AtomicUsize::new(0));
+            let observer = waits.clone();
+            let pin_dir = view_dir.clone();
+            let writer = std::thread::spawn(move || {
+                let _observe = crate::fs_lock::observe_retry_sleeps_for_test(observer);
+                crate::pins::AssemblyPin::create(&pin_dir, "family", "scope", "generation", &[])
+            });
+            // Rendezvous: the writer records a retry on the busy lock before
+            // it can write anything.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while waits.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    !writer.is_finished(),
+                    "split={split}: pin written while an old collector held retention/sweep.lock"
+                );
+                assert!(Instant::now() < deadline, "split={split}: pin never waited");
+                std::thread::yield_now();
+            }
+            assert!(
+                !metadata.exists(),
+                "split={split}: pin visible during collection"
+            );
+            drop(old_collector);
+            let pin = writer
+                .join()
+                .unwrap()
+                .expect("pin after the old collector released its lock");
+            assert!(metadata.is_file(), "split={split}");
+            drop(pin);
+            drop(prepared);
+        }
+    }
+
+    /// With no separate cache root both retention locks live under one root.
+    /// Pin creation takes each once, never itself twice, and releases both.
+    #[test]
+    fn assembly_pin_on_a_shared_root_takes_each_retention_lock_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let view_dir = temp.path().join("views").join("scope");
+        crate::private_storage::create_dir_all(&view_dir).unwrap();
+        let pin = crate::pins::AssemblyPin::create(&view_dir, "family", "scope", "g1", &[])
+            .expect("pin on a shared root");
+        drop(pin);
+        let sweep = temp.path().join("retention/sweep.lock");
+        let artifact = temp.path().join(".retention-sweep.lock");
+        drop(crate::fs_lock::try_acquire(&sweep, Duration::ZERO).expect("durable lock released"));
+        drop(crate::fs_lock::try_acquire(&artifact, Duration::ZERO).expect("cache lock released"));
+        let barrier = pin_barrier(&view_dir)
+            .unwrap()
+            .expect("a views directory is pinned");
+        assert!(matches!(
+            crate::fs_lock::try_acquire(&sweep, Duration::ZERO),
+            Err(crate::fs_lock::AcquireError::Timeout)
+        ));
+        drop(barrier);
     }
 
     #[test]
