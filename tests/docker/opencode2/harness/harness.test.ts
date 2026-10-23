@@ -563,6 +563,7 @@ describe("scenario isolation and liveness", () => {
     const legacy = await createScenarioIsolation({
       parent: join(parent, "legacy-runs"),
       scenarioId: "read/T7/legacy",
+      userConfig: { bash: { changed_files: "diff" } },
       fixture,
       pluginTarball: tarball,
       pluginDirectory,
@@ -579,6 +580,10 @@ describe("scenario isolation and liveness", () => {
       providerConfigKey: "provider",
     });
     const legacyConfig = JSON.parse(await readFile(legacy.host_config, "utf8"));
+    expect(JSON.parse(await readFile(join(legacy.config, "cortexkit", "aft.jsonc"), "utf8")))
+      .toEqual({ disabled_tools: [], bash: { changed_files: "diff" } });
+    expect(JSON.parse(await readFile(join(legacy.project, ".cortexkit", "aft.jsonc"), "utf8")))
+      .toEqual({});
     // The V1 host reads `provider`; it logs `providers` as an unsupported key
     // and then has no provider to resolve the run's model against.
     expect(legacyConfig.provider.mock.options.baseURL).toBe("http://127.0.0.1:1234/v1");
@@ -1472,10 +1477,14 @@ describe("source-of-truth derivation", () => {
     expect(parity?.comparison).toEqual(t1.comparison);
   });
 
-  test("all twelve list surfaces and supported reasons come from the Rust registry", async () => {
+  test("all fourteen list surfaces and supported reasons come from the Rust registry", async () => {
     const repo = join(import.meta.dir, "../../../..");
     const surfaces = await deriveListSurfaces(repo);
-    expect(surfaces).toHaveLength(12);
+    expect(surfaces).toHaveLength(14);
+    expect(surfaces.find((surface) => surface.id === "bash.changed_files.bash.changed_files"))
+      .toMatchObject({ owner: "bash", unit: "files" });
+    expect(surfaces.find((surface) => surface.id === "bash.diff_lines.bash.diff_lines"))
+      .toMatchObject({ owner: "bash", unit: "lines" });
     expect(surfaces.find((surface) => surface.id === "read.directory.payload.entries")).toMatchObject({
       owner: "read",
       unit: "items",

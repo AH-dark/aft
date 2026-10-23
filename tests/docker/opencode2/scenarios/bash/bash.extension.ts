@@ -17,7 +17,7 @@ import {
   prepareLinkedWorktree,
 } from "./linked-worktree.js";
 const here = dirname(fileURLToPath(import.meta.url));
-const expectedIds = ["bash/T1/happy","bash/T1/linked_worktree","bash/T2/invalid_arguments","bash/T2/missing_target","bash/T3/fallback_ask_allow","bash/T3/fallback_ask_deny","bash/T3/fallback_config_deny","bash/T3/loop_ask_allow","bash/T3/loop_ask_deny","bash/T3/loop_config_deny","bash/T4/abort","bash/T5/completion_wake","bash/T5/message_aborts_sync_watch","bash/T5/message_detaches_wait","bash/T5/message_queue_keeps_wait","bash/T5/watch_pattern_once","bash/T6/bash-bash-output/complete","bash/T6/bash-bash-output/incomplete","bash/T7/happy","bash/T7/linked_worktree"];
+const expectedIds = ["bash/T1/happy","bash/T1/linked_worktree","bash/T2/invalid_arguments","bash/T2/missing_target","bash/T3/fallback_ask_allow","bash/T3/fallback_ask_deny","bash/T3/fallback_config_deny","bash/T3/loop_ask_allow","bash/T3/loop_ask_deny","bash/T3/loop_config_deny","bash/T4/abort","bash/T5/completion_wake","bash/T5/message_aborts_sync_watch","bash/T5/message_detaches_wait","bash/T5/message_queue_keeps_wait","bash/T5/watch_pattern_once","bash/T6/bash-bash-output/complete","bash/T6/bash-bash-output/incomplete","bash/T6/bash-changed-files/complete","bash/T6/bash-changed-files/incomplete","bash/T6/bash-diff-lines/complete","bash/T6/bash-diff-lines/incomplete","bash/T7/happy","bash/T7/linked_worktree"];
 async function validate(context: HarnessValidationContext): Promise<void> {
   const scenarios = context.scenarios.filter((scenario) => scenario.tool === "bash");
   const actual = scenarios.map((scenario) => scenario.id).sort();
