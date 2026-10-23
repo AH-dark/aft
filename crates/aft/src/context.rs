@@ -4240,6 +4240,8 @@ pub struct AppContext {
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
     callgraph_force_demand: Arc<crate::callgraph_maintenance::CallgraphForceDemand>,
     callgraph_reconcile: Arc<crate::callgraph_maintenance::CallgraphReconcileState>,
+    #[cfg(test)]
+    callgraph_reused_install_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
     /// Refreshes the store must apply before it answers queries again.
     callgraph_catch_up: Arc<crate::callgraph_maintenance::CallgraphCatchUp>,
     /// Resolution fields of the watched workspace manifests at the last
@@ -5067,6 +5069,8 @@ impl AppContext {
             callgraph_store: Arc::new(RwLock::new(None)),
             callgraph_force_demand: Arc::default(),
             callgraph_reconcile: Arc::default(),
+            #[cfg(test)]
+            callgraph_reused_install_gate: Mutex::new(None),
             callgraph_catch_up: Arc::default(),
             workspace_resolution_manifests: parking_lot::Mutex::new(None),
             callgraph_store_rx: parking_lot::Mutex::new(None),
@@ -10738,17 +10742,30 @@ impl AppContext {
                 .callgraph_store
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if reconcile_reused && operation_generation > 0 {
+                // Register the comparison before publishing the reused reader:
+                // a concurrent query must not see the old graph without its
+                // pending check, even if installation pauses after this guard.
+                self.request_callgraph_reconcile("startup");
+            }
             *guard = Some(Arc::clone(&store));
             Arc::clone(&store)
         });
         let Some(store) = installed else {
             return CallgraphStoreAccess::Unavailable;
         };
+        #[cfg(test)]
+        if reconcile_reused {
+            let gate = self.callgraph_reused_install_gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
+        }
         if reconcile_reused && operation_generation > 0 {
             // A reused generation predates this engine's watcher. Compare it
             // off-thread so offline edits are refreshed without a cold build
             // or delaying configure's bind reply.
-            self.request_callgraph_reconcile("startup");
             self.start_pending_callgraph_reconcile();
         }
         self.clear_callgraph_store_build_denied();
@@ -17396,6 +17413,59 @@ mod callgraph_store_for_ops_tests {
             response.data["complete"], false,
             "an unchanged comparison must clear the gap: {response:?}"
         );
+        assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 0);
+    }
+
+    #[test]
+    fn reused_callgraph_is_pending_before_concurrent_read_can_see_it() {
+        let (_dirs, ctx) = restarted_callgraph_context();
+        let _wait = force_async_callgraph_builds(&ctx);
+        let root = ctx.callgraph_project_root().unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn caller() { callee(); }\npub fn callee() {}\npub fn offline() { callee(); }\n",
+        )
+        .unwrap();
+        let worker = crate::callgraph_store::isolated_callgraph_refresh_worker_for_test(root);
+        let (compare_entered, compare_release) = ctx.callgraph_reconcile.hold_next_for_test();
+        let (install_entered_tx, install_entered) = mpsc::channel();
+        let (install_release, install_release_rx) = mpsc::channel();
+        *ctx.callgraph_reused_install_gate.lock().unwrap() =
+            Some((install_entered_tx, install_release_rx));
+        let installing = Arc::clone(&ctx);
+        let installer = std::thread::spawn(move || installing.callgraph_store_for_ops());
+        // The reused reader is visible and the lifecycle and resident-store
+        // locks are released; this thread has not started maintenance yet.
+        install_entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("resident reader publication gate");
+        let response = finalized_restart_callers(&ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["total_callers"], 1);
+        assert_eq!(response.data["complete"], false, "a concurrent read must observe the startup comparison before serving the reused graph: {response:?}");
+        let mut notice = String::new();
+        crate::response_finalize::append_callgraph_pending_notice(&mut notice, &response);
+        assert!(
+            notice.contains("Call graph update pending for this checkout:"),
+            "{notice}"
+        );
+        compare_entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("overlapping query started the registered comparison");
+        drop(install_release);
+        assert!(matches!(
+            installer.join().unwrap(),
+            CallgraphStoreAccess::Ready(_)
+        ));
+        drop(compare_release);
+        wait_for_restart_comparison(&ctx);
+        assert!(
+            worker.wait(Duration::from_secs(30)),
+            "offline edit refresh did not settle"
+        );
+        let response = finalized_restart_callers(&ctx);
+        assert_eq!(response.data["total_callers"], 2, "{response:?}");
+        assert_ne!(response.data["complete"], false, "{response:?}");
         assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 0);
     }
 
