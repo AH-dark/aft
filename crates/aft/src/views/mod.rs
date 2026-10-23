@@ -1046,6 +1046,15 @@ impl ViewStore {
              INSERT OR IGNORE INTO pointer (singleton, generation) VALUES (1, '');
              COMMIT;",
         )?;
+        drop(connection);
+        // Registered v2 views recover under their family registry's pin barrier.
+        if !self
+            .view_dir
+            .parent()
+            .is_some_and(|parent| parent.ends_with("v2"))
+        {
+            self.recover_abandoned_derived(None);
+        }
         Ok(())
     }
 

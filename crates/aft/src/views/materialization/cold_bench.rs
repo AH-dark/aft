@@ -73,6 +73,7 @@ fn measure_private_cold_build_io() {
             let peak = AtomicU64::new(0);
             let before = written();
             let started = Instant::now();
+            let mut materialize_ms = 0;
             std::thread::scope(|scope| {
                 scope.spawn(|| {
                     while !stop.load(Ordering::Relaxed) {
@@ -80,16 +81,35 @@ fn measure_private_cold_build_io() {
                         std::thread::sleep(Duration::from_millis(1));
                     }
                 });
+                // WAL generations retain a schema-attached keeper through
+                // publication. Measure that latency separately from the
+                // eventual close/checkpoint.
+                let keeper = (!mode.0).then(|| {
+                    let keeper = crate::db::file_identity::IdentityConnection::open(
+                        &path,
+                        "cold-bench-keeper",
+                    )
+                    .unwrap();
+                    keeper.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+                    keeper
+                        .query_row("SELECT count(*) FROM sqlite_schema", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap();
+                    keeper
+                });
                 with_cold_mode(mode, || {
                     materialize_manifest_view_database(&path, &blobs, &manifest)
                 })
                 .unwrap();
+                materialize_ms = started.elapsed().as_millis();
+                drop(keeper);
                 peak.fetch_max(disk_bytes(&path), Ordering::Relaxed);
                 stop.store(true, Ordering::Relaxed);
             });
             let elapsed = started.elapsed();
             let after = written();
-            println!("cold_io files={files} mode={label} wall_ms={} physical_write_bytes={} logical_write_bytes={} peak_disk_bytes={} final_bytes={}",
+            println!("cold_io files={files} mode={label} materialize_ms={materialize_ms} total_wall_ms={} physical_write_bytes={} logical_write_bytes={} peak_disk_bytes={} final_bytes={}",
                 elapsed.as_millis(), after.0.saturating_sub(before.0), after.1.saturating_sub(before.1), peak.load(Ordering::Relaxed), disk_bytes(&path));
             if label == "legacy" {
                 legacy = Some(path);

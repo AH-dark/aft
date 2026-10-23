@@ -44,18 +44,18 @@ thread_local! {
     pub(super) static PER_REFERENCE_LOOKUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // Paired offline controls exercise the previous WAL/index strategy on the
     // same fixture without adding a production configuration switch.
-    pub(super) static COLD_BUILD_MODE: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((true, true)) };
+    pub(super) static COLD_BUILD_MODE: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
     pub(super) static COLD_WRITE_LIMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn with_cold_mode<T>(mode: (bool, bool), run: impl FnOnce() -> T) -> T {
-    struct Restore((bool, bool));
+    struct Restore(Option<(bool, bool)>);
     impl Drop for Restore {
         fn drop(&mut self) {
             COLD_BUILD_MODE.set(self.0);
         }
     }
-    let _restore = Restore(COLD_BUILD_MODE.replace(mode));
+    let _restore = Restore(COLD_BUILD_MODE.replace(Some(mode)));
     run()
 }
 

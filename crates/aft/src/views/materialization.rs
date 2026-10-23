@@ -288,10 +288,9 @@ fn materialize_reading(
     let mut unpublished =
         private_cold.then(|| super::generation::UnpublishedDerived::new(database_path));
     #[cfg(test)]
-    let (relaxed, deferred_indexes) = tests::COLD_BUILD_MODE.with(|mode| {
-        let mode = mode.get();
-        (private_cold && mode.0, private_cold && mode.1)
-    });
+    let (relaxed, deferred_indexes) = tests::COLD_BUILD_MODE
+        .get()
+        .unwrap_or((private_cold, private_cold));
     #[cfg(not(test))]
     let (relaxed, deferred_indexes) = (private_cold, private_cold);
     let write_probe = profile::WriteProbe::start(database_path);
@@ -1245,8 +1244,13 @@ fn materialize_reading(
         // A table with no emitted rows is still an observed zero, not a missing timer.
         profile.observe_empty(phase);
     }
-    // Incremental patches retain their indexes; cold builds create them after
-    // dispatch has emitted the last graph rows.
+    // Rebuild cold indexes after the bulk graph load. Dispatch performs
+    // per-file ref and node lookups, so it needs those indexes already present.
+    if deferred_indexes {
+        let phase = PhaseProbe::start(&transaction);
+        crate::callgraph_store::create_cold_build_secondary_indexes(&transaction)?;
+        profile.record(WritePhase::IndexMaintenance, phase.finish(&transaction));
+    }
     profile.observe_empty(WritePhase::IndexMaintenance);
     let ordinary_edge_refs = pending_edges
         .iter()
@@ -1291,11 +1295,6 @@ fn materialize_reading(
             .fetch_add(joined.dispatch_type_targets.len() as u64, Relaxed);
     }
     profile.finish("dispatch");
-    if deferred_indexes {
-        let phase = PhaseProbe::start(&transaction);
-        crate::callgraph_store::create_cold_build_secondary_indexes(&transaction)?;
-        profile.record(WritePhase::IndexMaintenance, phase.finish(&transaction));
-    }
     let mut commit_stage = profile::StageTimer::new("commit");
     set_meta_ready(&transaction, true)?;
     crate::callgraph_store::insert_meta(&transaction)?;

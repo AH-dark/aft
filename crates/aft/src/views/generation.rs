@@ -183,6 +183,41 @@ fn validated_v2_reference_keys(
 }
 
 impl ViewStore {
+    pub(super) fn recover_abandoned_derived(
+        &self,
+        registry: Option<&super::registry::FamilyRegistry>,
+    ) {
+        static RECOVERED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+        let recovered = RECOVERED.get_or_init(Default::default);
+        let path = self
+            .view_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| self.view_dir().to_path_buf());
+        if !recovered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.clone())
+        {
+            return;
+        }
+        // Sweep before a new private build can allocate another large output.
+        // Ordinary opens in this process need not repeat the directory census.
+        let result = if let Some(registry) = registry {
+            registry
+                .with_barrier(|_| Ok(self.sweep_generations_locked()?))
+                .map_err(|error| error.to_string())
+        } else {
+            self.sweep_generations().map_err(|error| error.to_string())
+        };
+        if let Err(error) = result {
+            recovered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&path);
+            log::warn!("view startup derived cleanup deferred: {error}");
+        }
+    }
+
     pub fn derived_path(&self, generation: &str) -> Result<PathBuf> {
         let owner = self.derived_owner(generation)?;
         Ok(self.view_dir().join(format!("derived-{owner}.sqlite")))
@@ -949,6 +984,87 @@ pub(super) struct UnpublishedDerived<'a> {
     armed: bool,
 }
 
+/// Owns first-load artifacts across materialization, rename and pointer CAS.
+/// Published or reader-protected names are never removed by this guard.
+pub(super) struct UnpublishedGenerations<'a> {
+    view: &'a ViewStore,
+    registry: &'a super::registry::FamilyRegistry,
+    names: Vec<String>,
+}
+
+impl<'a> UnpublishedGenerations<'a> {
+    pub(super) fn new(view: &'a ViewStore, registry: &'a super::registry::FamilyRegistry) -> Self {
+        Self {
+            view,
+            registry,
+            names: Vec::new(),
+        }
+    }
+
+    pub(super) fn track_new(&mut self, generation: &str) {
+        // Hash-named first loads can encounter an existing completed output.
+        // A failed rename must not delete a file this attempt did not create.
+        if !self
+            .view
+            .view_dir()
+            .join(format!("derived-{generation}.sqlite"))
+            .exists()
+            && !self
+                .view
+                .view_dir()
+                .join(format!("derived-{generation}.ref"))
+                .exists()
+        {
+            self.names.push(generation.to_owned());
+        }
+    }
+}
+
+impl Drop for UnpublishedGenerations<'_> {
+    fn drop(&mut self) {
+        let cleanup = || -> Result<()> {
+            let mut pointer = self.view.open_pointer_connection()?;
+            let transaction =
+                pointer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let current: String = transaction.query_row(
+                "SELECT generation FROM pointer WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            // Reference creation takes the same pointer write lock. Complete
+            // the bounded ownership census before deleting any artifact.
+            let mut owners = std::collections::HashSet::new();
+            for entry in
+                generation_directory_entries(self.view.view_dir(), GENERATION_DIRECTORY_LIMIT)?
+            {
+                let file_name = entry.file_name();
+                if let Some(generation) = file_name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("derived-"))
+                    .and_then(|name| name.strip_suffix(".ref"))
+                {
+                    owners.insert(self.view.derived_owner(generation)?);
+                }
+            }
+            let _barrier = crate::storage_retention::pin_barrier(self.view.view_dir())?;
+            for name in &self.names {
+                if name != &current
+                    && !owners.contains(name)
+                    && !crate::root_cache::protected_read_marker_exists(self.view.view_dir(), name)
+                {
+                    self.view.remove_generation_files(name);
+                }
+            }
+            Ok(())
+        };
+        // V2 pin admission uses the family registry, not the legacy retention
+        // barrier. Match the collector's registry-before-pointer lock order.
+        if let Err(error) = self.registry.with_barrier(|_| Ok(cleanup()?)) {
+            log::warn!("view first-load cleanup deferred: {error}");
+        }
+    }
+}
+
 impl<'a> UnpublishedDerived<'a> {
     pub(super) fn new(path: &'a Path) -> Self {
         Self { path, armed: true }
@@ -1076,7 +1192,31 @@ mod tests {
         let Some(storage) = std::env::var_os("AFT_TEST_CRASHED_DERIVED_STORAGE") else {
             return;
         };
-        let view = ViewStore::open(storage, "crash-cleanup").unwrap();
+        let view = if std::env::var_os("AFT_TEST_CRASHED_DERIVED_V2").is_some() {
+            let root = PathBuf::from(&storage).join("project");
+            fs::create_dir_all(&root).unwrap();
+            let registry =
+                super::super::registry::FamilyRegistry::open(&storage, "crash-family").unwrap();
+            registry
+                .register_view("crash-cleanup", &root)
+                .unwrap()
+                .view_store()
+                .unwrap()
+        } else {
+            ViewStore::open(storage, "crash-cleanup").unwrap()
+        };
+        let served = view.derived_path("served").unwrap();
+        let connection =
+            crate::db::file_identity::IdentityConnection::open(&served, "served-crash-test")
+                .unwrap();
+        connection
+            .execute_batch("CREATE TABLE retained(v); INSERT INTO retained VALUES(42)")
+            .unwrap();
+        drop(connection);
+        view.open_pointer_connection()
+            .unwrap()
+            .execute("UPDATE pointer SET generation = 'served'", [])
+            .unwrap();
         let _pin = crate::pins::AssemblyPin::create(
             view.view_dir(),
             "family",
@@ -1089,6 +1229,8 @@ mod tests {
         let connection =
             crate::db::file_identity::IdentityConnection::open(&path, "crash-test").unwrap();
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t(v); INSERT INTO t VALUES(randomblob(100000));").unwrap();
+        assert!(path.exists());
+        assert!(view.view_dir().join("derived-crashed.sqlite-wal").exists());
         fs::write(
             view.view_dir().join("derived-journal-only.sqlite-journal"),
             b"interrupted journal",
@@ -1098,26 +1240,48 @@ mod tests {
         std::process::exit(77);
     }
 
-    #[test]
-    fn startup_sweep_removes_crashed_files_and_retry_succeeds() {
+    fn crash_restart(v2: bool) {
         let storage = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "views::generation::tests::crashed_private_build_child",
                 "--nocapture",
             ])
-            .env("AFT_TEST_CRASHED_DERIVED_STORAGE", storage.path())
-            .status()
-            .unwrap();
+            .env("AFT_TEST_CRASHED_DERIVED_STORAGE", storage.path());
+        if v2 {
+            command.env("AFT_TEST_CRASHED_DERIVED_V2", "1");
+        }
+        let status = command.status().unwrap();
         assert_eq!(status.code(), Some(77));
-        let view = ViewStore::open(storage.path(), "crash-cleanup").unwrap();
+        let view = if v2 {
+            let registry =
+                super::super::registry::FamilyRegistry::open(storage.path(), "crash-family")
+                    .unwrap();
+            registry
+                .register_view("crash-cleanup", storage.path().join("project"))
+                .unwrap()
+                .view_store()
+                .unwrap()
+        } else {
+            ViewStore::open(storage.path(), "crash-cleanup").unwrap()
+        };
         let path = view.derived_path("crashed").unwrap();
-        assert!(path.exists());
-        assert!(view.view_dir().join("derived-crashed.sqlite-wal").exists());
-        assert_eq!(view.sweep_generations().unwrap(), 2);
         assert_file_set_removed(&path);
         assert_file_set_removed(&view.derived_path("journal-only").unwrap());
+        let served = crate::db::file_identity::IdentityConnection::open(
+            view.derived_path("served").unwrap(),
+            "served-restart-test",
+        )
+        .unwrap();
+        assert_eq!(
+            served
+                .query_row("SELECT v FROM retained", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
+        drop(served);
         let connection =
             crate::db::file_identity::IdentityConnection::open(&path, "retry-test").unwrap();
         connection
@@ -1125,6 +1289,16 @@ mod tests {
             .unwrap();
         drop(connection);
         remove_unpublished_derived(&path).unwrap();
+    }
+
+    #[test]
+    fn startup_sweep_removes_crashed_files_and_retry_succeeds() {
+        crash_restart(false);
+    }
+
+    #[test]
+    fn startup_v2_sweep_removes_crashed_files_and_retry_succeeds() {
+        crash_restart(true);
     }
 
     #[test]
@@ -1173,6 +1347,30 @@ mod tests {
         drop(prepared);
         assert_file_set_removed(&path);
         assert!(view.current_generation().unwrap().is_none());
+        let mut cancelled_path = None;
+        let result = crate::views::assembly::prepare_checkout(&request, &mut |phase| {
+            if phase == "cas" {
+                let path = fs::read_dir(view.view_dir())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with("derived-")
+                            && path.extension().is_some_and(|ext| ext == "sqlite")
+                    })
+                    .expect("cold database must exist at cancellation");
+                fs::write(format!("{}-journal", path.display()), b"cancelled journal").unwrap();
+                cancelled_path = Some(path);
+                return Err(ViewError::InvalidManifest(
+                    "injected publication cancellation".into(),
+                ));
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_file_set_removed(&cancelled_path.unwrap());
         let published = crate::views::assembly::publish_checkout(&request).unwrap();
         assert!(published.published);
         assert!(view
