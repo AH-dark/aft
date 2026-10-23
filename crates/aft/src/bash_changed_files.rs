@@ -232,18 +232,23 @@ impl ReadPolicy {
     }
 
     fn allows(&self, path: &Path) -> bool {
+        // Compare normalized copies: Windows canonicalization can add a path
+        // prefix that is absent from watcher paths. Keep launch paths unchanged.
         let path = crate::inspect::job::normalize_path(path);
         self.access
             .decide(crate::access_policy::AccessOperation::Read, &path, false)
             == crate::access_policy::AccessDecision::Allow
             && self.native_data.as_ref().is_none_or(|data| {
-                !data.deny.iter().any(|denied| path.starts_with(denied))
-                    || data
-                        .read_allow
-                        .iter()
-                        .any(|allowed| path.starts_with(allowed))
+                !data
+                    .deny
+                    .iter()
+                    .any(|denied| path.starts_with(crate::inspect::job::normalize_path(denied)))
+                    || data.read_allow.iter().any(|allowed| {
+                        path.starts_with(crate::inspect::job::normalize_path(allowed))
+                    })
             })
             && !self.deny_prefixes.iter().any(|prefix| {
+                let prefix = crate::inspect::job::normalize_path(prefix);
                 path.as_os_str()
                     .to_string_lossy()
                     .starts_with(prefix.as_os_str().to_string_lossy().as_ref())
@@ -595,7 +600,8 @@ impl Capture {
                 }
                 let opened = opened_location(&file).map_err(|_| ())?;
                 // Compare the descriptor's location, not a second lookup of the
-                // pathname. Windows parent reparse points must fail closed too.
+                // pathname. Reject Windows parent directories that redirect the
+                // path through a junction or other reparse point, too.
                 if comparison_path(&opened) != comparison_path(&target) || !policy.allows(&opened) {
                     return Err(());
                 }

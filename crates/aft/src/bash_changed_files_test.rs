@@ -1107,6 +1107,41 @@ fn bash_changed_files_diff_inherits_shell_launch_read_denies() {
         .contains("SECRET_MUST_NOT_APPEAR"));
 }
 
+#[cfg(windows)]
+#[test]
+fn bash_changed_files_windows_read_policy_compares_path_spellings_without_rewriting() {
+    let root = tempfile::tempdir().unwrap();
+    let canonical = root.path().canonicalize().unwrap();
+    let ordinary = crate::windows_path::normalize_windows_path(&canonical);
+    let access = crate::access_policy::AccessPolicy::from_config(
+        &crate::config::Config::default(),
+        &ordinary.join("storage"),
+        vec![ordinary.clone()],
+        &ordinary.join("home"),
+    );
+    let mut policy = ReadPolicy::new(access, None);
+    for (stored, target) in [(&canonical, &ordinary), (&ordinary, &canonical)] {
+        let prefix = stored.join("credential-prefix");
+        policy.deny_prefixes = vec![prefix.clone()];
+        assert!(
+            !policy.allows(&target.join("credential-prefix.toml")),
+            "filename prefix deny missed: stored={stored:?}, target={target:?}"
+        );
+        assert_eq!(policy.deny_prefixes, vec![prefix]);
+        policy.deny_prefixes.clear();
+        let data = crate::sandbox_profile::SandboxDataPolicy {
+            deny: vec![stored.join("private")],
+            read_allow: vec![stored.join("private/readable")],
+            ..Default::default()
+        };
+        policy.native_data = Some(data.clone());
+        assert!(!policy.allows(&target.join("private/secret.txt")));
+        assert!(policy.allows(&target.join("private/readable/report.txt")));
+        assert_eq!(policy.native_data, Some(data));
+        policy.native_data = None;
+    }
+}
+
 #[test]
 fn bash_changed_files_large_diff_never_displaces_later_paths() {
     let root = repo();
