@@ -1956,10 +1956,7 @@ impl BgTaskRegistry {
         let task = self
             .task_for_session(task_id, session_id)
             .ok_or_else(|| "task_not_found".to_string())?;
-        let mut file = open_task_artifact(&task.paths, artifact)
-            .map_err(|error| format!("artifact_refused: {error}"))?;
-        let len = file
-            .len()
+        let (mut file, len) = super::persistence::sample_task_artifact(&task.paths, artifact)
             .map_err(|error| format!("artifact_refused: {error}"))?;
         #[cfg(test)]
         ARTIFACT_RANGE_AFTER_STAT.with(|hook| {
