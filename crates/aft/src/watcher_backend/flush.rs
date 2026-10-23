@@ -266,6 +266,31 @@ pub(crate) fn is_marker_path(path: &Path) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn bash_changed_files_flush_acknowledges_only_observed_marker() {
+        let control = FlushControl::default();
+        let marker = PathBuf::from(".aft-flush-123-1");
+        let (tx, rx) = mpsc::channel();
+        control.pending.lock().unwrap().insert(
+            1,
+            Pending {
+                marker: marker.clone(),
+                ack: tx,
+            },
+        );
+        assert!(!control
+            .observe(&Event::new(notify::EventKind::Any).add_path(PathBuf::from("changed.txt"))));
+        assert!(control.observe(
+            &Event::new(notify::EventKind::Any).add_path(PathBuf::from(".aft-flush-123-2"))
+        ));
+        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert!(control.observe(&Event::new(notify::EventKind::Any).add_path(marker.clone())));
+        assert_eq!(rx.try_recv(), Ok(true));
+        assert!(control.pending.lock().unwrap().is_empty());
+        assert!(control.observe(&Event::new(notify::EventKind::Any).add_path(marker)));
+        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+    }
+
+    #[test]
     fn bash_changed_files_flush_marker_does_not_hide_overflow() {
         let event = Event::new(notify::EventKind::Other)
             .add_path(PathBuf::from(".aft-flush-123-1"))

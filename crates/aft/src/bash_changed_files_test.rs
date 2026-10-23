@@ -303,6 +303,7 @@ fn bash_changed_files_off_does_no_probes_or_watcher_registration() {
     assert!(ctx.watcher_counters().bash_changes.get().is_none());
 }
 #[test]
+#[ignore = "manual 50k-file latency measurement; run cargo test -p agent-file-tools --lib -- bash_changed_files_50k_fixture_start_latency --ignored --nocapture --test-threads=1"]
 fn bash_changed_files_50k_fixture_start_latency() {
     let _activity = filesystem_activity_lease();
     let root = repo();
@@ -601,10 +602,7 @@ fn bash_changed_files_flush_timeout_and_remaining_call_budget() {
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "requires a live FSEvents service; run the focused native gate separately from large fixtures"
-)]
+#[ignore = "manual native build/flush latency measurement; run cargo test -p agent-file-tools --lib -- bash_changed_files_flush_native_latency_during_build --ignored --nocapture --test-threads=1"]
 fn bash_changed_files_flush_native_latency_during_build() {
     let _activity = filesystem_activity_lease();
     use std::sync::atomic::Ordering;
