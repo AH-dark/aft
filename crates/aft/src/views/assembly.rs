@@ -1055,11 +1055,26 @@ pub fn prepare_checkout_deferring(
                     ),
                 ));
             } else {
-                match super::generation::clone_derived(&base_path, &derived) {
-                    Ok(_) => {
+                let cloned =
+                    super::generation::clone_derived(&base_path, &derived).and_then(|mechanism| {
+                        run_after_derived_clone_for_test(&derived);
+                        clone_readiness(view.view_dir(), &next_generation)
+                            .map(|ready| (mechanism, ready))
+                    });
+                match cloned {
+                    Ok((mechanism, Err((reason, detail)))) => {
+                        log::warn!(
+                            "view derived clone failed readiness: generation={next_generation} mechanism={} {detail}",
+                            mechanism.as_str()
+                        );
+                        cold_build = Some((reason, detail));
+                        super::generation::remove_unpublished_derived(&derived)?;
+                    }
+                    Ok((mechanism, Ok(()))) => {
                         prepared.profile.seed_source =
                             if sibling.is_some() { "sibling" } else { "own" };
                         prepared.profile.cold_build_reason = "none";
+                        prepared.profile.clone_mechanism = mechanism.as_str();
                         #[cfg(test)]
                         {
                             prepared.profile.derived_cloned = true;
@@ -1248,6 +1263,9 @@ struct PublicationProfile {
     derived_clone_ms: u128,
     seed_source: &'static str,
     cold_build_reason: &'static str,
+    /// How a seeded derived database was copied (`clonefile`,
+    /// `sqlite_backup`), or `none` when nothing was copied.
+    clone_mechanism: &'static str,
     #[cfg(test)]
     derived_cloned: bool,
     materialization_call_ms: u128,
@@ -1281,6 +1299,7 @@ impl PublicationProfile {
             derived_clone_ms: 0,
             seed_source: "cold",
             cold_build_reason: "no_base",
+            clone_mechanism: "none",
             #[cfg(test)]
             derived_cloned: false,
             materialization_call_ms: 0,
@@ -1339,7 +1358,7 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
     // pointer transaction is a subset of the cas phase, which also includes
     // waiting to acquire the actor barrier.
     format!(
-        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_dispatch_ms={} materialize_commit_ms={} materialize_cleanup_memory_ms={} materialize_cleanup_connections_ms={} pointer_ms={} total_ms={} derived_bytes={} semantic_fill={} generation={} concurrent_publications={} seed_source={} cold_build_reason={} {}",
+        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_dispatch_ms={} materialize_commit_ms={} materialize_cleanup_memory_ms={} materialize_cleanup_connections_ms={} pointer_ms={} total_ms={} derived_bytes={} semantic_fill={} generation={} concurrent_publications={} seed_source={} cold_build_reason={} clone_mechanism={} {}",
         profile.root.display(), profile.outcome, profile.candidates, profile.blob_puts,
         profile.pending_paths, profile.phase_ms[0], profile.phase_ms[1],
         profile.phase_ms[2], profile.phase_ms[3], profile.head_ms, profile.assembly_ms,
@@ -1364,7 +1383,7 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
         profile.materialization.cleanup_memory_ms,
         profile.materialization.cleanup_connections_ms,
         profile.pointer_ms, profile.total_ms, profile.derived_bytes,
-        profile.semantic_fill, profile.generation, profile.concurrent_publications, profile.seed_source, profile.cold_build_reason, profile.io.fields(),
+        profile.semantic_fill, profile.generation, profile.concurrent_publications, profile.seed_source, profile.cold_build_reason, profile.clone_mechanism, profile.io.fields(),
     )
 }
 
@@ -1557,6 +1576,59 @@ fn cold_build_reason_for_diff_error(
             Some(ColdBuildReason::BaseUnreadable)
         }
         _ => None,
+    }
+}
+
+/// Run the reader's readiness query on a freshly copied derived database
+/// before anything patches or publishes it. The donor passed the same query
+/// before the copy. Checking the copy as well means a torn, truncated or
+/// unfinished file is rebuilt cold, never served. The inner error is the
+/// cold-build reason; the outer error is contention the scheduler retries.
+fn clone_readiness(
+    view_dir: &Path,
+    generation: &str,
+) -> Result<std::result::Result<(), (ColdBuildReason, String)>> {
+    match crate::callgraph_store::manifest_view_database_ready(
+        view_dir,
+        generation,
+        Instant::now() + crate::db::STEADY_BUSY_TIMEOUT,
+    ) {
+        Ok(true) => Ok(Ok(())),
+        Ok(false) => Ok(Err((
+            ColdBuildReason::BaseNotReady,
+            "cloned derived graph fails the build-output readiness check".to_string(),
+        ))),
+        Err(crate::callgraph_store::CallGraphStoreError::Sqlite(error))
+            if crate::db::is_busy_error(&error) =>
+        {
+            Err(ViewError::Sqlite(error))
+        }
+        Err(crate::callgraph_store::CallGraphStoreError::Sqlite(error))
+            if sqlite_error_is_unreadable_database(&error) =>
+        {
+            Ok(Err((ColdBuildReason::BaseUnreadable, error.to_string())))
+        }
+        Err(error) => Err(ViewError::InvalidManifest(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_DERIVED_CLONE: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` on the next derived copy this thread makes, before its
+/// readiness check, to simulate a copy that was torn or left unfinished.
+#[cfg(test)]
+pub(super) fn after_derived_clone_for_test(hook: impl FnOnce(&Path) + 'static) {
+    AFTER_DERIVED_CLONE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+fn run_after_derived_clone_for_test(_derived: &Path) {
+    #[cfg(test)]
+    if let Some(hook) = AFTER_DERIVED_CLONE.with(|slot| slot.borrow_mut().take()) {
+        hook(_derived);
     }
 }
 

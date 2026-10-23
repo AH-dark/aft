@@ -678,10 +678,178 @@ pub(super) fn schedule_derived_checkpoint(
     }
 }
 
+/// How [`clone_derived`] produced its copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CloneMechanism {
+    /// An APFS copy-on-write clone of a quiescent source: no page is rewritten.
+    Clonefile,
+    /// A page-by-page SQLite backup, which writes the whole database again.
+    Backup(BackupCopy),
+}
+
+impl CloneMechanism {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Clonefile => "clonefile",
+            Self::Backup(_) => "sqlite_backup",
+        }
+    }
+}
+
+/// Copy a published derived database to an unpublished destination path.
+///
+/// On macOS a quiescent source is cloned copy-on-write (see
+/// [`clone_quiescent`]), so a seeded checkout does not rewrite a database it
+/// shares byte for byte with its donor. Everywhere else, and whenever the
+/// source cannot be proven quiescent, the copy goes through the SQLite backup
+/// API. Neither path opens a raw descriptor on the source's file set.
+pub(super) fn clone_derived(source: &Path, destination: &Path) -> Result<CloneMechanism> {
+    #[cfg(target_os = "macos")]
+    if !FORCE_BACKUP_CLONE_FOR_TEST.load(Ordering::Relaxed) {
+        let started = Instant::now();
+        match clone_quiescent(source, destination)? {
+            Ok(()) => {
+                log::info!(
+                    "view derived clone mechanism=clonefile ms={} source={} destination={}",
+                    started.elapsed().as_millis(),
+                    source.display(),
+                    destination.display()
+                );
+                return Ok(CloneMechanism::Clonefile);
+            }
+            Err(reason) => log::info!(
+                "view derived clone fallback=sqlite_backup reason={reason} source={}",
+                source.display()
+            ),
+        }
+    }
+    clone_derived_backup(source, destination).map(CloneMechanism::Backup)
+}
+
+/// Test-only switch that sends [`clone_derived`] down the backup path, so a
+/// measurement can compare both mechanisms in one process.
+#[cfg(target_os = "macos")]
+pub(crate) static FORCE_BACKUP_CLONE_FOR_TEST: AtomicBool = AtomicBool::new(false);
+
+/// How long the quiescence checks may wait on a lock before the copy falls
+/// back to the backup API, which has its own bounded contention handling.
+#[cfg(target_os = "macos")]
+const QUIESCENT_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Clone `source` with `clonefile(2)` while SQLite proves its main file is
+/// the whole database and cannot change.
+///
+/// `clonefile` takes paths, so nothing in this process opens (and later
+/// closes) a descriptor on the source's main file, `-wal` or `-shm`. Closing
+/// such a descriptor would drop every POSIX lock this process's SQLite
+/// connections hold on that file. Every step below that touches the source
+/// goes through a SQLite connection; the `-wal` is only `stat`ed.
+///
+/// 1. The source must be in WAL mode. A non-empty `-wal` is first
+///    checkpointed with TRUNCATE through the connection.
+/// 2. `BEGIN IMMEDIATE` takes the WAL write lock, which excludes writers and
+///    WAL-resetting checkpoints in every process.
+/// 3. Under that lock the `-wal` must be empty: with no frames, the main file
+///    is the complete database and nothing can write to it while the lock is
+///    held, so the clone is a consistent snapshot.
+///
+/// The outer error is fatal for the publication (a live connection on the
+/// destination). The inner error is the reason the caller should fall back to
+/// the backup copy instead.
+#[cfg(target_os = "macos")]
+fn clone_quiescent(source: &Path, destination: &Path) -> Result<std::result::Result<(), String>> {
+    let fallback = |step: &str, error: &dyn std::fmt::Display| Ok(Err(format!("{step}: {error}")));
+    let wal_bytes = || {
+        let mut wal = source.as_os_str().to_owned();
+        wal.push("-wal");
+        match fs::metadata(PathBuf::from(wal)) {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error),
+        }
+    };
+    let mut connection = match crate::db::file_identity::IdentityConnection::open_with_flags(
+        source,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        "views::generation::clone_quiescent source",
+    ) {
+        Ok(connection) => connection,
+        Err(error) => return fallback("open", &error),
+    };
+    if let Err(error) = connection.busy_timeout(QUIESCENT_BUSY_TIMEOUT) {
+        return fallback("busy_timeout", &error);
+    }
+    match connection.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0)) {
+        Ok(mode) if mode.eq_ignore_ascii_case("wal") => {}
+        Ok(mode) => return fallback("journal_mode", &mode),
+        Err(error) => return fallback("journal_mode", &error),
+    }
+    match wal_bytes() {
+        Ok(0) => {}
+        Ok(_) => {
+            if let Err(error) = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, i64>(0)
+            }) {
+                return fallback("checkpoint", &error);
+            }
+        }
+        Err(error) => return fallback("wal_stat", &error),
+    }
+    let transaction =
+        match connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+            Ok(transaction) => transaction,
+            Err(error) => return fallback("begin_immediate", &error),
+        };
+    match wal_bytes() {
+        Ok(0) => {}
+        Ok(bytes) => return fallback("wal_not_empty", &format!("{bytes} bytes")),
+        Err(error) => return fallback("wal_stat", &error),
+    }
+    {
+        let _files = crate::db::file_identity::filesystem_guard();
+        remove_unpublished_derived_locked(destination)?;
+        if let Err(error) = clonefile(source, destination) {
+            return fallback("clonefile", &error);
+        }
+        // The clone is a new, unpublished file that no connection anywhere has
+        // opened: the registry reported none at this path under the guard,
+        // and no other process knows the unpublished generation's name. So a
+        // plain descriptor may flush it. SQLite's own publication checkpoint
+        // would not: with an empty WAL it has no frames to copy and syncs
+        // nothing.
+        let synced = fs::File::open(destination).and_then(|file| file.sync_all());
+        if let Err(error) = synced {
+            remove_unpublished_derived_locked(destination)?;
+            return fallback("sync", &error);
+        }
+    }
+    super::sync_parent(destination)?;
+    drop(transaction);
+    Ok(Ok(()))
+}
+
+#[cfg(target_os = "macos")]
+fn clonefile(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let source = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    // `CLONE_NOFOLLOW` from <sys/clonefile.h>; the libc crate does not export
+    // it. It refuses a symlinked source instead of cloning its target.
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+    // Both C strings outlive the call.
+    if unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), CLONE_NOFOLLOW) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Copy a coherent SQLite snapshot without opening the source file directly.
 /// The backup API includes committed WAL content while preserving every lock
 /// SQLite holds for other live connections in this process.
-pub(super) fn clone_derived(source: &Path, destination: &Path) -> Result<BackupCopy> {
+pub(super) fn clone_derived_backup(source: &Path, destination: &Path) -> Result<BackupCopy> {
     let started = Instant::now();
     let source_connection = crate::db::file_identity::IdentityConnection::open(
         source,
@@ -1073,7 +1241,7 @@ mod tests {
         assert!(fs::metadata(&wal).unwrap().len() > 0);
         assert_eq!(crate::db::file_identity::open_connections(&source), 1);
 
-        clone_derived(&source, &destination).unwrap();
+        clone_derived_backup(&source, &destination).unwrap();
 
         assert_eq!(
             crate::db::file_identity::open_connections(&source),
@@ -1115,7 +1283,9 @@ mod tests {
         );
         assert_eq!(response.data["code"], "callgraph_building");
 
-        let copy = clone_derived(&source, &destination).unwrap();
+        let CloneMechanism::Backup(copy) = clone_derived(&source, &destination).unwrap() else {
+            panic!("a rollback-journal donor cannot be proven quiescent for clonefile");
+        };
         assert_eq!(copy.steps, 1);
         assert_eq!(copy.busy_retries, 0);
     }
@@ -1147,7 +1317,7 @@ mod tests {
         // need several steps.
         assert!(pages > 1_000, "fixture too small: {pages} pages");
 
-        let copy = clone_derived(&source, &destination).unwrap();
+        let copy = clone_derived_backup(&source, &destination).unwrap();
 
         assert_eq!(
             copy,
@@ -1192,6 +1362,228 @@ mod tests {
         destination_connection
             .query_row("SELECT COUNT(*) FROM destination", [], |_| Ok(()))
             .unwrap();
+    }
+
+    /// A WAL-mode donor with committed rows, like a published derived file.
+    fn wal_donor(path: &Path) -> crate::db::file_identity::IdentityConnection {
+        let connection =
+            crate::db::file_identity::IdentityConnection::open(path, "views generation donor")
+                .unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE state (value TEXT NOT NULL);\
+                 INSERT INTO state VALUES ('committed-in-wal');",
+            )
+            .unwrap();
+        connection
+    }
+
+    fn wal_len(path: &Path) -> u64 {
+        fs::metadata(format!("{}-wal", path.display())).map_or(0, |metadata| metadata.len())
+    }
+
+    fn state(path: &Path) -> String {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT value FROM state", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clone_of_a_quiescent_wal_donor_is_copy_on_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.sqlite");
+        let destination = directory.path().join("destination.sqlite");
+        let donor = wal_donor(&source);
+        assert!(wal_len(&source) > 0, "fixture must start with WAL frames");
+
+        assert_eq!(
+            clone_derived(&source, &destination).unwrap(),
+            CloneMechanism::Clonefile
+        );
+
+        // The frames were checkpointed into the main file through SQLite
+        // before the clone, so the clone holds them without a WAL of its own.
+        assert_eq!(wal_len(&source), 0);
+        assert!(!PathBuf::from(format!("{}-wal", destination.display())).exists());
+        assert_eq!(state(&destination), "committed-in-wal");
+        assert_eq!(crate::db::file_identity::open_connections(&source), 1);
+        donor
+            .query_row("SELECT COUNT(*) FROM state", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clone_falls_back_to_backup_while_a_reader_keeps_wal_frames() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.sqlite");
+        let destination = directory.path().join("destination.sqlite");
+        let _donor = wal_donor(&source);
+        // A reader whose snapshot includes the frames stops TRUNCATE from
+        // emptying the WAL, so the main file alone is not the database.
+        let reader = Connection::open(&source).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM state;")
+            .unwrap();
+
+        let mechanism = clone_derived(&source, &destination).unwrap();
+
+        assert!(
+            matches!(mechanism, CloneMechanism::Backup(_)),
+            "a donor with WAL frames must not be cloned: {mechanism:?}"
+        );
+        assert!(wal_len(&source) > 0);
+        assert_eq!(state(&destination), "committed-in-wal");
+        reader.execute_batch("COMMIT;").unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn copy_on_write_clone_refuses_to_replace_a_live_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.sqlite");
+        let destination = directory.path().join("destination.sqlite");
+        let _donor = wal_donor(&source);
+        let destination_connection = crate::db::file_identity::IdentityConnection::open(
+            &destination,
+            "views generation clone test destination",
+        )
+        .unwrap();
+        destination_connection
+            .execute_batch("CREATE TABLE destination(value);")
+            .unwrap();
+
+        let error = clone_derived(&source, &destination).unwrap_err();
+
+        assert!(
+            matches!(&error, ViewError::InvalidManifest(message) if message.contains("live SQLite connection")),
+            "unexpected error: {error}"
+        );
+        destination_connection
+            .query_row("SELECT COUNT(*) FROM destination", [], |_| Ok(()))
+            .unwrap();
+    }
+
+    const LOCK_PROBE_ENV: &str = "AFT_TEST_CLONE_LOCK_PROBE_DATABASE";
+
+    /// Report, from another process, whether some process holds SQLite's
+    /// shared lock on `database` and the dead-man-switch lock on its `-shm`.
+    /// POSIX locks never conflict within one process, so only a second
+    /// process can see whether this process's locks are still in place.
+    #[cfg(unix)]
+    fn probe_sqlite_locks(database: &Path) -> String {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "views::generation::tests::clone_lock_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(LOCK_PROBE_ENV, database)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        stdout
+            .lines()
+            // libtest prints the test name on the same line before the output.
+            .find_map(|line| line.split_once("LOCK_PROBE ").map(|(_, result)| result))
+            .unwrap_or_else(|| panic!("probe printed no result: {stdout}"))
+            .to_owned()
+    }
+
+    /// Child half of [`probe_sqlite_locks`]; a no-op in an ordinary run.
+    #[cfg(unix)]
+    #[test]
+    fn clone_lock_probe_child() {
+        let Some(database) = std::env::var_os(LOCK_PROBE_ENV) else {
+            return;
+        };
+        let database = PathBuf::from(database);
+        // SQLite's unix VFS takes a read lock on this byte range of the main
+        // file for SHARED (PENDING_BYTE + 2, 510 bytes), and every connection
+        // with the WAL index mapped holds a read lock on byte 128 of `-shm`.
+        let held = |path: PathBuf, start: i64, len: i64| {
+            use std::os::fd::AsRawFd;
+            let file = fs::File::open(&path).unwrap();
+            let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+            lock.l_type = libc::F_WRLCK as _;
+            lock.l_whence = libc::SEEK_SET as _;
+            lock.l_start = start as _;
+            lock.l_len = len as _;
+            assert_eq!(
+                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) },
+                0
+            );
+            if i64::from(lock.l_type) == i64::from(libc::F_UNLCK) {
+                "free"
+            } else {
+                "held"
+            }
+        };
+        let shared = held(database.clone(), 0x4000_0002, 510);
+        let dms = held(PathBuf::from(format!("{}-shm", database.display())), 128, 1);
+        println!("LOCK_PROBE db_shared={shared} shm_dms={dms}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clone_keeps_this_process_sqlite_locks_on_a_live_donor() {
+        let directory = tempfile::tempdir().unwrap();
+
+        // Positive control: closing a raw descriptor on a live database drops
+        // this process's locks, and the probe sees that. Without it, a probe
+        // that always answered "held" would pass the assertion below.
+        let control = directory.path().join("control.sqlite");
+        let control_connection = wal_donor(&control);
+        control_connection
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM state;")
+            .unwrap();
+        assert_eq!(probe_sqlite_locks(&control), "db_shared=held shm_dms=held");
+        drop(fs::File::open(&control).unwrap());
+        drop(fs::File::open(format!("{}-shm", control.display())).unwrap());
+        assert_eq!(probe_sqlite_locks(&control), "db_shared=free shm_dms=free");
+
+        let source = directory.path().join("source.sqlite");
+        let destination = directory.path().join("destination.sqlite");
+        let donor = wal_donor(&source);
+        donor
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        donor
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM state;")
+            .unwrap();
+        assert_eq!(probe_sqlite_locks(&source), "db_shared=held shm_dms=held");
+
+        let mechanism = clone_derived(&source, &destination).unwrap();
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(mechanism, CloneMechanism::Clonefile);
+        #[cfg(not(target_os = "macos"))]
+        assert!(matches!(mechanism, CloneMechanism::Backup(_)));
+        assert_eq!(
+            probe_sqlite_locks(&source),
+            "db_shared=held shm_dms=held",
+            "the copy dropped a lock this process's donor connection holds"
+        );
+        assert_eq!(
+            donor
+                .query_row("SELECT value FROM state", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "committed-in-wal"
+        );
+        donor.execute_batch("COMMIT;").unwrap();
+        assert_eq!(state(&destination), "committed-in-wal");
     }
 }
 

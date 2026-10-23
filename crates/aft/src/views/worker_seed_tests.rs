@@ -251,6 +251,12 @@ fn worker_first_publication_clones_main_with_cold_query_parity() {
         "a new linked checkout must clone its main checkout's compatible derived database"
     );
     assert_eq!(prepared.profile.seed_source, "sibling");
+    // A settled published donor has an empty WAL, so macOS copies it
+    // copy-on-write instead of rewriting every page.
+    #[cfg(target_os = "macos")]
+    assert_eq!(prepared.profile.clone_mechanism, "clonefile");
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(prepared.profile.clone_mechanism, "sqlite_backup");
     let report = prepared.commit().unwrap();
     assert_eq!(report.blob_puts, 3);
     assert_cold_parity(&worker, &report);
@@ -326,6 +332,53 @@ fn worker_seed_uses_freshest_ready_sibling_and_repairs_unusable_own_base() {
     assert_eq!(repaired.profile.cold_build_reason, "none");
     let report = repaired.commit().unwrap();
     assert_cold_parity(&main, &report);
+}
+
+#[test]
+fn worker_seed_copy_that_fails_readiness_is_rebuilt_cold_not_served() {
+    // A copy that is well-formed SQLite but whose build never finished, and a
+    // torn copy cut off partway through. Neither may be patched into the
+    // worker's generation.
+    type Damage = fn(&Path);
+    let unfinished: Damage = |derived| {
+        Connection::open(derived)
+            .unwrap()
+            .execute("UPDATE meta SET v = '0' WHERE k = 'ready'", [])
+            .unwrap();
+    };
+    let torn: Damage = |derived| {
+        let file = fs::OpenOptions::new().write(true).open(derived).unwrap();
+        let len = file.metadata().unwrap().len();
+        file.set_len(len / 2).unwrap();
+    };
+    for (label, damage, expected) in [
+        ("unfinished", unfinished, &["base_not_ready"][..]),
+        ("torn", torn, &["base_not_ready", "base_unreadable"][..]),
+    ] {
+        let (_dirs, main, mut worker) = checkouts(24);
+        publish_checkout(&main).unwrap();
+        crate::views::generation::wait_for_derived_checkpoint_for_test(
+            ViewStore::open(&main.storage, &main.scope)
+                .unwrap()
+                .view_dir(),
+        );
+        fs::write(
+            worker.project_root.join("file_0.ts"),
+            "export function target_0() { return 7; }",
+        )
+        .unwrap();
+        worker.changed_paths.insert(b"file_0.ts".to_vec());
+        super::after_derived_clone_for_test(damage);
+        let mut prepared = prepare_checkout(&worker, &mut |_| Ok(())).unwrap();
+        assert_eq!(prepared.profile.seed_source, "cold", "{label}");
+        assert!(
+            expected.contains(&prepared.profile.cold_build_reason),
+            "{label}: {}",
+            prepared.profile.cold_build_reason
+        );
+        let report = prepared.commit().unwrap();
+        assert_cold_parity(&worker, &report);
+    }
 }
 
 #[test]
@@ -464,4 +517,137 @@ fn bench_repository_cold_materialization() {
             .unwrap();
         println!("repository table={name} allocated_bytes={bytes}");
     }
+}
+
+/// Bytes written by a sibling-seeded worker publication, with the donor copied
+/// by SQLite backup (the previous behavior) and copy-on-write (macOS).
+///
+/// Set `AFT_IO_PROBE_DIR` to an empty directory and `AFT_IO_PROBE_ROOT` to a
+/// Git checkout. The driver clones that checkout into the probe directory,
+/// adds two linked worktrees with the same one-file edit, publishes the clone
+/// cold, then publishes each worktree seeded from it. It prints `IO_PROBE`
+/// JSON lines like the other view I/O drivers.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "builds a real checkout's views twice; run single-threaded with isolated HOME/XDG"]
+fn io_amplification_sibling_seed_probe() {
+    use crate::process_io::Bytes;
+    use crate::write_ledger::{pending_for_test, Domain};
+    use std::sync::atomic::Ordering;
+
+    let base =
+        PathBuf::from(std::env::var_os("AFT_IO_PROBE_DIR").expect("set isolated probe directory"));
+    let source = PathBuf::from(std::env::var_os("AFT_IO_PROBE_ROOT").expect("set checkout root"));
+    fs::create_dir_all(&base).unwrap();
+    let base = base.canonicalize().unwrap();
+    let main_root = base.join("main");
+    assert!(!main_root.exists(), "use an empty directory for a cold run");
+    assert!(std::process::Command::new("git")
+        .args(["clone", "--quiet", "--local"])
+        .arg(&source)
+        .arg(&main_root)
+        .status()
+        .unwrap()
+        .success());
+    let workers = ["worker-backup", "worker-clonefile"].map(|name| base.join(name));
+    for worker in &workers {
+        git(
+            &main_root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                worker.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+    }
+    let storage = base.join("store");
+    let request = |root: &Path| AssemblyRequest {
+        storage: storage.clone(),
+        project_root: root.to_path_buf(),
+        family: crate::search_index::artifact_cache_key(root),
+        scope: crate::path_identity::project_scope_key(root),
+        desired_head: head_tree_fingerprint(&head_tree_entries(root).unwrap()),
+        changed_paths: Default::default(),
+        semantic_keys: Default::default(),
+        require_semantic: false,
+        allow_blob_put: true,
+        callgraph: true,
+    };
+    let measure = |label: &str, request: &AssemblyRequest| {
+        let root_id = request.project_root.display().to_string();
+        let domains = [
+            Domain::ViewsBlob,
+            Domain::ViewsDerived,
+            Domain::ViewsClosure,
+        ];
+        let before_domains = domains.map(|domain| pending_for_test(domain, &root_id));
+        let before = Bytes::capture().unwrap();
+        let started = Instant::now();
+        let mut prepared = prepare_checkout(request, &mut |_| Ok(())).unwrap();
+        let seed_source = prepared.profile.seed_source;
+        let cold_build_reason = prepared.profile.cold_build_reason;
+        let clone_mechanism = prepared.profile.clone_mechanism;
+        let clone_ms = prepared.profile.derived_clone_ms;
+        let report = prepared.commit().unwrap();
+        let io = Bytes::capture().unwrap().delta(before).unwrap();
+        let elapsed_ms = started.elapsed().as_millis();
+        for (domain, baseline) in domains.into_iter().zip(before_domains) {
+            let after = pending_for_test(domain, &root_id);
+            eprintln!(
+                "IO_PROBE {}",
+                serde_json::json!({
+                    "kind": "domain", "label": label, "domain": domain.as_str(),
+                    "logical_bytes": after.0 - baseline.0,
+                    "physical_bytes": after.1 - baseline.1,
+                })
+            );
+        }
+        eprintln!(
+            "IO_PROBE {}",
+            serde_json::json!({
+                "kind": "publication", "label": label, "io": io,
+                "elapsed_ms": elapsed_ms, "clone_ms": clone_ms,
+                "seed_source": seed_source, "cold_build_reason": cold_build_reason,
+                "clone_mechanism": clone_mechanism, "blob_puts": report.blob_puts,
+            })
+        );
+        let view = ViewStore::open(&request.storage, &request.scope).unwrap();
+        crate::views::generation::wait_for_derived_checkpoint_for_test(view.view_dir());
+        (seed_source, clone_mechanism)
+    };
+    measure("main_cold", &request(&main_root));
+    // The same small edit in both worktrees, so both patches do the same work.
+    let edited = "crates/aft/src/views/profile.rs";
+    for (worker, force_backup) in workers.iter().zip([true, false]) {
+        let path = worker.join(edited);
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str("\n// sibling seed probe edit\n");
+        fs::write(&path, text).unwrap();
+        let mut worker_request = request(worker);
+        worker_request
+            .changed_paths
+            .insert(edited.as_bytes().to_vec());
+        crate::views::generation::FORCE_BACKUP_CLONE_FOR_TEST
+            .store(force_backup, Ordering::Relaxed);
+        let label = if force_backup {
+            "worker_sqlite_backup"
+        } else {
+            "worker_clonefile"
+        };
+        let (seed_source, mechanism) = measure(label, &worker_request);
+        assert_eq!(seed_source, "sibling", "{label}");
+        assert_eq!(
+            mechanism,
+            if force_backup {
+                "sqlite_backup"
+            } else {
+                "clonefile"
+            },
+            "{label}"
+        );
+    }
+    crate::views::generation::FORCE_BACKUP_CLONE_FOR_TEST.store(false, Ordering::Relaxed);
 }
