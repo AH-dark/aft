@@ -237,4 +237,56 @@ mod tests {
             "committed WAL survives close/reopen"
         );
     }
+
+    #[test]
+    fn wal_reset_reclaims_closed_store_high_water() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("derived.sqlite-wal");
+        let configured: i64;
+        {
+            let mut writer = PathStatusStore::open(dir.path()).unwrap();
+            configured = writer
+                .connection
+                .pragma_query_value(None, "journal_size_limit", |row| row.get(0))
+                .unwrap();
+            // Exceed the normal 1,000-page autocheckpoint in one commit. The
+            // allocation remains after close until a subsequent WAL reset.
+            writer
+                .mark_pending(b"large", "x".repeat(5 * 1024 * 1024), 1)
+                .unwrap();
+        }
+        let high_water = std::fs::metadata(&wal).unwrap().len();
+        assert!(high_water > crate::db::lifecycle::WAL_JOURNAL_SIZE_LIMIT as u64);
+        {
+            let mut writer = PathStatusStore::open(dir.path()).unwrap();
+            // Reopening can rebuild the WAL index. Establish a completed
+            // checkpoint on this connection before testing its next reset.
+            let checkpoint: (i64, i64, i64) = writer
+                .connection
+                .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap();
+            assert_eq!(checkpoint.0, 0);
+            assert_eq!(checkpoint.1, checkpoint.2);
+            writer
+                .mark_pending(b"small", "after checkpoint", 2)
+                .unwrap();
+        }
+        let after_reset = std::fs::metadata(&wal).unwrap().len();
+        assert!(
+            after_reset <= crate::db::lifecycle::WAL_JOURNAL_SIZE_LIMIT as u64,
+            "checkpointed WAL high-water allocation was retained: {high_water} -> {after_reset}"
+        );
+        assert_eq!(configured, crate::db::lifecycle::WAL_JOURNAL_SIZE_LIMIT);
+        assert_eq!(
+            PathStatusStore::open(dir.path())
+                .unwrap()
+                .summary()
+                .unwrap()
+                .pending_count,
+            2
+        );
+        println!("closed path-status WAL reset: {high_water} -> {after_reset} bytes");
+    }
 }

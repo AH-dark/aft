@@ -18,6 +18,10 @@ use serde::Serialize;
 
 pub const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
 
+/// Reclaim oversized WAL allocations when SQLite resets a checkpointed log.
+/// Active transactions may exceed this; it is not a live WAL size cap.
+pub(crate) const WAL_JOURNAL_SIZE_LIMIT: i64 = 1024 * 1024;
+
 const CLOSE_CHECKPOINT_SEAM: &str = "db::TrackedConnection::drop";
 const CLOSE_CHECKPOINT_REASON: &str =
     "the close-time checkpoint result is unavailable without reopening the live SQLite file set, which would release this process's POSIX locks";
@@ -729,6 +733,7 @@ impl TrackedConnection {
     /// worker performs explicit checkpoint attempts at refresh boundaries.
     /// Keep the ledger's existing hook as an observer, with no checkpoint work.
     pub(crate) fn configure_refresh_wal(&self) -> rusqlite::Result<()> {
+        self.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT)?;
         self.pragma_update(None, "wal_autocheckpoint", 0)?;
         self.wal_hook.threshold_pages.store(0, Ordering::Relaxed);
         let context = std::ptr::from_ref(self.wal_hook.as_ref())
@@ -959,6 +964,28 @@ mod tests {
             open_on_this_thread(SqliteStore::CallgraphGeneration),
             baseline_callgraph
         );
+    }
+
+    #[test]
+    fn refresh_connections_limit_retained_wal_without_enabling_autocheckpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let connection = TrackedConnection::open(
+            &dir.path().join("refresh.sqlite"),
+            SqliteStore::CallgraphGeneration,
+        )
+        .unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        connection.configure_refresh_wal().unwrap();
+        let limit: i64 = connection
+            .pragma_query_value(None, "journal_size_limit", |row| row.get(0))
+            .unwrap();
+        assert_eq!(limit, WAL_JOURNAL_SIZE_LIMIT);
+        assert_eq!(connection.wal_autocheckpoint_pages(), 0);
+        assert!(connection
+            .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
+            .unwrap());
     }
 
     #[test]

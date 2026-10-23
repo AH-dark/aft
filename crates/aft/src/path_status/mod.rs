@@ -423,6 +423,11 @@ impl PathStatusStore {
         crate::blob_store::retry_while_busy(crate::db::STEADY_BUSY_TIMEOUT, || {
             connection.pragma_update(None, "journal_mode", "WAL")
         })?;
+        connection.pragma_update(
+            None,
+            "journal_size_limit",
+            crate::db::lifecycle::WAL_JOURNAL_SIZE_LIMIT,
+        )?;
         connection.execute_batch(PATH_STATUS_SCHEMA)?;
         let mut store = Self {
             path: path.to_path_buf(),

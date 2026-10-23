@@ -320,6 +320,20 @@ fn bench_health_rollup_steps() {
         "memory census measured on {} of {TICKS} ticks",
         cache.census_builds_for_test() - census_builds_before
     );
+    let mut wal_sizes = BTreeMap::<u64, usize>::new();
+    for registration in &registrations {
+        let bytes = std::fs::metadata(registration.view_dir().join("derived.sqlite-wal"))
+            .map_or(0, |metadata| metadata.len());
+        *wal_sizes.entry(bytes).or_default() += 1;
+    }
+    println!("closed path-status WAL bytes per store (bytes: stores): {wal_sizes:?}");
+    println!(
+        "closed path-status WAL total_bytes={}",
+        wal_sizes
+            .iter()
+            .map(|(bytes, stores)| bytes * *stores as u64)
+            .sum::<u64>()
+    );
     let metrics = DispatchPathMetrics::new();
     let pending = HashMap::new();
     let before = cpu_ns();

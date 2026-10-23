@@ -14,7 +14,8 @@ pub mod assembly;
 mod generation;
 #[cfg(test)]
 pub(crate) use generation::{
-    checkpoint_test_hooks, wait_for_derived_checkpoint_for_test, CheckpointTestHooks,
+    checkpoint_test_hooks, clone_derived_for_test, wait_for_derived_checkpoint_for_test,
+    CheckpointTestHooks,
 };
 pub(crate) mod io;
 #[cfg(aft_views_lazy_benchmark)]
