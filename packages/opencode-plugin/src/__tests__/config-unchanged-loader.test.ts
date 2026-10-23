@@ -51,6 +51,49 @@ function countingLoader() {
 }
 
 describe("createUnchangedConfigLoader", () => {
+  test("rejected legacy project config reloads after the legacy file is repaired", async () => {
+    const { projectDir, projectPath } = await fixture("{}", "{}");
+    unlinkSync(projectPath);
+    mkdirSync(join(projectDir, ".opencode"));
+    const legacyPath = join(projectDir, ".opencode", "aft.jsonc");
+    writeFileSync(legacyPath, "{");
+    const loader = countingLoader();
+
+    expect(() => loader.load(projectDir)).toThrow(ConfigRejectedError);
+    expect(() => loader.load(projectDir)).toThrow(ConfigRejectedError);
+    expect(loader.loads()).toBe(1);
+    writeFileSync(legacyPath, '{"bash": {"wait_detach_on_user_message": false}}');
+
+    expect(loader.load(projectDir)).toEqual(loadAftConfig(projectDir));
+    expect(loader.loads()).toBe(2);
+    expect(() => loader.load(projectDir)).not.toThrow();
+    expect(loader.loads()).toBe(2);
+  });
+
+  test("project acceptance recovers after a rejected legacy config is repaired", async () => {
+    const { projectDir, projectPath } = await fixture("{}", "{}");
+    unlinkSync(projectPath);
+    mkdirSync(join(projectDir, ".opencode"));
+    const legacyPath = join(projectDir, ".opencode", "aft.jsonc");
+    writeFileSync(legacyPath, "{");
+    let loads = 0;
+    const accepts = createProjectAcceptance(join(projectDir, "boot-root"), {
+      loadConfig: (directory) => {
+        loads++;
+        return loadAftConfig(directory);
+      },
+    });
+
+    expect(accepts(projectDir)).toBe(false);
+    expect(accepts(`${projectDir}/.`)).toBe(false);
+    expect(loads).toBe(1);
+    writeFileSync(legacyPath, "{}");
+
+    expect(accepts(projectDir)).toBe(true);
+    expect(accepts(`${projectDir}/.`)).toBe(true);
+    expect(loads).toBe(2);
+  });
+
   test("project acceptance revalidates boot roots and aliases after config edits", async () => {
     const { projectDir, projectPath, userPath } = await fixture("{}", "{}");
     let loads = 0;

@@ -2167,7 +2167,7 @@ export function loadAftConfig(projectDirectory: string): AftConfig {
  * replacement, chmod or deletion changes it.
  */
 export function configFilesIdentity(projectDirectory: string): string {
-  const { userConfigPath, projectConfigPath } = resolveCortexKitConfigPaths(projectDirectory);
+  const { userConfigPath, projectConfigPath } = resolveAftConfigPaths(projectDirectory);
   return [userConfigPath, projectConfigPath]
     .map((path) => {
       try {
