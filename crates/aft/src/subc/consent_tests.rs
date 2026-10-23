@@ -429,6 +429,8 @@ fn scope_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
         "read" => read_dispatch(request, ctx),
         "grep" => crate::commands::grep::handle_grep(&request, ctx),
         "glob" => crate::commands::glob::handle_glob(&request, ctx),
+        "outline" => crate::commands::outline::handle_outline(&request, ctx),
+        "zoom" => crate::commands::zoom::handle_zoom(&request, ctx),
         "write" => crate::commands::write::handle_write(&request, ctx),
         other => panic!("unexpected scope test command: {other}"),
     }
@@ -902,6 +904,96 @@ async fn consent_answer_within_the_budget_runs_the_held_call() {
     // allow_scope with no answered_by is the head's answer; the head holds the
     // path, so the scope grant is installed on the worker's scope.
     assert_eq!(f.worker_grants().len(), 1);
+}
+
+/// Models route cleanup after a consent reply has arrived but before the
+/// transport returns it to the held tool call.
+struct ReceiptGate {
+    fake: Arc<FakeCingulate>,
+    received: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl ConsentTransport for ReceiptGate {
+    fn call(&self, call: ConsentCall) -> ConsentFuture {
+        self.call_with_receipt(call, Box::new(|record| Box::pin(async { Ok(record) })))
+    }
+
+    fn call_with_receipt(&self, call: ConsentCall, receipt: ConsentReceipt) -> ConsentFuture {
+        let reply = SharedFake(Arc::clone(&self.fake)).call(call.clone());
+        let received = Arc::clone(&self.received);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            let result = receipt(reply.await?).await?;
+            if call.method == "consent.await"
+                && matches!(decode_record(&result), Ok(Settlement::Allow { .. }))
+            {
+                received.notify_one();
+                release.notified().await;
+            }
+            Ok(result)
+        })
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_outline_settlement_precedes_cleanup_and_zoom_via_symlink() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe_budget = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    let target = f.head_root.join("live.rs");
+    std::fs::write(&target, "pub fn retained() -> bool { true }\n").unwrap();
+    let alias = f.dir.path().join("target");
+    std::os::unix::fs::symlink(&f.head_root, &alias).unwrap();
+    let received = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    install_test_transport(Some(Arc::new(ReceiptGate {
+        fake: Arc::clone(&f.fake),
+        received: Arc::clone(&received),
+        release: Arc::clone(&release),
+    })));
+    let mut outline = f
+        .send_tool(
+            &f.worker,
+            "outline",
+            json!({"target": alias.join("live.rs")}),
+            701,
+            scope_dispatch,
+        )
+        .await;
+    wait_for(|| !f.fake.calls("consent.request").is_empty()).await;
+    let request = &f.fake.calls("consent.request")[0];
+    assert_eq!(request["paths"][0], json!(target));
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_scope"}),
+    );
+    tokio::time::timeout(Duration::from_secs(5), received.notified())
+        .await
+        .unwrap();
+    let zoom = f
+        .tool(
+            "zoom",
+            json!({"batch":[{"target": target, "symbols":"retained"}]}),
+            702,
+        )
+        .await;
+    release.notify_one();
+    assert!(text(&zoom).contains("retained"), "{zoom}");
+    assert_eq!(
+        f.fake.calls("consent.request").len(),
+        1,
+        "zoom must not file another ask"
+    );
+    assert_eq!(f.worker_grants().len(), 1);
+    let reply = tokio::time::timeout(Duration::from_secs(5), outline.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert!(text(&reply).contains("retained"), "{reply}");
 }
 
 #[cfg(unix)]

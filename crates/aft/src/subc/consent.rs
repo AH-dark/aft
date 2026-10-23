@@ -63,6 +63,7 @@ pub(super) enum ConsentError {
 }
 
 pub(super) type ConsentFuture = Pin<Box<dyn Future<Output = Result<Value, ConsentError>> + Send>>;
+pub(super) type ConsentReceipt = Box<dyn FnOnce(Value) -> ConsentFuture + Send>;
 
 /// One consent method sent under the asking route's scope.
 #[derive(Clone, Debug)]
@@ -79,6 +80,13 @@ pub(super) struct ConsentCall {
 /// daemon; tests install a fake.
 pub(super) trait ConsentTransport: Send + Sync {
     fn call(&self, call: ConsentCall) -> ConsentFuture;
+
+    /// Apply a reply before asynchronous transport cleanup can release or
+    /// delay the held call. Simple transports have no separate cleanup phase.
+    fn call_with_receipt(&self, call: ConsentCall, receipt: ConsentReceipt) -> ConsentFuture {
+        let reply = self.call(call);
+        Box::pin(async move { receipt(reply.await?).await })
+    }
 }
 
 static TRANSPORT: LazyLock<StdMutex<Option<Arc<dyn ConsentTransport>>>> =
@@ -346,6 +354,14 @@ impl SubcConsentTransport {
     }
 
     async fn send(self: Arc<Self>, call: ConsentCall) -> Result<Value, ConsentError> {
+        self.send_with_receipt(call, None).await
+    }
+
+    async fn send_with_receipt(
+        self: Arc<Self>,
+        call: ConsentCall,
+        receipt: Option<ConsentReceipt>,
+    ) -> Result<Value, ConsentError> {
         use subc_client_rs::{CallError, CallOptions};
         let body = encode(call.method, &call.params)?;
         let consumer = self.consumer().await?;
@@ -410,8 +426,7 @@ impl SubcConsentTransport {
             ..CallOptions::default()
         };
         let reply = consumer.request(&route, body, options).await;
-        lease.close().await;
-        match reply {
+        let result = match reply {
             Ok(bytes) => decode_result(&bytes),
             Err(CallError::Module(body)) => Err(ConsentError::Refused {
                 code: body.code,
@@ -421,7 +436,15 @@ impl SubcConsentTransport {
                 self.forget(&consumer).await;
                 Err(ConsentError::Unavailable(error.to_string()))
             }
-        }
+        };
+        // A settled scope answer must be durable before closing the route:
+        // close_handle can wait while another tool is already checking access.
+        let result = match (result, receipt) {
+            (Ok(record), Some(receipt)) => receipt(record).await,
+            (result, _) => result,
+        };
+        lease.close().await;
+        result
     }
 }
 
@@ -481,6 +504,10 @@ struct SharedSubcConsent(Arc<SubcConsentTransport>);
 impl ConsentTransport for SharedSubcConsent {
     fn call(&self, call: ConsentCall) -> ConsentFuture {
         Box::pin(Arc::clone(&self.0).send(call))
+    }
+
+    fn call_with_receipt(&self, call: ConsentCall, receipt: ConsentReceipt) -> ConsentFuture {
+        Box::pin(Arc::clone(&self.0).send_with_receipt(call, Some(receipt)))
     }
 }
 
@@ -551,6 +578,7 @@ pub(super) fn note_route_closed(route: RouteChannel) {
 }
 
 /// The parts of a held call the consent flow reads.
+#[derive(Clone)]
 pub(super) struct HeldCall {
     pub(super) reply_deadline: Instant,
     pub(super) identity: RouteIdentity,
@@ -1319,6 +1347,15 @@ fn pattern(grant: &AccessGrant) -> String {
     }
 }
 
+fn log_consent(event: &str, ask: &str, tool: &str, grant: &AccessGrant, epoch: u64) {
+    let path_hash = cortexkit_role_tool_provider::catalog::composition_digest(&json!(grant.path))
+        .expect("canonical consent path is JSON");
+    log::info!(
+        "consent {event}: ask={ask} tool={tool} operation={} kind={:?} scope_epoch={epoch} path_hash={path_hash}",
+        operation_name(grant.operation), grant.kind,
+    );
+}
+
 fn head_policy_name(policy: HeadPolicy) -> &'static str {
     match policy {
         HeadPolicy::Allow => "allow",
@@ -1633,6 +1670,13 @@ async fn hold(
         Ok(elicitation) => elicitation,
         Err(error) => return failed(call, &prep, error).await,
     };
+    log_consent(
+        "ask filed",
+        &elicitation,
+        &call.tool,
+        &prep.grant,
+        prep.key.scope.epoch,
+    );
     {
         let key = prep.key.clone();
         let call_key = prep.call_key.clone();
@@ -1653,13 +1697,40 @@ async fn hold(
         }
         first = false;
         let wait = deadline.saturating_duration_since(now).min(MAX_AWAIT);
-        let awaited = transport.call(consent_call(
-            call,
-            &prep,
-            "consent.await",
-            json!({"elicitation_id": elicitation, "timeout_ms": wait.as_millis() as u64}),
-            wait + UNARY_TIMEOUT,
-        ));
+        let applied = Arc::new(StdMutex::new(None));
+        let received = Arc::clone(&applied);
+        let receipt_call = call.clone();
+        let receipt_prep = prep.clone();
+        let ask_id = elicitation.clone();
+        let awaited = transport.call_with_receipt(
+            consent_call(
+                call,
+                &prep,
+                "consent.await",
+                json!({"elicitation_id": elicitation, "timeout_ms": wait.as_millis() as u64}),
+                wait + UNARY_TIMEOUT,
+            ),
+            Box::new(move |record| {
+                Box::pin(async move {
+                    if let Ok(settled) = decode_record(&record) {
+                        if settled != Settlement::Pending {
+                            log_consent(
+                                "answer settled",
+                                &ask_id,
+                                &receipt_call.tool,
+                                &receipt_prep.grant,
+                                receipt_prep.key.scope.epoch,
+                            );
+                            let result = finish(&receipt_call, &receipt_prep, settled).await;
+                            *received
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+                        }
+                    }
+                    Ok(record)
+                })
+            }),
+        );
         tokio::pin!(awaited);
         let reply = loop {
             tokio::select! {
@@ -1681,6 +1752,13 @@ async fn hold(
                 }
             }
         };
+        if let Some(result) = applied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            return result;
+        }
         match reply.map(|reply| reply.and_then(|record| decode_record(&record))) {
             None | Some(Ok(Settlement::Pending)) => {}
             Some(Ok(settled)) => return finish(call, &prep, settled).await,
@@ -1800,6 +1878,7 @@ fn apply_allow(
             asks::discard(conn, key)?;
             return Ok(Applied::HeadNotHeld);
         }
+        let audit = if scope { asks::get(conn, key)? } else { None };
         let Some(approved) = asks::claim(conn, key, call_key, claimant)? else {
             return Ok(Applied::NotClaimed);
         };
@@ -1809,6 +1888,19 @@ fn apply_allow(
                 &access_grants::policy_scope_key(identity),
                 grant,
             )?;
+            if let Some(record) = audit {
+                log_consent(
+                    "grant inserted",
+                    record.elicitation_id.as_deref().unwrap_or(call_key),
+                    record
+                        .request
+                        .as_ref()
+                        .and_then(|r| r["tool"].as_str())
+                        .unwrap_or("unknown"),
+                    grant,
+                    key.scope.epoch,
+                );
+            }
         }
         Ok(Applied::Run(approved))
     })
