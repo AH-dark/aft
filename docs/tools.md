@@ -586,15 +586,11 @@ File-touching commands (`rm`, `cp`, `mv`, etc.) also fire
 `ctx.ask({ permission: "external_directory" })` for paths outside the project root. Pi has no
 permission system; bash runs without prompts.
 
-For an outside **file**, OpenCode's saved “always” rule and Cingulate's optional read/write
-folder scope stay file-only in home, its ancestors, filesystem/volume roots, root-level
-folders, and system trees. System trees include `/usr`, `/etc`, `/bin`, `/sbin`, `/lib*`,
-`/opt`, `/var`, `/System`, `/Library`, `/private/etc`, and `/private/var` and their descendants;
-`/var/folders` and `/private/var/folders` are exceptions for macOS per-user temporary files.
-On Windows, `Windows` and `Program Files*` trees at a drive or share root are file-only,
-case-insensitively. Other eligible folders retain their folder wildcard. This restriction
-limits the optional parent-folder scope for a file; it does not itself deny an explicit
-directory request.
+For a file outside the project, OpenCode's "always" rule and Cingulate's folder option stay
+file-only for your home folder and the folders above it, drive and volume roots, root-level
+folders, and system folders such as `/usr`, `/etc`, `/System`, `C:\Windows` and
+`C:\Program Files` (macOS per-user temp folders under `/var/folders` are not system folders).
+Other folders keep the folder-wide rule.
 
 ---
 
