@@ -1895,16 +1895,25 @@ mod tests {
         TREE_STATS.with(|stats| stats.set(0));
         TREE_WALKS.with(|walks| walks.set(0));
         TREE_LISTS.with(|lists| lists.set(0));
+        let started = Instant::now();
         let cold = measure(&registry, None).unwrap();
+        let cold_elapsed = started.elapsed();
         let cold_stats = TREE_STATS.with(|stats| stats.replace(0));
         let cold_lists = TREE_LISTS.with(|lists| lists.replace(0));
+        let started = Instant::now();
         let warm = measure(&registry, None).unwrap();
+        let warm_elapsed = started.elapsed();
         let warm_stats = TREE_STATS.with(|stats| stats.replace(0));
         let warm_lists = TREE_LISTS.with(|lists| lists.replace(0));
         let walks = TREE_WALKS.with(|walks| walks.get());
         assert_eq!(walks, 2 * (24 + 1));
         assert_eq!(cold.views, warm.views);
         println!("directory listings: cold={cold_lists}, warm={warm_lists}");
+        println!(
+            "disk measurement wall time: cold_us={} warm_us={}",
+            cold_elapsed.as_micros(),
+            warm_elapsed.as_micros()
+        );
         assert_eq!(
             warm_lists + 24,
             cold_lists,

@@ -3090,7 +3090,7 @@ impl<'a> CacheKeyResolveProfile<'a> {
         // These are wall times, not CPU times. Hold includes memo load/prune/
         // write; rev-list includes process startup and waiting for child exit.
         Some(format!(
-            "slow configure cache_key_resolve root={} total_ms={} context_cache_hit={} git_spawns={} git_usable_ms={} rev_list_wall_ms={} retry_wait_ms={} memo_wait_ms={} memo_hold_ms={} memo_load_ms={} memo_prune_ms={} memo_write_ms={} context_memo_wait_ms={} retention_bind_ms={} format_preflight_ms={}",
+            "slow configure cache_key_resolve root={} total_ms={} context_cache_hit={} git_spawns={} git_usable_ms={} rev_list_wall_ms={} retry_wait_ms={} memo_wait_ms={} memo_hold_ms={} memo_load_ms={} memo_prune_ms={} memo_write_ms={} context_memo_wait_ms={} retention_bind_ms={} format_preflight_ms={} legacy_memo_ms={}",
             self.root.display(), total.as_millis(), self.key.context_cache_hit,
             self.key.git_spawns, self.key.git_usable.as_millis(),
             self.key.rev_list.as_millis(), self.key.retry_wait.as_millis(),
@@ -3098,6 +3098,7 @@ impl<'a> CacheKeyResolveProfile<'a> {
             self.key.memo_load.as_millis(), self.key.memo_prune.as_millis(),
             self.key.memo_write.as_millis(), self.key.context_memo_wait.as_millis(), self.retention_bind.as_millis(),
             self.format_preflight.as_millis(),
+            self.key.legacy_memo.as_millis(),
         ))
     }
 }
@@ -22298,13 +22299,14 @@ mod tests {
         profile.key.memo_load = Duration::from_millis(100);
         profile.key.memo_prune = Duration::from_millis(200);
         profile.key.memo_write = Duration::from_millis(50);
+        profile.key.legacy_memo = Duration::from_millis(70);
         profile.key.context_memo_wait = Duration::from_millis(2);
         profile.retention_bind = Duration::from_millis(30);
         profile.format_preflight = Duration::from_millis(5);
         assert!(profile.slow_line(Duration::from_millis(999)).is_none());
         assert!(profile.slow_line(Duration::from_secs(1)).is_some());
         assert_eq!(profile.slow_line(Duration::from_secs(3)).unwrap(),
-            "slow configure cache_key_resolve root=checkout total_ms=3000 context_cache_hit=false git_spawns=2 git_usable_ms=3 rev_list_wall_ms=16 retry_wait_ms=50 memo_wait_ms=2000 memo_hold_ms=400 memo_load_ms=100 memo_prune_ms=200 memo_write_ms=50 context_memo_wait_ms=2 retention_bind_ms=30 format_preflight_ms=5");
+            "slow configure cache_key_resolve root=checkout total_ms=3000 context_cache_hit=false git_spawns=2 git_usable_ms=3 rev_list_wall_ms=16 retry_wait_ms=50 memo_wait_ms=2000 memo_hold_ms=400 memo_load_ms=100 memo_prune_ms=200 memo_write_ms=50 context_memo_wait_ms=2 retention_bind_ms=30 format_preflight_ms=5 legacy_memo_ms=70");
     }
 
     #[test]
@@ -22330,6 +22332,7 @@ mod tests {
         assert!(!cold.memo_load.is_zero());
         assert!(!cold.memo_prune.is_zero());
         assert!(!cold.memo_write.is_zero());
+        assert!(!cold.legacy_memo.is_zero());
         assert!(cold.memo_hold >= cold.memo_load + cold.memo_prune + cold.memo_write);
         for _ in 0..8 {
             let mut warm = crate::search_index::ArtifactCacheKeyTimings::default();
@@ -22347,21 +22350,43 @@ mod tests {
             assert!(warm.context_cache_hit);
             assert!(warm.memo_wait.is_zero());
             assert!(warm.memo_hold.is_zero());
+            assert!(warm.legacy_memo.is_zero());
         }
     }
 
     #[test]
     #[ignore = "manual native cache-key timing probe"]
     fn cache_key_resolve_profile_native_probe() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
+        let root = std::env::var_os("AFT_CACHE_KEY_PROBE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
             .canonicalize()
             .unwrap();
         assert!(
             root.join(".git").exists(),
             "probe must reach a real checkout"
         );
-        let storage = tempfile::tempdir().unwrap();
+        // Opting into default storage requires an isolated HOME/XDG supplied by
+        // the caller; the ordinary manual probe keeps its private temp storage.
+        let temporary = tempfile::tempdir().unwrap();
+        let storage = if std::env::var_os("AFT_CACHE_KEY_PROBE_DEFAULT_STORAGE").is_some() {
+            assert!(std::env::var_os("AFT_STORAGE_DIR").is_none());
+            let home = PathBuf::from(std::env::var_os("HOME").expect("isolated HOME"));
+            let marker = home.join(".aft-isolated-timing-probe");
+            assert!(
+                marker.is_file(),
+                "default-storage probe requires {}",
+                marker.display()
+            );
+            let storage = crate::bash_background::storage_dir(None);
+            assert!(
+                storage.starts_with(&home),
+                "storage must stay in isolated HOME"
+            );
+            storage
+        } else {
+            temporary.path().to_path_buf()
+        };
         let warm_context = test_context();
         for sample in 0..8 {
             let cold_context = test_context();
@@ -22374,7 +22399,7 @@ mod tests {
                     .memoized_artifact_cache_key_for_configure_profiled(
                         &root,
                         &root,
-                        storage.path(),
+                        &storage,
                         None,
                         &mut profile.key,
                     )
@@ -22385,10 +22410,10 @@ mod tests {
                     usize::from(label == "cold_context" || sample == 0)
                 );
                 let started = Instant::now();
-                crate::storage_retention::record_bind(storage.path(), &root, &key).unwrap();
+                crate::storage_retention::record_bind(&storage, &root, &key).unwrap();
                 profile.retention_bind = started.elapsed();
                 let started = Instant::now();
-                crate::persisted_format::preflight_project_artifacts(storage.path(), &key);
+                crate::persisted_format::preflight_project_artifacts(&storage, &key);
                 profile.format_preflight = started.elapsed();
                 eprintln!("cache_key_probe sample={sample} mode={label} total_us={} timings={:?} retention_us={} preflight_us={}",
                     profile.started.elapsed().as_micros(), profile.key,
