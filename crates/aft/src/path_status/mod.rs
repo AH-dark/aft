@@ -10,6 +10,13 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
+pub(crate) mod health;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static HEALTH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Maximum paths included in a refresh-status response; counts include paths beyond this limit.
 pub const VISIBLE_PATH_CAP: usize = 20;
 
@@ -383,6 +390,7 @@ impl From<rusqlite::Error> for PathStatusError {
 pub struct PathStatusStore {
     path: PathBuf,
     connection: crate::db::file_identity::IdentityConnection,
+    health: std::sync::Arc<health::Health>,
 }
 
 impl PathStatusStore {
@@ -401,6 +409,13 @@ impl PathStatusStore {
             path,
             "path_status::PathStatusStore::open_at",
         )?;
+        // A last-close checkpoint changes the health signature without a
+        // ledger write. Leave checkpointing to the normal WAL threshold so
+        // cached local projections never need to guess who changed the files.
+        connection.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
         connection.busy_timeout(crate::db::STEADY_BUSY_TIMEOUT)?;
         // This is a long-lived annotation store. A publication can update one
         // row per source file, so rollback journaling creates and unlinks a
@@ -412,6 +427,7 @@ impl PathStatusStore {
         let mut store = Self {
             path: path.to_path_buf(),
             connection,
+            health: health::Health::for_path(path),
         };
         add_mark_column(&mut store.connection)?;
         Ok(store)
@@ -469,6 +485,7 @@ impl PathStatusStore {
             }
         }
         transaction.commit()?;
+        self.publish_health();
         Ok(())
     }
 
@@ -484,10 +501,13 @@ impl PathStatusStore {
 
     /// Removes an annotation after the path joined a complete generation.
     pub fn clear(&mut self, rel_path: &[u8]) -> Result<(), PathStatusError> {
-        self.connection.execute(
+        let changed = self.connection.execute(
             "DELETE FROM path_status WHERE rel_path = ?1",
             params![rel_path],
         )?;
+        if changed > 0 {
+            self.publish_health();
+        }
         Ok(())
     }
 
@@ -499,14 +519,18 @@ impl PathStatusStore {
         paths: impl IntoIterator<Item = &'a [u8]>,
     ) -> Result<(), PathStatusError> {
         let transaction = self.connection.transaction()?;
+        let mut changed = 0;
         {
             let mut delete =
                 transaction.prepare_cached("DELETE FROM path_status WHERE rel_path = ?1")?;
             for path in paths {
-                delete.execute(params![path])?;
+                changed += delete.execute(params![path])?;
             }
         }
         transaction.commit()?;
+        if changed > 0 {
+            self.publish_health();
+        }
         Ok(())
     }
 
@@ -629,6 +653,15 @@ impl PathStatusStore {
         })
     }
 
+    /// All health fields describe one SQLite read snapshot, even if another
+    /// process commits between the summary's individual queries.
+    fn health_summary(&self) -> Result<PathStatusSummary, PathStatusError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let summary = self.summary()?;
+        transaction.commit()?;
+        Ok(summary)
+    }
+
     /// The rows `intent` would change, read without writing. Empty when the
     /// ledger already says what `intent` says.
     pub(crate) fn plan_settlement(
@@ -692,6 +725,9 @@ impl PathStatusStore {
             }
         }
         transaction.commit()?;
+        if !changes.is_empty() {
+            self.publish_health();
+        }
         Ok(changes.clear.len() + changes.fail.len() + changes.skips.len())
     }
 
@@ -728,7 +764,16 @@ impl PathStatusStore {
             params![rel_path, state.as_str(), reason, generation, mark],
         )?;
         transaction.commit()?;
+        self.publish_health();
         Ok(())
+    }
+
+    fn publish_health(&mut self) {
+        // Without a context observing this ledger, the first health read can
+        // build its projection lazily. Writers must not pay for unused health.
+        if std::sync::Arc::strong_count(&self.health) > 1 {
+            self.health.committed(self);
+        }
     }
 
     /// The ledger's current mark epoch. Annotations written since marks were

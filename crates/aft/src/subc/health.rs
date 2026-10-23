@@ -4805,6 +4805,149 @@ mod tests {
         assert_eq!(snapshot["percentiles"]["p99_ms"], 90_000);
     }
 
+    fn view_health_fixture() -> (
+        tempfile::TempDir,
+        Executor,
+        Arc<AppContext>,
+        std::path::PathBuf,
+    ) {
+        let (dir, root) = super::super::test_support::test_root("view-health-next-tick");
+        let view_dir = dir.path().join("view");
+        let mut status = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
+        status.mark_pending(b"a.rs", "fixture", 1).unwrap();
+        drop(status);
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.as_path().into()),
+                storage_dir: Some(dir.path().join("storage")),
+                ..Default::default()
+            },
+        ));
+        ctx.update_config(|config| config.views.enabled = true);
+        ctx.install_view_runtime(
+            crate::context::ViewRuntimeSnapshot {
+                query_pin: None,
+                storage: dir.path().join("storage"),
+                family: "health-fixture".into(),
+                scope: "health-checkout".into(),
+                view_dir: view_dir.clone(),
+                generation: Some("1-fixture".into()),
+                manifest: None,
+                head_fingerprint: String::new(),
+                head_metadata: crate::alias::GitHeadMetadata {
+                    head_path: Default::default(),
+                    head_mtime: None,
+                    resolved_ref_path: None,
+                    resolved_ref_mtime: None,
+                },
+                pending_paths: Default::default(),
+                pending_inputs: Default::default(),
+            },
+            None,
+        );
+        let executor = Executor::new();
+        assert!(executor.register_actor(root, Arc::clone(&ctx)));
+        (dir, executor, ctx, view_dir)
+    }
+
+    fn rolled_up_view(cache: &HealthRollupCache, executor: &Executor, app: &App) -> Value {
+        cache.refresh_for_test(executor, app);
+        cache.snapshot().0.metrics["roots"][0]["views"].clone()
+    }
+
+    #[test]
+    fn view_health_local_failure_is_in_next_rollup_without_sqlite_reopen() {
+        let (_dir, executor, _ctx, view_dir) = view_health_fixture();
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["pending_paths"], 1);
+        let before = crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
+        {
+            let mut status = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
+            status.mark_failed(b"a.rs", "missing payload", 1).unwrap();
+        }
+        let next = rolled_up_view(&cache, &executor, &app);
+        assert_eq!(
+            next["failed_paths"], 1,
+            "committed failure must show next tick"
+        );
+        assert_eq!(next["pending_paths"], 0);
+        assert_eq!(
+            crate::path_status::HEALTH_READS.with(std::cell::Cell::get),
+            before,
+            "a local commit must supply its projection without reopening SQLite"
+        );
+    }
+
+    #[test]
+    fn view_health_external_failure_is_in_next_rollup() {
+        const CHILD_VIEW: &str = "AFT_HEALTH_EXTERNAL_WRITE_VIEW";
+        if let Some(view_dir) = std::env::var_os(CHILD_VIEW) {
+            let mut status =
+                crate::path_status::PathStatusStore::open(Path::new(&view_dir)).unwrap();
+            status
+                .mark_failed(b"a.rs", "external missing payload", 1)
+                .unwrap();
+            return;
+        }
+        let (_dir, executor, _ctx, view_dir) = view_health_fixture();
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["pending_paths"], 1);
+        // First make a local write, so an obsolete local projection must not
+        // explain away the later signature change from the child process.
+        {
+            let mut status = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
+            status.mark_pending(b"b.rs", "local", 1).unwrap();
+        }
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["pending_paths"], 2);
+        let before = crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "subc::health::tests::view_health_external_failure_is_in_next_rollup",
+                "--nocapture",
+            ])
+            .env(CHILD_VIEW, &view_dir)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "child: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let next = rolled_up_view(&cache, &executor, &app);
+        assert_eq!(
+            next["failed_paths"], 1,
+            "external commit must show next tick"
+        );
+        assert_eq!(next["pending_paths"], 1);
+        assert_eq!(
+            crate::path_status::HEALTH_READS.with(std::cell::Cell::get),
+            before + 1,
+            "external signature changes must reopen SQLite"
+        );
+    }
+
+    #[test]
+    fn view_health_runtime_replacement_disable_and_clear_are_in_next_rollup() {
+        let (_dir, executor, ctx, _view_dir) = view_health_fixture();
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["generation"], 1);
+        let mut next = ctx.view_runtime_snapshot().unwrap();
+        next.generation = Some("2-fixture".into());
+        ctx.install_view_runtime(next, None);
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["generation"], 2);
+        ctx.update_config(|config| config.views.enabled = false);
+        assert!(rolled_up_view(&cache, &executor, &app).is_null());
+        ctx.update_config(|config| config.views.enabled = true);
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["generation"], 2);
+        ctx.clear_view_runtime();
+        assert!(rolled_up_view(&cache, &executor, &app).is_null());
+    }
+
     fn refresh_until_root_count(
         cache: &HealthRollupCache,
         executor: &Executor,

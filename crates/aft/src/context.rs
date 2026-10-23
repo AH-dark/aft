@@ -1176,10 +1176,6 @@ struct ConfigureWarmState {
     key: Option<String>,
 }
 
-/// How long a view's path-status summary is reused while its database files
-/// look unchanged. A bound on how late a missed change can show.
-const PATH_STATUS_REREAD_INTERVAL: Duration = Duration::from_secs(30);
-
 /// How long the health rollup reuses one index's memory walk while that
 /// index's shape counters stay the same. A bound on how late an in-place
 /// change that leaves every counter alone can show.
@@ -1217,26 +1213,11 @@ struct HealthMemoryWalks {
     symbols: Option<IndexMemoryWalk<[u64; 3]>>,
 }
 
-/// Length and modification time of a view's derived database and of its
-/// write-ahead log, `None` for a file that does not exist.
-type PathStatusFiles = [Option<(u64, Option<std::time::SystemTime>)>; 2];
-
-fn path_status_files(view_dir: &Path) -> PathStatusFiles {
-    let state = |name: &str| {
-        std::fs::metadata(view_dir.join(name))
-            .ok()
-            .map(|metadata| (metadata.len(), metadata.modified().ok()))
-    };
-    [state("derived.sqlite"), state("derived.sqlite-wal")]
-}
-
-/// The last path-status summary read for this root's view.
+/// The immutable health projection of one installed runtime and ledger version.
 #[derive(Debug)]
-struct PathStatusCache {
-    view_dir: PathBuf,
-    files: PathStatusFiles,
-    read_at: Instant,
-    summary: Option<crate::path_status::PathStatusSummary>,
+struct ViewHealthCache {
+    revision: u64,
+    snapshot: ViewHealthSnapshot,
 }
 
 /// Progress of the background walks that record which language servers apply
@@ -1327,8 +1308,6 @@ impl Drop for ProjectApplicabilityHold {
 
 #[cfg(test)]
 thread_local! {
-    /// Path-status database reads made on this thread.
-    static PATH_STATUS_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Memory estimates on this thread that walked at least one of a root's
     /// resident indexes.
     static MEMORY_ESTIMATE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2337,6 +2316,19 @@ pub(crate) struct ViewRuntimeSnapshot {
 struct ViewRuntimeState {
     snapshot: ViewRuntimeSnapshot,
     pin: Option<Arc<crate::pins::QueryPin>>,
+    health: Arc<crate::path_status::health::Health>,
+    health_cache: parking_lot::Mutex<Option<ViewHealthCache>>,
+}
+
+impl ViewRuntimeState {
+    fn new(snapshot: ViewRuntimeSnapshot, pin: Option<Arc<crate::pins::QueryPin>>) -> Self {
+        Self {
+            health: crate::path_status::health::Health::for_view(&snapshot.view_dir),
+            snapshot,
+            pin,
+            health_cache: parking_lot::Mutex::new(None),
+        }
+    }
 }
 
 pub(crate) struct PreparedViewUpdate {
@@ -4331,11 +4323,6 @@ pub struct AppContext {
     /// `project_applicability_epoch`, no walk for the current configuration
     /// is still running.
     project_applicability_progress: Arc<ProjectApplicabilityProgress>,
-    /// The last path-status summary read from this root's view database,
-    /// with the state of the database files it was read from, so the health
-    /// rollup reopens the database only after it changed (see
-    /// `view_path_status_summary`).
-    view_path_status_cache: parking_lot::Mutex<Option<PathStatusCache>>,
     /// The last walk of this root's semantic index, trigram index and symbol
     /// cache that the health rollup made for its memory estimate. A later
     /// rollup reuses it while those indexes' `memory_shape` counters are
@@ -5119,7 +5106,6 @@ impl AppContext {
             lsp_manager: Arc::new(parking_lot::Mutex::new(lsp_manager)),
             project_applicability_epoch: Arc::new(AtomicU64::new(0)),
             project_applicability_progress: Arc::default(),
-            view_path_status_cache: parking_lot::Mutex::new(None),
             health_memory_walk: parking_lot::Mutex::new(HealthMemoryWalks::default()),
             lsp_post_edit_worker_running: Arc::new(AtomicBool::new(false)),
             lsp_watcher_forward_slot: Default::default(),
@@ -9025,10 +9011,8 @@ impl AppContext {
         *self
             .view_runtime
             .write()
-            .unwrap_or_else(|error| error.into_inner()) = Some(ViewRuntimeState {
-            snapshot,
-            pin: pin.map(Arc::new),
-        });
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(ViewRuntimeState::new(snapshot, pin.map(Arc::new)));
     }
 
     /// A deleted checkout has no publication consumer. Retire once rather than
@@ -9090,94 +9074,69 @@ impl AppContext {
             .read()
             .unwrap_or_else(|error| error.into_inner());
         let state = state.as_ref()?;
-        let status = self.view_path_status_summary(&state.snapshot.view_dir);
-        Some(ViewHealthSnapshot {
-            generation: state
-                .snapshot
-                .generation
-                .as_deref()
-                .and_then(|generation| generation.split('-').next())
-                .and_then(|generation| generation.parse().ok())
-                .unwrap_or(0),
-            pinned: state.pin.is_some(),
-            pending_paths: status
-                .as_ref()
-                .map_or(state.snapshot.pending_paths.len(), |status| {
-                    status.pending_count
-                }),
-            failed_paths: status.as_ref().map_or(0, |status| status.failed_count),
-            skipped_paths: status
-                .as_ref()
-                .map(|status| status.skipped_by_reason.clone())
-                .unwrap_or_default(),
-            skipped_path_sample: status
-                .as_ref()
-                .map(|status| {
-                    status
-                        .skipped_sample
-                        .iter()
-                        .map(|skip| ViewSkippedPath {
-                            path: String::from_utf8_lossy(&skip.rel_path).into_owned(),
-                            reason: skip.reason.clone(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            cold_builds: crate::views::assembly::cold_build_counts(&state.snapshot.view_dir),
-            publication_failure,
-            callgraph_readiness_deferred: state
-                .snapshot
-                .pending_inputs
-                .values()
-                .map(|input| input.reason)
-                .find(|reason| {
-                    matches!(
-                        *reason,
-                        crate::views::read::CALLGRAPH_READINESS_BUSY
-                            | crate::views::read::CALLGRAPH_READINESS_PROBE_FAILED
-                    )
-                }),
-        })
-    }
-
-    /// The path-status summary of `view_dir`, read again only when its
-    /// database files changed since the last read, or after
-    /// [`PATH_STATUS_REREAD_INTERVAL`].
-    ///
-    /// The health rollup asks for this for every views-on root every few
-    /// seconds. Reading it opens the view's SQLite database, applies its
-    /// schema, queries it and closes it again, and closing the last
-    /// connection checkpoints the write-ahead log; doing that for every root
-    /// on every pass kept the rollup thread busy while nothing had changed.
-    fn view_path_status_summary(
-        &self,
-        view_dir: &Path,
-    ) -> Option<crate::path_status::PathStatusSummary> {
-        let files = path_status_files(view_dir);
-        if let Some(cached) = self.view_path_status_cache.lock().as_ref() {
-            if cached.view_dir == view_dir
-                && cached.files == files
-                && cached.read_at.elapsed() < PATH_STATUS_REREAD_INTERVAL
-            {
-                return cached.summary.clone();
-            }
-        }
-        #[cfg(test)]
-        PATH_STATUS_READS.with(|reads| reads.set(reads.get() + 1));
-        let summary = crate::path_status::PathStatusStore::open(view_dir)
-            .ok()
-            .and_then(|store| store.summary().ok());
-        // Opening and closing the database can itself create, checkpoint or
-        // remove its files, so the state to compare against next time is
-        // taken after the store is closed. A write that lands in between is
-        // picked up by the next change or by the reread interval.
-        *self.view_path_status_cache.lock() = Some(PathStatusCache {
-            view_dir: view_dir.to_path_buf(),
-            files: path_status_files(view_dir),
-            read_at: Instant::now(),
-            summary: summary.clone(),
-        });
-        summary
+        let (revision, status) = state.health.snapshot();
+        let mut cache = state.health_cache.lock();
+        let mut snapshot = if let Some(cached) = cache.as_ref().filter(|c| c.revision == revision) {
+            cached.snapshot.clone()
+        } else {
+            let snapshot = ViewHealthSnapshot {
+                generation: state
+                    .snapshot
+                    .generation
+                    .as_deref()
+                    .and_then(|generation| generation.split('-').next())
+                    .and_then(|generation| generation.parse().ok())
+                    .unwrap_or(0),
+                pinned: state.pin.is_some(),
+                pending_paths: status
+                    .as_ref()
+                    .map_or(state.snapshot.pending_paths.len(), |status| {
+                        status.pending_count
+                    }),
+                failed_paths: status.as_ref().map_or(0, |status| status.failed_count),
+                skipped_paths: status
+                    .as_ref()
+                    .map(|status| status.skipped_by_reason.clone())
+                    .unwrap_or_default(),
+                skipped_path_sample: status
+                    .as_ref()
+                    .map(|status| {
+                        status
+                            .skipped_sample
+                            .iter()
+                            .map(|skip| ViewSkippedPath {
+                                path: String::from_utf8_lossy(&skip.rel_path).into_owned(),
+                                reason: skip.reason.clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                cold_builds: Default::default(),
+                publication_failure: None,
+                callgraph_readiness_deferred: state
+                    .snapshot
+                    .pending_inputs
+                    .values()
+                    .map(|input| input.reason)
+                    .find(|reason| {
+                        matches!(
+                            *reason,
+                            crate::views::read::CALLGRAPH_READINESS_BUSY
+                                | crate::views::read::CALLGRAPH_READINESS_PROBE_FAILED
+                        )
+                    }),
+            };
+            *cache = Some(ViewHealthCache {
+                revision,
+                snapshot: snapshot.clone(),
+            });
+            snapshot
+        };
+        // Retry delay counts down without a write, and cold-build counters
+        // advance during preparation, before a runtime is published.
+        snapshot.publication_failure = publication_failure;
+        snapshot.cold_builds = crate::views::assembly::cold_build_counts(&state.snapshot.view_dir);
+        Some(snapshot)
     }
 
     pub(crate) fn view_runtime_snapshot(&self) -> Option<ViewRuntimeSnapshot> {
@@ -9429,10 +9388,7 @@ impl AppContext {
                 .view_runtime
                 .write()
                 .unwrap_or_else(|error| error.into_inner())
-                .replace(ViewRuntimeState {
-                    snapshot,
-                    pin: prepared.pin.take(),
-                });
+                .replace(ViewRuntimeState::new(snapshot, prepared.pin.take()));
             if let Some(gate) = prepared.callgraph_install_test_gate.take() {
                 let _ = gate.installed.send(report.generation.clone().unwrap());
             }
@@ -15908,7 +15864,7 @@ mod core_regressions {
             },
             None,
         );
-        let reads = || PATH_STATUS_READS.with(std::cell::Cell::get);
+        let reads = || crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
 
         let before = reads();
         let started = Instant::now();
