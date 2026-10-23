@@ -341,13 +341,42 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
         (parsed.args.len() == 1 && parsed.appends_to.is_none() && parsed.heredoc.is_none())
             .then(|| parsed.args.remove(0))
     }
-    fn resolve_target(head: &str, parts: &[Part], cwd: Option<&Path>) -> Option<DirectoryTarget> {
-        let raw = parts
-            .iter()
-            .skip(1)
-            .find(|part| !part.text.starts_with('-'))?
-            .text
-            .as_str();
+    fn resolve_target(
+        head: &str,
+        parts: &[Part],
+        cwd: Option<&Path>,
+    ) -> Option<(DirectoryTarget, PathBuf)> {
+        let mut physical = false;
+        let mut options = true;
+        let mut operand = None;
+        for part in parts.iter().skip(1) {
+            let word = literal_word(&part.text);
+            if options {
+                if word.as_deref() == Some("--") {
+                    options = false;
+                    continue;
+                }
+                if let Some(flags) = word
+                    .as_deref()
+                    .filter(|word| word.starts_with('-') && word.len() > 1)
+                {
+                    if head == "cd" {
+                        // Bash processes option letters in order; the last -L/-P wins.
+                        for flag in flags.chars().skip(1) {
+                            match flag {
+                                'L' => physical = false,
+                                'P' => physical = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+            operand = Some(part.text.as_str());
+            break;
+        }
+        let raw = operand?;
         let expand_home = raw == "~" || raw.starts_with("~/");
         // Decode the supported home prefix without allowing other expansions;
         // quoted or escaped tildes remain ordinary path text.
@@ -359,17 +388,29 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
         let text = literal_word(&word)
             .filter(|text| text != "-" && !(head == "pushd" && text.starts_with('+')))?;
         let literal_absolute = Path::new(&text).is_absolute();
-        let path = if expand_home {
+        let joined = if expand_home {
             PathBuf::from(std::env::var_os("HOME")?).join(text.strip_prefix("~/").unwrap_or(""))
         } else if literal_absolute {
             PathBuf::from(text)
         } else {
             cwd?.join(text)
         };
-        Some(DirectoryTarget {
-            path: super::resolve_with_existing_ancestors(&path),
-            literal_absolute,
-        })
+        let (path, next_cwd) = if physical {
+            let resolved = super::resolve_with_existing_ancestors(&joined);
+            (resolved.clone(), resolved)
+        } else {
+            // Default cd follows logical PWD: fold .. before resolving symlinks
+            // for the containment check, and retain that logical spelling to walk.
+            let logical = super::normalize_path(&joined);
+            (super::resolve_with_existing_ancestors(&logical), logical)
+        };
+        Some((
+            DirectoryTarget {
+                path,
+                literal_absolute,
+            },
+            next_cwd,
+        ))
     }
     fn directory_change(
         head: &str,
@@ -380,8 +421,8 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
         let mut success = Paths::empty();
         let mut emitted: Vec<DirectoryTarget> = Vec::new();
         let mut resolve = |cwd| {
-            if let Some(target) = resolve_target(head, parts, cwd) {
-                success.insert(target.path.clone());
+            if let Some((target, next_cwd)) = resolve_target(head, parts, cwd) {
+                success.insert(next_cwd);
                 if !emitted.iter().any(|previous| previous.path == target.path) {
                     emitted.push(target);
                 }
@@ -1141,6 +1182,53 @@ mod tests {
                 cwd.parent().unwrap().join("$literal")
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_targets_preserve_logical_paths_and_physical_cd_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let deep = root.join("deep");
+        std::fs::create_dir(&deep).unwrap();
+        std::os::unix::fs::symlink("..", deep.join("link")).unwrap();
+        let parent = root.parent().unwrap().to_path_buf();
+        for (command, expected) in [
+            ("cd link && cd ..", vec![root.clone(), deep.clone()]),
+            (
+                "pushd link >/dev/null && cd ..",
+                vec![root.clone(), deep.clone()],
+            ),
+            ("cd -- link && cd ..", vec![root.clone(), deep.clone()]),
+            ("cd link/..", vec![deep.clone()]),
+            ("cd -P link && cd ..", vec![root.clone(), parent.clone()]),
+            ("cd -P link/..", vec![parent.clone()]),
+            ("cd -P -L link && cd ..", vec![root.clone(), deep.clone()]),
+            ("cd -L -P link && cd ..", vec![root.clone(), parent.clone()]),
+            ("cd -PL link && cd ..", vec![root.clone(), deep.clone()]),
+            ("cd -LP link && cd ..", vec![root.clone(), parent.clone()]),
+            ("cd '-P' link && cd ..", vec![root.clone(), parent.clone()]),
+        ] {
+            let output = std::process::Command::new("/bin/bash")
+                .args([
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    &format!("{command} && pwd -P"),
+                ])
+                .current_dir(&deep)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{command}: {output:?}");
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap().trim(),
+                expected.last().unwrap().to_str().unwrap(),
+                "{command}"
+            );
+            assert_eq!(directory_paths(command, &deep), expected, "{command}");
+        }
     }
 
     #[cfg(unix)]
