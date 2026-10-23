@@ -1,6 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import {
   existsSync,
@@ -76,8 +76,8 @@ function createCtx(withToast = true) {
   };
 }
 
-async function waitFor(predicate: () => boolean, message: string): Promise<void> {
-  const deadline = Date.now() + 1000;
+async function waitFor(predicate: () => boolean, message: string, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error(message);
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -338,6 +338,197 @@ describe("auto-update audit regressions", () => {
     expect(JSON.parse(readFileSync(reclaimPath, "utf-8"))).toEqual(owner);
   });
 
+  test("paused stale-guard recoverers cannot admit two updater processes", async () => {
+    const storageDir = createStorageDir();
+    const lockPath = join(storageDir, "opencode", "last-update-check.json.lock");
+    const reclaimPath = `${lockPath}.reclaim`;
+    mkdirSync(join(storageDir, "opencode"), { recursive: true });
+    const stale = JSON.stringify({ pid: 2147483647, startedMs: Date.now() });
+    writeFileSync(lockPath, stale);
+    writeFileSync(reclaimPath, stale);
+    const moduleUrl = new URL("../hooks/auto-update-checker/index.ts", import.meta.url).href;
+    const marker = (name: string) => join(storageDir, name);
+    const start = (name: "a" | "b", pausePath: string) => {
+      const script = `
+        const fs = await import("node:fs");
+        const { __test__ } = await import(${JSON.stringify(moduleUrl)});
+        const gate = new Int32Array(new SharedArrayBuffer(4));
+        const wait = (path) => {
+          const deadline = Date.now() + 15000;
+          while (!fs.existsSync(path)) {
+            if (Date.now() >= deadline) throw new Error("pause timed out: " + path);
+            Atomics.wait(gate, 0, 0, 10);
+          }
+        };
+        let paused = false;
+        const lock = __test__.claimCheckSlot(${JSON.stringify(storageDir)}, 0, {
+          beforeTakeover(path) {
+            if (paused || path !== ${JSON.stringify(pausePath)}) return;
+            paused = true;
+            fs.writeFileSync(${JSON.stringify(marker(`${name}-paused`))}, "");
+            wait(${JSON.stringify(marker(`${name}-resume`))});
+          }
+        });
+        try {
+          const result = ${JSON.stringify(marker(`${name}-result`))};
+          fs.writeFileSync(result + ".tmp", JSON.stringify(lock !== null));
+          fs.renameSync(result + ".tmp", result);
+          if (lock) wait(${JSON.stringify(marker(`${name}-release`))});
+        } finally { lock?.release(); }
+      `;
+      const child = spawn(process.execPath, ["--eval", script], {
+        env: {
+          ...process.env,
+          HOME: storageDir,
+          XDG_CONFIG_HOME: join(storageDir, "config"),
+          XDG_DATA_HOME: join(storageDir, "data"),
+          XDG_STATE_HOME: join(storageDir, "state"),
+          XDG_CACHE_HOME: join(storageDir, "cache"),
+          AFT_STORAGE_DIR: undefined,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout.on("data", (chunk) => {
+        output += String(chunk);
+      });
+      child.stderr.on("data", (chunk) => {
+        output += String(chunk);
+      });
+      const exited = new Promise<number | null>((resolve) => {
+        child.once("error", (error) => {
+          output += String(error);
+          resolve(null);
+        });
+        child.once("exit", resolve);
+      });
+      return { child, exited, output: () => output };
+    };
+    const a = start("a", reclaimPath);
+    let b: ReturnType<typeof start> | undefined;
+    try {
+      await waitFor(() => existsSync(marker("a-paused")), "first guard observation", 10000);
+      b = start("b", lockPath);
+      await waitFor(() => existsSync(marker("b-paused")), "second primary observation", 10000);
+      // Process b holds a new reclaim guard and is paused before primary takeover.
+      // Resume process a with its stale guard snapshot.
+      writeFileSync(marker("a-resume"), "");
+      await waitFor(() => existsSync(marker("a-result")), "first admission result", 10000);
+      writeFileSync(marker("b-resume"), "");
+      await waitFor(() => existsSync(marker("b-result")), "second admission result", 10000);
+      const admittedA = JSON.parse(readFileSync(marker("a-result"), "utf-8"));
+      const admittedB = JSON.parse(readFileSync(marker("b-result"), "utf-8"));
+      expect(Number(admittedA) + Number(admittedB)).toBe(1);
+      expect(admittedA).toBe(false);
+      expect(admittedB).toBe(true);
+    } finally {
+      for (const name of ["a", "b"]) {
+        writeFileSync(marker(`${name}-resume`), "");
+        writeFileSync(marker(`${name}-release`), "");
+      }
+      expect(await a.exited, a.output()).toBe(0);
+      if (b) expect(await b.exited, b.output()).toBe(0);
+    }
+  }, 45000);
+
+  test.each([
+    "inode",
+    "content",
+  ] as const)("reclaim takeover preserves changed %s", async (change) => {
+    const storageDir = createStorageDir();
+    const lockPath = join(storageDir, "opencode", "last-update-check.json.lock");
+    const reclaimPath = `${lockPath}.reclaim`;
+    mkdirSync(join(storageDir, "opencode"), { recursive: true });
+    const stale = JSON.stringify({ pid: 2147483647, startedMs: Date.now() });
+    writeFileSync(lockPath, stale);
+    writeFileSync(reclaimPath, stale);
+    const originalInode = fs.statSync(reclaimPath, { bigint: true }).ino;
+    let replacement = "";
+    let replacementInode = 0n;
+    const { __test__ } = await freshIndexImport();
+    const lock = __test__.claimCheckSlot(storageDir, 0, {
+      beforeTakeover(path) {
+        if (path !== reclaimPath) return;
+        if (change === "inode") {
+          fs.renameSync(path, `${path}.original`);
+          writeFileSync(path, stale);
+        } else {
+          writeFileSync(path, JSON.stringify({ pid: process.pid, startedMs: Date.now() }));
+        }
+        replacement = readFileSync(path, "utf-8");
+        replacementInode = fs.statSync(path, { bigint: true }).ino;
+      },
+    });
+    try {
+      expect(lock).toBeNull();
+      expect(readFileSync(reclaimPath, "utf-8")).toBe(replacement);
+      expect(fs.statSync(reclaimPath, { bigint: true }).ino).toBe(replacementInode);
+      expect(replacementInode === originalInode).toBe(change === "content");
+    } finally {
+      lock?.release();
+    }
+  });
+
+  test("primary takeover preserves a replacement after stale observation", async () => {
+    const storageDir = createStorageDir();
+    const lockPath = join(storageDir, "opencode", "last-update-check.json.lock");
+    mkdirSync(join(storageDir, "opencode"), { recursive: true });
+    writeFileSync(lockPath, JSON.stringify({ pid: 2147483647, startedMs: Date.now() }));
+    const replacement = JSON.stringify({ pid: process.pid, startedMs: Date.now() });
+    let interleaved = false;
+    const { __test__ } = await freshIndexImport();
+    const lock = __test__.claimCheckSlot(storageDir, 0, {
+      beforeTakeover(path) {
+        if (path !== lockPath) return;
+        interleaved = true;
+        fs.renameSync(path, `${path}.original`);
+        writeFileSync(path, replacement);
+      },
+    });
+    try {
+      expect(lock).toBeNull();
+      expect(interleaved).toBe(true);
+      expect(readFileSync(lockPath, "utf-8")).toBe(replacement);
+    } finally {
+      lock?.release();
+    }
+  });
+
+  test("takeover restoration does not overwrite a newer guard", async () => {
+    const storageDir = createStorageDir();
+    const lockPath = join(storageDir, "opencode", "last-update-check.json.lock");
+    const reclaimPath = `${lockPath}.reclaim`;
+    mkdirSync(join(storageDir, "opencode"), { recursive: true });
+    const stale = JSON.stringify({ pid: 2147483647, startedMs: Date.now() });
+    writeFileSync(lockPath, stale);
+    writeFileSync(reclaimPath, stale);
+    const newer = JSON.stringify({ pid: process.pid, startedMs: Date.now(), token: "newer-guard" });
+    let restored = false;
+    const { __test__ } = await freshIndexImport();
+    let lock: ReturnType<typeof __test__.claimCheckSlot> = null;
+    try {
+      lock = __test__.claimCheckSlot(storageDir, 0, {
+        beforeTakeover(path) {
+          if (path === reclaimPath)
+            writeFileSync(
+              path,
+              JSON.stringify({ pid: process.pid, startedMs: Date.now(), token: "moved-guard" }),
+            );
+        },
+        beforeRestore(path) {
+          if (path !== reclaimPath) return;
+          restored = true;
+          writeFileSync(reclaimPath, newer);
+        },
+      });
+      expect(lock).toBeNull();
+      expect(restored).toBe(true);
+      expect(readFileSync(reclaimPath, "utf-8")).toBe(newer);
+    } finally {
+      lock?.release();
+    }
+  });
+
   test("updater retries when the orphan lock disappears before stat", async () => {
     const storageDir = createStorageDir();
     const lockPath = join(storageDir, "opencode", "last-update-check.json.lock");
@@ -412,18 +603,16 @@ describe("auto-update audit regressions", () => {
     writeFileSync(lockPath, "{}");
     const { __test__ } = await freshIndexImport();
     let disappeared = false;
-    const originalRead = fs.readFileSync;
-    const read = spyOn(fs, "readFileSync").mockImplementation(((
-      file: fs.PathOrFileDescriptor,
-      options: unknown,
-    ) => {
-      if (file === lockPath && !disappeared) {
+    const originalOpen = fs.openSync;
+    const read = spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      if (file === lockPath && flags === "r" && !disappeared) {
+        // Remove the pathname before the snapshot reader can open its descriptor.
         disappeared = true;
         rmSync(lockPath);
         throw Object.assign(new Error("released lock"), { code: "ENOENT" });
       }
-      return originalRead(file, options as BufferEncoding);
-    }) as typeof fs.readFileSync);
+      return originalOpen(file, flags, mode);
+    });
     try {
       const lock = __test__.claimCheckSlot(storageDir, 0);
       expect(disappeared).toBe(true);
