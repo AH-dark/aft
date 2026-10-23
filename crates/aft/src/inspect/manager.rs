@@ -10129,6 +10129,20 @@ export function bannerUnused() {}
     }
 
     fn corrupt_cached_dead_code_exports(cache: &InspectCache, file: &str, corruption: &str) {
+        let expected = canonicalize_for_snapshot(&cache.project_root().join(file));
+        // Match fixture aliases by identity, but bind the producer's exact SQL
+        // key spelling, including native Windows separators, without rewriting it.
+        let file = cache
+            .contribution_freshness(InspectCategory::DeadCode)
+            .unwrap()
+            .into_iter()
+            .find(|(path, _)| {
+                canonicalize_for_snapshot(&cache.project_root().join(path)) == expected
+            })
+            .expect("seeded facts must contain the fixture source")
+            .0
+            .to_string_lossy()
+            .into_owned();
         let conn = rusqlite::Connection::open(cache.sqlite_path()).unwrap();
         let blob: Vec<u8> = conn
             .query_row(
@@ -10184,7 +10198,7 @@ export function bannerUnused() {}
         for corruption in ["missing exports", "invalid exports"] {
             let (_dir, root, manager, snapshot) = dead_code_edge_case_fixture(&[]);
             let (job, cache) = seed_dead_code_fact_cache(&manager, &snapshot);
-            corrupt_cached_dead_code_exports(&cache, "src/main.rs", corruption);
+            corrupt_cached_dead_code_exports(&cache, "src/./main.rs", corruption);
             let first = manager
                 .tier2_run_with_reuse_job_result_with_options(
                     job.clone(),
@@ -10257,7 +10271,7 @@ export function bannerUnused() {}
             let original_hash = cache
                 .contribution_set_hash_for_config(job.category, &job.config)
                 .unwrap();
-            corrupt_cached_dead_code_exports(&cache, "src/dead.rs", corruption);
+            corrupt_cached_dead_code_exports(&cache, "src/../src/dead.rs", corruption);
             assert_eq!(
                 cache
                     .contribution_set_hash_for_config(job.category, &job.config)
@@ -10306,8 +10320,17 @@ export function bannerUnused() {}
                 )
                 .outcome
                 .expect("recompute after manifest change");
+            let scanned = recomputed
+                .scanned_files
+                .iter()
+                .map(|file| canonicalize_for_snapshot(file))
+                .collect::<BTreeSet<_>>();
             assert!(
-                !recomputed.scanned_files.contains(&root.join("src/dead.rs")),
+                scanned.contains(&canonicalize_for_snapshot(&root.join("Cargo.toml"))),
+                "the changed manifest must be recognized among the rescanned files"
+            );
+            assert!(
+                !scanned.contains(&canonicalize_for_snapshot(&root.join("src/dead.rs"))),
                 "the corrupted row must not be repaired by rescanning its unchanged source"
             );
             assert_cached_dead_code_gap(&recomputed.aggregate, "src/dead.rs");
