@@ -488,7 +488,14 @@ impl PreparedAssembly {
     /// opens a shared SQLite file and may wait on another process.
     pub fn settle_status(&mut self) -> SettleOutcome {
         if let Some(entry) = self.committed_index_entry.take() {
+            // `commit` has already closed the publication's I/O phases, so this
+            // write is measured as its own interval and added to the same
+            // record, which is logged when the assembly is dropped.
+            let started = Instant::now();
+            let before = super::io::Bytes::capture();
             entry.write();
+            self.profile
+                .record_derived_index_write(before, super::io::Bytes::capture(), started);
         }
         let Some(settlement) = self.committed_settlement.take() else {
             return SettleOutcome::Nothing;
@@ -1460,6 +1467,8 @@ struct PublicationProfile {
     /// How a seeded derived database was copied (`clonefile`,
     /// `sqlite_backup`), or `none` when nothing was copied.
     clone_mechanism: &'static str,
+    /// Time spent writing the derived-output index row after the commit.
+    derived_index_ms: u128,
     /// Where a sibling donor was found (`index_exact`, `index_nearest`,
     /// `worktrees`), or `none`.
     seed_lookup: &'static str,
@@ -1498,6 +1507,7 @@ impl PublicationProfile {
             cold_build_reason: "no_base",
             clone_mechanism: "none",
             seed_lookup: "none",
+            derived_index_ms: 0,
             #[cfg(test)]
             derived_cloned: false,
             materialization_call_ms: 0,
@@ -1538,6 +1548,23 @@ impl PublicationProfile {
     }
 }
 
+impl PublicationProfile {
+    /// Add the derived-index write, measured after `commit` closed the
+    /// publication's I/O phases. Its bytes join the derived and total I/O,
+    /// and its time is added to the total.
+    fn record_derived_index_write(
+        &mut self,
+        before: Option<super::io::Bytes>,
+        after: Option<super::io::Bytes>,
+        started: Instant,
+    ) {
+        self.io.credit_derived_index(before, after);
+        let elapsed = started.elapsed().as_millis();
+        self.derived_index_ms += elapsed;
+        self.total_ms += elapsed;
+    }
+}
+
 impl Drop for PublicationProfile {
     fn drop(&mut self) {
         if self.active_phase.is_some() {
@@ -1556,7 +1583,7 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
     // pointer transaction is a subset of the cas phase, which also includes
     // waiting to acquire the actor barrier.
     format!(
-        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_dispatch_ms={} materialize_commit_ms={} materialize_cleanup_memory_ms={} materialize_cleanup_connections_ms={} pointer_ms={} total_ms={} derived_bytes={} semantic_fill={} generation={} concurrent_publications={} seed_source={} cold_build_reason={} clone_mechanism={} seed_lookup={} {}",
+        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_dispatch_ms={} materialize_commit_ms={} materialize_cleanup_memory_ms={} materialize_cleanup_connections_ms={} pointer_ms={} total_ms={} derived_bytes={} semantic_fill={} generation={} concurrent_publications={} seed_source={} cold_build_reason={} clone_mechanism={} seed_lookup={} derived_index_ms={} {}",
         profile.root.display(), profile.outcome, profile.candidates, profile.blob_puts,
         profile.pending_paths, profile.phase_ms[0], profile.phase_ms[1],
         profile.phase_ms[2], profile.phase_ms[3], profile.head_ms, profile.assembly_ms,
@@ -1581,7 +1608,7 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
         profile.materialization.cleanup_memory_ms,
         profile.materialization.cleanup_connections_ms,
         profile.pointer_ms, profile.total_ms, profile.derived_bytes,
-        profile.semantic_fill, profile.generation, profile.concurrent_publications, profile.seed_source, profile.cold_build_reason, profile.clone_mechanism, profile.seed_lookup, profile.io.fields(),
+        profile.semantic_fill, profile.generation, profile.concurrent_publications, profile.seed_source, profile.cold_build_reason, profile.clone_mechanism, profile.seed_lookup, profile.derived_index_ms, profile.io.fields(),
     )
 }
 

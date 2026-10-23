@@ -198,7 +198,7 @@ pub const SQLITE_UNINSTRUMENTED_OPENERS: &[SqliteUninstrumentedOpener] = &[
     SqliteUninstrumentedOpener {
         seam: "views::assembly::derived_index",
         class: UninstrumentedOpenerClass::AttributedElsewhere,
-        reason: "the family derived-output index is read in the publication clone phase and written in its cas phase, which credit their process-I/O deltas to the publication",
+        reason: "index lookups run inside the publication's clone phase; the row write runs after commit and is measured as the publication's derived_index interval; both are credited to views_derived",
     },
     SqliteUninstrumentedOpener {
         seam: "views::generation::checkpoint_derived",

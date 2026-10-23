@@ -487,6 +487,68 @@ fn indexed_donor_from_an_older_build_output_is_forgotten_not_reused() {
 }
 
 #[test]
+fn deferred_derived_index_write_is_counted_in_the_publication_io() {
+    let (_dirs, main, _worker) = checkouts(24);
+    let view_dir = ViewStore::open(&main.storage, &main.scope)
+        .unwrap()
+        .view_dir()
+        .to_owned();
+    let root_id = main.project_root.display().to_string();
+    let mut prepared = prepare_checkout(&main, &mut |_| Ok(())).unwrap();
+    prepared.commit().unwrap();
+    let field = |fields: &str, name: &str| -> Option<u64> {
+        fields
+            .split(' ')
+            .find_map(|field| field.strip_prefix(name)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    let before = prepared.profile.io.fields();
+    let ledger_before =
+        crate::write_ledger::pending_for_test(crate::write_ledger::Domain::ViewsDerived, &root_id);
+
+    // The row is written here, after `commit` closed the publication's phases.
+    prepared.settle_status();
+
+    assert_eq!(index_writes_for_test(&view_dir), vec![IndexWrite::Recorded]);
+    let after = prepared.profile.io.fields();
+    assert!(
+        publication_profile_line(&prepared.profile).contains("derived_index_ms="),
+        "the publication line must report the deferred write's time"
+    );
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
+        let written = field(&after, "derived_index_logical_bytes_written").unwrap();
+        assert_eq!(
+            field(&before, "derived_index_logical_bytes_written"),
+            Some(0)
+        );
+        assert!(
+            written > 0,
+            "the deferred SQLite write must reach the publication's I/O: {after}"
+        );
+        for total in [
+            "derived_logical_bytes_written",
+            "total_logical_bytes_written",
+        ] {
+            assert_eq!(
+                field(&after, total).unwrap() - field(&before, total).unwrap(),
+                written,
+                "{total} must include the deferred write"
+            );
+        }
+        let ledger_after = crate::write_ledger::pending_for_test(
+            crate::write_ledger::Domain::ViewsDerived,
+            &root_id,
+        );
+        assert_eq!(
+            ledger_after.0 - ledger_before.0,
+            written,
+            "the views_derived ledger must be credited with the deferred write"
+        );
+    }
+}
+
+#[test]
 fn derived_index_row_of_a_superseded_publication_is_never_written() {
     let (_dirs, mut main, _worker) = checkouts(24);
     publish_checkout(&main).unwrap();
