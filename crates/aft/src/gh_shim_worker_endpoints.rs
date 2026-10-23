@@ -123,7 +123,7 @@ pub(crate) struct Generation {
     root: PathBuf,
     name: String,
     directory: PathBuf,
-    _lease: File,
+    _lease: crate::fs_lock::AdvisoryLockGuard,
 }
 impl Generation {
     pub(crate) fn new(root: &Path) -> io::Result<Arc<Self>> {
@@ -152,7 +152,7 @@ impl Generation {
             root: root.to_owned(),
             name,
             directory,
-            _lease: lease,
+            _lease: crate::fs_lock::AdvisoryLockGuard::from_locked_file(lease),
         }))
     }
     pub(crate) fn bind(self: &Arc<Self>, task: &str) -> io::Result<(UnixListener, Arc<Endpoint>)> {
@@ -336,6 +336,7 @@ fn reclaim_dead(root: &Path) -> io::Result<()> {
             }
             return Err(io::Error::last_os_error());
         }
+        let _lease = crate::fs_lock::AdvisoryLockGuard::from_locked_file(lease);
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
             let file = entry.file_name();

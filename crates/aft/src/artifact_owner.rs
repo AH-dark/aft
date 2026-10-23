@@ -704,7 +704,7 @@ fn atomic_write_manifest(path: &Path, manifest: &ArtifactOwnerManifest) -> io::R
     replace_manifest_unsynced(path, &manifest_bytes(manifest)?)
 }
 
-fn manifest_mutation_lock(path: &Path) -> io::Result<std::fs::File> {
+fn manifest_mutation_lock(path: &Path) -> io::Result<fs_lock::AdvisoryLockGuard> {
     let directory = path
         .parent()
         .ok_or_else(|| io::Error::other("missing owner parent"))?;
@@ -745,10 +745,10 @@ fn manifest_mutation_lock(path: &Path) -> io::Result<std::fs::File> {
         }
         Err(error) => return Err(error),
     };
-    // The kernel releases exclusion when this handle closes, including after a
-    // crash. Keep the file in place so heartbeats need no new inode or fsync.
+    // Keep the mutation-lock file after unlocking so heartbeat and manifest
+    // updates can reuse the same coordination inode without a new file or fsync.
     file.lock()?;
-    Ok(file)
+    Ok(fs_lock::AdvisoryLockGuard::from_locked_file(file))
 }
 
 fn manifest_bytes(manifest: &ArtifactOwnerManifest) -> io::Result<Vec<u8>> {
