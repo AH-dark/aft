@@ -31,6 +31,11 @@ on:
       - "ci-speed/**"
   workflow_dispatch:
     inputs:
+      storm_profile_probe:
+        description: Compare the no-LTO storm lane with thin LTO on free runners
+        required: false
+        type: boolean
+        default: false
       ref:
         description: "Git ref to test (branch name, tag, or commit SHA)"
         required: false
@@ -136,6 +141,7 @@ jobs:
           python3 -m unittest discover -s scripts/lib -p test_rust_gate_collection.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_macos_integration_archive.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_windows_probes.py -v
+          python3 -m unittest discover -s scripts/lib -p test_ci_storm_controls.py -v
           python3 -m unittest discover -s scripts/lib -p test_cache_write_policy.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_artifact.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_workflow.py -v
@@ -158,6 +164,8 @@ jobs:
   unit:
     name: Unit
     uses: ./.github/workflows/_unit-suite.yml
+    with:
+      storm_profile_probe: ${{ github.event_name == 'workflow_dispatch' && inputs.storm_profile_probe }}
 
   # ---------------------------------------------------------------------------
   # Linux Docker e2e + Pi RPC e2e + macOS native e2e + Windows native e2e.
