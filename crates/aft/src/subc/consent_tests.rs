@@ -1725,6 +1725,36 @@ fn consent_scope_rejects_home_ancestors() {
 }
 
 #[test]
+fn consent_scope_preserves_ordinary_system_name_prefixes() {
+    #[cfg(unix)]
+    let (home, root, ordinary, system) = (
+        Path::new("/srv/users/alice"),
+        Path::new("/"),
+        vec!["/library/x", "/library/projects", "/libfoo/x"],
+        vec!["/lib64/x", "/libx32/x"],
+    );
+    #[cfg(windows)]
+    let (home, root, ordinary, system) = (
+        Path::new(r"C:\Users\alice"),
+        Path::new(r"C:\"),
+        vec![r"C:\Program Files-backup\x", r"C:\PROGRAM FILES ARM\Vendor"],
+        vec![r"C:\Program Files (x86)\x", r"C:\pRoGrAm FiLeS\x"],
+    );
+    for directory in ordinary {
+        assert!(
+            directory_scope_is_narrow(Path::new(directory), home, root),
+            "ordinary folder must remain eligible: {directory}"
+        );
+    }
+    for directory in system {
+        assert!(
+            !directory_scope_is_narrow(Path::new(directory), home, root),
+            "system tree must stay file-only: {directory}"
+        );
+    }
+}
+
+#[test]
 fn consent_scope_rejects_system_trees() {
     #[cfg(unix)]
     let (home, root, directories) = (
@@ -1737,7 +1767,9 @@ fn consent_scope_rejects_system_trees() {
             "/bin/tools",
             "/sbin/tools",
             "/lib/modules",
+            "/lib32/modules",
             "/lib64/modules",
+            "/libx32/modules",
             "/libexec/tools",
             "/opt/vendor",
             "/var/log",
@@ -1757,7 +1789,7 @@ fn consent_scope_rejects_system_trees() {
             r"C:\wInDoWs\Temp",
             r"C:\Program Files\Vendor",
             r"C:\Program Files (x86)\Vendor",
-            r"C:\PROGRAM FILES ARM\Vendor",
+            r"C:\PROGRAM FILES (X86)\Vendor",
         ],
     );
     for directory in directories {

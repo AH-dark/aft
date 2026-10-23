@@ -665,17 +665,107 @@ fn push_ask(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, ask: Perm
         // A single displayed folder ask may represent several files. Keep all
         // of them so approving one file cannot authorize its unapproved sibling.
         for target in ask.targets {
-            if !existing.targets.contains(&target) {
+            if !existing
+                .targets
+                .iter()
+                .any(|prior| same_external_target(prior, &target))
+            {
                 existing.targets.push(target);
             }
         }
     }
 }
 
+fn same_external_target(
+    left: &crate::access_policy::AccessGrant,
+    right: &crate::access_policy::AccessGrant,
+) -> bool {
+    #[cfg(windows)]
+    let same_path = crate::windows_path::normalize_windows_path(&left.path)
+        == crate::windows_path::normalize_windows_path(&right.path);
+    #[cfg(not(windows))]
+    let same_path = left.path == right.path;
+    same_path && left.kind == right.kind && left.operation == right.operation
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bash_permissions::normalize_path;
+
+    #[cfg(windows)]
+    #[test]
+    fn external_target_dedup_normalizes_windows_path_spellings() {
+        use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+        for (plain, verbatim) in [
+            (r"D:/a/aft/file.txt", r"\\?\d:\a\aft\file.txt"),
+            (
+                r"\\server\share\folder\file.txt",
+                r"\\?\UNC\server\share\folder\file.txt",
+            ),
+        ] {
+            let original = AccessGrant {
+                path: PathBuf::from(verbatim),
+                kind: GrantKind::File,
+                operation: AccessOperation::Read,
+            };
+            let pattern = "unchanged-host-pattern/*";
+            let ask = |target| PermissionAsk {
+                kind: PermissionKind::ExternalDirectory,
+                patterns: vec![pattern.into()],
+                always: vec![pattern.into()],
+                targets: vec![target],
+            };
+            let mut asks = Vec::new();
+            let mut seen = HashSet::new();
+            push_ask(&mut asks, &mut seen, ask(original.clone()));
+            push_ask(
+                &mut asks,
+                &mut seen,
+                ask(AccessGrant {
+                    path: PathBuf::from(plain),
+                    ..original.clone()
+                }),
+            );
+            assert_eq!(asks.len(), 1);
+            assert_eq!(
+                asks[0].targets,
+                [original.clone()],
+                "equivalent targets should merge without rewriting the first spelling"
+            );
+            push_ask(
+                &mut asks,
+                &mut seen,
+                ask(AccessGrant {
+                    kind: GrantKind::Subtree,
+                    ..original.clone()
+                }),
+            );
+            push_ask(
+                &mut asks,
+                &mut seen,
+                ask(AccessGrant {
+                    operation: AccessOperation::Write,
+                    ..original.clone()
+                }),
+            );
+            push_ask(
+                &mut asks,
+                &mut seen,
+                ask(AccessGrant {
+                    path: original.path.with_file_name("other.txt"),
+                    ..original
+                }),
+            );
+            assert_eq!(
+                asks[0].targets.len(),
+                4,
+                "different kind, mode or path must remain distinct"
+            );
+            assert_eq!(asks[0].patterns, [pattern]);
+            assert_eq!(asks[0].always, [pattern]);
+        }
+    }
 
     #[test]
     fn pwd_expands_against_scan_cwd() {

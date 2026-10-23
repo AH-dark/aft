@@ -561,7 +561,17 @@ fn permissions_granted_cover(
 
 fn external_approval_covers(granted: &str, target: &crate::access_policy::AccessGrant) -> bool {
     use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+    // Compare Windows identities without rewriting host patterns or stored targets.
     let path = Path::new(granted);
+    #[cfg(windows)]
+    let normalized_grant = crate::windows_path::normalize_windows_path(path);
+    #[cfg(windows)]
+    let path = normalized_grant.as_path();
+    let target_path = target.path.as_path();
+    #[cfg(windows)]
+    let normalized_target = crate::windows_path::normalize_windows_path(target_path);
+    #[cfg(windows)]
+    let target_path = normalized_target.as_path();
     let (path, kind) = if path.file_name().is_some_and(|name| name == "*") {
         let Some(parent) = path.parent() else {
             return false;
@@ -576,7 +586,7 @@ fn external_approval_covers(granted: &str, target: &crate::access_policy::Access
             kind,
             operation: AccessOperation::Read,
         }
-        .covers_kind(AccessOperation::Read, &target.path, target.kind)
+        .covers_kind(AccessOperation::Read, target_path, target.kind)
 }
 
 fn conservative_powershell_permission_asks(
@@ -895,6 +905,68 @@ mod tests {
             !permissions_granted_cover(&[missing], &[folder]),
             "unknown targets must fail closed"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn external_approval_coverage_normalizes_windows_path_spellings() {
+        use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+        for (plain, verbatim) in [
+            (r"D:\a\aft\file.txt", r"\\?\D:\a\aft\file.txt"),
+            (r"D:/a/aft/file.txt", r"\\?\d:\a\aft\file.txt"),
+            (
+                r"\\server\share\folder\file.txt",
+                r"\\?\UNC\server\share\folder\file.txt",
+            ),
+        ] {
+            for (approved, requested) in [(plain, verbatim), (verbatim, plain)] {
+                let target = AccessGrant {
+                    path: PathBuf::from(requested),
+                    kind: GrantKind::File,
+                    operation: AccessOperation::Read,
+                };
+                let original = target.clone();
+                assert!(
+                    external_approval_covers(approved, &target),
+                    "file: {approved} -> {requested}"
+                );
+                let folder = format!("{}/*", Path::new(approved).parent().unwrap().display());
+                assert!(
+                    external_approval_covers(&folder, &target),
+                    "folder: {folder} -> {requested}"
+                );
+                assert!(!external_approval_covers(
+                    approved,
+                    &AccessGrant {
+                        kind: GrantKind::Subtree,
+                        ..target.clone()
+                    }
+                ));
+                assert!(!external_approval_covers(
+                    approved,
+                    &AccessGrant {
+                        path: target.path.with_file_name("other.txt"),
+                        ..target.clone()
+                    }
+                ));
+                assert!(!external_approval_covers(
+                    &folder,
+                    &AccessGrant {
+                        path: target
+                            .path
+                            .parent()
+                            .unwrap()
+                            .with_file_name("other-folder")
+                            .join("file.txt"),
+                        ..target.clone()
+                    }
+                ));
+                assert_eq!(
+                    target, original,
+                    "comparison must preserve the requested spelling"
+                );
+            }
+        }
     }
 
     #[test]

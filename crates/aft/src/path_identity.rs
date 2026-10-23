@@ -75,6 +75,11 @@ fn directory_is_system_tree(directory: &Path) -> bool {
         "/etc",
         "/bin",
         "/sbin",
+        "/lib",
+        "/lib32",
+        "/lib64",
+        "/libx32",
+        "/libexec",
         "/opt",
         "/var",
         "/System",
@@ -84,11 +89,6 @@ fn directory_is_system_tree(directory: &Path) -> bool {
     ]
     .iter()
     .any(|root| directory.starts_with(root))
-        || directory
-            .strip_prefix("/")
-            .ok()
-            .and_then(|relative| relative.components().next())
-            .is_some_and(|component| component.as_os_str().to_string_lossy().starts_with("lib"))
 }
 
 #[cfg(windows)]
@@ -99,7 +99,12 @@ fn directory_is_system_tree(directory: &Path) -> bool {
             std::path::Component::Normal(name) => Some(name.to_string_lossy().to_ascii_lowercase()),
             _ => None,
         })
-        .is_some_and(|name| name == "windows" || name.starts_with("program files"))
+        .is_some_and(|name| {
+            matches!(
+                name.as_str(),
+                "windows" | "program files" | "program files (x86)"
+            )
+        })
 }
 
 /// Decide whether a canonical project root admits watching and indexing.
