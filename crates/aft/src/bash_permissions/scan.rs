@@ -251,12 +251,16 @@ pub(super) fn collect_commands<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tre
 }
 
 #[cfg(any(unix, test))]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct DirectoryTarget {
     pub path: PathBuf,
+    /// An uncertain shell mode requires both candidate destinations to be invalid.
+    pub alternate_path: Option<PathBuf>,
     pub literal_absolute: bool,
 }
 
+/// This runon check is best-effort: callers refuse only changes known to be
+/// invalid. Shell behavior the check cannot follow continues to run as before.
 /// Follow reachable outer-shell folder and physical-mode alternatives, keeping
 /// successful and failed commands separate so `&&` and `||` stay correlated.
 #[cfg(any(unix, test))]
@@ -266,7 +270,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
     #[derive(Clone, PartialEq, Eq)]
     struct ShellState {
         cwd: PathBuf,
-        physical: bool,
+        physical: Option<bool>,
     }
     #[derive(Clone)]
     enum Paths {
@@ -279,7 +283,10 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
             Self::Known(Vec::new())
         }
         fn one(cwd: PathBuf, physical: bool) -> Self {
-            Self::Known(vec![ShellState { cwd, physical }])
+            Self::Known(vec![ShellState {
+                cwd,
+                physical: Some(physical),
+            }])
         }
         fn is_empty(&self) -> bool {
             matches!(self, Self::Known(paths) if paths.is_empty())
@@ -289,17 +296,18 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                 Self::Unknown(mode) => *mode,
                 Self::Known(states) => {
                     let first = states.first()?.physical;
-                    states
-                        .iter()
-                        .all(|state| state.physical == first)
-                        .then_some(first)
+                    if states.iter().all(|state| state.physical == first) {
+                        first
+                    } else {
+                        None
+                    }
                 }
             }
         }
         fn insert(&mut self, state: ShellState) {
             match self {
                 Self::Unknown(mode) => {
-                    if *mode != Some(state.physical) {
+                    if *mode != state.physical {
                         *mode = None;
                     }
                 }
@@ -310,7 +318,8 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                         let mode = paths
                             .iter()
                             .all(|path| path.physical == state.physical)
-                            .then_some(state.physical);
+                            .then_some(state.physical)
+                            .flatten();
                         *self = Self::Unknown(mode);
                     } else {
                         paths.push(state);
@@ -333,9 +342,9 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                 }
             }
         }
-        fn with_physical(self, physical: bool) -> Self {
+        fn with_physical(self, physical: Option<bool>) -> Self {
             match self {
-                Self::Unknown(_) => Self::Unknown(Some(physical)),
+                Self::Unknown(_) => Self::Unknown(physical),
                 Self::Known(states) => {
                     let mut result = Self::empty();
                     for mut state in states {
@@ -526,6 +535,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
         Some((
             DirectoryTarget {
                 path,
+                alternate_path: None,
                 literal_absolute,
             },
             next_cwd,
@@ -539,40 +549,45 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
     ) -> Flow {
         let mut success = Paths::empty();
         let mut emitted: Vec<DirectoryTarget> = Vec::new();
-        let mut resolve = |cwd, physical, tracked_mode| {
-            if let Some((target, next_cwd)) = resolve_target(head, parts, cwd, physical) {
-                if let Some(physical) = tracked_mode {
+        let mut resolve = |cwd, mode| {
+            let resolved = match mode {
+                Some(physical) => resolve_target(head, parts, cwd, physical)
+                    .map(|(target, next_cwd)| (target, Some(next_cwd))),
+                None => resolve_target(head, parts, cwd, false)
+                    .zip(resolve_target(head, parts, cwd, true))
+                    .map(|((mut logical, logical_cwd), (physical, physical_cwd))| {
+                        if logical.path != physical.path {
+                            logical.alternate_path = Some(physical.path);
+                        }
+                        // A divergent logical/physical walk cannot establish the
+                        // next folder, even if one candidate is allowed remotely.
+                        let next_cwd = (logical_cwd == physical_cwd).then_some(logical_cwd);
+                        (logical, next_cwd)
+                    }),
+            };
+            if let Some((target, next_cwd)) = resolved {
+                if let Some(next_cwd) = next_cwd {
                     success.insert(ShellState {
                         cwd: next_cwd,
-                        physical,
+                        physical: mode,
                     });
                 } else {
                     success = Paths::Unknown(None);
                 }
-                if !emitted.iter().any(|previous| previous.path == target.path) {
+                if !emitted.contains(&target) {
                     emitted.push(target);
                 }
             } else {
-                success = success.clone().union(Paths::Unknown(tracked_mode));
+                success = success.clone().union(Paths::Unknown(mode));
             }
         };
         match &incoming {
             Paths::Known(paths) => {
                 for state in paths {
-                    resolve(
-                        Some(state.cwd.as_path()),
-                        state.physical,
-                        Some(state.physical),
-                    );
+                    resolve(Some(state.cwd.as_path()), state.physical);
                 }
             }
-            Paths::Unknown(Some(physical)) => resolve(None, *physical, Some(*physical)),
-            Paths::Unknown(None) => {
-                // Inspect absolute targets in both modes without guessing how
-                // later relative changes would behave.
-                resolve(None, false, None);
-                resolve(None, true, None);
-            }
+            Paths::Unknown(mode) => resolve(None, *mode),
         }
         targets.extend(emitted);
         // A failed cd/pushd leaves its incoming directory unchanged.
@@ -656,9 +671,11 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                         let flow = match set_mode_change(&parts) {
                             SetModeChange::Unchanged => Flow::success(incoming.clone()),
                             SetModeChange::Set(physical) => {
-                                Flow::success(incoming.clone().with_physical(physical))
+                                Flow::success(incoming.clone().with_physical(Some(physical)))
                             }
-                            SetModeChange::Unknown => Flow::either(Paths::Unknown(None)),
+                            SetModeChange::Unknown => {
+                                Flow::either(incoming.clone().with_physical(None))
+                            }
                         };
                         let mut cursor = node.walk();
                         if node
@@ -1498,7 +1515,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn directory_targets_unknown_mode_requires_explicit_recovery() {
+    fn directory_targets_unknown_set_preserves_folder_but_not_mode() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let deep = root.join("deep");
@@ -1512,8 +1529,14 @@ mod tests {
             "set -o unsupported",
             "set -P \"$OPTS\"",
         ] {
-            assert!(
-                directory_paths(&format!("{prefix}; cd link && cd .."), &deep).is_empty(),
+            let expected = if prefix.starts_with("set ") {
+                vec![root.clone()]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                directory_paths(&format!("{prefix}; cd link && cd .."), &deep),
+                expected,
                 "{prefix}"
             );
             let logical = format!(
@@ -1539,6 +1562,21 @@ mod tests {
                 "{prefix}"
             );
         }
+        assert_eq!(
+            directory_paths("set \"$OPTS\"; cd .. && cd ..", &deep),
+            vec![root.clone(), root.parent().unwrap().to_path_buf()]
+        );
+        let paired = top_level_directory_targets("set \"$OPTS\"; cd link/.. && cd ../..", &deep);
+        assert_eq!(paired.len(), 1);
+        assert_eq!(paired[0].path, deep);
+        assert_eq!(
+            paired[0].alternate_path,
+            Some(root.parent().unwrap().to_path_buf())
+        );
+        let explicit = top_level_directory_targets("set \"$OPTS\"; cd -P link/..", &deep);
+        assert_eq!(explicit.len(), 1);
+        assert_eq!(explicit[0].path, root.parent().unwrap());
+        assert_eq!(explicit[0].alternate_path, None);
         for command in ["set -- \"$X\"; cd ..", "set value \"$X\"; cd .."] {
             assert_eq!(
                 directory_paths(command, &deep),

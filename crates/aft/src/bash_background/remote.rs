@@ -1691,18 +1691,26 @@ fn runon_cd_refusal(command: &str, request: &RunRequest) -> Result<Option<String
                 let template = if windows && target.literal_absolute {
                     RUNON_CD_WINDOWS_ABSOLUTE_MESSAGE
                 } else {
-                    let copied = target.path.starts_with(checkout)
-                        || siblings
-                            .iter()
-                            .any(|sibling| target.path.starts_with(sibling));
-                    // System and unknown paths may exist on the runner. Reject only
-                    // paths identified as local home content or another checkout.
-                    let local_only = homes.iter().any(|home| target.path.starts_with(home))
-                        || crate::root_identity::nearest_git_marker(&target.path)
-                            .ok()
-                            .flatten()
-                            .is_some();
-                    if copied || !local_only {
+                    let invalid = |path: &Path| {
+                        let copied = path.starts_with(checkout)
+                            || siblings.iter().any(|sibling| path.starts_with(sibling));
+                        // System and unknown paths may exist on the runner. Reject
+                        // only local home content or another checkout.
+                        let local_only = homes.iter().any(|home| path.starts_with(home))
+                            || crate::root_identity::nearest_git_marker(path)
+                                .ok()
+                                .flatten()
+                                .is_some();
+                        !copied && local_only
+                    };
+                    // An unknown shell mode gives mutually exclusive candidates,
+                    // unlike separate reachable command branches: both must fail.
+                    if !invalid(&target.path)
+                        || target
+                            .alternate_path
+                            .as_ref()
+                            .is_some_and(|path| !invalid(path))
+                    {
                         return None;
                     }
                     RUNON_CD_OUTSIDE_CHECKOUT_MESSAGE
