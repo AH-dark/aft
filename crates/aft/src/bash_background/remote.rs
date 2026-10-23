@@ -321,6 +321,19 @@ async fn draining_retry_sleep(_root: &Path, _now: u64, delay: u64) {
     tokio::time::sleep(Duration::from_millis(delay)).await;
 }
 
+/// Shown for a remote task cancelled after it was submitted but before the
+/// build server accepted it: with no job id, nothing can confirm whether the
+/// command ran.
+#[cfg(unix)]
+pub(crate) const PRE_ACCEPTANCE_CANCELLED: &str =
+    "cancelled before the build server accepted the job; whether it ran is unknown";
+
+/// Prefix shown, followed by `: <error>`, when cancelling such a task
+/// failed.
+#[cfg(unix)]
+pub(crate) const PRE_ACCEPTANCE_CANCEL_FAILED: &str =
+    "could not cancel before the build server accepted the job; whether it ran is unknown";
+
 /// The remote runner AFT dispatches to; named in every remote reply header.
 #[cfg(unix)]
 const RUNNER_ID: &str = "ck-motor";
@@ -2263,16 +2276,15 @@ impl BgTaskRegistry {
                     // Before the runner accepts the submission, there is no job
                     // ID for exec.cancel or attach. Cancel the active call instead.
                     // The SDK closes its receiver, so this cannot prove the job stopped.
-                    let result = client.cancel_submission(&stream).await.map_err(|error| {
-                        format!(
-                        "remote cancellation before acceptance failed; outcome unknown: {error}"
-                    )
-                    });
+                    let result = client
+                        .cancel_submission(&stream)
+                        .await
+                        .map_err(|error| format!("{PRE_ACCEPTANCE_CANCEL_FAILED}: {error}"));
                     if self.finish_owner_pause_cancel(&task, result.clone()) {
                         return Ok(());
                     }
                     result?;
-                    return Err("remote cancellation requested before acceptance; outcome unknown: no job ID to recover terminal proof".into());
+                    return Err(PRE_ACCEPTANCE_CANCELLED.into());
                 }
             }
             let result = tokio::select! {

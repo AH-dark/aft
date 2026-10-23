@@ -5750,6 +5750,13 @@ mod grant_path_tests {
             "unsubscribe is not terminal proof: {status:?}"
         );
         assert!(!status.data.to_string().contains("admitted"), "{status:?}");
+        assert!(
+            status
+                .data
+                .to_string()
+                .contains(crate::bash_background::registry::remote::PRE_ACCEPTANCE_CANCELLED),
+            "{status:?}"
+        );
     }
 
     /// A runner that is slow to accept a job must not hold a foreground call
