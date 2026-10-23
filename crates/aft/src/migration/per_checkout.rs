@@ -1332,6 +1332,7 @@ fn convert_semantic(
 /// What one binder asks the import to produce.
 #[derive(Clone, Debug)]
 pub struct ImportRequest {
+    pub durable_storage: PathBuf,
     pub storage: PathBuf,
     /// The v2 family whose stores receive the imported payloads.
     pub family: String,
@@ -1457,7 +1458,11 @@ pub fn run_import(
     }
     report.outcome = ImportOutcome::Completed;
     let registry = FamilyRegistry::open(&request.storage, &request.family)?;
-    let registration = registry.register_view(&request.scope, &request.root)?;
+    let registration = registry.register_view_with_storage(
+        &request.durable_storage,
+        &request.scope,
+        &request.root,
+    )?;
     let mut run = Run {
         request,
         ledger: &ledger,
@@ -2094,12 +2099,15 @@ pub(crate) fn import_for_semantic_lane(
     keep_going: &dyn Fn() -> bool,
 ) {
     const SETTLE_DEADLINE: Duration = Duration::from_secs(10 * 60);
-    const SETTLE_POLL: Duration = Duration::from_secs(1);
-    let (storage, key) = (&config.storage, &config.family);
-    if !has_importable_legacy_artifact(storage, key) {
+    if config.storage.durable != config.storage.artifacts {
         return;
     }
-    if let Ok(Some(ledger)) = ImportLedger::open_existing(storage, key) {
+    const SETTLE_POLL: Duration = Duration::from_secs(1);
+    let (storage, key) = (&config.storage, &config.family);
+    if !has_importable_legacy_artifact(&storage.artifacts, key) {
+        return;
+    }
+    if let Ok(Some(ledger)) = ImportLedger::open_existing(&storage.artifacts, key) {
         if ledger.status().is_ok_and(|status| status.complete) {
             return;
         }
@@ -2125,10 +2133,11 @@ pub(crate) fn import_for_semantic_lane(
     ) else {
         return;
     };
-    let semantic = legacy_semantic_producer(storage, key, &config.semantic);
+    let semantic = legacy_semantic_producer(&storage.artifacts, key, &config.semantic);
     let unregistered = crate::views::semantic_runtime::UNREGISTERED_PRODUCER.to_owned();
     let request = ImportRequest {
-        storage: storage.clone(),
+        durable_storage: config.storage.durable.clone(),
+        storage: storage.artifacts.clone(),
         family: config.family.clone(),
         legacy_key: key.clone(),
         scope: config.scope.clone(),

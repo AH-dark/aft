@@ -383,6 +383,9 @@ fn verify_final_root_stats(
 }
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        return Response::error(&req.id, crate::root_cache::CACHE_DIR_UNAVAILABLE, reason);
+    }
     if req.worker_session() {
         ctx.lsp().disable_rust_cargo_for_worker();
     }
@@ -539,6 +542,9 @@ pub fn handle_inspect_warm_for_test(req: &RawRequest, ctx: &AppContext) -> Respo
 }
 
 pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response {
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        return Response::error(&req.id, crate::root_cache::CACHE_DIR_UNAVAILABLE, reason);
+    }
     if req.worker_session() {
         ctx.lsp().disable_rust_cargo_for_worker();
     }
@@ -8702,7 +8708,11 @@ mod checkout_deferred_tests {
             let registry =
                 crate::views::registry::FamilyRegistry::open(storage.path(), "inspect-test")
                     .unwrap();
-            let access = ViewAccess::Owner(registry.register_view("scope", root.path()).unwrap());
+            let access = ViewAccess::Owner(
+                registry
+                    .register_view_with_storage(registry.storage(), "scope", root.path())
+                    .unwrap(),
+            );
             ctx.install_checkout_query_runtime(Arc::new(
                 crate::views::query_wait::CheckoutQueryRuntime {
                     access,

@@ -262,6 +262,7 @@ pub(crate) mod tests {
 
     pub(crate) fn config(connection_file: std::path::PathBuf) -> SemanticBackendConfig {
         SemanticBackendConfig {
+            local_cache_dir: None,
             backend: crate::config::SemanticBackend::Synapse,
             model: "embedding".into(),
             base_url: None,

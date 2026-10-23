@@ -206,23 +206,38 @@ pub fn expand_index_root_path(
     path: &str,
     home: Option<&std::path::Path>,
 ) -> Result<PathBuf, String> {
+    expand_configured_absolute_path("index.roots", path, home)
+}
+
+/// Expand the supported `~` forms in `storage.cache_dir` and require the
+/// result to be absolute.
+pub fn expand_cache_dir_path(
+    path: &str,
+    home: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
+    expand_configured_absolute_path("storage.cache_dir", path, home)
+}
+
+/// Shared `~` expansion and absolute-path check for user-configured paths.
+/// `key` is the setting's name as the user writes it, so a refusal names the
+/// setting that actually holds the bad value.
+fn expand_configured_absolute_path(
+    key: &str,
+    path: &str,
+    home: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
+    let no_home = || format!("{key} path uses ~ but no home directory is available");
     let expanded = if path == "~" {
-        home.ok_or_else(|| {
-            "index.roots path uses ~ but no home directory is available".to_string()
-        })?
-        .to_path_buf()
+        home.ok_or_else(no_home)?.to_path_buf()
     } else if let Some(remainder) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
-        home.ok_or_else(|| {
-            "index.roots path uses ~ but no home directory is available".to_string()
-        })?
-        .join(remainder)
+        home.ok_or_else(no_home)?.join(remainder)
     } else {
         PathBuf::from(path)
     };
 
     if !expanded.is_absolute() {
         return Err(format!(
-            "index.roots path must be absolute after ~ expansion: {path:?}"
+            "{key} path must be absolute after ~ expansion: {path:?}"
         ));
     }
     Ok(expanded)
@@ -262,6 +277,9 @@ impl SemanticBackend {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticBackendConfig {
+    /// Runtime-only local model location selected with the artifact root.
+    #[serde(skip)]
+    pub local_cache_dir: Option<PathBuf>,
     pub backend: SemanticBackend,
     pub model: String,
     pub base_url: Option<String>,
@@ -333,6 +351,7 @@ impl SemanticBackendConfig {
 impl Default for SemanticBackendConfig {
     fn default() -> Self {
         Self {
+            local_cache_dir: None,
             backend: SemanticBackend::Fastembed,
             model: DEFAULT_SEMANTIC_MODEL.to_string(),
             base_url: None,
@@ -649,6 +668,11 @@ pub struct SearchConfig {
 }
 
 impl Config {
+    /// Optional artifact location for APIs that keep disk persistence opt-in.
+    pub fn cache_storage_dir(&self) -> Option<PathBuf> {
+        (self.cache_dir.is_some() || self.storage_dir.is_some())
+            .then(|| crate::root_cache::cache_root(self))
+    }
     pub fn semantic_backend_label(&self) -> &'static str {
         self.semantic.backend.as_str()
     }
@@ -793,9 +817,44 @@ impl Default for BashConfig {
     }
 }
 
+/// `storage.cache_dir` as configured and the directory it named when the cache
+/// root was prepared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredCacheDir {
+    pub spelling: PathBuf,
+    pub resolved: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Existing cache parent; AFT owns only its `aft` namespace. None preserves the storage-root layout.
+    #[serde(skip_deserializing)]
+    pub cache_dir: Option<PathBuf>,
+    /// The spelling of `cache_dir` the user configured, kept once preparation
+    /// replaces `cache_dir` with the directory it resolved to. A symlink in
+    /// that spelling may later be repointed; every recheck resolves the
+    /// configured spelling again so the change is noticed.
+    #[serde(skip)]
+    pub cache_dir_configured: Option<ConfiguredCacheDir>,
+    /// Runtime validation failure; a configured unavailable root never falls back.
+    #[serde(skip_deserializing)]
+    pub cache_unavailable: Option<String>,
+    /// The user document could not establish whether a cache volume was selected.
+    #[serde(skip)]
+    pub cache_config_unknown: Option<String>,
+    /// The user config sets `storage.cache_dir` to null: caches deliberately
+    /// return to the storage root even if it earlier used a cache directory.
+    #[serde(skip)]
+    pub cache_dir_opt_out: bool,
+    /// Runtime cache-volume transition identity, used to retire old handles.
+    #[serde(skip_deserializing)]
+    pub cache_epoch: u64,
+    #[serde(skip)]
+    pub cache_lease: Option<std::sync::Arc<crate::root_cache::CacheLease>>,
+    /// A trusted process lease, never accepted from configuration or tool input.
+    #[serde(skip)]
+    pub storage_lease: Option<std::sync::Arc<crate::root_cache::ProcessStorageLease>>,
     /// Root directory of the project being analyzed. `None` if not scoped.
     pub project_root: Option<PathBuf>,
     /// Legacy serialized setting (default: 1); validation does not consume it.
@@ -948,6 +1007,14 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            cache_dir: None,
+            cache_dir_configured: None,
+            cache_unavailable: None,
+            cache_config_unknown: None,
+            cache_dir_opt_out: false,
+            cache_epoch: 0,
+            cache_lease: None,
+            storage_lease: None,
             project_root: None,
             validation_depth: 1,
             checkpoint_ttl_hours: 24,
@@ -1113,5 +1180,27 @@ mod tests {
         );
         assert!(expand_index_root_path("relative/root", Some(&home)).is_err());
         assert!(expand_index_root_path("~", None).is_err());
+    }
+
+    #[test]
+    fn relative_path_refusals_name_the_setting_that_holds_the_path() {
+        let home = std::env::temp_dir().join("aft-home");
+        let cache_error = expand_cache_dir_path("relative/cache", Some(&home)).unwrap_err();
+        assert!(
+            cache_error.starts_with("storage.cache_dir path must be absolute"),
+            "{cache_error}"
+        );
+        assert!(!cache_error.contains("index.roots"), "{cache_error}");
+        let no_home = expand_cache_dir_path("~/cache", None).unwrap_err();
+        assert!(
+            no_home.starts_with("storage.cache_dir path uses ~"),
+            "{no_home}"
+        );
+
+        // The index.roots refusal keeps its own key name and exact text.
+        assert_eq!(
+            expand_index_root_path("relative/root", Some(&home)).unwrap_err(),
+            "index.roots path must be absolute after ~ expansion: \"relative/root\""
+        );
     }
 }

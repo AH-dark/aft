@@ -553,7 +553,9 @@ fn trigram_persistence_child() {
     let root = storage.join("checkout");
     fs::create_dir_all(&root).unwrap();
     let registry = FamilyRegistry::open(&storage, "family").unwrap();
-    let registration = registry.register_view("scope", &root).unwrap();
+    let registration = registry
+        .register_view_with_storage(registry.storage(), "scope", &root)
+        .unwrap();
     let files: &[(&str, &[u8])] = &[("a.txt", b"old\n")];
     let mut manifest = generation(files, "a").manifest().clone();
     let store = registration.open_store(FamilyPlane::Trigram).unwrap();
@@ -643,7 +645,9 @@ fn trigram_real_restart_and_kill_strict_reconcile() {
             assert!(child.wait().unwrap().success());
         }
         let registry = FamilyRegistry::open(storage.path(), "family").unwrap();
-        let view = registry.register_view("scope", &root).unwrap();
+        let view = registry
+            .register_view_with_storage(registry.storage(), "scope", &root)
+            .unwrap();
         let view_store = view.view_store().unwrap();
         if let Some(current) = view_store.current_generation().unwrap() {
             let manifest = view_store.load_manifest_v2(&current).unwrap();
@@ -685,7 +689,11 @@ fn trigram_driver_rejects_obsolete_install_and_reports_actual_gaps() {
     let producers = generation.manifest().header().producers.clone();
     let delta = Arc::new(Mutex::new(LiveDelta::new(generation)));
     let registry = aft::views::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
-    let access = ViewAccess::Owner(registry.register_view("scope", &root).unwrap());
+    let access = ViewAccess::Owner(
+        registry
+            .register_view_with_storage(registry.storage(), "scope", &root)
+            .unwrap(),
+    );
     let shared = segment(files);
     let open: Arc<Opener> = Arc::new(move |_, snapshot| {
         GenerationIndex::new(shared.clone(), snapshot, policy(), &Default::default()).map_err(
@@ -821,7 +829,9 @@ fn trigram_materializer_preserves_shared_segment_and_other_planes() {
     fs::create_dir_all(&root).unwrap();
     write(&root, "a.txt", b"old\n");
     let registry = aft::views::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
-    let registration = registry.register_view("scope", &root).unwrap();
+    let registration = registry
+        .register_view_with_storage(registry.storage(), "scope", &root)
+        .unwrap();
     let access = ViewAccess::Owner(registration.clone());
     let mut manifest = generation(&[("a.txt", b"old\n")], "a").manifest().clone();
     if let EntryV2::Regular { planes, .. } = manifest.get_mut(&rel("a.txt")).unwrap() {
@@ -906,7 +916,9 @@ fn trigram_materializer_pins_all_keys_with_one_key_file_write() {
         .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
         .collect();
     let registry = aft::views::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
-    let registration = registry.register_view("scope", &root).unwrap();
+    let registration = registry
+        .register_view_with_storage(registry.storage(), "scope", &root)
+        .unwrap();
     let mut manifest = generation(&files, "a").manifest().clone();
     let observed = live_delta::strict_walk(&root, &policy(), 1);
     let (writes_before, syncs_before) = key_file_work();

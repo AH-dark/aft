@@ -907,7 +907,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let registry =
             crate::views::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
-        let owner = registry.register_view("scope", root.path()).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "scope", root.path())
+            .unwrap();
         let store = owner.open_store(FamilyPlane::Trigram).unwrap();
         let policy = TrigramPolicy {
             max_file_size: 1 << 20,

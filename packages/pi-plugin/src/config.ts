@@ -56,9 +56,9 @@ function normalizeConfigForActiveHarness(value: unknown): unknown {
   const override = config.harnesses[ACTIVE_HARNESS];
   return {
     ...config,
-    // Other harnesses deliberately remain opaque to this plugin so future
-    // harness-specific settings never make an older Pi plugin reject the shared
-    // config file.
+    // Only the active harness participates in value validation and merging.
+    // User-config key names are checked before this filter so an inactive
+    // harness block cannot hide a misspelled cache location.
     harnesses:
       override === undefined
         ? {}
@@ -467,6 +467,8 @@ export interface AftConfig {
   indexes?: RawIndexesConfig;
   /** User-tier standing roots; project config cannot configure this machine state. */
   index?: IndexConfig;
+  /** Only the user config's top level may select this existing directory. Caches live in its `aft` child; an unavailable directory disables caches instead of writing them under the storage root. */
+  storage?: { cache_dir?: string | null };
   /** Content-addressed index views. Disabled by default. */
   views?: ViewsConfig;
   /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
@@ -1127,6 +1129,7 @@ const AftConfigFieldsSchema = z.object({
   indexes: IndexesConfigSchema.optional(),
   /** User-configured filesystem roots for indexed search; project config cannot change them. */
   index: IndexConfigSchema.optional(),
+  storage: z.object({ cache_dir: z.string().nullable().optional() }).optional(),
   views: ViewsConfigSchema.optional(),
   callgraph_chunk_size: z.number().optional(),
   inspect: InspectConfigSchema.optional(),
@@ -1180,6 +1183,8 @@ function applyActiveHarnessOverride(config: AftConfig, trusted: boolean): AftCon
   const override = config.harnesses?.[ACTIVE_HARNESS];
   if (override === undefined) return base as AftConfigFields;
   const merged = { ...base, ...override } as AftConfigFields;
+  if (base.storage) merged.storage = base.storage;
+  else delete merged.storage;
   const disabled = unionDisabledTools(base.disabled_tools, override.disabled_tools);
   if (disabled === undefined) delete merged.disabled_tools;
   else merged.disabled_tools = disabled;
@@ -1478,6 +1483,60 @@ export function deliverConfigLoadNotices(
   for (const notice of notices) deliverMigrationNoticeOnce({ ...notice, deliver });
 }
 
+function storageLikeKey(key: string, value: unknown): boolean {
+  if (key === "storage_dir") return false;
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (normalized.startsWith("storage") || ["cachedir", "cacheroot"].includes(normalized))
+    return true;
+  if (isConfigRecord(value) && Object.hasOwn(value, "cache_dir")) return true;
+  const target = "storage";
+  if (Math.abs(normalized.length - target.length) > 2) return false;
+  let row = Array.from({ length: target.length + 1 }, (_, index) => index);
+  for (let i = 0; i < normalized.length; i++) {
+    const next = [i + 1];
+    for (let j = 0; j < target.length; j++) {
+      next.push(
+        Math.min(row[j] + Number(normalized[i] !== target[j]), row[j + 1] + 1, next[j] + 1),
+      );
+    }
+    row = next;
+  }
+  return row[target.length] <= 2;
+}
+
+function unknownCacheConfigKey(config: Record<string, unknown>): string | undefined {
+  const unknownField = (block: Record<string, unknown>) =>
+    Object.keys(block)
+      .sort()
+      .find(
+        (key) =>
+          key !== "harnesses" &&
+          key !== "type_checker_timeout_secs" &&
+          !OPENCODE_ONLY_KEYS.some((known) => known === key) &&
+          !Object.hasOwn(AftConfigFieldsSchema.shape, key) &&
+          storageLikeKey(key, block[key]),
+      );
+  const unknownStorageField = (block: Record<string, unknown>) =>
+    isConfigRecord(block.storage)
+      ? Object.keys(block.storage)
+          .sort()
+          .find((key) => key !== "cache_dir")
+      : undefined;
+  // Validate names before partial parsing or active-harness filtering can hide
+  // a misspelled cache location. Known unrelated values remain lenient.
+  const direct = unknownField(config) ?? unknownStorageField(config);
+  if (direct !== undefined) return direct;
+  if (isConfigRecord(config.harnesses)) {
+    for (const name of Object.keys(config.harnesses).sort()) {
+      const block = config.harnesses[name];
+      if (!isConfigRecord(block)) continue;
+      const unknown = unknownField(block) ?? unknownStorageField(block);
+      if (unknown !== undefined) return unknown;
+    }
+  }
+  return undefined;
+}
+
 function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftConfig | null {
   let cleanConfig: Record<string, unknown>;
   try {
@@ -1512,6 +1571,9 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   const projection = noticeProjection(structuredClone(cleanConfig));
   if (suppliesSemanticIndexInput(cleanConfig, ACTIVE_HARNESS)) semanticInputSupplied = true;
   const translation = translateConfigDocument(cleanConfig, tier);
+  const unknown = tier === "user" ? unknownCacheConfigKey(cleanConfig) : undefined;
+  if (unknown !== undefined)
+    throw new ConfigRejectedError([`invalid_cache_config: unknown field \`${unknown}\``]);
   for (const warning of translation.warnings) {
     const text = `Config ${configPath} [${warning.key}]: ${warning.message} (${warning.code})`;
     if (warning.once) {
@@ -1938,6 +2000,7 @@ function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[]
   if (override.backup?.enabled !== undefined || override.backup?.max_depth !== undefined)
     stripped.push("backup");
   if (override.index?.roots !== undefined) stripped.push("index.roots");
+  if (override.storage?.cache_dir !== undefined) stripped.push("storage.cache_dir");
   const order = { off: 0, relaxed: 1, strict: 2 };
   for (const role of ["worker", "head"] as const) {
     const requested = override.sandbox?.profile?.[role];

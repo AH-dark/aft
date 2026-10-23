@@ -355,6 +355,11 @@ pub(crate) fn open_search_index_cancellable(
     duration: Duration,
     keep_going: &dyn Fn() -> bool,
 ) -> ReadOnlyArtifact<SearchIndex> {
+    if crate::root_cache::check_cache_access(&cache_dir).is_err() {
+        return ReadOnlyArtifact::Degraded(ReadOnlyDegradation {
+            reason: crate::root_cache::CACHE_DIR_UNAVAILABLE,
+        });
+    }
     #[cfg(test)]
     let probe = BORROWED_SEARCH_LOAD_PROBES
         .lock()
@@ -453,6 +458,7 @@ fn borrowed_artifact_generation(path: PathBuf) -> Option<BorrowedArtifactGenerat
     Some(BorrowedArtifactGeneration { path, generation })
 }
 
+#[cfg(test)]
 pub(crate) fn open_semantic_index_read_only(
     project_root: &Path,
     storage_dir: Option<&Path>,
@@ -484,6 +490,11 @@ fn open_semantic_index_from_location(
     data_path: PathBuf,
     project_key: &str,
 ) -> ReadOnlyArtifact<SemanticIndex> {
+    if crate::root_cache::check_cache_access(&data_path).is_err() {
+        return ReadOnlyArtifact::Degraded(ReadOnlyDegradation {
+            reason: crate::root_cache::CACHE_DIR_UNAVAILABLE,
+        });
+    }
     let Some(storage_dir) = storage_dir else {
         return ReadOnlyArtifact::Absent;
     };
@@ -512,6 +523,9 @@ fn search_cancelled() -> bool {
     crate::executor::current_job_cancelled()
 }
 
+/// Test-only: production openers take the key configure resolved, because
+/// this derivation falls back to a path-based key when the Git probe fails.
+#[cfg(test)]
 fn semantic_index_location(
     project_root: &Path,
     storage_dir: Option<&Path>,
@@ -668,8 +682,56 @@ mod tests {
         assert!(!base.path().join("launched").exists());
     }
 
+    #[test]
+    fn borrow_only_checkout_opens_owner_artifacts_from_cache_root() {
+        let (_repo, root) = fixture_project();
+        let (_checkout, checkout) = linked_worktree(&root);
+        let storage = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            cache_dir: Some(cache.path().to_path_buf()),
+            project_root: Some(checkout.clone()),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let artifact_root = crate::root_cache::cache_root(&config);
+        let key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &key, false);
+        build_search_artifact(&root, &artifact_root);
+        build_semantic_artifact(&root, &artifact_root);
+        crate::root_cache::configure_artifact_access(&checkout, &key, true);
+        let claim = crate::artifact_owner::open_read_only_borrow(
+            Some(storage.path()),
+            &checkout,
+            &key,
+            &crate::path_identity::project_scope_key(&checkout),
+        );
+        assert!(claim.lease.is_none());
+        assert_eq!(
+            claim.status.mode,
+            crate::artifact_owner::ArtifactOwnerMode::ReadOnly
+        );
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        );
+        assert!(matches!(
+            ctx.open_borrowed_search_index(&checkout, ctx.config().cache_storage_dir().as_deref()),
+            ReadOnlyArtifact::Fresh(_)
+        ));
+        assert!(matches!(
+            ctx.open_borrowed_semantic_index(
+                &checkout,
+                ctx.config().cache_storage_dir().as_deref()
+            ),
+            ReadOnlyArtifact::Fresh(_)
+        ));
+        assert!(!storage.path().join("index").exists());
+        assert!(!storage.path().join("semantic").exists());
+    }
     use super::*;
-    use crate::search_index::{artifact_cache_key_with_memo, resolve_cache_dir};
+    use crate::search_index::resolve_cache_dir;
 
     use std::collections::BTreeMap;
     use std::fs;
@@ -1263,6 +1325,101 @@ mod tests {
             Some(crate::root_identity::Identity::Git { .. })
         ));
         (project, root, path_key, git_key, owner)
+    }
+
+    /// `storage.cache_dir` moves artifacts, not identity. The folder below has
+    /// a saved path identity on its durable root and is a Git repository now,
+    /// so a lookup in a storage root without that record would choose a Git
+    /// key. Readers that name the cache root must resolve the key configure
+    /// memoizes for the durable root, and the call-graph folder must sit on
+    /// the cache root under that key.
+    #[test]
+    fn cache_root_readers_resolve_the_key_configure_memoizes_for_the_durable_root() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let storage = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let (_project, root, path_key, git_key, _owner) =
+            folder_with_path_identity_in_a_and_git_identity_in_b(storage.path(), other.path());
+        let mut config = crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            cache_dir: Some(cache.path().to_path_buf()),
+            ..crate::config::Config::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let durable = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        let artifacts = crate::root_cache::cache_root(&config);
+        assert_ne!(artifacts, durable);
+        let ctx = crate::context::AppContext::new(
+            crate::context::default_language_provider_factory(),
+            config,
+        );
+
+        let configured = ctx
+            .memoized_artifact_cache_key_for_configure(&root, &root, &durable, None)
+            .unwrap()
+            .expect("settled path identity on the durable root");
+        assert_eq!(configured, path_key);
+        assert_ne!(configured, git_key);
+        assert_eq!(
+            artifact_cache_key_read_only(&root, &artifacts).unwrap(),
+            configured,
+            "a reader naming the cache root must use the durable root's identity"
+        );
+        let reader = borrowed_context(&root, storage.path());
+        assert_eq!(
+            reader
+                .memoized_readonly_artifact_cache_key(&root, &artifacts)
+                .unwrap(),
+            configured
+        );
+        assert_eq!(
+            ctx.callgraph_store_dir(),
+            artifacts.join("callgraph").join(&configured)
+        );
+    }
+
+    /// Without `storage.cache_dir` the artifact root is the durable root, so
+    /// readers resolve keys and folders exactly where they did before the
+    /// setting existed: the saved identity's key, under the storage root.
+    #[test]
+    fn without_cache_dir_reader_keys_and_folders_stay_on_the_durable_root() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let storage = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let (_project, root, path_key, _git_key, owner) =
+            folder_with_path_identity_in_a_and_git_identity_in_b(storage.path(), other.path());
+        let config = owner.config();
+        assert!(config.cache_dir.is_none());
+        let artifacts = config.cache_storage_dir().expect("configured storage");
+        assert_eq!(artifacts, storage.path());
+        assert_eq!(
+            crate::root_cache::identity_storage_root(&artifacts),
+            std::borrow::Cow::Borrowed(storage.path())
+        );
+        assert_eq!(
+            path_key,
+            crate::search_index::artifact_path_identity_key(&root)
+        );
+        assert_eq!(
+            artifact_cache_key_read_only(&root, &artifacts).unwrap(),
+            path_key
+        );
+        assert_eq!(
+            owner
+                .memoized_readonly_artifact_cache_key(&root, &artifacts)
+                .unwrap(),
+            path_key
+        );
+        assert_eq!(
+            resolve_cache_dir_with_key(&path_key, Some(&artifacts)),
+            storage.path().join("index").join(&path_key)
+        );
+        assert_eq!(
+            owner.callgraph_store_dir(),
+            storage.path().join("callgraph").join(&path_key)
+        );
     }
 
     #[test]
@@ -2036,7 +2193,7 @@ mod tests {
         let storage = tempfile::tempdir().expect("storage");
         let search_cache_dir = build_search_artifact(&root, storage.path());
         build_semantic_artifact(&root, storage.path());
-        artifact_cache_key_with_memo(&root, &root, storage.path(), None)
+        crate::search_index::artifact_cache_key_with_memo(&root, &root, storage.path(), None)
             .expect("seed cache-key memo before read-only snapshot");
         let semantic_cache_dir = storage
             .path()

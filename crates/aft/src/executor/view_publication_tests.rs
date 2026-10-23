@@ -698,7 +698,9 @@ fn publication_omits_staged_and_unstaged_working_tree_deletions() {
         let root = fixture.job_root();
         let registry =
             FamilyRegistry::open(fixture._storage.path(), "publication-fixture").unwrap();
-        let owner = registry.register_view("query", &root).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "query", &root)
+            .unwrap();
         let policy = crate::blob_store::v2::TrigramPolicy {
             max_file_size: 1 << 20,
         };
@@ -816,7 +818,9 @@ fn callgraph_producer_change_republishes_an_existing_generation() {
     let fixture = Fixture::new();
     let root = fixture.job_root();
     let registry = FamilyRegistry::open(fixture._storage.path(), "publication-fixture").unwrap();
-    let owner = registry.register_view("query", &root).unwrap();
+    let owner = registry
+        .register_view_with_storage(fixture._storage.path(), "query", &root)
+        .unwrap();
     let access = ViewAccess::Owner(owner.clone());
     let policy = crate::blob_store::v2::TrigramPolicy {
         max_file_size: 1 << 20,
@@ -972,6 +976,7 @@ fn publication_keeps_reused_semantic_rows_pinned_during_handoff() {
     fixture.ctx.set_config(config);
     let collect = || {
         crate::gc::sweep_semantic_handoff_for_test(crate::gc::SweepRequest {
+            durable_storage: &snapshot.storage,
             storage: &snapshot.storage,
             family: &snapshot.family,
             view_dir: &snapshot.view_dir,

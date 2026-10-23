@@ -43,7 +43,11 @@ fn query_fixture(with_graph: bool) -> QueryFixture {
     let source = b"function target() { return 1; }\nexport function caller() { return target(); }\ncaller();\n";
     std::fs::write(root_path.join("fixture.ts"), source).unwrap();
     let registry = FamilyRegistry::open(storage.path(), "query-callgraph-test").unwrap();
-    let access = ViewAccess::Owner(registry.register_view("scope", &root_path).unwrap());
+    let access = ViewAccess::Owner(
+        registry
+            .register_view_with_storage(registry.storage(), "scope", &root_path)
+            .unwrap(),
+    );
     let driver = Driver {
         plane: CallgraphPlane::default(),
         source: source.to_vec(),
@@ -365,7 +369,11 @@ fn callgraph_plane_driver_attaches_materializes_and_installs_pinned_reader() {
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), "callgraph-test").unwrap();
-    let access = ViewAccess::Owner(registry.register_view("scope", root.path()).unwrap());
+    let access = ViewAccess::Owner(
+        registry
+            .register_view_with_storage(registry.storage(), "scope", root.path())
+            .unwrap(),
+    );
     let driver = Driver { plane: CallgraphPlane::default(), source: b"interface I { m(): void; }\nclass A implements I { m() {} }\nclass B implements I { m() {} }\nexport function caller(x: I) { x.m(); }".to_vec(), revision: Mutex::new(1), installed: Mutex::new(None) };
     let reconciled = driver.reconcile(&access).unwrap();
     let empty = ManifestV2::new(ManifestHeader {
@@ -422,7 +430,9 @@ fn store_clone_pins_old_blobs_after_swap_and_gc() {
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), "callgraph-pin-test").unwrap();
-    let view = registry.register_view("scope-pin", root.path()).unwrap();
+    let view = registry
+        .register_view_with_storage(registry.storage(), "scope-pin", root.path())
+        .unwrap();
     let access = ViewAccess::Owner(view.clone());
     let driver = Driver {
         plane: CallgraphPlane::default(),

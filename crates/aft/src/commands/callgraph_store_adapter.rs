@@ -2537,6 +2537,14 @@ pub fn home_root_disabled_response(req_id: &str, operation: &str) -> Response {
 }
 
 pub fn unavailable_for(req_id: &str, operation: &str, ctx: &AppContext) -> Response {
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        return callgraph_index_refusal(
+            req_id,
+            crate::root_cache::CACHE_DIR_UNAVAILABLE,
+            format!("{operation}: cache_dir_unavailable: {reason}"),
+            IndexObservation::unavailable(crate::root_cache::CACHE_DIR_UNAVAILABLE),
+        );
+    }
     if ctx.is_home_root() {
         return home_root_disabled_response(req_id, operation);
     }

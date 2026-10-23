@@ -461,7 +461,7 @@ fn pending_and_failed_states_survive_publication_and_reopen() {
     let storage = tempfile::tempdir().unwrap();
     let registry = super::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
     let registration = registry
-        .register_view("scope", &storage.path().join("root"))
+        .register_view_with_storage(registry.storage(), "scope", &storage.path().join("root"))
         .unwrap();
     let mut manifest = ManifestV2::new(header());
     manifest

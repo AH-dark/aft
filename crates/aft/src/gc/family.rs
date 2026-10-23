@@ -1061,14 +1061,19 @@ fn deregister_if_missing(
     report: &mut FamilySweepReport,
 ) -> Result<(), FamilySweepError> {
     use crate::storage_retention::RootEligibility;
+    let durable_storage = registry.durable_storage();
     report.examined_roots += 1;
     let eligibility = if root_is_missing(member) {
         member.root.as_ref().map_or(RootEligibility::Live, |root| {
-            crate::storage_retention::missing_root_eligibility(
-                registry.storage(),
-                root,
-                member.last_bind_ms,
-            )
+            durable_storage
+                .as_deref()
+                .map_or(RootEligibility::Live, |storage| {
+                    crate::storage_retention::missing_root_eligibility(
+                        storage,
+                        root,
+                        member.last_bind_ms,
+                    )
+                })
         })
     } else {
         RootEligibility::Live
@@ -1094,7 +1099,9 @@ fn deregister_if_missing(
                     .unwrap_or_else(|| Instant::now() + Duration::from_secs(5)),
             )
             .ok();
-            registry.with_barrier(|tx| remove_if_still_due(tx, &member.scope, recorded))?
+            registry.with_barrier(|tx| {
+                remove_if_still_due(tx, &member.scope, recorded, durable_storage.as_deref())
+            })?
         }
         other => other,
     };
@@ -1161,6 +1168,7 @@ fn remove_if_still_due(
     tx: &rusqlite::Transaction<'_>,
     scope: &str,
     recorded: i64,
+    storage: Option<&Path>,
 ) -> Result<Deregistration, RegistryError> {
     let Some(current) = read_members(tx)?
         .into_iter()
@@ -1172,11 +1180,6 @@ fn remove_if_still_due(
     if i64::from(current.missing_sweeps) != recorded {
         return Ok(Deregistration::Retained);
     }
-    let storage = current
-        .view_dir
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent);
     if !root_is_missing(&current)
         || !storage
             .zip(current.root.as_ref())

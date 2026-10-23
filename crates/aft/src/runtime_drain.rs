@@ -2372,7 +2372,7 @@ fn spawn_search_corpus_refresh_admitted(
                 }
                 let cache_dir = aft::search_index::resolve_cache_dir_with_key(
                     &project_key,
-                    config.storage_dir.as_deref(),
+                    config.cache_storage_dir().as_deref(),
                 );
                 let cache_lock = if shared_artifacts_read_only {
                     None
@@ -4292,6 +4292,7 @@ pub(crate) fn configure_search_order_context_for_test(
     ctx.set_canonical_cache_root(canonical_root.clone());
     ctx.set_harness(crate::harness::Harness::Opencode);
     ctx.enqueue_configure_maintenance(crate::context::ConfigureMaintenanceJob {
+        artifact_root: ctx.cache_dir(),
         generation: ctx.configure_generation(),
         root_path: root.to_path_buf(),
         canonical_cache_root: canonical_root,

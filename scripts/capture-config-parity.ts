@@ -88,6 +88,9 @@ function goldenParamsFromMerged(
   if (merged.gh_shim !== undefined) {
     params.gh_shim = merged.gh_shim;
   }
+  if (merged.storage?.cache_dir !== undefined) {
+    params.cache_dir = merged.storage.cache_dir;
+  }
   // The OpenCode prompt server is read by the plugin itself and is not a
   // configure param either; it is carried here so the Rust resolver's user-only
   // handling of it is compared against the TypeScript loader's.
@@ -168,6 +171,15 @@ function captureCase(caseDef: ParityCase, savedOpencodeConfigDir: string | undef
   }
 }
 
+// `storage.cache_dir` must be an absolute path, and `/aft-cache` is absolute on
+// macOS and Linux but not on Windows (no drive letter). Fixtures whose cache
+// directory is accepted therefore spell it under this placeholder; the Rust
+// parity test (config_parity_test.rs, `platform_fixture_text`) replaces it
+// with an absolute root for the platform it runs on, in both the tier files
+// and the golden. The TypeScript loader passes the string through unchanged.
+const ABSOLUTE_ROOT = "{ABSOLUTE_ROOT}";
+const USER_CACHE_DIR = `${ABSOLUTE_ROOT}/aft-cache`;
+
 const CASES: ParityCase[] = [
   { name: "pi_active_harness_ignored_auto_update_hardening", harness: "pi", user: { harnesses: { pi: { auto_update: "opaque", sandbox: { profile: { worker: "strict" } } } } } },
   { name: "malformed_security_sandbox", user: { sandbox: { profile: { worker: 5 } } } },
@@ -180,6 +192,53 @@ const CASES: ParityCase[] = [
   { name: "malformed_nonsecurity_inspect_partial", user: { inspect: { categories: { diagnostics: "off" } }, format_on_edit: true } },
   { name: "malformed_config_document", user: "{" },
   { name: "pi_malformed_config_document", harness: "pi", user: "{" },
+  // storage.cache_dir is not a security section: a malformed value turns caches
+  // off with a warning while the rest of the candidate applies.
+  { name: "malformed_storage_cache_dir_number", user: { storage: { cache_dir: 5 }, format_on_edit: true } },
+  { name: "malformed_storage_cache_dir_object", user: { storage: { cache_dir: { path: "/aft-cache" } }, format_on_edit: true } },
+  { name: "pi_malformed_storage_cache_dir_number", harness: "pi", user: { storage: { cache_dir: 5 }, format_on_edit: true } },
+  { name: "malformed_storage_cache_dir_project_dropped", user: { format_on_edit: true }, project: { storage: { cache_dir: 5 } } },
+  ...(["opencode", "pi"] as const).map((harness) => ({
+    name: `cache_dir_bash_env_trust_${harness}`,
+    harness,
+    user: {
+      storage: { cache_dir: USER_CACHE_DIR },
+      bash: { env: { TZ: "UTC" } },
+      harnesses: {
+        [harness]: {
+          storage: { cache_dir: "/ignored-cache" },
+          bash: { env: { TZ: "Etc/GMT" } },
+        },
+      },
+    },
+    project: {
+      storage: { cache_dir: "/evil-cache" },
+      // A project may not set bash.env; BASH_ENV itself is now a malformed
+      // value (#769 rejects the whole candidate), so an ordinary name is used.
+      bash: { env: { TZ: "project-top" } },
+      harnesses: {
+        [harness]: {
+          storage: { cache_dir: "/evil-harness-cache" },
+          bash: { env: { TZ: "project" } },
+        },
+      },
+    },
+  })),
+  ...(["opencode", "pi"] as const).flatMap((harness) => [
+    { name: `cache_dir_unrelated_unknown_${harness}`, harness, user: { future_feature: true, format_on_edit: true } },
+    { name: `cache_dir_unrelated_harness_unknown_${harness}`, harness, user: { harnesses: { [harness]: { future_option: true } } } },
+  ]),
+  ...(["opencode", "pi"] as const).flatMap((harness) => [
+    { name: `cache_dir_typo_section_${harness}`, harness, user: { storge: { cache_dir: "/aft-cache" } } },
+    { name: `cache_dir_typo_key_${harness}`, harness, user: { storage: { cachedir: "/aft-cache" } } },
+    { name: `cache_dir_typo_inactive_harness_${harness}`, harness, user: { harnesses: { future: { storge: { cache_dir: "/aft-cache" } } } } },
+    { name: `cache_dir_typo_harness_storage_${harness}`, harness, user: { harnesses: { future: { storage: { cachedir: "/aft-cache" } } } } },
+  ]),
+  { name: "cache_dir_user", user: { storage: { cache_dir: USER_CACHE_DIR } } },
+  { name: "cache_dir_project_dropped", user: { storage: { cache_dir: USER_CACHE_DIR } }, project: { storage: { cache_dir: "/evil" } } },
+  { name: "cache_dir_project_only_dropped", project: { storage: { cache_dir: "/evil" } } },
+  { name: "cache_dir_harness_attempts_dropped", user: { storage: { cache_dir: USER_CACHE_DIR }, harnesses: { pi: { storage: { cache_dir: "/pi-cache" } } } }, project: { harnesses: { pi: { storage: { cache_dir: "/evil" } } } }, harness: "pi" },
+  { name: "cache_dir_harness_only_dropped", user: { harnesses: { pi: { storage: { cache_dir: "/pi-cache" } } } }, harness: "pi" },
   { name: "privacy_user_on_project_off", user: { bash: { disclaim_privacy: true } }, project: { bash: { disclaim_privacy: false } } },
   { name: "privacy_project_on", user: { bash: { disclaim_privacy: false } }, project: { bash: { disclaim_privacy: true } } },
   { name: "privacy_project_off_dropped", project: { bash: { disclaim_privacy: false } } },

@@ -74,6 +74,7 @@ pub struct SweepReferences {
 
 #[derive(Clone, Debug)]
 pub struct SweepRequest<'a> {
+    pub durable_storage: &'a Path,
     pub storage: &'a Path,
     pub family: &'a str,
     pub view_dir: &'a Path,
@@ -131,13 +132,17 @@ fn sweep_planes_bounded(
     // throughout marking, including pins from older binaries. A pending bind
     // cancels maintenance instead of waiting behind the whole mark pass.
     let cancelled_for_bind =
-        || cancelled() || crate::storage_retention::bind_pending(request.storage);
+        || cancelled() || crate::storage_retention::bind_pending(request.durable_storage);
     let control = SweepControl {
         deadline: Instant::now() + Duration::from_secs(5),
         cancelled: &cancelled_for_bind,
     };
     control.check()?;
-    let _barrier = crate::storage_retention::barrier(request.storage)?;
+    let roots = crate::root_cache::StoragePaths::new(
+        request.durable_storage.to_path_buf(),
+        request.storage.to_path_buf(),
+    );
+    let _barrier = crate::storage_retention::cache_barrier(&roots)?;
     let mut report = SweepReport::default();
     let mut references = request.references.retained_keys.clone();
     // Families are shared across checkouts. A one-view mark can delete content
@@ -205,7 +210,7 @@ fn sweep_planes_bounded(
         let path = plane_path(request.storage, request.family, plane);
         let id = blake3::hash(path.to_string_lossy().as_bytes()).to_hex();
         let pending = request
-            .storage
+            .durable_storage
             .join("retention/vacuum")
             .join(format!("{id}.json"));
         if !path.exists() {
@@ -486,6 +491,7 @@ mod storage_retention_tests {
             }))
         });
         let report = sweep(SweepRequest {
+            durable_storage: temp.path(),
             storage: temp.path(),
             family: "family",
             view_dir: &temp.path().join("view"),
@@ -514,6 +520,7 @@ mod storage_retention_tests {
         )
         .unwrap();
         let error = sweep(SweepRequest {
+            durable_storage: temp.path(),
             storage: temp.path(),
             family: "family",
             view_dir: &temp.path().join("view"),
@@ -546,6 +553,7 @@ mod storage_retention_tests {
         }
         drop(connection);
         let report = sweep(SweepRequest {
+            durable_storage: temp.path(),
             storage: temp.path(),
             family: "family",
             view_dir: &temp.path().join("view"),
@@ -603,6 +611,7 @@ mod storage_retention_tests {
         )
         .unwrap();
         let report = sweep(SweepRequest {
+            durable_storage: temp.path(),
             storage: temp.path(),
             family: "family",
             view_dir: &temp.path().join("requesting-view"),
@@ -638,6 +647,7 @@ mod storage_retention_tests {
         drop(connection);
         let before = fs::metadata(&path).unwrap().len();
         let report = sweep(SweepRequest {
+            durable_storage: temp.path(),
             storage: temp.path(),
             family: "family",
             view_dir: &temp.path().join("requesting-view"),

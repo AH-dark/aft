@@ -1289,15 +1289,18 @@ fn remove_malformed_reclaim_token(token_path: &Path) -> io::Result<bool> {
 }
 
 /// Remove abandoned reclaim tokens from the bounded set of storage domains that
-/// own persistent artifact locks. The first maintenance pass in a process runs;
-/// later passes are suppressed for 24 hours.
-pub(crate) fn sweep_stale_reclaim_tokens(root: &Path) -> io::Result<Option<usize>> {
+/// own persistent artifact locks, under every root in `roots`. A lock's token
+/// sits beside the lock, so with `storage.cache_dir` set the cache-domain
+/// tokens live under the cache root and the durable-state tokens under the
+/// storage root; one pass covers both. The first maintenance pass in a
+/// process runs; later passes are suppressed for 24 hours.
+pub(crate) fn sweep_stale_reclaim_tokens(roots: &[&Path]) -> io::Result<Option<usize>> {
     let last_run = RECLAIM_TOKEN_SWEEP_LAST_RUN.get_or_init(|| Mutex::new(None));
-    sweep_stale_reclaim_tokens_at(root, Instant::now(), last_run)
+    sweep_stale_reclaim_tokens_at(roots, Instant::now(), last_run)
 }
 
 fn sweep_stale_reclaim_tokens_at(
-    root: &Path,
+    roots: &[&Path],
     now: Instant,
     last_run: &Mutex<Option<Instant>>,
 ) -> io::Result<Option<usize>> {
@@ -1314,14 +1317,16 @@ fn sweep_stale_reclaim_tokens_at(
     }
 
     let mut removed = 0_usize;
-    for relative in ROOT_RECLAIM_TOKEN_PATHS {
-        removed =
-            removed.saturating_add(remove_stale_reclaim_token(&root.join(relative))? as usize);
+    for root in roots {
+        for relative in ROOT_RECLAIM_TOKEN_PATHS {
+            removed =
+                removed.saturating_add(remove_stale_reclaim_token(&root.join(relative))? as usize);
+        }
+        for domain in RECLAIM_TOKEN_SWEEP_DOMAINS {
+            removed = removed.saturating_add(sweep_reclaim_token_domain(&root.join(domain))?);
+        }
+        removed = removed.saturating_add(sweep_backup_reclaim_tokens(root)?);
     }
-    for domain in RECLAIM_TOKEN_SWEEP_DOMAINS {
-        removed = removed.saturating_add(sweep_reclaim_token_domain(&root.join(domain))?);
-    }
-    removed = removed.saturating_add(sweep_backup_reclaim_tokens(root)?);
     Ok(Some(removed))
 }
 
@@ -2861,7 +2866,7 @@ mod tests {
         let backup_token = write_reclaim_token(&backup_locks.join("x.lock"), &dead);
         let cadence = Mutex::new(None);
 
-        let removed = sweep_stale_reclaim_tokens_at(root.path(), Instant::now(), &cadence)
+        let removed = sweep_stale_reclaim_tokens_at(&[root.path()], Instant::now(), &cadence)
             .expect("sweep tokens");
 
         assert_eq!(removed, Some(2));
@@ -2877,6 +2882,34 @@ mod tests {
         );
     }
 
+    /// With `storage.cache_dir` set, cache-domain locks (and so their reclaim
+    /// tokens) are under the cache root while durable-state locks stay under
+    /// the storage root. One pass must sweep both roots.
+    #[test]
+    fn maintenance_sweep_covers_the_cache_root_and_the_durable_root() {
+        let durable = tempfile::tempdir().expect("temporary durable root");
+        let cache = tempfile::tempdir().expect("temporary cache root");
+        let dead = synthetic_metadata(999_999_999, current_hostname(), now_ms());
+        let index_dir = cache.path().join("index").join("project");
+        fs::create_dir_all(&index_dir).expect("create cache index");
+        let cache_token = write_reclaim_token(&index_dir.join("cache.lock"), &dead);
+        let checkpoints = durable.path().join("checkpoints").join("project");
+        fs::create_dir_all(&checkpoints).expect("create checkpoints");
+        let durable_token = write_reclaim_token(&checkpoints.join("store.lock"), &dead);
+        let cadence = Mutex::new(None);
+
+        let removed = sweep_stale_reclaim_tokens_at(
+            &[cache.path(), durable.path()],
+            Instant::now(),
+            &cadence,
+        )
+        .expect("sweep tokens");
+
+        assert_eq!(removed, Some(2));
+        assert!(!cache_token.exists(), "cache-root token kept");
+        assert!(!durable_token.exists(), "durable-root token kept");
+    }
+
     #[test]
     fn maintenance_sweep_runs_first_then_obeys_daily_cadence() {
         let root = tempfile::tempdir().expect("temporary storage root");
@@ -2888,21 +2921,25 @@ mod tests {
         let start = Instant::now();
 
         assert_eq!(
-            sweep_stale_reclaim_tokens_at(root.path(), start, &cadence).expect("first sweep"),
+            sweep_stale_reclaim_tokens_at(&[root.path()], start, &cadence).expect("first sweep"),
             Some(1)
         );
         assert!(!first_token.exists());
 
         let second_token = write_reclaim_token(&cache_dir.join("cache.lock"), &dead);
         assert_eq!(
-            sweep_stale_reclaim_tokens_at(root.path(), start + Duration::from_secs(60), &cadence,)
-                .expect("suppressed sweep"),
+            sweep_stale_reclaim_tokens_at(
+                &[root.path()],
+                start + Duration::from_secs(60),
+                &cadence,
+            )
+            .expect("suppressed sweep"),
             None
         );
         assert!(second_token.exists());
         assert_eq!(
             sweep_stale_reclaim_tokens_at(
-                root.path(),
+                &[root.path()],
                 start + RECLAIM_TOKEN_SWEEP_INTERVAL + Duration::from_secs(1),
                 &cadence,
             )

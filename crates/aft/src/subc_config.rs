@@ -129,7 +129,10 @@ fn read_tiers_from(
 
     if let Some(user_path) = user_config_path {
         migration = migrate_user_file(user_path);
-        if let Ok(doc) = std::fs::read_to_string(user_path) {
+        let read = std::fs::read_to_string(user_path);
+        if !matches!(&read, Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+            let doc =
+                read.unwrap_or_else(|error| format!("unreadable user configuration: {error}"));
             tiers.push(ConfigTier {
                 tier: "user".to_string(),
                 source: user_path.to_string_lossy().into_owned(),

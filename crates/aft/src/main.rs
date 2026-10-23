@@ -87,6 +87,31 @@ fn exit_after_log_flush(code: i32) -> i32 {
     code
 }
 
+fn hold_process_storage_lease() -> Arc<aft::root_cache::ProcessStorageLease> {
+    let storage = aft::bash_background::storage_dir(None);
+    aft::root_cache::acquire_daemon_storage_lease(&storage).unwrap_or_else(|error| {
+        eprintln!(
+            "cannot acquire storage lease for {}: {error}",
+            storage.display()
+        );
+        std::process::exit(1);
+    })
+}
+
+#[cfg(debug_assertions)]
+fn storage_lease_exit_probe() {
+    let Some(path) =
+        std::env::var_os("AFT_TEST_STORAGE_LEASE_EXIT_PROBE").map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    std::fs::write(&path, b"exit tail").expect("write storage lease exit probe");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !path.with_extension("release").is_file() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn main() {
     // The subc daemon hands a supervised module its launch nonce through an
     // inherited pipe (and, for now, an environment copy). Take it before
@@ -188,6 +213,7 @@ fn main() {
     // snapshot and exits before logging, the App, runtime registry, or subc
     // scheduler can establish any standing actor or future maintenance work.
     if std::env::args().nth(1).as_deref() == Some("index") {
+        let _process_storage_lease = hold_process_storage_lease();
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
         match cli::index::run(args) {
             Ok(cli::index::IndexExit::Success) => return,
@@ -218,6 +244,11 @@ fn main() {
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
         std::process::exit(cli::fix_config::run(args));
     }
+    if std::env::args().nth(1).as_deref() == Some("clean-old-caches") {
+        std::process::exit(cli::clean_old_caches::run(
+            std::env::args_os().skip(2).collect(),
+        ));
+    }
 
     // `aft backups purge` removes undo backups early. It runs before logging
     // and the application start: it either hands the purge to the running
@@ -240,6 +271,11 @@ fn main() {
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
         std::process::exit(cli::prune_legacy::run(args));
     }
+
+    // Keep the lease outside every context and module-loop lifetime. It is
+    // acquired before any cache can be prepared and remains held until process
+    // exit; process::exit releases its kernel handle even when Rust skips Drop.
+    let _process_storage_lease = hold_process_storage_lease();
 
     // Daemon launches can miss user shell PATH entries. Initialize before any
     // AFT threads or executors start so all subprocesses inherit one PATH.
@@ -362,6 +398,8 @@ fn main() {
                 if let Err(error) = aft::logging::write_terminal_log_sync(&terminal) {
                     eprintln!("[aft] terminal log persistence failed: {error}; {terminal}");
                 }
+                #[cfg(debug_assertions)]
+                storage_lease_exit_probe();
                 if !native_idle {
                     aft::ort_lifecycle::exit_without_native_teardown(0);
                 }

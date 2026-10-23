@@ -107,6 +107,7 @@ pub struct ResolveResult {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawAftConfig {
+    pub storage: Option<RawStorage>,
     #[serde(rename = "$schema")]
     pub schema: Option<String>,
     pub edit_mode: Option<RawEditMode>,
@@ -272,6 +273,12 @@ pub struct RawIndexes {
     pub trigram: Option<bool>,
     pub semantic: Option<bool>,
     pub callgraph: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RawStorage {
+    pub cache_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -721,7 +728,7 @@ pub fn resolve_config_for_harness(
         .unwrap_or_default();
     if !errors.is_empty() {
         return ResolveResult {
-            config: Config::default(),
+            config: rejected_cache_config(tiers, Config::default(), &errors),
             dropped,
             warnings,
             errors,
@@ -733,12 +740,16 @@ pub fn resolve_config_for_harness(
         let outcome = match parse_tier(tier, harness, &mut warnings) {
             Ok(outcome) => outcome,
             Err(errors) => {
+                // A rejected candidate still records where caches belong, or
+                // that the user file leaves it unknown, so caches stay off
+                // rather than falling back to the storage root.
+                let config = cache_location_checked_config(tiers, &mut warnings);
                 return ResolveResult {
-                    config: Config::default(),
+                    config: rejected_cache_config(tiers, config, &errors),
                     dropped,
                     warnings,
                     errors,
-                }
+                };
             }
         };
         let (raw, translation) = outcome;
@@ -785,17 +796,25 @@ pub fn resolve_config_for_harness(
         if is_user && raw.disabled_tools.is_none() {
             raw.disabled_tools = Some(default_disabled());
         }
-        apply_harness_override(&mut raw, harness, tier, is_user, &mut warnings);
+        apply_harness_override(
+            &mut raw,
+            harness,
+            tier,
+            is_user,
+            &mut warnings,
+            &mut dropped,
+        );
         if is_user {
             if let Some(blocked) = blocked_bash_env_key(&raw) {
+                let errors = vec![format!(
+                    "{} has blocked bash.env key {blocked}; environment startup hooks and protected variables cannot be configured",
+                    tier.source
+                )];
                 return ResolveResult {
-                    config: Config::default(),
+                    config: rejected_cache_config(tiers, Config::default(), &errors),
                     dropped,
                     warnings,
-                    errors: vec![format!(
-                        "{} has blocked bash.env key {blocked}; environment startup hooks and protected variables cannot be configured",
-                        tier.source
-                    )],
+                    errors,
                 };
             }
         }
@@ -818,32 +837,127 @@ pub fn resolve_config_for_harness(
         }
     }
 
-    let mut config = Config::default();
+    let mut config = cache_location_checked_config(tiers, &mut warnings);
     if let Err(missing) = apply_resolved_config(&merged, &mut config, &mut warnings) {
         return ResolveResult {
-            config: Config::default(),
+            config: rejected_cache_config(tiers, config, &missing),
             dropped,
             warnings,
             errors: missing,
         };
     }
     config.index = resolve_index_config(merged.index.as_ref(), &mut warnings);
+    if let Some(raw) = merged
+        .storage
+        .as_ref()
+        .and_then(|storage| storage.cache_dir.as_ref())
+    {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from);
+        match crate::config::expand_cache_dir_path(raw, home.as_deref()) {
+            Ok(path) => config.cache_dir = Some(path),
+            Err(error) => {
+                let path = std::path::PathBuf::from(raw);
+                config.cache_dir = Some(path.clone());
+                config.cache_unavailable = Some(error.clone());
+                warnings.push(crate::root_cache::unavailable_warning(&path, &error));
+            }
+        }
+    }
+    config.cache_dir_opt_out = config.cache_dir.is_none()
+        && tiers
+            .iter()
+            .filter(|tier| tier.tier == "user")
+            .any(explicit_null_cache_dir);
     config.idle = resolve_idle_config(merged.idle.as_ref(), &mut warnings);
     let resolved = serde_json::to_value(&config).unwrap_or(Value::Null);
     if let Err(invalid) = feature_config::validate_resolved_config(&resolved) {
         return ResolveResult {
-            config: Config::default(),
+            config: rejected_cache_config(tiers, config, &invalid),
             dropped,
             warnings,
             errors: invalid,
         };
     }
+    let errors = config
+        .cache_config_unknown
+        .as_ref()
+        .filter(|reason| reason.contains("unknown field"))
+        .and_then(|reason| {
+            // The warning retains the source and section. Keep rejection codes
+            // independent of file paths so every config loader agrees on them.
+            let (_, detail) = reason.split_once("unknown field `")?;
+            let key = detail.split('`').next().unwrap_or_default();
+            Some(vec![format!("invalid_cache_config: unknown field `{key}`")])
+        })
+        .unwrap_or_default();
     ResolveResult {
         config,
         dropped,
         warnings,
-        errors: Vec::new(),
+        errors,
     }
+}
+
+/// A default config carrying the user tier's cache-location verdict: when the
+/// user file is unreadable or its storage section invalid, the cache location
+/// is unknown and a `cache_dir_config_unknown` warning says so.
+fn cache_location_checked_config(
+    tiers: &[ConfigTier],
+    warnings: &mut Vec<ConfigWarning>,
+) -> Config {
+    let mut config = Config::default();
+    config.cache_config_unknown = tiers
+        .iter()
+        .filter(|tier| tier.tier == "user")
+        .find_map(cache_location_config_error);
+    if let Some(reason) = &config.cache_config_unknown {
+        warnings.push(ConfigWarning {
+            code: "cache_dir_config_unknown", key: "storage.cache_dir", tier: "user".into(),
+            value: "unknown".into(),
+            message: format!("User configuration is unreadable or invalid ({reason}); AFT is running without its caches until the configuration is valid."),
+        });
+    }
+    config
+}
+
+fn rejected_cache_config(tiers: &[ConfigTier], mut config: Config, errors: &[String]) -> Config {
+    if config.cache_dir.is_none() {
+        // Read only `storage.cache_dir` from the user document itself: the
+        // candidate was rejected, possibly for another section, so the tier
+        // as a whole may not parse.
+        if let Some(raw) = tiers
+            .iter()
+            .filter(|tier| tier.tier == "user")
+            .filter_map(|tier| {
+                serde_json::from_str::<Value>(&strip_jsonc(&tier.doc))
+                    .ok()?
+                    .get("storage")?
+                    .get("cache_dir")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .last()
+        {
+            let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(std::path::PathBuf::from);
+            config.cache_dir = Some(
+                crate::config::expand_cache_dir_path(&raw, home.as_deref())
+                    .unwrap_or_else(|_| std::path::PathBuf::from(raw)),
+            );
+        }
+    }
+    config.cache_dir_opt_out = config.cache_dir.is_none()
+        && tiers
+            .iter()
+            .filter(|tier| tier.tier == "user")
+            .any(explicit_null_cache_dir);
+    config
+        .cache_config_unknown
+        .get_or_insert_with(|| format!("configuration rejected: {}", errors.join(", ")));
+    config
 }
 
 /// Resolve raw config tiers into the core-domain config and RESET it onto an
@@ -943,6 +1057,7 @@ fn carry_process_state(base: &Config, resolved: &mut Config) {
     resolved.bash_permissions = base.bash_permissions;
     resolved.search_index_max_file_size = base.search_index_max_file_size;
     resolved.storage_dir = base.storage_dir.clone();
+    resolved.storage_lease = base.storage_lease.clone();
     resolved.lsp_paths_extra = base.lsp_paths_extra.clone();
     resolved.lsp_auto_install_binaries = base.lsp_auto_install_binaries.clone();
     resolved.lsp_inflight_installs = base.lsp_inflight_installs.clone();
@@ -1046,6 +1161,8 @@ fn normalize_config_for_harness(map: &mut Map<String, Value>, harness: Option<&H
     }
 }
 
+// `storage` is deliberately not listed: a malformed `storage.cache_dir` weakens
+// no protection; it turns caches off (`cache_config_unknown`) and warns.
 fn security_config_section(key: &str, harness: Option<&Harness>) -> bool {
     if harness_ignored_config_keys(harness).contains(&key) {
         return false;
@@ -1138,6 +1255,143 @@ fn malformed_security_config_errors(
     errors.sort();
     errors.dedup();
     errors
+}
+
+/// Whether a user tier sets `storage.cache_dir` to null, the explicit way to
+/// move caches back to the storage root after it used a cache directory.
+fn explicit_null_cache_dir(tier: &ConfigTier) -> bool {
+    serde_json::from_str::<Value>(&strip_jsonc(&tier.doc)).is_ok_and(|value| {
+        value
+            .get("storage")
+            .and_then(|storage| storage.get("cache_dir"))
+            .is_some_and(Value::is_null)
+    })
+}
+
+/// Recognize storage-section typos without making unrelated user keys strict.
+pub(crate) fn storage_like_key(key: &str, value: Option<&Value>) -> bool {
+    // This is a distinct process-state field, not a misspelled cache selector.
+    if key == "storage_dir" {
+        return false;
+    }
+    let normalized: String = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if normalized.starts_with("storage") || matches!(normalized.as_str(), "cachedir" | "cacheroot")
+    {
+        return true;
+    }
+    if value
+        .and_then(Value::as_object)
+        .is_some_and(|fields| fields.contains_key("cache_dir"))
+    {
+        return true;
+    }
+    let target = b"storage";
+    if normalized.len().abs_diff(target.len()) > 2 {
+        return false;
+    }
+    let mut row: Vec<usize> = (0..=target.len()).collect();
+    for (i, byte) in normalized.bytes().enumerate() {
+        let mut next = vec![i + 1];
+        for (j, expected) in target.iter().enumerate() {
+            next.push(
+                (row[j] + usize::from(byte != *expected))
+                    .min(row[j + 1] + 1)
+                    .min(next[j] + 1),
+            );
+        }
+        row = next;
+    }
+    row[target.len()] <= 2
+}
+
+/// Why a user tier leaves its cache location unknown. Storage sections and
+/// storage-like typos fail closed; unrelated unknown keys retain partial parsing.
+pub fn cache_location_config_error(tier: &ConfigTier) -> Option<String> {
+    let stripped = strip_jsonc(&tier.doc);
+    let value = match serde_json::from_str::<Value>(&stripped) {
+        Ok(value) => value,
+        Err(error) => return Some(format!("{} does not parse: {error}", tier.source)),
+    };
+    let Value::Object(map) = value else {
+        return Some(format!("{} is not a JSON object", tier.source));
+    };
+    if let Some(error) = feature_config::removed_config_key_errors(&map)
+        .into_iter()
+        .find(|error| error.contains("storage"))
+    {
+        return Some(format!(
+            "{} has a removed storage setting: {error}",
+            tier.source
+        ));
+    }
+    let unknown_key = |map: &Map<String, Value>| -> Option<String> {
+        let mut map = map.clone();
+        feature_config::translate_document(&mut map, feature_config::DocumentTier::User);
+        map.keys().find_map(|key| {
+            // Validate the name independently of its value: an invalid known
+            // setting must not hide a misspelled storage key later in the file.
+            let field = Map::from_iter([(key.clone(), Value::Null)]);
+            serde_json::from_value::<RawAftConfig>(Value::Object(field))
+                .err()
+                .map(|error| error.to_string())
+                .filter(|error| {
+                    error.starts_with("unknown field") && storage_like_key(key, map.get(key))
+                })
+        })
+    };
+    if let Some(error) = unknown_key(&map) {
+        return Some(format!("{} has an invalid setting: {error}", tier.source));
+    }
+    // Stricter than the resolver's RawStorage: a misspelled key inside
+    // storage (for example `cachedir`) would otherwise leave cache_dir unset
+    // and quietly put caches back on the storage root.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct StrictStorage {
+        cache_dir: Option<String>,
+    }
+    let invalid_storage = |section: &Value| -> Option<String> {
+        if section.is_null() {
+            return None;
+        }
+        if let Some(key) = section
+            .as_object()
+            .and_then(|fields| fields.keys().find(|key| key.as_str() != "cache_dir"))
+        {
+            return Some(format!("unknown field `{key}`, expected `cache_dir`"));
+        }
+        serde_json::from_value::<StrictStorage>(section.clone())
+            .err()
+            .map(|error| error.to_string())
+    };
+    if let Some(error) = map.get("storage").and_then(invalid_storage) {
+        return Some(format!(
+            "{} has an invalid storage section: {error}",
+            tier.source
+        ));
+    }
+    if let Some(Value::Object(harnesses)) = map.get("harnesses") {
+        for (name, block) in harnesses {
+            if let Some(error) = block.as_object().and_then(unknown_key) {
+                return Some(format!(
+                    "{} has an invalid harnesses.{name} setting: {error}",
+                    tier.source
+                ));
+            }
+            if let Some(error) = block.get("storage").and_then(invalid_storage) {
+                return Some(format!(
+                    "{} has an invalid harnesses.{name}.storage section: {error}",
+                    tier.source
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Return why a tier would be accepted only by the lenient resolver, or
@@ -1260,6 +1514,7 @@ fn apply_harness_override(
     tier: &ConfigTier,
     trusted: bool,
     warnings: &mut Vec<ConfigWarning>,
+    dropped: &mut Vec<DroppedKey>,
 ) {
     let Some(overrides) = raw.harnesses.take() else {
         return;
@@ -1299,6 +1554,18 @@ fn apply_harness_override(
 
     match serde_json::from_value::<RawAftConfig>(Value::Object(override_map)) {
         Ok(mut override_config) => {
+            if override_config
+                .storage
+                .take()
+                .is_some_and(|storage| storage.cache_dir.is_some())
+            {
+                push_drop(
+                    dropped,
+                    "storage.cache_dir",
+                    &tier.tier,
+                    "cache location is storage-wide; only the user-tier base may set it",
+                );
+            }
             // A project harness block, like the project base, may only turn an
             // index off; a user harness block overrides the user base.
             let override_indexes = override_config.indexes.take();
@@ -1317,6 +1584,13 @@ fn apply_harness_override(
 }
 
 fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) {
+    if override_config
+        .storage
+        .as_ref()
+        .is_some_and(|storage| storage.cache_dir.is_some())
+    {
+        base.storage = override_config.storage;
+    }
     if override_config.harnesses.is_some() {
         base.harnesses = override_config.harnesses.clone();
     }
@@ -2025,6 +2299,13 @@ fn record_resource_loosening(
 }
 
 fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<DroppedKey>) {
+    if raw
+        .storage
+        .as_ref()
+        .is_some_and(|storage| storage.cache_dir.is_some())
+    {
+        push_drop(dropped, "storage.cache_dir", tier, USER_ONLY_REASON);
+    }
     if matches!(&raw.bash, Some(RawBash::Features(features)) if features.disclaim_privacy == Some(false))
     {
         push_drop(
@@ -3145,6 +3426,145 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn storage_cache_dir_is_a_recognized_user_setting() {
+        let raw = serde_json::from_str::<super::RawAftConfig>(
+            r#"{"storage":{"cache_dir":"/cache/aft"}}"#,
+        );
+        assert!(raw.is_ok(), "storage.cache_dir must be recognized: {raw:?}");
+    }
+
+    #[test]
+    fn storage_cache_dir_only_user_base_can_select_storage_wide_root() {
+        let result = super::resolve_config_for_harness(&[
+            super::ConfigTier { tier: "user".into(), source: "user".into(), doc: r#"{"storage":{"cache_dir":"/cache/base"},"harnesses":{"pi":{"storage":{"cache_dir":"/cache/pi"}}}}"#.into() },
+            super::ConfigTier { tier: "project".into(), source: "project".into(), doc: r#"{"storage":{"cache_dir":"/evil"},"harnesses":{"pi":{"storage":{"cache_dir":"/evil/pi"}}}}"#.into() },
+        ], Some(&crate::harness::Harness::Pi));
+        assert!(result.errors.is_empty());
+        assert_eq!(
+            result.config.cache_dir,
+            Some(std::path::PathBuf::from("/cache/base"))
+        );
+        assert!(result
+            .dropped
+            .iter()
+            .any(|dropped| dropped.key == "storage.cache_dir"));
+    }
+
+    #[test]
+    fn cache_dir_and_bash_env_keep_distinct_harness_trust_rules() {
+        for harness in [
+            crate::harness::Harness::Opencode,
+            crate::harness::Harness::Pi,
+        ] {
+            let result = super::resolve_config_for_harness(
+                &[
+                    tier(
+                        "user",
+                        r#"{
+                        "storage":{"cache_dir":"/cache/base"},
+                        "bash":{"env":{"TZ":"UTC"}},
+                        "harnesses":{
+                            "opencode":{"storage":{"cache_dir":"/cache/override"},"bash":{"env":{"TZ":"Etc/GMT"}}},
+                            "pi":{"storage":{"cache_dir":"/cache/override"},"bash":{"env":{"TZ":"Etc/GMT"}}}
+                        }
+                    }"#,
+                    ),
+                    tier(
+                        "project",
+                        r#"{
+                        "storage":{"cache_dir":"/evil"},
+                        "bash":{"env":{"BASH_ENV":"/evil/startup"}},
+                        "harnesses":{
+                            "opencode":{"storage":{"cache_dir":"/evil/override"},"bash":{"env":{"TZ":"project"}}},
+                            "pi":{"storage":{"cache_dir":"/evil/override"},"bash":{"env":{"TZ":"project"}}}
+                        }
+                    }"#,
+                    ),
+                ],
+                Some(&harness),
+            );
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            assert_eq!(result.config.cache_dir, Some("/cache/base".into()));
+            assert_eq!(result.config.bash.env.len(), 1);
+            assert_eq!(result.config.bash.env["TZ"], "Etc/GMT");
+            assert!(result
+                .dropped
+                .iter()
+                .any(|drop| drop.key == "bash.env" && drop.tier == "project"));
+            assert!(result
+                .dropped
+                .iter()
+                .any(|drop| drop.key == "storage.cache_dir" && drop.tier == "user"));
+            assert!(result
+                .dropped
+                .iter()
+                .any(|drop| drop.key == "storage.cache_dir" && drop.tier == "project"));
+        }
+    }
+
+    #[test]
+    fn cache_dir_stays_fenced_when_bash_env_rejects_the_user_config() {
+        for in_harness in [false, true] {
+            let mut document = serde_json::json!({"storage":{"cache_dir":"/cache/base"}});
+            let blocked = serde_json::json!({"env":{"BASH_ENV":"/evil/startup"}});
+            if in_harness {
+                document["harnesses"] = serde_json::json!({"pi":{"bash":blocked}});
+            } else {
+                document["bash"] = blocked;
+            }
+            let result = super::resolve_config_for_harness(
+                &[tier("user", &document.to_string())],
+                Some(&crate::harness::Harness::Pi),
+            );
+            assert!(result
+                .errors
+                .iter()
+                .any(|error| error.contains("blocked bash.env key BASH_ENV")));
+            assert_eq!(result.config.cache_dir, Some("/cache/base".into()));
+            assert!(result.config.cache_config_unknown.is_some());
+            assert!(result.config.bash.env.is_empty());
+        }
+    }
+
+    #[test]
+    fn storage_cache_dir_relative_stays_unavailable_without_redirecting() {
+        let result = super::resolve_config(&[super::ConfigTier {
+            tier: "user".into(),
+            source: "user".into(),
+            doc: r#"{"storage":{"cache_dir":"relative"}}"#.into(),
+        }]);
+        assert_eq!(
+            result.config.cache_dir,
+            Some(std::path::PathBuf::from("relative"))
+        );
+        assert!(result.config.cache_unavailable.is_some());
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "cache_dir_unavailable"
+                && warning
+                    .message
+                    .contains("AFT is running without its caches until it is back.")));
+    }
+
+    #[test]
+    fn storage_cache_dir_expands_tilde_before_absolute_validation() {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from)
+            .unwrap();
+        let result = super::resolve_config(&[super::ConfigTier {
+            tier: "user".into(),
+            source: "user".into(),
+            doc: r#"{"storage":{"cache_dir":"~/aft-cache"}}"#.into(),
+        }]);
+        assert_eq!(result.config.cache_dir, Some(home.join("aft-cache")));
+        assert!(!result
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "cache_dir_unavailable"));
+    }
     use super::*;
 
     #[test]
@@ -5050,7 +5470,7 @@ mod tests {
     }
 
     #[test]
-    fn config_resolve_unknown_top_level_key_is_dropped_but_rest_survives() {
+    fn config_resolve_unrelated_unknown_user_key_keeps_lenient_defaults() {
         let result = resolve_config(&[tier(
             "user",
             r#"{ "not_a_real_key": true, "indexes": { "trigram": true } }"#,
@@ -5058,6 +5478,8 @@ mod tests {
 
         assert!(result.config.indexes.trigram);
         assert!(result.dropped.is_empty());
+        assert!(result.errors.is_empty(), "{result:?}");
+        assert!(result.config.cache_config_unknown.is_none());
     }
 
     #[test]

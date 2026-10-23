@@ -1686,8 +1686,9 @@ impl InspectManager {
             snapshot.project_root,
             snapshot.inspect_dir
         );
+        let cache_storage = snapshot.config.cache_storage_dir();
         let storage = checkout_view_some!(
-            snapshot.config.storage_dir.as_ref(),
+            cache_storage.as_ref(),
             "verification_storage_missing: config.storage_dir=None root={:?}",
             snapshot.project_root
         );
@@ -5547,8 +5548,7 @@ fn current_view_projection_result(
 ) -> Result<(ReadonlyCallGraphStore, String), CheckoutViewUnavailable> {
     let result = (|| -> Result<(ReadonlyCallGraphStore, String), CheckoutViewUnavailable> {
         let storage = config
-            .storage_dir
-            .clone()
+            .cache_storage_dir()
             .or_else(|| {
                 callgraph_store_dir_from_inspect_dir(inspect_dir, project_root)
                     .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))

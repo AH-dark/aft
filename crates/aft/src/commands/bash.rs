@@ -1353,6 +1353,43 @@ mod tests {
     }
 
     #[test]
+    fn split_cache_root_bash_launch_persists_the_real_task_under_durable_storage() {
+        // Tests elsewhere set AFT_STORAGE_DIR process-wide, which outranks the
+        // configured storage_dir; hold the shared env lock without it.
+        let _storage_env = crate::test_env::without_storage_override();
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            project_root: Some(project.path().to_path_buf()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            cache_dir: Some(cache.path().to_path_buf()),
+            experimental_bash_background: true,
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let artifacts = crate::root_cache::cache_root(&config);
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        crate::sandbox_spawn::install_sandbox_spawn_test_seam(project.path().to_path_buf());
+        let response = handle(
+            &spawn_test_request("split-root-task", "echo durable-task", true),
+            &ctx,
+        );
+        crate::sandbox_spawn::clear_sandbox_spawn_test_seam(project.path());
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"].as_str().unwrap();
+        let root = crate::bash_background::task_storage_dir(&ctx);
+        assert_eq!(root, storage.path());
+        let task =
+            crate::bash_background::persistence::resolve_task(&root, "sandbox-spawn-test", task_id)
+                .unwrap();
+        assert!(task.paths.json.is_file());
+        assert!(task.paths.json.starts_with(storage.path()));
+        assert!(!artifacts.join("bash-tasks").exists());
+        stop_spawned_test_task(&ctx, &response);
+    }
+
+    #[test]
     fn synthetic_load_role_gate_refuses_worker_not_head() {
         use crate::sandbox_spawn::{with_spawn_plan_for_test, SpawnPlan};
 

@@ -1022,11 +1022,23 @@ fn open_semantic_view_blob_store(
     source: Option<SemanticViewBlobSource>,
 ) -> Option<crate::blob_store::BlobStore> {
     let source = source?;
-    match crate::blob_store::BlobStore::open(
+    #[cfg(test)]
+    let observed_family = source.family.clone();
+    let opened = crate::blob_store::BlobStore::open(
         &source.storage,
         source.family,
         crate::blob_store::BlobPlane::Semantic,
-    ) {
+    );
+    #[cfg(test)]
+    if let Some(sender) = SEMANTIC_BLOB_OPEN_OBSERVERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .remove(&observed_family)
+    {
+        let _ = sender.send((source.storage.clone(), opened.is_ok()));
+    }
+    match opened {
         Ok(store) => Some(store),
         Err(error) => {
             slog_warn!("semantic view blob reuse unavailable: {}", error);
@@ -1034,6 +1046,11 @@ fn open_semantic_view_blob_store(
         }
     }
 }
+
+#[cfg(test)]
+static SEMANTIC_BLOB_OPEN_OBSERVERS: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<String, crossbeam_channel::Sender<(PathBuf, bool)>>>,
+> = std::sync::OnceLock::new();
 
 fn semantic_view_blob_for_path(
     store: Option<&crate::blob_store::BlobStore>,
@@ -1617,8 +1634,7 @@ pub(crate) fn ensure_ready_semantic_refresh_worker(ctx: &AppContext) -> bool {
                 .map(SemanticViewBlobSource::from)
                 .or_else(|| {
                     runtime_config
-                        .storage_dir
-                        .clone()
+                        .cache_storage_dir()
                         .map(|storage| SemanticViewBlobSource {
                             storage,
                             family: ctx.memoized_artifact_cache_key(&project_root),
@@ -2854,7 +2870,7 @@ fn configure_warm_key(
     format!(
         "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};views={};callgraph={}",
         canonical_root,
-        config.storage_dir,
+        (config.cache_storage_dir(), config.cache_epoch),
         root_too_broad,
         is_worktree_bridge,
         shared_artifacts_read_only,
@@ -2880,7 +2896,7 @@ fn configure_callgraph_build_key(
     format!(
         "root={:?};storage={:?};home={};worktree={};readonly={};enabled={}",
         canonical_root,
-        config.storage_dir,
+        (config.cache_storage_dir(), config.cache_epoch),
         root_too_broad,
         is_worktree_bridge,
         shared_artifacts_read_only,
@@ -2970,7 +2986,12 @@ fn configure_retention_timeout_is_retryable_and_names_lock() {
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     assert!(error.to_string().contains("publication round"));
     assert!(!storage.path().join("retention/roots").exists());
-    crate::storage_retention::record_bind(storage.path(), &root, "0123456789abcdef").unwrap();
+    crate::storage_retention::record_bind(
+        &crate::root_cache::StoragePaths::same(storage.path()),
+        &root,
+        "0123456789abcdef",
+    )
+    .unwrap();
     assert!(storage.path().join("retention/roots").is_dir());
 
     let response = retention_binding_failure(
@@ -3158,21 +3179,91 @@ fn log_artifact_owner_note(note: &str) {
 /// Stderr log: `[aft] project root set: <path>`
 /// Stderr log: `[aft] watcher started: <path>`
 pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
+    handle_configure_prepared(req, ctx, None)
+}
+
+fn prepared_cache_matches(prepared: &Config, candidate: &Config) -> bool {
+    prepared.cache_dir == candidate.cache_dir
+        && prepared.storage_dir == candidate.storage_dir
+        && prepared.cache_config_unknown == candidate.cache_config_unknown
+        && prepared.cache_dir_opt_out == candidate.cache_dir_opt_out
+}
+
+fn prepared_cache_warning(
+    prepared: &Config,
+    storage: &Path,
+) -> Option<crate::config_resolve::ConfigWarning> {
+    prepared.cache_unavailable.as_ref().map(|reason| {
+        crate::root_cache::unavailable_warning(
+            prepared.cache_dir.as_deref().unwrap_or(storage),
+            reason,
+        )
+    })
+}
+
+/// Re-run the session's retained connect request after the standing probe saw
+/// its cache volume change state, with `prepared` carrying the fresh volume
+/// check. Unlike a connect it re-resolves no config file: the session keeps
+/// the configuration it is running with (see `handle_configure_inner`).
+/// Re-run the connect request `req` to recheck the cache location, unless a
+/// connect started after `req` was retained (`connect_generation` changed).
+/// The newer connect's settings stand, and the next probe checks them; an old
+/// request re-run over them would restore its storage root, harness and other
+/// process settings.
+pub(crate) fn handle_cache_recovery(
+    req: &RawRequest,
+    connect_generation: u64,
+    ctx: &AppContext,
+    prepared: &Config,
+) -> Response {
+    if ctx.connect_generation() != connect_generation {
+        return Response::success(
+            &req.id,
+            json!({"cache_recovery": "dropped", "reason": "a newer connect replaced the request"}),
+        );
+    }
+    handle_configure_prepared(req, ctx, Some(prepared))
+}
+
+fn handle_configure_prepared(
+    req: &RawRequest,
+    ctx: &AppContext,
+    prepared: Option<&Config>,
+) -> Response {
+    // The configuration active before a connect, kept only to recognise a
+    // refused connect that left it in place.
+    let active_before = prepared.is_none().then(|| ctx.config_unpinned());
+    if prepared.is_none() {
+        ctx.note_connect_started();
+    }
     let _sources_scope = crate::config_live::configure_sources_scope();
     // Configure can change the project root, search paths or server
     // overrides, and follows installs the file watcher may not report, so the
     // memoized TypeScript server choices are recomputed.
     crate::lsp::typescript_project::clear_typescript_selection();
-    let response = handle_configure_inner(req, ctx);
+    let response = handle_configure_inner(req, ctx, prepared);
     crate::provisional_identity_retry::note_configure_outcome(ctx, req, response.success);
     // A successful configure applied the files it read; record them so a live
     // config reload can tell later edits apart and knows what is deferred.
     ctx.begin_configure_ack_step("finish_configure");
     crate::config_live::finish_configure(ctx, response.success);
+    if response.success {
+        ctx.retain_cache_recovery_request(req);
+    } else if active_before.is_some_and(|before| Arc::ptr_eq(&before, &ctx.config_unpinned())) {
+        // The refused connect published nothing, so the earlier connect's
+        // request still describes the active configuration. Without a new
+        // stamp every later cache recovery would be dropped as stale and
+        // caches would not restart when their volume returns.
+        ctx.restamp_cache_recovery_request();
+    }
     response
 }
 
-fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
+fn handle_configure_inner(
+    req: &RawRequest,
+    ctx: &AppContext,
+    prepared: Option<&Config>,
+) -> Response {
     let prefix_started_at = Instant::now();
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
@@ -3261,19 +3352,33 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
+    // A cache recovery (`prepared` is set) re-runs this configure only to
+    // re-check the cache volume and restart what depends on it. It keeps the
+    // configuration the session is running with, including keys live reload
+    // applied since, and reads no config file: an edit live reload reported as
+    // deferred until the next connect must stay deferred. The running config
+    // already holds this request's resolved tiers, so nothing is re-resolved
+    // and the recorded config sources are left as they are.
+    let recovery = prepared.is_some();
     ctx.begin_configure_ack_step("tier_file_reads");
-    let (tiers, user_config_migration) =
+    let (tiers, user_config_migration) = if recovery {
+        (Vec::new(), None)
+    } else {
         match resolve_config_tiers_for_configure(params, &root_path, Some(&harness)) {
             Ok(read) => read,
             Err(error) => return Response::error(&req.id, "invalid_request", error),
-        };
+        }
+    };
     ctx.begin_configure_ack_step("tier_merge");
-    let config_diagnostics =
+    let config_diagnostics = if recovery {
+        crate::config_resolve::ResolveDiagnostics::default()
+    } else {
         crate::config_resolve::resolve_config_onto_with_diagnostics_for_harness(
             &tiers,
             Some(&harness),
             &mut next_config,
-        );
+        )
+    };
     let config_dropped_keys = config_diagnostics.dropped;
     if !config_diagnostics.errors.is_empty() {
         // The whole candidate is rejected before anything is published or any
@@ -3288,12 +3393,16 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
     ctx.begin_configure_ack_step("source_tracking");
-    crate::config_live::stage_configure_sources(crate::config_live::ConfigSources::from_configure(
-        parse_cortexkit_user_config_path(params).ok().flatten(),
-        &root_path,
-        &tiers,
-        &next_config,
-    ));
+    if !recovery {
+        crate::config_live::stage_configure_sources(
+            crate::config_live::ConfigSources::from_configure(
+                parse_cortexkit_user_config_path(params).ok().flatten(),
+                &root_path,
+                &tiers,
+                &next_config,
+            ),
+        );
+    }
     ctx.begin_configure_ack_step("validate_params");
     let mut configure_warnings = config_diagnostics
         .warnings
@@ -3422,6 +3531,38 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.begin_configure_ack_step("storage_root");
     let resolved_storage_dir =
         crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    if resolved_storage_dir.exists() {
+        crate::reader_floor::prepare(&resolved_storage_dir);
+    }
+    next_config.storage_dir = Some(resolved_storage_dir.clone());
+    if let Err(error) = crate::root_cache::ensure_config_storage_lease(&mut next_config) {
+        return Response::error(&req.id, "storage_in_use", error.to_string());
+    }
+    let warning = if let Some(prepared) =
+        prepared.filter(|prepared| prepared_cache_matches(prepared, &next_config))
+    {
+        next_config.cache_unavailable = prepared.cache_unavailable.clone();
+        next_config.cache_epoch = prepared.cache_epoch;
+        next_config.cache_lease = prepared.cache_lease.clone();
+        next_config.semantic.local_cache_dir = prepared.semantic.local_cache_dir.clone();
+        prepared_cache_warning(prepared, &resolved_storage_dir)
+    } else {
+        crate::root_cache::prepare_cache_root(&mut next_config)
+    };
+    if let Some(warning) = warning {
+        if next_config
+            .cache_dir
+            .as_ref()
+            .is_some_and(|parent| !parent.exists() && resolved_storage_dir.starts_with(parent))
+        {
+            return Response::error(
+                &req.id,
+                crate::root_cache::CACHE_DIR_UNAVAILABLE,
+                warning.message,
+            );
+        }
+        configure_warnings.push(json!({"code": warning.code, "key": warning.key, "tier": warning.tier, "value": warning.value, "message": warning.message}));
+    }
     if let Err(error) = crate::private_storage::open_root(&resolved_storage_dir) {
         log::warn!(
             "could not open private storage {}: {error}",
@@ -3557,6 +3698,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                         .unwrap_or_default(),
                     harness: harness.clone(),
                     storage_root: storage_root.clone(),
+                    artifact_root: crate::root_cache::cache_root(&next_config),
                     harness_dir: storage_root.join(harness.storage_segment()),
                     session_id: req.session().to_string(),
                     root_too_broad: ctx.root_too_broad(),
@@ -3834,6 +3976,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     .unwrap_or_default(),
                 harness: harness.clone(),
                 storage_root: storage_root.clone(),
+                artifact_root: crate::root_cache::cache_root(&next_config),
                 harness_dir: storage_root.join(harness.storage_segment()),
                 session_id: req.session().to_string(),
                 root_too_broad,
@@ -3940,10 +4083,16 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // the project binary here: configure/warm paths are existence-only by design.
     let format_tool_cache_clear_needed = effective_configure_changed;
 
-    let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    let storage_root = crate::root_cache::cache_root(&next_config);
+    let durable_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    let cache_available = crate::root_cache::cache_unavailable(&next_config).is_none();
+    if !cache_available {
+        degraded_reasons.push(crate::root_cache::CACHE_DIR_UNAVAILABLE.into());
+    }
     // Choose a durable identity at the first bind that needs an artifact key.
     // With indexes and views off, keep the no-key, no-Git-probe fast path.
-    let artifact_key_needed = !root_too_broad
+    let artifact_key_needed = cache_available
+        && !root_too_broad
         && (next_config.indexes.trigram
             || next_config.indexes.semantic
             || next_config.indexes.callgraph
@@ -3958,7 +4107,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         ctx.memoized_artifact_cache_key_for_configure_profiled(
             &root_path,
             &canonical_cache_root,
-            &storage_root,
+            &durable_root,
             git_common_dir.as_deref(),
             &mut cache_key_profile.key,
         )
@@ -4009,14 +4158,14 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
     ctx.begin_configure_ack_step("retention_bind");
     let retention_started = Instant::now();
-    let retention_result = if identity_provisional {
-        Ok(())
-    } else {
+    let retention_result = if cache_available && !identity_provisional {
         crate::storage_retention::record_bind(
-            &storage_root,
+            &crate::root_cache::StoragePaths::new(durable_root.clone(), storage_root.clone()),
             &canonical_cache_root,
             project_key.as_deref().unwrap_or_default(),
         )
+    } else {
+        Ok(())
     };
     cache_key_profile.retention_bind = retention_started.elapsed();
     if let Err(error) = retention_result {
@@ -4029,7 +4178,11 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         // written by a newer build is refused by name from the start instead
         // of being discovered halfway through a rebuild.
         let preflight_started = Instant::now();
-        crate::persisted_format::preflight_project_artifacts(&storage_root, project_key);
+        crate::persisted_format::preflight_project_artifacts(
+            &durable_root,
+            &storage_root,
+            project_key,
+        );
         cache_key_profile.format_preflight = preflight_started.elapsed();
     }
     drop(cache_key_profile);
@@ -4039,7 +4192,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     let artifact_owner_claim = if let Some(project_key) = project_key.as_ref() {
         match crate::artifact_owner::claim_or_open_read_only(
-            next_config.storage_dir.as_deref(),
+            Some(&durable_root),
             &canonical_cache_root,
             project_key,
             &project_scope_key,
@@ -4078,26 +4231,27 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
-    let root_cache_storage_ok = match crate::root_cache::storage_allows_root_keyed(&storage_root) {
-        Ok(true) => true,
-        Ok(false) => {
-            degraded_reasons.push("root_cache_network_fs".to_string());
-            slog_warn!(
+    let root_cache_storage_ok = cache_available
+        && match crate::root_cache::storage_allows_root_keyed(&storage_root) {
+            Ok(true) => true,
+            Ok(false) => {
+                degraded_reasons.push("root_cache_network_fs".to_string());
+                slog_warn!(
                 "root-keyed callgraph/inspect writers disabled: storage directory appears to be on a network filesystem ({})",
                 storage_root.display()
             );
-            false
-        }
-        Err(error) => {
-            degraded_reasons.push("root_cache_fs_probe_failed".to_string());
-            slog_warn!(
+                false
+            }
+            Err(error) => {
+                degraded_reasons.push("root_cache_fs_probe_failed".to_string());
+                slog_warn!(
                 "root-keyed callgraph/inspect writers disabled: failed to probe storage filesystem {}: {}",
                 storage_root.display(),
                 error
             );
-            false
-        }
-    };
+                false
+            }
+        };
     let callgraph_writer_capability = root_cache_storage_ok
         && !is_worktree_bridge
         && !artifact_owner_read_only
@@ -4107,7 +4261,8 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // itself; its children are served from their own sessions' results.
     let inspect_writer_capability =
         root_cache_storage_ok && !root_too_broad && !parent_folder && !identity_provisional;
-    let heavy_root_work_allowed = !root_too_broad
+    let heavy_root_work_allowed = cache_available
+        && !root_too_broad
         && !parent_folder
         && !identity_provisional
         && !degraded_reasons.iter().any(|reason| reason == "home_root");
@@ -4240,7 +4395,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // first request after this bind is already answered by it. Starting only
     // spawns its worker.
     ctx.begin_configure_ack_step("views_parent");
-    if !root_too_broad && !identity_provisional {
+    if cache_available && !root_too_broad && !identity_provisional {
         crate::views::parent::activate(ctx, &canonical_cache_root, &storage_root, &parent_semantic);
     }
     ctx.begin_configure_ack_step("warm_key");
@@ -4254,7 +4409,8 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let semantic_build_inputs_changed = project_root_changed
         || previous_config.indexes.semantic != next_config.indexes.semantic
         || semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic)
-        || previous_config.semantic.max_files != next_config.semantic.max_files;
+        || previous_config.semantic.max_files != next_config.semantic.max_files
+        || previous_config.cache_epoch != next_config.cache_epoch;
     let (configure_generation, equivalent_warm_config) =
         ctx.note_configure_warm_key(warm_key, semantic_build_inputs_changed);
     release_callgraph_start_waiters_for_generation_change(
@@ -4273,8 +4429,10 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.begin_configure_ack_step("build_state");
     let callgraph_build_in_progress = ctx.callgraph_store_rx().lock().is_some();
     let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
-    let semantic_build_adopted =
-        !equivalent_warm_config && semantic_build_in_progress && !semantic_build_inputs_changed;
+    let semantic_build_adopted = cache_available
+        && !equivalent_warm_config
+        && semantic_build_in_progress
+        && !semantic_build_inputs_changed;
     let first_session_bind =
         ctx.note_configure_session_binding(canonical_cache_root.clone(), req.session().to_string());
     // An interactive session binding this root opens it for semantic indexing
@@ -4293,7 +4451,8 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             ctx.reset_semantic_cold_seed_gate_for_configure();
             // The cold-seed gate holds Tier-2 work until a semantic build
             // finishes; a root that will not build must not hold it.
-            if next_config.indexes.semantic
+            if cache_available
+                && next_config.indexes.semantic
                 && !ctx.shared_artifacts_read_only()
                 && !root_too_broad
                 && semantic_admitted
@@ -4413,17 +4572,23 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
 
         // A change to another lane's settings does not invalidate the serving
         // trigram generation. Root and corpus-limit changes still require a reset.
-        let retain_search = !project_root_changed
+        let retain_search = cache_available
+            && !project_root_changed
             && search_index
             && previous_config.search_index_max_file_size == next_config.search_index_max_file_size
-            && previous_config.storage_dir == next_config.storage_dir;
+            && previous_config.storage_dir == next_config.storage_dir
+            && previous_config.cache_dir == next_config.cache_dir
+            && previous_config.cache_epoch == next_config.cache_epoch;
         if !retain_search {
             *ctx.search_index()
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
-        let retain_semantic = !semantic_build_inputs_changed
-            && previous_config.storage_dir == next_config.storage_dir;
+        let retain_semantic = cache_available
+            && !semantic_build_inputs_changed
+            && previous_config.storage_dir == next_config.storage_dir
+            && previous_config.cache_dir == next_config.cache_dir
+            && previous_config.cache_epoch == next_config.cache_epoch;
         ctx.retire_search_index_rx("a reconfigure with different settings superseded it");
         if semantic_build_adopted {
             let adopted = ctx.adopt_semantic_index_rx_generation(configure_generation);
@@ -4522,6 +4687,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         project_key: project_key.clone(),
         harness: harness.clone(),
         storage_root,
+        artifact_root: crate::root_cache::cache_root(&next_config),
         harness_dir: ctx.harness_dir(),
         session_id: req.session().to_string(),
         root_too_broad,
@@ -5125,9 +5291,16 @@ fn schedule_artifact_loads_admitted(
     load_semantic: bool,
     semantic_view_work_allowed: bool,
 ) -> ArtifactLoadStarts {
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            SemanticIndexStatus::Failed(format!("cache_dir_unavailable: {reason}"));
+        return (None, None);
+    }
     let canonical_cache_root = ctx.canonical_cache_root();
     let config = ctx.config();
-    let storage_dir = config.storage_dir.clone();
+    let storage_dir = config.cache_storage_dir();
     let search_index_max_file_size = config.search_index_max_file_size;
     let semantic_config = config.semantic.clone();
     let views_enabled = config.views.enabled;
@@ -5533,7 +5706,6 @@ fn schedule_artifact_loads_admitted(
                 ctx,
                 &canonical_cache_root,
                 &project_key,
-                storage_dir.as_deref(),
                 semantic_config.clone(),
             ));
             false
@@ -5570,6 +5742,11 @@ fn schedule_artifact_loads_admitted(
         semantic_artifact_load_start = Some(start_tx);
         let semantic_root = canonical_cache_root.clone();
         let semantic_storage = storage_dir.clone();
+        // Open the snapshot under the key configure already resolved. Deriving
+        // it again here would re-run the Git probe, and when that probe fails
+        // it falls back to a path-based key, so a linked worktree would look
+        // in its own folder and miss the owner checkout's shared snapshot.
+        let semantic_project_key = project_key.clone();
         let semantic_load_generation = configure_generation;
         let semantic_load_generation_flag = ctx.configure_generation_flag();
         let semantic_load_lifecycle = subc_lifecycle.clone();
@@ -5592,9 +5769,10 @@ fn schedule_artifact_loads_admitted(
             }
             log_ctx::with_session(session_id, || {
                 note_configure_artifact_load_attempt(&semantic_root);
-                let event = match crate::readonly_artifacts::open_semantic_index_read_only(
+                let event = match crate::readonly_artifacts::open_semantic_index_read_only_with_key(
                     &semantic_root,
                     semantic_storage.as_deref(),
+                    &semantic_project_key,
                 ) {
                     crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
                         SemanticIndexEvent::Ready(index)
@@ -6619,7 +6797,6 @@ fn start_checkout_semantic_lane(
     ctx: &AppContext,
     root: &Path,
     family: &str,
-    storage_dir: Option<&Path>,
     semantic: SemanticBackendConfig,
 ) -> crossbeam_channel::Sender<()> {
     let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
@@ -6637,7 +6814,7 @@ fn start_checkout_semantic_lane(
     let strict_lifecycle = lifecycle.clone();
     let config = crate::views::semantic_runtime::WorkerConfig {
         root: root.to_path_buf(),
-        storage: crate::bash_background::storage_dir(storage_dir),
+        storage: ctx.storage_paths(),
         family: family.to_owned(),
         scope: crate::path_identity::project_scope_key(root),
         status: ctx.semantic_index_status_handle(),
@@ -7402,6 +7579,9 @@ fn import_legacy_view_once(
     job: &ConfigureMaintenanceJob,
     view: &ViewRuntimeSnapshot,
 ) -> Result<bool, String> {
+    if job.storage_root != job.artifact_root {
+        return Ok(true);
+    }
     if input.read_only {
         return Ok(true);
     }
@@ -7448,7 +7628,7 @@ fn import_legacy_view_once(
     Ok(true)
 }
 
-fn run_configure_view_sweep(view: &ViewRuntimeSnapshot) {
+fn run_configure_view_sweep(view: &ViewRuntimeSnapshot, durable_storage: &Path) {
     if !crate::storage_retention::startup_sweeps_ready(&view.storage) {
         return;
     }
@@ -7509,6 +7689,7 @@ fn run_configure_view_sweep(view: &ViewRuntimeSnapshot) {
         .unwrap_or_default()
         .as_millis() as u64;
     if let Err(error) = crate::gc::sweep(crate::gc::SweepRequest {
+        durable_storage,
         storage: &view.storage,
         family: &view.family,
         view_dir: &view.view_dir,
@@ -7918,7 +8099,10 @@ fn run_configure_maintenance_unit_inner(
             if crate::views::parent::held_by(ctx, &job.canonical_cache_root) {
                 // A parent folder owns no view; its session reads the children's.
                 ctx.clear_view_runtime();
-            } else if ctx.config().views.enabled && !job.root_too_broad {
+            } else if ctx.cache_unavailable_reason().is_none()
+                && ctx.config().views.enabled
+                && !job.root_too_broad
+            {
                 finish_configure_view_load(
                     ctx,
                     prepare_configure_view(&ConfigureViewInput::capture(ctx, job), job),
@@ -7929,8 +8113,15 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
         }
         ConfigureMaintenanceStage::StorageSweeps => {
+            if ctx.cache_unavailable_reason().is_some() {
+                continuation.stage = ConfigureMaintenanceStage::ProcessFlags;
+                return ConfigureMaintenanceUnitResult::Continue;
+            }
             crate::storage_retention::schedule(
-                job.storage_root.clone(),
+                crate::root_cache::StoragePaths::new(
+                    job.storage_root.clone(),
+                    job.artifact_root.clone(),
+                ),
                 ctx.subc_lifecycle_admission(),
                 ctx.configure_generation_flag(),
                 job.generation,
@@ -8367,21 +8558,21 @@ fn open_view_runtime_for_configure(
         return Err("view requires a settled artifact identity".to_string());
     }
     let scope = crate::path_identity::project_scope_key(&job.canonical_cache_root);
-    let view = crate::views::ViewStore::open(&job.storage_root, &scope)
+    let view = crate::views::ViewStore::open(&job.artifact_root, &scope)
         .map_err(|error| error.to_string())?;
     let semantic_store = crate::blob_store::BlobStore::open(
-        &job.storage_root,
+        &job.artifact_root,
         family.clone(),
         crate::blob_store::BlobPlane::Semantic,
     )
     .map_err(|error| error.to_string())?;
     let callgraph_store = crate::blob_store::BlobStore::open(
-        &job.storage_root,
+        &job.artifact_root,
         family.clone(),
         crate::blob_store::BlobPlane::Callgraph,
     )
     .map_err(|error| error.to_string())?;
-    let alias_store = crate::alias::AliasStore::open(&job.storage_root, &family)
+    let alias_store = crate::alias::AliasStore::open(&job.artifact_root, &family)
         .map_err(|error| error.to_string())?;
 
     let head_entries = crate::alias::head_tree_entries(&job.canonical_cache_root)
@@ -8613,7 +8804,7 @@ fn open_view_runtime_for_configure(
     Ok(PreparedConfigureView {
         snapshot: ViewRuntimeSnapshot {
             query_pin: None,
-            storage: job.storage_root.clone(),
+            storage: job.artifact_root.clone(),
             family,
             scope,
             view_dir: view.view_dir().to_path_buf(),
@@ -8677,7 +8868,7 @@ fn prepare_configure_view(
     // An import may have published the first generation. Re-read only in that
     // case, so the installed pin and manifest refer to the imported generation.
     if import_ready && prepared.snapshot.generation.is_none() {
-        let store = crate::views::ViewStore::open(&job.storage_root, &prepared.snapshot.scope)
+        let store = crate::views::ViewStore::open(&job.artifact_root, &prepared.snapshot.scope)
             .map_err(|error| error.to_string())?;
         if store
             .current_generation()
@@ -8728,6 +8919,8 @@ fn spawn_configure_storage_sweeps(
     // finishes. The worker owns only immutable sweep inputs, never the actor
     // gate or lifecycle admission; the view snapshot keeps its query pin live.
     let storage_root = job.storage_root.clone();
+    let sweep_paths =
+        crate::root_cache::StoragePaths::new(job.storage_root.clone(), job.artifact_root.clone());
     let root = job.canonical_cache_root.clone();
     let harness = job.harness.clone();
     let session = Some(job.session_id.clone());
@@ -8741,9 +8934,9 @@ fn spawn_configure_storage_sweeps(
                 ConfigureMaintenanceStage::StorageSweeps,
             );
             delay_configure_storage_sweeps_for_debug();
-            run_configure_storage_sweeps(&storage_root, harness);
+            run_configure_storage_sweeps(&sweep_paths, harness);
             if let Some(view) = view {
-                run_configure_view_sweep(&view);
+                run_configure_view_sweep(&view, &storage_root);
             }
         });
         #[cfg(test)]
@@ -8770,13 +8963,27 @@ fn spawn_configure_storage_sweeps(
     }
 }
 
-fn run_configure_storage_sweeps(storage_root: &Path, harness: Harness) {
-    match crate::url_fetch::cleanup_url_cache(storage_root) {
-        Ok(0) => {}
-        Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
-        Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
+/// `paths.artifacts` is where rebuildable caches live (the `storage.cache_dir`
+/// volume when one is configured); `paths.durable` holds locks, ownership
+/// records and migration state. Each sweep runs where its data is written.
+fn run_configure_storage_sweeps(paths: &crate::root_cache::StoragePaths, harness: Harness) {
+    let storage_root = paths.durable.as_path();
+    // Rebuildable data is written under the cache root (URL downloads through
+    // `AppContext::cache_dir`, cache-domain locks beside their caches). Data
+    // written before `storage.cache_dir` was set stays under the durable root,
+    // so that root is swept too.
+    let mut cache_sweep_roots = vec![paths.artifacts.as_path()];
+    if paths.durable != paths.artifacts {
+        cache_sweep_roots.push(storage_root);
     }
-    match crate::fs_lock::sweep_stale_reclaim_tokens(storage_root) {
+    for url_root in &cache_sweep_roots {
+        match crate::url_fetch::cleanup_url_cache(url_root) {
+            Ok(0) => {}
+            Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
+            Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
+        }
+    }
+    match crate::fs_lock::sweep_stale_reclaim_tokens(&cache_sweep_roots) {
         Ok(None | Some(0)) => {}
         Ok(Some(n)) => slog_info!(
             "filesystem lock cleanup: removed {} stale reclaim tokens",
@@ -8859,6 +9066,28 @@ fn callgraph_store_upgrade_required(ctx: &AppContext) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prepared_cache_reuse_preserves_unknown_and_opt_out_intent() {
+        let candidate = crate::config::Config::default();
+        let mut prepared = candidate.clone();
+        assert!(super::prepared_cache_matches(&prepared, &candidate));
+        prepared.cache_config_unknown = Some("invalid user file".into());
+        assert!(!super::prepared_cache_matches(&prepared, &candidate));
+        prepared.cache_config_unknown = None;
+        prepared.cache_dir_opt_out = true;
+        assert!(!super::prepared_cache_matches(&prepared, &candidate));
+    }
+
+    #[test]
+    fn prepared_cache_warning_accepts_an_absent_cache_directory() {
+        let prepared = crate::config::Config {
+            cache_unavailable: Some("cache location is unknown".into()),
+            ..Default::default()
+        };
+        let storage = std::env::temp_dir().join("durable-warning-root");
+        let warning = super::prepared_cache_warning(&prepared, &storage).unwrap();
+        assert_eq!(warning.value, storage.display().to_string());
+    }
     use serde_json::{json, Value};
 
     #[test]
@@ -13650,6 +13879,319 @@ mod tests {
     }
 
     #[test]
+    fn standalone_cache_dir_number_fails_closed() {
+        cache_tier_failure("standalone", "number");
+    }
+    #[test]
+    fn standalone_cache_file_missing_fails_closed() {
+        cache_tier_failure("standalone", "missing");
+    }
+    #[test]
+    fn standalone_cache_file_unparseable_fails_closed() {
+        cache_tier_failure("standalone", "unparseable");
+    }
+    #[test]
+    fn standalone_cache_file_unreadable_fails_closed() {
+        cache_tier_failure("standalone", "unreadable");
+    }
+    #[test]
+    fn subc_local_cache_dir_number_fails_closed() {
+        cache_tier_failure("subc", "number");
+    }
+    #[test]
+    fn subc_local_cache_file_missing_fails_closed() {
+        cache_tier_failure("subc", "missing");
+    }
+    #[test]
+    fn subc_local_cache_file_unparseable_fails_closed() {
+        cache_tier_failure("subc", "unparseable");
+    }
+    #[test]
+    fn subc_local_cache_file_unreadable_fails_closed() {
+        cache_tier_failure("subc", "unreadable");
+    }
+
+    fn cache_tier_failure(transport: &str, failure: &str) {
+        // Tests elsewhere set AFT_STORAGE_DIR process-wide, which outranks the
+        // storage_dir this fixture configures; hold the shared env lock without it.
+        let _storage_env = crate::test_env::without_storage_override();
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        let cache = temp.path().join("cache-volume");
+        let user = temp.path().join("user.jsonc");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&cache).unwrap();
+        init_git_fixture(&project);
+        fs::create_dir_all(project.join(".cortexkit")).unwrap();
+        fs::write(
+            project.join(".cortexkit/aft.jsonc"),
+            r#"{"indexes":{"semantic":false,"callgraph":false}}"#,
+        )
+        .unwrap();
+        fs::write(project.join("needle.rs"), "fn cache_guard_needle() {}\n").unwrap();
+        let mut split = Config {
+            storage_dir: Some(storage.clone()),
+            cache_dir: Some(cache),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut split).is_none());
+        drop(split);
+        match failure {
+            "number" => fs::write(
+                &user,
+                r#"{"storage":{"cache_dir":123},"indexes":{"semantic":false,"callgraph":false}}"#,
+            )
+            .unwrap(),
+            "unparseable" => fs::write(&user, "{").unwrap(),
+            "unreadable" => fs::create_dir(&user).unwrap(),
+            "missing" => {}
+            _ => unreachable!(),
+        }
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let mut params = json!({"project_root":project,"storage_dir":storage,"harness":"opencode"});
+        if transport == "standalone" {
+            // Plugins relay the raw document and its path, not their lenient
+            // merged defaults. Native re-reading also detects unreadable files.
+            params["cortexkit_user_config_path"] = json!(user);
+            params["config"] = match fs::read_to_string(&user) {
+                Ok(doc) => json!([{"tier":"user","source":user,"doc":doc}]),
+                Err(_) => json!([]),
+            };
+        } else {
+            let tiers =
+                crate::subc_config::read_local_cortexkit_config_tiers(Some(&user), &project);
+            params["config"] = json!(tiers
+                .iter()
+                .map(|tier| json!({"tier":tier.tier,"source":tier.source,"doc":tier.doc}))
+                .collect::<Vec<_>>());
+        }
+        let response = handle_configure_for_test(&configure_request_with_params(params), &ctx);
+        if matches!(failure, "unparseable" | "unreadable") {
+            // A user document that cannot be read or parsed rejects the whole
+            // candidate: nothing is published, so no default settings and no
+            // cache location replace the last good configuration.
+            assert!(!response.success, "{response:?}");
+            assert_eq!(response.data["code"], "config_rejected", "{response:?}");
+            assert!(
+                response.data["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("invalid_config_document")),
+                "{response:?}"
+            );
+        } else {
+            assert!(response.success, "{response:?}");
+            super::drain_deferred_configure_maintenance(&ctx);
+            let expected = if failure == "missing" {
+                "cache_dir_unavailable"
+            } else {
+                "cache_dir_config_unknown"
+            };
+            assert!(
+                ctx.cache_unavailable_reason()
+                    .is_some_and(|reason| reason.contains(expected)),
+                "{response:?}"
+            );
+        }
+        for domain in crate::root_cache::CACHE_DOMAINS {
+            assert!(
+                !storage.join(domain).exists(),
+                "{transport}/{failure} wrote {domain} on primary storage"
+            );
+        }
+    }
+
+    /// A configured context whose user file later becomes unreadable or
+    /// unparseable keeps its last good settings on the next configure, as for
+    /// every other key: the rejected candidate changes nothing, including the
+    /// cache location and its availability.
+    #[test]
+    fn configure_rejected_user_document_keeps_the_last_good_cache_location() {
+        for failure in ["unparseable", "unreadable"] {
+            let _storage_env = crate::test_env::without_storage_override();
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            let storage = temp.path().join("storage");
+            let cache = temp.path().join("cache-volume");
+            let user = temp.path().join("user.jsonc");
+            fs::create_dir(&project).unwrap();
+            fs::create_dir(&cache).unwrap();
+            let _volume = crate::walk_boundary::simulated_volumes::simulate(&cache, u64::MAX - 17);
+            init_git_fixture(&project);
+            fs::write(project.join("needle.rs"), "fn last_good_needle() {}\n").unwrap();
+            fs::write(
+                &user,
+                json!({
+                    "storage": {"cache_dir": cache},
+                    "format_on_edit": true,
+                    "indexes": {"trigram": false, "semantic": false, "callgraph": false},
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+            let request = |id: &str| {
+                let tiers =
+                    crate::subc_config::read_local_cortexkit_config_tiers(Some(&user), &project);
+                let mut request = configure_request_with_params(json!({
+                    "project_root": project, "storage_dir": storage, "harness": "opencode",
+                    "config": tiers
+                        .iter()
+                        .map(|tier| json!({"tier":tier.tier,"source":tier.source,"doc":tier.doc}))
+                        .collect::<Vec<_>>(),
+                }));
+                request.id = id.to_owned();
+                request
+            };
+            let first = handle_configure_for_test(&request("first"), &ctx);
+            assert!(first.success, "{first:?}");
+            super::drain_deferred_configure_maintenance(&ctx);
+            let good = ctx.config();
+            assert!(good.cache_dir.is_some() && good.format_on_edit);
+            assert!(ctx.cache_unavailable_reason().is_none());
+
+            match failure {
+                "unparseable" => fs::write(&user, "{").unwrap(),
+                _ => {
+                    fs::remove_file(&user).unwrap();
+                    fs::create_dir(&user).unwrap();
+                }
+            }
+            let rejected = handle_configure_for_test(&request("rejected"), &ctx);
+            assert_eq!(
+                rejected.data["code"], "config_rejected",
+                "{failure}: {rejected:?}"
+            );
+            let after = ctx.config();
+            assert_eq!(after.cache_dir, good.cache_dir, "{failure}");
+            assert_eq!(after.cache_epoch, good.cache_epoch, "{failure}");
+            assert!(after.format_on_edit, "{failure}");
+            assert!(
+                ctx.cache_unavailable_reason().is_none(),
+                "{failure}: {:?}",
+                ctx.cache_unavailable_reason()
+            );
+        }
+    }
+
+    #[test]
+    fn configure_cache_unavailable_walks_without_caches_and_recovers_on_bind() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        let cache = temp.path().join("offline-volume");
+        fs::create_dir(&project).unwrap();
+        init_git_fixture(&project);
+        fs::write(project.join("needle.rs"), "fn cache_offline_needle() {}\n").unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let request = configure_request_with_params(json!({
+            "project_root": project, "storage_dir": storage, "harness": "opencode",
+            "config": [user_tier(json!({"storage": {"cache_dir": cache}, "views": {"enabled": true}, "indexes": {"trigram": true, "semantic": false, "callgraph": true}}))],
+        }));
+        let response = handle_configure_for_test(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(response.data["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["code"] == "cache_dir_unavailable"
+                && warning["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("AFT is running without its caches until it is back.")));
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(ctx.cache_unavailable_reason().is_some());
+        assert_eq!(
+            ctx.try_health_snapshot(&project).cache_unavailable_reason,
+            Some(crate::root_cache::CACHE_DIR_UNAVAILABLE)
+        );
+        for plane in [
+            crate::feature_status::IndexPlane::Trigram,
+            crate::feature_status::IndexPlane::Semantic,
+            crate::feature_status::IndexPlane::Callgraph,
+        ] {
+            assert_eq!(
+                crate::feature_status::observed_index_status(&ctx, plane)
+                    .unavailable_reason
+                    .as_deref(),
+                Some("cache_dir_unavailable")
+            );
+        }
+        let search: RawRequest = serde_json::from_value(json!({"id":"offline-search", "command":"semantic_search", "query":"cache_offline_needle"})).unwrap();
+        let response = crate::commands::semantic_search::handle_semantic_search(&search, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(
+            response.data["cache_unavailable_reason"],
+            "cache_dir_unavailable"
+        );
+        let output = response.data["text"]
+            .as_str()
+            .expect("rendered bounded search response");
+        assert!(output.contains("cache_offline_needle"), "{output}");
+        assert!(
+            output.contains("walk") || output.contains("scan"),
+            "bounded fallback must be disclosed: {output}"
+        );
+        assert!(!cache.exists());
+        for domain in crate::root_cache::CACHE_DOMAINS {
+            assert!(
+                !storage.join(domain).exists(),
+                "cache domain {domain} leaked into storage"
+            );
+        }
+        fs::create_dir(&cache).unwrap();
+        let _mounted_volume =
+            crate::walk_boundary::simulated_volumes::simulate(&cache, u64::MAX - 17);
+        let response = handle_configure_for_test(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(response.data["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| warning["code"] != "cache_dir_unavailable"));
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(ctx.cache_unavailable_reason().is_none());
+        assert!(ctx.cache_dir().ends_with("offline-volume/aft"));
+        let _ = ctx.flush_search_index_on_graceful_shutdown();
+        assert!(ctx
+            .search_index()
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|index| index.ready));
+        let key = ctx.memoized_artifact_cache_key(&ctx.canonical_cache_root());
+        assert!(
+            ctx.cache_dir()
+                .join("index")
+                .join(key)
+                .join("cache.bin")
+                .is_file(),
+            "normal cold initialization must persist the recovered trigram cache"
+        );
+        assert_eq!(
+            ctx.try_health_snapshot(&project).cache_unavailable_reason,
+            None
+        );
+    }
+
+    #[test]
+    fn configure_flat_cache_dir_parameter_cannot_bypass_tier_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let evil = temp.path().join("wire-cache");
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let request = configure_request_with_params(
+            json!({"project_root":project,"harness":"opencode","storage_dir":temp.path().join("storage"),"cache_dir":evil,"config":[user_tier(json!({"indexes":{"trigram":false,"semantic":false,"callgraph":false}}))]}),
+        );
+        let response = handle_configure_for_test(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(ctx.config().cache_dir.is_none());
+        assert_eq!(ctx.cache_dir(), ctx.storage_dir());
+        assert!(!evil.exists());
+    }
+
+    #[test]
     fn configure_writes_cache_key_memo_to_explicit_storage_only() {
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -13741,6 +14283,98 @@ mod tests {
                 }
             }))],
         }))
+    }
+
+    #[test]
+    fn ready_semantic_refresh_worker_opens_blobs_only_on_cache_volume() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let durable = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let root = project.path().canonicalize().unwrap();
+        let server = CountingEmbeddingServer::start();
+        let tiers = [crate::config_resolve::ConfigTier { tier: "user".into(), source: "test".into(), doc: json!({"storage":{"cache_dir":cache.path()}, "views":{"enabled":true}, "semantic":{"backend":"openai_compatible", "model":"counting-test-embedding", "base_url":server.base_url}}).to_string() }];
+        let mut config = crate::config_resolve::resolve_config(&tiers).config;
+        config.storage_dir = Some(durable.path().to_path_buf());
+        config.project_root = Some(root.clone());
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+        ctx.set_canonical_cache_root(root.clone());
+        let family = ctx.memoized_artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &family, false);
+        crate::semantic_admission::note_opened("audit-refresh-worker", &root);
+        *ctx.semantic_index().write().unwrap() =
+            Some(crate::semantic_index::SemanticIndex::new(root.clone(), 3));
+        assert!(ctx.view_runtime_snapshot().is_none());
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        super::SEMANTIC_BLOB_OPEN_OBSERVERS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(family, sender);
+        assert!(super::ensure_ready_semantic_refresh_worker(&ctx));
+        let (opened_root, opened) = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("refresh worker did not open its blob store");
+        // The configured cache parent is resolved once (macOS temp
+        // directories sit behind the /var system symlink; Windows resolves
+        // to the plain, non-verbatim spelling).
+        assert_eq!(
+            opened_root,
+            crate::bash_background::persistence::canonical_root_path(cache.path())
+                .unwrap()
+                .join("aft")
+        );
+        assert!(opened);
+        assert!(cache.path().join("aft/blobs").is_dir());
+        assert!(
+            !durable.path().join("blobs").exists(),
+            "ready refresh worker created a blob store in durable storage"
+        );
+        crate::semantic_admission::note_closed("audit-refresh-worker", &root);
+    }
+
+    #[test]
+    fn configure_semantic_checkout_uses_cache_volume_with_storage_env_override() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let _quiet_window = EnvVarGuard::set("AFT_SEMANTIC_QUIET_WINDOW_MS", "50");
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let _volume =
+            crate::walk_boundary::simulated_volumes::simulate(cache.path(), u64::MAX - 17);
+        let _storage_env = EnvVarGuard::set("AFT_STORAGE_DIR", storage.path().to_str().unwrap());
+        init_git_fixture(project.path());
+        let root = project.path().canonicalize().unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let fills = crate::views::semantic_runtime::FillObserver::new(root.clone());
+        let request = configure_request_with_params(json!({
+            "project_root": root, "harness": "opencode",
+            "config": [user_tier(json!({
+                "storage": {"cache_dir": cache.path()},
+                "views": {"enabled": true},
+                "indexes": {"trigram": false, "semantic": true, "callgraph": false},
+                "semantic": {"backend": "openai_compatible", "model": "counting-test-embedding", "base_url": server.base_url, "timeout_ms": 5000, "max_files": 1000}
+            }))]
+        }));
+        let response = handle_configure_for_test(&request, &ctx);
+        assert!(response.success, "{}", response.data);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert_eq!(fills.next(), "settled");
+        assert!(ctx.checkout_semantic_runtime().is_some());
+        assert!(cache.path().join("aft/views").is_dir());
+        assert!(cache.path().join("aft/blobs").is_dir());
+        for domain in ["views", "blobs", "semantic"] {
+            assert!(
+                !storage.path().join(domain).exists(),
+                "semantic lane wrote {domain} to durable storage"
+            );
+        }
     }
 
     fn configure_semantic_views(
@@ -15684,6 +16318,137 @@ mod tests {
             },
         );
         assert!(!ctx.config().indexes.trigram);
+    }
+
+    #[test]
+    fn linked_worktree_with_failed_git_probe_opens_owner_semantic_snapshot() {
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _storage_env = crate::test_env::without_storage_override();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        let worktree = temp.path().join("worktree");
+        assert!(git_command(&main)
+            .args(["worktree", "add", "--detach", "--quiet"])
+            .arg(&worktree)
+            .arg("HEAD")
+            .status()
+            .unwrap()
+            .success());
+        let canonical_main = std::fs::canonicalize(&main).unwrap();
+        let canonical_worktree = std::fs::canonicalize(&worktree).unwrap();
+        let common_dir = canonical_main.join(".git");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+
+        // The owner checkout and its linked worktree share the repository key.
+        let key = crate::search_index::artifact_cache_key(&canonical_main);
+        assert_eq!(
+            crate::search_index::artifact_cache_key(&canonical_worktree),
+            key
+        );
+        // A successful configure-time key lookup for the worktree stores the
+        // memo that a later lookup uses when its Git probe fails.
+        assert_eq!(
+            test_context()
+                .memoized_artifact_cache_key_for_configure(
+                    &worktree,
+                    &canonical_worktree,
+                    &storage,
+                    Some(&common_dir),
+                )
+                .unwrap(),
+            Some(key.clone())
+        );
+        crate::root_cache::configure_artifact_access(&canonical_main, &key, false);
+        let source = canonical_main.join("tracked.rs");
+        let mut embed =
+            |texts: Vec<String>| Ok::<_, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
+        let mut owner_index =
+            crate::semantic_index::SemanticIndex::build(&canonical_main, &[source], &mut embed, 8)
+                .expect("build owner semantic snapshot");
+        owner_index.set_fingerprint(crate::semantic_index::SemanticIndexFingerprint {
+            backend: "openai_compatible".to_string(),
+            model: "readonly-test".to_string(),
+            base_url: "http://127.0.0.1".to_string(),
+            dimension: 3,
+            chunking_version: 1,
+            ..Default::default()
+        });
+        assert!(owner_index.write_to_disk(&storage, &key));
+
+        let _override =
+            crate::search_index::force_git_root_commit_probe_transient_for_paths_for_test(
+                vec![worktree.clone(), canonical_worktree.clone()],
+                "spawn failed: Too many open files (os error 24)",
+            );
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.project_root = Some(worktree.clone());
+            config.storage_dir = Some(storage.clone());
+            config.indexes.semantic = true;
+            config.views.enabled = false;
+        });
+        // Configure recovers the repository key from the memo ...
+        assert_eq!(
+            ctx.memoized_artifact_cache_key_for_configure(
+                &worktree,
+                &canonical_worktree,
+                &storage,
+                Some(&common_dir),
+            )
+            .unwrap(),
+            Some(key.clone())
+        );
+        // ... while a fresh derivation falls back to a path-based key, which
+        // names a folder that holds no snapshot.
+        assert_ne!(
+            crate::search_index::artifact_cache_key(&canonical_worktree),
+            key
+        );
+        ctx.set_canonical_cache_root(canonical_worktree.clone());
+        ctx.set_cache_role(true, Some(common_dir.clone()));
+        crate::root_cache::configure_artifact_access(&canonical_worktree, &key, true);
+        // Mark the worktree as open, as an interactive session would, so a
+        // missing snapshot reports as missing rather than as "not opened".
+        struct OpenedRoot(std::path::PathBuf);
+        impl Drop for OpenedRoot {
+            fn drop(&mut self) {
+                crate::semantic_admission::note_closed("linked-worktree-probe-test", &self.0);
+            }
+        }
+        crate::semantic_admission::note_opened("linked-worktree-probe-test", &canonical_worktree);
+        let _opened = OpenedRoot(canonical_worktree.clone());
+
+        let starts = super::schedule_artifact_loads(&ctx, false, true);
+        assert!(starts.1.is_some(), "the read-only semantic arm must start");
+        let receiver = ctx
+            .semantic_index_rx()
+            .lock()
+            .clone()
+            .expect("semantic load receiver");
+        assert!(super::start_artifact_loads(starts));
+        let cap = Instant::now() + Duration::from_secs(60);
+        let event = loop {
+            let event = receiver
+                .recv_timeout(cap.saturating_duration_since(Instant::now()))
+                .expect("read-only semantic load result");
+            if matches!(
+                &event,
+                crate::context::SemanticIndexEvent::Ready(_)
+                    | crate::context::SemanticIndexEvent::Failed(_)
+            ) {
+                break event;
+            }
+        };
+        match event {
+            crate::context::SemanticIndexEvent::Ready(_) => {}
+            crate::context::SemanticIndexEvent::Failed(reason) => {
+                panic!("linked worktree missed the owner's semantic snapshot: {reason}")
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
@@ -23023,10 +23788,15 @@ mod tests {
                     usize::from(label == "cold_context" || sample == 0)
                 );
                 let started = Instant::now();
-                crate::storage_retention::record_bind(&storage, &root, &key).unwrap();
+                crate::storage_retention::record_bind(
+                    &crate::root_cache::StoragePaths::same(&storage),
+                    &root,
+                    &key,
+                )
+                .unwrap();
                 profile.retention_bind = started.elapsed();
                 let started = Instant::now();
-                crate::persisted_format::preflight_project_artifacts(&storage, &key);
+                crate::persisted_format::preflight_project_artifacts(&storage, &storage, &key);
                 profile.format_preflight = started.elapsed();
                 eprintln!("cache_key_probe sample={sample} mode={label} total_us={} timings={:?} retention_us={} preflight_us={}",
                     profile.started.elapsed().as_micros(), profile.key,
@@ -23410,6 +24180,63 @@ mod tests {
 mod inspect_orphan_sweep_tests {
     use super::*;
 
+    /// Write a URL download fetched at `fetched_at_ms` under `storage`, the
+    /// way `url_fetch` lays it out, and return its content and metadata paths.
+    fn url_download(storage: &Path, url: &str, fetched_at_ms: u64) -> (PathBuf, PathBuf) {
+        let content = crate::url_fetch::cache_content_path_for_url(storage, url, ".md");
+        let meta = crate::url_fetch::cache_meta_path_for_url(storage, url);
+        fs::create_dir_all(content.parent().unwrap()).unwrap();
+        fs::write(&content, "body").unwrap();
+        let meta_json = serde_json::json!({
+            "url": url,
+            "contentType": "text/markdown",
+            "extension": ".md",
+            "fetchedAt": fetched_at_ms,
+        });
+        fs::write(&meta, serde_json::to_vec(&meta_json).unwrap()).unwrap();
+        (content, meta)
+    }
+
+    /// With `storage.cache_dir` set, URL downloads are written under the cache
+    /// root, so the configure sweep must expire them there; sweeping only the
+    /// durable root would let them pile up on the cache volume forever.
+    #[test]
+    fn configure_storage_sweep_expires_url_downloads_on_the_cache_root() {
+        let durable = tempfile::tempdir().expect("durable storage");
+        let cache = tempfile::tempdir().expect("cache root");
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let (expired, expired_meta) = url_download(cache.path(), "https://example.com/old.md", 0);
+        let (fresh, fresh_meta) = url_download(cache.path(), "https://example.com/new.md", now_ms);
+        // A download made before `storage.cache_dir` was set.
+        let (legacy, legacy_meta) =
+            url_download(durable.path(), "https://example.com/legacy.md", 0);
+
+        run_configure_storage_sweeps(
+            &crate::root_cache::StoragePaths::new(
+                durable.path().to_path_buf(),
+                cache.path().to_path_buf(),
+            ),
+            Harness::Opencode,
+        );
+
+        assert!(!expired.exists(), "expired download kept on the cache root");
+        assert!(
+            !expired_meta.exists(),
+            "expired metadata kept on the cache root"
+        );
+        assert!(
+            fresh.exists() && fresh_meta.exists(),
+            "fresh download removed"
+        );
+        assert!(
+            !legacy.exists() && !legacy_meta.exists(),
+            "expired download from before cache_dir kept on durable storage"
+        );
+    }
+
     #[test]
     fn configure_scheduled_storage_sweep_reaps_dead_inspect_scope_after_grace() {
         let storage = tempfile::tempdir().expect("storage");
@@ -23426,7 +24253,10 @@ mod inspect_orphan_sweep_tests {
         )
         .expect("age cache fixture");
 
-        run_configure_storage_sweeps(storage.path(), Harness::Opencode);
+        run_configure_storage_sweeps(
+            &crate::root_cache::StoragePaths::same(storage.path()),
+            Harness::Opencode,
+        );
         let ctx = AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Config {
@@ -23439,7 +24269,7 @@ mod inspect_orphan_sweep_tests {
             // separate durable observation grace, not daemon warm-up admission.
             crate::storage_retention::allow_next_scheduled_pass_for_test(storage.path());
             crate::storage_retention::schedule(
-                storage.path().to_path_buf(),
+                crate::root_cache::StoragePaths::same(storage.path()),
                 ctx.subc_lifecycle_admission(),
                 ctx.configure_generation_flag(),
                 ctx.configure_generation(),
@@ -23516,14 +24346,14 @@ mod startup_view_sweep_tests {
             pending_paths: BTreeSet::new(),
             pending_inputs: Default::default(),
         };
-        run_configure_view_sweep(&view);
+        run_configure_view_sweep(&view, storage.path());
         assert_eq!(
             starts.load(Ordering::SeqCst),
             0,
             "view/blob GC started during startup warm-up"
         );
         crate::storage_retention::allow_next_scheduled_pass_for_test(storage.path());
-        run_configure_view_sweep(&view);
+        run_configure_view_sweep(&view, storage.path());
         assert_eq!(
             starts.load(Ordering::SeqCst),
             1,

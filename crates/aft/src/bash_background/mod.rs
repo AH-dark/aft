@@ -1620,6 +1620,27 @@ pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
     root
 }
 
+/// Resolve the root that holds rebuildable cache artifacts (search, semantic,
+/// symbol, call-graph, inspect and view caches).
+///
+/// `cache_root` is a root the caller already resolved, normally
+/// `Config::cache_storage_dir()`, which is `<storage.cache_dir>/aft` when a
+/// separate cache volume is configured. That root must be used exactly as
+/// given. [`storage_dir`] is the wrong helper here: it lets `AFT_STORAGE_DIR`
+/// replace the supplied path, which is right for durable state but would move
+/// cache artifacts back onto the durable disk, where the split-storage guard
+/// then refuses to create them. Without a resolved root the caches share the
+/// default durable root, as they always have.
+pub fn cache_artifact_root(cache_root: Option<&std::path::Path>) -> PathBuf {
+    match cache_root.filter(|path| !path.as_os_str().is_empty()) {
+        Some(root) => {
+            crate::project_content::register_storage_root(root);
+            root.to_path_buf()
+        }
+        None => storage_dir(None),
+    }
+}
+
 /// Resolve the current test environment's default, excluding AFT-specific
 /// overrides. HOME and XDG may deliberately name a fixture, not the live store.
 #[cfg(test)]

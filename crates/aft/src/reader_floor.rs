@@ -468,6 +468,15 @@ pub fn prepare(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
     prepare_uncached(storage_root)
 }
 
+/// A floor lives in durable storage, and its refusals also cover artifacts on
+/// a separate `storage.cache_dir` volume: refusal routing spells paths inside
+/// a prepared cache root under the durable root that owns it (see
+/// [`crate::root_cache::durable_route`]), so nothing is recorded for the
+/// cache root itself, which never becomes a storage owner of its own.
+pub(crate) fn prepare_artifact_root(storage: &Path, _artifacts: &Path) {
+    prepare(storage);
+}
+
 fn prepare_uncached(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
     let path = floor_path(storage_root);
     let observed = read_snapshot(&path);

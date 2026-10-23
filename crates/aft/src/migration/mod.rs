@@ -1060,6 +1060,7 @@ mod tests {
         let view = ViewStore::open(&request.storage, &request.view).unwrap();
         let sweep = || {
             crate::gc::sweep(crate::gc::SweepRequest {
+                durable_storage: &request.storage,
                 storage: &request.storage,
                 family: &request.family,
                 view_dir: view.view_dir(),

@@ -594,7 +594,9 @@ pub(super) mod tests {
         ));
         let registry =
             crate::views::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
-        let owner = registry.register_view("child", root.path()).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "child", root.path())
+            .unwrap();
         let access = ViewAccess::Owner(owner.clone());
         let mut manifest = ManifestV2::new(ManifestHeader {
             producers: Producers {

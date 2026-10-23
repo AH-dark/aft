@@ -319,7 +319,8 @@ impl AppContext {
         // resolved (no project_root), fall back to zeros — the cross-project
         // total is never the right answer to display per-session.
         let storage_dir = config.storage_dir.as_ref().map(|d| d.display().to_string());
-        let disk_info = match (&config.storage_dir, &config.project_root) {
+        let cache_dir = config.cache_storage_dir();
+        let disk_info = match (&cache_dir, &config.project_root) {
             (Some(dir), Some(root)) => {
                 let key_root = self
                     .canonical_cache_root_opt()
@@ -333,14 +334,16 @@ impl AppContext {
                         let trigram_size = dir_size(&dir.join("index").join(&key));
                         let semantic_size = dir_size(&dir.join("semantic").join(&key));
                         serde_json::json!({
-                            "storage_dir": dir.display().to_string(),
+                            "storage_dir": storage_dir,
+                            "cache_dir": dir.display().to_string(),
                             "project_cache_key": key,
                             "trigram_disk_bytes": trigram_size,
                             "semantic_disk_bytes": semantic_size,
                         })
                     }
                     None => serde_json::json!({
-                        "storage_dir": dir.display().to_string(),
+                        "storage_dir": storage_dir,
+                        "cache_dir": dir.display().to_string(),
                         "project_cache_key": null,
                         "trigram_disk_bytes": 0,
                         "semantic_disk_bytes": 0,
@@ -348,7 +351,8 @@ impl AppContext {
                 }
             }
             (Some(dir), None) => serde_json::json!({
-                "storage_dir": dir.display().to_string(),
+                "storage_dir": storage_dir,
+                "cache_dir": dir.display().to_string(),
                 "project_cache_key": null,
                 "trigram_disk_bytes": 0,
                 "semantic_disk_bytes": 0,
@@ -403,6 +407,13 @@ impl AppContext {
         // surface the reason so users know why and can decide whether to open a
         // project subdirectory. Empty list = full-featured mode.
         let mut degraded_reasons = self.degraded_reasons();
+        if self.cache_unavailable_reason().is_some()
+            && !degraded_reasons
+                .iter()
+                .any(|reason| reason == crate::root_cache::CACHE_DIR_UNAVAILABLE)
+        {
+            degraded_reasons.push(crate::root_cache::CACHE_DIR_UNAVAILABLE.into());
+        }
         // Everything under the storage root that this build refused because a
         // newer build wrote it (or the reader floor requires a newer reader).
         let storage_root = crate::bash_background::storage_dir(config.storage_dir.as_deref());
@@ -560,7 +571,7 @@ impl AppContext {
             "degraded": degraded,
             "degraded_reasons": degraded_reasons,
             "storage_refusals": storage_refusals,
-            "storage_retention": crate::storage_retention::snapshot(&storage_root),
+            "storage_retention": crate::storage_retention::snapshot(&self.cache_dir()),
             "git": crate::developer_tools::git_status_json(),
             "features": {
                 "format_on_edit": config.format_on_edit,
@@ -589,6 +600,8 @@ impl AppContext {
             "runtime": runtime,
             "compression": compression,
             "storage_dir": storage_dir,
+            "cache_dir": self.cache_dir(),
+            "cache_unavailable_reason": self.cache_unavailable_reason().map(|reason| crate::root_cache::unavailable_code(&reason)),
             // Project-wide (all sessions): total in-memory checkpoint count.
             "checkpoints_total": checkpoint_total,
             "backup_skipped_too_large_total": backup_skipped_too_large_total,

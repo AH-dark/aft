@@ -2344,6 +2344,9 @@ impl SearchIndex {
     /// a reload would read it rather than rebuild. Reads a few header bytes
     /// only; it does not load or verify postings.
     pub(crate) fn disk_cache_header_valid(cache_dir: &Path) -> bool {
+        if crate::root_cache::check_cache_access(cache_dir).is_err() {
+            return false;
+        }
         (|| -> Option<bool> {
             let cache_file = open_cache_file_read(&cache_dir.join("cache.bin")).ok()?;
             if cache_file.metadata().ok()?.len() < 16 {
@@ -2480,6 +2483,7 @@ impl SearchIndex {
         ignore_rules_load_policy: IgnoreRulesLoadPolicy,
         borrowed_load_budget: Option<&BorrowedIndexLoadBudget>,
     ) -> Option<(Self, bool)> {
+        crate::root_cache::check_cache_access(cache_dir).ok()?;
         debug_assert!(current_canonical_root.is_absolute());
         // A newer build's cache is refused by name before its payload is read;
         // callers see a miss, and every write path refuses to replace it.
@@ -4944,6 +4948,10 @@ impl PartialOrd for HeapItem {
 type RefreshReadProbe = (Arc<AtomicUsize>, Arc<AtomicBool>);
 #[cfg(test)]
 static REFRESH_READ_PROBES: OnceLock<Mutex<BTreeMap<PathBuf, RefreshReadProbe>>> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static FAIL_STREAMING_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[cfg(test)]
 fn note_refresh_read_for_test(root: &Path) {
@@ -4971,6 +4979,10 @@ fn build_streaming_index(
         crate::cold_build_limiter::progress::StartLog::Info,
     );
     crate::cold_build_limiter::progress::phase("enumerating", None);
+    #[cfg(test)]
+    if FAIL_STREAMING_BUILD.replace(false) {
+        return Err(std::io::Error::other("injected streaming cache failure"));
+    }
     crate::private_storage::open_keyed_dir(cache_dir, "index")?;
     sweep_stale_search_build_dirs(cache_dir);
     let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -8122,6 +8134,11 @@ pub(crate) fn resolve_root_identity_for_bind(
     persist: bool,
     force: bool,
 ) -> Result<crate::root_identity::BoundIdentity, ArtifactCacheKeyProbeError> {
+    // A `storage.cache_dir` cache root keeps no identity records; resolve and
+    // save them on the durable root that owns it, where configure memoizes
+    // the key. Any other root, and every root without `cache_dir`, is used
+    // as given.
+    let storage_root: &Path = &crate::root_cache::identity_storage_root(storage_root);
     let mut git_unavailable = false;
     let mut choose = |pin: crate::root_identity::LegacyPin,
                       saved: Option<&crate::root_identity::Identity>|
@@ -8294,8 +8311,10 @@ pub fn artifact_cache_key_memoized_only(project_root: &Path) -> Option<String> {
     map.get(project_root).cloned()
 }
 
+/// `storage_dir` is the cache artifact root (see
+/// [`crate::bash_background::cache_artifact_root`]), not the durable root.
 pub fn resolve_cache_dir_with_key(project_key: &str, storage_dir: Option<&Path>) -> PathBuf {
-    crate::bash_background::storage_dir(storage_dir)
+    crate::bash_background::cache_artifact_root(storage_dir)
         .join("index")
         .join(project_key)
 }
@@ -8655,9 +8674,9 @@ fn artifact_key_looks_valid(key: &str) -> bool {
 // Retained for isolated cache-lock fixtures; production eviction is scheduled
 // through storage_retention rather than inferring abandonment from payload age.
 #[cfg(test)]
-pub(crate) fn sweep_orphaned_index_dirs(storage_root: &Path) {
-    let index_root = storage_root.join("index");
-    let referenced_keys = match referenced_artifact_cache_keys(storage_root) {
+pub(crate) fn sweep_orphaned_index_dirs(storage_root: &crate::root_cache::StoragePaths) {
+    let index_root = storage_root.artifacts.join("index");
+    let referenced_keys = match referenced_artifact_cache_keys(&storage_root.durable) {
         Ok(keys) => keys,
         Err(error) => {
             crate::slog_warn!(
@@ -11719,15 +11738,16 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let blocked = cache.path().join("not-a-directory");
-        fs::write(&blocked, "blocks streaming cache creation").unwrap();
         fs::write(root.join("source.rs"), "fn marker() {}\n").unwrap();
+        // A malformed cache path is rejected at admission, before streaming.
+        // Fail after admission so this still exercises cancellation in fallback.
+        FAIL_STREAMING_BUILD.set(true);
         let probes = AtomicUsize::new(0);
         let (result, events) = crate::logging::capture_index_events(|| {
             SearchIndex::build_with_limit_to_cache_dir_cancellable(
                 &root,
                 1024 * 1024,
-                &blocked,
+                cache.path(),
                 &|| probes.fetch_add(1, Ordering::SeqCst) < 2,
             )
         });
@@ -14839,7 +14859,7 @@ mod tests {
         );
         write_cache_key_memo(storage.path(), &memo);
 
-        sweep_orphaned_index_dirs(storage.path());
+        sweep_orphaned_index_dirs(&crate::root_cache::StoragePaths::same(storage.path()));
 
         assert!(
             !aged_orphan.exists(),
@@ -15693,6 +15713,67 @@ mod tests {
         assert!(error.detail().contains("Too many open files"));
     }
 
+    /// With `storage.cache_dir` set to a cache root outside the storage root,
+    /// a search index written in a newer format on the cache root is refused,
+    /// and its refusal belongs to the durable storage root that owns the cache
+    /// root: health and status list it there, under the project's key, and a
+    /// replacement with a current-format header clears it. Paths under the
+    /// durable root itself are never re-spelled.
+    #[test]
+    fn cache_root_index_refusal_is_listed_and_cleared_under_its_storage_root() {
+        let storage = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            cache_dir: Some(cache.path().to_path_buf()),
+            ..crate::config::Config::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let durable = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        let artifacts = crate::root_cache::cache_root(&config);
+        assert!(!artifacts.starts_with(&durable));
+        let key = "cache-dir-refusal-key";
+        assert!(crate::root_cache::durable_route(&durable.join("index").join(key)).is_none());
+
+        let cache_dir = artifacts.join("index").join(key);
+        fs::create_dir_all(&cache_dir).unwrap();
+        let cache_bin = cache_dir.join("cache.bin");
+        let write_header = |version: u32| {
+            let mut bytes = CACHE_MAGIC.to_le_bytes().to_vec();
+            bytes.extend(version.to_le_bytes());
+            fs::write(&cache_bin, bytes).unwrap();
+        };
+        let listed_under_storage = || {
+            crate::persisted_format::refusals_under(&durable)
+                .into_iter()
+                .filter(|refusal| {
+                    refusal.store == crate::persisted_format::PersistedStore::SearchIndex
+                        && refusal.path == cache_bin
+                })
+                .count()
+        };
+
+        write_header(INDEX_FORMAT_VERSION + 1);
+        crate::persisted_format::preflight_project_artifacts(&durable, &artifacts, key);
+        let refused = SearchIndex::check_disk_cache_format(&cache_dir)
+            .expect_err("a newer-format index on the cache root is refused");
+        assert_eq!(refused.path, cache_bin);
+        assert_eq!(listed_under_storage(), 1);
+        let (owned, _) = crate::persisted_format::refusals_for_push(&durable, Some(key));
+        assert!(
+            owned.iter().any(|refusal| refusal.path == cache_bin),
+            "status attributes the refusal to this project on its storage root: {owned:?}"
+        );
+
+        write_header(INDEX_FORMAT_VERSION);
+        assert!(SearchIndex::check_disk_cache_format(&cache_dir).is_ok());
+        assert_eq!(listed_under_storage(), 0);
+        assert!(crate::persisted_format::refusal_covering(
+            crate::persisted_format::PersistedStore::SearchIndex,
+            &cache_bin
+        )
+        .is_none());
+    }
     #[test]
     fn artifact_cache_key_concurrent_memo_writes_keep_valid_json() {
         let _probe_lock = git_root_commit_probe_override_lock_for_test();

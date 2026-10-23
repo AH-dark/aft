@@ -870,6 +870,7 @@ pub(super) fn response_is_fatal_panic(response: &Response) -> bool {
 #[derive(Debug)]
 pub enum SubcError {
     Runtime(std::io::Error),
+    StorageLease(std::io::Error),
     ConnectionFile {
         path: PathBuf,
         source: subc_transport::ConnectionFileError,
@@ -920,6 +921,7 @@ impl fmt::Display for SubcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Runtime(e) => write!(f, "failed to build subc tokio runtime: {e}"),
+            Self::StorageLease(e) => write!(f, "failed to acquire subc storage lease: {e}"),
             Self::ConnectionFile { path, source } => {
                 write!(f, "failed to read subc connection file {path:?}: {source}")
             }

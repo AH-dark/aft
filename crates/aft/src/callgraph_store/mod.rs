@@ -25835,6 +25835,97 @@ mod cold_build_insert_tests {
         );
     }
 
+    /// Read-only stores are opened through a `file:` URI. That URI must not be
+    /// mistaken for a filesystem path by the cache-location checks: on Windows
+    /// such a "path" is an invalid name (os error 123), so every call-graph
+    /// read failed while builds kept succeeding. The temp folder is used as
+    /// given (Windows runners often hand out an 8.3 `RUNNER~1` spelling), and
+    /// also resolved, which on Windows is a verbatim `\\?\` path.
+    #[test]
+    fn readonly_store_opens_through_its_uri_under_plain_and_resolved_temp_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolved = std::fs::canonicalize(temp.path()).unwrap();
+        for (index, base) in [temp.path().to_path_buf(), resolved].iter().enumerate() {
+            let path = base
+                .join("callgraph")
+                .join(format!("readonly-probe-{index}.sqlite"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            Connection::open(&path)
+                .unwrap()
+                .execute_batch("CREATE TABLE probe(value INTEGER); INSERT INTO probe VALUES (7);")
+                .unwrap();
+            let conn = open_readonly_connection(&path).unwrap_or_else(|error| {
+                panic!("read-only open of {} failed: {error}", path.display())
+            });
+            let value: i64 = conn
+                .query_row("SELECT value FROM probe", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, 7, "read the store at {}", path.display());
+        }
+    }
+
+    /// A URI open is checked against the file it names, not waved through:
+    /// a writable open of a cache database on durable storage whose cache
+    /// location is unknown is refused whether the name is a path or a URI.
+    #[test]
+    fn uri_open_gets_the_same_durable_cache_refusal_as_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(temp.path().join("storage")),
+            cache_config_unknown: Some("unreadable test configuration".into()),
+            ..crate::config::Config::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root(&mut config).is_some());
+        let storage = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        let path = storage.join("callgraph").join("uri-refusal-probe.sqlite");
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
+        let refusal = "cache_write_on_durable_storage";
+        let plain = crate::private_storage::prepare_sqlite(&path, flags)
+            .expect_err("a plain path to a durable cache database is refused");
+        assert!(plain.to_string().contains(refusal), "{plain}");
+        let uri = sqlite_readonly_uri(&path);
+        let through_uri = crate::private_storage::prepare_sqlite(
+            Path::new(&uri),
+            flags | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .expect_err("the same database named by a URI is refused too");
+        assert!(through_uri.to_string().contains(refusal), "{through_uri}");
+        assert!(!path.exists(), "no refused database was created");
+    }
+
+    /// A store under a `storage.cache_dir` root whose path is longer than the
+    /// classic Windows limit still opens read-only. On Windows its URI names
+    /// the long-path (`\\?\`) spelling SQLite needs, and the cache-location
+    /// checks must admit that spelling of a path inside the prepared cache
+    /// root. Elsewhere the path is used as it is.
+    #[test]
+    fn readonly_store_opens_past_the_windows_path_limit_under_a_cache_root() {
+        let storage = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            cache_dir: Some(cache.path().to_path_buf()),
+            ..crate::config::Config::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let mut dir = crate::root_cache::cache_root(&config).join("callgraph");
+        while dir.as_os_str().len() < 300 {
+            dir = dir.join("long-path-segment-0123456789");
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("readonly-probe.sqlite");
+        Connection::open(crate::db::lifecycle::sqlite_open_path(&path))
+            .unwrap()
+            .execute_batch("CREATE TABLE probe(value INTEGER); INSERT INTO probe VALUES (7);")
+            .unwrap();
+        let conn = open_readonly_connection(&path)
+            .unwrap_or_else(|error| panic!("read-only open of {} failed: {error}", path.display()));
+        let value: i64 = conn
+            .query_row("SELECT value FROM probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 7);
+    }
+
     #[test]
     fn legacy_migration_completion_log_has_operator_fields() {
         assert_eq!(

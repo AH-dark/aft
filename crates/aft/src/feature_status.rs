@@ -198,6 +198,9 @@ pub fn observed_index_status(ctx: &AppContext, plane: IndexPlane) -> IndexObserv
             unavailable_reason: Some(cause::ROOT_TOO_BROAD.into()),
         };
     }
+    if ctx.cache_unavailable_reason().is_some() {
+        return IndexObservation::unavailable(crate::root_cache::CACHE_DIR_UNAVAILABLE);
+    }
     // Configure forces every index off for a HOME root (degraded mode). That
     // is not the user's resolved choice, so report it as unavailable with its
     // cause rather than as configured off.
@@ -233,7 +236,7 @@ pub fn storage_refusal(
     plane: IndexPlane,
 ) -> Option<crate::persisted_format::UnsupportedPersistedFormat> {
     use crate::persisted_format::{refusal_covering, PersistedStore};
-    let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    let storage = ctx.cache_dir();
     let key = ctx
         .canonical_cache_root_opt()
         .and_then(|root| ctx.cached_artifact_cache_key(&root));
@@ -308,8 +311,10 @@ fn trigram_disk_cache_valid(ctx: &AppContext) -> bool {
     let Some(key) = ctx.cached_artifact_cache_key(&root) else {
         return false;
     };
-    let cache_dir =
-        crate::search_index::resolve_cache_dir_with_key(&key, ctx.config().storage_dir.as_deref());
+    let cache_dir = crate::search_index::resolve_cache_dir_with_key(
+        &key,
+        ctx.config().cache_storage_dir().as_deref(),
+    );
     crate::search_index::SearchIndex::disk_cache_header_valid(&cache_dir)
 }
 
@@ -349,6 +354,11 @@ fn observe_semantic(ctx: &AppContext) -> IndexObservation {
 
 /// Classify a failed semantic build into a named cause.
 pub fn semantic_failure_cause(ctx: &AppContext, message: &str) -> &'static str {
+    if ctx.cache_unavailable_reason().is_some()
+        || message.contains(crate::root_cache::CACHE_DIR_UNAVAILABLE)
+    {
+        return crate::root_cache::CACHE_DIR_UNAVAILABLE;
+    }
     if crate::semantic_admission::is_not_opened_status(message) {
         return cause::SEMANTIC_NOT_OPENED;
     }

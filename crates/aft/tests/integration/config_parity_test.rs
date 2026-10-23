@@ -23,11 +23,26 @@ fn fixtures_root() -> PathBuf {
         .join("config_parity")
 }
 
+/// Placeholder the capture script writes in front of paths that must be
+/// absolute, such as an accepted `storage.cache_dir`. `/aft-cache` is absolute
+/// on macOS and Linux but relative on Windows (no drive letter), so one fixture
+/// spelling cannot be absolute everywhere.
+const ABSOLUTE_ROOT_PLACEHOLDER: &str = "{ABSOLUTE_ROOT}";
+
+/// Replace the placeholder with an absolute root for this platform: empty on
+/// Unix (`{ABSOLUTE_ROOT}/aft-cache` becomes `/aft-cache`) and a drive letter
+/// on Windows (`C:/aft-cache`). Applied to the tier files and the golden alike,
+/// so both sides of the comparison carry the same platform path.
+fn platform_fixture_text(text: &str) -> String {
+    let root = if cfg!(windows) { "C:" } else { "" };
+    text.replace(ABSOLUTE_ROOT_PLACEHOLDER, root)
+}
+
 /// Read a tier file if present; returns None when the file is absent (case has
 /// no tier at that level).
 fn read_tier(dir: &Path, filename: &str, tier: &str) -> Option<ConfigTier> {
     let path = dir.join(filename);
-    let doc = fs::read_to_string(&path).ok()?;
+    let doc = platform_fixture_text(&fs::read_to_string(&path).ok()?);
     Some(ConfigTier {
         tier: tier.to_string(),
         source: path.to_string_lossy().to_string(),
@@ -106,9 +121,9 @@ fn assert_case(dir: &Path) -> Option<String> {
     // `idle.lsp_ttl_minutes`; both languages translate them in memory.
     let result = resolve_config_for_harness(&tiers, Some(&harness));
 
-    let golden: Value = serde_json::from_str(
+    let golden: Value = serde_json::from_str(&platform_fixture_text(
         &fs::read_to_string(dir.join("expected.json")).expect("read expected.json"),
-    )
+    ))
     .expect("parse expected.json");
 
     // A rejected TypeScript load must be rejected by Rust with the same codes.

@@ -353,7 +353,17 @@ fn absolute_route(path: &Path) -> PathBuf {
     };
     #[cfg(windows)]
     let absolute = crate::windows_path::normalize_windows_path(&absolute);
-    absolute
+    // An artifact on a `storage.cache_dir` cache root is owned by the durable
+    // storage root that owns the cache root, as if the cache were linked
+    // under it. Spell it that way so it is routed, listed and cleared there,
+    // and so the cache root never becomes a storage owner of its own.
+    match crate::root_cache::durable_route(&absolute) {
+        #[cfg(windows)]
+        Some(route) => crate::windows_path::normalize_windows_path(&route),
+        #[cfg(not(windows))]
+        Some(route) => route,
+        None => absolute,
+    }
 }
 
 fn canonical_scope(path: &Path) -> PathBuf {
@@ -994,15 +1004,15 @@ pub fn gate(
 /// semantic, symbol cache, callgraph, ownership manifest) and record a named
 /// refusal for each one written in a newer format. Reads headers only; never
 /// changes anything. Absent artifacts are skipped.
-pub fn preflight_project_artifacts(storage_root: &Path, project_key: &str) {
+pub fn preflight_project_artifacts(storage_root: &Path, artifacts: &Path, project_key: &str) {
     register_storage_root(storage_root);
     let _ = crate::search_index::SearchIndex::check_disk_cache_format(
-        &storage_root.join("index").join(project_key),
+        &artifacts.join("index").join(project_key),
     );
-    let _ = crate::semantic_index::SemanticIndex::check_disk_format(storage_root, project_key);
-    let _ = crate::symbol_cache_disk::check_disk_format(storage_root, project_key);
+    let _ = crate::semantic_index::SemanticIndex::check_disk_format(artifacts, project_key);
+    let _ = crate::symbol_cache_disk::check_disk_format(artifacts, project_key);
     let _ = crate::callgraph_store::check_published_format(
-        &storage_root.join("callgraph").join(project_key),
+        &artifacts.join("callgraph").join(project_key),
         project_key,
     );
     let _ = crate::artifact_owner::check_manifest_format(storage_root, project_key);
