@@ -1060,6 +1060,8 @@ pub struct BackupStore {
     discovery_entries_examined: AtomicU64,
     #[cfg(test)]
     discovery_deadline_override: Option<Instant>,
+    #[cfg(test)]
+    discard_outcome_for_tests: Option<Result<(), String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1133,6 +1135,8 @@ impl BackupStore {
             discovery_entries_examined: AtomicU64::new(0),
             #[cfg(test)]
             discovery_deadline_override: None,
+            #[cfg(test)]
+            discard_outcome_for_tests: None,
         }
     }
 
@@ -3334,6 +3338,10 @@ impl BackupStore {
     }
 
     pub fn discard_operation_entries(&mut self, session: &str, op_id: &str) {
+        #[cfg(test)]
+        {
+            self.discard_outcome_for_tests = None;
+        }
         let budget = BackupIoBudget::rollback_cleanup();
         if let Some(skips) = self.skipped_backups.get_mut(session) {
             skips.retain(|skip| skip.op_id.as_deref() != Some(op_id));
@@ -3344,6 +3352,10 @@ impl BackupStore {
         let keys = match self.operation_candidate_keys_with_budget(session, budget) {
             Ok(keys) => keys,
             Err(error) => {
+                #[cfg(test)]
+                {
+                    self.discard_outcome_for_tests = Some(Err(error.to_string()));
+                }
                 crate::slog_warn!(
                     "failed to discover backup stacks during operation discard: {error}"
                 );
@@ -3351,9 +3363,24 @@ impl BackupStore {
             }
         };
         for key in keys {
-            if let Err(error) =
-                self.discard_operation_entries_for_path(session, op_id, &key, true, budget)
+            let result =
+                self.discard_operation_entries_for_path(session, op_id, &key, true, budget);
+            #[cfg(test)]
             {
+                if self
+                    .discard_outcome_for_tests
+                    .as_ref()
+                    .is_none_or(|outcome| outcome.is_ok())
+                {
+                    self.discard_outcome_for_tests = Some(
+                        result
+                            .as_ref()
+                            .map(|_| ())
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+            }
+            if let Err(error) = result {
                 crate::slog_warn!(
                     "failed to discard operation backups for {}: {error}",
                     key.display()
@@ -4459,6 +4486,12 @@ impl BackupStore {
         })?;
         let lock_path = lock_dir.join(format!("{}.lock", Self::path_hash(key)));
         check_rollback_cleanup_deadline(&lock_path, cleanup_deadline)?;
+        #[cfg(test)]
+        BEFORE_BACKUP_STACK_LEASE.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook(&lock_path);
+            }
+        });
         let guard = match cleanup_deadline {
             Some(deadline) => {
                 crate::fs_lock::try_acquire_until(&lock_path, deadline).map_err(|error| {
@@ -6434,8 +6467,11 @@ struct LegacyBackupRepairReport {
 #[cfg(test)]
 type NamespaceAdmissionHook = Box<dyn FnOnce(&Path)>;
 #[cfg(test)]
+type StackLeaseHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
 thread_local! {
     static AFTER_BACKUP_NAMESPACE_ADMISSION: std::cell::RefCell<Option<NamespaceAdmissionHook>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_BACKUP_STACK_LEASE: std::cell::RefCell<Option<StackLeaseHook>> = const { std::cell::RefCell::new(None) };
 }
 
 fn backup_namespace_file(storage: &Path) -> std::io::Result<std::fs::File> {
@@ -8234,12 +8270,26 @@ mod tests {
 
     #[test]
     fn backup_rollback_cleanup_bounds_namespace_session_and_stack_waits() {
-        for held_stage in 0..3 {
-            let (mut store, storage, path) = durability_store();
+        for (held_stage, released) in [(0, false), (1, false), (2, false), (2, true)] {
+            let (mut store, storage, original_path) = durability_store();
+            // Keep a noncanonical spelling even on hosts whose temp directory
+            // is already canonical, so the held lease must use the snapshot key.
+            let path = if held_stage == 2 {
+                original_path
+                    .parent()
+                    .unwrap()
+                    .join(".")
+                    .join(original_path.file_name().unwrap())
+            } else {
+                original_path.clone()
+            };
+            let key = canonicalize_key(&path);
             let session = "cleanup-contention";
             store
                 .snapshot_with_op(session, &path, "rolled back", Some("failed"))
                 .unwrap();
+            assert!(store.entries[session].contains_key(&key));
+            assert_eq!(store.disk_index[session][&key].count, 1);
             let session_dir = store.session_dir(session).unwrap();
             create_private_durable_dir(&session_dir).unwrap();
             let namespace = if held_stage == 0 {
@@ -8252,13 +8302,30 @@ mod tests {
             } else {
                 None
             };
+            // Stack leases hash canonical snapshot keys, not user path aliases.
+            let held_key = &key;
             let stack = if held_stage == 2 {
-                store.acquire_stack_disk_lock(session, &path).unwrap()
+                assert_ne!(BackupStore::path_hash(&path), BackupStore::path_hash(&key));
+                store.acquire_stack_disk_lock(session, held_key).unwrap()
             } else {
                 None
             };
+            let held_stack_path = stack.as_ref().map(|guard| guard.path().to_path_buf());
+            if released {
+                store.release_memory();
+            }
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
             let (tx, rx) = std::sync::mpsc::channel();
             let worker = std::thread::spawn(move || {
+                if held_stage == 2 {
+                    BEFORE_BACKUP_STACK_LEASE.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(move |attempted| {
+                            ready_tx.send(attempted.to_path_buf()).unwrap();
+                            resume_rx.recv().unwrap();
+                        }));
+                    });
+                }
                 let cancellation = crate::executor::JobCancellation::new();
                 cancellation.request_cancel();
                 let _guard = crate::executor::install_job_cancellation(cancellation);
@@ -8271,16 +8338,68 @@ mod tests {
                     },
                 );
             });
+            // The worker reports the exact production lease it is about to
+            // acquire. Check that lease while its held guard is still alive,
+            // then release the rendezvous, not the held lease.
+            let attempted =
+                (held_stage == 2).then(|| ready_rx.recv_timeout(Duration::from_secs(5)));
+            let held_lease_is_busy = attempted.as_ref().is_some_and(|attempted| {
+                attempted.as_ref().is_ok_and(|attempted| {
+                    held_stack_path.as_ref() == Some(attempted)
+                        && matches!(
+                            crate::fs_lock::try_acquire_once(attempted),
+                            Err(crate::fs_lock::AcquireError::Timeout)
+                        )
+                })
+            });
+            let _ = resume_tx.send(());
             let result = rx.recv_timeout(Duration::from_secs(5));
-            // Release the held lease before joining even when the timed path
-            // regresses, so a failure cannot leave a blocked test worker behind.
+            // Release guards and join before asserting even when a rendezvous
+            // or bounded wait regresses, so no blocked test worker is abandoned.
             drop((namespace, session_gate, stack));
             worker.join().unwrap();
             assert!(
                 result.is_ok(),
-                "cleanup waited past its allowance at lock stage {held_stage}"
+                "cleanup waited past its allowance at stage {held_stage}"
             );
-            let store = result.unwrap();
+            let mut store = result.unwrap();
+            let outcome = store
+                .discard_outcome_for_tests
+                .take()
+                .expect("discard did not report an outcome");
+            eprintln!("cleanup stage={held_stage} released={released} raw={original_path:?} requested={path:?} canonical={key:?} held={held_stack_path:?} attempted={attempted:?} busy={held_lease_is_busy} outcome={outcome:?}");
+            if held_stage == 2 {
+                let attempted = attempted
+                    .unwrap()
+                    .expect("worker never reached the stack lease");
+                assert_eq!(
+                    Some(attempted),
+                    held_stack_path,
+                    "the held lease is not the cleanup lease; outcome={outcome:?}"
+                );
+                assert!(
+                    held_lease_is_busy,
+                    "the exact cleanup lease was not held at the rendezvous"
+                );
+            }
+            let error = outcome.expect_err("cleanup succeeded instead of reporting a timeout");
+            let timeout = match held_stage {
+                0 => "namespace lease timed out",
+                1 => "session lease timed out",
+                _ => "timed out acquiring filesystem lock",
+            };
+            assert!(
+                error.contains(timeout),
+                "cleanup did not report the held lease timeout: {error}"
+            );
+            assert_eq!(
+                store
+                    .entries
+                    .get(session)
+                    .map_or(0, |entries| entries.len()),
+                usize::from(!released)
+            );
+            assert_eq!(store.disk_index[session][&key].count, 1);
             assert_eq!(
                 store.history(session, &path).len(),
                 1,
