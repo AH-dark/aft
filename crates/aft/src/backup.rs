@@ -993,6 +993,8 @@ pub struct BackupStore {
     migration_backups_dir_reads: AtomicU64,
     #[cfg(test)]
     fail_next_disk_write: bool,
+    #[cfg(test)]
+    release_after_next_snapshot: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1058,6 +1060,8 @@ impl BackupStore {
             migration_backups_dir_reads: AtomicU64::new(0),
             #[cfg(test)]
             fail_next_disk_write: false,
+            #[cfg(test)]
+            release_after_next_snapshot: false,
         }
     }
 
@@ -1127,6 +1131,11 @@ impl BackupStore {
     #[cfg(test)]
     fn fail_next_disk_write_for_tests(&mut self) {
         self.fail_next_disk_write = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_after_next_snapshot_for_tests(&mut self) {
+        self.release_after_next_snapshot = true;
     }
 
     #[cfg(test)]
@@ -2940,6 +2949,12 @@ impl BackupStore {
             .entry(session.to_string())
             .or_default()
             .insert(key.to_path_buf(), stack);
+        // Model route-close cleanup after a backup commits but before its
+        // caller writes or rolls back the file, without a timing-dependent test.
+        #[cfg(test)]
+        if std::mem::take(&mut self.release_after_next_snapshot) {
+            self.release_session_memory(session);
+        }
         Ok(())
     }
 
@@ -3227,59 +3242,23 @@ impl BackupStore {
                 self.skipped_backups.remove(session);
             }
         }
-        let keys: Vec<PathBuf> = self
-            .entries
-            .get(session)
-            .map(|files| files.keys().cloned().collect())
-            .unwrap_or_default();
-
+        let keys = match self.restore_operation_candidate_keys(session) {
+            Ok(keys) => keys,
+            Err(error) => {
+                crate::slog_warn!(
+                    "failed to discover backup stacks during operation discard: {error}"
+                );
+                return;
+            }
+        };
         for key in keys {
-            let mut remove_key = false;
-            let mut remaining_stack = None;
-            if let Some(session_entries) = self.entries.get_mut(session) {
-                if let Some(stack) = session_entries.get_mut(&key) {
-                    while stack
-                        .last()
-                        .is_some_and(|entry| entry.op_id.as_deref() == Some(op_id))
-                    {
-                        stack.pop();
-                    }
-                    if stack.is_empty() {
-                        remove_key = true;
-                    } else {
-                        remaining_stack = Some(stack.clone());
-                    }
-                }
-                if remove_key {
-                    session_entries.remove(&key);
-                }
+            if let Err(error) = self.discard_operation_entries_for_path(session, op_id, &key, true)
+            {
+                crate::slog_warn!(
+                    "failed to discard operation backups for {}: {error}",
+                    key.display()
+                );
             }
-
-            if remove_key {
-                if let Err(error) = self.remove_disk_backups(session, &key) {
-                    crate::slog_warn!(
-                        "failed to remove backup stack for {} during operation discard: {}",
-                        key.display(),
-                        error
-                    );
-                }
-            } else if let Some(stack) = remaining_stack {
-                if let Err(error) = self.write_snapshot_to_disk(session, &key, &stack) {
-                    crate::slog_warn!(
-                        "failed to persist backup stack for {} during operation discard: {}",
-                        key.display(),
-                        error
-                    );
-                }
-            }
-        }
-
-        if self
-            .entries
-            .get(session)
-            .is_some_and(|session_entries| session_entries.is_empty())
-        {
-            self.entries.remove(session);
         }
     }
 
@@ -3296,53 +3275,59 @@ impl BackupStore {
                 self.skipped_backups.remove(session);
             }
         }
-        let mut remove_key = false;
-        let mut remaining_stack = None;
-
-        if let Some(session_entries) = self.entries.get_mut(session) {
-            if let Some(stack) = session_entries.get_mut(&key) {
-                if stack
-                    .last()
-                    .is_some_and(|entry| entry.op_id.as_deref() == Some(op_id))
-                {
-                    stack.pop();
-                    if stack.is_empty() {
-                        remove_key = true;
-                    } else {
-                        remaining_stack = Some(stack.clone());
-                    }
-                }
-            }
-            if remove_key {
-                session_entries.remove(&key);
-            }
+        if let Err(error) = self.discard_operation_entries_for_path(session, op_id, &key, false) {
+            crate::slog_warn!(
+                "failed to discard latest operation backup for {}: {error}",
+                key.display()
+            );
         }
+    }
 
-        if remove_key {
-            if let Err(error) = self.remove_disk_backups(session, &key) {
-                crate::slog_warn!(
-                    "failed to remove backup stack for {} during single-entry discard: {}",
-                    key.display(),
-                    error
-                );
-            }
-        } else if let Some(stack) = remaining_stack {
-            if let Err(error) = self.write_snapshot_to_disk(session, &key, &stack) {
-                crate::slog_warn!(
-                    "failed to persist backup stack for {} during single-entry discard: {}",
-                    key.display(),
-                    error
-                );
-            }
-        }
-
-        if self
+    fn discard_operation_entries_for_path(
+        &mut self,
+        session: &str,
+        op_id: &str,
+        key: &Path,
+        all: bool,
+    ) -> Result<(), AftError> {
+        let _disk_lock = self.acquire_stack_disk_lock(session, key)?;
+        // Route-close cleanup can release the resident stack between capture
+        // and rollback. Reload under the disk lease before deciding what to pop;
+        // another process may also have appended since our last snapshot.
+        self.ensure_stack_hydrated_locked(session, key)?;
+        let Some(mut stack) = self
             .entries
             .get(session)
-            .is_some_and(|session_entries| session_entries.is_empty())
+            .and_then(|files| files.get(key))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if !stack
+            .last()
+            .is_some_and(|entry| entry.op_id.as_deref() == Some(op_id))
         {
-            self.entries.remove(session);
+            return Ok(());
         }
+        loop {
+            stack.pop();
+            if !all
+                || !stack
+                    .last()
+                    .is_some_and(|entry| entry.op_id.as_deref() == Some(op_id))
+            {
+                break;
+            }
+        }
+        // Keep the loaded cache intact if persistence fails. The same lease
+        // covers the authoritative read and the complete discard transaction.
+        if stack.is_empty() {
+            self.remove_disk_backups_locked(session, key)?;
+        } else {
+            self.write_snapshot_to_disk_locked(session, key, &stack)?;
+        }
+        self.restore_in_memory_stack(session, key, (!stack.is_empty()).then_some(stack));
+        Ok(())
     }
 
     fn touch_session(&mut self, session: &str) {
@@ -4717,16 +4702,6 @@ impl BackupStore {
         Ok(entry)
     }
 
-    fn write_snapshot_to_disk(
-        &mut self,
-        session: &str,
-        key: &Path,
-        stack: &[BackupEntry],
-    ) -> Result<(), AftError> {
-        let _disk_lock = self.acquire_stack_disk_lock(session, key)?;
-        self.write_snapshot_to_disk_locked(session, key, stack)
-    }
-
     fn write_snapshot_to_disk_locked(
         &mut self,
         session: &str,
@@ -5056,11 +5031,6 @@ impl BackupStore {
         }
 
         failed
-    }
-
-    fn remove_disk_backups(&mut self, session: &str, key: &Path) -> Result<(), AftError> {
-        let _disk_lock = self.acquire_stack_disk_lock(session, key)?;
-        self.remove_disk_backups_locked(session, key)
     }
 
     fn remove_disk_backups_locked(&mut self, session: &str, key: &Path) -> Result<(), AftError> {
@@ -7966,6 +7936,56 @@ mod tests {
             store.history("late", &path)[0].post_state,
             Some(PathFingerprint::of_bytes(b"late result"))
         );
+    }
+
+    #[test]
+    fn backup_discard_single_entry_reloads_after_session_release() {
+        let (mut store, _storage, path) = durability_store();
+        fs::write(&path, b"original").unwrap();
+        store
+            .snapshot_with_op("discard", &path, "successful", Some("good"))
+            .unwrap();
+        fs::write(&path, b"successful").unwrap();
+        store.record_post_mutation_states();
+        store
+            .snapshot_with_op("discard", &path, "failed", Some("bad"))
+            .unwrap();
+        store.release_session_memory("discard");
+        store.discard_latest_operation_entry_for_path("discard", "bad", &path);
+        store.restore_last_operation("discard").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+    }
+
+    #[test]
+    fn backup_discard_operation_reloads_all_released_paths() {
+        let (mut store, storage, first) = durability_store();
+        let second = storage.path().join("second.txt");
+        let paths = [first, second];
+        for path in &paths {
+            fs::write(path, b"original").unwrap();
+            store
+                .snapshot_with_op("discard", path, "successful", Some("good"))
+                .unwrap();
+            fs::write(path, b"successful").unwrap();
+        }
+        store.record_post_mutation_states();
+        for path in &paths {
+            store
+                .snapshot_with_op("discard", path, "failed", Some("bad"))
+                .unwrap();
+            store
+                .snapshot_with_op("discard", path, "same failed request", Some("bad"))
+                .unwrap();
+        }
+        store.release_session_memory("discard");
+        store.discard_operation_entries("discard", "bad");
+        store.record_post_mutation_states();
+        let restored = store.restore_last_operation("discard").unwrap();
+        assert_eq!(restored.op_id, "good");
+        assert_eq!(restored.restored.len(), 2);
+        for path in &paths {
+            assert_eq!(fs::read(path).unwrap(), b"original");
+        }
     }
 
     #[test]

@@ -261,6 +261,52 @@ mod audit_regressions {
     use super::*;
 
     #[test]
+    fn backup_discard_after_session_release_keeps_previous_successful_undo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollback.ts");
+        let original = "const value = 0;\n";
+        let successful = "const value = 1;\n";
+        std::fs::write(&path, original).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        ctx.backup()
+            .lock()
+            .set_storage_dir(dir.path().join("storage"), 72);
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "successful", "command": "write", "file": path, "content": successful,
+        }))
+        .unwrap();
+        let response = handle_write(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        ctx.backup().lock().record_post_mutation_states();
+        ctx.backup().lock().release_after_next_snapshot_for_tests();
+
+        let failed: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "failed", "command": "write", "file": path, "content": "const value = {;\n",
+        }))
+        .unwrap();
+        let response = handle_write(&failed, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["rolled_back"], true, "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), successful);
+        ctx.backup().lock().record_post_mutation_states();
+        ctx.backup()
+            .lock()
+            .restore_last_operation(request.session())
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "undo must reverse the successful edit, not pop the rolled-back write"
+        );
+    }
+
+    #[test]
     fn binary_write_reuses_observed_backup_and_restores_exact_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("binary.txt");
