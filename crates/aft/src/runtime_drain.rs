@@ -5184,6 +5184,41 @@ mod tests {
         assert!(!ctx.watcher_lsp_diagnostics_retry_pending_for_test());
     }
 
+    #[test]
+    fn watcher_empty_diagnostics_phase_finishes_with_busy_manager() {
+        let _clock = WatcherDrainTestClock::freeze();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (ctx, _tx) = watcher_context(&root);
+        let mut state = WatcherDrainSliceState::new(
+            ctx.configure_generation(),
+            ctx.configure_content_generation(),
+        );
+        state.phase = WatcherDrainPhase::Apply {
+            stage: WatcherDrainApplyPhase::LspDiagnostics,
+            paths: VecDeque::new(),
+            remaining: 0,
+            oversized_inline_batch: false,
+        };
+        *ctx.watcher_drain_slice().lock() = Some(state);
+        // No outstanding paths means no diagnostics lock is needed, even
+        // while another producer owns the manager.
+        let _held_lsp = ctx.lsp();
+
+        let outcome = drain_watcher_events_bounded(&ctx, 1);
+
+        assert_eq!(outcome.processed, 0);
+        assert!(
+            !outcome.has_more,
+            "an empty diagnostics phase cannot defer work"
+        );
+        assert!(!ctx.watcher_lsp_diagnostics_retry_pending_for_test());
+        assert!(matches!(
+            ctx.watcher_drain_slice().lock().as_ref().unwrap().phase,
+            WatcherDrainPhase::Collect
+        ));
+    }
+
     /// A burst of watcher events for files whose bytes still match the index
     /// (a copied tree, a checkout restoring the same content, FSEvents replaying
     /// events from before the watcher started) must leave every vector in place,
@@ -5247,10 +5282,19 @@ mod tests {
             .send(WatcherDispatchEvent::Paths(files.clone()))
             .unwrap();
 
+        // A background language-server discovery walk can briefly own the manager.
+        // Hold it explicitly so diagnostics always defer, while the retry probe
+        // below proves that every earlier semantic check has finished.
+        let held_lsp = ctx.lsp();
         let outcome = drain_watcher_events_bounded(&ctx, files.len());
 
         assert_eq!(outcome.processed, files.len());
-        assert!(!outcome.has_more);
+        assert!(
+            outcome.has_more,
+            "diagnostics must wait for the held manager"
+        );
+        assert!(ctx.watcher_lsp_diagnostics_retry_pending_for_test());
+        drop(held_lsp);
         let index = ctx
             .semantic_index()
             .read()
