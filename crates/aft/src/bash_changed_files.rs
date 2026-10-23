@@ -148,6 +148,32 @@ pub struct Report {
     pub changed_files_list_envelope: ListEnvelope,
 }
 
+fn render_file(file: &ChangedFile) -> String {
+    let path = if file.path.chars().any(char::is_control) {
+        serde_json::to_string(&file.path).unwrap_or_default()
+    } else {
+        file.path.clone()
+    };
+    let mut rendered = format!("\n  {} {}", file.status, path);
+    if let Some(reason) = &file.reason {
+        rendered.push_str(&format!(" ({reason})"));
+    }
+    if let Some(diff) = &file.diff {
+        rendered.push('\n');
+        rendered.push_str(diff);
+    }
+    rendered
+}
+
+fn report_body_bytes(files: &[ChangedFile]) -> usize {
+    let mut text = HEADER.to_string();
+    for file in files {
+        text.push_str(&render_file(file));
+    }
+    serde_json::to_vec(&text).map_or(MAX_REPORT_BYTES, |bytes| bytes.len())
+        + serde_json::to_vec(files).map_or(MAX_REPORT_BYTES, |bytes| bytes.len())
+}
+
 #[derive(Debug)]
 pub(crate) struct Capture {
     root: PathBuf,
@@ -419,8 +445,6 @@ impl Capture {
         }
         drop(state);
         let total = paths.len();
-        let mut files = Vec::new();
-        let mut serialized_files_bytes = 0;
         let mut text = HEADER.to_string();
         let mut cut = false;
         let mut pending = Vec::new();
@@ -457,39 +481,44 @@ impl Capture {
         // diffs, so a slow diff never hides later files we can already list.
         let diff_deadline = deadline
             - Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now()) / 10);
-        for (path, created, exists, mut file) in pending {
+        let mut files = pending
+            .iter()
+            .map(|(_, _, _, file)| file.clone())
+            .collect::<Vec<_>>();
+        // Paths have first claim on the report budget. Only the path list itself,
+        // never a diff, may force a later path out of the response.
+        while report_body_bytes(&files) > MAX_REPORT_BYTES - 2048 {
+            files.pop();
+            pending.pop();
+            cut = true;
+        }
+        for (index, (path, created, exists, _)) in pending.into_iter().enumerate() {
+            let file = &mut files[index];
             if self.mode == BashChangedFiles::Diff && Instant::now() < diff_deadline {
                 if let Some(git) = &self.git {
-                    self.diff_file(git, &path, created, exists, diff_deadline, &mut file);
+                    self.diff_file(git, &path, created, exists, diff_deadline, file);
                 }
             }
-            let mut rendered = format!(
-                "\n  {} {}",
-                file.status,
-                serde_json::to_string(&file.path).unwrap_or_default()
-            );
-            // Ordinary paths stay readable; control characters remain escaped.
-            if !file.path.chars().any(char::is_control) {
-                rendered = format!("\n  {} {}", file.status, file.path);
+            if report_body_bytes(&files) > MAX_REPORT_BYTES - 2048 {
+                files[index].diff = None;
+                files[index].diff_lines_list_envelope = None;
+                // A new denial/skip reason may need space too. Reclaim earlier
+                // diff space before considering the bounded path list itself.
+                for earlier in (0..index).rev() {
+                    if report_body_bytes(&files) <= MAX_REPORT_BYTES - 2048 {
+                        break;
+                    }
+                    files[earlier].diff = None;
+                    files[earlier].diff_lines_list_envelope = None;
+                }
             }
-            if let Some(reason) = &file.reason {
-                rendered.push_str(&format!(" ({reason})"));
-            }
-            if let Some(diff) = &file.diff {
-                rendered.push('\n');
-                rendered.push_str(diff);
-            }
-            let file_bytes =
-                serde_json::to_vec(&file).map_or(MAX_REPORT_BYTES, |bytes| bytes.len() + 1);
-            let text_bytes = serde_json::to_vec(&format!("{text}{rendered}"))
-                .map_or(MAX_REPORT_BYTES, |bytes| bytes.len());
-            if text_bytes + serialized_files_bytes + file_bytes > MAX_REPORT_BYTES - 2048 {
-                cut = true;
-                break;
-            }
-            serialized_files_bytes += file_bytes;
-            text.push_str(&rendered);
-            files.push(file);
+        }
+        while report_body_bytes(&files) > MAX_REPORT_BYTES - 2048 {
+            files.pop();
+            cut = true;
+        }
+        for file in &files {
+            text.push_str(&render_file(file));
         }
         if files.is_empty() {
             text.push_str("\n  (no file changes observed)");

@@ -1106,3 +1106,39 @@ fn bash_changed_files_diff_inherits_shell_launch_read_denies() {
         .unwrap()
         .contains("SECRET_MUST_NOT_APPEAR"));
 }
+
+#[test]
+fn bash_changed_files_large_diff_never_displaces_later_paths() {
+    let root = repo();
+    let (journal, capture) = capture(root.path(), BashChangedFiles::Diff);
+    assert!(capture.git.is_some());
+    let huge = (0..300)
+        .map(|i| format!("line-{i:03}:{}\n", "x".repeat(220)))
+        .collect::<String>();
+    for (name, contents) in [
+        ("a-huge.txt", huge.as_str()),
+        ("b-small.txt", "b\n"),
+        ("c-small.txt", "c\n"),
+        ("d-small.txt", "d\n"),
+    ] {
+        std::fs::write(root.path().join(name), contents).unwrap();
+        event(
+            &journal,
+            root.path(),
+            name,
+            notify::EventKind::Create(CreateKind::File),
+        );
+    }
+    let report = capture.finish();
+    assert_eq!(
+        report
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a-huge.txt", "b-small.txt", "c-small.txt", "d-small.txt"],
+        "diff consumed path space: {report:?}"
+    );
+    assert!(serde_json::to_vec(report).unwrap().len() <= MAX_REPORT_BYTES);
+    assert!(!report.text.contains("no file changes observed"));
+}
