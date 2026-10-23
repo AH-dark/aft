@@ -221,7 +221,7 @@ fn find_enclosing_item(lines: &[&str], target_idx: usize) -> String {
     "<file_root>".to_string()
 }
 
-/// Scans the four governed locations for list-cutting primitives.
+/// Scans governed response surfaces and explicitly registered internal bounds.
 pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let src_dir = aft_src_dir();
     let mut files_to_scan = Vec::new();
@@ -238,6 +238,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     files_to_scan.push(src_dir.join("response_finalize.rs"));
     files_to_scan.push(src_dir.join("runtime_drain.rs"));
     files_to_scan.push(src_dir.join("edit.rs"));
+    files_to_scan.push(src_dir.join("bash_permissions/scan.rs"));
     // 4. crates/aft/src/compress/**
     files_to_scan.extend(collect_rs_files(&src_dir.join("compress")));
 
@@ -253,6 +254,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
         "skipped_foreign_mounts",
         "collection_truncated",
         "MAX_DISPLAY_",
+        "MAX_CWD_PATHS",
         "REFORMATTED_EXCERPT_MAX_",
     ];
 

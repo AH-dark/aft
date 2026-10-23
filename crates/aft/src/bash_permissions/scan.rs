@@ -257,17 +257,90 @@ pub(crate) struct DirectoryTarget {
     pub literal_absolute: bool,
 }
 
-/// Follow literal directory changes in the outer shell in order. Unknown
-/// changes suppress relative targets until the current folder is known again.
-/// The scan skips nested shells and function definitions.
+/// Follow reachable outer-shell directory changes, retaining cwd alternatives
+/// separately for successful and failed commands so `&&` and `||` stay correlated.
 #[cfg(any(unix, test))]
 pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<DirectoryTarget> {
+    const MAX_CWD_PATHS: usize = 8;
+
+    #[derive(Clone)]
+    enum Paths {
+        Known(Vec<PathBuf>),
+        Unknown,
+    }
+    impl Paths {
+        fn empty() -> Self {
+            Self::Known(Vec::new())
+        }
+        fn one(path: PathBuf) -> Self {
+            Self::Known(vec![path])
+        }
+        fn is_empty(&self) -> bool {
+            matches!(self, Self::Known(paths) if paths.is_empty())
+        }
+        fn insert(&mut self, path: PathBuf) {
+            if let Self::Known(paths) = self {
+                if !paths.contains(&path) {
+                    // Too many possible folders make the set unknown; never discard
+                    // just the extra folder and keep pretending the set is complete.
+                    if paths.len() >= MAX_CWD_PATHS {
+                        *self = Self::Unknown;
+                    } else {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+        fn union(mut self, other: Self) -> Self {
+            match other {
+                Self::Unknown => Self::Unknown,
+                Self::Known(paths) => {
+                    for path in paths {
+                        self.insert(path);
+                    }
+                    self
+                }
+            }
+        }
+    }
+    struct Flow {
+        success: Paths,
+        failure: Paths,
+    }
+    impl Flow {
+        fn success(paths: Paths) -> Self {
+            Self {
+                success: paths,
+                failure: Paths::empty(),
+            }
+        }
+        fn failure(paths: Paths) -> Self {
+            Self {
+                success: Paths::empty(),
+                failure: paths,
+            }
+        }
+        fn either(paths: Paths) -> Self {
+            Self {
+                success: paths.clone(),
+                failure: paths,
+            }
+        }
+        fn all(self) -> Paths {
+            self.success.union(self.failure)
+        }
+    }
+    enum Operator {
+        Sequence,
+        And,
+        Or,
+    }
+
     fn literal_word(raw: &str) -> Option<String> {
         let mut parsed = crate::bash_rewrite::parser::parse(raw)?;
         (parsed.args.len() == 1 && parsed.appends_to.is_none() && parsed.heredoc.is_none())
             .then(|| parsed.args.remove(0))
     }
-
     fn resolve_target(head: &str, parts: &[Part], cwd: Option<&Path>) -> Option<DirectoryTarget> {
         let raw = parts
             .iter()
@@ -298,97 +371,180 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
             literal_absolute,
         })
     }
-
-    fn visit_without_cwd(node: Node<'_>, source: &str, targets: &mut Vec<DirectoryTarget>) {
-        match node.kind() {
-            "subshell"
-            | "command_substitution"
-            | "process_substitution"
-            | "function_definition" => return,
-            "command" => {
-                visit(node, source, &mut None, targets);
-                return;
+    fn directory_change(
+        head: &str,
+        parts: &[Part],
+        incoming: Paths,
+        targets: &mut Vec<DirectoryTarget>,
+    ) -> Flow {
+        let mut success = Paths::empty();
+        let mut emitted: Vec<DirectoryTarget> = Vec::new();
+        let mut resolve = |cwd| {
+            if let Some(target) = resolve_target(head, parts, cwd) {
+                success.insert(target.path.clone());
+                if !emitted.iter().any(|previous| previous.path == target.path) {
+                    emitted.push(target);
+                }
+            } else {
+                success = Paths::Unknown;
             }
-            _ => {}
+        };
+        match &incoming {
+            Paths::Known(paths) => {
+                for path in paths {
+                    resolve(Some(path.as_path()));
+                }
+            }
+            Paths::Unknown => resolve(None),
         }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            visit_without_cwd(child, source, targets);
+        targets.extend(emitted);
+        // A failed cd/pushd leaves its incoming directory unchanged.
+        Flow {
+            success,
+            failure: incoming,
         }
     }
-
-    fn visit(
+    fn inspect_independent_children(
         node: Node<'_>,
         source: &str,
-        cwd: &mut Option<PathBuf>,
         targets: &mut Vec<DirectoryTarget>,
     ) {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            let _ = evaluate(child, source, Paths::Unknown, targets);
+        }
+    }
+    fn evaluate(
+        node: Node<'_>,
+        source: &str,
+        incoming: Paths,
+        targets: &mut Vec<DirectoryTarget>,
+    ) -> Flow {
+        if incoming.is_empty() {
+            return Flow::success(incoming);
+        }
         match node.kind() {
-            "subshell" => {
-                // Treat a nested shell as a conservative boundary for cwd tracking.
-                *cwd = None;
-                return;
-            }
-            "command_substitution" | "process_substitution" | "function_definition" => return,
+            "subshell" => return Flow::either(Paths::Unknown),
+            "command_substitution" | "process_substitution" => return Flow::either(incoming),
+            "function_definition" => return Flow::success(incoming),
             "if_statement"
             | "for_statement"
             | "c_style_for_statement"
             | "while_statement"
             | "case_statement"
-            | "pipeline"
-            | "negated_command" => {
-                // Branches and pipelines do not establish one outer-shell cwd.
-                // Keep inspecting absolute targets without inferring branch order.
-                *cwd = None;
-                visit_without_cwd(node, source, targets);
-                return;
+            | "pipeline" => {
+                // Unsupported control flow loses cwd precision; independently
+                // resolvable targets remain inspectable without choosing a branch.
+                inspect_independent_children(node, source, targets);
+                return Flow::either(Paths::Unknown);
+            }
+            "negated_command" => {
+                if let Some(body) = node.named_child(0) {
+                    let inner = evaluate(body, source, incoming, targets);
+                    return Flow {
+                        success: inner.failure,
+                        failure: inner.success,
+                    };
+                }
+                return Flow::either(incoming);
+            }
+            "redirected_statement" => {
+                let mut cursor = node.walk();
+                let body = node.child_by_field_name("body").or_else(|| {
+                    node.named_children(&mut cursor)
+                        .find(|child| !child.kind().contains("redirect"))
+                });
+                let inner = body
+                    .map(|body| evaluate(body, source, incoming.clone(), targets))
+                    .unwrap_or_else(|| Flow::either(incoming.clone()));
+                // Redirection can fail before the body changes directory.
+                return Flow {
+                    success: inner.success,
+                    failure: inner.failure.union(incoming),
+                };
             }
             "command" => {
                 let parts = command_parts(source, node);
                 let head = parts.first().and_then(|part| literal_word(&part.text));
-                match head.as_deref() {
+                return match head.as_deref() {
                     Some(head @ ("cd" | "pushd")) => {
-                        if let Some(target) = resolve_target(head, &parts, cwd.as_deref()) {
-                            *cwd = Some(target.path.clone());
-                            targets.push(target);
+                        directory_change(head, &parts, incoming, targets)
+                    }
+                    Some("popd") => Flow {
+                        success: Paths::Unknown,
+                        failure: incoming,
+                    },
+                    Some("source" | "." | "eval") | None => Flow::either(Paths::Unknown),
+                    Some("false") => Flow::failure(incoming),
+                    Some("true" | ":") => {
+                        let mut cursor = node.walk();
+                        if node
+                            .named_children(&mut cursor)
+                            .any(|child| child.kind().contains("redirect"))
+                        {
+                            Flow::either(incoming)
                         } else {
-                            *cwd = None;
+                            Flow::success(incoming)
                         }
                     }
-                    Some("popd" | "source" | "." | "eval") | None => *cwd = None,
-                    _ => {}
-                }
-                // Do not visit substitutions used as arguments to this command.
-                return;
+                    _ => Flow::either(incoming),
+                };
             }
             _ => {}
         }
-        let mut conditional = false;
+        let mut flow: Option<Flow> = None;
+        let mut operator = Operator::Sequence;
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if child.kind() == "||" {
-                // Either side may determine the next cwd; do not choose one.
-                *cwd = None;
-                conditional = true;
-            } else if child.is_named() {
-                if conditional {
-                    visit_without_cwd(child, source, targets);
-                } else {
-                    visit(child, source, cwd, targets);
+            match child.kind() {
+                "&&" => {
+                    operator = Operator::And;
+                    continue;
                 }
+                "||" => {
+                    operator = Operator::Or;
+                    continue;
+                }
+                "&" => {
+                    flow = flow.map(|_| Flow::either(Paths::Unknown));
+                    operator = Operator::Sequence;
+                    continue;
+                }
+                "comment" => continue,
+                _ if !child.is_named() => continue,
+                _ => {}
             }
+            flow = Some(match flow.take() {
+                None => evaluate(child, source, incoming.clone(), targets),
+                Some(left) => match operator {
+                    Operator::Sequence => evaluate(child, source, left.all(), targets),
+                    Operator::And => {
+                        let right = evaluate(child, source, left.success, targets);
+                        Flow {
+                            success: right.success,
+                            failure: left.failure.union(right.failure),
+                        }
+                    }
+                    Operator::Or => {
+                        let right = evaluate(child, source, left.failure, targets);
+                        Flow {
+                            success: left.success.union(right.success),
+                            failure: right.failure,
+                        }
+                    }
+                },
+            });
+            operator = Operator::Sequence;
         }
-        if conditional {
-            *cwd = None;
-        }
+        flow.unwrap_or_else(|| Flow::either(incoming))
     }
 
     let mut targets = Vec::new();
     if let Some(tree) = parse_tree(command) {
-        visit(
+        let _ = evaluate(
             tree.root_node(),
             command,
-            &mut Some(cwd.to_path_buf()),
+            Paths::one(cwd.to_path_buf()),
             &mut targets,
         );
     }
@@ -811,7 +967,7 @@ mod tests {
     fn directory_targets_preserve_literal_absolute_paths() {
         let dir = tempfile::tempdir().unwrap();
         let absolute = dir.path().canonicalize().unwrap();
-        let command = format!("cd '{}'; cd nested; cd '~/literal'", absolute.display());
+        let command = format!("cd '{}' && cd nested && cd '~/literal'", absolute.display());
         let targets = top_level_directory_targets(&command, &absolute);
         assert_eq!(
             targets
@@ -820,6 +976,52 @@ mod tests {
                 .collect::<Vec<_>>(),
             [true, false, false]
         );
+    }
+
+    #[test]
+    fn directory_targets_preserve_success_and_failure_reachability() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let parent = cwd.parent().unwrap().to_path_buf();
+        assert_eq!(
+            directory_paths("false && cd nested; cd ..", &cwd),
+            vec![parent.clone()]
+        );
+        assert_eq!(
+            directory_paths("true || cd nested; cd ..", &cwd),
+            vec![parent.clone()]
+        );
+        assert_eq!(
+            directory_paths("maybe && cd nested; cd ..", &cwd),
+            vec![cwd.join("nested"), cwd.clone(), parent.clone()]
+        );
+        assert_eq!(
+            directory_paths("cd nested || cd fallback", &cwd),
+            vec![cwd.join("nested"), cwd.join("fallback")]
+        );
+        assert_eq!(
+            directory_paths("! cd nested && cd ..", &cwd),
+            vec![cwd.join("nested"), parent.clone()]
+        );
+        assert!(directory_paths("false && cd ../not-executed", &cwd).is_empty());
+        assert!(directory_paths("true || cd ../not-executed", &cwd).is_empty());
+        assert_eq!(
+            directory_paths("true >/not-writable && cd nested; cd ..", &cwd),
+            vec![cwd.join("nested"), cwd.clone(), parent]
+        );
+    }
+
+    #[test]
+    fn directory_targets_bound_reachable_cwd_alternatives() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let command = format!(
+            "cd a; cd b; cd c; cd d; cd ..; cd '{}' && cd child",
+            cwd.display()
+        );
+        let targets = directory_paths(&command, &cwd);
+        assert_eq!(targets.len(), 17);
+        assert_eq!(&targets[15..], &[cwd.clone(), cwd.join("child")]);
     }
 
     #[test]
@@ -858,12 +1060,16 @@ mod tests {
     }
 
     #[test]
-    fn directory_targets_do_not_infer_cwd_after_conditional_execution() {
+    fn directory_targets_preserve_conditional_cwd_alternatives() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap();
         assert_eq!(
             directory_paths("cd nested || printf fallback; cd ..", &cwd),
-            vec![cwd.join("nested")]
+            vec![
+                cwd.join("nested"),
+                cwd.clone(),
+                cwd.parent().unwrap().to_path_buf()
+            ]
         );
         for command in [
             "if true; then cd nested; fi; cd ..",
@@ -889,7 +1095,11 @@ mod tests {
             vec![
                 cwd.join("nested"),
                 cwd.join("sibling repo"),
-                cwd.join("sibling repo")
+                cwd.parent().unwrap().join("sibling repo"),
+                cwd.join("sibling repo"),
+                cwd.parent().unwrap().join("sibling repo"),
+                cwd.join("nested"),
+                cwd
             ]
         );
     }

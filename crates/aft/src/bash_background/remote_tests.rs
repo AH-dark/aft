@@ -7118,6 +7118,72 @@ async fn runon_cd_outside_checkout_is_refused_before_submit() {
 }
 
 #[tokio::test]
+async fn runon_cd_skipped_changes_do_not_hide_checkout_exits() {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    let checkout = tempfile::Builder::new()
+        .prefix("aft-runon-branches-")
+        .tempdir_in(&home)
+        .unwrap();
+    let ctx = remote_test_context(checkout.path());
+    fs::create_dir(checkout.path().join("nested")).unwrap();
+    let marker = checkout.path().join("must-not-run-locally");
+    for (line, refused) in [
+        ("false && cd nested; cd ..", true),
+        ("maybe && cd nested; cd ..", true),
+        ("cd nested; cd ..", true),
+        ("true || cd nested; cd ..", true),
+        ("cd \"$X\" || cd ..", true),
+        ("cd nested && cd ..", false),
+        ("false || cd nested && cd ..", false),
+        ("false && cd nested || cd nested && cd ..", false),
+        ("false && cd ../must-not-execute", false),
+        ("true || cd ..", false),
+        ("cd \"$X\" && cd ..", false),
+    ] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let command = format!("{line}; printf local-proof > '{}'", marker.display());
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({
+                "command": command, "runon": "linux", "compressed": false,
+            }),
+        );
+        assert!(response.success, "{line}: {response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        if refused {
+            assert_eq!(done.info.status, BgTaskStatus::Failed, "{line}: {done:?}");
+            let refusal = refusal_response(done);
+            assert_eq!(refusal.data["code"], "runon_cd_outside_checkout");
+            assert!(
+                refusal.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("changes into {},", home.display())),
+                "{line}: {refusal:?}"
+            );
+            assert!(exec_runs(&daemon).is_empty(), "a refusal must never submit");
+        } else {
+            assert_eq!(
+                done.info.status,
+                BgTaskStatus::Completed,
+                "{line}: {done:?}"
+            );
+            let runs = exec_runs(&daemon);
+            assert_eq!(runs.len(), 1, "{line}: {runs:?}");
+            assert_eq!(runs[0]["command"], command);
+        }
+        assert!(!marker.exists(), "runon must never spawn locally");
+    }
+}
+
+#[tokio::test]
 async fn runon_cd_sequential_targets_follow_the_shell_cwd() {
     let home = PathBuf::from(std::env::var_os("HOME").unwrap())
         .canonicalize()

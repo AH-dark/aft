@@ -307,6 +307,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "bash_permissions/scan.rs",
+        enclosing_item: "top_level_directory_targets, MAX_CWD_PATHS, insert",
+        location_or_primitive: "MAX_CWD_PATHS",
+        reason: "internal cwd analysis retains at most eight folders per exit-status branch; exceeding that bound makes the folder unknown rather than removing alternatives, and no response list is shortened",
+    },
+    ExclusionEntry {
         file: "standalone_input.rs",
         enclosing_item: "read_bounded_line, room, push",
         location_or_primitive: "MAX_LINE_BYTES / MAX_RETAINED_BYTES / MAX_RETAINED_ITEMS / MAX_HELD_BYTES / MAX_HELD_ITEMS",
