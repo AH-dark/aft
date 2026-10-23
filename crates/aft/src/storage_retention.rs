@@ -1631,13 +1631,13 @@ fn bindings_with_admission(
         let binding = match read_binding_record(&path) {
             Ok((_, binding)) => binding,
             Err(error) => {
-                handle_binding_read_error(storage, &path, error, false, false);
+                handle_binding_read_error(&storage.durable, &path, error, false, false);
                 // The filename still identifies this scope. Keep it out of
                 // orphan cleanup until a readable binding replaces the record.
                 result
                     .entry(scope.clone())
                     .or_default()
-                    .push(unreadable_binding_sentinel(storage, &scope));
+                    .push(unreadable_binding_sentinel(&storage.durable, &scope));
                 continue;
             }
         };
@@ -9162,7 +9162,7 @@ mod storage_retention_tests {
             ..Default::default()
         };
         let (result, lines) = crate::logging::capture_log_lines(|| {
-            prune_bindings(storage.path(), &|| false, &mut report)
+            prune_bindings(&StoragePaths::same(storage.path()), &|| false, &mut report)
         });
 
         assert!(
@@ -9252,7 +9252,7 @@ mod storage_retention_tests {
                 at_ms: u64::MAX,
                 ..Default::default()
             };
-            prune_bindings(storage.path(), &|| false, &mut report).unwrap();
+            prune_bindings(&StoragePaths::same(storage.path()), &|| false, &mut report).unwrap();
             assert!(!eligible_path.exists(), "cleanup stalled in cycle {cycle}");
             assert_eq!(report.skipped_unknown, 1);
 
@@ -9394,7 +9394,7 @@ fn prune_bindings(
             Ok(record) => record,
             Err(error) => {
                 let message = error.error.to_string();
-                handle_binding_read_error(storage, &path, error, true, false);
+                handle_binding_read_error(&storage.durable, &path, error, true, false);
                 report.skipped_unknown += 1;
                 if report.errors.len() < 16 {
                     report

@@ -469,7 +469,9 @@ mod tests {
     fn seed_failure_names_the_loader_not_the_trigram_plane() {
         let temp = tempfile::tempdir().unwrap();
         let registry = FamilyRegistry::open(temp.path(), "family").unwrap();
-        let owner = registry.register_view("owner", temp.path()).unwrap();
+        let owner = registry
+            .register_view_with_storage(temp.path(), "owner", temp.path())
+            .unwrap();
         let driver = Arc::new(Driver {
             owner,
             revision: AtomicU64::new(0),
