@@ -688,6 +688,91 @@ mod write_amplification_tests {
     }
 
     #[test]
+    fn obsolete_generation_is_removed_before_replacement_publication() {
+        for obsolete_key in ["schema_version", "fingerprint"] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("root");
+            fs::create_dir_all(&root).unwrap();
+            let dir = temp.path().join("store");
+            let (store, _) =
+                CallGraphStore::cold_build_with_lease(dir.clone(), root.clone(), &[]).unwrap();
+            let old = store.sqlite_path().to_path_buf();
+            let key = store.project_key().to_string();
+            drop(store);
+            Connection::open(&old)
+                .unwrap()
+                .execute(
+                    "UPDATE meta SET v = ?1 WHERE k = ?2",
+                    params![
+                        if obsolete_key == "schema_version" {
+                            "1"
+                        } else {
+                            "previous-output"
+                        },
+                        obsolete_key
+                    ],
+                )
+                .unwrap();
+            let removed = Arc::new(AtomicBool::new(false));
+            let observed = Arc::clone(&removed);
+            let old_before_publish = old.clone();
+            set_cold_build_before_publish_observer(Some(Arc::new(move || {
+                observed.store(!old_before_publish.exists(), AtomicOrdering::SeqCst);
+            })));
+            let rebuilt = CallGraphStore::ensure_built_with_lease(dir.clone(), root, &[]);
+            set_cold_build_before_publish_observer(None);
+            let (store, stats) = rebuilt.unwrap();
+            assert!(stats.is_some());
+            assert!(
+                removed.load(AtomicOrdering::SeqCst),
+                "obsolete {obsolete_key} must be reclaimed before replacement publication"
+            );
+            assert!(!old.exists());
+            assert!(store.sqlite_path().exists());
+            assert!(!published_store_is_obsolete(&dir, &key));
+        }
+    }
+
+    #[test]
+    fn obsolete_generation_retirement_preserves_readers_and_interrupted_upgrade_intent() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let dir = temp.path().join("store");
+        let (store, _) =
+            CallGraphStore::cold_build_with_lease(dir.clone(), root.clone(), &[]).unwrap();
+        let old = store.sqlite_path().to_path_buf();
+        let key = store.project_key().to_string();
+        drop(store);
+        let generation = read_pointer(&dir, &key).unwrap();
+        let marker = crate::root_cache::ReadMarker::create(&dir, &generation).unwrap();
+        Connection::open(&old)
+            .unwrap()
+            .execute(
+                "UPDATE meta SET v = 'previous-output' WHERE k = 'fingerprint'",
+                [],
+            )
+            .unwrap();
+        let _lease = acquire_writer_lease(&dir, &key, &root).unwrap().unwrap();
+        retire_obsolete_published_generation(&dir, &key);
+        assert!(
+            old.exists(),
+            "a live reader must retain its obsolete generation"
+        );
+        drop(marker);
+        retire_obsolete_published_generation(&dir, &key);
+        assert!(!old.exists());
+        assert_eq!(
+            read_pointer(&dir, &key).as_deref(),
+            Some(generation.as_str())
+        );
+        assert!(
+            published_store_is_obsolete(&dir, &key),
+            "a failed replacement must still trigger configure on restart"
+        );
+    }
+
+    #[test]
     fn obsolete_store_probe_preserves_current_missing_and_newer_formats() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("root");
@@ -6153,6 +6238,8 @@ impl CallGraphStore {
             callgraph_dir.join("build-breaker.sqlite"),
         )
         .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+
+        retire_obsolete_published_generation(callgraph_dir, project_key);
 
         let generation = generation_file_name(project_key);
         let gen_path = callgraph_dir.join(&generation);
@@ -12413,7 +12500,10 @@ pub(crate) fn published_store_is_obsolete(callgraph_dir: &Path, project_key: &st
         return false;
     }
     let Some((path, version)) = published_schema_version(callgraph_dir, project_key) else {
-        return false;
+        // Keep the pointer as upgrade intent if retirement succeeded but the
+        // replacement build was interrupted before it could publish.
+        return read_pointer(callgraph_dir, project_key)
+            .is_some_and(|generation| !callgraph_dir.join(generation).is_file());
     };
     if version < u64::from(STORE_FORMAT_VERSION) {
         return true;
@@ -12427,6 +12517,41 @@ pub(crate) fn published_store_is_obsolete(callgraph_dir: &Path, project_key: &st
         .flatten()
     });
     fingerprint.is_some_and(|fingerprint| fingerprint != schema_fingerprint())
+}
+
+/// Reclaim an unusable generation before writing its replacement, but never
+/// unlink a live reader's database. The caller holds the root's writer lease.
+fn retire_obsolete_published_generation(callgraph_dir: &Path, project_key: &str) {
+    let Ok(_publication) = crate::fs_lock::try_acquire(
+        &publication_gc_lock(callgraph_dir, project_key),
+        Duration::ZERO,
+    ) else {
+        return;
+    };
+    if !published_store_is_obsolete(callgraph_dir, project_key) {
+        return;
+    }
+    let Some(generation) = read_pointer(callgraph_dir, project_key) else {
+        return;
+    };
+    if Path::new(&generation).components().count() != 1
+        || !generation.starts_with(&format!("{project_key}.g"))
+        || !generation.ends_with(".sqlite")
+    {
+        return;
+    }
+    if crate::root_cache::sweep_read_markers(callgraph_dir, &generation).protected {
+        return;
+    }
+    let path = callgraph_dir.join(&generation);
+    remove_sqlite_file_set(&path);
+    if !path.exists() {
+        let _ = std::fs::remove_file(migration_manifest_path(callgraph_dir, &generation));
+        let _ = std::fs::remove_dir_all(crate::root_cache::read_marker_dir(
+            callgraph_dir,
+            &generation,
+        ));
+    }
 }
 
 /// Refuse, by name, a published generation whose schema version is above
