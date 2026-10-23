@@ -360,6 +360,18 @@ impl Drop for ProvisionRollback<'_> {
     }
 }
 
+/// Every reason a jailed worker command starts without the read broker is
+/// reported through this one warning, so an operator can tell why `gh` reads
+/// are unavailable in that shell.
+#[cfg(unix)]
+pub(crate) fn log_unavailable(task_id: &str, reason: &str) {
+    crate::slog_warn!(
+        "gh_shim worker_read unavailable: task={} reason={}; command continues without broker authority",
+        task_id.escape_debug(),
+        reason.escape_debug()
+    );
+}
+
 /// Broker availability never decides whether a confined shell may start. A
 /// failed setup grants nothing and publishes no endpoint paths to that child.
 #[cfg(unix)]
@@ -398,7 +410,7 @@ pub(crate) fn provision_optional(
             ] {
                 env.remove(key);
             }
-            crate::slog_warn!("gh_shim worker_read unavailable: task={} reason={}; command continues without broker authority",task_id.escape_debug(),reason.escape_debug());
+            log_unavailable(task_id, &reason);
             false
         }
     }

@@ -568,6 +568,36 @@ impl SpawnPlan {
             && matches!(self.policy(), Self::Launcher { profile, .. } if profile.mode == SandboxMode::Strict)
     }
 
+    /// Why a jailed worker's shell launched under this plan must not receive
+    /// the host-local GitHub read broker, or `None` when it may. The broker's
+    /// isolation needs an OS policy that keeps each worker out of the shared
+    /// task-temp root: the worker must not read another task's capability
+    /// file or replace another task's broker socket with its own listener.
+    /// Strict enforces that on macOS and Linux. Relaxed enforces it only on
+    /// macOS (Seatbelt applies its denies); relaxed Linux grants all of `/`
+    /// and enforces no deny. Off is the operator's explicit opt-out of the
+    /// jail. This is the only profile rule for the broker, so the profiles
+    /// cannot drift apart.
+    #[cfg(unix)]
+    pub(crate) fn worker_read_broker_unavailable(&self) -> Option<&'static str> {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return Some("the native worker jail runs only on macOS and Linux");
+        }
+        match self.policy() {
+            Self::Launcher { profile, .. } => match profile.mode {
+                SandboxMode::Strict => None,
+                SandboxMode::Relaxed if cfg!(target_os = "macos") => None,
+                SandboxMode::Relaxed => Some(
+                    "sandbox profile relaxed on Linux does not protect the shared task-temp root, so another worker could read this command's capability or replace its broker socket",
+                ),
+                SandboxMode::Off => Some(
+                    "sandbox profile off runs the worker shell without the worker jail",
+                ),
+            },
+            _ => Some("the command does not run under the native worker launcher"),
+        }
+    }
+
     #[cfg(unix)]
     pub(crate) fn host_shell_path(&self) -> Option<&Path> {
         match self.policy() {

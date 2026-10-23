@@ -1115,32 +1115,16 @@ pub(crate) fn spawn(
             (plan, Some(task))
         } else {
             let root = project_root.as_deref().unwrap_or(&workdir);
-            if crate::sandbox_spawn::worker_jail_active() && remote.is_some() {
-                // A host-local socket is not delegated to remote execution or
-                // its later local fallback. Neither path requires broker setup.
-                for key in [
-                    crate::gh_shim_worker_broker::SOCKET_ENV,
-                    crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV,
-                    crate::gh_shim_worker_broker::STATE_ENV,
-                ] {
-                    env.remove(key);
-                }
-                crate::slog_info!("gh_shim worker_read unavailable: task={} reason=remote launch or local fallback has no host broker; command continues without broker authority",task.paths.task_id.escape_debug());
-            }
-            if crate::sandbox_spawn::worker_jail_active()
-                && remote.is_none()
-                && plan.enforces_shell_containment()
-            {
-                crate::gh_shim_worker_broker::provision_optional(
-                    &gh_shim_ticket,
-                    &task.paths.task_id,
-                    plan.temp_dir(),
-                    std::time::Instant::now() + hard_kill.limit(),
-                    ctx.bash_background().clone(),
-                    &mut env,
-                    config.github.shim,
-                );
-            }
+            provision_worker_read_broker(
+                &plan,
+                remote.is_some(),
+                &gh_shim_ticket,
+                &task.paths.task_id,
+                std::time::Instant::now() + hard_kill.limit(),
+                ctx.bash_background().clone(),
+                &mut env,
+                config.github.shim,
+            );
             enter_bash_startup_step(BashStartupStep::Environment);
             let environment = crate::sandbox_spawn::approved_environment_for_plan(&plan, &env);
             enter_bash_startup_step(BashStartupStep::ControlFiles);
@@ -1341,6 +1325,57 @@ pub(crate) fn spawn(
             }
         }
     }
+}
+
+/// Decide, in one place, whether a jailed worker's shell receives the host-local
+/// GitHub read broker (socket, capability file and shim state directory in its
+/// private task temp). Strict and relaxed native launches both go through
+/// here, so their broker behaviour cannot drift apart. A remote launch or a
+/// profile that cannot protect the broker removes any broker paths from the
+/// child environment and logs the reason; provisioning failures are logged by
+/// `provision_optional`. Head shells are not workers and get no broker.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn provision_worker_read_broker(
+    plan: &crate::sandbox_spawn::SpawnPlan,
+    remote: bool,
+    ticket: &crate::gh_shim_ticket::PendingTicket,
+    task_id: &str,
+    deadline: std::time::Instant,
+    tasks: BgTaskRegistry,
+    env: &mut HashMap<String, String>,
+    shim_enabled: bool,
+) {
+    if !crate::sandbox_spawn::worker_jail_active() {
+        return;
+    }
+    // A host-local socket is not delegated to remote execution or its later
+    // local fallback. Neither path requires broker setup.
+    let skipped = if remote {
+        Some("remote launch or local fallback has no host broker")
+    } else {
+        plan.worker_read_broker_unavailable()
+    };
+    if let Some(reason) = skipped {
+        for key in [
+            crate::gh_shim_worker_broker::SOCKET_ENV,
+            crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV,
+            crate::gh_shim_worker_broker::STATE_ENV,
+        ] {
+            env.remove(key);
+        }
+        crate::gh_shim_worker_broker::log_unavailable(task_id, reason);
+        return;
+    }
+    crate::gh_shim_worker_broker::provision_optional(
+        ticket,
+        task_id,
+        plan.temp_dir(),
+        deadline,
+        tasks,
+        env,
+        shim_enabled,
+    );
 }
 
 fn execution_error_response(request_id: &str, native: bool, message: String) -> Response {

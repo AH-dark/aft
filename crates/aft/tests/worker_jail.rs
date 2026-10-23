@@ -3251,11 +3251,15 @@ async fn worker_jail_session_dbus_socket_is_reachable_and_reported_unenforced() 
 }
 
 async fn gh_read_jail() -> Jail {
+    gh_read_jail_with_profile("strict").await
+}
+
+async fn gh_read_jail_with_profile(profile: &str) -> Jail {
     Jail::start_with_layout_and_env(
         None,
         None,
         true,
-        "strict",
+        profile,
         false,
         false,
         worker_gh_read::configure,
@@ -3545,7 +3549,24 @@ async fn worker_gh_read_t11_cross_command_capability_file_and_socket_isolation()
     if !native_available() {
         return;
     }
-    let mut jail = gh_read_jail().await;
+    cross_command_broker_isolation("strict").await;
+}
+
+/// Relaxed macOS workers get the broker, so the same boundary must hold there:
+/// another command cannot list the shared task-temp root, read this command's
+/// capability file, connect to its broker socket, or unlink that socket to
+/// stand up its own listener in its place.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_gh_read_relaxed_cross_command_capability_file_and_socket_isolation() {
+    if !native_available() {
+        return;
+    }
+    cross_command_broker_isolation("relaxed").await;
+}
+
+async fn cross_command_broker_isolation(profile: &str) {
+    let mut jail = gh_read_jail_with_profile(profile).await;
     let paths = jail.worktree.join("broker-a-paths");
     let finish = jail.worktree.join("broker-a-finish");
     let corr = jail.submit_held_bash(json!({"command":format!(
@@ -3596,9 +3617,15 @@ async fn worker_gh_read_t11_cross_command_capability_file_and_socket_isolation()
         call_mode: None,
     })
     .await;
+    let task_temp_root = Path::new(parts[1])
+        .parent()
+        .and_then(Path::parent)
+        .expect("capability file lives in a task temp under the shared root");
     let probe = format!(
         r#"set -eu
+if ls {} >/dev/null 2>&1; then echo TASK_TEMP_ROOT_LISTED; exit 94; fi
 if cat {} >/dev/null 2>&1; then echo CAPABILITY_STOLEN; exit 95; fi
+if rm {} 2>/dev/null; then echo FOREIGN_SOCKET_UNLINKED; exit 98; fi
 if gh api repos/cortexkit/aft >/dev/null 2>&1; then echo FOREIGN_REPOSITORY_ALLOWED; exit 96; fi
 if AFT_GH_READ_SOCKET={} gh api repos/cortexkit/common-auth >/dev/null 2>&1; then echo WRONG_BROKER_ALLOWED; exit 97; fi
 python3 - {} {} <<'PY'
@@ -3627,7 +3654,9 @@ for label, path in [('CROSS', sys.argv[1]), ('ALIAS', sys.argv[2])]:
 PY
 printf 'ISOLATION_OK\n'
 "#,
+        quote(task_temp_root),
         quote(Path::new(parts[1])),
+        quote(Path::new(parts[0])),
         quote(Path::new(parts[0])),
         quote(Path::new(parts[0])),
         quote(&alias)
@@ -3675,6 +3704,62 @@ printf 'ISOLATION_OK\n'
     assert_eq!(finished["structuredContent"]["exit_code"], 0, "{finished}");
     assert!(jail.read_holder.lock().unwrap().calls.is_empty());
     assert!(!other_root.join("native-gh.log").exists());
+}
+
+/// The default worker profile is relaxed. On macOS its shell gets the broker
+/// paths, the broker files exist in its private task temp, and a bound read
+/// goes through the broker rather than any native `gh`.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_gh_read_relaxed_shell_reads_through_broker() {
+    if !native_available() {
+        return;
+    }
+    let mut jail = gh_read_jail_with_profile("relaxed").await;
+    let reply = jail
+        .bash(
+            r#"set -eu
+test -S "$AFT_GH_READ_SOCKET"
+test -r "$AFT_GH_READ_CAPABILITY_FILE"
+test -d "$AFT_GH_SHIM_STATE_DIR"
+test -z "${AFT_GH_SHIM_TICKET+x}"
+gh api repos/cortexkit/aft
+echo RELAXED_READ_OK
+"#,
+        )
+        .await;
+    assert!(reply.contains("RELAXED_READ_OK"), "{reply}");
+    assert!(reply.contains("worker-bound-read"), "{reply}");
+    let calls = jail.read_holder.lock().unwrap().calls.clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["repository"], "cortexkit/aft");
+    assert!(!jail.worktree.join("native-gh.log").exists());
+}
+
+/// Relaxed Linux enforces no filesystem deny, so another worker could read a
+/// broker capability or replace a broker socket in the shared task-temp root.
+/// Its shell therefore runs without the broker, and the daemon log says why.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn worker_gh_read_relaxed_linux_withholds_broker_and_logs_reason() {
+    if !native_available() {
+        return;
+    }
+    let mut jail = gh_read_jail_with_profile("relaxed").await;
+    let reply = jail
+        .bash(
+            r#"test -z "${AFT_GH_READ_SOCKET+x}" && test -z "${AFT_GH_READ_CAPABILITY_FILE+x}" && test -z "${AFT_GH_SHIM_STATE_DIR+x}" && test ! -e "$TMPDIR/.gh-read-capability" && echo RELAXED_LINUX_NO_BROKER"#,
+        )
+        .await;
+    assert!(reply.contains("RELAXED_LINUX_NO_BROKER"), "{reply}");
+    assert!(jail.read_holder.lock().unwrap().calls.is_empty());
+    let trace = std::fs::read_to_string(jail.base.join("daemon.log")).unwrap();
+    assert!(
+        trace.lines().any(|line| line.contains("WARN")
+            && line.contains("gh_shim worker_read unavailable")
+            && line.contains("reason=sandbox profile relaxed on Linux does not protect the shared task-temp root")),
+        "{trace}"
+    );
 }
 
 #[tokio::test]
