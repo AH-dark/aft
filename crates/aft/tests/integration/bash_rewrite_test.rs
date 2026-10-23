@@ -974,6 +974,34 @@ fn rewrite_shape_decline_log_names_predicate_and_resolved_candidate() {
     );
 }
 
+/// `cat` on a file outside the project root (a host temp folder such as
+/// `$TMPDIR/opencode/...`) is an expected, routine decline: the command runs as
+/// native bash and the agent sees ordinary `cat` output. It should not write a
+/// WARN line to the log on every call; the dispatcher already records each
+/// decline, with its reason, at debug level.
+#[test]
+#[ignore = "fails today (#759): every out-of-root cat writes a WARN line"]
+fn routine_out_of_root_cat_decline_is_not_a_warning() {
+    init_test_logger();
+
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_path = outside.path().join("opencode").join("tool-output.txt");
+    fs::create_dir_all(outside_path.parent().unwrap()).unwrap();
+    fs::write(&outside_path, "hello\n").unwrap();
+    let ctx = context(dir.path(), true);
+
+    assert!(rewrite(&format!("cat {}", outside_path.display()), &ctx).is_none());
+
+    let logs = take_logs();
+    assert!(
+        !logs
+            .iter()
+            .any(|line| line.contains("bash rewrite rule cat declined")),
+        "routine decline logged at WARN: {logs:?}"
+    );
+}
+
 #[test]
 fn rewrite_target_failure_falls_through_to_bash() {
     let dir = tempfile::tempdir().unwrap();

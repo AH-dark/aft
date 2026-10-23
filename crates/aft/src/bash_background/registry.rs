@@ -18971,6 +18971,41 @@ mod tests {
             .contains("test result: FAILED. 64 passed; 3 failed"));
     }
 
+    /// A command no compressor recognises gets only the reply byte cap, which
+    /// keeps a 6 KiB head and at most twenty tail lines. Failure lines in the
+    /// dropped middle vanish from the agent's reply even though the compressor
+    /// layer has a "[raw failure lines preserved by AFT]" rescue: that rescue
+    /// runs only after a specific compressor matched, and it runs before this
+    /// cap, not inside it.
+    #[test]
+    #[ignore = "fails today (#759): the reply byte cap drops failure lines from the middle of unrecognised output"]
+    fn reply_cap_keeps_failure_lines_from_the_middle_of_unrecognised_output() {
+        let stdout: String = (1..=3000)
+            .map(|index| match index {
+                1500 => "FAILED: step 1500 could not open fixture\n".to_string(),
+                2200 => "ERROR: step 2200 lost its connection\n".to_string(),
+                _ => format!("step {index:04} processed\n"),
+            })
+            .collect();
+        let (foreground, _completion) =
+            cargo_verdict_agent_text("./scripts/run-steps.sh", &stdout, "", 1);
+        let shown = |text: &str| {
+            text.lines()
+                .filter(|line| line.starts_with("step "))
+                .count()
+        };
+        for failure in [
+            "FAILED: step 1500 could not open fixture",
+            "ERROR: step 2200 lost its connection",
+        ] {
+            assert!(
+                foreground.contains(failure),
+                "{failure:?} dropped; {} ordinary lines shown:\n{foreground}",
+                shown(&foreground)
+            );
+        }
+    }
+
     #[test]
     fn cargo_verdict_fixture_golden_agent_output() {
         let (foreground, completion) = synapse_agent_text();
@@ -22448,6 +22483,61 @@ mod tests {
         );
         assert!(registry.kill(&task_id, session).is_ok());
         registry.shutdown();
+    }
+
+    /// What the durable log file receives for a background spawn: the captured
+    /// line passed through the same redactor `TeeWriter` applies. Inline
+    /// credentials in common shell shapes must not reach the file, and the
+    /// ordinary commands beside them must survive unchanged.
+    #[test]
+    #[ignore = "fails today (#825): spawn logs keep NAME=value, credential flags and secrets cut by the 200-char limit"]
+    fn spawn_log_masks_inline_command_credentials() {
+        let root = Path::new("/project");
+        let durable = |command: &str| -> String {
+            let ((), lines) = crate::logging::capture_log_lines(|| {
+                log_bash_spawn("bgb_test", 1, "session", root, command)
+            });
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            crate::log_redact::aft_redactor(&lines[0]).into_owned()
+        };
+        // The token body is 36 characters; only 15 survive the 200-character
+        // cut, too few for the GitHub token pattern to recognise.
+        let cut_token_body = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        let cut_token_command = format!("#{} ghp_{cut_token_body}", "x".repeat(179));
+        let mut problems = Vec::new();
+        for (command, secret) in [
+            ("GITHUB_TOKEN=plainvalue123 gh api /user", "plainvalue123"),
+            ("export OPENAI_API_KEY=plainvalue123", "plainvalue123"),
+            ("export DB_PASSWORD='plain value 123'", "plain value 123"),
+            ("PGPASSWORD=plainvalue123 psql -h db", "plainvalue123"),
+            (
+                "docker login --password plainvalue123 -u me",
+                "plainvalue123",
+            ),
+            ("cargo login --token plainvalue123", "plainvalue123"),
+            ("mysql -u root -pplainvalue123 app", "plainvalue123"),
+            (cut_token_command.as_str(), &cut_token_body[..15]),
+        ] {
+            let line = durable(command);
+            if line.contains(secret) {
+                problems.push(format!("secret survived: {line}"));
+            }
+        }
+        for command in [
+            "cargo test -p agent-file-tools --lib -- log_redact",
+            "git log -p -3 -- crates/aft/src/log_redact.rs",
+            "ssh -p 2222 deploy@host",
+            "TOKENIZERS_PARALLELISM=false MAX_TOKENS=4096 python train.py",
+            "GIT_AUTHOR_NAME=Someone GH_SHIM_BYPASS=1 git commit -m x",
+            "export GITHUB_TOKEN=$GH_TOKEN",
+            "gcloud secrets versions access latest --secret=prod-db",
+        ] {
+            let line = durable(command);
+            if !line.ends_with(&format!("cmd={command}")) {
+                problems.push(format!("mangled: {line}"));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 
     #[cfg(unix)]

@@ -773,6 +773,39 @@ mod a03_tests {
         .unwrap()
     }
 
+    /// The host `edit` tool sends a single-file `oldString` miss through this
+    /// batch path. Its error should name the miss without pasting the whole
+    /// match back; the nearest-miss excerpt that follows is already bounded.
+    #[test]
+    #[ignore = "fails today (#759): the batch not-found error repeats the entire match text"]
+    fn not_found_error_does_not_repeat_a_large_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("small.rs");
+        std::fs::write(&path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let needle: String = (0..400)
+            .map(|index| format!("    let absent_{index} = 0;\n"))
+            .collect();
+        let response = handle_batch(
+            &request(
+                &path,
+                serde_json::json!([{"match": needle, "replacement": "x"}]),
+                false,
+            ),
+            &ctx,
+        );
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "batch_edit_failed");
+        let message = response.data["message"].as_str().unwrap();
+        assert!(
+            !message.contains(&needle),
+            "{} byte match repeated in a {} byte error",
+            needle.len(),
+            message.len()
+        );
+        assert!(message.len() < 4 * 1024, "{} byte error", message.len());
+    }
+
     #[test]
     fn a03_batch_output_allocation_bound() {
         let temp = tempfile::tempdir().unwrap();
