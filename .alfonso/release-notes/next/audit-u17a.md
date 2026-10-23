@@ -1,0 +1,1 @@
+- OpenCode: an invalid shared TUI preferences file is no longer overwritten, edited project config is re-read correctly, and two OpenCode windows can no longer both take the auto-update lock.
