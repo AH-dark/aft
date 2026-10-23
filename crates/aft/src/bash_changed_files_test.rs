@@ -264,10 +264,15 @@ impl NativeWatcher {
             .clone();
         let mut ignores = ignore::gitignore::GitignoreBuilder::new(&root);
         ignores.add_line(None, "/target/").unwrap();
+        if root.join(".gitignore").is_file() {
+            assert!(ignores.add(root.join(".gitignore")).is_none());
+        }
         let matcher = Arc::new(std::sync::RwLock::new(Some(Arc::new(
             ignores.build().unwrap(),
         ))));
         let (tx, rx) = std::sync::mpsc::channel();
+        let observed_matcher = matcher.clone();
+        let observed_root = root.clone();
         let watcher = crate::watcher_backend::create_project_watcher(
             root.clone(),
             if watch_git {
@@ -322,7 +327,7 @@ impl NativeWatcher {
                     if event.need_rescan() {
                         observed_journal.gap();
                     }
-                    observed_journal.event(&event);
+                    observed_journal.event_for_root(&event, &observed_root, &observed_matcher);
                 }
             }
         });
@@ -742,4 +747,36 @@ fn bash_changed_files_expired_render_budget_marks_cut_list_incomplete() {
         Some(Reason::TimeLimit)
     );
     assert!(report.changed_files_list_envelope.total.is_at_least());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires a live FSEvents service; run as a focused native gate"
+)]
+fn bash_changed_files_ignored_paths_are_not_reported() {
+    let root = repo();
+    std::fs::write(root.path().join(".gitignore"), "config.local.json\n").unwrap();
+    let native = NativeWatcher::new(root.path(), false);
+    native.ready();
+    let capture = native.capture();
+    std::fs::write(
+        root.path().join("config.local.json"),
+        "ignored command output\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("clean.txt"), "tracked command output\n").unwrap();
+    let report = capture.finish();
+    assert!(
+        report.files.iter().any(|file| file.path == "clean.txt"),
+        "{report:?}"
+    );
+    assert!(
+        !report
+            .files
+            .iter()
+            .any(|file| file.path == "config.local.json"),
+        "ignored file leaked: {report:?}"
+    );
 }

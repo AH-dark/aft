@@ -417,7 +417,7 @@ pub(crate) fn watcher_directory_is_ignored_by_matcher(
     watcher_path_is_ignored_by_matcher_with_kind(matcher, path, root, true)
 }
 
-fn watcher_path_is_ignored_by_matcher_with_kind(
+pub(crate) fn watcher_path_is_ignored_by_matcher_with_kind(
     matcher: &SharedGitignore,
     path: &Path,
     root: &Path,
@@ -2343,7 +2343,7 @@ impl WatcherFilterThread {
                         continue;
                     }
                     if let Some(journal) = self.config.counters.bash_changes.get() {
-                        journal.event(&event);
+                        journal.event_for_root(&event, &self.config.project_root, &self.matcher);
                     }
                     if event.need_rescan() {
                         // Delay only this test's overflow notification so its

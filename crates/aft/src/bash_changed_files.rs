@@ -34,6 +34,27 @@ struct JournalState {
     events: VecDeque<(u64, PathBuf, bool)>,
 }
 impl Journal {
+    /// Raw watcher intake precedes batch filtering, so reports must apply the
+    /// same exclusions before retaining paths in their own event history.
+    pub(crate) fn event_for_root(
+        &self,
+        event: &notify::Event,
+        root: &Path,
+        matcher: &crate::watcher_filter::SharedGitignore,
+    ) {
+        let mut admitted = event.clone();
+        admitted.paths.retain(|path| {
+            let directory = matches!(
+                event.kind,
+                notify::EventKind::Create(notify::event::CreateKind::Folder)
+                    | notify::EventKind::Remove(notify::event::RemoveKind::Folder)
+            ) || path.is_dir();
+            !crate::watcher_filter::watcher_path_is_ignored_by_matcher_with_kind(
+                matcher, path, root, directory,
+            )
+        });
+        self.event(&admitted);
+    }
     pub(crate) fn event(&self, event: &notify::Event) {
         if !crate::watcher_filter::watcher_event_invalidates(&event.kind) {
             return;

@@ -923,6 +923,7 @@ fn bash_changed_files_foreground_and_background_completion_notice() {
             .success());
     }
     std::fs::write(project.path().join("file.txt"), "old\n").unwrap();
+    std::fs::write(project.path().join(".gitignore"), "config.local.json\n").unwrap();
     for args in [vec!["add", "."], vec!["commit", "-qm", "initial"]] {
         assert!(std::process::Command::new("git")
             .arg("-C")
@@ -972,7 +973,7 @@ fn bash_changed_files_foreground_and_background_completion_notice() {
         // Write as the last shell operation: no sleep gives the watcher a head
         // start before the completion barrier.
         let result = aft.send(&serde_json::json!({"id": name, "method": "bash", "params": {
-            "command": format!("printf done; printf 'hello\\n' > {name}"), "background": background, "wait": !background,
+            "command": format!("printf ignored > config.local.json; printf changed > file.txt; printf done; printf 'hello\\n' > {name}"), "background": background, "wait": !background,
             "compressed": false, "notify_on_completion": background
         }}).to_string());
         assert_eq!(result["success"], true, "{result}");
@@ -989,6 +990,17 @@ fn bash_changed_files_foreground_and_background_completion_notice() {
                 .iter()
                 .find(|item| item["task_id"] == result["task_id"])
                 .unwrap();
+            let files = completion["_bash_changed_files"]["files"]
+                .as_array()
+                .unwrap();
+            assert!(
+                files.iter().any(|file| file["path"] == "file.txt"),
+                "{completion}"
+            );
+            assert!(
+                !files.iter().any(|file| file["path"] == "config.local.json"),
+                "ignored file leaked: {completion}"
+            );
             assert!(
                 completion["_bash_changed_files"]["text"]
                     .as_str()
@@ -1021,6 +1033,15 @@ fn bash_changed_files_foreground_and_background_completion_notice() {
             );
         } else {
             let result = wait_for_terminal_status(&mut aft, result["task_id"].as_str().unwrap());
+            let files = result["_bash_changed_files"]["files"].as_array().unwrap();
+            assert!(
+                files.iter().any(|file| file["path"] == "file.txt"),
+                "{result}"
+            );
+            assert!(
+                !files.iter().any(|file| file["path"] == "config.local.json"),
+                "ignored file leaked: {result}"
+            );
             assert_eq!(
                 result["_bash_changed_files"]["incomplete"],
                 serde_json::json!([]),
