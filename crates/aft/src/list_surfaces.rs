@@ -362,9 +362,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "backup.rs",
-        enclosing_item: "read_session_disk_index, merge_disk_stack_heads",
-        location_or_primitive: "MAX_SESSION_DISCOVERY_ENTRIES, examined >= entry_limit, check_backup_discovery_deadline",
-        reason: "internal durable undo-stack discovery stops at its entry or request-deadline budget and returns an error, never a partial path list or a false no-history result; per-file undo avoids the session scan",
+        enclosing_item: "read_session_disk_index_with_budget, merge_disk_stack_heads",
+        location_or_primitive: "MAX_SESSION_DISCOVERY_ENTRIES, examined >= entry_limit, BackupIoBudget::check, ROLLBACK_CLEANUP_ALLOWANCE",
+        reason: "internal durable undo-stack discovery stops at its entry or deadline budget and returns an error, never a partial path list or false no-history result; rollback uses one independent bounded cleanup allowance after cancellation, and per-file undo avoids the session scan",
     },
     ExclusionEntry {
         file: "runtime_drain.rs",

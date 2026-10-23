@@ -56,6 +56,49 @@ const V2_FORMAT_VERSION: &str = "v2";
 const DB_RESTORE_META_VERSION: u32 = 2;
 const MAX_RESTORE_OPERATION_LOCK_RETRIES: usize = 32;
 const MAX_SESSION_DISCOVERY_ENTRIES: usize = 100_000;
+/// Recovery must finish undo bookkeeping even after its caller is cancelled,
+/// but cannot hold the backup store indefinitely waiting for a scan or lease.
+const ROLLBACK_CLEANUP_ALLOWANCE: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy)]
+struct BackupIoBudget {
+    deadline: Instant,
+    check_cancellation: bool,
+}
+
+impl BackupIoBudget {
+    fn request() -> Self {
+        Self {
+            deadline: backup_discovery_deadline(),
+            check_cancellation: true,
+        }
+    }
+
+    fn rollback_cleanup() -> Self {
+        Self {
+            deadline: Instant::now() + ROLLBACK_CLEANUP_ALLOWANCE,
+            check_cancellation: false,
+        }
+    }
+
+    fn check(self, path: &Path) -> Result<(), AftError> {
+        if self.check_cancellation {
+            check_backup_discovery_deadline(path, self.deadline)
+        } else {
+            check_rollback_cleanup_deadline(path, Some(self.deadline))
+        }
+    }
+}
+
+fn check_rollback_cleanup_deadline(path: &Path, deadline: Option<Instant>) -> Result<(), AftError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(AftError::IoError {
+            path: path.display().to_string(),
+            message: "backup rollback cleanup allowance exhausted; cleanup incomplete".to_string(),
+        });
+    }
+    Ok(())
+}
 
 fn backup_discovery_deadline() -> Instant {
     let deadline = Instant::now() + crate::bounded_io::IO_BUDGET;
@@ -3291,13 +3334,14 @@ impl BackupStore {
     }
 
     pub fn discard_operation_entries(&mut self, session: &str, op_id: &str) {
+        let budget = BackupIoBudget::rollback_cleanup();
         if let Some(skips) = self.skipped_backups.get_mut(session) {
             skips.retain(|skip| skip.op_id.as_deref() != Some(op_id));
             if skips.is_empty() {
                 self.skipped_backups.remove(session);
             }
         }
-        let keys = match self.restore_operation_candidate_keys(session) {
+        let keys = match self.operation_candidate_keys_with_budget(session, budget) {
             Ok(keys) => keys,
             Err(error) => {
                 crate::slog_warn!(
@@ -3307,7 +3351,8 @@ impl BackupStore {
             }
         };
         for key in keys {
-            if let Err(error) = self.discard_operation_entries_for_path(session, op_id, &key, true)
+            if let Err(error) =
+                self.discard_operation_entries_for_path(session, op_id, &key, true, budget)
             {
                 crate::slog_warn!(
                     "failed to discard operation backups for {}: {error}",
@@ -3323,6 +3368,7 @@ impl BackupStore {
         op_id: &str,
         path: &Path,
     ) {
+        let budget = BackupIoBudget::rollback_cleanup();
         let key = canonicalize_key(path);
         if let Some(skips) = self.skipped_backups.get_mut(session) {
             skips.retain(|skip| skip.op_id.as_deref() != Some(op_id) || skip.path != key);
@@ -3330,7 +3376,9 @@ impl BackupStore {
                 self.skipped_backups.remove(session);
             }
         }
-        if let Err(error) = self.discard_operation_entries_for_path(session, op_id, &key, false) {
+        if let Err(error) =
+            self.discard_operation_entries_for_path(session, op_id, &key, false, budget)
+        {
             crate::slog_warn!(
                 "failed to discard latest operation backup for {}: {error}",
                 key.display()
@@ -3344,12 +3392,20 @@ impl BackupStore {
         op_id: &str,
         key: &Path,
         all: bool,
+        budget: BackupIoBudget,
     ) -> Result<(), AftError> {
-        let _disk_lock = self.acquire_stack_disk_lock(session, key)?;
+        budget.check(key)?;
+        let _disk_lock = self.acquire_stack_disk_lock_with_cleanup_deadline(
+            session,
+            key,
+            Some(budget.deadline),
+        )?;
+        budget.check(key)?;
         // Route-close cleanup can release the resident stack between capture
         // and rollback. Reload under the disk lease before deciding what to pop;
         // another process may also have appended since our last snapshot.
         self.ensure_stack_hydrated_locked(session, key)?;
+        budget.check(key)?;
         let Some(mut stack) = self
             .entries
             .get(session)
@@ -4312,18 +4368,41 @@ impl BackupStore {
         session: &str,
         key: &Path,
     ) -> Result<Option<crate::fs_lock::LockGuard>, AftError> {
+        self.acquire_stack_disk_lock_with_cleanup_deadline(session, key, None)
+    }
+
+    fn acquire_stack_disk_lock_with_cleanup_deadline(
+        &self,
+        session: &str,
+        key: &Path,
+        cleanup_deadline: Option<Instant>,
+    ) -> Result<Option<crate::fs_lock::LockGuard>, AftError> {
         let Some(namespace_root) = self.storage_dir.as_deref() else {
             return Ok(None);
         };
+        check_rollback_cleanup_deadline(namespace_root, cleanup_deadline)?;
         create_private_durable_dir(namespace_root).map_err(|error| AftError::IoError {
             path: namespace_root.display().to_string(),
             message: error.to_string(),
         })?;
-        let _namespace =
-            backup_namespace_admission(namespace_root).map_err(|error| AftError::IoError {
-                path: namespace_root.display().to_string(),
-                message: error.to_string(),
-            })?;
+        let namespace = match cleanup_deadline {
+            Some(deadline) => {
+                lock_backup_namespace(namespace_root, Some(deadline), true).and_then(|guard| {
+                    guard.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "rollback cleanup namespace lease timed out",
+                        )
+                    })
+                })
+            }
+            None => backup_namespace_admission(namespace_root),
+        };
+        let _namespace = namespace.map_err(|error| AftError::IoError {
+            path: namespace_root.display().to_string(),
+            message: error.to_string(),
+        })?;
+        check_rollback_cleanup_deadline(namespace_root, cleanup_deadline)?;
         #[cfg(test)]
         AFTER_BACKUP_NAMESPACE_ADMISSION.with(|slot| {
             let hook = slot.borrow_mut().take();
@@ -4341,16 +4420,30 @@ impl BackupStore {
             message: error.to_string(),
         })?;
         let gate_path = session_gc_lock_path(&session_dir);
-        let _gate = session_gc_gate(&session_dir, true).map_err(|error| AftError::IoError {
-            path: gate_path.display().to_string(),
-            message: error.to_string(),
-        })?;
+        let gate = match cleanup_deadline {
+            Some(deadline) => session_gc_gate_until(&session_dir, deadline),
+            None => session_gc_gate(&session_dir, true),
+        };
+        let _gate = gate
+            .map_err(|error| AftError::IoError {
+                path: gate_path.display().to_string(),
+                message: error.to_string(),
+            })?
+            .ok_or_else(|| AftError::IoError {
+                path: gate_path.display().to_string(),
+                message: "rollback cleanup session lease timed out".to_string(),
+            })?;
+        check_rollback_cleanup_deadline(&session_dir, cleanup_deadline)?;
         if self.session_dir(session).as_ref() != Some(&session_dir) {
             // Repair may have migrated an inactive session while we waited for
             // its gate. Resolve again instead of recreating its legacy folder.
             drop(_gate);
             drop(_namespace);
-            return self.acquire_stack_disk_lock(session, key);
+            return self.acquire_stack_disk_lock_with_cleanup_deadline(
+                session,
+                key,
+                cleanup_deadline,
+            );
         }
         create_private_durable_dir(&session_dir).map_err(|error| AftError::IoError {
             path: session_dir.display().to_string(),
@@ -4365,12 +4458,22 @@ impl BackupStore {
             message: error.to_string(),
         })?;
         let lock_path = lock_dir.join(format!("{}.lock", Self::path_hash(key)));
-        crate::fs_lock::acquire(&lock_path)
-            .map(Some)
-            .map_err(|error| AftError::IoError {
+        check_rollback_cleanup_deadline(&lock_path, cleanup_deadline)?;
+        let guard = match cleanup_deadline {
+            Some(deadline) => {
+                crate::fs_lock::try_acquire_until(&lock_path, deadline).map_err(|error| {
+                    AftError::IoError {
+                        path: lock_path.display().to_string(),
+                        message: error.to_string(),
+                    }
+                })?
+            }
+            None => crate::fs_lock::acquire(&lock_path).map_err(|error| AftError::IoError {
                 path: lock_path.display().to_string(),
                 message: error.to_string(),
-            })
+            })?,
+        };
+        Ok(Some(guard))
     }
 
     fn acquire_stack_disk_locks(
@@ -4446,8 +4549,12 @@ impl BackupStore {
         Ok(())
     }
 
-    fn refresh_disk_index_for_session(&mut self, session: &str) -> Result<Vec<PathBuf>, AftError> {
-        let per_session = self.read_session_disk_index(session)?;
+    fn refresh_disk_index_for_session(
+        &mut self,
+        session: &str,
+        budget: BackupIoBudget,
+    ) -> Result<Vec<PathBuf>, AftError> {
+        let per_session = self.read_session_disk_index_with_budget(session, budget)?;
         let keys = per_session.keys().cloned().collect();
         if per_session.is_empty() {
             self.disk_index.remove(session);
@@ -4462,6 +4569,14 @@ impl BackupStore {
         &self,
         session: &str,
     ) -> Result<HashMap<PathBuf, DiskMeta>, AftError> {
+        self.read_session_disk_index_with_budget(session, BackupIoBudget::request())
+    }
+
+    fn read_session_disk_index_with_budget(
+        &self,
+        session: &str,
+        budget: BackupIoBudget,
+    ) -> Result<HashMap<PathBuf, DiskMeta>, AftError> {
         let Some(session_dir) = self.session_dir(session) else {
             return Ok(HashMap::new());
         };
@@ -4469,11 +4584,13 @@ impl BackupStore {
             return Ok(HashMap::new());
         }
 
-        let deadline = backup_discovery_deadline();
         #[cfg(test)]
-        let deadline = self
-            .discovery_deadline_override
-            .map_or(deadline, |override_| override_.min(deadline));
+        let budget = BackupIoBudget {
+            deadline: self
+                .discovery_deadline_override
+                .map_or(budget.deadline, |override_| override_.min(budget.deadline)),
+            ..budget
+        };
         #[cfg(not(test))]
         let entry_limit = MAX_SESSION_DISCOVERY_ENTRIES;
         #[cfg(test)]
@@ -4487,7 +4604,7 @@ impl BackupStore {
         loop {
             // Check before advancing ReadDir, including entries that will be
             // ignored. An incomplete scan must never certify absent history.
-            check_backup_discovery_deadline(&session_dir, deadline)?;
+            budget.check(&session_dir)?;
             if examined >= entry_limit {
                 return Err(AftError::IoError {
                     path: session_dir.display().to_string(),
@@ -4563,8 +4680,16 @@ impl BackupStore {
         &mut self,
         session: &str,
     ) -> Result<Vec<PathBuf>, AftError> {
+        self.operation_candidate_keys_with_budget(session, BackupIoBudget::request())
+    }
+
+    fn operation_candidate_keys_with_budget(
+        &mut self,
+        session: &str,
+        budget: BackupIoBudget,
+    ) -> Result<Vec<PathBuf>, AftError> {
         let mut keys: HashSet<PathBuf> = self
-            .refresh_disk_index_for_session(session)?
+            .refresh_disk_index_for_session(session, budget)?
             .into_iter()
             .collect();
         if let Some(files) = self.entries.get(session) {
@@ -6424,7 +6549,7 @@ fn lock_backup_namespace(
     }
 }
 
-fn session_gc_gate(session_dir: &Path, wait: bool) -> std::io::Result<Option<AdvisoryLockGuard>> {
+fn open_session_gc_gate(session_dir: &Path) -> std::io::Result<std::fs::File> {
     let path = session_gc_lock_path(session_dir);
     crate::production_storage::refuse_write(&path)?;
     let mut options = crate::private_storage::options();
@@ -6434,7 +6559,32 @@ fn session_gc_gate(session_dir: &Path, wait: bool) -> std::io::Result<Option<Adv
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options.open(path)?;
+    options.open(path)
+}
+
+fn session_gc_gate_until(
+    session_dir: &Path,
+    deadline: Instant,
+) -> std::io::Result<Option<AdvisoryLockGuard>> {
+    let file = open_session_gc_gate(session_dir)?;
+    let mut pause = Duration::from_millis(2);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(AdvisoryLockGuard::from_locked_file(file))),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(pause.min(deadline - now));
+        pause = (pause * 2).min(Duration::from_millis(50));
+    }
+}
+
+fn session_gc_gate(session_dir: &Path, wait: bool) -> std::io::Result<Option<AdvisoryLockGuard>> {
+    let file = open_session_gc_gate(session_dir)?;
     if wait {
         file.lock()?;
     } else {
@@ -8035,6 +8185,108 @@ mod tests {
         store.discard_latest_operation_entry_for_path("discard", "bad", &path);
         store.restore_last_operation("discard").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"original");
+    }
+
+    #[test]
+    fn backup_cancelled_rollback_ignores_expired_request() {
+        for single in [false, true] {
+            for released in [false, true] {
+                let (mut store, _storage, path) = durability_store();
+                fs::write(&path, b"original").unwrap();
+                store
+                    .snapshot_with_op("cancelled", &path, "success", Some("good"))
+                    .unwrap();
+                fs::write(&path, b"successful").unwrap();
+                store.record_post_mutation_states();
+                store
+                    .snapshot_with_op("cancelled", &path, "rolled back", Some("bad"))
+                    .unwrap();
+                if released {
+                    store.release_memory();
+                }
+                let cancellation = crate::executor::JobCancellation::new();
+                cancellation.request_cancel();
+                let guard = crate::executor::install_job_cancellation(cancellation);
+                crate::bounded_io::with_budget(
+                    Some(crate::bounded_io::Budget::after(Duration::ZERO)),
+                    || {
+                        assert!(crate::executor::current_job_cancelled());
+                        if single {
+                            store.discard_latest_operation_entry_for_path(
+                                "cancelled",
+                                "bad",
+                                &path,
+                            );
+                        } else {
+                            store.discard_operation_entries("cancelled", "bad");
+                        }
+                        assert!(crate::executor::current_job_cancelled());
+                    },
+                );
+                drop(guard);
+                store.record_post_mutation_states();
+                let restored = store.restore_last_operation("cancelled").unwrap();
+                assert_eq!(restored.op_id, "good");
+                assert_eq!(fs::read(&path).unwrap(), b"original");
+            }
+        }
+    }
+
+    #[test]
+    fn backup_rollback_cleanup_bounds_namespace_session_and_stack_waits() {
+        for held_stage in 0..3 {
+            let (mut store, storage, path) = durability_store();
+            let session = "cleanup-contention";
+            store
+                .snapshot_with_op(session, &path, "rolled back", Some("failed"))
+                .unwrap();
+            let session_dir = store.session_dir(session).unwrap();
+            create_private_durable_dir(&session_dir).unwrap();
+            let namespace = if held_stage == 0 {
+                backup_namespace_gate(storage.path(), None).unwrap()
+            } else {
+                None
+            };
+            let session_gate = if held_stage == 1 {
+                session_gc_gate(&session_dir, true).unwrap()
+            } else {
+                None
+            };
+            let stack = if held_stage == 2 {
+                store.acquire_stack_disk_lock(session, &path).unwrap()
+            } else {
+                None
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let cancellation = crate::executor::JobCancellation::new();
+                cancellation.request_cancel();
+                let _guard = crate::executor::install_job_cancellation(cancellation);
+                crate::bounded_io::with_budget(
+                    Some(crate::bounded_io::Budget::after(Duration::ZERO)),
+                    || {
+                        store.discard_operation_entries(session, "failed");
+                        assert!(crate::executor::current_job_cancelled());
+                        tx.send(store).unwrap();
+                    },
+                );
+            });
+            let result = rx.recv_timeout(Duration::from_secs(5));
+            // Release the held lease before joining even when the timed path
+            // regresses, so a failure cannot leave a blocked test worker behind.
+            drop((namespace, session_gate, stack));
+            worker.join().unwrap();
+            assert!(
+                result.is_ok(),
+                "cleanup waited past its allowance at lock stage {held_stage}"
+            );
+            let store = result.unwrap();
+            assert_eq!(
+                store.history(session, &path).len(),
+                1,
+                "timed-out cleanup must leave its stack intact at stage {held_stage}"
+            );
+        }
     }
 
     #[test]
