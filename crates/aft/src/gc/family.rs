@@ -456,14 +456,14 @@ fn sweep_pass(
                     "deadline reached during metadata cleanup".into(),
                 ));
             }
-            let cleanup =
-                mark_member(member, registry.family(), &bounds, true).map_err(|failure| {
+            let reclaimed =
+                reclaim_member_metadata(member, registry.family(), &bounds).map_err(|failure| {
                     match failure {
                         MarkFailure::Uncertain(reason) => FamilySweepError::Uncertain(reason),
                         MarkFailure::Bounded(reason) => FamilySweepError::Bounded(reason),
                     }
                 })?;
-            report.reclaimed_pins += cleanup.reclaimed_pins;
+            report.reclaimed_pins += reclaimed;
         }
         for member in &members {
             deregister_if_missing(registry, member, observer, &bounds, &mut report)?;
@@ -810,10 +810,33 @@ fn mark_member(
         store.as_ref(),
         bounds,
         reclaim,
+        true,
         &mut marks,
     )?;
     mark_readers(view_dir, store.as_ref(), bounds, reclaim, &mut marks)?;
     Ok(marks)
+}
+
+/// Reclaims dead-owner pin and reader files without loading references. A
+/// non-collecting pass needs only owner metadata, not manifests or live pin
+/// key lists whose contents would be discarded.
+fn reclaim_member_metadata(
+    member: &MemberRecord,
+    family: &str,
+    bounds: &SweepBounds,
+) -> Result<usize, MarkFailure> {
+    let mut cleanup = MemberMarks::default();
+    mark_pins(
+        &member.view_dir,
+        family,
+        None,
+        bounds,
+        true,
+        false,
+        &mut cleanup,
+    )?;
+    mark_readers(&member.view_dir, None, bounds, true, &mut cleanup)?;
+    Ok(cleanup.reclaimed_pins)
 }
 
 /// The entries of a protection directory, at most `bounds` of them. More
@@ -870,6 +893,7 @@ fn mark_pins(
     store: Option<&ViewStore>,
     bounds: &SweepBounds,
     reclaim: bool,
+    collect_keys: bool,
     marks: &mut MemberMarks,
 ) -> Result<(), MarkFailure> {
     let pins_dir = view_dir.join("pins");
@@ -897,6 +921,9 @@ fn mark_pins(
                 let _ = fs::remove_file(&keys_path);
                 marks.reclaimed_pins += 1;
             }
+            continue;
+        }
+        if !collect_keys {
             continue;
         }
         let keys = pins::read_keys(&keys_path).map_err(|error: PinError| {

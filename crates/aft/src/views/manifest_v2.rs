@@ -581,15 +581,60 @@ impl ViewStore {
             ViewError::GenerationMismatch(format!("`{generation}` is not a v2 generation name"))
         })?;
         let path = self.manifest_path(generation)?;
-        let manifest = ManifestV2::from_json_bytes(
-            &fs::read(&path).map_err(|error| ViewError::io_at("reading", &path, error))?,
-        )?;
+        let bytes = fs::read(&path).map_err(|error| ViewError::io_at("reading", &path, error))?;
+        #[cfg(test)]
+        MANIFEST_READS.with(|reads| {
+            if let Some(reads) = reads.borrow_mut().as_mut() {
+                let entry = reads.entry(path.clone()).or_default();
+                entry.0 += 1;
+                entry.1 += bytes.len() as u64;
+            }
+        });
+        let manifest = ManifestV2::from_json_bytes(&bytes)?;
         if manifest.content_fingerprint()? != name.content {
             return Err(ViewError::GenerationMismatch(format!(
                 "manifest {generation} does not match its content fingerprint"
             )));
         }
         Ok(manifest)
+    }
+}
+
+#[cfg(test)]
+type ManifestReads = BTreeMap<std::path::PathBuf, (u64, u64)>;
+
+#[cfg(test)]
+thread_local! {
+    static MANIFEST_READS: std::cell::RefCell<Option<ManifestReads>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Counts successful manifest file reads and their byte demand on this thread,
+/// at the actual read boundary rather than at a marking or cache lookup site.
+#[cfg(test)]
+pub(crate) struct ManifestReadProbe;
+
+#[cfg(test)]
+impl ManifestReadProbe {
+    pub(crate) fn start() -> Self {
+        MANIFEST_READS.with(|reads| {
+            let mut reads = reads.borrow_mut();
+            assert!(reads.is_none(), "manifest read probes cannot nest");
+            *reads = Some(BTreeMap::new());
+        });
+        Self
+    }
+
+    pub(crate) fn finish(self) -> ManifestReads {
+        MANIFEST_READS.with(|reads| reads.borrow_mut().take().unwrap())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ManifestReadProbe {
+    fn drop(&mut self) {
+        MANIFEST_READS.with(|reads| {
+            reads.borrow_mut().take();
+        });
     }
 }
 

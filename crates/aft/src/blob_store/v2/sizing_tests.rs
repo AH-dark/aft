@@ -575,4 +575,73 @@ fn io_amplification_real_payload_touch_probe() {
         )
         .unwrap();
     probe_touch(&store, &keys, "real_callgraph_split_control", true);
+
+    // A zero-budget all-live pass must inspect references to establish that
+    // collection is unnecessary; measure its manifest and SQLite read demand.
+    use crate::views::manifest_v2::{
+        EntryPlanes, EntryV2, GenerationName, ManifestHeader, ManifestReadProbe, ManifestV2,
+        Producers, PublishV2,
+    };
+    use crate::views::readiness::PlaneState;
+    use crate::views::RelPath;
+    let checkout = dir.path().join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let view = registry.register_view("probe-live", &checkout).unwrap();
+    crate::views::eviction::wait_for_background_enforcement(&registry);
+    let mut manifest = ManifestV2::new(ManifestHeader {
+        producers: Producers {
+            trigram: "trigram-v1".into(),
+            semantic: None,
+            callgraph: "callgraph-v1".into(),
+        },
+        head_tree: None,
+        ignore_fingerprint: None,
+        segment: None,
+    });
+    for (index, key) in keys.iter().enumerate() {
+        manifest
+            .insert(
+                RelPath::new(format!("src/file-{index}.rs").into_bytes()).unwrap(),
+                EntryV2::regular(
+                    ContentHash::of(key.as_bytes()),
+                    0,
+                    EntryPlanes {
+                        trigram: None,
+                        semantic: None,
+                        callgraph: Some(PlaneState::ready(key)),
+                    },
+                ),
+            )
+            .unwrap();
+    }
+    let view_store = view.view_store().unwrap();
+    let name = GenerationName::for_manifest(&manifest).unwrap();
+    let prepared = view_store.prepare_v2(&name, None, &manifest, None).unwrap();
+    assert_eq!(
+        view_store.commit_v2(prepared, None).unwrap(),
+        PublishV2::Published
+    );
+    let manifests = ManifestReadProbe::start();
+    let sqlite = ReadProbe::install(&lock(&store.inner.connection));
+    let report = crate::gc::family::sweep_family_remeasured(
+        &registry,
+        None,
+        crate::gc::family::FamilySweepPolicy { byte_budget: 0 },
+        crate::gc::family::SweepBounds::default(),
+        None,
+    )
+    .unwrap();
+    let manifest_reads = manifests.finish();
+    let loads = manifest_reads.values().map(|(loads, _)| loads).sum::<u64>();
+    let bytes = manifest_reads.values().map(|(_, bytes)| bytes).sum::<u64>();
+    eprintln!(
+        "IO_PROBE {}",
+        serde_json::json!({
+            "kind": "all_live_sweep", "rows": keys.len(), "manifest_loads": loads,
+            "manifest_read_bytes": bytes, "sqlite_main_read_bytes": sqlite.read_bytes(),
+            "overflow_reads": sqlite.counts().1,
+        })
+    );
+    assert_eq!(report.skipped, Some("nothing to collect"));
+    assert_eq!(loads, 1, "skip cleanup must not reload the live manifest");
 }

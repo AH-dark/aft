@@ -1180,3 +1180,89 @@ fn deleting_pass_marks_every_live_key_before_deletion() {
     }
     assert!(!fixture.store.contains(&chunk_key(8)).unwrap());
 }
+
+#[test]
+fn all_live_preflight_reads_each_manifest_once_and_reclaims_dead_owners() {
+    use crate::views::manifest_v2::ManifestReadProbe;
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = build(dir.path(), 4, |_| true);
+    let view_store = fixture.view.view_store().unwrap();
+    let protected_generation = view_store.current_generation().unwrap().unwrap();
+    publish_marks(&fixture.view, 0..3);
+    let current_generation = view_store.current_generation().unwrap().unwrap();
+    assert_ne!(current_generation, protected_generation);
+    let live_reader =
+        crate::root_cache::ReadMarker::create(fixture.view.view_dir(), &protected_generation)
+            .unwrap();
+    let live_pin =
+        crate::pins::AssemblyPin::create_v2(&fixture.view, "live-assembly", &[chunk_key(0)])
+            .unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--list")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let dead_pid = child.id();
+    child.wait().unwrap();
+    let (dead_pin, dead_keys) = crate::pins::pin_paths(fixture.view.view_dir(), "dead-assembly");
+    let metadata = crate::pins::PinMetadata {
+        family: FAMILY.to_owned(),
+        view: fixture.view.scope().to_owned(),
+        generation: "dead-assembly".to_owned(),
+        owner: crate::pins::PinOwner {
+            pid: dead_pid,
+            start_time: 0,
+        },
+        created_at: 0,
+        renewed_at: 0,
+    };
+    fs::write(&dead_pin, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    fs::write(&dead_keys, b"").unwrap();
+    let dead_marker =
+        crate::root_cache::ReadMarker::create(fixture.view.view_dir(), "dead-reader").unwrap();
+    let dead_marker_path = dead_marker.path().to_path_buf();
+    let mut dead_metadata = dead_marker.metadata().clone();
+    drop(dead_marker);
+    dead_metadata.pid = dead_pid;
+    fs::write(
+        &dead_marker_path,
+        serde_json::to_vec(&dead_metadata).unwrap(),
+    )
+    .unwrap();
+    let before = fixture.store.gc_epoch().unwrap();
+    let probe = ManifestReadProbe::start();
+    let report = sweep_family_remeasured(
+        &fixture.registry,
+        None,
+        FamilySweepPolicy { byte_budget: 0 },
+        SweepBounds::default(),
+        None,
+    )
+    .unwrap();
+    let reads = probe.finish();
+    assert_eq!(report.skipped, Some("nothing to collect"));
+    assert_eq!(fixture.store.gc_epoch().unwrap(), before);
+    assert_eq!(report.reclaimed_pins, 1);
+    assert!(!dead_pin.exists() && !dead_keys.exists() && !dead_marker_path.exists());
+    assert!(live_reader.path().exists());
+    assert!(
+        crate::pins::pin_paths(fixture.view.view_dir(), "live-assembly")
+            .0
+            .exists()
+    );
+    assert_eq!(
+        reads.len(),
+        2,
+        "current and distinct reader-protected generations must be inspected"
+    );
+    for generation in [&current_generation, &protected_generation] {
+        let path = view_store.manifest_path(generation).unwrap();
+        assert_eq!(
+            reads.get(&path),
+            Some(&(1, fs::metadata(&path).unwrap().len())),
+            "cleanup must not reload {generation}"
+        );
+    }
+    drop(live_pin);
+}
