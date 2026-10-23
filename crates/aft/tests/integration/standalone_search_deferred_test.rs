@@ -1211,7 +1211,7 @@ fn standalone_edit_then_grep_regex_does_not_return_replaced_text() {
         &json!({
             "id": "regex-edit", "command": "tool_call", "session_id": "regex-freshness",
             "name": "edit", "arguments": {
-                "filePath": "src/source.ts",
+                "path": "src/source.ts",
                 "edits": [{ "oldString": "libc::c_ulong", "newString": "libc::Ioctl" }]
             }
         })
