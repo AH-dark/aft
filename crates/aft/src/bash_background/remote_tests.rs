@@ -1211,6 +1211,87 @@ fn runon_uncaptured_reply_reports_terminal_outcome_not_starting() {
     assert_eq!(cached.success, expected.success);
 }
 
+pub(crate) struct UncapturedTerminalBeforeRenderForTest {
+    pub(crate) dir: tempfile::TempDir,
+    pub(crate) registry: BgTaskRegistry,
+    pub(crate) task: Arc<BgTask>,
+    release: crossbeam_channel::Sender<()>,
+    publisher: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for UncapturedTerminalBeforeRenderForTest {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
+        if let Some(publisher) = self.publisher.take() {
+            let result = publisher.join();
+            if !std::thread::panicking() {
+                result.unwrap();
+            }
+        }
+    }
+}
+
+pub(crate) fn uncaptured_terminal_before_render_for_test(
+    refused: bool,
+) -> UncapturedTerminalBeforeRenderForTest {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, _) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf unused");
+    let task = registry.task(&task_id).unwrap();
+    {
+        let mut state = task.state.lock().unwrap();
+        let remote = state.metadata.remote.as_mut().unwrap();
+        remote.explicit_runon = true;
+        remote.accepted = false;
+        remote.job_id = None;
+    }
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release, release_rx) = crossbeam_channel::bounded(1);
+    TERMINAL_PUBLICATION_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            task_id,
+            KillSignalGate {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        );
+    let publisher = {
+        let registry = registry.clone();
+        let task = task.clone();
+        std::thread::spawn(move || {
+            let verdict = if refused {
+                Verdict::RunLocally {
+                    reason: RefusalReason::Unreachable,
+                    refusal_detail: None,
+                }
+            } else {
+                Verdict::Signalled { signal: 9 }
+            };
+            registry.remote_terminal(
+                &task,
+                verdict,
+                refused.then(|| {
+                    "runon refused: remote refused: unreachable; command was not run".into()
+                }),
+            );
+        })
+    };
+    let fixture = UncapturedTerminalBeforeRenderForTest {
+        dir,
+        registry,
+        task,
+        release,
+        publisher: Some(publisher),
+    };
+    reached_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("terminal metadata published before rendering");
+    fixture
+}
+
 #[test]
 fn runon_network_lost_acceptance_does_not_claim_rerun_safe() {
     let dir = tempfile::tempdir().unwrap();

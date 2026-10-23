@@ -4244,3 +4244,6 @@ fn proves_no_start(error: &exec::Error) -> bool {
 #[cfg(all(test, unix))]
 #[path = "remote_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+pub(crate) use tests::uncaptured_terminal_before_render_for_test;

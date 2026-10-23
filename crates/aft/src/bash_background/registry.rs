@@ -1209,6 +1209,9 @@ pub(crate) struct BashDrainReplyState {
     pub(crate) execution_note: Option<String>,
     pub(crate) deadline: Option<(HardKillDeadline, u64)>,
     pub(crate) inputs_captured: Option<bool>,
+    /// Artifact-free terminal diagnostics, published with the metadata before
+    /// the full output renderer can finish the canonical response below.
+    pub(crate) uncaptured_terminal_facts: Option<Arc<crate::protocol::Response>>,
     pub(crate) uncaptured_terminal: Option<Arc<crate::protocol::Response>>,
 }
 
@@ -1222,6 +1225,17 @@ impl BashDrainReplyCache {
             .as_ref()
             .filter(|remote| remote.explicit_runon)
             .map(|remote| remote.accepted);
+        let terminal_facts =
+            (inputs_captured == Some(false) && metadata.is_terminal()).then(|| {
+                let mut snapshot = terminal_metadata_snapshot(metadata.clone());
+                if let Some(note) = &note {
+                    snapshot.output_preview = format!("{note}\n");
+                }
+                append_remote_report(&mut snapshot.output_preview, metadata);
+                Arc::new(
+                    crate::commands::bash_orchestrate::foreground_result_response("", snapshot),
+                )
+            });
         let mut published = self
             .0
             .lock()
@@ -1229,6 +1243,7 @@ impl BashDrainReplyCache {
         published.execution_note = note;
         published.deadline = deadline;
         published.inputs_captured = inputs_captured;
+        published.uncaptured_terminal_facts = terminal_facts;
         if inputs_captured != Some(false) || !metadata.is_terminal() {
             published.uncaptured_terminal = None;
         }
@@ -13649,6 +13664,15 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
                 .unwrap_or(false)
         })
     };
+    let mut snapshot = terminal_metadata_snapshot(metadata);
+    snapshot.output_path = existing_path(row.stdout_path);
+    snapshot.stderr_path = existing_path(row.stderr_path);
+    snapshot
+}
+
+/// Terminal facts without command output or artifact access. The normal
+/// snapshot renderer fills those details once they are available.
+fn terminal_metadata_snapshot(metadata: PersistedTask) -> BgTaskSnapshot {
     let duration_ms = metadata.duration_ms.or_else(|| {
         metadata
             .finished_at
@@ -13681,9 +13705,9 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
         output_preview: String::new(),
         bash_output_list_envelope: None,
         output_truncated: false,
-        output_path: existing_path(row.stdout_path),
+        output_path: None,
         output_incomplete: metadata.output_incomplete,
-        stderr_path: existing_path(row.stderr_path),
+        stderr_path: None,
         pty_rows: (metadata.mode == BgMode::Pty).then_some(metadata.pty_rows.unwrap_or(24)),
         pty_cols: (metadata.mode == BgMode::Pty).then_some(metadata.pty_cols.unwrap_or(80)),
         pty_screen: None,

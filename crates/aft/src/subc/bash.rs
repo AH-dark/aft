@@ -202,6 +202,111 @@ mod frame_loop_lock_tests {
     use super::*;
 
     #[tokio::test]
+    async fn module_drain_reports_uncaptured_terminal_before_output_rendering() {
+        for refused in [true, false] {
+            let fixture = crate::bash_background::registry::remote::uncaptured_terminal_before_render_for_test(refused);
+            let root = ProjectRootId::from_path(fixture.dir.path()).unwrap();
+            let task = &fixture.task;
+            let cached = fixture
+                .registry
+                .drain_reply_cache(&task.task_id, &task.session_id);
+            let published = cached.snapshot();
+            assert_eq!(published.inputs_captured, Some(false));
+            assert!(
+                published
+                    .uncaptured_terminal_facts
+                    .as_ref()
+                    .is_some_and(|reply| reply.data["status"] == "failed"),
+                "finished facts must accompany terminal metadata"
+            );
+            assert!(
+                published.uncaptured_terminal.is_none(),
+                "the terminal renderer must still be gated"
+            );
+            let metrics = DispatchPathMetrics::new();
+            let route = RouteChannel {
+                channel: 1,
+                epoch: 1,
+            };
+            metrics.held_bash_calls.insert(route, 1);
+            metrics
+                .held_bash_calls
+                .set_phase(route, 1, drain::BashHoldPhase::Wait);
+            metrics.held_bash_calls.set_detach_target(
+                route,
+                1,
+                drain::BashDetachTarget {
+                    reply_cache: cached,
+                    run_scoped: true,
+                    task_id: task.task_id.clone(),
+                    session_id: task.session_id.clone(),
+                    wait_mode: false,
+                    worker_session: false,
+                    server_completion: false,
+                    late_results: false,
+                    registry: fixture.registry.clone(),
+                    request_id: "terminal-before-render".into(),
+                    ver: PROTOCOL_VERSION,
+                    flags: Flags::new(false, Priority::Passive, false),
+                    format_context: Default::default(),
+                },
+            );
+            let routes = HashMap::from([(
+                route,
+                super::super::test_support::route_identity(&root, &task.session_id),
+            )]);
+            let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
+            let state = task.state.lock().unwrap();
+            assert!(state.metadata.status.is_terminal());
+            let no_task_locks =
+                crate::bash_background::registry::forbid_task_state_locks_for_test();
+            let reply =
+                answer_held_bash_calls_from_module_loop(&writer_tx, &routes, &metrics, true);
+            tokio::pin!(reply);
+            let answered = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(reply.as_mut(), cx))
+            })
+            .await;
+            assert!(
+                matches!(answered, std::task::Poll::Ready(Ok(1))),
+                "drain must not wait for rendering: {answered:?}"
+            );
+            let frame = writer_rx.try_recv().expect("terminal drain frame").frame;
+            let body: Value = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(
+                body["structuredContent"]["status"], "failed",
+                "refused={refused}: {body}"
+            );
+            assert_eq!(
+                body["structuredContent"]["exit_code"],
+                if refused { Value::Null } else { json!(137) }
+            );
+            assert!(
+                !body.to_string().contains(REMOTE_INPUT_CAPTURE_WARNING),
+                "{body}"
+            );
+            assert!(
+                !body
+                    .to_string()
+                    .contains("Detached because AFT is restarting"),
+                "{body}"
+            );
+            if refused {
+                assert_eq!(body["structuredContent"]["success"], false, "{body}");
+                assert_eq!(
+                    body["structuredContent"]["code"], "remote_unavailable",
+                    "{body}"
+                );
+                assert!(body.to_string().contains("unreachable"), "{body}");
+            } else {
+                assert!(body.to_string().contains("remote signal 9"), "{body}");
+            }
+            drop(no_task_locks);
+            drop(state);
+        }
+    }
+
+    #[tokio::test]
     async fn due_remote_handback_check_never_locks_task_state_on_frame_loop() {
         let (_dir, ctx, task) =
             crate::bash_background::registry::default_kill_tests::wait_fixture(None);
@@ -376,7 +481,7 @@ mod frame_loop_lock_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn stateful_module_drain_reply_for_test(
     registry: &crate::bash_background::BgTaskRegistry,
     task_id: &str,
@@ -686,7 +791,10 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                 // the note and capture inputs before releasing task state;
                 // only pure response formatting happens here.
                 let response = if cached.inputs_captured == Some(false) {
-                    if let Some(terminal) = cached.uncaptured_terminal {
+                    if let Some(terminal) = cached
+                        .uncaptured_terminal
+                        .or(cached.uncaptured_terminal_facts)
+                    {
                         let mut reply = copy_response(&terminal);
                         reply.id = target.request_id.clone();
                         reply
