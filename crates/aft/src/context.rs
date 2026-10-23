@@ -1161,6 +1161,8 @@ pub struct StatusEmitter {
     context: Mutex<Weak<AppContext>>,
     #[cfg(test)]
     pub(crate) snapshot_builds: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) memory_census_builds: AtomicUsize,
 }
 
 /// The part of a context's status emitter that the process-wide debounce
@@ -2435,6 +2437,8 @@ impl StatusEmitter {
             context: Mutex::new(Weak::new()),
             #[cfg(test)]
             snapshot_builds: AtomicUsize::new(0),
+            #[cfg(test)]
+            memory_census_builds: AtomicUsize::new(0),
         }
     }
 
@@ -3647,6 +3651,13 @@ impl App {
         &self,
     ) -> crate::lifecycle_census::LifecycleCensusSnapshot {
         self.lifecycle_census.snapshot()
+    }
+
+    pub(crate) fn lifecycle_lsp_applicability_for_root(
+        &self,
+        root: &str,
+    ) -> Option<crate::lsp::manager::ApplicabilityMetrics> {
+        self.lifecycle_census.lsp_applicability_for_root(root)
     }
 
     pub fn stdout_writer(&self) -> SharedStdoutWriter {
@@ -15984,6 +15995,10 @@ impl AppContext {
         current_root: Option<&Path>,
         cap_detail: bool,
     ) -> crate::memory::MemorySnapshot {
+        #[cfg(test)]
+        self.status_emitter()
+            .memory_census_builds
+            .fetch_add(1, Ordering::Relaxed);
         let mut roots = BTreeMap::new();
         let (roots_status, contexts) = match self.app.try_memory_contexts() {
             Some(contexts) => ("ready", contexts),

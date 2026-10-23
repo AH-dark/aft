@@ -618,6 +618,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn status_push_narrow_builder_matches_full_snapshot_projection() {
+        let fixture = busy_root();
+        let expected = project(&fixture.ctx, fixture.ctx.build_status_snapshot());
+        let pushed = fixture.ctx.try_build_status_push_snapshot().unwrap();
+        assert_eq!(pushed, expected);
+    }
+
     struct Refusals(Vec<(PersistedStore, PathBuf)>);
     impl Drop for Refusals {
         fn drop(&mut self) {
