@@ -17,6 +17,8 @@ import {
 } from "./bash-wait-detach.js";
 import {
   appendInTurnBgCompletions,
+  appendPendingWakeRecovery,
+  cancelPendingWakesForContext,
   extractSessionID,
   getActiveSessionId,
   handleIdleBgCompletions,
@@ -25,6 +27,7 @@ import {
   handlePushedPatternMatch,
   handleSubcBgEventsNudge,
   observeOpenCodeBgNotificationEvent,
+  runDetachedBgHandler,
 } from "./bg-notifications.js";
 import {
   applyToolSurfaceOverrides,
@@ -76,13 +79,14 @@ import {
 import { AftRpcServer } from "./shared/rpc-server.js";
 import { releaseSessionState } from "./shared/session-cleanup.js";
 import {
+  closeDeletedSessionRoutes,
   getSessionDirectory,
   getSessionDirectoryCached,
   verifySessionDirectory,
   warmSessionDirectory,
 } from "./shared/session-directory.js";
 import { coerceAftStatus, formatStatusMarkdown, NOT_STARTED_STATUS_TEXT } from "./shared/status.js";
-import { registerShutdownCleanup } from "./shutdown-hooks.js";
+import { registerShutdownCleanup, schedulePassiveTimer } from "./shutdown-hooks.js";
 import { instrumentToolMap } from "./tool-perf.js";
 import { buildAftToolDefinitions, openCodeHashlineEffective } from "./tool-registration.js";
 import { createInspectTier2IdleScheduler } from "./tools/inspect.js";
@@ -314,6 +318,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // chat.message loads the config on every message; skip the full reload while
   // neither config file has changed.
   const loadAftConfigIfChanged = createUnchangedConfigLoader(loadAftConfig);
+  const loggedConfigRejections = new WeakSet<ConfigRejectedError>();
   const loadAftConfigOrLastGood = (projectRoot: string): typeof aftConfig => {
     try {
       const loaded = loadAftConfigIfChanged(projectRoot);
@@ -321,7 +326,10 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       return loaded;
     } catch (err) {
       if (!(err instanceof ConfigRejectedError)) throw err;
-      error(err.message);
+      if (!loggedConfigRejections.has(err)) {
+        loggedConfigRejections.add(err);
+        error(err.message);
+      }
       return lastGoodConfig.get(projectRoot) ?? aftConfig;
     }
   };
@@ -377,39 +385,51 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // from that bridge, so draining/acking against a session-dir cache fallback
       // can target the wrong project on cold/stale cache.
       const sessionDir = bridge.getCwd();
-      return handlePushedBgCompletion(
-        {
-          ctx,
-          directory: sessionDir,
-          sessionID: completion.session_id,
-          client: input.client,
-        },
-        completion,
+      return runDetachedBgHandler(
+        () =>
+          handlePushedBgCompletion(
+            {
+              ctx,
+              directory: sessionDir,
+              sessionID: completion.session_id,
+              client: input.client,
+            },
+            completion,
+          ),
+        (err) => warn(`Background completion handler failed: ${String(err)}`),
       );
     },
     onBashLongRunning: (reminder, bridge) => {
       const sessionDir = bridge.getCwd();
-      return handlePushedBgLongRunning(
-        {
-          ctx,
-          directory: sessionDir,
-          sessionID: reminder.session_id,
-          client: input.client,
-        },
-        reminder,
+      return runDetachedBgHandler(
+        () =>
+          handlePushedBgLongRunning(
+            {
+              ctx,
+              directory: sessionDir,
+              sessionID: reminder.session_id,
+              client: input.client,
+            },
+            reminder,
+          ),
+        (err) => warn(`Background long-running handler failed: ${String(err)}`),
       );
     },
     onBashPatternMatch: (frame, bridge) => {
       const sessionDir = bridge.getCwd();
       const liveSession = getActiveSessionId();
-      return handlePushedPatternMatch(
-        {
-          ctx,
-          directory: sessionDir,
-          sessionID: liveSession ?? frame.session_id,
-          client: input.client,
-        },
-        frame,
+      return runDetachedBgHandler(
+        () =>
+          handlePushedPatternMatch(
+            {
+              ctx,
+              directory: sessionDir,
+              sessionID: liveSession ?? frame.session_id,
+              client: input.client,
+            },
+            frame,
+          ),
+        (err) => warn(`Background pattern-match handler failed: ${String(err)}`),
       );
     },
   };
@@ -536,10 +556,13 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // control, not implicit process-group death. Instance disposal runs only this
   // registration; process-exit handlers retain the global drain.
   let clearInspectTier2Idle = () => {};
+  let clearAnnouncementTimer = () => {};
   const shutdownCleanup = registerShutdownCleanup(async (reason) => {
+    cancelPendingWakesForContext(ctx);
     autoUpdateAbort.abort();
     liveConfigReload.stop();
     clearInspectTier2Idle();
+    clearAnnouncementTimer();
     for (const unsubscribe of statusUnsubscribes) {
       try {
         unsubscribe();
@@ -729,7 +752,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // Both share the same last_announced_version file and the same ANNOUNCEMENT_VERSION
   // constant, so bugfix releases don't re-fire a stale dialog. No-op when empty.
   if (ANNOUNCEMENT_VERSION && ANNOUNCEMENT_FEATURES.length > 0) {
-    setTimeout(() => {
+    clearAnnouncementTimer = schedulePassiveTimer(() => {
       sendFeatureAnnouncement(
         notifyOpts,
         ANNOUNCEMENT_VERSION,
@@ -838,9 +861,22 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   return {
     tool: allTools,
     "experimental.chat.system.transform": async (
-      _input: { sessionID?: string; model: unknown },
+      systemInput: { sessionID?: string; model: unknown },
       output: { system: string[] },
     ) => {
+      if (systemInput.sessionID) {
+        const recovered = { output: "" };
+        await appendPendingWakeRecovery(
+          {
+            ctx,
+            directory: getSessionDirectoryCached(systemInput.sessionID) ?? input.directory,
+            sessionID: systemInput.sessionID,
+            client: input.client,
+          },
+          recovered,
+        );
+        if (recovered.output) appendHintsToSystem(output.system, recovered.output);
+      }
       if (!hintsBlock) return;
       // Extend the existing entry instead of pushing a second system
       // message; strict Qwen-family templates reject non-leading system
@@ -866,7 +902,9 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         inspectTier2Idle.clear(sessionID);
         // Release this session's transport routes (subc: tool + bg_events;
         // standalone: no-op). Best-effort — never block the event hook.
-        void pool.closeSession(input.directory, sessionID).catch(() => {});
+        void closeDeletedSessionRoutes(pool, sessionID, input.worktree ?? input.directory).catch(
+          () => {},
+        );
         return;
       }
       if (eventType !== "session.idle") return;
