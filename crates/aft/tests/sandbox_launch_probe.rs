@@ -1760,10 +1760,15 @@ fn linux_support_reports_sccache_server_unblockable_on_landlock() {
     );
     let support: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(support["backend"], "landlock");
-    assert_eq!(
-        support["unenforced"],
-        serde_json::json!(["sccache_server_unblockable_on_landlock"])
-    );
+    // Kernels before Landlock ABI 6 cannot scope signals, so the worker signal
+    // limit is listed as unenforced there and nowhere else.
+    let mut expected = vec!["sccache_server_unblockable_on_landlock"];
+    match support["signal_scope"].as_str() {
+        Some("same_command") => {}
+        Some("not_enforced") => expected.push("signal_scope"),
+        other => panic!("unexpected signal_scope {other:?}: {support}"),
+    }
+    assert_eq!(support["unenforced"], serde_json::json!(expected));
 }
 
 #[cfg(target_os = "linux")]
