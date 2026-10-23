@@ -3070,9 +3070,9 @@ async fn every_catalog_preset_passes_the_conformance_suite() {
 /// Runs the published suite against the real module and compares its case
 /// outcomes with the inventory pinned in the fixture for this preset and this
 /// build: `hooks` when the crash kill hook is compiled in, `no_hooks`
-/// otherwise. The runner selects cases from the declared capabilities alone,
-/// so the feature-off build must skip exactly the cases that need
-/// `approval_execution`.
+/// otherwise. The runner combines declared capabilities with capabilities
+/// inferred from live discovery, including the preset-less catalog's list.
+/// The feature-off build skips the cases that need `approval_execution`.
 ///
 /// Known gap in the conformance runner (the
 /// `cortexkit-role-tool-provider-conformance` dev-dependency, from 0.5.0 up
@@ -3145,6 +3145,11 @@ async fn conformance_inventory(subject: Subject) {
     // must pass; the provider conforms for the capabilities it declares and
     // the skipped ones remain undeclared.
     assert!(failed.is_empty(), "failed conformance cases: {failed:?}");
+    assert_eq!(
+        report.outcome("catalog_listed_presets_served"),
+        Some(&CaseOutcome::Passed),
+        "the live preset list must enable and pass the served-presets case"
+    );
     eprintln!(
         "v1 binds ({build}): {} passed, {} failed, {} capability skips, {} kills",
         enabled.len() - failed.len(),

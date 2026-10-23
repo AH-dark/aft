@@ -2,19 +2,19 @@
   "registry_artifacts": [
     {
       "name": "cortexkit-role-tool-provider",
-      "version": "0.8.0",
+      "version": "0.10.4",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "192ba87687c8617f14e14b14a5b7ff17757e13d9f2bd8f6429535fa8e427ae85",
+      "checksum": "ca097348ffbd27d40a327528b078140bcbc3fa06ac096c13f84a7c7dc908ccc4",
       "dependency_kind": "normal",
-      "release_tag": "cortexkit-role-tool-provider-v0.8.0"
+      "release_tag": "cortexkit-role-tool-provider-v0.10.4"
     },
     {
       "name": "cortexkit-role-tool-provider-conformance",
-      "version": "0.8.0",
+      "version": "0.10.1",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "934da6effe205c9c619c03d7b6e36905248681f7996baaf45fce7f2f167830a9",
+      "checksum": "4d917b2b6ae9797a09da083670a8039c2905bf988dbd89c1dbab5c718b5c352d",
       "dependency_kind": "dev",
-      "release_tag": "cortexkit-role-tool-provider-conformance-v0.8.0"
+      "release_tag": "cortexkit-role-tool-provider-conformance-v0.10.1"
     },
     {
       "name": "cortexkit-role-harness",
@@ -112,6 +112,9 @@
       "head": {
         "hooks": {
           "enabled_cases": [
+            "user_commands_catalog",
+            "catalog_emits_events_boolean",
+            "catalog_listed_presets_served",
             "role_describe_shape",
             "role_describe_cacheable",
             "catalog_schemas_flat",
@@ -148,6 +151,13 @@
             "call_mode_matches_catalog"
           ],
           "skipped_cases": [
+            "catalog_capability_filter_matches_describe",
+            "user_commands_reply",
+            "user_commands_repeat",
+            "user_commands_codemode_refused",
+            "user_commands_flow_refused",
+            "user_commands_accepted_late",
+            "tool_result_held_reply_route_gating",
             "tool_result_content_v1_valid"
           ],
           "capabilities": [
@@ -165,6 +175,9 @@
         },
         "no_hooks": {
           "enabled_cases": [
+            "user_commands_catalog",
+            "catalog_emits_events_boolean",
+            "catalog_listed_presets_served",
             "role_describe_shape",
             "role_describe_cacheable",
             "catalog_schemas_flat",
@@ -197,6 +210,13 @@
             "call_mode_matches_catalog"
           ],
           "skipped_cases": [
+            "catalog_capability_filter_matches_describe",
+            "user_commands_reply",
+            "user_commands_repeat",
+            "user_commands_codemode_refused",
+            "user_commands_flow_refused",
+            "user_commands_accepted_late",
+            "tool_result_held_reply_route_gating",
             "late_results_cursor_round_trip",
             "late_results_ack",
             "crash_after_prepared_not_started",
@@ -219,6 +239,9 @@
       "worker": {
         "hooks": {
           "enabled_cases": [
+            "user_commands_catalog",
+            "catalog_emits_events_boolean",
+            "catalog_listed_presets_served",
             "role_describe_shape",
             "role_describe_cacheable",
             "catalog_schemas_flat",
@@ -255,6 +278,13 @@
             "call_mode_matches_catalog"
           ],
           "skipped_cases": [
+            "catalog_capability_filter_matches_describe",
+            "user_commands_reply",
+            "user_commands_repeat",
+            "user_commands_codemode_refused",
+            "user_commands_flow_refused",
+            "user_commands_accepted_late",
+            "tool_result_held_reply_route_gating",
             "tool_result_content_v1_valid"
           ],
           "capabilities": [
@@ -272,6 +302,9 @@
         },
         "no_hooks": {
           "enabled_cases": [
+            "user_commands_catalog",
+            "catalog_emits_events_boolean",
+            "catalog_listed_presets_served",
             "role_describe_shape",
             "role_describe_cacheable",
             "catalog_schemas_flat",
@@ -304,6 +337,13 @@
             "call_mode_matches_catalog"
           ],
           "skipped_cases": [
+            "catalog_capability_filter_matches_describe",
+            "user_commands_reply",
+            "user_commands_repeat",
+            "user_commands_codemode_refused",
+            "user_commands_flow_refused",
+            "user_commands_accepted_late",
+            "tool_result_held_reply_route_gating",
             "late_results_cursor_round_trip",
             "late_results_ack",
             "crash_after_prepared_not_started",
@@ -326,6 +366,9 @@
       "reader": {
         "hooks": {
           "enabled_cases": [
+            "user_commands_catalog",
+            "catalog_emits_events_boolean",
+            "catalog_listed_presets_served",
             "role_describe_shape",
             "role_describe_cacheable",
             "catalog_schemas_flat",
@@ -346,6 +389,13 @@
             "catalog_modes_valid"
           ],
           "skipped_cases": [
+            "catalog_capability_filter_matches_describe",
+            "user_commands_reply",
+            "user_commands_repeat",
+            "user_commands_codemode_refused",
+            "user_commands_flow_refused",
+            "user_commands_accepted_late",
+            "tool_result_held_reply_route_gating",
             "terminal_frame_on_cancel",
             "withdraw_unknown_call",
             "withdraw_answer_identical_on_repeat_and_owner",
@@ -373,6 +423,9 @@
         },
         "no_hooks": {
           "enabled_cases": [
+            "user_commands_catalog",
+            "catalog_emits_events_boolean",
+            "catalog_listed_presets_served",
             "role_describe_shape",
             "role_describe_cacheable",
             "catalog_schemas_flat",
@@ -393,6 +446,13 @@
             "catalog_modes_valid"
           ],
           "skipped_cases": [
+            "catalog_capability_filter_matches_describe",
+            "user_commands_reply",
+            "user_commands_repeat",
+            "user_commands_codemode_refused",
+            "user_commands_flow_refused",
+            "user_commands_accepted_late",
+            "tool_result_held_reply_route_gating",
             "terminal_frame_on_cancel",
             "withdraw_unknown_call",
             "withdraw_answer_identical_on_repeat_and_owner",
