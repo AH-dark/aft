@@ -21,7 +21,7 @@ on:
         type: boolean
         default: false
       storm_profile_probe:
-        description: Compare the no-LTO storm profile with the normal thin-LTO lane
+        description: Compare thin LTO with the normal no-LTO storm lane
         required: false
         type: boolean
         default: false
@@ -550,7 +550,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
-      CARGO_PROFILE_CI_STORM_LTO: thin
+      CARGO_PROFILE_CI_STORM_LTO: "false"
     steps:
       - uses: actions/checkout@v5
 
@@ -560,7 +560,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: ci-storm-thin
+          shared-key: ci-storm-off
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -569,7 +569,7 @@ jobs:
       - uses: ./.github/actions/storm-suite
 
   unit-linux-storm-profile-probe:
-    name: Storm profile comparison (no LTO)
+    name: Storm profile comparison (thin LTO)
     if: ${{ inputs.storm_profile_probe && github.event_name != 'pull_request' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 40
@@ -577,14 +577,14 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
-      CARGO_PROFILE_CI_STORM_LTO: "false"
+      CARGO_PROFILE_CI_STORM_LTO: thin
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: ci-storm-off
+          shared-key: ci-storm-thin
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/setup-nextest

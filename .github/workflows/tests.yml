@@ -32,7 +32,7 @@ on:
   workflow_dispatch:
     inputs:
       storm_profile_probe:
-        description: Compare no-LTO and thin-LTO storm builds on free runners
+        description: Compare the no-LTO storm lane with thin LTO on free runners
         required: false
         type: boolean
         default: false

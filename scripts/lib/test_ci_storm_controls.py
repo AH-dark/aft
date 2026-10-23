@@ -76,7 +76,7 @@ class StormControlTests(unittest.TestCase):
     def test_storm_profile_does_not_relax_bounds_or_change_production(self):
         manifest = (ROOT / "Cargo.toml").read_text()
         profile = manifest.split("[profile.ci-storm]\n", 1)[1].split("\n[", 1)[0]
-        for setting in ('inherits = "release"', 'opt-level = 3', 'lto = "thin"', 'codegen-units = 16', 'debug-assertions = false'):
+        for setting in ('inherits = "release"', 'opt-level = 3', 'lto = false', 'codegen-units = 16', 'debug-assertions = false'):
             self.assertIn(setting, profile)
         production = manifest.split("[profile.release]\n", 1)[1].split("\n[", 1)[0]
         self.assertIn("lto = true", production)
@@ -98,13 +98,13 @@ class StormWorkflowTests(unittest.TestCase):
         self.assertEqual(job["runs-on"], "ubuntu-22.04")
         self.assertEqual(job["timeout-minutes"], "40")
         self.assertTrue(any(step.get("uses") == "./.github/actions/storm-suite" for step in job["steps"]))
-        self.assertEqual(job["env"]["CARGO_PROFILE_CI_STORM_LTO"], "thin")
+        self.assertEqual(job["env"]["CARGO_PROFILE_CI_STORM_LTO"], "false")
 
     def test_both_lto_options_run_the_same_inventory_and_positive_controls(self):
         suite = gates.parse_workflow(str(ROOT / ".github/workflows/_unit-suite.yml"))
         probe = suite["jobs"]["unit-linux-storm-profile-probe"]
         self.assertEqual(probe["if"], "${{ inputs.storm_profile_probe && github.event_name != 'pull_request' }}")
-        self.assertEqual(probe["env"]["CARGO_PROFILE_CI_STORM_LTO"], "false")
+        self.assertEqual(probe["env"]["CARGO_PROFILE_CI_STORM_LTO"], "thin")
         self.assertEqual(probe["runs-on"], "ubuntu-22.04")
         self.assertTrue(any(step.get("uses") == "./.github/actions/storm-suite" for step in probe["steps"]))
         action = gates.parse_workflow(str(ROOT / ".github/actions/storm-suite/action.yml"))

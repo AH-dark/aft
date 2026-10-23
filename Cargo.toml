@@ -51,11 +51,11 @@ debug = 1
 panic = "unwind"
 
 # The latency harness keeps release optimization and absolute bounds, but does
-# not ship its binaries. Parallel codegen and thin LTO avoid the fat-LTO link
+# not ship its binaries. Parallel codegen without LTO avoids the fat-LTO link
 # paid by production artifacts; CI also checks delayed-response controls.
 [profile.ci-storm]
 inherits = "release"
 opt-level = 3
-lto = "thin"
+lto = false
 codegen-units = 16
 debug-assertions = false
