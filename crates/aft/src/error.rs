@@ -53,6 +53,9 @@ pub enum AftError {
     AmbiguousIndentation {
         message: String,
     },
+    DeniedFloor {
+        path: String,
+    },
 }
 
 impl AftError {
@@ -71,6 +74,7 @@ impl AftError {
             AftError::MemberNotFound { .. } => "member_not_found",
             AftError::IoError { .. } => "io_error",
             AftError::AmbiguousIndentation { .. } => "ambiguous_indentation",
+            AftError::DeniedFloor { .. } => "denied_floor",
         }
     }
 
@@ -88,6 +92,9 @@ impl AftError {
 impl fmt::Display for AftError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            AftError::DeniedFloor { path } => {
+                write!(f, "path '{}' is denied by the access policy floor", path)
+            }
             AftError::SymbolNotFound { name, file } => {
                 write!(f, "symbol '{}' not found in {}", name, file)
             }
