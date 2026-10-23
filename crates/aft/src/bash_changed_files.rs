@@ -23,6 +23,7 @@ const OUTSIDE_GIT: &str =
 const GIT_UNAVAILABLE: &str = "No diffs: git before-images could not be captured within the time/output budget, so only paths are listed.";
 const OVERFLOW: &str = "Incomplete: the file watcher overflowed, so some changes may be missing.";
 pub(crate) const NOT_CAUGHT_UP: &str = "Incomplete: the file watcher had not caught up when the command ended, so some changes may be missing.";
+const NOT_SHOWN: &str = "not shown: file is denied or could not be safely opened";
 
 fn comparison_path(path: &Path) -> Cow<'_, Path> {
     // Git and canonicalize can spell the same Windows path differently.
@@ -159,6 +160,7 @@ pub(crate) struct Capture {
     flush: Option<Arc<crate::watcher_backend::flush::FlushControl>>,
     call_deadline: SharedCallDeadline,
     git: Option<GitStart>,
+    read_policy: Option<ReadPolicy>,
     end: OnceLock<(u64, u64, u64)>,
     report: OnceLock<Report>,
     #[cfg(test)]
@@ -171,7 +173,62 @@ struct GitStart {
     dirty: BTreeSet<PathBuf>,
 }
 
+#[derive(Debug)]
+struct ReadPolicy {
+    access: crate::access_policy::AccessPolicy,
+    deny_prefixes: Vec<PathBuf>,
+    native_data: Option<crate::sandbox_profile::SandboxDataPolicy>,
+}
+
+impl ReadPolicy {
+    fn new(
+        mut access: crate::access_policy::AccessPolicy,
+        profile: Option<&crate::sandbox_profile::SandboxProfile>,
+    ) -> Self {
+        let mut deny_prefixes = Vec::new();
+        if let Some(profile) = profile {
+            // Use the actual launch profile so reports preserve its hook,
+            // credential and environment read restrictions.
+            access.absolute_floor.extend(
+                profile
+                    .read_deny
+                    .iter()
+                    .chain(&profile.keychain_deny)
+                    .cloned(),
+            );
+            deny_prefixes.extend(profile.deny_prefixes.iter().cloned());
+        }
+        Self {
+            access,
+            deny_prefixes,
+            native_data: profile.map(|profile| profile.data_policy.clone()),
+        }
+    }
+
+    fn allows(&self, path: &Path) -> bool {
+        let path = crate::inspect::job::normalize_path(path);
+        self.access
+            .decide(crate::access_policy::AccessOperation::Read, &path, false)
+            == crate::access_policy::AccessDecision::Allow
+            && self.native_data.as_ref().is_none_or(|data| {
+                !data.deny.iter().any(|denied| path.starts_with(denied))
+                    || data
+                        .read_allow
+                        .iter()
+                        .any(|allowed| path.starts_with(allowed))
+            })
+            && !self.deny_prefixes.iter().any(|prefix| {
+                path.as_os_str()
+                    .to_string_lossy()
+                    .starts_with(prefix.as_os_str().to_string_lossy().as_ref())
+            })
+            && !crate::project_content::is_excluded(&path)
+    }
+}
+
 thread_local! { static CURRENT: RefCell<Option<Arc<Capture>>> = const { RefCell::new(None) }; }
+#[cfg(test)]
+thread_local! { static READ_AFTER_CHECK_FOR_TEST: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) }; }
 pub(crate) struct Scope(Option<Arc<Capture>>);
 pub(crate) type SharedCallDeadline = Arc<Mutex<Option<Instant>>>;
 pub(crate) struct BudgetGuard(SharedCallDeadline);
@@ -207,7 +264,19 @@ pub(crate) fn current() -> Option<Arc<Capture>> {
 }
 
 impl Capture {
+    #[cfg(test)]
     pub(crate) fn start(ctx: &crate::context::AppContext) -> Option<Arc<Self>> {
+        Self::start_for_spawn(
+            ctx,
+            "bash_changed_files",
+            &crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+        )
+    }
+    pub(crate) fn start_for_spawn(
+        ctx: &crate::context::AppContext,
+        request_id: &str,
+        plan: &crate::sandbox_spawn::SpawnPlan,
+    ) -> Option<Arc<Self>> {
         let mode = ctx.config().bash.changed_files;
         if mode == BashChangedFiles::Off {
             return None;
@@ -220,6 +289,12 @@ impl Capture {
             .get_or_init(|| Arc::new(Journal::default()))
             .clone();
         let mut capture = Self::begin(root, journal, mode, ctx.watcher_runtime_active());
+        if mode == BashChangedFiles::Diff {
+            Arc::get_mut(&mut capture).unwrap().read_policy = ctx
+                .access_policy(request_id)
+                .ok()
+                .map(|access| ReadPolicy::new(access, plan.changed_files_read_profile()));
+        }
         Arc::get_mut(&mut capture).unwrap().flush = Some(ctx.watcher_counters().bash_flush.clone());
         if let Some(deadline) = crate::bash_background::changed_files_deadline_for_spawn() {
             Arc::get_mut(&mut capture).unwrap().call_deadline = deadline;
@@ -257,6 +332,7 @@ impl Capture {
             flush: None,
             call_deadline: Arc::new(Mutex::new(None)),
             git,
+            read_policy: None,
             end: OnceLock::new(),
             report: OnceLock::new(),
             #[cfg(test)]
@@ -463,12 +539,62 @@ impl Capture {
             changed_files_list_envelope: list_envelope,
         }
     }
+    fn verified_file(
+        &self,
+        path: &Path,
+    ) -> Result<Option<crate::commands::file_read_exact::OpenedFile>, ()> {
+        use crate::commands::file_read_exact::{open_no_follow, opened_location, ReadExactRefusal};
+        let policy = self.read_policy.as_ref().ok_or(())?;
+        let root = self.root.canonicalize().map_err(|_| ())?;
+        let target = root.join(path);
+        if !policy.allows(&target) {
+            return Err(());
+        }
+        #[cfg(test)]
+        READ_AFTER_CHECK_FOR_TEST.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        match open_no_follow(&root, &target) {
+            Ok(file) => {
+                let metadata = file.metadata().map_err(|_| ())?;
+                if crate::db::file_identity::is_live_sqlite_handle(&metadata)
+                    || metadata.file_type().is_symlink()
+                {
+                    return Err(());
+                }
+                let opened = opened_location(&file).map_err(|_| ())?;
+                // Compare the descriptor's location, not a second lookup of the
+                // pathname. Windows parent reparse points must fail closed too.
+                if comparison_path(&opened) != comparison_path(&target) || !policy.allows(&opened) {
+                    return Err(());
+                }
+                Ok(Some(file))
+            }
+            Err(ReadExactRefusal::NotFound) => {
+                // Git still records the deleted file's previous contents. Verify
+                // its parent by handle before trusting the missing final component.
+                let parent = target.parent().ok_or(())?;
+                let directory = open_no_follow(&root, parent).map_err(|_| ())?;
+                if !directory.metadata().map_err(|_| ())?.is_dir()
+                    || comparison_path(&opened_location(&directory).map_err(|_| ())?)
+                        != comparison_path(parent)
+                {
+                    return Err(());
+                }
+                Ok(None)
+            }
+            Err(_) => Err(()),
+        }
+    }
+
     fn diff_file(
         &self,
         git: &GitStart,
         path: &Path,
         _created: bool,
-        exists: bool,
+        _exists: bool,
         deadline: Instant,
         file: &mut ChangedFile,
     ) {
@@ -489,6 +615,14 @@ impl Capture {
             file.reason = Some("no diff: path is not valid UTF-8".into());
             return;
         }
+        let mut checked = match self.verified_file(path) {
+            Ok(file) => file,
+            Err(()) => {
+                file.reason = Some(NOT_SHOWN.into());
+                return;
+            }
+        };
+        let exists = checked.is_some();
         if git
             .dirty
             .iter()
@@ -537,28 +671,17 @@ impl Capture {
         if !before.is_empty() {
             file.status = if exists { "modified" } else { "deleted" };
         }
-        let after = if exists {
+        let after = if let Some(opened) = checked.as_mut() {
             if Instant::now() >= deadline {
                 return;
             }
-            if !std::fs::canonicalize(&absolute)
-                .is_ok_and(|path| comparison_path(&path).starts_with(comparison_path(&self.root)))
-            {
-                file.reason = Some("no diff: path resolves outside the project".into());
-                return;
-            }
-            if Instant::now() >= deadline {
-                return;
-            }
-            match std::fs::symlink_metadata(&absolute) {
+            match opened.metadata() {
                 Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_FILE_BYTES as u64 => {
-                    if Instant::now() >= deadline {
-                        return;
-                    }
                     use std::io::Read;
                     let mut bytes = Vec::new();
-                    if std::fs::File::open(&absolute)
-                        .and_then(|f| f.take((MAX_FILE_BYTES + 1) as u64).read_to_end(&mut bytes))
+                    if (&mut **opened)
+                        .take((MAX_FILE_BYTES + 1) as u64)
+                        .read_to_end(&mut bytes)
                         .is_err()
                         || bytes.len() > MAX_FILE_BYTES
                     {

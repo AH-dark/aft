@@ -39,7 +39,21 @@ fn event(journal: &Journal, root: &Path, name: &str, kind: notify::EventKind) {
 }
 fn capture(root: &Path, mode: BashChangedFiles) -> (Arc<Journal>, Arc<Capture>) {
     let journal = Arc::new(Journal::default());
-    let capture = Capture::begin(root.to_path_buf(), journal.clone(), mode, true);
+    let mut capture = Capture::begin(root.to_path_buf(), journal.clone(), mode, true);
+    if mode == BashChangedFiles::Diff {
+        let config = crate::config::Config::default();
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let access = crate::access_policy::AccessPolicy::from_config(
+            &config,
+            &root.join(".test-aft-storage"),
+            vec![root.canonicalize().unwrap()],
+            &home,
+        );
+        Arc::get_mut(&mut capture).unwrap().read_policy = Some(ReadPolicy::new(access, None));
+    }
     (journal, capture)
 }
 #[test]
@@ -915,4 +929,180 @@ fn bash_changed_files_windows_canonical_git_root_keeps_before_images() {
         );
         std::fs::remove_dir_all(root.path().join("nested")).unwrap();
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_changed_files_diff_never_reads_swapped_ancestor_git_hook() {
+    let root = repo();
+    std::fs::write(
+        root.path().join(".git/hooks/pre-commit"),
+        "PRIVATE_HOOK_MUST_NOT_APPEAR\n",
+    )
+    .unwrap();
+    let (journal, capture) = capture(root.path(), BashChangedFiles::Diff);
+    assert!(capture.git.is_some());
+    std::fs::create_dir(root.path().join("alias")).unwrap();
+    std::fs::write(root.path().join("alias/pre-commit"), "temporary\n").unwrap();
+    event(
+        &journal,
+        root.path(),
+        "alias/pre-commit",
+        notify::EventKind::Create(CreateKind::File),
+    );
+    std::fs::remove_dir_all(root.path().join("alias")).unwrap();
+    std::os::unix::fs::symlink(root.path().join(".git/hooks"), root.path().join("alias")).unwrap();
+    let report = capture.finish();
+    assert!(
+        !serde_json::to_string(report)
+            .unwrap()
+            .contains("PRIVATE_HOOK_MUST_NOT_APPEAR"),
+        "denied contents leaked: {report:?}"
+    );
+    let file = report
+        .files
+        .iter()
+        .find(|file| file.path == "alias/pre-commit")
+        .expect("path remains listed");
+    assert!(file.diff.is_none(), "unsafe read produced a diff: {file:?}");
+    assert_eq!(file.reason.as_deref(), Some(NOT_SHOWN));
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_changed_files_diff_rechecks_opened_handle_after_ancestor_swap() {
+    let root = repo();
+    std::fs::write(
+        root.path().join(".git/hooks/pre-commit"),
+        "PRIVATE_HOOK_RACE_MUST_NOT_APPEAR\n",
+    )
+    .unwrap();
+    let (journal, capture) = capture(root.path(), BashChangedFiles::Diff);
+    std::fs::create_dir(root.path().join("alias")).unwrap();
+    std::fs::write(root.path().join("alias/pre-commit"), "temporary\n").unwrap();
+    event(
+        &journal,
+        root.path(),
+        "alias/pre-commit",
+        notify::EventKind::Create(CreateKind::File),
+    );
+    let alias = root.path().join("alias");
+    let hooks = root.path().join(".git/hooks");
+    READ_AFTER_CHECK_FOR_TEST.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::fs::remove_dir_all(&alias).unwrap();
+            std::os::unix::fs::symlink(hooks, alias).unwrap();
+        }))
+    });
+    let report = capture.finish();
+    assert!(!serde_json::to_string(report)
+        .unwrap()
+        .contains("PRIVATE_HOOK_RACE_MUST_NOT_APPEAR"));
+    assert_eq!(report.files[0].reason.as_deref(), Some(NOT_SHOWN));
+    assert!(report.files[0].diff.is_none());
+}
+
+#[test]
+fn bash_changed_files_diff_respects_configured_and_credential_read_floors() {
+    let root = repo();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    let secret = root.path().join("private.txt");
+    let (journal, mut capture) = capture(root.path(), BashChangedFiles::Diff);
+    let mut config = crate::config::Config::default();
+    config.sandbox.read_deny = vec![secret];
+    let access = crate::access_policy::AccessPolicy::from_config(
+        &config,
+        &root.path().join(".test-storage"),
+        vec![root.path().canonicalize().unwrap()],
+        &home,
+    );
+    Arc::get_mut(&mut capture).unwrap().read_policy = Some(ReadPolicy::new(access, None));
+    std::fs::write(
+        root.path().join("private.txt"),
+        "CONFIGURED_SECRET_MUST_NOT_APPEAR\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".ssh/id_rsa"),
+        "CREDENTIAL_SECRET_MUST_NOT_APPEAR\n",
+    )
+    .unwrap();
+    for name in ["private.txt", "home/.ssh/id_rsa"] {
+        event(
+            &journal,
+            root.path(),
+            name,
+            notify::EventKind::Modify(ModifyKind::Any),
+        );
+    }
+    let report = capture.finish();
+    assert_eq!(report.files.len(), 2);
+    assert!(
+        report
+            .files
+            .iter()
+            .all(|file| file.diff.is_none() && file.reason.as_deref() == Some(NOT_SHOWN)),
+        "{report:?}"
+    );
+    assert!(!serde_json::to_string(report)
+        .unwrap()
+        .contains("SECRET_MUST_NOT_APPEAR"));
+}
+
+#[test]
+fn bash_changed_files_diff_inherits_shell_launch_read_denies() {
+    let root = repo();
+    let storage = tempfile::tempdir().unwrap();
+    let secret = root.path().join("environment-secret.txt");
+    std::fs::write(&secret, "LAUNCH_PROFILE_SECRET_MUST_NOT_APPEAR\n").unwrap();
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(root.path().into());
+    config.storage_dir = Some(storage.path().into());
+    config.bash.changed_files = BashChangedFiles::Diff;
+    let ctx =
+        crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let mut profile = crate::sandbox_profile::SandboxProfile::build(
+        vec![root.path().into()],
+        vec![],
+        vec![],
+        vec![],
+        vec![secret.clone()],
+        vec![],
+        vec![],
+        root.path().into(),
+    )
+    .unwrap();
+    profile.deny_prefixes = vec![root.path().join("credential-prefix")];
+    let profile = profile.canonicalize_for_launch().unwrap();
+    let plan = crate::sandbox_spawn::SpawnPlan::Launcher {
+        profile,
+        launcher_path: PathBuf::from("unused-test-launcher"),
+    };
+    let capture = Capture::start_for_spawn(&ctx, "read-floor-test", &plan).unwrap();
+    std::fs::write(
+        root.path().join("credential-prefix.toml"),
+        "PREFIX_SECRET_MUST_NOT_APPEAR\n",
+    )
+    .unwrap();
+    for name in ["environment-secret.txt", "credential-prefix.toml"] {
+        event(
+            &capture.journal,
+            &capture.root,
+            name,
+            notify::EventKind::Create(CreateKind::File),
+        );
+    }
+    let report = capture.finish();
+    assert_eq!(report.files.len(), 2);
+    assert!(
+        report
+            .files
+            .iter()
+            .all(|file| file.diff.is_none() && file.reason.as_deref() == Some(NOT_SHOWN)),
+        "{report:?}"
+    );
+    assert!(!serde_json::to_string(report)
+        .unwrap()
+        .contains("SECRET_MUST_NOT_APPEAR"));
 }
