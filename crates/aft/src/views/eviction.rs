@@ -1637,13 +1637,20 @@ fn spawn_enforcement(registry: FamilyRegistry, force: bool) -> Scheduled {
 /// The body of the one enforcement thread: runs `first`, then every queued
 /// pass in order, and exits when the queue is empty.
 fn run_enforcement_queue(first: FamilyRegistry, force: bool) {
+    run_enforcement_queue_with(first, force, run_enforcement_pass);
+}
+
+fn run_enforcement_queue_with(
+    first: FamilyRegistry,
+    force: bool,
+    mut run_pass: impl FnMut(&FamilyRegistry, bool),
+) {
     let mut next = Some((first, force));
     while let Some((registry, force)) = next.take() {
         let force = lock_scheduler().forced.remove(registry.path()) || force;
         // A panicking pass must not take the queued passes with it.
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_enforcement_pass(&registry, force)
-        }));
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_pass(&registry, force)));
         if outcome.is_err() {
             crate::slog_warn!(
                 "view disk limits check panicked family={}",
@@ -1652,11 +1659,18 @@ fn run_enforcement_queue(first: FamilyRegistry, force: bool) {
         }
         let mut scheduler = lock_scheduler();
         if scheduler.forced.remove(registry.path()) {
-            scheduler.pending.insert(registry.path().to_path_buf());
-            next = Some((registry, true));
-        } else {
-            next = scheduler.queue.pop_front();
+            let key = registry.path().to_path_buf();
+            if scheduler.pending.insert(key.clone()) {
+                // Repeated admission failures must not jump ahead of families
+                // that were already waiting for disk maintenance.
+                scheduler.queue.push_back((registry, true));
+            } else {
+                // A request queued this family after its pass released the
+                // pending slot. Upgrade that entry rather than duplicating it.
+                scheduler.forced.insert(key);
+            }
         }
+        next = scheduler.queue.pop_front();
         if next.is_none() {
             scheduler.runner = false;
         }
@@ -3188,6 +3202,83 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(!is_running(&key));
+    }
+
+    #[test]
+    fn repeated_hard_limit_admissions_do_not_starve_a_queued_family() {
+        if std::env::var_os("AFT_TEST_FAIR_SWEEP_CHILD").is_none() {
+            // The queue is process-global. Run this ordering fixture alone so
+            // unrelated tests cannot start a worker against its seeded queue.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "views::eviction::tests::repeated_hard_limit_admissions_do_not_starve_a_queued_family", "--nocapture", "--test-threads=1"])
+                .env("AFT_TEST_FAIR_SWEEP_CHILD", "1")
+                .output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                "isolated fairness test failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let stuck_storage = tempfile::tempdir().unwrap();
+        let queued_storage = tempfile::tempdir().unwrap();
+        let stuck = FamilyRegistry::open(stuck_storage.path(), FAMILY).unwrap();
+        let queued = FamilyRegistry::open(queued_storage.path(), FAMILY).unwrap();
+        let root = stuck_storage.path().join("held-root");
+        fs::create_dir_all(&root).unwrap();
+        let held = stuck.register_view("held", &root).unwrap();
+        publish(&held, &[("held.txt", text(1, 2_000))], 8);
+        idle_view(&queued, "idle", 2, 8);
+        wait_for_background_enforcement(&stuck);
+        wait_for_background_enforcement(&queued);
+        stuck.set_disk_budget(budget(0, 1));
+        queued.set_disk_budget(budget(0, 1));
+        assert!(measure(&stuck, None).unwrap().view_store_bytes > 1);
+        assert!(measure(&queued, None).unwrap().view_store_bytes > 1);
+        {
+            let mut scheduler = lock_scheduler();
+            assert!(!scheduler.runner && scheduler.queue.is_empty());
+            scheduler.runner = true;
+            scheduler.pending.insert(stuck.path().to_path_buf());
+            scheduler.pending.insert(queued.path().to_path_buf());
+            scheduler.queue.push_back((queued.clone(), true));
+        }
+        let mut passes = 0;
+        let mut retries = 0;
+        let mut queued_pass = None;
+        run_enforcement_queue_with(stuck.clone(), true, |registry, force| {
+            passes += 1;
+            if registry.path() == stuck.path() && retries < 4 {
+                // Retry while this family is pending, as a caller can during
+                // a slow enforcement pass. The held session cannot be evicted.
+                assert!(matches!(
+                    admit_new_view(registry),
+                    Err(RegistryError::AdmissionQueued(_))
+                ));
+                retries += 1;
+            }
+            run_enforcement_pass(registry, force);
+            if registry.path() == queued.path() {
+                queued_pass = Some(passes);
+            }
+        });
+        assert_eq!(retries, 4);
+        assert!(recorded_totals(&stuck).unwrap().unwrap().view_store_bytes > 1);
+        assert!(
+            queued.member("idle").unwrap().is_none(),
+            "the queued family's over-limit view must be removed"
+        );
+        assert_eq!(
+            family_payload_bytes(&queued).unwrap(),
+            0,
+            "the queued family must also be swept"
+        );
+        assert_eq!(
+            queued_pass,
+            Some(2),
+            "an older queued family must run before a forced retry"
+        );
     }
 
     /// Background passes of many families run one at a time, process-wide:
