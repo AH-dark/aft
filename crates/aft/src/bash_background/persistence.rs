@@ -1135,7 +1135,7 @@ fn lock_session_directory(session_dir: &Path) -> io::Result<File> {
 }
 
 fn lock_session_directories(session_dirs: &[&Path]) -> io::Result<Vec<File>> {
-    let mut storage_roots = Vec::with_capacity(session_dirs.len());
+    let mut roots = Vec::with_capacity(session_dirs.len());
     for session_dir in session_dirs {
         let task_root = session_dir
             .parent()
@@ -1143,15 +1143,27 @@ fn lock_session_directories(session_dirs: &[&Path]) -> io::Result<Vec<File>> {
         let storage_root = task_root
             .parent()
             .ok_or_else(|| io::Error::other("task root has no storage parent"))?;
-        crate::private_storage::open_dir(storage_root, task_root)?;
-        storage_roots.push(storage_root.to_path_buf());
+        let lock_path = storage_root.join(".bash-task-session.lock");
+        for path in [storage_root, task_root, *session_dir, lock_path.as_path()] {
+            crate::production_storage::refuse_write(path)?;
+        }
+        roots.push((storage_root.to_path_buf(), task_root.to_path_buf()));
     }
+    roots.sort();
+    roots.dedup();
+    for (storage_root, task_root) in &roots {
+        crate::private_storage::open_dir(storage_root, task_root)?;
+    }
+    let mut storage_roots = roots
+        .into_iter()
+        .map(|(storage_root, _)| storage_root)
+        .collect::<Vec<_>>();
     storage_roots.sort();
     storage_roots.dedup();
     storage_roots
         .into_iter()
         .map(|storage_root| {
-            let lock = OpenOptions::new()
+            let lock = crate::private_storage::options()
                 .create(true)
                 .read(true)
                 .write(true)
@@ -3554,6 +3566,47 @@ extern "system" {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn refused_task_layout_creation_leaves_storage_root_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        for (name, allocate) in [("create", false), ("allocate", true)] {
+            let storage = fixture.path().join(name);
+            std::fs::create_dir(&storage).unwrap();
+            std::fs::set_permissions(&storage, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let before_mode = std::fs::metadata(&storage).unwrap().permissions().mode() & 0o777;
+            let before_entries = std::fs::read_dir(&storage).unwrap().count();
+
+            let error = crate::production_storage::with_test_account(&storage, false, || {
+                let result = if allocate {
+                    super::allocate_task_layout(&storage, "session")
+                } else {
+                    super::create_task_layout(&storage, "session", "bash-0000000000000040")
+                };
+                result.unwrap_err()
+            });
+
+            assert!(
+                error.to_string().contains(crate::production_storage::CODE),
+                "protected task write was not refused: {error}"
+            );
+            assert_eq!(
+                std::fs::metadata(&storage).unwrap().permissions().mode() & 0o777,
+                before_mode,
+                "refused task creation changed storage permissions"
+            );
+            assert_eq!(
+                std::fs::read_dir(&storage).unwrap().count(),
+                before_entries,
+                "refused task creation added a storage entry"
+            );
+            assert!(!storage.join("bash-tasks").exists());
+            assert!(!storage.join(".bash-task-session.lock").exists());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn empty_task_directory_is_classified_and_removed_on_delete() {
