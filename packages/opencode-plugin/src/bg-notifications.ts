@@ -154,6 +154,8 @@ export const sessionBgStates: Map<string, SessionBgState> = new Map();
 
 // Lazily evict idle, task-free sessions after 1 hour; no timer is used so the plugin doesn't keep the event loop alive.
 export const SESSION_BG_STATE_IDLE_TTL_MS = 60 * 60 * 1000;
+const SESSION_BG_SWEEP_INTERVAL_MS = 60_000;
+let lastSessionSweepAt: number | null = null;
 const DEBOUNCE_STEP_MS = 200;
 const DEBOUNCE_CAP_MS = 1000;
 const MAX_WAKE_SEND_ATTEMPTS = 5;
@@ -1536,6 +1538,7 @@ export function __resetBgNotificationStateForTests(): void {
     for (const admission of state.wakeAdmissions.values()) clearWakeAdmission(state, admission);
   }
   sessionBgStates.clear();
+  lastSessionSweepAt = null;
   subcNudgesInFlight = new WeakMap();
   subcNudgeLogState.clear();
   for (const deferred of deferredBusyWakes.values()) clearTimeout(deferred.timer);
@@ -2009,12 +2012,35 @@ function ingestDrainedBgCompletions(
 }
 
 function cleanupIdleSessionStates(now: number): void {
+  if (
+    lastSessionSweepAt !== null &&
+    now >= lastSessionSweepAt &&
+    now - lastSessionSweepAt < SESSION_BG_SWEEP_INTERVAL_MS
+  )
+    return;
+  lastSessionSweepAt = now;
   const cutoff = now - SESSION_BG_STATE_IDLE_TTL_MS;
   for (const [sessionID, state] of sessionBgStates) {
     if (state.outstandingTaskIds.size > 0) continue;
     if (state.lastSeenAt >= cutoff) continue;
+    // Pending, admitted, and unacknowledged work must survive idle cleanup until consumed.
+    if (
+      state.pendingCompletions.length ||
+      state.pendingLongRunning.length ||
+      state.pendingPatternMatches.length ||
+      state.deliveringTaskIds.size ||
+      state.deliveredAwaitingAckTaskIds.size ||
+      state.wakeAdmissions.size ||
+      state.wakeDeferredTaskIds.size ||
+      state.debounceTimer ||
+      state.unknownCompletions.length ||
+      state.untrackedCompletionSinceDrain ||
+      deferredBusyWakes.has(sessionID)
+    )
+      continue;
     if (state.debounceTimer) clearTimeout(state.debounceTimer);
     for (const admission of state.wakeAdmissions.values()) clearWakeAdmission(state, admission);
+    clearDeferredBusyWake(sessionID);
     sessionBgStates.delete(sessionID);
   }
 }
@@ -2246,4 +2272,16 @@ function formatDuration(completion: BgCompletion): string | null {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+/** Push callbacks run outside host hooks, so catch their failures and report them through onError. */
+export async function runDetachedBgHandler(
+  work: () => Promise<unknown>,
+  onError: (error: unknown) => void,
+): Promise<void> {
+  try {
+    await work();
+  } catch (error) {
+    onError(error);
+  }
 }

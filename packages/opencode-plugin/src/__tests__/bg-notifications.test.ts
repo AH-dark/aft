@@ -1,6 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 
 // Spy on sessionLog/sessionWarn so we can assert on the structured trace
 // events emitted by the wake path (event names and
@@ -1501,6 +1501,8 @@ describe("OpenCode background notifications", () => {
       trackBgTask("stale", "task-1");
       ingestBgCompletions("stale", [completion("task-1", "done")]);
       expect(sessionBgStates.get("stale")?.outstandingTaskIds.size).toBe(0);
+      // A finished task still has a queued reminder until delivery consumes it.
+      consumeBgCompletion("stale", "task-1");
 
       now += SESSION_BG_STATE_IDLE_TTL_MS + 1;
       trackBgTask("active", "task-2");
@@ -1509,6 +1511,46 @@ describe("OpenCode background notifications", () => {
       expect(sessionBgStates.has("active")).toBe(true);
     } finally {
       Date.now = originalDateNow;
+    }
+  });
+
+  test("idle eviction retains pending and in-flight notification work", () => {
+    const originalDateNow = Date.now;
+    let now = 1_000;
+    Date.now = () => now;
+    try {
+      const fields = [
+        "pendingCompletions",
+        "pendingLongRunning",
+        "pendingPatternMatches",
+        "deliveringTaskIds",
+        "deliveredAwaitingAckTaskIds",
+        "wakeDeferredTaskIds",
+        "unknownCompletions",
+      ] as const;
+      for (const field of fields) {
+        trackBgTask(field, "task");
+        const state = sessionBgStates.get(field)!;
+        state.outstandingTaskIds.clear();
+        const work = state[field];
+        if (work instanceof Set) work.add("task");
+        else (work as unknown[]).push({ task_id: "task" });
+      }
+      now += SESSION_BG_STATE_IDLE_TTL_MS + 1;
+      trackBgTask("trigger", "task");
+      for (const field of fields) expect(sessionBgStates.has(field)).toBe(true);
+    } finally {
+      Date.now = originalDateNow;
+    }
+  });
+
+  test("state access throttles full idle sweeps within the cleanup interval", () => {
+    const scan = spyOn(sessionBgStates, Symbol.iterator);
+    try {
+      for (let i = 0; i < 100; i++) trackBgTask("same-session", "task");
+      expect(scan.mock.calls.length).toBeLessThanOrEqual(1);
+    } finally {
+      scan.mockRestore();
     }
   });
 
