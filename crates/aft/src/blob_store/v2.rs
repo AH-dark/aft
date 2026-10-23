@@ -569,6 +569,33 @@ fn put_or_touch_in(
 }
 
 impl FamilyStore {
+    /// A bounded covering-index check for possible garbage. An unmarked key
+    /// or an incomplete scan returns true; scan errors propagate. Only a
+    /// complete scan with no unmarked keys may suppress a deleting pass.
+    pub(crate) fn may_have_unmarked(
+        &self,
+        marked: &std::collections::BTreeSet<[u8; 32]>,
+        deadline: Option<std::time::Instant>,
+    ) -> StoreResult<bool> {
+        let connection = lock(&self.inner.connection);
+        let mut statement =
+            connection.prepare("SELECT full_key FROM blob_payloads INDEXED BY blob_membership")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            if deadline.is_some_and(|end| std::time::Instant::now() >= end) {
+                return Ok(true);
+            }
+            let key: Vec<u8> = row.get(0)?;
+            let key: [u8; 32] = key
+                .try_into()
+                .map_err(|_| StoreError::Incompatible("invalid stored key".into()))?;
+            if !marked.contains(&key) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Stamps the current epoch on stored keys and reports missing keys. A
     /// covering-index read avoids opening a writer when every epoch is current.
     pub fn touch(&self, keys: &[FamilyKey]) -> StoreResult<TouchReport> {
@@ -628,6 +655,7 @@ impl FamilyStore {
             }
         }
         tx.commit()?;
+        crate::gc::family::record_stale_rows(&self.inner.path, &self.inner.family, written as u64);
         if self.plane() == FamilyPlane::Semantic {
             use std::sync::atomic::Ordering;
             crate::views::io::WORK

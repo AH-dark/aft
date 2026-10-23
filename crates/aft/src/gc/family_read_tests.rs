@@ -1081,3 +1081,102 @@ fn free_pages_only_pass_receipt() {
     }
     drop(fixture.view);
 }
+
+#[test]
+fn under_budget_sweep_keeps_epoch_and_touches_no_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = build(dir.path(), 8, |_| true);
+    let before = fixture.store.gc_epoch().unwrap();
+    let probe = ReadProbe::start(&fixture.store);
+    let report = sweep_family_remeasured(
+        &fixture.registry,
+        None,
+        FamilySweepPolicy {
+            byte_budget: u64::MAX,
+        },
+        SweepBounds::default(),
+        None,
+    )
+    .unwrap();
+    let reads = probe.finish();
+    assert_eq!(
+        fixture.store.gc_epoch().unwrap(),
+        before,
+        "a non-collecting sweep must not stale live rows"
+    );
+    assert_eq!(report.epoch, before);
+    assert_eq!(report.marked_keys, 0);
+    assert_eq!(report.deleted_blobs, 0);
+    assert!(reads
+        .statements
+        .keys()
+        .all(|sql| !sql.contains("UPDATE blob_payloads")));
+}
+
+#[test]
+fn scheduled_sweeps_coalesce_but_force_collects_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = build(dir.path(), 8, |_| true);
+    let first = super::family::sweep_family_scheduled(
+        &fixture.registry,
+        SweepBounds {
+            max_rows_per_store: 1,
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(first.skipped, Some("nothing to collect"));
+    let epoch = fixture.store.gc_epoch().unwrap();
+    let garbage = chunk_key(99);
+    fixture.store.put_or_touch(&garbage, b"garbage").unwrap();
+    let second =
+        super::family::sweep_family_scheduled(&fixture.registry, SweepBounds::default(), false)
+            .unwrap();
+    assert_eq!(second.skipped, Some("interval"));
+    assert_eq!(fixture.store.gc_epoch().unwrap(), epoch);
+    let forced =
+        super::family::sweep_family_scheduled(&fixture.registry, SweepBounds::default(), true)
+            .unwrap();
+    assert_eq!(forced.skipped, None);
+    assert_eq!(forced.marked_keys, 8);
+    assert_eq!(forced.deleted_blobs, 1);
+    assert!(!fixture.store.contains(&garbage).unwrap());
+    for index in 0..8 {
+        assert!(fixture.store.contains(&chunk_key(index)).unwrap());
+    }
+}
+
+#[test]
+fn deleting_pass_marks_every_live_key_before_deletion() {
+    struct Check<'a> {
+        store: &'a FamilyStore,
+    }
+    impl SweepObserver for Check<'_> {
+        fn reached(&self, step: SweepStep) {
+            if step == SweepStep::Marked {
+                for index in 0..9 {
+                    assert!(self.store.contains(&chunk_key(index)).unwrap());
+                }
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = build(dir.path(), 9, |index| index != 8);
+    let report = sweep_family_remeasured(
+        &fixture.registry,
+        None,
+        FamilySweepPolicy { byte_budget: 0 },
+        SweepBounds::default(),
+        Some(&Check {
+            store: &fixture.store,
+        }),
+    )
+    .unwrap();
+    assert_eq!(report.marked_keys, 8);
+    assert_eq!(report.deleted_blobs, 1);
+    for index in 0..8 {
+        assert!(fixture.store.contains(&chunk_key(index)).unwrap());
+    }
+    assert!(!fixture.store.contains(&chunk_key(8)).unwrap());
+}

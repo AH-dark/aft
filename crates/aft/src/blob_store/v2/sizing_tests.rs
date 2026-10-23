@@ -548,6 +548,26 @@ fn io_amplification_real_payload_touch_probe() {
     probe_touch(&store, &keys, "real_callgraph_same_epoch", false);
     store.raise_epoch(store.gc_epoch().unwrap() + 1).unwrap();
     probe_touch(&store, &keys, "real_callgraph_advanced_epoch", false);
+    let registry = crate::views::registry::FamilyRegistry::open(dir.path(), "io-probe").unwrap();
+    let epoch = store.gc_epoch().unwrap();
+    let sweep = crate::gc::family::sweep_family_remeasured(
+        &registry,
+        None,
+        crate::gc::family::FamilySweepPolicy {
+            byte_budget: u64::MAX,
+        },
+        crate::gc::family::SweepBounds::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(sweep.skipped, Some("nothing to collect"));
+    assert_eq!(store.gc_epoch().unwrap(), epoch);
+    probe_touch(
+        &store,
+        &keys,
+        "real_callgraph_under_budget_after_preflight",
+        false,
+    );
     lock(&store.inner.connection)
         .execute_batch(
             "CREATE TABLE probe_refs(full_key BLOB PRIMARY KEY, ref_epoch INTEGER NOT NULL) WITHOUT ROWID;

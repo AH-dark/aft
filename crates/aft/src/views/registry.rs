@@ -612,10 +612,19 @@ impl FamilyRegistry {
         Ok(())
     }
 
-    /// Claims the family's one-sweeper lease and bumps the GC epoch in the same
-    /// transaction. `None` means a live sweeper holds the lease. A lease whose
-    /// owner process is gone is taken over.
+    /// Claims a lease and starts an unconditional deleting pass.
+    #[cfg(test)]
     pub(crate) fn begin_sweep(&self) -> RegistryResult<Option<SweepLease>> {
+        let Some(mut lease) = self.acquire_sweep()? else {
+            return Ok(None);
+        };
+        lease.advance_epoch()?;
+        Ok(Some(lease))
+    }
+
+    /// Claims the family's one-sweeper lease without changing its epoch.
+    /// A live owner keeps the lease; a dead owner's lease is taken over.
+    pub(crate) fn acquire_sweep(&self) -> RegistryResult<Option<SweepLease>> {
         let owner = current_owner();
         let mut connection = self.connection();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -637,10 +646,6 @@ impl FamilyRegistry {
                 return Ok(None);
             }
         }
-        tx.execute(
-            "UPDATE registry_meta SET gc_epoch = gc_epoch + 1 WHERE singleton = 1",
-            [],
-        )?;
         let epoch: i64 = tx.query_row(
             "SELECT gc_epoch FROM registry_meta WHERE singleton = 1",
             [],
@@ -734,6 +739,55 @@ pub struct SweepLease {
 }
 
 impl SweepLease {
+    /// Production deleting passes call this after preflight finds possible
+    /// work. The lease stays held through marking and deletion; the test-only
+    /// begin_sweep helper advances unconditionally.
+    pub(crate) fn advance_epoch(&mut self) -> RegistryResult<()> {
+        self.registry.with_barrier(|tx| {
+            tx.execute(
+                "UPDATE registry_meta SET gc_epoch = gc_epoch + 1 WHERE singleton = 1",
+                [],
+            )?;
+            self.epoch = tx
+                .query_row(
+                    "SELECT gc_epoch FROM registry_meta WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?
+                .max(0) as u64;
+            tx.execute(
+                "UPDATE sweep_lease SET epoch = ?1 WHERE singleton = 1",
+                params![self.epoch as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Both periodic callers consult this clock while holding the same lease.
+    /// A forced admission pass ignores it. Failed or partial passes do not
+    /// postpone a retry.
+    pub(crate) fn due(&self, force: bool) -> RegistryResult<bool> {
+        let connection = self.registry.connection();
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS sweep_schedule (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), completed_at_ms INTEGER NOT NULL)")?;
+        let last: Option<i64> = connection
+            .query_row(
+                "SELECT completed_at_ms FROM sweep_schedule WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(force
+            || last.is_none_or(|last| {
+                now_ms().saturating_sub(last.max(0) as u64)
+                    >= super::eviction::ENFORCEMENT_INTERVAL.as_millis() as u64
+            }))
+    }
+
+    pub(crate) fn completed(&self) -> RegistryResult<()> {
+        self.registry.connection().execute("INSERT INTO sweep_schedule VALUES (1, ?1) ON CONFLICT(singleton) DO UPDATE SET completed_at_ms = excluded.completed_at_ms", params![now_ms() as i64])?;
+        Ok(())
+    }
+
     pub fn epoch(&self) -> u64 {
         self.epoch
     }

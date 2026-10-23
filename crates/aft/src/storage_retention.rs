@@ -3259,16 +3259,14 @@ fn collect_one_v2_family(
         if cancelled() {
             return Ok(());
         }
-        let swept = crate::gc::family::sweep_family_bounded(
+        let swept = crate::gc::family::sweep_family_scheduled(
             &registry,
-            None,
-            crate::gc::family::FamilySweepPolicy { byte_budget: 0 },
             crate::gc::family::SweepBounds {
                 max_rows_per_store: 4096,
                 max_entries_per_dir: 4096,
                 deadline: Some(deadline),
             },
-            None,
+            false,
         )
         .map_err(|error| io::Error::other(error.to_string()))?;
         report.removed_roots += swept.deregistered.len();
