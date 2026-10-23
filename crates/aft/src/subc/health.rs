@@ -3006,6 +3006,24 @@ impl RollupStepTimer {
     }
 }
 
+/// The unavailable code of each context whose cache location is unavailable,
+/// keyed by its cache root. The reason is read once per context: a recovery
+/// can clear it at any moment, so a second read may find nothing.
+fn cache_unavailable_codes<'a>(
+    contexts: impl Iterator<Item = &'a AppContext>,
+    reason: impl Fn(&AppContext) -> Option<String>,
+) -> std::collections::BTreeMap<std::path::PathBuf, &'static str> {
+    contexts
+        .filter_map(|ctx| {
+            let reason = reason(ctx)?;
+            Some((
+                ctx.cache_dir(),
+                crate::root_cache::unavailable_code(&reason),
+            ))
+        })
+        .collect()
+}
+
 fn build_health_diagnostic_rollup_from_actors(
     cache: &HealthRollupCache,
     executor: &Executor,
@@ -3354,16 +3372,10 @@ fn build_health_diagnostic_rollup_from_actors(
         .iter()
         .map(|ctx| ctx.cache_dir())
         .collect::<std::collections::BTreeSet<_>>();
-    let cache_unavailable = lifecycle_contexts
-        .iter()
-        .filter(|ctx| ctx.cache_unavailable_reason().is_some())
-        .map(|ctx| {
-            (
-                ctx.cache_dir(),
-                crate::root_cache::unavailable_code(&ctx.cache_unavailable_reason().unwrap()),
-            )
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let cache_unavailable = cache_unavailable_codes(
+        lifecycle_contexts.iter().map(Arc::as_ref),
+        AppContext::cache_unavailable_reason,
+    );
     let measured_census = census_snapshot.map(|census_snapshot| {
         #[cfg(test)]
         cache.census_builds.fetch_add(1, Ordering::Relaxed);
@@ -3924,6 +3936,38 @@ mod tests {
                 return;
             }
         }
+    }
+
+    /// A cache recovery can clear a context's unavailable reason at any
+    /// moment. The health rollup reads it once per context, so a recovery
+    /// landing right after the read cannot panic the health worker, and the
+    /// next refresh reads the new state.
+    #[test]
+    fn health_cache_codes_survive_a_recovery_between_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(temp.path().join("storage")),
+                ..Default::default()
+            },
+        );
+        // Each read returns the reason once, then the recovered state.
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let recovering = |_: &AppContext| {
+            (reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0)
+                .then(|| "cache_dir_unavailable: volume missing".to_string())
+        };
+        let refresh = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::cache_unavailable_codes(std::iter::once(&ctx), &recovering)
+        }));
+        let codes = refresh.expect("a recovery between reads panicked the health refresh");
+        assert_eq!(
+            codes.get(&ctx.cache_dir()).copied(),
+            Some(crate::root_cache::CACHE_DIR_UNAVAILABLE)
+        );
+        // The next refresh runs and sees the recovered state.
+        assert!(super::cache_unavailable_codes(std::iter::once(&ctx), &recovering).is_empty());
     }
 
     #[test]
