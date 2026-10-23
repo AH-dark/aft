@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, RwLock};
@@ -115,14 +116,15 @@ impl From<serde_json::Error> for InspectCacheError {
     }
 }
 
-/// Persisted Tier-2 contribution/aggregate format version.
+/// Persisted Tier-2 analysis cache epoch.
 ///
-/// Bump this when `FileContribution.contribution` JSON changes in a way that
-/// requires existing per-file contributions to be rebuilt before roll-up, OR
-/// when the roll-up/aggregation LOGIC changes (e.g. dead_code reachability):
-/// cached aggregates are keyed by a `contribution_set_hash` that folds in this
-/// version, so a logic-only change is invisible to existing caches unless the
-/// version moves. v6: dead_code now propagates liveness through dispatch-only
+/// Inspect stores per-file analysis facts and the project findings computed
+/// from them. Increment this epoch when fact JSON or analysis logic changes,
+/// even if source files did not change. Writable opens atomically discard facts
+/// and findings from other epochs; borrowers return misses without modifying
+/// the database. Aggregate hashes also include this epoch.
+///
+/// v6: dead_code now propagates liveness through dispatch-only
 /// method bodies (free fns reached only via `obj.method()` were false-dead).
 /// v7: duplicates now collapses nested/overlapping fragments (a duplicated
 /// block no longer reports every nested subtree as its own group).
@@ -195,7 +197,12 @@ impl From<serde_json::Error> for InspectCacheError {
 /// before roll-up, with fact-version checks served from row metadata.
 /// v41: parse-incomplete dead-code and unused-export roll-ups expose findings
 /// from parsed files instead of retaining a legacy unknown aggregate.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 41;
+/// v42: corrected source-buffer freshness, impl scopes, complexity and cycles;
+/// an atomic epoch marker fences raw facts as well as derived findings, and
+/// undecodable dead-code rows remain explicit coverage gaps.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 42;
+// Reserved metadata category: its integer is an epoch, never a scan timestamp.
+const CACHE_VERSION_CATEGORY: &str = "__cache_version__";
 
 fn expected_facts_version(category: InspectCategory) -> i64 {
     match category {
@@ -245,12 +252,14 @@ pub struct ContributionRecord {
 
 #[derive(Debug, Clone)]
 struct MemoryAggregate {
+    touched: u64,
     payload: serde_json::Value,
     generated_at: i64,
     contribution_set_hash: Option<String>,
 }
 
 const TIER1_FILE_MEMO_MAX_ENTRIES: usize = 4_096;
+const MAX_SCOPED_MEMORY_AGGREGATES: usize = 128;
 
 #[derive(Debug, Clone)]
 struct Tier1MemoEntry<T> {
@@ -453,44 +462,61 @@ impl<T: Clone> Tier1FileMemo<T> {
     }
 
     fn cached_value(&self, path: &Path) -> Option<T> {
-        let mut cached = self
+        let cached = self
             .state
             .lock()
             .ok()
             .and_then(|state| state.entries.get(path).cloned())?;
 
-        match crate::cache_freshness::verify_file(path, &cached.freshness) {
+        let verdict = crate::cache_freshness::verify_file(path, &cached.freshness);
+        self.finish_cached_read(path, cached, verdict)
+    }
+
+    fn finish_cached_read(
+        &self,
+        path: &Path,
+        cached: Tier1MemoEntry<T>,
+        verdict: FreshnessVerdict,
+    ) -> Option<T> {
+        let mut state = self.state.lock().ok()?;
+        let current = state.entries.get_mut(path)?;
+        // Verification performs I/O outside the lock. A rescan may have
+        // replaced this entry in the meantime; do not publish its old value.
+        if current.generation != cached.generation {
+            return None;
+        }
+        match verdict {
             FreshnessVerdict::HotFresh => {
-                if let Ok(mut state) = self.state.lock() {
-                    state.touch(path);
-                }
+                state.touch(path);
                 Some(cached.value)
             }
             FreshnessVerdict::ContentFresh {
                 new_mtime,
                 new_size,
             } => {
-                cached.freshness.mtime = new_mtime;
-                cached.freshness.size = new_size;
-                let value = cached.value.clone();
-                if let Ok(mut state) = self.state.lock() {
-                    state.insert(path.to_path_buf(), cached);
-                }
-                Some(value)
+                current.freshness.mtime = new_mtime;
+                current.freshness.size = new_size;
+                state.touch(path);
+                Some(cached.value)
             }
             FreshnessVerdict::Stale => None,
             FreshnessVerdict::Deleted => {
-                if let Ok(mut state) = self.state.lock() {
-                    state.remove(path);
-                }
+                state.remove(path);
                 None
             }
         }
     }
 }
 
+fn is_scoped_memory_key(key: &JobKey) -> bool {
+    key.scope_hash
+        .as_deref()
+        .is_some_and(|scope| scope != "project")
+}
+
 #[derive(Debug)]
 pub struct InspectCache {
+    memory_clock: AtomicU64,
     project_root: PathBuf,
     project_key: String,
     sqlite_path: PathBuf,
@@ -613,7 +639,7 @@ impl InspectCache {
         crate::private_storage::open_keyed_dir(&inspect_dir, "inspect")?;
         let (sqlite_path, generation, needs_publish) =
             resolve_or_create_inspect_target(&inspect_dir, &project_key);
-        let conn = TrackedConnection::open_attributed(
+        let mut conn = TrackedConnection::open_attributed(
             &sqlite_path,
             SqliteStore::InspectScopeCache,
             project_root.display().to_string(),
@@ -625,6 +651,7 @@ impl InspectCache {
             )));
         }
         initialize_schema(&conn)?;
+        ensure_cache_version(&mut conn, &project_key)?;
         // Schema creation writes pages at open; credit them now so later
         // Tier-2 samples measure only their own commits.
         conn.sample_write_pages();
@@ -704,6 +731,7 @@ impl InspectCache {
         conn: TrackedConnection,
     ) -> Self {
         Self {
+            memory_clock: AtomicU64::new(0),
             project_root,
             project_key,
             sqlite_path,
@@ -791,17 +819,36 @@ impl InspectCache {
         payload: serde_json::Value,
         contribution_set_hash: Option<String>,
     ) -> Result<(), InspectCacheError> {
-        self.memory
+        let mut memory = self
+            .memory
             .write()
-            .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
-            .insert(
-                key,
-                MemoryAggregate {
-                    payload,
-                    generated_at: unix_seconds_now(),
-                    contribution_set_hash,
-                },
-            );
+            .map_err(|_| InspectCacheError::LockPoisoned("memory"))?;
+        memory.insert(
+            key,
+            MemoryAggregate {
+                touched: self.memory_clock.fetch_add(1, Ordering::Relaxed),
+                payload,
+                generated_at: unix_seconds_now(),
+                contribution_set_hash,
+            },
+        );
+        // Project totals are reused by status views. Only ad-hoc scoped
+        // responses compete for this budget, with recently read scopes kept.
+        while memory
+            .keys()
+            .filter(|key| is_scoped_memory_key(key))
+            .count()
+            > MAX_SCOPED_MEMORY_AGGREGATES
+        {
+            let oldest = memory
+                .iter()
+                .filter(|(key, _)| is_scoped_memory_key(key))
+                .min_by_key(|(key, entry)| (entry.touched, (*key).clone()))
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                memory.remove(&oldest);
+            }
+        }
         Ok(())
     }
 
@@ -829,10 +876,13 @@ impl InspectCache {
         if !key.category.is_tier2() {
             return Ok(self
                 .memory
-                .read()
+                .write()
                 .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
-                .get(key)
-                .map(|entry| entry.payload.clone()));
+                .get_mut(key)
+                .map(|entry| {
+                    entry.touched = self.memory_clock.fetch_add(1, Ordering::Relaxed);
+                    entry.payload.clone()
+                }));
         }
 
         let current_hash = {
@@ -840,6 +890,9 @@ impl InspectCache {
                 .conn
                 .lock()
                 .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+            if !cache_version_is_current(&conn, &self.project_key)? {
+                return Ok(None);
+            }
             contribution_set_hash_with_conn(
                 &conn,
                 key.category,
@@ -1133,6 +1186,9 @@ impl InspectCache {
                 .conn
                 .lock()
                 .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+            if !cache_version_is_current(&conn, &self.project_key)? {
+                return Ok(None);
+            }
             conn.query_row(
                 "SELECT aggregate FROM tier2_aggregates \
                  WHERE category = ?1 AND project_key = ?2 AND contribution_set_hash = ?3",
@@ -1166,6 +1222,9 @@ impl InspectCache {
                 .conn
                 .lock()
                 .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+            if !cache_version_is_current(&conn, &self.project_key)? {
+                return Ok(None);
+            }
             conn.query_row(
                 "SELECT aggregate FROM tier2_aggregates \
                  WHERE category = ?1 AND project_key = ?2 \
@@ -1272,6 +1331,9 @@ impl InspectCache {
             .conn
             .lock()
             .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        if !cache_version_is_current(&conn, &self.project_key)? {
+            return Ok(Vec::new());
+        }
         let mut stmt = conn.prepare(
             "SELECT file_path, file_mtime_ns, file_size, file_hash, contribution \
              FROM tier2_contributions \
@@ -1387,6 +1449,9 @@ impl InspectCache {
             .conn
             .lock()
             .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        if !cache_version_is_current(&conn, &self.project_key)? {
+            return Ok(Vec::new());
+        }
         let mut stmt = conn.prepare(
             "SELECT file_path, file_mtime_ns, file_size, file_hash \
              FROM tier2_contributions \
@@ -1481,6 +1546,9 @@ impl InspectCache {
             .conn
             .lock()
             .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        if !cache_version_is_current(&conn, &self.project_key)? {
+            return Ok(None);
+        }
         conn.query_row(
             "SELECT last_full_run FROM tier2_meta WHERE category = ?1 AND project_key = ?2",
             params![category.as_str(), self.project_key],
@@ -2181,6 +2249,57 @@ fn initialize_schema(conn: &Connection) -> Result<(), InspectCacheError> {
     Ok(())
 }
 
+fn cache_version_is_current(
+    conn: &Connection,
+    project_key: &str,
+) -> Result<bool, InspectCacheError> {
+    let stored = conn
+        .query_row(
+            "SELECT last_full_run FROM tier2_meta WHERE category = ?1 AND project_key = ?2",
+            params![CACHE_VERSION_CATEGORY, project_key],
+            |row| row.get::<_, u32>(0),
+        )
+        .optional()?;
+    Ok(stored == Some(TIER2_CONTRIBUTION_CACHE_VERSION))
+}
+
+fn ensure_cache_version(conn: &mut Connection, project_key: &str) -> Result<(), InspectCacheError> {
+    // Lock out competing writers before checking the epoch. Otherwise one
+    // opener could discard contributions written after another opener cleared
+    // the old rows. The marker and all invalidation writes commit together.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let current = cache_version_is_current(&tx, project_key)?;
+    #[cfg(test)]
+    CACHE_EPOCH_AFTER_CHECK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    if !current {
+        for table in ["tier2_contributions", "tier2_aggregates", "tier2_meta"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE project_key = ?1"),
+                params![project_key],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO tier2_meta (category, project_key, last_full_run) VALUES (?1, ?2, ?3)",
+            params![
+                CACHE_VERSION_CATEGORY,
+                project_key,
+                TIER2_CONTRIBUTION_CACHE_VERSION
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static CACHE_EPOCH_AFTER_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn existing_contribution_paths(
     conn: &Connection,
     category: InspectCategory,
@@ -2632,6 +2751,285 @@ fn now_nanos() -> u128 {
 pub(crate) mod tests {
     use super::*;
 
+    fn cache_epoch_fixture(
+        marker: Option<u32>,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, JobKey, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let inspect = dir.path().join("inspect");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("lib.rs");
+        fs::write(&path, "fn fixture() {}\n").unwrap();
+        let cache = InspectCache::open(inspect.clone(), root.clone()).unwrap();
+        let key = JobKey::for_project_category(InspectCategory::Complexity);
+        cache
+            .store_tier2_result(
+                key.clone(),
+                std::slice::from_ref(&path),
+                &[FileContribution::new(
+                    InspectCategory::Complexity,
+                    path.clone(),
+                    collect_freshness(&path),
+                    serde_json::json!({"file": "lib.rs", "functions": []}),
+                )],
+                serde_json::json!({"count": 42, "items": []}),
+            )
+            .unwrap();
+        let hash = contribution_set_hash_with_version(
+            &cache.conn.lock().unwrap(),
+            key.category,
+            &cache.project_key,
+            &root,
+            None,
+            marker.unwrap_or(41),
+        )
+        .unwrap();
+        cache
+            .store_tier2_aggregate(
+                key.clone(),
+                &hash,
+                serde_json::json!({"count": 42, "items": []}),
+            )
+            .unwrap();
+        let conn = cache.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM tier2_meta WHERE category = ?1 AND project_key = ?2",
+            params![CACHE_VERSION_CATEGORY, cache.project_key],
+        )
+        .unwrap();
+        if let Some(marker) = marker {
+            conn.execute(
+                "INSERT INTO tier2_meta (category, project_key, last_full_run) VALUES (?1, ?2, ?3)",
+                params![CACHE_VERSION_CATEGORY, cache.project_key, marker],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        drop(cache);
+        (dir, root, inspect, key, hash)
+    }
+
+    #[test]
+    fn cache_epoch_writer_invalidates_old_and_missing_markers() {
+        for marker in [Some(34), Some(35), Some(36), Some(40), Some(41), None] {
+            let (_dir, root, inspect, key, hash) = cache_epoch_fixture(marker);
+            let cache = InspectCache::open(inspect, root).unwrap();
+            assert!(cache
+                .load_tier2_contributions(key.category)
+                .unwrap()
+                .is_empty());
+            assert!(cache
+                .contribution_freshness(key.category)
+                .unwrap()
+                .is_empty());
+            assert!(cache
+                .load_aggregate_if_hash_matches(key.category, &hash)
+                .unwrap()
+                .is_none());
+            assert!(cache
+                .latest_aggregate_any_hash(key.category)
+                .unwrap()
+                .is_none());
+            assert!(cache.last_full_run(key.category).unwrap().is_none());
+            let conn = cache.conn.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM tier2_contributions WHERE project_key = ?1",
+                    params![cache.project_key],
+                    |row| row.get::<_, usize>(0)
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT last_full_run FROM tier2_meta WHERE category = ?1 AND project_key = ?2",
+                    params![CACHE_VERSION_CATEGORY, cache.project_key],
+                    |row| row.get::<_, u32>(0)
+                )
+                .unwrap(),
+                TIER2_CONTRIBUTION_CACHE_VERSION
+            );
+        }
+    }
+
+    #[test]
+    fn cache_epoch_writer_preserves_current_marker() {
+        let (_dir, root, inspect, key, hash) =
+            cache_epoch_fixture(Some(TIER2_CONTRIBUTION_CACHE_VERSION));
+        let cache = InspectCache::open(inspect, root).unwrap();
+        assert_eq!(
+            cache.load_tier2_contributions(key.category).unwrap().len(),
+            1
+        );
+        assert_eq!(cache.get_aggregated(&key).unwrap().unwrap()["count"], 42);
+        assert!(cache
+            .load_aggregate_if_hash_matches(key.category, &hash)
+            .unwrap()
+            .is_some());
+        assert!(cache.last_full_run(key.category).unwrap().is_some());
+    }
+
+    #[test]
+    fn cache_epoch_borrower_misses_old_and_missing_markers_without_writes() {
+        for marker in [Some(34), Some(35), Some(36), Some(40), Some(41), None] {
+            let (_dir, root, inspect, key, hash) = cache_epoch_fixture(marker);
+            let cache = InspectCache::open_readonly(inspect, root).unwrap().unwrap();
+            let cache = &cache.inner;
+            assert!(cache
+                .load_tier2_contributions(key.category)
+                .unwrap()
+                .is_empty());
+            assert!(cache
+                .contribution_freshness(key.category)
+                .unwrap()
+                .is_empty());
+            assert!(cache.get_aggregated(&key).unwrap().is_none());
+            assert!(cache
+                .load_aggregate_if_hash_matches(key.category, &hash)
+                .unwrap()
+                .is_none());
+            assert!(cache
+                .latest_aggregate_any_hash(key.category)
+                .unwrap()
+                .is_none());
+            assert!(cache.last_full_run(key.category).unwrap().is_none());
+            let conn = cache.conn.lock().unwrap();
+            assert_eq!(conn.total_changes(), 0);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM tier2_contributions WHERE project_key = ?1",
+                    params![cache.project_key],
+                    |row| row.get::<_, usize>(0)
+                )
+                .unwrap(),
+                1
+            );
+            let stored = conn
+                .query_row(
+                    "SELECT last_full_run FROM tier2_meta WHERE category = ?1 AND project_key = ?2",
+                    params![CACHE_VERSION_CATEGORY, cache.project_key],
+                    |row| row.get::<_, u32>(0),
+                )
+                .optional()
+                .unwrap();
+            assert_eq!(stored, marker);
+        }
+    }
+
+    #[test]
+    fn cache_epoch_borrower_preserves_current_marker() {
+        let (_dir, root, inspect, key, hash) =
+            cache_epoch_fixture(Some(TIER2_CONTRIBUTION_CACHE_VERSION));
+        let cache = InspectCache::open_readonly(inspect, root).unwrap().unwrap();
+        let cache = &cache.inner;
+        assert_eq!(
+            cache.load_tier2_contributions(key.category).unwrap().len(),
+            1
+        );
+        assert_eq!(cache.contribution_freshness(key.category).unwrap().len(), 1);
+        assert_eq!(cache.get_aggregated(&key).unwrap().unwrap()["count"], 42);
+        assert!(cache
+            .load_aggregate_if_hash_matches(key.category, &hash)
+            .unwrap()
+            .is_some());
+        assert!(cache
+            .latest_aggregate_any_hash(key.category)
+            .unwrap()
+            .is_some());
+        assert!(cache.last_full_run(key.category).unwrap().is_some());
+        assert_eq!(cache.conn.lock().unwrap().total_changes(), 0);
+    }
+
+    #[test]
+    fn cache_epoch_immediate_transaction_locks_before_check() {
+        let (_dir, root, inspect, _key, _hash) = cache_epoch_fixture(Some(41));
+        let reader = InspectCache::open_readonly(inspect, root).unwrap().unwrap();
+        let sqlite_path = reader.sqlite_path().to_path_buf();
+        let mut conn = Connection::open(&sqlite_path).unwrap();
+        CACHE_EPOCH_AFTER_CHECK.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            let mut contender = Connection::open(sqlite_path).unwrap();
+            contender.busy_timeout(Duration::ZERO).unwrap();
+            let error = match contender.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+                Err(error) => error,
+                Ok(_) => panic!("a second writer reserved the store after the epoch check"),
+            };
+            assert!(matches!(error, rusqlite::Error::SqliteFailure(error, _) if error.code == rusqlite::ErrorCode::DatabaseBusy));
+        })));
+        ensure_cache_version(&mut conn, reader.project_key()).unwrap();
+    }
+    #[test]
+    fn audit05_memo_refresh_does_not_replace_a_newer_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file.rs");
+        fs::write(&path, "old").unwrap();
+        let memo = Tier1FileMemo::<String>::default();
+        memo.get_or_insert_with(&path, |path| (Some(collect_freshness(path)), "old".into()));
+        let old = memo.state.lock().unwrap().entries[&path].clone();
+        fs::write(&path, "new contents").unwrap();
+        memo.get_or_insert_with(&path, |path| (Some(collect_freshness(path)), "new".into()));
+        let result = memo.finish_cached_read(
+            &path,
+            old,
+            FreshnessVerdict::ContentFresh {
+                new_mtime: UNIX_EPOCH,
+                new_size: 3,
+            },
+        );
+        assert!(result.is_none(), "a raced read must be retried");
+        assert_eq!(memo.state.lock().unwrap().entries[&path].value, "new");
+    }
+
+    #[test]
+    fn audit05_scoped_aggregates_are_bounded_and_keep_project_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            InspectCache::open(dir.path().join("inspect"), dir.path().to_path_buf()).unwrap();
+        let project = JobKey::for_category_scope(
+            InspectCategory::Todos,
+            &crate::inspect::JobScope::for_project(dir.path().to_path_buf()),
+        );
+        cache
+            .store_aggregated(project.clone(), serde_json::json!({"count": 42}))
+            .unwrap();
+        for i in 0..=MAX_SCOPED_MEMORY_AGGREGATES {
+            let key = JobKey {
+                category: InspectCategory::Todos,
+                scope_hash: Some(format!("scope-{i}")),
+            };
+            cache
+                .store_aggregated(key, serde_json::json!({"count": i}))
+                .unwrap();
+        }
+        assert_eq!(
+            cache.memory.read().unwrap().len(),
+            MAX_SCOPED_MEMORY_AGGREGATES + 1
+        );
+        assert_eq!(
+            cache.get_aggregated(&project).unwrap().unwrap()["count"],
+            42
+        );
+        let recent = JobKey {
+            category: InspectCategory::Todos,
+            scope_hash: Some("scope-1".into()),
+        };
+        assert!(cache.get_aggregated(&recent).unwrap().is_some());
+        cache
+            .store_aggregated(
+                JobKey {
+                    category: InspectCategory::Todos,
+                    scope_hash: Some("newest".into()),
+                },
+                serde_json::json!({"count": 1}),
+            )
+            .unwrap();
+        let memory = cache.memory.read().unwrap();
+        assert!(memory.contains_key(&recent));
+        assert!(!memory.contains_key(&JobKey {
+            category: InspectCategory::Todos,
+            scope_hash: Some("scope-2".into())
+        }));
+    }
     pub(crate) struct ForeignWriter {
         child: std::process::Child,
         _stdout: std::io::BufReader<std::process::ChildStdout>,
@@ -3447,7 +3845,7 @@ pub(crate) mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 41);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 42);
     }
 
     #[test]
