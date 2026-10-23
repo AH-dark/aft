@@ -26,6 +26,11 @@ unsafe extern "C" fn statement(
         return 0;
     }
     let path = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+    // Compare canonical spellings even when SQLite preserves a directory alias.
+    let Ok(path) = fs::canonicalize(path.as_ref()) else {
+        return 0;
+    };
+    let path = path.to_string_lossy();
     TRACE.with_borrow_mut(|trace| {
         if trace.path.is_empty() || trace.path != path {
             return;
@@ -78,6 +83,11 @@ unsafe extern "C" fn on_open(
     ffi::SQLITE_OK
 }
 fn start(path: &Path) {
+    // SQLite resolves directory symlinks, including macOS /var -> /private/var.
+    // The database may not exist yet, so canonicalize its existing parent.
+    let path = fs::canonicalize(path.parent().unwrap())
+        .unwrap()
+        .join(path.file_name().unwrap());
     static REGISTER: std::sync::Once = std::sync::Once::new();
     REGISTER.call_once(|| unsafe {
         assert_eq!(ffi::sqlite3_auto_extension(Some(on_open)), ffi::SQLITE_OK);
@@ -115,6 +125,36 @@ fn statement_tracer_detects_schema_and_payload_writes() {
     let trace = finish();
     assert_eq!(trace.schema, 1, "{trace:?}");
     assert_eq!(trace.payload_writes, 2, "{trace:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn statement_tracer_normalizes_symlinked_parents_before_file_creation() {
+    let root = tempfile::tempdir().unwrap();
+    let store = root.path().join("store");
+    fs::create_dir(&store).unwrap();
+    let store = fs::canonicalize(store).unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&store, &alias).unwrap();
+    let path = alias.join("control.sqlite");
+    assert!(!path.exists());
+    start(&path);
+    let other =
+        IdentityConnection::open(root.path().join("other.sqlite"), "views-v3-open-test").unwrap();
+    other
+        .execute_batch(
+            "CREATE TABLE blob_payloads(payload BLOB); INSERT INTO blob_payloads VALUES(x'00');",
+        )
+        .unwrap();
+    let c = IdentityConnection::open(store.join("control.sqlite"), "views-v3-open-test").unwrap();
+    c.execute_batch("CREATE TABLE blob_payloads(payload BLOB); INSERT INTO blob_payloads VALUES(x'00'); UPDATE blob_payloads SET payload=x'01';").unwrap();
+    let trace = finish();
+    assert_eq!(trace.schema, 1, "{trace:?}");
+    assert_eq!(trace.payload_writes, 2, "{trace:?}");
+    assert_eq!(
+        trace.statements, 3,
+        "unrelated database must stay excluded: {trace:?}"
+    );
 }
 
 #[test]
