@@ -407,6 +407,12 @@ fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::Appli
     let signal_scope = signal_scope_label(applied.signal_scope_enforced);
     if profile.worker_jail {
         eprintln!("sandbox-launch: signal_scope={signal_scope}");
+        // Landlock scopes kill(pid, 0) too and has no per-signal exception.
+        // Keep real signals confined, but report the cross-command probe limit
+        // alongside the unenforced capabilities below.
+        if applied.signal_scope_enforced {
+            eprintln!("sandbox-launch: signal_zero_cross_command=blocked_no_exception");
+        }
     }
     // Landlock's filesystem rights do not mediate AF_UNIX connect. Removing the
     // address from the environment does not hide predictable session-bus paths.

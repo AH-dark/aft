@@ -248,6 +248,9 @@ fn render_signal_scope(source: &mut String, profile: &SandboxProfile) {
     // identical profile. Host-side AFT cancellation remains available across
     // commands; a command may signal only processes in its own sandbox.
     source.push_str("(deny signal)\n(allow signal (target same-sandbox))\n");
+    // Signal 0 existence probes deliver no signal; scripts use their success
+    // to judge liveness, including for processes outside this command.
+    source.push_str("(allow signal (signal-number 0))\n");
 }
 
 fn render_worker_keychain_denies(
@@ -541,9 +544,11 @@ mod tests {
             profile.worker_jail = false;
             let operator = render_profile(&profile).unwrap();
             assert!(!operator.contains("(deny signal)"));
+            assert!(!operator.contains("(signal-number 0)"));
             profile.worker_jail = true;
             let source = render_profile(&profile).unwrap();
             assert!(source.contains("(deny signal)\n(allow signal (target same-sandbox))\n"));
+            assert!(source.contains("(allow signal (signal-number 0))\n"));
             assert!(!source.contains("(target pgrp)"));
         }
     }

@@ -1,0 +1,1 @@
+Worker sandboxes on macOS allow `kill -0` liveness probes across commands while keeping real signals confined; Linux reports Landlock's lack of a signal-zero exception without weakening signal isolation.
