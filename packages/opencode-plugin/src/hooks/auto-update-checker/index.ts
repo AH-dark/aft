@@ -211,13 +211,8 @@ function claimCheckSlot(storageDir: string | null, intervalMs: number): CheckSlo
       // Serialize stale-owner observation and removal. A contender can still win
       // the primary path during reclamation, so admission always ends with wx.
       const reclaimPath = `${lockPath}.reclaim`;
-      let reclaimFd: number;
-      try {
-        reclaimFd = openSync(reclaimPath, "wx");
-      } catch (reclaimError) {
-        if ((reclaimError as NodeJS.ErrnoException).code === "EEXIST") return null;
-        throw reclaimError;
-      }
+      const reclaimFd = claimReclaimGuard(reclaimPath, owner);
+      if (reclaimFd === null) return null;
       try {
         if (!isOrphanedCheckLock(lockPath)) return null;
         rmSync(lockPath, { force: true });
@@ -235,7 +230,7 @@ function claimCheckSlot(storageDir: string | null, intervalMs: number): CheckSlo
         }
       } finally {
         closeSync(reclaimFd);
-        rmSync(reclaimPath, { force: true });
+        if (checkLockIsOwnedBy(reclaimPath, owner)) rmSync(reclaimPath, { force: true });
       }
     }
 
@@ -264,6 +259,43 @@ function claimCheckSlot(storageDir: string | null, intervalMs: number): CheckSlo
   } catch (err) {
     warn(`[auto-update-checker] Could not coordinate via timestamp file: ${String(err)}`);
     return null;
+  }
+}
+
+function claimReclaimGuard(reclaimPath: string, owner: CheckLockOwner): number | null {
+  try {
+    return writeReclaimGuard(reclaimPath, owner);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+
+  // A crash can leave either owner metadata or an empty file. Reuse the primary
+  // lock's dead-process check and bounded expiry instead of blocking future starts.
+  const observed = readCheckLockState(reclaimPath);
+  if (observed !== null) {
+    if (!isOrphanedCheckLock(reclaimPath)) return null;
+    const current = readCheckLockState(reclaimPath);
+    if (current !== null) {
+      if (current.pid !== observed.pid || current.startedMs !== observed.startedMs) return null;
+      rmSync(reclaimPath, { force: true });
+    }
+  }
+  try {
+    return writeReclaimGuard(reclaimPath, owner);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
+    throw error;
+  }
+}
+
+function writeReclaimGuard(reclaimPath: string, owner: CheckLockOwner): number {
+  const fd = openSync(reclaimPath, "wx");
+  try {
+    writeFileSync(fd, JSON.stringify(owner));
+    return fd;
+  } catch (error) {
+    closeSync(fd);
+    throw error;
   }
 }
 

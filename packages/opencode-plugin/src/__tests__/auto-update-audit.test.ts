@@ -277,6 +277,67 @@ describe("auto-update audit regressions", () => {
     }
   });
 
+  test("updater recovers a reclaim guard left by an exited process", async () => {
+    const storageDir = createStorageDir();
+    const lockPath = join(storageDir, "opencode", "last-update-check.json.lock");
+    const reclaimPath = `${lockPath}.reclaim`;
+    mkdirSync(join(storageDir, "opencode"), { recursive: true });
+    const child = spawnSync(process.execPath, [
+      "-e",
+      `require("node:fs").writeFileSync(${JSON.stringify(reclaimPath)}, JSON.stringify({pid: process.pid, startedMs: Date.now()}))`,
+    ]);
+    expect(child.status).toBe(0);
+    expect(child.pid).toBeGreaterThan(0);
+    writeFileSync(lockPath, readFileSync(reclaimPath));
+
+    const { __test__ } = await freshIndexImport();
+    const lock = __test__.claimCheckSlot(storageDir, 0);
+    try {
+      expect(lock).not.toBeNull();
+      expect(existsSync(reclaimPath)).toBe(false);
+      expect(JSON.parse(readFileSync(lockPath, "utf-8")).pid).toBe(process.pid);
+    } finally {
+      lock?.release();
+    }
+  });
+
+  test("updater expires an old empty reclaim guard but preserves a fresh one", async () => {
+    const storageDir = createStorageDir();
+    const lockPath = join(storageDir, "opencode", "last-update-check.json.lock");
+    const reclaimPath = `${lockPath}.reclaim`;
+    mkdirSync(join(storageDir, "opencode"), { recursive: true });
+    writeFileSync(lockPath, "{}");
+    writeFileSync(reclaimPath, "");
+    const old = new Date(Date.now() - 61 * 60 * 1000);
+    utimesSync(lockPath, old, old);
+    const { __test__ } = await freshIndexImport();
+    expect(__test__.claimCheckSlot(storageDir, 0)).toBeNull();
+    expect(readFileSync(reclaimPath, "utf-8")).toBe("");
+
+    utimesSync(reclaimPath, old, old);
+    const lock = __test__.claimCheckSlot(storageDir, 0);
+    try {
+      expect(lock).not.toBeNull();
+      expect(existsSync(reclaimPath)).toBe(false);
+    } finally {
+      lock?.release();
+    }
+  });
+
+  test("updater preserves a reclaim guard owned by a live process", async () => {
+    const storageDir = createStorageDir();
+    const lockPath = join(storageDir, "opencode", "last-update-check.json.lock");
+    const reclaimPath = `${lockPath}.reclaim`;
+    mkdirSync(join(storageDir, "opencode"), { recursive: true });
+    const owner = { pid: process.pid, startedMs: Date.now() };
+    writeFileSync(lockPath, "{}");
+    writeFileSync(reclaimPath, JSON.stringify(owner));
+    const { __test__ } = await freshIndexImport();
+
+    expect(__test__.claimCheckSlot(storageDir, 0)).toBeNull();
+    expect(JSON.parse(readFileSync(reclaimPath, "utf-8"))).toEqual(owner);
+  });
+
   test("updater retries when the orphan lock disappears before stat", async () => {
     const storageDir = createStorageDir();
     const lockPath = join(storageDir, "opencode", "last-update-check.json.lock");
