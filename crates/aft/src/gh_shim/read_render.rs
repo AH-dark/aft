@@ -1400,7 +1400,16 @@ fn page_path(path: &str, page: u64) -> String {
     )
 }
 
+/// Raw log bytes requested per job-log page. The reply body is display text
+/// that can grow past the raw byte count: a multibyte character split at either
+/// page edge decodes to U+FFFD (up to +8 bytes per page), and redaction markers
+/// can add a little more. The headroom keeps a full page under the unchanged
+/// REPLY_BYTES bound on the decoded body.
+pub(super) const LOG_WINDOW_BYTES: u64 = REPLY_BYTES as u64 - 1024;
+
 /// Request every log window from offset zero; omitting a range means a tail.
+/// Paging advances by the reply's raw `offset + length`, never by the body's
+/// length, because the body is display text rather than raw log bytes.
 fn stream_log(
     job_id: u64,
     execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
@@ -1414,7 +1423,7 @@ fn stream_log(
                 job_id,
                 range: Some(ByteRange {
                     offset,
-                    length: REPLY_BYTES as u64,
+                    length: LOG_WINDOW_BYTES,
                 }),
             },
             execute,
@@ -1422,10 +1431,7 @@ fn stream_log(
         let ReadReply::JobLog(reply) = response else {
             return Err(failed("job_log returned the wrong reply type"));
         };
-        if reply.offset != offset
-            || reply.length != reply.body.len() as u64
-            || reply.length > REPLY_BYTES as u64
-        {
+        if reply.offset != offset || reply.length > LOG_WINDOW_BYTES {
             return Err(failed("job_log returned an invalid offset or length"));
         }
         if total.is_some_and(|total| total != reply.total_bytes) {
@@ -1437,7 +1443,10 @@ fn stream_log(
         let end = offset
             .checked_add(reply.length)
             .ok_or_else(|| failed("job log offset overflow"))?;
-        if end > reply.total_bytes || (end < reply.total_bytes && reply.body.is_empty()) {
+        // A page that consumed no raw bytes before the end would repeat
+        // forever. An empty body alone is fine: a page of only ANSI codes
+        // still advances the raw cursor.
+        if end > reply.total_bytes || (end < reply.total_bytes && reply.length == 0) {
             return Err(failed("job_log returned an invalid byte range"));
         }
         output

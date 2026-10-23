@@ -300,6 +300,7 @@ fn v20_three_megabyte_job_log_pages_into_one_byte_exact_stream() {
     for index in 0..3 * REPLY_BYTES {
         log.push(b'a' + (index % 26) as u8);
     }
+    let window = render::LOG_WINDOW_BYTES;
     let plan = planned(&["api", "repos/cortexkit/aft/actions/jobs/42/logs"]);
     let mut ranges = Vec::new();
     let mut output = Vec::new();
@@ -314,24 +315,152 @@ fn v20_three_megabyte_job_log_pages_into_one_byte_exact_stream() {
                 panic!("full logs must not request Plexus's no-range tail");
             };
             assert_eq!(*job_id, 42);
-            assert_eq!(range.length, REPLY_BYTES as u64);
+            assert_eq!(range.length, window);
             ranges.push(range.clone());
             let offset = range.offset as usize;
-            Ok(log_reply(
-                &log[offset..offset + REPLY_BYTES],
-                range.offset,
-                log.len() as u64,
-            ))
+            let end = (offset + window as usize).min(log.len());
+            Ok(log_reply(&log[offset..end], range.offset, log.len() as u64))
         },
         &mut output,
     )
     .unwrap();
     assert_eq!(status, 0);
+    // 3 MiB does not divide into windows evenly, so a short fourth page follows.
     assert_eq!(
         ranges.iter().map(|range| range.offset).collect::<Vec<_>>(),
-        vec![0, 1_048_576, 2_097_152]
+        vec![0, window, 2 * window, 3 * window]
     );
     assert_eq!(output, log);
+}
+
+/// Decode a job-log reply through the real wire contract, so these paging tests
+/// exercise the same range checks that a Plexus reply goes through.
+fn decoded_log_reply(
+    request: &ReadRequest,
+    body: &str,
+    offset: u64,
+    length: u64,
+    total_bytes: u64,
+) -> Result<ReadReply, ReadError> {
+    let wire = executor::wire_request("cortexkit/aft", request).unwrap();
+    executor::decode_reply(
+        &wire,
+        &json!({"isError":false,"result":{"body":body,"offset":offset,"length":length,"total_bytes":total_bytes}}),
+    )
+}
+
+// The cursor is raw log bytes; bodies are display text (ANSI stripped, split
+// characters as U+FFFD). The second page must start at the first reply's
+// offset + length, not at the first body's length.
+#[test]
+fn v20_job_log_pages_resume_at_raw_offset_plus_length_not_body_length() {
+    // Page one raw bytes: ESC[32m ok ESC[0m \n plus the first byte of "é".
+    let first_raw: &[u8] = b"\x1b[32mok\x1b[0m\n\xc3";
+    // Page two raw bytes: the last byte of "é", then ESC[31m bad ESC[0m \n.
+    let second_raw: &[u8] = b"\xa9\x1b[31mbad\x1b[0m\n";
+    let pages = [
+        (first_raw.len() as u64, "ok\n\u{FFFD}"),
+        (second_raw.len() as u64, "\u{FFFD}bad\n"),
+    ];
+    let total = (first_raw.len() + second_raw.len()) as u64;
+    let plan = planned(&["api", "repos/cortexkit/aft/actions/jobs/42/logs"]);
+    let mut offsets = Vec::new();
+    let mut output = Vec::new();
+    render::run(
+        &plan,
+        &mut |request| {
+            let ReadRequest::JobLog {
+                range: Some(range), ..
+            } = request
+            else {
+                panic!("full logs must request a byte range");
+            };
+            offsets.push(range.offset);
+            let (length, body) = pages[offsets.len() - 1];
+            decoded_log_reply(request, body, range.offset, length, total)
+        },
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(offsets, vec![0, first_raw.len() as u64]);
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        "ok\n\u{FFFD}\u{FFFD}bad\n"
+    );
+}
+
+// A page made only of colour codes has an empty display body but still
+// consumes raw bytes, so paging continues instead of reporting a stall.
+#[test]
+fn v20_job_log_page_of_only_colour_codes_still_advances() {
+    let colour_only: &[u8] = b"\x1b[32m\x1b[0m";
+    let pages = [(colour_only.len() as u64, ""), (3, "ok\n")];
+    let total = colour_only.len() as u64 + 3;
+    let plan = planned(&["api", "repos/cortexkit/aft/actions/jobs/42/logs"]);
+    let mut offsets = Vec::new();
+    let mut output = Vec::new();
+    render::run(
+        &plan,
+        &mut |request| {
+            let ReadRequest::JobLog {
+                range: Some(range), ..
+            } = request
+            else {
+                panic!("full logs must request a byte range");
+            };
+            offsets.push(range.offset);
+            let (length, body) = pages[offsets.len() - 1];
+            decoded_log_reply(request, body, range.offset, length, total)
+        },
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(offsets, vec![0, colour_only.len() as u64]);
+    assert_eq!(output, b"ok\n");
+}
+
+// A full window whose edges both split a 4-byte character grows by U+FFFD
+// replacements (+6 at the start, +2 at the end). The window headroom keeps that
+// page under the 1 MiB decoded-reply bound.
+#[test]
+fn v20_full_log_window_with_split_characters_at_both_edges_is_accepted() {
+    let window = render::LOG_WINDOW_BYTES;
+    // Three ASCII bytes misalign the 4-byte emoji, so every window boundary
+    // falls one byte into a character.
+    let mut log = b"abc".to_vec();
+    while log.len() < 2 * window as usize + 64 {
+        log.extend_from_slice("\u{1F600}".as_bytes());
+    }
+    let total = log.len() as u64;
+    let plan = planned(&["api", "repos/cortexkit/aft/actions/jobs/42/logs"]);
+    let mut offsets = Vec::new();
+    let mut bodies = Vec::new();
+    let mut output = Vec::new();
+    render::run(
+        &plan,
+        &mut |request| {
+            let ReadRequest::JobLog {
+                range: Some(range), ..
+            } = request
+            else {
+                panic!("full logs must request a byte range");
+            };
+            offsets.push(range.offset);
+            let start = range.offset as usize;
+            let end = (start + range.length as usize).min(log.len());
+            let body = String::from_utf8_lossy(&log[start..end]).into_owned();
+            bodies.push(body.clone());
+            decoded_log_reply(request, &body, range.offset, (end - start) as u64, total)
+        },
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(offsets, vec![0, window, 2 * window]);
+    // The middle page is split at both edges: three lone continuation bytes at
+    // the start and one lead byte at the end.
+    assert_eq!(bodies[1].len() as u64, window + 8);
+    assert!(bodies[1].len() <= REPLY_BYTES);
+    assert_eq!(output, bodies.concat().into_bytes());
 }
 
 #[test]
