@@ -956,6 +956,7 @@ pub(super) fn prepare_bash_elicitation_plan(
             kind: crate::bash_permissions::PermissionKind::Bash,
             patterns: vec![command.clone()],
             always: Vec::new(),
+            targets: Vec::new(),
         }]
     } else {
         crate::bash_permissions::scan::scan_with_project_root(&command, project_root, &workdir)

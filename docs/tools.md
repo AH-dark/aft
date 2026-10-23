@@ -586,6 +586,12 @@ File-touching commands (`rm`, `cp`, `mv`, etc.) also fire
 `ctx.ask({ permission: "external_directory" })` for paths outside the project root. Pi has no
 permission system; bash runs without prompts.
 
+For a file outside the project, OpenCode's "always" rule and Cingulate's folder option stay
+file-only for your home folder and the folders above it, drive and volume roots, root-level
+folders, and system folders such as `/usr`, `/etc`, `/System`, `C:\Windows` and
+`C:\Program Files` (macOS per-user temp folders under `/var/folders` are not system folders).
+Other folders keep the folder-wide rule.
+
 ---
 
 ### ast_grep_search

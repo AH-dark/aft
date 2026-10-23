@@ -542,12 +542,51 @@ fn permissions_granted_cover(
         return false;
     }
 
-    asks.iter().all(|ask| {
-        ask.patterns
+    asks.iter().all(|ask| match ask.kind {
+        crate::bash_permissions::PermissionKind::ExternalDirectory => {
+            !ask.targets.is_empty()
+                && ask.targets.iter().all(|target| {
+                    granted
+                        .iter()
+                        .any(|grant| external_approval_covers(grant, target))
+                })
+        }
+        crate::bash_permissions::PermissionKind::Bash => ask
+            .patterns
             .iter()
             .chain(ask.always.iter())
-            .any(|pattern| granted.iter().any(|grant| grant == pattern))
+            .any(|pattern| granted.iter().any(|grant| grant == pattern)),
     })
+}
+
+fn external_approval_covers(granted: &str, target: &crate::access_policy::AccessGrant) -> bool {
+    use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+    // Compare Windows identities without rewriting host patterns or stored targets.
+    let path = Path::new(granted);
+    #[cfg(windows)]
+    let normalized_grant = crate::windows_path::normalize_windows_path(path);
+    #[cfg(windows)]
+    let path = normalized_grant.as_path();
+    let target_path = target.path.as_path();
+    #[cfg(windows)]
+    let normalized_target = crate::windows_path::normalize_windows_path(target_path);
+    #[cfg(windows)]
+    let target_path = normalized_target.as_path();
+    let (path, kind) = if path.file_name().is_some_and(|name| name == "*") {
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        (parent, GrantKind::Subtree)
+    } else {
+        (path, GrantKind::File)
+    };
+    path.is_absolute()
+        && AccessGrant {
+            path: path.to_path_buf(),
+            kind,
+            operation: AccessOperation::Read,
+        }
+        .covers_kind(AccessOperation::Read, target_path, target.kind)
 }
 
 fn conservative_powershell_permission_asks(
@@ -557,6 +596,7 @@ fn conservative_powershell_permission_asks(
         kind: crate::bash_permissions::PermissionKind::Bash,
         patterns: vec![command.to_string()],
         always: Vec::new(),
+        targets: Vec::new(),
     }]
 }
 
@@ -694,6 +734,239 @@ mod tests {
                 ..crate::config::Config::default()
             },
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_file_approval_survives_scope_probe_timeout() {
+        let project = tempfile::tempdir().unwrap();
+        // System temporary paths are exempt from external-directory asks, so
+        // use a distinct non-temporary parent to exercise the real scanner.
+        let scratch = std::env::current_dir()
+            .unwrap()
+            .join("target/approval-scope-tests");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let outside = tempfile::tempdir_in(&scratch).unwrap();
+        let parent = crate::access_policy::policy_path(outside.path());
+        let file = parent.join("file.txt");
+        let command = format!("cat \"{}\"", file.display());
+        let stall = crate::bounded_io::stall_helper(&parent);
+        let first = crate::bash_permissions::scan::scan_with_project_root(
+            &command,
+            project.path(),
+            project.path(),
+        );
+        stall
+            .reached
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let external = first
+            .iter()
+            .find(|ask| {
+                matches!(
+                    ask.kind,
+                    crate::bash_permissions::PermissionKind::ExternalDirectory
+                )
+            })
+            .unwrap();
+        assert_eq!(external.patterns, [file.to_string_lossy()]);
+        let granted: Vec<String> = first
+            .iter()
+            .flat_map(|ask| {
+                if ask.always.is_empty() {
+                    ask.patterns.clone()
+                } else {
+                    ask.always.clone()
+                }
+            })
+            .collect();
+        drop(stall);
+        let retry = crate::bash_permissions::scan::scan_with_project_root(
+            &command,
+            project.path(),
+            project.path(),
+        );
+        let external = retry
+            .iter()
+            .find(|ask| {
+                matches!(
+                    ask.kind,
+                    crate::bash_permissions::PermissionKind::ExternalDirectory
+                )
+            })
+            .unwrap();
+        assert_eq!(external.patterns, [format!("{}/*", parent.display())]);
+        assert!(
+            permissions_granted_cover(&retry, &granted),
+            "the approved file must not ask again after its folder becomes eligible"
+        );
+
+        let sibling = parent.join("sibling.txt");
+        let batch = crate::bash_permissions::scan::scan_with_project_root(
+            &format!("cat \"{}\" \"{}\"", file.display(), sibling.display()),
+            project.path(),
+            project.path(),
+        );
+        let external: Vec<_> = batch
+            .iter()
+            .filter(|ask| {
+                matches!(
+                    ask.kind,
+                    crate::bash_permissions::PermissionKind::ExternalDirectory
+                )
+            })
+            .collect();
+        assert_eq!(
+            external.len(),
+            1,
+            "the displayed folder asks are deduplicated"
+        );
+        assert_eq!(external[0].targets.len(), 2);
+        assert!(
+            !permissions_granted_cover(&batch, &granted),
+            "one approved file cannot cover a deduplicated sibling"
+        );
+        let mut both = granted;
+        both.push(sibling.to_string_lossy().into_owned());
+        assert!(permissions_granted_cover(&batch, &both));
+    }
+
+    #[test]
+    fn external_approval_coverage_respects_path_and_kind() {
+        use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join("target/coverage-fixture");
+        let file = directory.join("file.txt");
+        let target = AccessGrant {
+            path: file.clone(),
+            kind: GrantKind::File,
+            operation: AccessOperation::Read,
+        };
+        let exact = file.to_string_lossy().into_owned();
+        let folder = format!("{}/*", directory.display());
+        assert!(external_approval_covers(&exact, &target));
+        assert!(external_approval_covers(&folder, &target));
+        assert!(external_approval_covers(
+            &folder,
+            &AccessGrant {
+                path: directory.join("nested/other.txt"),
+                ..target.clone()
+            }
+        ));
+        assert!(!external_approval_covers(
+            &exact,
+            &AccessGrant {
+                path: directory.join("sibling.txt"),
+                ..target.clone()
+            }
+        ));
+        assert!(!external_approval_covers(
+            &exact,
+            &AccessGrant {
+                kind: GrantKind::Subtree,
+                ..target.clone()
+            }
+        ));
+        assert!(external_approval_covers(
+            &folder,
+            &AccessGrant {
+                path: directory.join("nested"),
+                kind: GrantKind::Subtree,
+                ..target.clone()
+            }
+        ));
+        assert!(!external_approval_covers(
+            &folder,
+            &AccessGrant {
+                path: directory
+                    .with_file_name("coverage-fixture-other")
+                    .join("file.txt"),
+                ..target.clone()
+            }
+        ));
+        assert!(!external_approval_covers("*", &target));
+        assert!(!external_approval_covers("cat *", &target));
+
+        let ask = crate::bash_permissions::PermissionAsk {
+            kind: crate::bash_permissions::PermissionKind::ExternalDirectory,
+            patterns: vec![folder.clone()],
+            always: vec![folder.clone()],
+            targets: vec![target],
+        };
+        let serialized = serde_json::to_value(&ask).unwrap();
+        assert!(
+            serialized.get("targets").is_none(),
+            "internal targets must not change host prompts"
+        );
+        let missing: crate::bash_permissions::PermissionAsk =
+            serde_json::from_value(serialized).unwrap();
+        assert!(
+            !permissions_granted_cover(&[missing], &[folder]),
+            "unknown targets must fail closed"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn external_approval_coverage_normalizes_windows_path_spellings() {
+        use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+        for (plain, verbatim) in [
+            (r"D:\a\aft\file.txt", r"\\?\D:\a\aft\file.txt"),
+            (r"D:/a/aft/file.txt", r"\\?\d:\a\aft\file.txt"),
+            (
+                r"\\server\share\folder\file.txt",
+                r"\\?\UNC\server\share\folder\file.txt",
+            ),
+        ] {
+            for (approved, requested) in [(plain, verbatim), (verbatim, plain)] {
+                let target = AccessGrant {
+                    path: PathBuf::from(requested),
+                    kind: GrantKind::File,
+                    operation: AccessOperation::Read,
+                };
+                let original = target.clone();
+                assert!(
+                    external_approval_covers(approved, &target),
+                    "file: {approved} -> {requested}"
+                );
+                let folder = format!("{}/*", Path::new(approved).parent().unwrap().display());
+                assert!(
+                    external_approval_covers(&folder, &target),
+                    "folder: {folder} -> {requested}"
+                );
+                assert!(!external_approval_covers(
+                    approved,
+                    &AccessGrant {
+                        kind: GrantKind::Subtree,
+                        ..target.clone()
+                    }
+                ));
+                assert!(!external_approval_covers(
+                    approved,
+                    &AccessGrant {
+                        path: target.path.with_file_name("other.txt"),
+                        ..target.clone()
+                    }
+                ));
+                assert!(!external_approval_covers(
+                    &folder,
+                    &AccessGrant {
+                        path: target
+                            .path
+                            .parent()
+                            .unwrap()
+                            .with_file_name("other-folder")
+                            .join("file.txt"),
+                        ..target.clone()
+                    }
+                ));
+                assert_eq!(
+                    target, original,
+                    "comparison must preserve the requested spelling"
+                );
+            }
+        }
     }
 
     #[test]

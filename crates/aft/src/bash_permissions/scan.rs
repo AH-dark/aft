@@ -225,6 +225,7 @@ fn parse_failed_ask() -> PermissionAsk {
         kind: PermissionKind::Bash,
         patterns: vec!["*".to_string()],
         always: Vec::new(),
+        targets: Vec::new(),
     }
 }
 
@@ -1076,14 +1077,6 @@ fn resolve_existing(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| super::normalize_path(path))
 }
 
-fn permission_dir(path: &Path) -> PathBuf {
-    if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent().unwrap_or(path).to_path_buf()
-    }
-}
-
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -1105,6 +1098,7 @@ fn push_bash_ask(
             kind: PermissionKind::Bash,
             patterns: vec![pattern],
             always: vec![format!("{stable} *")],
+            targets: Vec::new(),
         },
     );
 }
@@ -1153,8 +1147,22 @@ fn push_external_path(
     if read_exemption.is_some_and(|is_exempt| is_exempt(path)) {
         return;
     }
-    let dir = permission_dir(path);
-    let pattern = format!("{}/*", display_path(&dir));
+    use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+    let grant = AccessGrant {
+        path: path.to_path_buf(),
+        kind: if path.is_dir() {
+            GrantKind::Subtree
+        } else {
+            GrantKind::File
+        },
+        // Folder eligibility is identical for read and write approvals.
+        operation: AccessOperation::Read,
+    };
+    let scope = crate::subc::directory_scope(&grant);
+    let pattern = match scope.kind {
+        GrantKind::File => display_path(&scope.path),
+        GrantKind::Subtree => format!("{}/*", display_path(&scope.path)),
+    };
     push_ask(
         asks,
         seen,
@@ -1162,6 +1170,7 @@ fn push_external_path(
             kind: PermissionKind::ExternalDirectory,
             patterns: vec![pattern.clone()],
             always: vec![pattern],
+            targets: vec![grant],
         },
     );
 }
@@ -1170,7 +1179,35 @@ fn push_ask(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, ask: Perm
     let key = format!("{:?}:{:?}:{:?}", ask.kind, ask.patterns, ask.always);
     if seen.insert(key) {
         asks.push(ask);
+    } else if let Some(existing) = asks.iter_mut().find(|existing| {
+        existing.kind == ask.kind
+            && existing.patterns == ask.patterns
+            && existing.always == ask.always
+    }) {
+        // A single displayed folder ask may represent several files. Keep all
+        // of them so approving one file cannot authorize its unapproved sibling.
+        for target in ask.targets {
+            if !existing
+                .targets
+                .iter()
+                .any(|prior| same_external_target(prior, &target))
+            {
+                existing.targets.push(target);
+            }
+        }
     }
+}
+
+fn same_external_target(
+    left: &crate::access_policy::AccessGrant,
+    right: &crate::access_policy::AccessGrant,
+) -> bool {
+    #[cfg(windows)]
+    let same_path = crate::windows_path::normalize_windows_path(&left.path)
+        == crate::windows_path::normalize_windows_path(&right.path);
+    #[cfg(not(windows))]
+    let same_path = left.path == right.path;
+    same_path && left.kind == right.kind && left.operation == right.operation
 }
 
 #[cfg(test)]
@@ -1649,6 +1686,80 @@ mod tests {
     }
     use crate::bash_permissions::normalize_path;
 
+    #[cfg(windows)]
+    #[test]
+    fn external_target_dedup_normalizes_windows_path_spellings() {
+        use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+        for (plain, verbatim) in [
+            (r"D:/a/aft/file.txt", r"\\?\d:\a\aft\file.txt"),
+            (
+                r"\\server\share\folder\file.txt",
+                r"\\?\UNC\server\share\folder\file.txt",
+            ),
+        ] {
+            let original = AccessGrant {
+                path: PathBuf::from(verbatim),
+                kind: GrantKind::File,
+                operation: AccessOperation::Read,
+            };
+            let pattern = "unchanged-host-pattern/*";
+            let ask = |target| PermissionAsk {
+                kind: PermissionKind::ExternalDirectory,
+                patterns: vec![pattern.into()],
+                always: vec![pattern.into()],
+                targets: vec![target],
+            };
+            let mut asks = Vec::new();
+            let mut seen = HashSet::new();
+            push_ask(&mut asks, &mut seen, ask(original.clone()));
+            push_ask(
+                &mut asks,
+                &mut seen,
+                ask(AccessGrant {
+                    path: PathBuf::from(plain),
+                    ..original.clone()
+                }),
+            );
+            assert_eq!(asks.len(), 1);
+            assert_eq!(
+                asks[0].targets,
+                [original.clone()],
+                "equivalent targets should merge without rewriting the first spelling"
+            );
+            push_ask(
+                &mut asks,
+                &mut seen,
+                ask(AccessGrant {
+                    kind: GrantKind::Subtree,
+                    ..original.clone()
+                }),
+            );
+            push_ask(
+                &mut asks,
+                &mut seen,
+                ask(AccessGrant {
+                    operation: AccessOperation::Write,
+                    ..original.clone()
+                }),
+            );
+            push_ask(
+                &mut asks,
+                &mut seen,
+                ask(AccessGrant {
+                    path: original.path.with_file_name("other.txt"),
+                    ..original
+                }),
+            );
+            assert_eq!(
+                asks[0].targets.len(),
+                4,
+                "different kind, mode or path must remain distinct"
+            );
+            assert_eq!(asks[0].patterns, [pattern]);
+            assert_eq!(asks[0].always, [pattern]);
+        }
+    }
+
     #[test]
     fn pwd_expands_against_scan_cwd() {
         let temp = tempfile::tempdir().unwrap();
@@ -1814,7 +1925,7 @@ mod tests {
     fn partly_quoted_absolute_path_is_not_treated_as_relative() {
         let project = tempfile::tempdir().unwrap();
         let asks = external_asks(r#"rm "/usr"/aft-scan-probe"#, project.path());
-        assert_eq!(asks, vec!["/usr/*".to_string()]);
+        assert_eq!(asks, vec!["/usr/aft-scan-probe".to_string()]);
         assert_eq!(unquote(r#""/etc"/'pass'wd"#), "/etc/passwd");
         assert_eq!(unquote(r#"'a"b'"c'd""#), "a\"bc'd");
     }
@@ -1824,7 +1935,7 @@ mod tests {
     fn pushd_and_popd_move_the_scan_directory() {
         let project = tempfile::tempdir().unwrap();
         let asks = external_asks("pushd /usr && rm aft-scan-probe", project.path());
-        assert_eq!(asks, vec!["/usr/*".to_string()]);
+        assert_eq!(asks, vec!["/usr/aft-scan-probe".to_string()]);
         let asks = external_asks("pushd /usr && popd && rm aft-scan-probe", project.path());
         assert!(asks.is_empty(), "{asks:?}");
     }

@@ -15149,10 +15149,13 @@ impl AppContext {
                 return Ok(());
             }
             let id = crate::access_policy::plugin::issue(&scope, &grant);
-            let pattern = if is_dir {
-                identity.join("*")
-            } else {
-                identity.parent().unwrap_or(identity).join("*")
+            // OpenCode's `*` includes every descendant. Use the same folder
+            // eligibility as consent cards so saving a file approval cannot
+            // silently approve home, a volume root, or a system tree.
+            let saved_scope = crate::subc::directory_scope(&grant);
+            let pattern = match saved_scope.kind {
+                GrantKind::File => saved_scope.path,
+                GrantKind::Subtree => saved_scope.path.join("*"),
             };
             let mut ask = serde_json::json!({
                 "kind": "external_directory", "patterns": [pattern], "always": [pattern],

@@ -1726,6 +1726,98 @@ fn consent_scope_rejects_home_ancestors() {
     }
 }
 
+#[test]
+fn consent_scope_preserves_ordinary_system_name_prefixes() {
+    #[cfg(unix)]
+    let (home, root, ordinary, system) = (
+        Path::new("/srv/users/alice"),
+        Path::new("/"),
+        vec!["/library/x", "/library/projects", "/libfoo/x"],
+        vec!["/lib64/x", "/libx32/x"],
+    );
+    #[cfg(windows)]
+    let (home, root, ordinary, system) = (
+        Path::new(r"C:\Users\alice"),
+        Path::new(r"C:\"),
+        vec![r"C:\Program Files-backup\x", r"C:\PROGRAM FILES ARM\Vendor"],
+        vec![r"C:\Program Files (x86)\x", r"C:\pRoGrAm FiLeS\x"],
+    );
+    for directory in ordinary {
+        assert!(
+            directory_scope_is_narrow(Path::new(directory), home, root),
+            "ordinary folder must remain eligible: {directory}"
+        );
+    }
+    for directory in system {
+        assert!(
+            !directory_scope_is_narrow(Path::new(directory), home, root),
+            "system tree must stay file-only: {directory}"
+        );
+    }
+}
+
+#[test]
+fn consent_scope_rejects_system_trees() {
+    #[cfg(unix)]
+    let (home, root, directories) = (
+        Path::new("/srv/users/alice"),
+        Path::new("/"),
+        vec![
+            "/usr/local",
+            "/usr/local/share",
+            "/etc/ssl",
+            "/bin/tools",
+            "/sbin/tools",
+            "/lib/modules",
+            "/lib32/modules",
+            "/lib64/modules",
+            "/libx32/modules",
+            "/libexec/tools",
+            "/opt/vendor",
+            "/var/log",
+            "/var/folders-other/user",
+            "/System/Library",
+            "/Library/Application Support",
+            "/private/etc/ssl",
+            "/private/var/db",
+        ],
+    );
+    #[cfg(windows)]
+    let (home, root, directories) = (
+        Path::new(r"C:\Users\alice"),
+        Path::new(r"C:\"),
+        vec![
+            r"C:\Windows\System32",
+            r"C:\wInDoWs\Temp",
+            r"C:\Program Files\Vendor",
+            r"C:\Program Files (x86)\Vendor",
+            r"C:\PROGRAM FILES (X86)\Vendor",
+        ],
+    );
+    for directory in directories {
+        assert!(
+            !directory_scope_is_narrow(Path::new(directory), home, root),
+            "system tree must stay file-only: {directory}"
+        );
+    }
+    #[cfg(unix)]
+    let ordinary = [
+        "/srv/projects/src",
+        "/usr-local/project",
+        "/opt-project/src",
+        "/var/folders/ab/user/T",
+        "/private/var/folders/ab/user/T",
+    ];
+    #[cfg(windows)]
+    let ordinary = [r"C:\Users\alice\Work\src", r"C:\Windows-project\src"];
+    for directory in ordinary {
+        assert!(
+            directory_scope_is_narrow(Path::new(directory), home, root),
+            "{directory}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn consent_scope_rejects_volume_boundaries() {
