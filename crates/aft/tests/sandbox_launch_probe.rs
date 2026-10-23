@@ -38,6 +38,10 @@ struct ProbeFixture {
 
 impl ProbeFixture {
     fn new() -> Self {
+        Self::with_worker_jail(false)
+    }
+
+    fn with_worker_jail(worker_jail: bool) -> Self {
         let root_guard = tempfile::tempdir().expect("create probe root");
         let root = root_guard
             .path()
@@ -84,7 +88,7 @@ impl ProbeFixture {
             read_allow.extend(linux_system_read_allow());
             read_allow
         };
-        let profile = SandboxProfile::build(
+        let mut profile = SandboxProfile::build(
             vec![project.clone(), artifacts],
             Vec::new(),
             vec![project.join(".git"), project.join(".cortexkit")],
@@ -95,6 +99,7 @@ impl ProbeFixture {
             task_temp,
         )
         .expect("build canonical sandbox profile");
+        profile.worker_jail = worker_jail;
 
         Self {
             _root_guard: root_guard,
@@ -206,6 +211,7 @@ mod signal_scope {
                 return false;
             }
             let support: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(support["signal_scope_profile"], "worker");
             if support["signal_scope"] != "same_command" {
                 assert_eq!(support["signal_scope"], "not_enforced");
                 assert!(support["unenforced"]
@@ -284,7 +290,7 @@ mod signal_scope {
         if !signal_scope_available() {
             return;
         }
-        let mut fixture = ProbeFixture::new();
+        let mut fixture = ProbeFixture::with_worker_jail(true);
         let mut victim = Victim::new();
         let output = attack(&mut fixture, &victim.0.id().to_string());
         assert_refused(output, &mut victim);
@@ -295,7 +301,7 @@ mod signal_scope {
         if !signal_scope_available() {
             return;
         }
-        let mut fixture = ProbeFixture::new();
+        let mut fixture = ProbeFixture::with_worker_jail(true);
         fixture.profile.rewind();
         let mut command = launcher_command(
             fixture.profile.fd(),
@@ -324,7 +330,7 @@ mod signal_scope {
         if !signal_scope_available() {
             return;
         }
-        let mut fixture = ProbeFixture::new();
+        let mut fixture = ProbeFixture::with_worker_jail(true);
         fixture.profile.rewind();
         let output = launcher_command(fixture.profile.fd(), &[
             "/bin/bash", "--noprofile", "--norc", "-c",
@@ -334,6 +340,24 @@ mod signal_scope {
         .output()
         .expect("launch own-child signal probe");
         assert!(output.status.success(), "own-child kill failed: {output:?}");
+    }
+
+    #[test]
+    fn native_signal_nonworker_profile_is_unchanged() {
+        #[cfg(target_os = "linux")]
+        if !landlock_available() {
+            assert_ne!(std::env::var("AFT_REQUIRE_LANDLOCK").as_deref(), Ok("1"));
+            eprintln!("nonworker signal test skipped: Landlock unavailable");
+            return;
+        }
+        let mut fixture = ProbeFixture::new();
+        let mut victim = Victim::new();
+        let output = attack(&mut fixture, &victim.0.id().to_string());
+        assert!(
+            output.status.success(),
+            "operator signal unexpectedly refused: {output:?}"
+        );
+        assert_eq!(victim.0.wait().unwrap().signal(), Some(9));
     }
 }
 

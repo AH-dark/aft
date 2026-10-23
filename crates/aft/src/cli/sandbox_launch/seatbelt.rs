@@ -55,7 +55,7 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
     let mut source = String::from(
         "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (literal \"/dev/null\"))\n",
     );
-    render_signal_scope(&mut source);
+    render_signal_scope(&mut source, profile);
 
     for root in profile.write_allow_roots() {
         source.push_str(&format!(
@@ -143,7 +143,7 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
 
 fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
     let mut source = String::from("(version 1)\n(allow default)\n");
-    render_signal_scope(&mut source);
+    render_signal_scope(&mut source, profile);
     for path in &profile.write_deny {
         source.push_str(&format!(
             "(deny file-write* {})\n",
@@ -240,7 +240,10 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
     Ok(source)
 }
 
-fn render_signal_scope(source: &mut String) {
+fn render_signal_scope(source: &mut String, profile: &SandboxProfile) {
+    if !profile.worker_jail {
+        return;
+    }
     // Separate sandbox_init calls do not share a signal domain, even with an
     // identical profile. Host-side AFT cancellation remains available across
     // commands; a command may signal only processes in its own sandbox.
@@ -517,7 +520,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn signal_scope_is_present_in_strict_and_relaxed_profiles() {
+    fn signal_scope_is_limited_to_worker_profiles_in_both_modes() {
         let dir = tempfile::tempdir().unwrap();
         let mut profile = SandboxProfile::build(
             vec![dir.path().to_path_buf()],
@@ -535,6 +538,10 @@ mod tests {
             aft::config::SandboxMode::Relaxed,
         ] {
             profile.mode = mode;
+            profile.worker_jail = false;
+            let operator = render_profile(&profile).unwrap();
+            assert!(!operator.contains("(deny signal)"));
+            profile.worker_jail = true;
             let source = render_profile(&profile).unwrap();
             assert!(source.contains("(deny signal)\n(allow signal (target same-sandbox))\n"));
             assert!(!source.contains("(target pgrp)"));
