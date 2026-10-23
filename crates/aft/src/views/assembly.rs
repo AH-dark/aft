@@ -127,6 +127,9 @@ pub struct PreparedAssembly {
     /// The family index row this generation's ready derived database earns
     /// once published: the index path, this scope and the output identity.
     derived_index_entry: Option<(PathBuf, String, [u8; 32])>,
+    /// That row once the generation is published, waiting for
+    /// `settle_status` to write it outside the publisher's commit barrier.
+    committed_index_entry: Option<IndexEntry>,
     pin: Option<AssemblyPin>,
     _base_pin: Option<crate::pins::QueryPin>,
     profile: PublicationProfile,
@@ -245,6 +248,138 @@ fn run_before_settle_write(view_dir: &Path) {
     }
 }
 
+/// A derived-output index row for a published generation, written after the
+/// publisher leaves its commit barrier.
+struct IndexEntry {
+    view: ViewStore,
+    index: PathBuf,
+    scope: String,
+    generation: String,
+    identity: [u8; 32],
+}
+
+/// What became of an [`IndexEntry`], for tests.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IndexWrite {
+    Recorded,
+    /// Another generation is served by now, so the row would name a
+    /// generation nobody serves.
+    Superseded,
+    /// The write failed (for example the index stayed locked) and was logged.
+    Failed,
+}
+
+impl IndexEntry {
+    /// Record the row unless the view no longer serves this generation. The
+    /// row is a hint for other scopes' seeding: losing it only costs a missed
+    /// reuse, so a failure is logged and never fails the publication.
+    ///
+    /// The view's settle gate serializes the check with the write, so an
+    /// older publication cannot overwrite the row of a newer one that
+    /// published between the check and the write.
+    fn write(self) {
+        let gate = settle_gate(self.view.view_dir());
+        let _serial = gate
+            .serial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(test)]
+        run_before_index_write(self.view.view_dir());
+        let outcome = match self.view.current_generation() {
+            Ok(Some(served)) if served == self.generation => {
+                match derived_index::record(
+                    &self.index,
+                    &self.scope,
+                    &self.generation,
+                    &self.identity,
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            Ok(_) => {
+                log::info!(
+                    "view derived index skipped: scope={} generation={} is no longer served",
+                    self.scope,
+                    self.generation
+                );
+                #[cfg(test)]
+                note_index_write(self.view.view_dir(), IndexWrite::Superseded);
+                return;
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        match outcome {
+            Ok(()) => {
+                #[cfg(test)]
+                note_index_write(self.view.view_dir(), IndexWrite::Recorded);
+            }
+            Err(error) => {
+                log::warn!(
+                    "view derived index not updated: scope={} generation={} error={error}",
+                    self.scope,
+                    self.generation
+                );
+                #[cfg(test)]
+                note_index_write(self.view.view_dir(), IndexWrite::Failed);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+static BEFORE_INDEX_WRITE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, SettleHook>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+static INDEX_WRITES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<IndexWrite>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Runs `hook` each time a derived-index row for `view_dir` is about to be
+/// written, before the served generation is checked.
+#[cfg(test)]
+pub(crate) fn before_index_write_for_test(
+    view_dir: &Path,
+    hook: impl Fn() + Send + Sync + 'static,
+) {
+    BEFORE_INDEX_WRITE
+        .lock()
+        .unwrap()
+        .insert(view_dir.to_path_buf(), std::sync::Arc::new(hook));
+}
+
+/// The outcomes of every derived-index write for `view_dir` so far.
+#[cfg(test)]
+pub(crate) fn index_writes_for_test(view_dir: &Path) -> Vec<IndexWrite> {
+    INDEX_WRITES
+        .lock()
+        .unwrap()
+        .get(view_dir)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn run_before_index_write(view_dir: &Path) {
+    let hook = BEFORE_INDEX_WRITE.lock().unwrap().get(view_dir).cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn note_index_write(view_dir: &Path, outcome: IndexWrite) {
+    INDEX_WRITES
+        .lock()
+        .unwrap()
+        .entry(view_dir.to_path_buf())
+        .or_default()
+        .push(outcome);
+}
+
 impl PreparedAssembly {
     pub fn report(&self) -> &AssemblyReport {
         &self.report
@@ -260,19 +395,24 @@ impl PreparedAssembly {
             match outcome? {
                 PublishOutcome::Published => {
                     self.report.published = true;
-                    self.files = None;
-                    if let (Some((index, scope, identity)), Some(generation)) = (
+                    // Only moved aside here: the commit runs under the root's
+                    // write gate and the process-wide job table, and the
+                    // index is a shared SQLite file another process may hold.
+                    // `settle_status` writes it after both are released.
+                    if let (Some((index, scope, identity)), Some((view, _)), Some(generation)) = (
                         self.derived_index_entry.take(),
-                        self.report.generation.as_deref(),
+                        self.files.as_ref(),
+                        self.report.generation.as_ref(),
                     ) {
-                        // A hint for other scopes' seeding; losing it only
-                        // costs a missed reuse, so it never fails publication.
-                        if let Err(error) =
-                            derived_index::record(&index, &scope, generation, &identity)
-                        {
-                            log::warn!("view derived index not updated: {error}");
-                        }
+                        self.committed_index_entry = Some(IndexEntry {
+                            view: view.clone(),
+                            index,
+                            scope,
+                            generation: generation.clone(),
+                            identity,
+                        });
                     }
+                    self.files = None;
                     if retires_legacy_plane {
                         log::info!(
                             "views: root={} legacy plane retired at generation={}",
@@ -342,7 +482,14 @@ impl PreparedAssembly {
     /// generation is already current, so a write that fails does not fail
     /// the publication: it is logged, the transaction rolls back, and the next
     /// publication of the view (a no-op included) computes the changes again.
+    ///
+    /// It also writes the derived-output index row a published generation
+    /// earned (see [`IndexEntry::write`]), for the same reason: that write
+    /// opens a shared SQLite file and may wait on another process.
     pub fn settle_status(&mut self) -> SettleOutcome {
+        if let Some(entry) = self.committed_index_entry.take() {
+            entry.write();
+        }
         let Some(settlement) = self.committed_settlement.take() else {
             return SettleOutcome::Nothing;
         };
@@ -805,6 +952,7 @@ pub fn prepare_checkout_deferring(
         files: Some((view.clone(), next_generation.clone())),
         derived_checkpoint: None,
         derived_index_entry: None,
+        committed_index_entry: None,
         pin: Some(pin),
         _base_pin: base_pin,
         profile,

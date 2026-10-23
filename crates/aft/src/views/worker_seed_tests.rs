@@ -487,6 +487,45 @@ fn indexed_donor_from_an_older_build_output_is_forgotten_not_reused() {
 }
 
 #[test]
+fn derived_index_row_of_a_superseded_publication_is_never_written() {
+    let (_dirs, mut main, _worker) = checkouts(24);
+    publish_checkout(&main).unwrap();
+    let view_dir = ViewStore::open(&main.storage, &main.scope)
+        .unwrap()
+        .view_dir()
+        .to_owned();
+    let edit = |request: &mut AssemblyRequest, body: &str| {
+        fs::write(
+            request.project_root.join("file_0.ts"),
+            format!("export function target_0() {{ return {body}; }}"),
+        )
+        .unwrap();
+        request.changed_paths.insert(b"file_0.ts".to_vec());
+    };
+    edit(&mut main, "1");
+    let mut older = prepare_checkout(&main, &mut |_| Ok(())).unwrap();
+    let older_generation = older.commit().unwrap().generation.unwrap();
+    // A newer publication is committed and settled before the older one's
+    // deferred index write runs.
+    edit(&mut main, "2");
+    let newer = publish_checkout(&main).unwrap();
+    older.settle_status();
+
+    assert_eq!(
+        index_writes_for_test(&view_dir),
+        vec![
+            IndexWrite::Recorded,
+            IndexWrite::Recorded,
+            IndexWrite::Superseded
+        ]
+    );
+    let rows = derived_index::candidates(&index_of(&main), &[0; 32], "some-other-scope").unwrap();
+    let row = rows.iter().find(|row| row.scope == main.scope).unwrap();
+    assert_eq!(Some(&row.generation), newer.generation.as_ref());
+    assert_ne!(row.generation, older_generation);
+}
+
+#[test]
 fn worker_seed_copy_that_fails_readiness_is_rebuilt_cold_not_served() {
     // A copy that is well-formed SQLite but whose build never finished, and a
     // torn copy cut off partway through. Neither may be patched into the

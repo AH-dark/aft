@@ -392,7 +392,10 @@ impl Fixture {
         assert!(response.success, "{:?}", response.data);
     }
     fn wait_idle(&self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        self.wait_idle_for(Duration::from_secs(10));
+    }
+    fn wait_idle_for(&self, limit: Duration) {
+        let deadline = Instant::now() + limit;
         while running_for_context(&self.ctx) {
             assert!(
                 Instant::now() < deadline,
@@ -1677,5 +1680,94 @@ fn context_keeps_a_typed_conflict_and_the_winning_generation_for_retry() {
     assert_eq!(
         retry.failures, 1,
         "formatted text must not decide the retry category"
+    );
+}
+
+/// A publication writes its derived-output index row only after it has left
+/// its commit barrier. The index is a SQLite file shared by every checkout of
+/// the family, possibly held by another process; writing it under the root's
+/// write gate or the process-wide job table would make this root's queries and
+/// other roots' publications wait for an optional hint.
+#[test]
+fn publication_writes_the_derived_index_outside_the_commit_barrier() {
+    use crate::views::assembly::{before_index_write_for_test, index_writes_for_test, IndexWrite};
+    let fixture = Fixture::new();
+    let other = Fixture::new();
+    let view_dir = fixture.view.view_dir().to_owned();
+    assert_eq!(
+        index_writes_for_test(&view_dir),
+        vec![IndexWrite::Recorded],
+        "the fixture's first publication must build and index a derived graph"
+    );
+    let index = fixture
+        ._storage
+        .path()
+        .join("blobs")
+        .join("publication-fixture")
+        .join("derived-index.sqlite");
+    assert!(index.is_file());
+    // Another connection holds the index's write lock, as another process
+    // updating the family's index would.
+    let holder = rusqlite::Connection::open(&index).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let epoch = {
+        let state = fixture.executor.inner.state.lock();
+        Arc::clone(&state.actors.get(&fixture.root).expect("actor").epoch)
+    };
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded::<(bool, bool, bool)>(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+    before_index_write_for_test(&view_dir, move || {
+        // Whether this thread still holds the barrier, whether the job table
+        // is free, and whether this root's write gate is released.
+        let state = (
+            super::in_commit_barrier_for_test(),
+            super::JOBS.try_lock().is_some(),
+            epoch.try_read().is_some(),
+        );
+        let _ = entered_tx.try_send(state);
+        // Blocks only the first write: the test drops the sender to release it.
+        let _ = release_rx.recv_timeout(Duration::from_secs(30));
+    });
+
+    fixture.change("next");
+    fixture.schedule();
+    let state = entered_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the publication never reached its index write");
+    assert_eq!(
+        state,
+        (false, true, true),
+        "(inside commit barrier, job table free, write gate free) at the index write"
+    );
+    // The new generation is already served while the index write waits.
+    assert_ne!(
+        fixture.view.current_generation().unwrap().as_deref(),
+        Some(fixture.initial.as_str())
+    );
+    // A publication on another root needs the job table and finishes now.
+    other.change("elsewhere");
+    other.schedule();
+    other.wait_idle();
+    assert_ne!(
+        other.view.current_generation().unwrap().as_deref(),
+        Some(other.initial.as_str())
+    );
+    drop(release_tx);
+    fixture.wait_idle_for(Duration::from_secs(30));
+    assert_eq!(
+        index_writes_for_test(&view_dir).last(),
+        Some(&IndexWrite::Failed),
+        "a locked index is skipped with a log line, not waited on"
+    );
+
+    // Once the lock is gone, the next publication records its row.
+    holder.execute_batch("ROLLBACK;").unwrap();
+    drop(holder);
+    fixture.change("again");
+    fixture.schedule();
+    fixture.wait_idle_for(Duration::from_secs(30));
+    assert_eq!(
+        index_writes_for_test(&view_dir).last(),
+        Some(&IndexWrite::Recorded)
     );
 }
