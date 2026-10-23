@@ -4112,6 +4112,79 @@ trait ReadDirectoryLister {
     fn children(&mut self, parent: &Path) -> std::io::Result<Vec<ListedReadChild>>;
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod fixed_read_inventory {
+    use super::*;
+
+    type Inventory = Arc<BTreeMap<PathBuf, Vec<ListedReadChild>>>;
+
+    thread_local! {
+        static CURRENT: RefCell<Option<Inventory>> = const { RefCell::new(None) };
+    }
+
+    pub(super) struct Scope {
+        previous: Option<Inventory>,
+        _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            CURRENT.with(|slot| slot.replace(self.previous.take()));
+        }
+    }
+
+    pub(super) fn install(root: &Path) -> Scope {
+        fn capture(
+            root: &Path,
+            directories: &mut BTreeMap<PathBuf, Vec<ListedReadChild>>,
+        ) -> std::io::Result<()> {
+            let children = SecureReadDirectoryLister.children(root)?;
+            for child in &children {
+                if child.is_dir {
+                    capture(&child.path, directories)?;
+                }
+            }
+            directories.insert(root.to_path_buf(), children);
+            Ok(())
+        }
+
+        let root = root.canonicalize().unwrap();
+        let mut directories = BTreeMap::new();
+        capture(&root, &mut directories).expect("capture the immutable profile fixture");
+        // This fixture's filesystem contains its own entries and the ancestor
+        // chain needed to reach them, not other tests' home or temp directories.
+        for child in root.ancestors() {
+            if let Some(parent) = child.parent() {
+                directories
+                    .entry(parent.to_path_buf())
+                    .or_default()
+                    .push(ListedReadChild {
+                        path: child.to_path_buf(),
+                        is_dir: true,
+                    });
+            }
+        }
+        let previous = CURRENT.with(|slot| slot.replace(Some(Arc::new(directories))));
+        Scope {
+            previous,
+            _same_thread: std::marker::PhantomData,
+        }
+    }
+
+    pub(super) struct FixtureLister(Inventory);
+
+    impl ReadDirectoryLister for FixtureLister {
+        fn children(&mut self, parent: &Path) -> std::io::Result<Vec<ListedReadChild>> {
+            // An unlisted directory is empty in this fixed fixture universe.
+            Ok(self.0.get(parent).cloned().unwrap_or_default())
+        }
+    }
+
+    pub(super) fn current() -> Option<FixtureLister> {
+        CURRENT.with(|slot| slot.borrow().clone().map(FixtureLister))
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn build_linux_profile(
     profile: SandboxProfile,
@@ -4160,6 +4233,11 @@ fn build_linux_profile(
             force_children: true,
             mandatory: true,
         });
+    }
+
+    #[cfg(test)]
+    if let Some(mut inventory) = fixed_read_inventory::current() {
+        return compute_linux_profile(profile, home, git_read_roots, &intended, &mut inventory);
     }
 
     compute_linux_profile(
@@ -8441,13 +8519,31 @@ mod policy_tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn tool_policy_matches_session_shell_for_every_role_and_untrusted_bind() {
+    enum PolicyParityPhase {
+        BeforeTool,
+        BetweenBuilds,
+    }
+
+    #[cfg(unix)]
+    fn assert_tool_shell_policy_parity(mut hook: impl FnMut(&Path, PolicyParityPhase)) {
+        #[cfg(target_os = "linux")]
+        let root = tempfile::Builder::new()
+            .prefix("aft-policy-parity-")
+            .tempdir_in(absolute_env_path("HOME").expect("profile tests require an absolute HOME"))
+            .unwrap();
+        #[cfg(not(target_os = "linux"))]
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
         std::fs::create_dir(&project).unwrap();
         let account = root.path().join("account");
         std::fs::create_dir(&account).unwrap();
+        std::fs::create_dir(root.path().join("store")).unwrap();
+        #[cfg(target_os = "linux")]
+        let marker = root.path().join("fixed-inventory-marker");
+        #[cfg(target_os = "linux")]
+        std::fs::create_dir(&marker).unwrap();
+        #[cfg(target_os = "linux")]
+        let marker = marker.canonicalize().unwrap();
         let ctx = context(project.clone());
         let operator_binary = root.path().join("operator-aft");
         std::fs::write(&operator_binary, "operator executable fixture").unwrap();
@@ -8465,6 +8561,8 @@ mod policy_tests {
             session_id: "tool-policy".into(),
             principal_id: Some("unverified".into()),
         };
+        #[cfg(target_os = "linux")]
+        let _inventory = fixed_read_inventory::install(root.path());
         for jailed in [false, true] {
             for mode in [SandboxMode::Off, SandboxMode::Relaxed, SandboxMode::Strict] {
                 for principal in [AuthenticatedPrincipal::FirstParty, untrusted.clone()] {
@@ -8474,6 +8572,7 @@ mod policy_tests {
                         config.sandbox.profile.worker =
                             if jailed { mode } else { SandboxMode::Off };
                     });
+                    hook(root.path(), PolicyParityPhase::BeforeTool);
                     let reads = if principal_requires_strict(&principal)
                         || mode == SandboxMode::Strict
                         || (mode == SandboxMode::Relaxed && (!jailed || !cfg!(target_os = "linux")))
@@ -8491,6 +8590,7 @@ mod policy_tests {
                                     .as_ref()
                                     .map(|task| task.paths.io_dir.as_path())
                                     .unwrap_or(Path::new(""));
+                                hook(root.path(), PolicyParityPhase::BetweenBuilds);
                                 let shell = resolve_sandbox_spawn(
                                     &ctx,
                                     &principal,
@@ -8515,6 +8615,11 @@ mod policy_tests {
                                             mode
                                         };
                                         assert_eq!(tool.mode, expected);
+                                        #[cfg(target_os = "linux")]
+                                        if expected == SandboxMode::Strict {
+                                            assert!(tool.read_allow.contains(&marker));
+                                            assert!(bash.read_allow.contains(&marker));
+                                        }
                                         assert_eq!(
                                             normalized_tool_profile(tool),
                                             normalized_tool_profile(bash)
@@ -8531,6 +8636,39 @@ mod policy_tests {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_policy_matches_session_shell_for_every_role_and_untrusted_bind() {
+        assert_tool_shell_policy_parity(|_, _| {});
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tool_policy_matches_session_shell_despite_directory_churn_between_builds() {
+        let mut changes = 0;
+        assert_tool_shell_policy_parity(|root, phase| {
+            let before = root.join("inventory-before");
+            let after = root.join("inventory-after");
+            match phase {
+                PolicyParityPhase::BeforeTool => {
+                    if after.exists() {
+                        std::fs::remove_dir(&after).unwrap();
+                    }
+                    std::fs::create_dir(&before).unwrap();
+                }
+                PolicyParityPhase::BetweenBuilds => {
+                    std::fs::remove_dir(&before).unwrap();
+                    std::fs::create_dir(&after).unwrap();
+                    changes += 1;
+                }
+            }
+        });
+        assert_eq!(
+            changes, 12,
+            "the hook must run between every pair of builds"
+        );
     }
 
     #[cfg(unix)]
