@@ -203,6 +203,7 @@ pub(crate) fn bind_with_recheck(
     }
     let lock = options.open(lock_path)?;
     lock.lock()?;
+    let _lock = crate::fs_lock::AdvisoryLockGuard::from_locked_file(lock);
     let previous = read_record(&root, storage)?;
     if let Some(record) = &previous {
         if reusable(record, &root, force) {

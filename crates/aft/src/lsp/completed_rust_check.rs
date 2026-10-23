@@ -1050,6 +1050,7 @@ fn write_record(path: &Path, record: &SavedCheck) -> Option<()> {
         .open(directory.join(".write-lock"))
         .ok()?;
     lock.lock().ok()?;
+    let _lock = crate::fs_lock::AdvisoryLockGuard::from_locked_file(lock);
     if !sweep_records(directory, path, RECORD_SCAN_LIMIT).complete {
         // A saturated legacy store is reduced on each write attempt. Do not add
         // another record until a bounded scan can certify the total record cap.

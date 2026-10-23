@@ -1123,7 +1123,7 @@ fn existing_gh_entry_is_valid(_shims_dir: &Path) -> bool {
     false
 }
 
-fn lock_hook_maintenance(hooks_dir: &Path) -> Result<fs::File, String> {
+fn lock_hook_maintenance(hooks_dir: &Path) -> Result<crate::fs_lock::AdvisoryLockGuard, String> {
     let root = hooks_dir
         .parent()
         .ok_or_else(|| "Git hooks directory has no parent".to_string())?;
@@ -1142,7 +1142,7 @@ fn lock_hook_maintenance(hooks_dir: &Path) -> Result<fs::File, String> {
         .map_err(|error| error.to_string())?;
     lock.lock()
         .map_err(|error| format!("failed to lock Git hook maintenance: {error}"))?;
-    Ok(lock)
+    Ok(crate::fs_lock::AdvisoryLockGuard::from_locked_file(lock))
 }
 
 fn ensure_managed_git_hooks(hooks_dir: &Path) -> Result<(), String> {

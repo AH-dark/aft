@@ -14,6 +14,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::{slog_debug, slog_error, slog_info, slog_warn};
 
+/// Owns an already-acquired OS file lock, unlike the path/heartbeat lease below.
+/// Closing a file alone can leave its lock held by a forked child's descriptor
+/// until exec or exit. Explicitly unlock when the protected operation ends.
+/// Keep one guard per acquisition; share the guard, not cloned file handles.
+#[derive(Debug)]
+pub(crate) struct AdvisoryLockGuard(File);
+
+impl AdvisoryLockGuard {
+    pub(crate) fn from_locked_file(file: File) -> Self {
+        Self(file)
+    }
+}
+
+impl Drop for AdvisoryLockGuard {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 pub const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 pub const STALE_HEARTBEAT_MS: u64 = 15_000;
 pub const LIVE_OWNER_WARN_MS: u64 = 600_000;
@@ -1949,6 +1968,45 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Barrier};
+
+    #[cfg(unix)]
+    #[test]
+    fn advisory_lock_guard_releases_lock_with_a_live_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("advisory.lock");
+        for shared in [true, false] {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap();
+            if shared {
+                file.lock_shared().unwrap();
+            } else {
+                file.lock().unwrap();
+            }
+            // A duplicate shares the open file description, just like fork's copy.
+            let duplicate = file.try_clone().unwrap();
+            let guard = AdvisoryLockGuard::from_locked_file(file);
+            let probe = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            assert!(matches!(
+                probe.try_lock(),
+                Err(fs::TryLockError::WouldBlock)
+            ));
+            drop(guard);
+            probe
+                .try_lock()
+                .expect("the owner released exclusion even with a live duplicate");
+            assert!(duplicate.metadata().is_ok());
+            probe.unlock().unwrap();
+        }
+    }
 
     #[cfg(windows)]
     #[test]

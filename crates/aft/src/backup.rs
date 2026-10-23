@@ -11,6 +11,7 @@ use rusqlite::Connection;
 
 use crate::db::backups::BackupRow;
 use crate::error::AftError;
+use crate::fs_lock::AdvisoryLockGuard;
 use sha2::{Digest, Sha256};
 
 pub mod purge;
@@ -6185,10 +6186,10 @@ fn backup_namespace_file(storage: &Path) -> std::io::Result<std::fs::File> {
 
 // Admissions share the stable gate even while a file lock is busy. Repair
 // alone needs exclusivity, so unrelated sessions can keep admitting backups.
-fn backup_namespace_admission(storage: &Path) -> std::io::Result<std::fs::File> {
+fn backup_namespace_admission(storage: &Path) -> std::io::Result<AdvisoryLockGuard> {
     let file = backup_namespace_file(storage)?;
     file.lock_shared()?;
-    Ok(file)
+    Ok(AdvisoryLockGuard::from_locked_file(file))
 }
 
 /// Longest any caller waits for a busy backup namespace. The wait holds the
@@ -6222,7 +6223,7 @@ fn namespace_wait_deadline() -> Instant {
 fn backup_namespace_gate(
     storage: &Path,
     wait_until: Option<Instant>,
-) -> std::io::Result<Option<std::fs::File>> {
+) -> std::io::Result<Option<AdvisoryLockGuard>> {
     lock_backup_namespace(storage, wait_until, false)
 }
 
@@ -6233,7 +6234,7 @@ fn backup_namespace_gate(
 fn backup_namespace_shared(
     storage: &Path,
     deadline: Instant,
-) -> std::io::Result<Option<std::fs::File>> {
+) -> std::io::Result<Option<AdvisoryLockGuard>> {
     lock_backup_namespace(storage, Some(deadline), true)
 }
 
@@ -6241,7 +6242,7 @@ fn lock_backup_namespace(
     storage: &Path,
     wait_until: Option<Instant>,
     shared: bool,
-) -> std::io::Result<Option<std::fs::File>> {
+) -> std::io::Result<Option<AdvisoryLockGuard>> {
     let file = backup_namespace_file(storage)?;
     let mut pause = Duration::from_millis(2);
     let mut announced = false;
@@ -6252,7 +6253,7 @@ fn lock_backup_namespace(
             file.try_lock()
         };
         match attempt {
-            Ok(()) => return Ok(Some(file)),
+            Ok(()) => return Ok(Some(AdvisoryLockGuard::from_locked_file(file))),
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(error)) => return Err(error),
         }
@@ -6281,7 +6282,7 @@ fn lock_backup_namespace(
     }
 }
 
-fn session_gc_gate(session_dir: &Path, wait: bool) -> std::io::Result<Option<std::fs::File>> {
+fn session_gc_gate(session_dir: &Path, wait: bool) -> std::io::Result<Option<AdvisoryLockGuard>> {
     let path = session_gc_lock_path(session_dir);
     crate::production_storage::refuse_write(&path)?;
     let mut options = crate::private_storage::options();
@@ -6301,7 +6302,7 @@ fn session_gc_gate(session_dir: &Path, wait: bool) -> std::io::Result<Option<std
             Err(std::fs::TryLockError::Error(error)) => return Err(error),
         }
     }
-    Ok(Some(file))
+    Ok(Some(AdvisoryLockGuard::from_locked_file(file)))
 }
 
 fn acquire_inactive_session_leases(
@@ -8162,8 +8163,9 @@ mod tests {
             crate::harness::Harness::Opencode,
             72,
         );
-        let namespace_lock = backup_namespace_file(storage.path()).unwrap();
-        namespace_lock.lock().unwrap();
+        let namespace_lock = backup_namespace_gate(storage.path(), None)
+            .unwrap()
+            .unwrap();
 
         store.run_process_maintenance_once();
         assert!(
@@ -8171,6 +8173,13 @@ mod tests {
             "a busy namespace must defer flat-layout migration"
         );
 
+        // A child inherits the lock descriptor at fork. FD_CLOEXEC closes it
+        // only at exec, so hold that copy across the parent's release and retry.
+        #[cfg(target_os = "linux")]
+        let _child = ForkedDescriptorHolder::new();
+        assert!(backup_namespace_gate(storage.path(), None)
+            .unwrap()
+            .is_none());
         drop(namespace_lock);
         store.run_process_maintenance_once();
         let migrated_dir = backups_dir
@@ -8178,6 +8187,94 @@ mod tests {
             .join(BackupStore::path_hash(&key));
         assert!(migrated_dir.join("meta.json").exists());
         assert!(!legacy_dir.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ForkedDescriptorHolder {
+        release: std::os::unix::net::UnixStream,
+        pid: libc::pid_t,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ForkedDescriptorHolder {
+        fn new() -> Self {
+            use std::os::fd::AsRawFd;
+
+            let (release, held) = std::os::unix::net::UnixStream::pair().unwrap();
+            let release_fd = release.as_raw_fd();
+            let held_fd = held.as_raw_fd();
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                // Only async-signal-safe calls are allowed in the forked child.
+                unsafe {
+                    libc::close(release_fd);
+                    let mut byte = 0u8;
+                    while libc::read(held_fd, (&mut byte as *mut u8).cast(), 1) == -1 {
+                        if *libc::__errno_location() != libc::EINTR {
+                            break;
+                        }
+                    }
+                    libc::_exit(0);
+                }
+            }
+            assert!(pid > 0, "fork failed: {}", std::io::Error::last_os_error());
+            drop(held);
+            Self { release, pid }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ForkedDescriptorHolder {
+        fn drop(&mut self) {
+            // Shutting down the control socket wakes the child even if another
+            // fork inherited the parent's endpoint. Always reap, even on panic.
+            let _ = self.release.shutdown(std::net::Shutdown::Both);
+            loop {
+                let result = unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) };
+                if result != -1
+                    || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_namespace_gates_release_with_forked_descriptors() {
+        let storage = tempfile::tempdir().unwrap();
+        for admission in [true, false] {
+            let lock = if admission {
+                backup_namespace_admission(storage.path()).unwrap()
+            } else {
+                backup_namespace_shared(storage.path(), namespace_wait_deadline())
+                    .unwrap()
+                    .unwrap()
+            };
+            let _child = ForkedDescriptorHolder::new();
+            assert!(backup_namespace_gate(storage.path(), None)
+                .unwrap()
+                .is_none());
+            drop(lock);
+            assert!(backup_namespace_gate(storage.path(), None)
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_gc_gates_release_with_forked_descriptors() {
+        let storage = tempfile::tempdir().unwrap();
+        let session = storage.path().join("session");
+        for wait in [true, false] {
+            let lock = session_gc_gate(&session, wait).unwrap().unwrap();
+            let _child = ForkedDescriptorHolder::new();
+            assert!(session_gc_gate(&session, false).unwrap().is_none());
+            drop(lock);
+            assert!(session_gc_gate(&session, false).unwrap().is_some());
+        }
     }
 
     #[test]
@@ -8456,16 +8553,14 @@ mod tests {
         // The namespace lock is held, so repair is deferred. Once it is free,
         // the maintenance a default-session undo runs must move the legacy
         // backup stack from the root backup directory into the default session.
-        let namespace_lock = backup_namespace_file(storage.path()).unwrap();
-        namespace_lock.lock().unwrap();
+        let namespace_lock = backup_namespace_gate(storage.path(), None)
+            .unwrap()
+            .unwrap();
         store.run_process_maintenance_once();
         assert!(legacy_dir.exists(), "the busy namespace must defer repair");
         drop(namespace_lock);
 
-        // Dropping the lock does not free the namespace at once if a child
-        // process spawned meanwhile by another thread still holds a copy of the
-        // descriptor until it executes. A nonblocking pass would then defer
-        // again; the undo maintenance waits for the namespace instead.
+        // Undo maintenance must repair the deferred layout before reading history.
         store.run_restore_maintenance().unwrap();
         let default_session_dir = storage
             .path()
@@ -8518,8 +8613,7 @@ mod tests {
     }
 
     /// Another holder of the backup namespace, taken between root repair and
-    /// the flat migration, as a concurrent backup operation (or a child process
-    /// that inherited a namespace descriptor) can. It lets go when `release`
+    /// the flat migration, as a concurrent backup operation can. It lets go when `release`
     /// is sent, or after a 10 s backstop so a test that never releases it
     /// cannot hang the suite.
     struct NamespaceHolderAfterRepair {
@@ -8534,10 +8628,7 @@ mod tests {
             let thread_slot = Arc::clone(&thread);
             let storage_path = storage.to_path_buf();
             set_migration_after_repair_hook_for_tests(storage, move || {
-                // Block rather than try: a child process another thread spawned
-                // can briefly hold a copy of repair's namespace descriptor.
-                let lock = backup_namespace_file(&storage_path).unwrap();
-                lock.lock().unwrap();
+                let lock = backup_namespace_gate(&storage_path, None).unwrap().unwrap();
                 *thread_slot.lock().unwrap() = Some(std::thread::spawn(move || {
                     let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
                     drop(lock);
@@ -8745,8 +8836,7 @@ mod tests {
         );
         set_between_legacy_checks_hook_for_tests(storage.path(), move || {
             ran.store(true, Ordering::SeqCst);
-            let namespace = backup_namespace_file(&storage_path).unwrap();
-            if namespace.try_lock().is_ok() {
+            if let Some(_namespace) = backup_namespace_gate(&storage_path, None).unwrap() {
                 fs::create_dir_all(to.parent().unwrap()).unwrap();
                 fs::rename(&from, &to).unwrap();
                 moved.store(true, Ordering::SeqCst);
