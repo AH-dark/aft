@@ -736,11 +736,11 @@ enum Prep {
 }
 
 fn selector(stamp: &subc_protocol::scope::ScopeStamp) -> ScopeSelector {
-    ScopeSelector {
-        owner: stamp.owner.clone(),
-        scope_ref: stamp.scope_ref.clone(),
-        scope_epoch: Some(stamp.scope_epoch),
-    }
+    ScopeSelector::new(
+        stamp.owner.clone(),
+        stamp.scope_ref.clone(),
+        Some(stamp.scope_epoch),
+    )
 }
 
 fn operation_name(operation: AccessOperation) -> &'static str {

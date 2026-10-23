@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "961a91509a919c3db0a4119057647877aad8b024ada13f9835aa7a9175565f40",
-      "catalog_digest": "961a91509a919c3db0a4119057647877aad8b024ada13f9835aa7a9175565f40",
+      "generation": "57227959149f7fdb264935f6c51f649af08936061fe27abad0a2c5baed474d4a",
+      "catalog_digest": "57227959149f7fdb264935f6c51f649af08936061fe27abad0a2c5baed474d4a",
       "tools": [
         {
           "name": "status",
@@ -1169,7 +1169,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -1189,8 +1194,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "c98777f802921783b10bfc34f47d52257156117624e30f8192e5fef2ca717bc0",
-      "catalog_digest": "c98777f802921783b10bfc34f47d52257156117624e30f8192e5fef2ca717bc0",
+      "generation": "f042b90b98d362004dfc3540be5eb65b63c78670b3a12d11f8275d0e05dc3785",
+      "catalog_digest": "f042b90b98d362004dfc3540be5eb65b63c78670b3a12d11f8275d0e05dc3785",
       "tools": [
         {
           "name": "status",
@@ -2342,7 +2347,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -2364,8 +2374,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a6f6d1a9342c0fd26951b657abc85e0180a6fdc4e6bf81ef82182f7d54ac4d38",
-      "catalog_digest": "a6f6d1a9342c0fd26951b657abc85e0180a6fdc4e6bf81ef82182f7d54ac4d38",
+      "generation": "44c0645bbad480218af01a0988c7ae82f5ed1d20df3a436164923f6d98eecd7c",
+      "catalog_digest": "44c0645bbad480218af01a0988c7ae82f5ed1d20df3a436164923f6d98eecd7c",
       "tools": [
         {
           "name": "status",
@@ -3436,7 +3446,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -3458,8 +3473,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "dd7d6b4f4c1205d7ec55d9aef9e4eabe928a87519c50fc52c8aa5adfbc43f0c0",
-      "catalog_digest": "dd7d6b4f4c1205d7ec55d9aef9e4eabe928a87519c50fc52c8aa5adfbc43f0c0",
+      "generation": "aae16d0455db6858a3e6b8bac729475b849f2acefe9a8aa658e8833bbbef7632",
+      "catalog_digest": "aae16d0455db6858a3e6b8bac729475b849f2acefe9a8aa658e8833bbbef7632",
       "tools": [
         {
           "name": "status",
@@ -4565,7 +4580,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -4587,8 +4607,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "1db5222be9c7a1c92b3e4ecb25d37d650196afa78a927dcb3c1d6b730b0e624c",
-      "catalog_digest": "1db5222be9c7a1c92b3e4ecb25d37d650196afa78a927dcb3c1d6b730b0e624c",
+      "generation": "e202269df33d5e5d9f9cb5ec9e8664dbdc373ccaca802fb666616364475d4978",
+      "catalog_digest": "e202269df33d5e5d9f9cb5ec9e8664dbdc373ccaca802fb666616364475d4978",
       "tools": [
         {
           "name": "status",
@@ -5691,7 +5711,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -5714,8 +5739,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "1d49cc21f0988b3331f22768c407be9b4208271d4705e3b4dd2fde89af51b570",
-      "catalog_digest": "1d49cc21f0988b3331f22768c407be9b4208271d4705e3b4dd2fde89af51b570",
+      "generation": "76c4b0752c925b8f4e6ed0098c94b51b842c8142a21ccf185c3c1c299c3fed59",
+      "catalog_digest": "76c4b0752c925b8f4e6ed0098c94b51b842c8142a21ccf185c3c1c299c3fed59",
       "tools": [
         {
           "name": "status",
@@ -6761,7 +6786,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -6784,8 +6814,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d6c293db3c53b9f838209d0e4ad17d1d4108d8f30197032c870c1ab29343699e",
-      "catalog_digest": "d6c293db3c53b9f838209d0e4ad17d1d4108d8f30197032c870c1ab29343699e",
+      "generation": "0a92c216f6896a1fd74598aa40297c8f34f99b5cbcb5cffce954ab0cc39f51dd",
+      "catalog_digest": "0a92c216f6896a1fd74598aa40297c8f34f99b5cbcb5cffce954ab0cc39f51dd",
       "tools": [
         {
           "name": "status",
@@ -7828,7 +7858,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -7851,8 +7886,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d502b937ae1b9b97610d3abb4dcc52b8531cea2f560cae14eebe98271b70cb38",
-      "catalog_digest": "d502b937ae1b9b97610d3abb4dcc52b8531cea2f560cae14eebe98271b70cb38",
+      "generation": "574041f2866c79dcdfd09862db9782d0bfde97515e76b266537ea0cc0370d327",
+      "catalog_digest": "574041f2866c79dcdfd09862db9782d0bfde97515e76b266537ea0cc0370d327",
       "tools": [
         {
           "name": "status",
@@ -8892,7 +8927,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -8915,8 +8955,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "9c4baee0720a1c88bb85140844450d0a3d32077e43445a5083e0ad675db165f7",
-      "catalog_digest": "9c4baee0720a1c88bb85140844450d0a3d32077e43445a5083e0ad675db165f7",
+      "generation": "ceba921134226f17e1145d7c2ded09d396ab8b73a021baa1773b0bd2e8dbf17f",
+      "catalog_digest": "ceba921134226f17e1145d7c2ded09d396ab8b73a021baa1773b0bd2e8dbf17f",
       "tools": [
         {
           "name": "status",
@@ -9953,7 +9993,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -9973,8 +10018,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "51626b400394e0f9b33404de09d0bea0b4c237242783d398ef896e2b27752592",
-      "catalog_digest": "51626b400394e0f9b33404de09d0bea0b4c237242783d398ef896e2b27752592",
+      "generation": "a5c8341b468978388bc00faf138640c9cee8722e0a1a7e37df65135da2dbab8b",
+      "catalog_digest": "a5c8341b468978388bc00faf138640c9cee8722e0a1a7e37df65135da2dbab8b",
       "tools": [
         {
           "name": "status",
@@ -11200,7 +11245,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -11220,8 +11270,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "39732ae163fc8398a36976f286465ef0101f0c1f8276a713084be33481aaac5d",
-      "catalog_digest": "39732ae163fc8398a36976f286465ef0101f0c1f8276a713084be33481aaac5d",
+      "generation": "57c7e6fa0e44a63cf1a7ad14f1e92f07b2cc1771a0d5b42bffeaaeb8bcb32181",
+      "catalog_digest": "57c7e6fa0e44a63cf1a7ad14f1e92f07b2cc1771a0d5b42bffeaaeb8bcb32181",
       "tools": [
         {
           "name": "status",
@@ -12447,7 +12497,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -12469,8 +12524,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "876944415f75df567d24b55f9b6ffbeacf8ae687e3e60bd92d14d68a0a5d39ea",
-      "catalog_digest": "876944415f75df567d24b55f9b6ffbeacf8ae687e3e60bd92d14d68a0a5d39ea",
+      "generation": "6529301071d0232e1a1ad1c74b12f3f433ecb55cf1850471edcebe4ea406a433",
+      "catalog_digest": "6529301071d0232e1a1ad1c74b12f3f433ecb55cf1850471edcebe4ea406a433",
       "tools": [
         {
           "name": "status",
@@ -13615,7 +13670,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -13637,8 +13697,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "df3d3c24d56e17fcea874217afd152dad3299096c2341ad7215d375afb83fdf7",
-      "catalog_digest": "df3d3c24d56e17fcea874217afd152dad3299096c2341ad7215d375afb83fdf7",
+      "generation": "3ba11f5cc5476e3dd37ee272653ed7f8ec149f22b754bb6ced1843f0b8dd9440",
+      "catalog_digest": "3ba11f5cc5476e3dd37ee272653ed7f8ec149f22b754bb6ced1843f0b8dd9440",
       "tools": [
         {
           "name": "status",
@@ -14818,7 +14878,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -14840,8 +14905,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "3f8f576b81db8d9fe2dc85165190d090773b54e768d307e01fd212c5e65dd5b7",
-      "catalog_digest": "3f8f576b81db8d9fe2dc85165190d090773b54e768d307e01fd212c5e65dd5b7",
+      "generation": "38868e01ed10ae04ec27bd39467c7d5263cef0f407467eec60e567744314a9c9",
+      "catalog_digest": "38868e01ed10ae04ec27bd39467c7d5263cef0f407467eec60e567744314a9c9",
       "tools": [
         {
           "name": "status",
@@ -16018,7 +16083,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -16041,8 +16111,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d18017ea80eda4a37ac7e4192f6a4a75f30d36be95f0259208030e3ac5a724ac",
-      "catalog_digest": "d18017ea80eda4a37ac7e4192f6a4a75f30d36be95f0259208030e3ac5a724ac",
+      "generation": "84c24d03e4efd359f726c3f76ef94e5d693faba6b2948b92da1d8c0bd40338fd",
+      "catalog_digest": "84c24d03e4efd359f726c3f76ef94e5d693faba6b2948b92da1d8c0bd40338fd",
       "tools": [
         {
           "name": "status",
@@ -17162,7 +17232,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -17185,8 +17260,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "01b1e5674c804e6184530e097db4057f78a8377d78eb89e93830f19bf60c51b8",
-      "catalog_digest": "01b1e5674c804e6184530e097db4057f78a8377d78eb89e93830f19bf60c51b8",
+      "generation": "6ba85c9fe6268235848a6c13238dcf85ebf65785750cbebd02dab2fe843b7b84",
+      "catalog_digest": "6ba85c9fe6268235848a6c13238dcf85ebf65785750cbebd02dab2fe843b7b84",
       "tools": [
         {
           "name": "status",
@@ -18303,7 +18378,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -18326,8 +18406,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "7ed453611394c6f17658110934453be5b2be85eb949d7bd0127709fe48d1bd28",
-      "catalog_digest": "7ed453611394c6f17658110934453be5b2be85eb949d7bd0127709fe48d1bd28",
+      "generation": "ead8e801829358becb1dbb42457afbcb7b55cc55c184df41332db6ee5a22c8bf",
+      "catalog_digest": "ead8e801829358becb1dbb42457afbcb7b55cc55c184df41332db6ee5a22c8bf",
       "tools": [
         {
           "name": "status",
@@ -19441,7 +19521,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -19464,8 +19549,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a0e89e82a3d4a57e443ced913c2c3de00146adf8bdd3fe0ad4e93828ba143717",
-      "catalog_digest": "a0e89e82a3d4a57e443ced913c2c3de00146adf8bdd3fe0ad4e93828ba143717",
+      "generation": "f3fa16b4c6fed1fe007f80d42fe111f9d2460723f35635eb91e43e090efb3643",
+      "catalog_digest": "f3fa16b4c6fed1fe007f80d42fe111f9d2460723f35635eb91e43e090efb3643",
       "tools": [
         {
           "name": "status",
@@ -20576,7 +20661,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   }
 ]

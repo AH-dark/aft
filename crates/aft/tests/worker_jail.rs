@@ -3801,11 +3801,11 @@ async fn gh_shim_router_host_scope_dials_require_the_live_bind() {
     .await
     .unwrap();
     let stamp = jail.read_holder.lock().unwrap().binds["worker-session"].clone();
-    let selector = subc_protocol::scope::ScopeSelector {
-        owner: stamp.owner.clone(),
-        scope_ref: stamp.scope_ref.clone(),
-        scope_epoch: Some(stamp.scope_epoch),
-    };
+    let selector = subc_protocol::scope::ScopeSelector::new(
+        stamp.owner.clone(),
+        stamp.scope_ref.clone(),
+        Some(stamp.scope_epoch),
+    );
     let target = RouteTarget::ToolProvider {
         module_id: "plexus".into(),
     };

@@ -71,22 +71,24 @@ pub(super) fn ledger_carrier(principal: &crate::sandbox_spawn::AuthenticatedPrin
 }
 
 pub(super) fn describe() -> Value {
-    serde_json::to_value(RoleDescribe {
-        majors: vec![Major {
-            version: "tool-provider/v1".into(),
-            ops: vec![
-                "role.describe".into(),
-                "tool.catalog".into(),
-                "tool.call".into(),
-                "tool.withdraw".into(),
-                "late_results".into(),
-                "late_results.ack".into(),
-            ],
-            stability: "alpha".into(),
-        }],
-        implementation_version: env!("CARGO_PKG_VERSION").into(),
-        capabilities: vec!["tool-catalog-confine/v1".into()],
-    })
+    serde_json::to_value(
+        RoleDescribe::new(
+            vec![Major {
+                version: "tool-provider/v1".into(),
+                ops: vec![
+                    "role.describe".into(),
+                    "tool.catalog".into(),
+                    "tool.call".into(),
+                    "tool.withdraw".into(),
+                    "late_results".into(),
+                    "late_results.ack".into(),
+                ],
+                stability: "alpha".into(),
+            }],
+            env!("CARGO_PKG_VERSION"),
+        )
+        .with_capabilities(vec!["tool-catalog-confine/v1".into()]),
+    )
     .expect("the commons role declaration is JSON")
 }
 
@@ -895,6 +897,9 @@ fn render_catalog(
         runon,
         revision_reads,
     ));
+    if request.preset.is_none() {
+        answer = answer.with_presets(CatalogPreset::ALL.map(CatalogPreset::name));
+    }
     if confined {
         answer
             .tools
@@ -969,8 +974,8 @@ fn render_catalog(
     content.as_object_mut().unwrap().remove("catalog_digest");
     // The preset is part of the fingerprint, so two presets can never share a
     // generation even if their content one day coincides. `head` adds
-    // nothing: an absent preset is `head`, and its fingerprint stays the one
-    // runners froze before presets existed.
+    // nothing: the preset-less answer serves head's tools, but its discovery
+    // list is additional content and participates in the fingerprint above.
     if preset != CatalogPreset::Head {
         content
             .as_object_mut()
@@ -3740,9 +3745,30 @@ mod tests {
     }
 
     #[test]
-    fn head_preset_is_byte_identical_to_the_catalog_without_a_preset() {
-        // An absent preset is `head`, and naming `head` must not move a byte
-        // or the fingerprint a runner froze before presets existed.
+    fn presetless_catalog_lists_exactly_the_served_presets() {
+        let answer = catalog(json!({}), &[], false).unwrap();
+        assert_eq!(answer["presets"], json!(["head", "worker", "reader"]));
+        println!("PRESETLESS_CATALOG_JSON={answer}");
+    }
+
+    #[test]
+    fn preset_specific_catalog_omits_presets() {
+        for preset in CatalogPreset::ALL {
+            let answer = catalog(json!({"preset": preset.name()}), &[], false).unwrap();
+            assert!(answer.get("presets").is_none(), "{}", preset.name());
+        }
+    }
+
+    #[test]
+    fn head_preset_matches_presetless_content_except_discovery_and_fingerprint() {
+        // Both requests serve head's tools and text. Only the preset-less
+        // answer lists presets, so its content fingerprint is different.
+        let without_discovery = |mut answer: Value| {
+            for field in ["presets", "generation", "catalog_digest"] {
+                answer.as_object_mut().unwrap().remove(field);
+            }
+            answer
+        };
         for available in [false, true] {
             for (worker, text) in [(false, "broca"), (true, "broca"), (false, "head")] {
                 let params = if text == "broca" {
@@ -3762,16 +3788,17 @@ mod tests {
                     available,
                 )
                 .unwrap();
+                assert_ne!(named["catalog_digest"], unnamed["catalog_digest"]);
                 assert_eq!(
-                    serde_json::to_vec(&named).unwrap(),
-                    serde_json::to_vec(&unnamed).unwrap(),
+                    without_discovery(named),
+                    without_discovery(unnamed),
                     "pwsh={available} worker={worker} text={text}"
                 );
             }
             let bare = catalog(json!({}), &[], available).unwrap();
             assert_eq!(
-                catalog(json!({"preset": "head"}), &[], available).unwrap(),
-                bare
+                without_discovery(catalog(json!({"preset": "head"}), &[], available).unwrap()),
+                without_discovery(bare.clone())
             );
             assert!(!names(&bare).contains(&"bash_watch".to_string()));
         }

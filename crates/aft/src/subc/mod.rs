@@ -222,6 +222,8 @@ mod readiness;
 mod remote_policy;
 mod run_scope;
 mod scope_describe;
+#[cfg(test)]
+mod scope_workdir_tests;
 mod stall_watchdog;
 mod standing;
 mod tool_provider;
@@ -7216,6 +7218,188 @@ async fn send_cached_health_response(
     send_frame(tx, metrics, response).await
 }
 
+fn normalized_scope_workdir(workdir: &Path) -> Option<PathBuf> {
+    let mut ancestor = workdir;
+    let mut missing = Vec::new();
+    loop {
+        match ProjectRootId::from_path(ancestor) {
+            Ok(root) => {
+                let mut normalized = root.into_path_buf();
+                for component in missing.iter().rev() {
+                    normalized.push(component);
+                }
+                return Some(normalized);
+            }
+            Err(crate::path_identity::IdentityError::NonExistentPath { .. }) => {
+                missing.push(ancestor.file_name()?.to_os_string());
+                ancestor = ancestor.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+const MAX_SCOPE_WORKDIR_DIAGNOSTICS: usize = 2;
+
+#[derive(Default)]
+struct ScopeWorkdirDiagnostics {
+    in_flight: StdMutex<HashSet<String>>,
+    pool: OnceLock<crate::bounded_io::IsolatedPool>,
+    #[cfg(test)]
+    idle: std::sync::Condvar,
+}
+
+static SCOPE_WORKDIR_DIAGNOSTICS: LazyLock<Arc<ScopeWorkdirDiagnostics>> =
+    LazyLock::new(|| Arc::new(ScopeWorkdirDiagnostics::default()));
+
+struct ScopeWorkdirPermit {
+    diagnostics: Arc<ScopeWorkdirDiagnostics>,
+    workdir: String,
+}
+
+impl ScopeWorkdirDiagnostics {
+    fn try_admit(self: &Arc<Self>, workdir: &str) -> Result<ScopeWorkdirPermit, &'static str> {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if in_flight.contains(workdir) {
+            return Err("workdir_already_in_flight");
+        }
+        if in_flight.len() >= MAX_SCOPE_WORKDIR_DIAGNOSTICS {
+            return Err("diagnostic_capacity_exhausted");
+        }
+        // The daemon supplies the canonical spelling, including missing tails.
+        // Admission must not touch the filesystem to derive a different key.
+        in_flight.insert(workdir.to_owned());
+        Ok(ScopeWorkdirPermit {
+            diagnostics: Arc::clone(self),
+            workdir: workdir.to_owned(),
+        })
+    }
+}
+
+impl Drop for ScopeWorkdirPermit {
+    fn drop(&mut self) {
+        self.diagnostics
+            .in_flight
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.workdir);
+        #[cfg(test)]
+        self.diagnostics.idle.notify_all();
+    }
+}
+
+fn schedule_scope_workdir_comparison(
+    identity: &subc_protocol::BindIdentity,
+    scope: Option<&subc_protocol::scope::ScopeStamp>,
+) {
+    let Some(stamp) = scope else { return };
+    let Some(workdir) = stamp.workdir.as_deref() else {
+        return;
+    };
+    #[cfg(test)]
+    let observed = scope_workdir_tests::take_comparison_observer();
+    let permit = match SCOPE_WORKDIR_DIAGNOSTICS.try_admit(workdir) {
+        Ok(permit) => permit,
+        Err(reason) => {
+            log_scope_workdir_comparison(identity, stamp, Err(io::Error::other(reason)));
+            #[cfg(test)]
+            if let Some(observed) = observed {
+                let _ = observed.send(());
+            }
+            return;
+        }
+    };
+    let budget = crate::bounded_io::Budget::after(crate::bounded_io::IO_BUDGET);
+    let deadline = tokio::time::Instant::from_std(budget.deadline);
+    let project_root = identity.project_root.clone();
+    let workdir = workdir.to_owned();
+    // A diagnostic must not delay frame processing or serialize project work. The
+    // bounded helper owns all filesystem work; the blocking task only waits for it.
+    let worker = tokio::task::spawn_blocking(move || {
+        compare_scope_workdir(project_root, workdir, budget, permit)
+    });
+    let identity = identity.clone();
+    let stamp = stamp.clone();
+    tokio::spawn(async move {
+        // Include time queued in Tokio's blocking pool in the same budget. Late
+        // filesystem results are discarded and cannot produce a mismatch record.
+        let result = match tokio::time::timeout_at(deadline, worker).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(io::Error::other(format!(
+                "comparison worker failed: {error}"
+            ))),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "filesystem comparison budget expired",
+            )),
+        };
+        log_scope_workdir_comparison(&identity, &stamp, result);
+        #[cfg(test)]
+        if let Some(observed) = observed {
+            let _ = observed.send(());
+        }
+    });
+}
+
+fn compare_scope_workdir(
+    project_root: PathBuf,
+    workdir: String,
+    budget: crate::bounded_io::Budget,
+    permit: ScopeWorkdirPermit,
+) -> io::Result<Option<(PathBuf, PathBuf)>> {
+    // A stamped folder can have a missing tail. Normalize its existing prefix
+    // like a routing root, including Windows path spelling, then append that tail.
+    // Bound the whole walk, including direct canonicalization of the project root.
+    let pool = permit
+        .diagnostics
+        .pool
+        .get_or_init(|| crate::bounded_io::IsolatedPool::new(MAX_SCOPE_WORKDIR_DIAGNOSTICS))
+        .clone();
+    crate::bounded_io::with_budget(Some(budget), || {
+        pool.run(Path::new(&workdir), None, move |workdir| {
+            // Keep both the capacity slot and this folder's deduplication key
+            // until the actual filesystem job exits, not merely until timeout.
+            let _permit = permit;
+            let (Ok(project_root), Some(workdir)) = (
+                ProjectRootId::from_path(project_root),
+                normalized_scope_workdir(&workdir),
+            ) else {
+                return Ok(None);
+            };
+            Ok((workdir.as_path() != project_root.as_path())
+                .then(|| (project_root.into_path_buf(), workdir)))
+        })
+    })
+}
+
+fn log_scope_workdir_comparison(
+    identity: &subc_protocol::BindIdentity,
+    stamp: &subc_protocol::scope::ScopeStamp,
+    result: io::Result<Option<(PathBuf, PathBuf)>>,
+) {
+    match result {
+        Ok(Some((project_root, workdir))) => crate::slog_info!(
+            "subc scope workdir differs: project_root={} workdir={} session={} project_id={}",
+            project_root.display(),
+            workdir.display(),
+            identity.session,
+            stamp.project_id.as_deref().unwrap_or("none"),
+        ),
+        Ok(None) => {}
+        Err(error) => crate::slog_info!(
+            "subc scope workdir comparison skipped: project_root={} workdir={} session={} project_id={} reason={}",
+            identity.project_root.display(),
+            stamp.workdir.as_deref().unwrap_or("none"),
+            identity.session,
+            stamp.project_id.as_deref().unwrap_or("none"),
+            error,
+        ),
+    }
+}
+
 /// Channel-0 control requests: RouteBind plus the cached health probe.
 /// Tool-provider binds reconcile RootConfig through the executor's Mutating lane;
 /// management binds install immediately without creating project state.
@@ -7283,6 +7467,7 @@ async fn handle_control_request(
                 ),
                 if role_versions.is_some() { "declared" } else { "none" }
             );
+            schedule_scope_workdir_comparison(&identity, scope.as_ref());
             if epoch == 0 {
                 return send_route_bind_error(
                     tx,
