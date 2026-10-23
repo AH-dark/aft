@@ -9241,7 +9241,10 @@ impl AppContext {
         &self,
         changed_paths: BTreeSet<Vec<u8>>,
         allow_semantic_blob_put: bool,
-    ) -> Result<crate::views::assembly::AssemblyReport, String> {
+    ) -> Result<
+        crate::views::assembly::AssemblyReport,
+        crate::executor::view_publication::PublicationFailure,
+    > {
         let mut prepared =
             self.prepare_view_paths(changed_paths, allow_semantic_blob_put, &mut |_| Ok(()))?;
         let report = self.commit_view_update(&mut prepared)?;
@@ -9389,16 +9392,18 @@ impl AppContext {
     pub(crate) fn commit_view_update(
         &self,
         prepared: &mut PreparedViewUpdate,
-    ) -> Result<crate::views::assembly::AssemblyReport, String> {
+    ) -> Result<
+        crate::views::assembly::AssemblyReport,
+        crate::executor::view_publication::PublicationFailure,
+    > {
         if self.configure_content_generation() != prepared.content_generation
             || !self.config().views.enabled
         {
-            return Err("view publication configuration was superseded".to_owned());
+            return Err("view publication configuration was superseded"
+                .to_owned()
+                .into());
         }
-        let report = prepared
-            .assembly
-            .commit()
-            .map_err(|error| error.to_string())?;
+        let report = prepared.assembly.commit()?;
         if let Some(snapshot) = prepared
             .snapshot
             .take()

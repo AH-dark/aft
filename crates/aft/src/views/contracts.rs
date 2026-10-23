@@ -140,21 +140,56 @@ impl ViewAccess {
     }
 }
 
-/// An error a plane reports to the loader. It is carried into the existing
+/// An error from an index plane or loader orchestration, carried into existing
 /// incomplete/named-gap reporting, never turned into an empty success.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlaneError {
-    pub plane: FamilyPlane,
+    /// Loader failures have no persisted artifact plane.
+    pub plane: Option<FamilyPlane>,
     pub reason: String,
 }
 
 impl std::fmt::Display for PlaneError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} plane: {}", self.plane.as_str(), self.reason)
+        match self.plane {
+            Some(plane) => write!(f, "{} plane: {}", plane.as_str(), self.reason),
+            None => write!(f, "view loader {}", self.reason),
+        }
     }
 }
 
 impl std::error::Error for PlaneError {}
+
+/// Loader work is not an artifact plane; name its stage instead of blaming an index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoaderStage {
+    SeedSelection,
+    Reconciliation,
+    Installation,
+    ProducerValidation,
+    Driver,
+}
+
+impl LoaderStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SeedSelection => "seed selection",
+            Self::Reconciliation => "reconciliation",
+            Self::Installation => "installation",
+            Self::ProducerValidation => "producer validation",
+            Self::Driver => "driver",
+        }
+    }
+}
+
+impl PlaneError {
+    pub fn loader(stage: LoaderStage, reason: impl Into<String>) -> Self {
+        Self {
+            plane: None,
+            reason: format!("[{}]: {}", stage.as_str(), reason.into()),
+        }
+    }
+}
 
 /// One query plane's hooks into the view core.
 pub trait PlaneAdapter: Send + Sync {
@@ -315,6 +350,16 @@ mod tests {
         for step in DurabilityStep::ALL {
             assert_eq!(DurabilityStep::parse(step.as_str()), Some(step));
         }
+    }
+
+    #[test]
+    fn adapter_error_keeps_its_plane_tag_and_text() {
+        let error = PlaneError {
+            plane: Some(FamilyPlane::Semantic),
+            reason: "store unavailable".into(),
+        };
+        assert_eq!(error.plane, Some(FamilyPlane::Semantic));
+        assert_eq!(error.to_string(), "semantic plane: store unavailable");
     }
 
     #[test]

@@ -175,16 +175,26 @@ pub fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Option<Str
         "subscript_expression" => extract_computed_member_name(&func_node, source)
             .or_else(|| extract_last_segment(&func_node, source)),
         _ => {
-            // Fallback: use the full text
+            // Other callee kinds may be expressions rather than names.
             let text = &source[func_node.byte_range()];
             // If it contains a dot, take the last segment
-            if text.contains('.') {
+            let name = if text.contains('.') {
                 text.rsplit('.').next().map(|s| s.trim().to_string())
             } else {
                 Some(text.trim().to_string())
-            }
+            };
+            name.filter(|name| is_name_like_callee(name))
         }
     }
+}
+
+/// Keep qualified names and language-specific sigils, but not the source text
+/// of an anonymous function, arrow expression, or call result.
+fn is_name_like_callee(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().all(|ch| {
+            ch.is_alphanumeric() || matches!(ch, '_' | '$' | ':' | '\\' | '@' | '?' | '!')
+        })
 }
 
 /// Extract the full callee expression from a call expression node.
@@ -1518,6 +1528,32 @@ mod tests {
             after <= 10000,
             "{after} block binding operations for 1000 declarations"
         );
+    }
+
+    #[test]
+    fn non_name_callee_expressions_are_not_recorded_as_call_names() {
+        let source = "(function () { inner(); })();\n(() => 1)();\nfactory()();\nnamed();\n";
+        let tree = parse_source(LangId::TypeScript, source);
+        let names = extract_calls_full(
+            source,
+            tree.root_node(),
+            0,
+            source.len(),
+            LangId::TypeScript,
+        )
+        .into_iter()
+        .map(|call| call.1)
+        .collect::<Vec<_>>();
+        assert_eq!(names, vec!["inner", "factory", "named"]);
+
+        // Go selector expressions use the text fallback but still name a callee.
+        let source = "package main\nfunc main() { fmt.Println(1); helper(); }\n";
+        let tree = parse_source(LangId::Go, source);
+        let names = extract_calls_full(source, tree.root_node(), 0, source.len(), LangId::Go)
+            .into_iter()
+            .map(|call| call.1)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Println", "helper"]);
     }
 
     #[test]

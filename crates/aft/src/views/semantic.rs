@@ -69,7 +69,7 @@ fn try_lock<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
 
 fn plane_error(reason: impl Into<String>) -> PlaneError {
     PlaneError {
-        plane: FamilyPlane::Semantic,
+        plane: Some(FamilyPlane::Semantic),
         reason: reason.into(),
     }
 }

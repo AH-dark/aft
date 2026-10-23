@@ -1131,7 +1131,7 @@ impl super::first_load::PublishFence for LaneFence {
                 self.epoch
             );
             Err(super::contracts::PlaneError {
-                plane: crate::blob_store::v2::FamilyPlane::Semantic,
+                plane: Some(crate::blob_store::v2::FamilyPlane::Semantic),
                 reason: super::first_load::SUPERSEDED_PUBLISH.to_owned(),
             })
         };

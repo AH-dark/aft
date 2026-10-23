@@ -120,6 +120,11 @@ pub enum ViewError {
     Sqlite(rusqlite::Error),
     Json(serde_json::Error),
     InvalidManifest(String),
+    /// Another publisher changed the pointer after this generation was built.
+    PublicationConflict {
+        attempted_generation: String,
+        current_generation: Option<String>,
+    },
     ManifestAlreadyExists(String),
     MissingBlob {
         plane: ArtifactPlane,
@@ -151,6 +156,9 @@ impl fmt::Display for ViewError {
             Self::Sqlite(error) => write!(formatter, "view SQLite operation failed: {error}"),
             Self::Json(error) => write!(formatter, "view manifest JSON failed: {error}"),
             Self::InvalidManifest(message) => write!(formatter, "invalid view manifest: {message}"),
+            Self::PublicationConflict { attempted_generation, current_generation } => write!(
+                formatter, "view publication conflict: attempted {attempted_generation}, current {current_generation:?}"
+            ),
             Self::ManifestAlreadyExists(generation) => {
                 write!(
                     formatter,
@@ -563,6 +571,8 @@ impl<'de> Deserialize<'de> for Manifest {
     where
         D: Deserializer<'de>,
     {
+        #[cfg(test)]
+        MANIFEST_DECODES.with(|count| count.set(count.get() + 1));
         let json = JsonManifest::deserialize(deserializer)?;
         if json.path_identity_version != PATH_IDENTITY_VERSION {
             return Err(D::Error::custom(format!(
@@ -577,6 +587,16 @@ impl<'de> Deserialize<'de> for Manifest {
         )
         .map_err(D::Error::custom)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static MANIFEST_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn take_manifest_decodes() -> usize {
+    MANIFEST_DECODES.with(|count| count.replace(0))
 }
 
 /// A transient list of aliases that a derived generation references. It is not

@@ -536,8 +536,7 @@ pub fn callers_result(
     let effective_depth = depth.max(1);
     let mut visited = HashMap::new();
     let mut sites = Vec::new();
-    let mut depth_limited = false;
-    let mut truncated = 0usize;
+    let mut boundary = BTreeSet::new();
     let callers_by_symbol = prefetch_callers(
         store,
         &target.representative.file,
@@ -546,7 +545,6 @@ pub fn callers_result(
     )?;
 
     collect_callers_recursive(
-        store,
         &callers_by_symbol,
         &target.representative.file,
         &target.representative.symbol,
@@ -554,9 +552,9 @@ pub fn callers_result(
         0,
         &mut visited,
         &mut sites,
-        &mut depth_limited,
-        &mut truncated,
+        &mut boundary,
     )?;
+    let (depth_limited, truncated) = omitted_boundary_callers(store, boundary, &visited)?;
 
     let mut sites = dedup_call_sites(sites);
     sites.sort_by(|left, right| {
@@ -861,8 +859,7 @@ pub fn impact_result(
     let effective_depth = depth.max(1);
     let mut visited = HashMap::new();
     let mut sites = Vec::new();
-    let mut depth_limited = false;
-    let mut truncated = 0usize;
+    let mut boundary = BTreeSet::new();
     let callers_by_symbol = prefetch_callers(
         store,
         &target.representative.file,
@@ -871,7 +868,6 @@ pub fn impact_result(
     )?;
 
     collect_callers_recursive(
-        store,
         &callers_by_symbol,
         &target.representative.file,
         &target.representative.symbol,
@@ -879,9 +875,9 @@ pub fn impact_result(
         0,
         &mut visited,
         &mut sites,
-        &mut depth_limited,
-        &mut truncated,
+        &mut boundary,
     )?;
+    let (depth_limited, truncated) = omitted_boundary_callers(store, boundary, &visited)?;
 
     let mut sites = dedup_call_sites(sites);
     sites.sort_by(|left, right| {
@@ -959,15 +955,20 @@ pub fn impact_result(
             .or_default()
             .insert(site.line.saturating_sub(1) as usize);
     }
-    let source_lines = wanted_lines
-        .into_iter()
-        .map(|(file, wanted)| {
-            let lines = read_source_lines_at(&store.project_root().join(file), &wanted);
-            (file.to_string(), lines)
-        })
-        .collect::<HashMap<_, _>>();
+    // Stored call positions are only meaningful for the content indexed.
+    let mut stale_files = HashSet::new();
+    let mut source_lines = HashMap::new();
+    for (file, wanted) in wanted_lines {
+        let path = store.project_root().join(file);
+        if !file_matches_store(store, file, &path)? {
+            stale_files.insert(file.to_string());
+            continue;
+        }
+        source_lines.insert(file.to_string(), read_source_lines_at(&path, &wanted));
+    }
     for site in visible_sites {
         let lines = source_lines.get(&site.caller.file).and_then(Option::as_ref);
+        let stale = stale_files.contains(&site.caller.file);
         callers.push(StoreImpactCaller {
             caller_symbol: site.caller.symbol.clone(),
             caller_file: site.caller.file.clone(),
@@ -983,7 +984,11 @@ pub fn impact_result(
                 .as_deref()
                 .map(|signature| callgraph::extract_parameters(signature, site.caller.lang))
                 .unwrap_or_default(),
-            approximate: edge_approximate(&site),
+            approximate: if stale {
+                Some(true)
+            } else {
+                edge_approximate(&site)
+            },
             resolved_by: edge_resolved_by(&site),
         });
     }
@@ -1435,6 +1440,7 @@ struct TraceFileFacts {
 
 struct TraceFile {
     source: String,
+    content_hash: blake3::Hash,
     tree: tree_sitter::Tree,
     symbols: Vec<Symbol>,
 }
@@ -1469,6 +1475,7 @@ impl TraceFileFacts {
                     })?;
                 let symbols = extract_symbols_from_tree(&source, &tree, lang)?;
                 Some(Rc::new(TraceFile {
+                    content_hash: crate::cache_freshness::hash_bytes(source.as_bytes()),
                     source,
                     tree,
                     symbols,
@@ -1535,7 +1542,11 @@ fn trace_data_inner(
         return Ok(());
     };
 
-    let mut tracked = TrackedBindings::with_origin(tracking_name, tracking_approximate);
+    // An unindexed edit invalidates stored call offsets. Name-only matching
+    // can still trace the current body, but cannot claim exact attribution.
+    let stale = !content_matches_store(store, &rel_file, facts.content_hash)?;
+    let current_calls = if stale { Vec::new() } else { current_calls };
+    let mut tracked = TrackedBindings::with_origin(tracking_name, tracking_approximate || stale);
     walk_for_data_flow(
         store,
         symbol_cache,
@@ -1915,13 +1926,23 @@ fn check_call_for_data_flow(
             let target_file = store.project_root().join(&target.file);
             for (pos, _tracked, approximate) in &arg_positions {
                 if let Some(param_name) = params.get(*pos) {
+                    // The incoming hop uses the stored parameter name and location.
+                    // Check the destination's parsed content before emitting that hop,
+                    // not only when the recursive body walk starts afterwards.
+                    let target_stale = match files.load(&target_file)? {
+                        Some(facts) => {
+                            !content_matches_store(store, &target.file, facts.content_hash)?
+                        }
+                        None => false,
+                    };
+                    let approximate = *approximate || target_stale;
                     hops.push(callgraph::DataFlowHop {
                         file: target.file.clone(),
                         symbol: target.symbol.clone(),
                         variable: param_name.clone(),
                         line: target.line,
                         flow_type: "parameter".to_string(),
-                        approximate: *approximate,
+                        approximate,
                     });
                     trace_data_inner(
                         store,
@@ -1930,7 +1951,7 @@ fn check_call_for_data_flow(
                         &target_file,
                         &target.symbol,
                         param_name,
-                        *approximate,
+                        approximate,
                         max_depth,
                         current_depth + 1,
                         hops,
@@ -2658,9 +2679,27 @@ fn prefetch_callers(
     Ok(callers_by_symbol)
 }
 
+/// Count callers omitted beyond the depth boundary once per symbol. A symbol
+/// expanded through a shorter path has already contributed its callers.
+fn omitted_boundary_callers(
+    store: &impl CallGraphRead,
+    mut boundary: BTreeSet<(String, String)>,
+    expanded: &HashMap<(String, String), usize>,
+) -> StoreAdapterResult<(bool, usize)> {
+    boundary.retain(|key| !expanded.contains_key(key));
+    if boundary.is_empty() {
+        return Ok((false, 0));
+    }
+    let boundary = boundary.into_iter().collect::<Vec<_>>();
+    let omitted = store
+        .direct_caller_counts_of(&boundary)?
+        .into_values()
+        .fold(0usize, usize::saturating_add);
+    Ok((omitted > 0, omitted))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_callers_recursive(
-    store: &impl CallGraphRead,
     callers_by_symbol: &HashMap<(String, String), Vec<StoreCallSite>>,
     file: &str,
     symbol: &str,
@@ -2668,20 +2707,8 @@ fn collect_callers_recursive(
     current_depth: usize,
     visited: &mut HashMap<(String, String), usize>,
     result: &mut Vec<StoreCallSite>,
-    depth_limited: &mut bool,
-    truncated: &mut usize,
+    boundary: &mut BTreeSet<(String, String)>,
 ) -> StoreAdapterResult<()> {
-    if current_depth >= max_depth {
-        let target = (file.to_string(), symbol.to_string());
-        let counts = store.direct_caller_counts_of(std::slice::from_ref(&target))?;
-        let omitted = counts.get(&target).copied().unwrap_or_default();
-        if omitted > 0 {
-            *depth_limited = true;
-            *truncated = truncated.saturating_add(omitted);
-        }
-        return Ok(());
-    }
-
     let key = (file.to_string(), symbol.to_string());
     if visited.get(&key).is_some_and(|best| *best <= current_depth) {
         return Ok(());
@@ -2692,16 +2719,12 @@ fn collect_callers_recursive(
     let Some(sites) = callers_by_symbol.get(&(file.to_string(), symbol.to_string())) else {
         return Ok(());
     };
-    if sites.is_empty() {
-        return Ok(());
-    }
-    if current_depth + 1 < max_depth {
-        for site in sites {
-            if first_visit {
-                result.push(site.clone());
-            }
+    for site in sites {
+        if first_visit {
+            result.push(site.clone());
+        }
+        if current_depth + 1 < max_depth {
             collect_callers_recursive(
-                store,
                 callers_by_symbol,
                 &site.caller.file,
                 &site.caller.symbol,
@@ -2709,27 +2732,10 @@ fn collect_callers_recursive(
                 current_depth + 1,
                 visited,
                 result,
-                depth_limited,
-                truncated,
+                boundary,
             )?;
-        }
-    } else {
-        let boundary_targets = sites
-            .iter()
-            .map(|site| (site.caller.file.clone(), site.caller.symbol.clone()))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let boundary_counts = store.direct_caller_counts_of(&boundary_targets)?;
-        for site in sites {
-            if first_visit {
-                result.push(site.clone());
-            }
-            let key = (site.caller.file.clone(), site.caller.symbol.clone());
-            let omitted = boundary_counts.get(&key).copied().unwrap_or_default();
-            if omitted > 0 {
-                *depth_limited = true;
-            }
+        } else {
+            boundary.insert((site.caller.file.clone(), site.caller.symbol.clone()));
         }
     }
     Ok(())
@@ -3032,6 +3038,43 @@ fn unqualified_name(symbol: &str) -> &str {
     symbol.rsplit("::").next().unwrap_or(symbol)
 }
 
+/// Unknown or size-capped hashes cannot establish staleness. Otherwise stored
+/// line and byte positions describe only the matching indexed content.
+fn content_matches_store(
+    store: &impl CallGraphRead,
+    file: &str,
+    current: blake3::Hash,
+) -> StoreAdapterResult<bool> {
+    let Some(stored) = store.stored_content_hash(file)? else {
+        return Ok(true);
+    };
+    Ok(
+        stored == crate::cache_freshness::zero_hash().to_hex().as_str()
+            || stored == current.to_hex().as_str(),
+    )
+}
+
+fn file_matches_store(
+    store: &impl CallGraphRead,
+    file: &str,
+    path: &Path,
+) -> StoreAdapterResult<bool> {
+    let Ok(mut reader) = std::fs::File::open(path) else {
+        return Ok(true);
+    };
+    if reader
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() > crate::cache_freshness::CONTENT_HASH_SIZE_CAP)
+    {
+        return Ok(true);
+    }
+    let mut hasher = blake3::Hasher::new();
+    if std::io::copy(&mut reader, &mut hasher).is_err() {
+        return Ok(true);
+    }
+    content_matches_store(store, file, hasher.finalize())
+}
+
 /// The requested zero-based lines of a file, trimmed. Reading stops after the
 /// last requested line, so a large file is not loaded whole to show a few call
 /// sites. Like a whole-file UTF-8 read, a decoding error in the lines read
@@ -3098,6 +3141,7 @@ mod trace_to_tests {
         caller_count_queries: RefCell<usize>,
         caller_count_targets: RefCell<usize>,
         node_lookups: RefCell<usize>,
+        stored_hashes: HashMap<String, String>,
     }
 
     impl CountingStore {
@@ -3116,6 +3160,7 @@ mod trace_to_tests {
                 caller_count_queries: RefCell::new(0),
                 caller_count_targets: RefCell::new(0),
                 node_lookups: RefCell::new(0),
+                stored_hashes: HashMap::new(),
             }
         }
 
@@ -3245,6 +3290,10 @@ mod trace_to_tests {
             Ok(self.nodes.get(&key).cloned().into_iter().collect())
         }
 
+        fn stored_content_hash(&self, file: &str) -> CallGraphResult<Option<String>> {
+            Ok(self.stored_hashes.get(file).cloned())
+        }
+
         fn nodes_matching(&self, symbol: &str) -> CallGraphResult<Vec<StoreNode>> {
             Ok(self
                 .nodes
@@ -3351,7 +3400,7 @@ mod trace_to_tests {
         }
 
         fn resolved_self_calls_of(&self, _node: &StoreNode) -> CallGraphResult<Vec<StoreCallSite>> {
-            unreachable!("not used by these adapter tests")
+            Ok(Vec::new())
         }
 
         fn unresolved_calls_of(
@@ -3530,6 +3579,141 @@ mod trace_to_tests {
     }
 
     #[test]
+    fn impact_does_not_show_call_text_from_a_caller_edited_since_indexing() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = CountingStore::new();
+        store.root = temp.path().to_path_buf();
+        let target = node("target", false);
+        let mut caller = node("caller", false);
+        caller.line = 2;
+        store.add_node(target.clone());
+        store.add_node(caller.clone());
+        store.add_caller_at(&target, &caller, 2);
+        let indexed = "function caller() {\n  target();\n}\n";
+        std::fs::write(temp.path().join(&caller.file), indexed).unwrap();
+        store.stored_hashes.insert(
+            caller.file.clone(),
+            crate::cache_freshness::hash_bytes(indexed.as_bytes())
+                .to_hex()
+                .to_string(),
+        );
+        let fresh =
+            impact_result(&store, Path::new(&target.file), &target.symbol, 1, true).unwrap();
+        assert_eq!(
+            fresh.callers[0].call_expression.as_deref(),
+            Some("target();")
+        );
+        assert_eq!(fresh.callers[0].approximate, None);
+        // The unindexed edit moves the call off its stored line.
+        std::fs::write(
+            temp.path().join(&caller.file),
+            "function caller() {\n  // moved\n  target();\n}\n",
+        )
+        .unwrap();
+        let stale =
+            impact_result(&store, Path::new(&target.file), &target.symbol, 1, true).unwrap();
+        assert_eq!(stale.callers[0].call_expression, None);
+        assert_eq!(stale.callers[0].approximate, Some(true));
+    }
+
+    fn trace_data_across_files_with_unindexed_edits(
+        edit_source: bool,
+        edit_destination: bool,
+    ) -> callgraph::TraceDataResult {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = CountingStore::new();
+        store.root = temp.path().canonicalize().unwrap();
+        let source_text = "function entry(x: number) { sink(x); }\n";
+        let destination_text = "function sink(p: number) { const copied = p; }\n";
+        let mut source = node("entry", false);
+        source.signature = Some("function entry(x: number)".into());
+        let mut destination = node("sink", false);
+        destination.signature = Some("function sink(p: number)".into());
+        for (node, text) in [(&source, source_text), (&destination, destination_text)] {
+            store.add_node(node.clone());
+            std::fs::write(store.root.join(&node.file), text).unwrap();
+            store.stored_hashes.insert(
+                node.file.clone(),
+                crate::cache_freshness::hash_bytes(text.as_bytes())
+                    .to_hex()
+                    .to_string(),
+            );
+        }
+        store.add_outgoing(&source, &destination);
+        let site = &mut store
+            .outgoing
+            .get_mut(&(source.file.clone(), source.symbol.clone()))
+            .unwrap()[0];
+        site.byte_start = source_text.find("sink(x)").unwrap();
+        site.byte_end = site.byte_start + "sink(x)".len();
+        if edit_source {
+            std::fs::write(
+                store.root.join(&source.file),
+                format!("// source shifted\n{source_text}"),
+            )
+            .unwrap();
+        }
+        if edit_destination {
+            std::fs::write(
+                store.root.join(&destination.file),
+                format!("// destination shifted\n{destination_text}"),
+            )
+            .unwrap();
+        }
+        trace_data_result(
+            &store,
+            &store.root.join(&source.file),
+            "entry",
+            "x",
+            5,
+            std::sync::Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new())),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn trace_data_destination_only_edit_marks_the_first_parameter_hop_approximate() {
+        let trace = trace_data_across_files_with_unindexed_edits(false, true);
+        let first = trace.hops.first().expect("parameter hop into destination");
+        assert_eq!(first.flow_type, "parameter");
+        assert_eq!(first.file, "sink.ts");
+        assert_eq!(first.variable, "p");
+        assert_eq!(
+            first.line, 1,
+            "the hop still uses the stored parameter location"
+        );
+        assert!(first.approximate, "{first:?}");
+        assert!(trace
+            .hops
+            .iter()
+            .any(|hop| hop.variable == "copied" && hop.approximate));
+    }
+
+    #[test]
+    fn trace_data_source_only_edit_keeps_the_first_parameter_hop_approximate() {
+        let trace = trace_data_across_files_with_unindexed_edits(true, false);
+        let first = trace.hops.first().expect("name-only parameter hop");
+        assert_eq!(first.flow_type, "parameter");
+        assert_eq!(first.file, "entry.ts");
+        assert_eq!(first.variable, "x");
+        assert!(first.approximate, "{first:?}");
+    }
+
+    #[test]
+    fn trace_data_unchanged_files_keep_the_first_parameter_hop_exact() {
+        let trace = trace_data_across_files_with_unindexed_edits(false, false);
+        let first = trace.hops.first().expect("parameter hop into destination");
+        assert_eq!(first.flow_type, "parameter");
+        assert_eq!(first.file, "sink.ts");
+        assert_eq!(first.variable, "p");
+        assert!(!first.approximate, "{first:?}");
+        assert!(trace
+            .hops
+            .iter()
+            .any(|hop| hop.variable == "copied" && !hop.approximate));
+    }
+
+    #[test]
     fn impact_source_lines_stop_after_the_last_shown_line() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("caller.ts");
@@ -3637,6 +3821,56 @@ mod trace_to_tests {
     }
 
     #[test]
+    fn callers_and_impact_count_callers_omitted_at_the_depth_limit() {
+        let mut store = CountingStore::new();
+        let target = node("target", false);
+        let boundary = node("boundary", false);
+        let upstream_a = node("upstreamA", true);
+        let upstream_b = node("upstreamB", true);
+        for fixture_node in [&target, &boundary, &upstream_a, &upstream_b] {
+            store.add_node(fixture_node.clone());
+        }
+        store.add_caller(&target, &boundary);
+        store.add_caller(&boundary, &upstream_a);
+        store.add_caller(&boundary, &upstream_b);
+        let callers =
+            callers_result(&store, Path::new(&target.file), &target.symbol, 1, true).unwrap();
+        assert!(callers.depth_limited);
+        assert_eq!(callers.truncated, 2);
+        let impact =
+            impact_result(&store, Path::new(&target.file), &target.symbol, 1, true).unwrap();
+        assert!(impact.depth_limited);
+        assert_eq!(impact.truncated, 2);
+        // At depth two, upstreamA and upstreamB are both listed.
+        let deeper =
+            callers_result(&store, Path::new(&target.file), &target.symbol, 2, true).unwrap();
+        assert!(!deeper.depth_limited);
+        assert_eq!(deeper.truncated, 0);
+    }
+
+    #[test]
+    fn boundary_callers_expanded_by_a_shorter_path_are_not_counted_as_omitted() {
+        let mut store = CountingStore::new();
+        let target = node("target", false);
+        let deep = node("deep", false);
+        let shared = node("shared", false);
+        let entry = node("entry", true);
+        for fixture_node in [&target, &deep, &shared, &entry] {
+            store.add_node(fixture_node.clone());
+        }
+        store.add_caller(&target, &deep);
+        store.add_caller(&deep, &shared);
+        store.add_caller(&target, &shared);
+        store.add_caller(&shared, &entry);
+        let result =
+            callers_result(&store, Path::new(&target.file), &target.symbol, 2, true).unwrap();
+        assert!(result.callers.iter().any(|group| group.file == entry.file));
+        assert!(!result.depth_limited, "every caller was listed");
+        assert_eq!(result.truncated, 0);
+    }
+
+    #[test]
+    // At depth one hubCaller is listed, but upstreamA and upstreamB are not.
     fn batched_boundary_counts_preserve_serialized_callers_and_impact_contract() {
         let mut store = CountingStore::new();
         let target = node("target", false);
@@ -3661,7 +3895,7 @@ mod trace_to_tests {
         assert_eq!(store.caller_count_target_count(), 1);
         assert_eq!(
             serde_json::to_string(&callers).expect("serialize callers result"),
-            r#"{"symbol":"target","file":"target.ts","callers":[{"file":"hubCaller.ts","callers":[{"symbol":"hubCaller","line":1}]}],"total_callers":21,"hub_summary":{"message":"Next: 21 callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"scanned_files":4,"depth_limited":true,"truncated":0,"callers_list_envelope":{"shown":1,"total":{"kind":"at_least","value":1},"unit":"items","reason":"depth","causes":["depth","cap"],"narrow":["depth","includeTests"]}}"#
+            r#"{"symbol":"target","file":"target.ts","callers":[{"file":"hubCaller.ts","callers":[{"symbol":"hubCaller","line":1}]}],"total_callers":21,"hub_summary":{"message":"Next: 21 callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"scanned_files":4,"depth_limited":true,"truncated":2,"callers_list_envelope":{"shown":1,"total":{"kind":"at_least","value":1},"unit":"items","reason":"depth","causes":["depth","cap"],"narrow":["depth","includeTests"]}}"#
         );
 
         store.reset_query_counts();
@@ -3674,7 +3908,7 @@ mod trace_to_tests {
         assert_eq!(store.caller_count_target_count(), 1);
         assert_eq!(
             serde_json::to_string(&impact).expect("serialize impact result"),
-            r#"{"symbol":"target","file":"target.ts","parameters":[],"total_affected":21,"affected_files":1,"callers":[{"caller_symbol":"hubCaller","caller_file":"hubCaller.ts","line":1,"is_entry_point":false,"parameters":[]}],"hub_summary":{"message":"Next: 21 affected callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"depth_limited":true,"truncated":0,"sites_list_envelope":{"shown":1,"total":{"kind":"at_least","value":1},"unit":"sites","reason":"depth","causes":["depth","cap"],"narrow":["depth","includeTests"]}}"#
+            r#"{"symbol":"target","file":"target.ts","parameters":[],"total_affected":21,"affected_files":1,"callers":[{"caller_symbol":"hubCaller","caller_file":"hubCaller.ts","line":1,"is_entry_point":false,"parameters":[]}],"hub_summary":{"message":"Next: 21 affected callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"depth_limited":true,"truncated":2,"sites_list_envelope":{"shown":1,"total":{"kind":"at_least","value":1},"unit":"sites","reason":"depth","causes":["depth","cap"],"narrow":["depth","includeTests"]}}"#
         );
     }
 

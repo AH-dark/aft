@@ -1065,6 +1065,7 @@ fn publication_io_error_names_operation_and_path() {
         .ctx
         .publish_view_paths(BTreeSet::new(), true)
         .unwrap_err();
+    let error = error.to_string();
     assert!(error.starts_with("view I/O failed reading "), "{error}");
     assert!(error.contains("tracked.rs"), "{error}");
     assert_ne!(fixture.view.current_generation().unwrap(), None);
@@ -1617,4 +1618,64 @@ fn publication_status_writes_run_outside_the_commit_barrier() {
         .status_for(b"gone.rs")
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn context_keeps_a_typed_conflict_and_the_winning_generation_for_retry() {
+    let fixture = Fixture::new();
+    std::fs::write(
+        fixture.project.path().join("tracked.rs"),
+        "pub fn contender() {}\n",
+    )
+    .unwrap();
+    let paths = BTreeSet::from([b"tracked.rs".to_vec()]);
+    let mut first = fixture
+        .ctx
+        .prepare_view_paths(paths.clone(), true, &mut |_| Ok(()))
+        .unwrap();
+    let mut second = fixture
+        .ctx
+        .prepare_view_paths(paths, true, &mut |_| Ok(()))
+        .unwrap();
+    let winner = fixture
+        .ctx
+        .commit_view_update(&mut first)
+        .unwrap()
+        .generation
+        .unwrap();
+    let error = fixture.ctx.commit_view_update(&mut second).unwrap_err();
+    assert!(
+        matches!(&error, PublicationFailure::View(crate::views::ViewError::PublicationConflict {
+        attempted_generation, current_generation: Some(current),
+    }) if !attempted_generation.is_empty() && *current == winner)
+    );
+    assert_eq!(
+        fixture
+            .ctx
+            .view_runtime_snapshot()
+            .unwrap()
+            .generation
+            .as_deref(),
+        Some(winner.as_str())
+    );
+    let mut retry = PublicationRetry::default();
+    retry.failed(fixture.project.path(), "storage failure");
+    retry.failed(fixture.project.path(), "storage failure");
+    retry.failed_publication(fixture.project.path(), &error);
+    assert!(matches!(retry.category, Some(FailureCategory::Conflict)));
+    assert_eq!(retry.failures, 1);
+    assert_eq!(retry.delay, retry.initial);
+    assert!(retry.due().is_some());
+    retry.failed_publication(
+        fixture.project.path(),
+        &PublicationFailure::Other(error.to_string()),
+    );
+    assert!(matches!(
+        retry.category,
+        Some(FailureCategory::StorageOrBuild)
+    ));
+    assert_eq!(
+        retry.failures, 1,
+        "formatted text must not decide the retry category"
+    );
 }

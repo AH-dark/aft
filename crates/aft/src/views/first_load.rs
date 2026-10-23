@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::blob_store::v2::FamilyPlane;
 
-use super::contracts::{PlaneError, ViewAccess};
+use super::contracts::{LoaderStage, PlaneError, ViewAccess};
 use super::manifest_v2::Producers;
 use super::snapshot::{LiveEntry, OpenGeneration, Snapshot};
 use super::RelPath;
@@ -119,10 +119,11 @@ impl SiblingLoader {
     }
 
     fn error(reason: impl Into<String>) -> PlaneError {
-        PlaneError {
-            plane: FamilyPlane::Trigram,
-            reason: reason.into(),
-        }
+        PlaneError::loader(LoaderStage::Driver, reason)
+    }
+
+    fn stage_error(stage: LoaderStage, reason: impl Into<String>) -> PlaneError {
+        PlaneError::loader(stage, reason)
     }
 
     fn seed(&self, access: &ViewAccess) -> Result<Arc<OpenGeneration>, PlaneError> {
@@ -133,9 +134,12 @@ impl SiblingLoader {
         } = access
         {
             return super::read::open_foreign_generation(registration, scope, &producers)
-                .map_err(|error| Self::error(error.to_string()))?
+                .map_err(|error| Self::stage_error(LoaderStage::SeedSelection, error.to_string()))?
                 .ok_or_else(|| {
-                    Self::error(format!("foreign view {scope} unavailable: no generation"))
+                    Self::stage_error(
+                        LoaderStage::SeedSelection,
+                        format!("foreign view {scope} unavailable: no generation"),
+                    )
                 });
         }
         let ViewAccess::Owner(owner) = access else {
@@ -144,12 +148,12 @@ impl SiblingLoader {
         let reader = owner
             .registry()
             .register_reader("first-load")
-            .map_err(|error| Self::error(error.to_string()))?;
+            .map_err(|error| Self::stage_error(LoaderStage::SeedSelection, error.to_string()))?;
         let mut candidates = Vec::new();
         let head = self.driver.head_tree(access);
         for member in reader
             .members()
-            .map_err(|error| Self::error(error.to_string()))?
+            .map_err(|error| Self::stage_error(LoaderStage::SeedSelection, error.to_string()))?
         {
             // A broken sibling is not repaired and cannot prevent a full walk.
             if let Ok(Some(generation)) =
@@ -218,7 +222,10 @@ impl SiblingLoader {
             }
             return Ok((delta.snapshot(), checkout.revision));
         }
-        Err(Self::error(CHECKOUT_CHANGED_DURING_RECONCILE))
+        Err(Self::stage_error(
+            LoaderStage::Reconciliation,
+            CHECKOUT_CHANGED_DURING_RECONCILE,
+        ))
     }
 
     fn open_planes(&self, access: &ViewAccess, snapshot: &Snapshot) -> Vec<PlaneError> {
@@ -235,7 +242,7 @@ impl SiblingLoader {
                 })
             {
                 pending.push(PlaneError {
-                    plane: adapter.plane(),
+                    plane: Some(adapter.plane()),
                     reason: "plane has unreflected checkout work".into(),
                 });
             }
@@ -267,14 +274,19 @@ impl SiblingLoader {
             || snapshot.pending_intent().next().is_some()
             || matches!(access, ViewAccess::Owner(owner) if super::intent::active(owner.root()))
         {
-            return Err(Self::error(CHECKOUT_CHANGED_BEFORE_INSTALL));
+            return Err(Self::stage_error(
+                LoaderStage::Installation,
+                CHECKOUT_CHANGED_BEFORE_INSTALL,
+            ));
         }
         let own = self
             .driver
             .build_own_generation(access, snapshot, DERIVED_CALLGRAPH_SEEDING)?;
         own.manifest()
             .ensure_producers(&self.driver.producers(access))
-            .map_err(|error| Self::error(error.to_string()))?;
+            .map_err(|error| {
+                Self::stage_error(LoaderStage::ProducerValidation, error.to_string())
+            })?;
         let (snapshot, revision) = if self.driver.revision(access) == revision {
             // Rebase the reconciled disk facts, not the new manifest's claims.
             // A builder can leave pending data without changing source bytes.
@@ -451,6 +463,31 @@ mod tests {
             self.installed.lock().unwrap().push(snapshot.clone());
             Ok(())
         }
+    }
+
+    #[test]
+    fn seed_failure_names_the_loader_not_the_trigram_plane() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(temp.path(), "family").unwrap();
+        let owner = registry.register_view("owner", temp.path()).unwrap();
+        let driver = Arc::new(Driver {
+            owner,
+            revision: AtomicU64::new(0),
+            walks: AtomicU64::new(0),
+            installed: Mutex::new(Vec::new()),
+        });
+        let reader = registry.register_reader("missing-seed").unwrap();
+        let error = SiblingLoader::new(driver, vec![])
+            .load(&ViewAccess::Reader {
+                registration: Arc::new(reader),
+                scope: "missing".into(),
+            })
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .starts_with("view loader [seed selection]:"));
+        assert!(!error.to_string().contains("trigram plane:"));
+        assert_eq!(error.plane, None);
     }
 
     #[test]
@@ -1705,14 +1742,14 @@ impl CompositePlane for CallgraphBridge {
             "config".to_string()
         } else {
             let path = std::str::from_utf8(path.as_bytes()).map_err(|error| PlaneError {
-                plane: FamilyPlane::Callgraph,
+                plane: Some(FamilyPlane::Callgraph),
                 reason: error.to_string(),
             })?;
             format!(
                 "{:?}",
                 crate::parser::detect_language(std::path::Path::new(path)).ok_or_else(|| {
                     PlaneError {
-                        plane: FamilyPlane::Callgraph,
+                        plane: Some(FamilyPlane::Callgraph),
                         reason: format!("unsupported callgraph member: {path}"),
                     }
                 })?
@@ -1734,7 +1771,7 @@ impl CompositePlane for CallgraphBridge {
         seed_derived: bool,
     ) -> Result<(), PlaneError> {
         let error = |reason: String| PlaneError {
-            plane: FamilyPlane::Callgraph,
+            plane: Some(FamilyPlane::Callgraph),
             reason,
         };
         if seed_derived {
@@ -1802,7 +1839,7 @@ impl CompositePlane for CallgraphBridge {
         published: &str,
     ) -> Result<(), PlaneError> {
         let error = |e: super::ViewError| PlaneError {
-            plane: FamilyPlane::Callgraph,
+            plane: Some(FamilyPlane::Callgraph),
             reason: e.to_string(),
         };
         let staging_path = super::resolve_derived_path(owner.view_dir(), staging).map_err(error)?;
@@ -1813,7 +1850,7 @@ impl CompositePlane for CallgraphBridge {
         .map_err(error)?;
         if busy != 0 || (frames >= 0 && checkpointed != frames) {
             return Err(PlaneError {
-                plane: FamilyPlane::Callgraph,
+                plane: Some(FamilyPlane::Callgraph),
                 reason: "private callgraph checkpoint incomplete".into(),
             });
         }
@@ -1824,7 +1861,7 @@ impl CompositePlane for CallgraphBridge {
                 || published_path.exists()
             {
                 return Err(PlaneError {
-                    plane: FamilyPlane::Callgraph,
+                    plane: Some(FamilyPlane::Callgraph),
                     reason: "private callgraph install would replace a live database".into(),
                 });
             }

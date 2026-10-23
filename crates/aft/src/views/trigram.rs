@@ -253,12 +253,13 @@ impl GenerationIndex {
             membership: members,
             matches: Vec::new(),
             gaps,
+            relative_gaps: Vec::new(),
         };
         for path in candidates.indexed.union(&candidates.direct) {
             let absolute = match rel_path_to_os(path) {
                 Ok(relative) => root.join(relative),
                 Err(_) => {
-                    result.gaps.push(root.to_path_buf());
+                    record_conversion_gap(&mut result, path);
                     continue;
                 }
             };
@@ -347,11 +348,31 @@ pub struct QueryResult {
     pub membership: BTreeSet<RelPath>,
     pub matches: Vec<MatchedLine>,
     pub gaps: Vec<PathBuf>,
+    /// Exact manifest keys that cannot be represented as native paths.
+    pub relative_gaps: Vec<RelPath>,
+}
+
+fn record_conversion_gap(result: &mut QueryResult, path: &RelPath) {
+    result.relative_gaps.push(path.clone());
 }
 
 impl QueryResult {
     pub fn complete(&self) -> bool {
-        self.gaps.is_empty()
+        self.gaps.is_empty() && self.relative_gaps.is_empty()
+    }
+
+    /// Preserve OS bytes for native paths and the manifest encoding for other keys.
+    pub fn gap_diagnostics(&self) -> Vec<String> {
+        self.gaps
+            .iter()
+            .map(|path| format!("{path:?}"))
+            .chain(self.relative_gaps.iter().map(|path| {
+                format!(
+                    "unrepresentable relative path: {}",
+                    serde_json::to_string(path).expect("relative paths always serialize")
+                )
+            }))
+            .collect()
     }
 }
 
@@ -432,7 +453,7 @@ impl TrigramDriver {
 
 fn plane_error(reason: impl Into<String>) -> super::contracts::PlaneError {
     super::contracts::PlaneError {
-        plane: FamilyPlane::Trigram,
+        plane: Some(FamilyPlane::Trigram),
         reason: reason.into(),
     }
 }
@@ -848,6 +869,28 @@ impl super::contracts::PlaneAdapter for TrigramAdapter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unrepresentable_query_gap_keeps_the_exact_relative_bytes() {
+        let path = RelPath::new(b"a-\xff.rs".to_vec()).unwrap();
+        let mut result = QueryResult {
+            membership: BTreeSet::new(),
+            matches: Vec::new(),
+            gaps: Vec::new(),
+            relative_gaps: Vec::new(),
+        };
+        record_conversion_gap(&mut result, &path);
+        assert_eq!(result.relative_gaps, vec![path]);
+        assert!(result.gaps.is_empty());
+        assert!(!result.complete());
+        assert_eq!(
+            serde_json::to_string(&result.relative_gaps[0]).unwrap(),
+            r#"{"b64":"YS3/LnJz"}"#
+        );
+        assert_eq!(
+            result.gap_diagnostics(),
+            vec![r#"unrepresentable relative path: {"b64":"YS3/LnJz"}"#]
+        );
+    }
     use super::super::contracts::{PlaneAdapter, ViewAccess};
     use super::super::manifest_v2::{ManifestHeader, ManifestV2, Producers};
     use super::super::snapshot::{LiveDelta, OpenGeneration};

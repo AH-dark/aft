@@ -283,7 +283,7 @@ fn queryable_manifest(manifest: &ManifestV2) -> Result<Manifest, PlaneError> {
 }
 fn error(reason: impl std::fmt::Display) -> PlaneError {
     PlaneError {
-        plane: FamilyPlane::Callgraph,
+        plane: Some(FamilyPlane::Callgraph),
         reason: reason.to_string(),
     }
 }

@@ -4231,6 +4231,11 @@ pub trait CallGraphRead {
     fn nodes_for_stored(&self, file: &str, symbol: &str) -> Result<Vec<StoreNode>> {
         self.nodes_for(Path::new(file), symbol)
     }
+    /// The indexed content hash for a path returned by this store, or `None`
+    /// when unknown. Compare before pairing stored positions with live text.
+    fn stored_content_hash(&self, _file: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
     fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>>;
     fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>>;
     fn direct_callers_for_symbols(
@@ -7605,6 +7610,24 @@ impl CallGraphStore {
             }
             resolution_importers = importers;
         }
+        // Cargo manifests control crate names, source roots and workspace
+        // membership. Re-resolve unchanged Rust callers when those inputs move.
+        if deleted
+            .iter()
+            .chain(changed_extracts.keys())
+            .any(|path| invalidates_workspace_crate_prefix_cache(Path::new(path)))
+        {
+            for caller in stored_rust_files(&conn)? {
+                if deleted.contains(&caller) {
+                    continue;
+                }
+                record_dependent_refs(
+                    &mut selected_ref_ids,
+                    &mut selected_refs_by_caller,
+                    all_refs_of_caller(&conn, &caller)?,
+                );
+            }
+        }
         // Time only the created-file scan here; the configuration selection
         // above belongs to dependency selection, which `started` still covers.
         let created_started = Instant::now();
@@ -8168,6 +8191,44 @@ impl CallGraphStore {
         nodes_for_file_matching_symbol(&conn, &rel_path, symbol)
     }
 
+    /// Read one committed state throughout a multi-query answer without
+    /// nesting transactions on the shared connection. The caller must retain
+    /// this store for the snapshot's lifetime to keep its generation pinned.
+    pub(crate) fn read_snapshot(&self) -> Result<CallGraphStore> {
+        let conn = open_readonly_connection(&self.sqlite_path)?;
+        conn.execute_batch("BEGIN DEFERRED")?;
+        let mut snapshot = CallGraphStore::from_connection(
+            self.project_root.clone(),
+            self.project_key.clone(),
+            self.sqlite_path.clone(),
+            self.publication_dir.clone(),
+            self.legacy_fallback,
+            self.generation.clone(),
+            None,
+            None,
+            conn,
+        );
+        snapshot.manifest_view = self.manifest_view;
+        snapshot.database_ready.store(
+            self.database_ready.load(AtomicOrdering::Acquire),
+            AtomicOrdering::Release,
+        );
+        Ok(snapshot)
+    }
+
+    /// The indexed content hash for `file`, or `None` when no row exists.
+    /// See [`CallGraphRead::stored_content_hash`].
+    pub fn stored_content_hash(&self, file: &str) -> Result<Option<String>> {
+        self.refresh_read_marker()?;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        let hash = conn
+            .prepare_cached("SELECT content_hash FROM files WHERE path = ?1")?
+            .query_row(params![file], |row| row.get::<_, String>(0))
+            .optional()?;
+        Ok(hash)
+    }
+
     /// [`CallGraphRead::nodes_for_stored`]: `file` is a path the store
     /// returned, so it is used as the key without a filesystem lookup.
     pub fn nodes_for_stored(&self, file: &str, symbol: &str) -> Result<Vec<StoreNode>> {
@@ -8662,6 +8723,11 @@ impl CallGraphStore {
 }
 
 impl ReadonlyCallGraphStore {
+    /// Read one answer snapshot while this reader retains the generation pins.
+    pub(crate) fn read_snapshot(&self) -> Result<CallGraphStore> {
+        self.inner.read_snapshot()
+    }
+
     /// Open only the selected derived database, without legacy fallback. The
     /// caller must retain the pinned generation for the lifetime of this reader.
     pub(crate) fn open_pinned_derived(
@@ -8962,6 +9028,9 @@ impl ReadonlyCallGraphStore {
 }
 
 impl CallGraphRead for CallGraphStore {
+    fn stored_content_hash(&self, file: &str) -> Result<Option<String>> {
+        CallGraphStore::stored_content_hash(self, file)
+    }
     fn project_root(&self) -> &Path {
         CallGraphStore::project_root(self)
     }
@@ -9080,6 +9149,9 @@ impl CallGraphRead for CallGraphStore {
 }
 
 impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
+    fn stored_content_hash(&self, file: &str) -> Result<Option<String>> {
+        (**self).stored_content_hash(file)
+    }
     fn project_root(&self) -> &Path {
         (**self).project_root()
     }
@@ -9198,6 +9270,9 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
 }
 
 impl CallGraphRead for ReadonlyCallGraphStore {
+    fn stored_content_hash(&self, file: &str) -> Result<Option<String>> {
+        self.inner.stored_content_hash(file)
+    }
     fn project_root(&self) -> &Path {
         self.project_root()
     }
@@ -21709,6 +21784,13 @@ fn resolution_change_importers<'a>(
     Ok((importers, barrels))
 }
 
+fn stored_rust_files(conn: &Connection) -> Result<Vec<String>> {
+    let mut statement =
+        conn.prepare_cached("SELECT path FROM files WHERE lang = 'rust' ORDER BY path")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Every stored ref of `caller_file`, selected for re-resolution.
 fn all_refs_of_caller(conn: &Connection, caller_file: &str) -> Result<Vec<DependentRefSelection>> {
     let mut statement =
@@ -23055,6 +23137,68 @@ mod refresh_worker_tests {
     }
 
     #[test]
+    fn trace_data_marks_hops_approximate_when_the_file_changed_since_indexing() {
+        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
+        let indexed = "fn entry() {\n    let x = 1;\n    let y = x;\n    first(y);\n}\nfn first(p: i32) {\n    let _ = p;\n}\n";
+        fs::write(&source, indexed).unwrap();
+        let store = CallGraphStore::open_ready(callgraph_dir, root)
+            .unwrap()
+            .unwrap();
+        store.refresh_files(std::slice::from_ref(&source)).unwrap();
+        let trace = || {
+            crate::commands::callgraph_store_adapter::trace_data_result(
+                &store,
+                &source,
+                "entry",
+                "x",
+                5,
+                Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new())),
+            )
+            .unwrap()
+        };
+        let fresh = trace();
+        assert!(fresh
+            .hops
+            .iter()
+            .any(|hop| hop.variable == "y" && !hop.approximate));
+        // Stored offsets no longer describe the edited file's call sites.
+        fs::write(&source, format!("// shifted\n{indexed}")).unwrap();
+        let stale = trace();
+        assert!(!stale.hops.is_empty());
+        assert!(
+            stale.hops.iter().all(|hop| hop.approximate),
+            "{:?}",
+            stale.hops
+        );
+    }
+
+    #[test]
+    fn read_snapshot_answers_from_one_committed_state() {
+        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
+        let writer = CallGraphStore::open_ready(callgraph_dir.clone(), root.clone())
+            .unwrap()
+            .unwrap();
+        let reader = CallGraphStore::open_readonly(callgraph_dir, root)
+            .unwrap()
+            .unwrap();
+        let snapshot = reader.read_snapshot().unwrap();
+        let main = Path::new("main.rs");
+        // The first query fixes the deferred transaction's snapshot.
+        assert_eq!(snapshot.nodes_for(main, "old_leaf").unwrap().len(), 1);
+        fs::write(&source, "fn entry() { new_leaf(); }\nfn new_leaf() {}\n").unwrap();
+        writer.refresh_files(std::slice::from_ref(&source)).unwrap();
+        assert_eq!(reader.nodes_for(main, "new_leaf").unwrap().len(), 1);
+        assert!(snapshot.nodes_for(main, "new_leaf").unwrap().is_empty());
+        assert_eq!(snapshot.nodes_for(main, "old_leaf").unwrap().len(), 1);
+        let tree = crate::commands::callgraph_store_adapter::call_tree_result(
+            &snapshot, &source, "entry", 1, true,
+        )
+        .unwrap();
+        assert_eq!(tree.children.len(), 1);
+        assert_eq!(tree.children[0].name, "old_leaf");
+    }
+
+    #[test]
     fn store_callers_count_each_boundary_caller_once() {
         let (_temp, root, callgraph_dir, source) = ready_store_fixture();
         fs::write(
@@ -24335,6 +24479,45 @@ mod refresh_worker_tests {
         .unwrap();
         drop(store);
         (temp, root, callgraph_dir, caller)
+    }
+
+    #[test]
+    fn cargo_manifest_refresh_re_resolves_rust_callers_it_did_not_touch() {
+        let (_temp, root, callgraph_dir, _caller) = workspace_refresh_fixture();
+        let added_source = root.join("added/src/lib.rs");
+        fs::create_dir_all(added_source.parent().unwrap()).unwrap();
+        fs::write(&added_source, "pub fn target() {}\n").unwrap();
+        let store = CallGraphStore::open_ready(callgraph_dir, root.clone())
+            .unwrap()
+            .unwrap();
+        store
+            .refresh_files(std::slice::from_ref(&added_source))
+            .unwrap();
+        let unresolved = store
+            .call_tree(Path::new("app/src/lib.rs"), "run", 1)
+            .unwrap();
+        assert!(!unresolved.children[0].resolved, "{unresolved:?}");
+        // Only Cargo metadata changes; the caller's source stays untouched.
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\", \"added\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        let added_manifest = root.join("added/Cargo.toml");
+        fs::write(
+            &added_manifest,
+            "[package]\nname = \"added-crate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        store
+            .refresh_files(&[root.join("Cargo.toml"), added_manifest])
+            .unwrap();
+        let tree = store
+            .call_tree(Path::new("app/src/lib.rs"), "run", 1)
+            .unwrap();
+        assert_eq!(tree.children.len(), 1);
+        assert!(tree.children[0].resolved, "{tree:?}");
+        assert_eq!(tree.children[0].file, "added/src/lib.rs");
     }
 
     #[test]
