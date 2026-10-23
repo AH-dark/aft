@@ -5776,6 +5776,83 @@ mod render_text_tests {
     }
 
     #[test]
+    fn non_git_obsolete_store_discloses_unknown_dead_code_and_preserves_unused_exports() {
+        use crate::callgraph_store::CallGraphStore;
+        use crate::inspect::{InspectJob, JobKey};
+        use std::sync::{Arc, RwLock};
+
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let source = root.join("helper.ts");
+        std::fs::write(&source, "export function unused_helper() {}\n").unwrap();
+        assert!(!root.join(".git").exists());
+        let (store, _) = CallGraphStore::cold_build_with_lease(
+            storage.path().to_path_buf(),
+            root.clone(),
+            &[source.clone()],
+        )
+        .unwrap();
+        let database = store.sqlite_path().to_path_buf();
+        drop(store);
+        let conn = rusqlite::Connection::open(database).unwrap();
+        conn.execute(
+            "UPDATE meta SET v = 'old-output-fingerprint' WHERE k = 'fingerprint'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            CallGraphStore::open_readonly(storage.path().to_path_buf(), root.clone())
+                .unwrap()
+                .is_none()
+        );
+
+        let mut job = InspectJob {
+            job_id: 1,
+            key: JobKey::for_project_category(InspectCategory::DeadCode),
+            category: InspectCategory::DeadCode,
+            scope_files: vec![source],
+            project_root: root.clone(),
+            inspect_dir: storage.path().join("inspect"),
+            config: Arc::new(crate::config::Config {
+                project_root: Some(root),
+                ..Default::default()
+            }),
+            symbol_cache: Arc::new(RwLock::new(crate::parser::SymbolCache::new())),
+            inspect_writer: true,
+            callgraph_writer: true,
+            callgraph_snapshot: None,
+        };
+        let dead = crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
+            .outcome
+            .unwrap()
+            .aggregate;
+        let dead = summary_for(InspectCategory::DeadCode, &dead);
+        job.category = InspectCategory::UnusedExports;
+        let unused = crate::inspect::scanners::unused_exports::run_unused_exports_scan(&job)
+            .outcome
+            .unwrap()
+            .aggregate;
+        let text = render(serde_json::json!({
+            "dead_code": dead,
+            "unused_exports": summary_for(InspectCategory::UnusedExports, &unused),
+        }));
+        assert!(
+            text.starts_with("PARTIAL — dead code unavailable:"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Dead code analysis unavailable (no callgraph)"),
+            "{text}"
+        );
+        assert!(!text.contains("Dead code: 0"), "{text}");
+        assert!(dead.get("count").is_none(), "{dead:#}");
+        assert_eq!(unused["count"], 1, "{unused:#}");
+        assert!(text.contains("Unused exports: 1"), "{text}");
+    }
+
+    #[test]
     fn renders_complexity_summary_and_drill_down() {
         let text = render_with_details(
             serde_json::json!({
