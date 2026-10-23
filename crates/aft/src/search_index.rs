@@ -87,6 +87,7 @@ const POSTING_BYTES: usize = 6;
 const ARTIFACT_CACHE_KEY_MEMO_FILE: &str = "cache-keys.json";
 const ARTIFACT_CACHE_KEY_MEMO_EVICTION_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const ARTIFACT_CACHE_KEY_MEMO_READ_REFRESH_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const LEGACY_IDENTITY_MEMO_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 #[cfg(test)]
 const INDEX_ORPHAN_MIN_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 #[cfg(test)]
@@ -154,6 +155,11 @@ struct ArtifactCacheKeyMemoEntry {
 #[derive(Default)]
 struct ArtifactCacheKeyMemoState {
     by_storage_root: BTreeMap<PathBuf, BTreeMap<String, ArtifactCacheKeyMemoEntry>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEGACY_MEMO_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Default)]
@@ -7660,7 +7666,179 @@ pub(crate) fn artifact_cache_key_for_bind_profiled(
     Ok(Some(key))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LegacyMemoStamp {
+    identity: crate::file_identity::FileIdentity,
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl LegacyMemoStamp {
+    fn new(metadata: &fs::Metadata, identity: crate::file_identity::FileIdentity) -> Option<Self> {
+        if identity == crate::file_identity::FileIdentity::Unavailable {
+            return None;
+        }
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            identity,
+            len: metadata.len(),
+            modified: metadata.modified().ok()?,
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+
+    fn at(path: &Path) -> Option<Self> {
+        let (metadata, identity) = crate::file_identity::metadata(path).ok()?;
+        Self::new(&metadata, identity)
+    }
+
+    fn of_file(file: &File) -> Option<Self> {
+        Self::new(
+            &file.metadata().ok()?,
+            crate::file_identity::FileIdentity::of_file(file),
+        )
+    }
+}
+
+struct LegacyMemoIndex {
+    stamp: Option<LegacyMemoStamp>,
+    built_at: Instant,
+    entries: Vec<(String, ArtifactCacheKeyMemoEntry, PathBuf)>,
+    aliases: BTreeMap<PathBuf, Vec<usize>>,
+}
+
+impl LegacyMemoIndex {
+    fn build(
+        entries: BTreeMap<String, ArtifactCacheKeyMemoEntry>,
+        stamp: Option<LegacyMemoStamp>,
+    ) -> Self {
+        #[cfg(test)]
+        LEGACY_MEMO_BUILDS.with(|count| count.set(count.get() + 1));
+        let mut aliases: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+        let entries = entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, (spelling, entry))| {
+                let canonical = crate::root_identity::canonical_root(Path::new(&spelling));
+                aliases.entry(canonical.clone()).or_default().push(index);
+                (spelling, entry, canonical)
+            })
+            .collect();
+        Self {
+            stamp,
+            built_at: Instant::now(),
+            entries,
+            aliases,
+        }
+    }
+
+    fn lookup(
+        &self,
+        root: &Path,
+        raw_key: &str,
+    ) -> std::io::Result<Option<ArtifactCacheKeyMemoEntry>> {
+        let canonical = crate::root_identity::canonical_root(root);
+        let mut candidates = self.aliases.get(&canonical).cloned().unwrap_or_default();
+        if let Ok(raw) = self
+            .entries
+            .binary_search_by(|(spelling, _, _)| spelling.as_str().cmp(raw_key))
+        {
+            if let Err(position) = candidates.binary_search(&raw) {
+                candidates.insert(position, raw);
+            }
+        }
+        let mut found: Option<&ArtifactCacheKeyMemoEntry> = None;
+        for index in candidates {
+            let (spelling, entry, indexed_root) = &self.entries[index];
+            let current = crate::root_identity::canonical_root(Path::new(spelling));
+            // Keep the exact-spelling shortcut while its path mapping is
+            // unchanged, but not after it moves away from the query root.
+            if current != canonical && !(spelling == raw_key && current == *indexed_root) {
+                continue;
+            }
+            if !artifact_key_looks_valid(&entry.key) || entry.git_root_commit.trim().is_empty() {
+                return Err(std::io::Error::other(
+                    "legacy repository identity memo is invalid",
+                ));
+            }
+            if found.is_some_and(|previous| previous.git_root_commit != entry.git_root_commit) {
+                return Err(std::io::Error::other(
+                    "canonical root aliases have conflicting repository identities",
+                ));
+            }
+            found = Some(entry);
+        }
+        Ok(found.cloned())
+    }
+}
+
+type LegacyMemoSlot = Arc<Mutex<Option<LegacyMemoIndex>>>;
+
+fn legacy_identity_memo_slot(storage: &Path) -> LegacyMemoSlot {
+    static INDEXES: OnceLock<Mutex<BTreeMap<PathBuf, LegacyMemoSlot>>> = OnceLock::new();
+    INDEXES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(artifact_cache_key_memo_path(storage))
+        .or_default()
+        .clone()
+}
+
+/// Cache canonical spellings by the memo file's identity, length and times;
+/// refresh on AFT writes and after ten minutes even if the file is unchanged.
+/// Revalidate matched spellings on every lookup so a moved alias cannot return
+/// its former root's identity. Newly matching spellings, including new conflicts,
+/// can be missed until refresh; the age limit bounds that discovery delay.
 fn legacy_identity_memo(
+    root: &Path,
+    raw_key: &str,
+    storage: &Path,
+) -> std::io::Result<Option<ArtifactCacheKeyMemoEntry>> {
+    let path = artifact_cache_key_memo_path(storage);
+    let slot = legacy_identity_memo_slot(storage);
+    // Only this storage's first build is serialized. Do not take the ordinary
+    // process memo mutex while resolving every legacy spelling's filesystem path.
+    let mut cached = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stamp = LegacyMemoStamp::at(&path);
+    if let Some(index) = cached.as_ref().filter(|index| {
+        stamp.is_some()
+            && index.stamp == stamp
+            && index.built_at.elapsed() < LEGACY_IDENTITY_MEMO_MAX_AGE
+    }) {
+        return index.lookup(root, raw_key);
+    }
+    *cached = None;
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let before = LegacyMemoStamp::of_file(&file);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let entries = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+    let index = LegacyMemoIndex::build(entries, before);
+    let result = index.lookup(root, raw_key);
+    // Read and canonicalization can race a writer. Return the opened snapshot,
+    // as a full scan would, but never cache it under a replacement's stamp.
+    if before.is_some()
+        && before == LegacyMemoStamp::of_file(&file)
+        && before == LegacyMemoStamp::at(&path)
+    {
+        *cached = Some(index);
+    }
+    result
+}
+
+#[cfg(test)]
+fn legacy_identity_memo_full_scan(
     root: &Path,
     raw_key: &str,
     storage: &Path,
@@ -8257,6 +8435,11 @@ fn write_artifact_cache_key_memo_file(
         let _ = fs::remove_file(&temp_path);
         return Err(error);
     }
+    // A same-process write must invalidate aliases even on a filesystem whose
+    // metadata cannot reliably distinguish successive versions of this file.
+    *legacy_identity_memo_slot(storage_root)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     Ok(())
 }
 
@@ -10343,6 +10526,334 @@ pub(crate) fn audit_work() -> AuditWork {
 
 #[cfg(test)]
 mod tests {
+    fn legacy_memo_entry(commit: &str) -> super::ArtifactCacheKeyMemoEntry {
+        super::ArtifactCacheKeyMemoEntry {
+            key: "0123456789abcdef".into(),
+            git_root_commit: commit.into(),
+            recorded_at_ms: 1,
+        }
+    }
+
+    fn legacy_memo_value(
+        result: std::io::Result<Option<super::ArtifactCacheKeyMemoEntry>>,
+    ) -> Result<Option<(String, String, u64)>, (std::io::ErrorKind, String)> {
+        result
+            .map(|entry| {
+                entry.map(|entry| (entry.key, entry.git_root_commit, entry.recorded_at_ms))
+            })
+            .map_err(|error| (error.kind(), error.to_string()))
+    }
+
+    #[test]
+    fn legacy_identity_memo_rebuilds_on_same_size_same_time_replacement() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("checkout");
+        let raw = root.to_string_lossy().into_owned();
+        let mut entries = BTreeMap::from([(raw.clone(), legacy_memo_entry("old"))]);
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        assert_eq!(
+            super::legacy_identity_memo(&root, &raw, storage.path())
+                .unwrap()
+                .unwrap()
+                .git_root_commit,
+            "old"
+        );
+        entries.get_mut(&raw).unwrap().git_root_commit = "new".into();
+        let bytes = serde_json::to_vec_pretty(&entries).unwrap();
+        crate::file_identity::replace_keeping_times(
+            &super::artifact_cache_key_memo_path(storage.path()),
+            &bytes,
+        );
+        assert_eq!(
+            super::legacy_identity_memo(&root, &raw, storage.path())
+                .unwrap()
+                .unwrap()
+                .git_root_commit,
+            "new"
+        );
+    }
+
+    #[test]
+    fn legacy_identity_memo_own_write_invalidates_snapshot() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("checkout");
+        let raw = root.to_string_lossy().into_owned();
+        let mut entries = BTreeMap::from([(raw.clone(), legacy_memo_entry("old"))]);
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        super::legacy_identity_memo(&root, &raw, storage.path()).unwrap();
+        let slot = super::legacy_identity_memo_slot(storage.path());
+        assert!(slot.lock().unwrap().is_some());
+        entries.get_mut(&raw).unwrap().git_root_commit = "new".into();
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "a successful AFT memo write must discard canonical aliases"
+        );
+        assert_eq!(
+            super::legacy_identity_memo(&root, &raw, storage.path())
+                .unwrap()
+                .unwrap()
+                .git_root_commit,
+            "new"
+        );
+    }
+
+    #[test]
+    fn legacy_identity_memo_rechecks_in_place_edits_deletion_and_invalid_json() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("checkout");
+        let raw = root.to_string_lossy().into_owned();
+        let path = super::artifact_cache_key_memo_path(storage.path());
+        let mut entries = BTreeMap::from([(raw.clone(), legacy_memo_entry("old"))]);
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        super::legacy_identity_memo(&root, &raw, storage.path()).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        entries.get_mut(&raw).unwrap().git_root_commit = "new".into();
+        fs::write(&path, serde_json::to_vec_pretty(&entries).unwrap()).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified + Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(
+            super::legacy_identity_memo(&root, &raw, storage.path())
+                .unwrap()
+                .unwrap()
+                .git_root_commit,
+            "new"
+        );
+        fs::remove_file(&path).unwrap();
+        assert!(super::legacy_identity_memo(&root, &raw, storage.path())
+            .unwrap()
+            .is_none());
+        fs::write(&path, b"not json").unwrap();
+        assert_eq!(
+            legacy_memo_value(super::legacy_identity_memo(&root, &raw, storage.path())),
+            legacy_memo_value(super::legacy_identity_memo_full_scan(
+                &root,
+                &raw,
+                storage.path()
+            ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_identity_memo_revalidates_retargeted_matches() {
+        for conflict in [false, true] {
+            let storage = tempfile::tempdir().unwrap();
+            let root = storage.path().join("checkout");
+            let other = storage.path().join("other");
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(&other).unwrap();
+            let alias = storage.path().join("alias");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            let raw = root.to_string_lossy().into_owned();
+            let alias_raw = alias.to_string_lossy().into_owned();
+            let mut entries =
+                BTreeMap::from([(alias_raw.clone(), legacy_memo_entry("alias-commit"))]);
+            if conflict {
+                entries.insert(raw.clone(), legacy_memo_entry("root-commit"));
+            }
+            super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+            let first = super::legacy_identity_memo(&root, &raw, storage.path());
+            if conflict {
+                assert!(first
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("conflicting repository identities"));
+            } else {
+                assert_eq!(first.unwrap().unwrap().git_root_commit, "alias-commit");
+            }
+            fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink(&other, &alias).unwrap();
+            let result = super::legacy_identity_memo(&root, &raw, storage.path()).unwrap();
+            if conflict {
+                assert_eq!(result.unwrap().git_root_commit, "root-commit");
+            } else {
+                assert!(
+                    result.is_none(),
+                    "retargeted alias must not return its former identity"
+                );
+                assert!(
+                    super::legacy_identity_memo(&root, &alias_raw, storage.path())
+                        .unwrap()
+                        .is_none(),
+                    "raw-spelling shortcut must not bypass revalidation"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_identity_memo_age_refresh_discovers_new_aliases() {
+        for conflict in [false, true] {
+            let storage = tempfile::tempdir().unwrap();
+            let root = storage.path().join("checkout");
+            fs::create_dir(&root).unwrap();
+            let alias = storage.path().join("formerly-missing");
+            let raw = root.to_string_lossy().into_owned();
+            let mut entries = BTreeMap::from([(
+                alias.to_string_lossy().into_owned(),
+                legacy_memo_entry("root-commit"),
+            )]);
+            if conflict {
+                entries.insert(raw.clone(), legacy_memo_entry("other-commit"));
+            }
+            super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+            let before =
+                legacy_memo_value(super::legacy_identity_memo(&root, &raw, storage.path()));
+            assert_eq!(
+                before,
+                legacy_memo_value(super::legacy_identity_memo_full_scan(
+                    &root,
+                    &raw,
+                    storage.path()
+                ))
+            );
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            assert_eq!(legacy_memo_value(super::legacy_identity_memo(&root, &raw, storage.path())), before,
+                "new aliases and conflicts are discovered at refresh rather than by rescanning every miss");
+            let slot = super::legacy_identity_memo_slot(storage.path());
+            slot.lock().unwrap().as_mut().unwrap().built_at =
+                Instant::now() - super::LEGACY_IDENTITY_MEMO_MAX_AGE;
+            let refreshed = super::legacy_identity_memo(&root, &raw, storage.path());
+            if conflict {
+                assert!(refreshed
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("conflicting repository identities"));
+            } else {
+                assert_eq!(refreshed.unwrap().unwrap().git_root_commit, "root-commit");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_identity_memo_index_matches_randomized_full_scan() {
+        fn next(seed: &mut u64) -> u64 {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *seed
+        }
+        let storage = tempfile::tempdir().unwrap();
+        let roots: Vec<_> = (0..9)
+            .map(|index| {
+                let root = storage.path().join(format!("checkout-{index}"));
+                fs::create_dir(&root).unwrap();
+                root
+            })
+            .collect();
+        let mut queries = roots.clone();
+        let mut spellings = Vec::new();
+        for (index, root) in roots[..8].iter().enumerate() {
+            spellings.push(root.clone());
+            spellings.push(root.join("."));
+            let missing = storage.path().join(format!("gone-{index}/nested/project"));
+            queries.push(missing.clone());
+            spellings.push(missing);
+            #[cfg(unix)]
+            {
+                let alias = storage.path().join(format!("symlink-{index}"));
+                std::os::unix::fs::symlink(root, &alias).unwrap();
+                spellings.push(alias.clone());
+                spellings.push(alias.join("missing/project"));
+                queries.push(root.join("missing/project"));
+            }
+        }
+        let mut seed = 0x615f_726f_6f74_u64;
+        for round in 0..32 {
+            let mut entries = BTreeMap::new();
+            for _ in 0..48 {
+                let spelling = &spellings[next(&mut seed) as usize % spellings.len()];
+                let mut entry = legacy_memo_entry(&format!("root-{}", next(&mut seed) % 3));
+                entry.recorded_at_ms = next(&mut seed);
+                entry.key = format!("{:016x}", next(&mut seed));
+                if next(&mut seed) % 11 == 0 {
+                    entry.key = "invalid".into();
+                }
+                entries.insert(spelling.to_string_lossy().into_owned(), entry);
+            }
+            let fixed = roots[8].to_string_lossy().into_owned();
+            let alias = roots[8].join(".").to_string_lossy().into_owned();
+            entries.insert(fixed.clone(), legacy_memo_entry("fixed-root"));
+            let mut second = legacy_memo_entry("fixed-root");
+            second.key = "fedcba9876543210".into();
+            match round % 4 {
+                0 => second.git_root_commit = "conflicting-root".into(),
+                1 => {}
+                2 => second.git_root_commit = " ".into(),
+                _ => second.key = "invalid".into(),
+            }
+            entries.insert(alias, second);
+            super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+            for root in &queries {
+                let raw = root.to_string_lossy();
+                let indexed =
+                    legacy_memo_value(super::legacy_identity_memo(root, &raw, storage.path()));
+                let scanned = legacy_memo_value(super::legacy_identity_memo_full_scan(
+                    root,
+                    &raw,
+                    storage.path(),
+                ));
+                assert_eq!(indexed, scanned, "round={round} root={root:?}");
+            }
+            let unrelated = storage.path().join("unrelated-query");
+            assert_eq!(
+                legacy_memo_value(super::legacy_identity_memo(
+                    &unrelated,
+                    &fixed,
+                    storage.path()
+                )),
+                legacy_memo_value(super::legacy_identity_memo_full_scan(
+                    &unrelated,
+                    &fixed,
+                    storage.path()
+                )),
+                "exact raw spellings must retain the full scan's shortcut"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_identity_memo_repeated_misses_share_snapshot() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("new-checkout");
+        let entries = BTreeMap::from([(
+            storage
+                .path()
+                .join("removed/checkouts/old")
+                .to_string_lossy()
+                .into_owned(),
+            super::ArtifactCacheKeyMemoEntry {
+                key: "0123456789abcdef".into(),
+                git_root_commit: "root-commit".into(),
+                recorded_at_ms: 1,
+            },
+        )]);
+        fs::write(
+            super::artifact_cache_key_memo_path(storage.path()),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        super::LEGACY_MEMO_BUILDS.with(|count| count.set(0));
+        for _ in 0..2 {
+            assert!(
+                super::legacy_identity_memo(&root, "new-checkout", storage.path())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            super::LEGACY_MEMO_BUILDS.with(|count| count.get()),
+            1,
+            "unchanged memo misses must share the canonical-alias snapshot"
+        );
+    }
+
     /// Measures the compatibility lookup independently of Git and durable writes.
     /// Missing checkout spellings exercise the canonical-ancestor fallback used
     /// when old worktrees have been removed. No live cache memo is read.
@@ -10372,14 +10883,17 @@ mod tests {
                 .collect();
             let bytes = serde_json::to_vec(&memo).unwrap();
             fs::write(super::artifact_cache_key_memo_path(fixture.path()), &bytes).unwrap();
+            super::LEGACY_MEMO_BUILDS.with(|count| count.set(0));
             for sample in 0..8 {
                 let started = std::time::Instant::now();
                 assert!(super::legacy_identity_memo(&root, &raw_key, fixture.path())
                     .unwrap()
                     .is_none());
                 eprintln!(
-                    "legacy_memo_probe entries={entries} bytes={} sample={sample} elapsed_us={}",
+                    "legacy_memo_probe entries={entries} bytes={} sample={sample} phase={} builds={} elapsed_us={}",
                     bytes.len(),
+                    if sample == 0 { "first" } else { "repeated_miss" },
+                    super::LEGACY_MEMO_BUILDS.with(|count| count.get()),
                     started.elapsed().as_micros()
                 );
             }
