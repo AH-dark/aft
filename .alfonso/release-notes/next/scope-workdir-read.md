@@ -1,1 +1,0 @@
-- Internal: AFT reads the session folder the daemon sends and logs when it differs from the project root; no behaviour change.
