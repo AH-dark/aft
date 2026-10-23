@@ -367,6 +367,44 @@ describe("auto-update audit regressions", () => {
     }
   });
 
+  test("updater preserves a new owner after observing a missing primary lock", async () => {
+    const storageDir = createStorageDir();
+    const lockPath = join(storageDir, "opencode", "last-update-check.json.lock");
+    mkdirSync(join(storageDir, "opencode"), { recursive: true });
+    writeFileSync(lockPath, "{}");
+    const { __test__ } = await freshIndexImport();
+    let nested: ReturnType<typeof __test__.claimCheckSlot> = null;
+    let replacement = "";
+    let interleaved = false;
+    const originalStat = fs.statSync;
+    const stat = spyOn(fs, "statSync").mockImplementation(((
+      file: fs.PathLike,
+      options: unknown,
+    ) => {
+      if (file === lockPath && !interleaved) {
+        interleaved = true;
+        rmSync(lockPath);
+        // A second window claims the released primary before the first handles ENOENT.
+        nested = __test__.claimCheckSlot(storageDir, 0);
+        replacement = readFileSync(lockPath, "utf-8");
+        throw Object.assign(new Error("released lock"), { code: "ENOENT" });
+      }
+      return originalStat(file, options as fs.StatOptions & { bigint: true });
+    }) as typeof fs.statSync);
+    let outer: ReturnType<typeof __test__.claimCheckSlot> = null;
+    try {
+      outer = __test__.claimCheckSlot(storageDir, 0);
+      expect(interleaved).toBe(true);
+      expect(nested).not.toBeNull();
+      expect(outer).toBeNull();
+      expect(readFileSync(lockPath, "utf-8")).toBe(replacement);
+    } finally {
+      stat.mockRestore();
+      outer?.release();
+      (nested as ReturnType<typeof __test__.claimCheckSlot>)?.release();
+    }
+  });
+
   test("updater retries when the orphan lock disappears before read", async () => {
     const storageDir = createStorageDir();
     const lockPath = join(storageDir, "opencode", "last-update-check.json.lock");

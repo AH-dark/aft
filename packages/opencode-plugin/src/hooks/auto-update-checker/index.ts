@@ -214,8 +214,12 @@ function claimCheckSlot(storageDir: string | null, intervalMs: number): CheckSlo
       const reclaimFd = claimReclaimGuard(reclaimPath, owner);
       if (reclaimFd === null) return null;
       try {
-        if (!isOrphanedCheckLock(lockPath)) return null;
-        rmSync(lockPath, { force: true });
+        const state = readCheckLockState(lockPath);
+        if (state !== null) {
+          if (!isOrphanedCheckLock(state)) return null;
+          rmSync(lockPath, { force: true });
+        }
+        // A missing lock needs no removal: exclusive creation must yield to any new owner.
         try {
           lockFd = openSync(lockPath, "wx");
         } catch (claimError) {
@@ -273,7 +277,7 @@ function claimReclaimGuard(reclaimPath: string, owner: CheckLockOwner): number |
   // lock's dead-process check and bounded expiry instead of blocking future starts.
   const observed = readCheckLockState(reclaimPath);
   if (observed !== null) {
-    if (!isOrphanedCheckLock(reclaimPath)) return null;
+    if (!isOrphanedCheckLock(observed)) return null;
     const current = readCheckLockState(reclaimPath);
     if (current !== null) {
       if (current.pid !== observed.pid || current.startedMs !== observed.startedMs) return null;
@@ -299,9 +303,7 @@ function writeReclaimGuard(reclaimPath: string, owner: CheckLockOwner): number {
   }
 }
 
-function isOrphanedCheckLock(lockPath: string): boolean {
-  const state = readCheckLockState(lockPath);
-  if (state === null) return true; // Released after EEXIST: retry exclusive creation.
+function isOrphanedCheckLock(state: CheckLockState): boolean {
   const ageMs = Date.now() - state.startedMs;
   if (ageMs >= CHECK_LOCK_STALE_MS) return true;
   if (state.pid === null) return false;
