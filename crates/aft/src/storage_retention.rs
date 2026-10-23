@@ -1283,14 +1283,13 @@ fn quarantine_truncated_binding(
         .file_stem()
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::other("root binding has no UTF-8 scope name"))?;
-    let mut random = [0_u8; 8];
-    getrandom::fill(&mut random).map_err(io::Error::other)?;
-    let nonce = random
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let destination = quarantine_root.join(format!("{scope}.truncated-{nonce}.json"));
-    fs::rename(path, &destination)?;
+    let destination = quarantine_root.join(format!("{scope}.truncated.json"));
+    crate::durability::atomic_write(
+        &destination,
+        &current,
+        crate::durability::AtomicWriteDurability::FileAndDirectory,
+    )?;
+    fs::remove_file(path)?;
     Ok(destination)
 }
 
@@ -1445,7 +1444,7 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
         let Some(scope) = path
             .file_stem()
             .and_then(|stem| stem.to_str())
-            .and_then(|stem| stem.split_once(".truncated-").map(|(scope, _)| scope))
+            .and_then(|stem| stem.strip_suffix(".truncated"))
         else {
             continue;
         };
@@ -7485,7 +7484,21 @@ mod storage_retention_tests {
         )
         .unwrap();
         assert_eq!(quarantine.len(), 1, "truncated binding was not quarantined");
-        assert_eq!(fs::read(quarantine[0].path()).unwrap(), truncated_bytes);
+        let quarantined_path = quarantine[0].path();
+        assert_eq!(fs::read(&quarantined_path).unwrap(), truncated_bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&quarantined_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0,
+                "truncated binding quarantine file is not owner-only"
+            );
+        }
         assert_eq!(
             lines
                 .iter()
@@ -7502,6 +7515,83 @@ mod storage_retention_tests {
         assert!(history
             .get(future_scope)
             .is_some_and(|records| { records.iter().any(|binding| binding.root == roots) }));
+    }
+
+    #[test]
+    fn truncated_binding_quarantine_stays_bounded_across_repair_cycles() {
+        let storage = tempfile::tempdir().unwrap();
+        let roots = storage.path().join("retention/roots");
+        fs::create_dir_all(&roots).unwrap();
+        let broken_scope = "repaired-scope";
+        let broken_path = roots.join(format!("{broken_scope}.json"));
+        let live_root = storage.path().join("live-root");
+        let anchor = storage.path().join("volume-anchor");
+        fs::create_dir(&live_root).unwrap();
+        fs::create_dir(&anchor).unwrap();
+        let _volume =
+            test_volume_uuid_guard(storage.path(), &anchor, "retention-cycle-volume").unwrap();
+
+        for cycle in 0..24 {
+            fs::write(&broken_path, br#"{"root":"/unfinished"#).unwrap();
+            let eligible_path = roots.join(format!("eligible-{cycle}.json"));
+            atomic_json(
+                &eligible_path,
+                &Binding {
+                    root: storage.path().join(format!("missing-{cycle}")),
+                    artifact_key: "x".into(),
+                    last_bound_ms: 0,
+                    volume: Some((anchor.clone(), 0)),
+                    stable_volume: Some(VolumeIdentity {
+                        uuid: Some("retention-cycle-volume".into()),
+                        boot_id: None,
+                    }),
+                    linked_worktree: false,
+                },
+            )
+            .unwrap();
+            let mut report = SweepReport {
+                at_ms: u64::MAX,
+                ..Default::default()
+            };
+            prune_bindings(storage.path(), &|| false, &mut report).unwrap();
+            assert!(!eligible_path.exists(), "cleanup stalled in cycle {cycle}");
+            assert_eq!(report.skipped_unknown, 1);
+
+            let quarantine = bounded_dirs(
+                &storage.path().join("retention/quarantine/roots"),
+                HISTORY_ENTRIES,
+            )
+            .unwrap();
+            assert_eq!(
+                quarantine.len(),
+                1,
+                "quarantine history grew during repair cycle {cycle}: {:?}",
+                quarantine
+                    .iter()
+                    .map(|entry| entry.file_name())
+                    .collect::<Vec<_>>()
+            );
+
+            atomic_json(
+                &broken_path,
+                &Binding {
+                    root: live_root.clone(),
+                    artifact_key: "x".into(),
+                    last_bound_ms: crate::pins::now_ms(),
+                    volume: Some((anchor.clone(), 0)),
+                    stable_volume: Some(VolumeIdentity {
+                        uuid: Some("retention-cycle-volume".into()),
+                        boot_id: None,
+                    }),
+                    linked_worktree: false,
+                },
+            )
+            .unwrap();
+            let history = bindings(storage.path()).unwrap();
+            assert!(history.get(broken_scope).is_some_and(|records| {
+                records.iter().any(|binding| binding.root == live_root)
+            }));
+        }
     }
 }
 
