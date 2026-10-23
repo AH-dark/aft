@@ -764,7 +764,13 @@ mod tests {
                 config.storage_dir = Some(dir.path().join("storage"));
                 config.backup.enabled = Some(false);
                 let ctx = std::sync::Arc::new(AppContext::from_app(app.clone(), config));
-                app.register_memory_context(root, &ctx);
+                // Actor registration keys the census by project identity, not
+                // the caller's spelling of a temporary or symlinked path.
+                let memory_root = cortexkit_paths::ProjectRootId::from_path(&root)
+                    .expect("fixture root identity")
+                    .as_path()
+                    .to_path_buf();
+                app.register_memory_context(memory_root, &ctx);
                 ctx
             })
             .collect();
@@ -788,12 +794,68 @@ mod tests {
 
         let explicit = handle_status(&request(), ctx).data;
         assert_eq!(census_builds.load(Ordering::Relaxed), 1);
-        assert_eq!(explicit["memory"]["roots_total"], 2);
+        assert_eq!(
+            explicit["memory"]["roots_total"],
+            2,
+            "memory root keys: {:?}",
+            explicit["memory"]["roots"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>()
+        );
         assert_eq!(
             ctx.try_build_status_push_snapshot().unwrap(),
             crate::status_push::project(ctx, explicit)
         );
         assert_eq!(census_builds.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn status_memory_actor_registration_keeps_one_row_for_aliased_current_root() {
+        use cortexkit_paths::ProjectRootId;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        #[cfg(unix)]
+        let root = {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&real, &alias).unwrap();
+            alias
+        };
+        #[cfg(windows)]
+        let root = std::fs::canonicalize(&real).unwrap();
+        let root_id = ProjectRootId::from_path(&root).unwrap();
+        assert_ne!(root, root_id.as_path());
+
+        let app = crate::context::App::default_shared();
+        let mut config = Config::default();
+        config.project_root = Some(root.clone());
+        config.storage_dir = Some(dir.path().join("storage"));
+        config.backup.enabled = Some(false);
+        let ctx = Arc::new(AppContext::from_app(app.clone(), config));
+        let executor = crate::executor::Executor::new();
+        assert!(executor.register_actor(root_id.clone(), ctx.clone()));
+        let registered: Vec<_> = app
+            .try_memory_contexts()
+            .unwrap()
+            .into_iter()
+            .map(|(root, _)| root)
+            .collect();
+        eprintln!("configured root: {root:?}; actor census keys: {registered:?}");
+        assert_eq!(registered, vec![root_id.as_path().to_path_buf()]);
+
+        let explicit = handle_status(&request(), &ctx).data;
+        let roots = explicit["memory"]["roots"].as_object().unwrap();
+        eprintln!(
+            "explicit memory root keys: {:?}",
+            roots.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(explicit["memory"]["roots_total"], 1);
+        assert!(roots.contains_key(&root_id.as_path().display().to_string()));
     }
 
     #[test]
