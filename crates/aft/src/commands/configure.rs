@@ -5750,6 +5750,8 @@ fn schedule_artifact_loads_admitted(
         let semantic_load_generation = configure_generation;
         let semantic_load_generation_flag = ctx.configure_generation_flag();
         let semantic_load_lifecycle = subc_lifecycle.clone();
+        let semantic_query_slot = ctx.semantic_embedding_model_slot();
+        let semantic_query_config = semantic_config.clone();
         let session_id = log_ctx::current_session();
         thread::spawn(move || {
             let _terminal_guard = semantic_rx_terminal_guard;
@@ -5813,10 +5815,35 @@ fn schedule_artifact_loads_admitted(
                     }
                     _ => None,
                 };
+                // Read-only roots have no refresh worker to keep a query model
+                // resident. Attempt warmup before publishing a usable local
+                // index; failures remain retryable by a later search.
+                let warm_query = if finished_bytes.is_some()
+                    && semantic_query_config.backend == crate::config::SemanticBackend::Fastembed
+                {
+                    match crate::semantic_index::EmbeddingModel::from_config_for_query(
+                        &semantic_query_config,
+                    ) {
+                        Ok(model) => Some(model),
+                        Err(error) => {
+                            slog_warn!("read-only semantic query model warmup failed: {}", error);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 let published = semantic_load_lifecycle.run_if_current(
                     semantic_load_generation_flag.as_ref(),
                     semantic_load_generation,
-                    || tx.send(event).is_ok(),
+                    || {
+                        if let Some(mut slot) = semantic_query_slot.try_lock() {
+                            if slot.is_none() {
+                                *slot = warm_query;
+                            }
+                        }
+                        tx.send(event).is_ok()
+                    },
                 );
                 if let Some(bytes) = finished_bytes {
                     note_finished_load_handoff(

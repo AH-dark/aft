@@ -4350,7 +4350,8 @@ pub struct AppContext {
     semantic_worker_bytes: Arc<AtomicU64>,
     semantic_refresh_retry_attempts: parking_lot::Mutex<BTreeMap<PathBuf, usize>>,
     semantic_refresh_circuit: Arc<SemanticRefreshCircuit>,
-    semantic_embedding_model: parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>>,
+    semantic_embedding_model:
+        Arc<parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>>>,
     watcher_runtime_lock: parking_lot::Mutex<()>,
     watcher: parking_lot::Mutex<Option<RecommendedWatcher>>,
     watcher_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
@@ -5157,7 +5158,7 @@ impl AppContext {
             semantic_worker_bytes: Arc::default(),
             semantic_refresh_retry_attempts: parking_lot::Mutex::new(BTreeMap::new()),
             semantic_refresh_circuit: Arc::new(SemanticRefreshCircuit::default()),
-            semantic_embedding_model: parking_lot::Mutex::new(None),
+            semantic_embedding_model: Arc::new(parking_lot::Mutex::new(None)),
             watcher_runtime_lock: parking_lot::Mutex::new(()),
             watcher: parking_lot::Mutex::new(None),
             watcher_rx: parking_lot::Mutex::new(None),
@@ -12971,6 +12972,12 @@ impl AppContext {
         &self,
     ) -> &parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>> {
         &self.semantic_embedding_model
+    }
+
+    pub(crate) fn semantic_embedding_model_slot(
+        &self,
+    ) -> Arc<parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>>> {
+        Arc::clone(&self.semantic_embedding_model)
     }
 
     /// Access the file watcher handle (kept alive to continue watching).

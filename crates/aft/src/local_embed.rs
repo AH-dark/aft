@@ -200,10 +200,14 @@ pub(crate) fn intra_thread_derivation() -> IntraThreadDerivation {
     derive_intra_threads(available_parallelism, None, None, None)
 }
 
-/// A root owns a lightweight handle; native state is shared across indexing,
-/// refresh and queries, and may be unloaded even while an idle handle survives.
+/// Roots share a query session and a separate build/refresh session. Only the
+/// build session can unload while its handles survive: sporadic queries must
+/// not pay a model reload or wait behind a large indexing inference.
 pub struct LocalEmbedder {
     shared: Arc<Mutex<ResidentModel>>,
+    // A root's build/refresh handle keeps queries warm even after its idle
+    // native build state unloads. Both sessions drop with their last lease.
+    _query_keepalive: Option<Arc<Mutex<ResidentModel>>>,
 }
 
 struct ResidentModel {
@@ -212,8 +216,10 @@ struct ResidentModel {
 }
 
 const MODEL_IDLE_TTL: Duration = Duration::from_secs(60);
-// MiniLM and its lowercase alias are the only accepted model ids; both use this slot.
-static LOCAL_MODEL: Mutex<Option<Weak<Mutex<ResidentModel>>>> = Mutex::new(None);
+// MiniLM and its lowercase alias are the only accepted model ids. Each role
+// shares one session across every root, rather than allocating per-root copies.
+static BUILD_MODEL: Mutex<Option<Weak<Mutex<ResidentModel>>>> = Mutex::new(None);
+static QUERY_MODEL: Mutex<Option<Weak<Mutex<ResidentModel>>>> = Mutex::new(None);
 static MODEL_REAPER: OnceLock<Result<(), String>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -245,27 +251,17 @@ impl ResidentModel {
 impl LocalEmbedder {
     pub fn new(model: &str) -> Result<Self, String> {
         validate_model(model)?;
-        let mut registry = LOCAL_MODEL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let shared = match registry.as_ref().and_then(Weak::upgrade) {
-            Some(shared) => shared,
-            None => {
-                let shared = Arc::new(Mutex::new(ResidentModel {
-                    model: Some(NativeEmbedder::new(model)?),
-                    last_used: Instant::now(),
-                }));
-                *registry = Some(Arc::downgrade(&shared));
-                shared
-            }
-        };
+        // Initialize the query model before background work becomes available.
+        // Its registry and inference lock never depend on the build session.
+        let query_keepalive = shared_model(&QUERY_MODEL, model)?;
+        let shared = shared_model(&BUILD_MODEL, model)?;
         MODEL_REAPER
             .get_or_init(|| {
                 std::thread::Builder::new()
                     .name("embedding-idle".into())
                     .spawn(|| loop {
                         std::thread::sleep(Duration::from_secs(15));
-                        let shared = LOCAL_MODEL
+                        let shared = BUILD_MODEL
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .as_ref()
@@ -287,15 +283,26 @@ impl LocalEmbedder {
             })
             .as_ref()
             .map_err(Clone::clone)?;
-        Ok(Self { shared })
+        Ok(Self {
+            shared,
+            _query_keepalive: Some(query_keepalive),
+        })
+    }
+
+    pub(crate) fn new_for_query(model: &str) -> Result<Self, String> {
+        validate_model(model)?;
+        Ok(Self {
+            shared: shared_model(&QUERY_MODEL, model)?,
+            _query_keepalive: None,
+        })
     }
 
     pub fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        // ort::Session::run requires exclusive access. Serializing all users
-        // also bounds simultaneous attention buffers to one inference budget.
+        // ort::Session::run requires exclusive access. Builds serialize with
+        // builds, queries with queries; neither role holds the other's lock.
         let mut resident = self
             .shared
             .lock()
@@ -307,6 +314,24 @@ impl LocalEmbedder {
         resident.last_used = Instant::now();
         result
     }
+}
+
+fn shared_model(
+    registry: &Mutex<Option<Weak<Mutex<ResidentModel>>>>,
+    model: &str,
+) -> Result<Arc<Mutex<ResidentModel>>, String> {
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(shared) = registry.as_ref().and_then(Weak::upgrade) {
+        return Ok(shared);
+    }
+    let shared = Arc::new(Mutex::new(ResidentModel {
+        model: Some(NativeEmbedder::new(model)?),
+        last_used: Instant::now(),
+    }));
+    *registry = Some(Arc::downgrade(&shared));
+    Ok(shared)
 }
 
 fn validate_model(model: &str) -> Result<(), String> {
@@ -846,7 +871,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires cached MiniLM and ONNX Runtime; run explicitly with ORT_DYLIB_PATH"]
-    fn local_embedding_one_session_serves_two_roots_and_queries() {
+    fn local_embedding_two_sessions_serve_all_roots_and_query_workers() {
         let _serial = native_test();
         let config = crate::config::SemanticBackendConfig::default();
         let mut root_one =
@@ -857,8 +882,8 @@ mod tests {
             crate::semantic_index::SemanticEmbeddingModel::from_config_for_query(&config).unwrap();
         assert_eq!(
             super::session_memory().sessions,
-            1,
-            "builds and queries loaded duplicate sessions"
+            2,
+            "roots loaded more than one session per inference role"
         );
         let corpus = fixture_corpus();
         let expected = bits(root_one.embed(corpus.clone()).unwrap());
@@ -873,7 +898,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bits(vec![query_vector]), bits(vec![build_vector]));
-        assert_eq!(super::session_memory().sessions, 1);
+        assert_eq!(super::session_memory().sessions, 2);
         // Query workers own provider clones until their request channel closes.
         drop((root_one, root_two, query));
         wait_for_sessions(0);
@@ -913,9 +938,10 @@ mod tests {
 
     #[test]
     #[ignore = "requires cached MiniLM and ONNX Runtime; run explicitly with ORT_DYLIB_PATH"]
-    fn local_embedding_idle_session_unloads_and_reloads_identically() {
+    fn local_embedding_build_unloads_but_queries_stay_warm() {
         let _serial = native_test();
         let mut handle = super::LocalEmbedder::new("all-minilm-l6-v2").unwrap();
+        let mut query = super::LocalEmbedder::new_for_query("all-MiniLM-L6-v2").unwrap();
         let corpus = fixture_corpus();
         let expected = bits(handle.embed(&corpus).unwrap());
         {
@@ -926,19 +952,67 @@ mod tests {
             );
             assert_eq!(
                 super::session_memory().sessions,
-                1,
+                2,
                 "released before the idle deadline"
             );
             resident.release_if_idle(last_used + super::MODEL_IDLE_TTL);
         }
         assert_eq!(
             super::session_memory().sessions,
-            0,
-            "idle handle pinned native session"
+            1,
+            "idle build must unload without releasing the warm query session"
         );
-        assert_eq!(super::session_memory().model_bytes, 0);
+        assert!(query.shared.lock().unwrap().model.is_some());
+        assert_eq!(bits(query.embed(&corpus).unwrap()), expected);
         assert_eq!(bits(handle.embed(&corpus).unwrap()), expected);
-        assert_eq!(super::session_memory().sessions, 1);
+        assert_eq!(super::session_memory().sessions, 2);
+        drop((handle, query));
+        assert_eq!(super::session_memory().sessions, 0);
+        assert_eq!(super::session_memory().model_bytes, 0);
+    }
+
+    #[test]
+    #[ignore = "requires cached MiniLM and ONNX Runtime; run explicitly with ORT_DYLIB_PATH"]
+    fn local_embedding_query_completes_with_build_gate_held() {
+        let _serial = native_test();
+        let build = super::LocalEmbedder::new("all-MiniLM-L6-v2").unwrap();
+        // Hold the exact mutex used for a whole indexing inference. Query
+        // progress must not depend on releasing this gate or on scheduler luck.
+        let build_gate = build.shared.lock().unwrap();
+        let query = super::LocalEmbedder::new_for_query("all-MiniLM-L6-v2").unwrap();
+        assert!(
+            query.shared.try_lock().is_ok(),
+            "query inference is blocked by the held build gate"
+        );
+        let config = crate::config::SemanticBackendConfig {
+            query_timeout_ms: 30_000,
+            ..Default::default()
+        };
+        let mut model =
+            crate::semantic_index::SemanticEmbeddingModel::from_config_for_query(&config).unwrap();
+        assert_eq!(
+            model.embed(vec!["query provider".into()]).unwrap()[0].len(),
+            384
+        );
+        let vector = model
+            .embed_query_cached(
+                "query worker",
+                crate::semantic_index::QueryBudget::from_config(&config),
+            )
+            .unwrap();
+        assert_eq!(vector.len(), 384);
+        let mut refresh_model =
+            crate::semantic_index::SemanticEmbeddingModel::from_config(&config).unwrap();
+        let vector = refresh_model
+            .embed_query_cached(
+                "parent-folder query",
+                crate::semantic_index::QueryBudget::from_config(&config),
+            )
+            .unwrap();
+        assert_eq!(vector.len(), 384);
+        drop(build_gate);
+        drop((model, refresh_model, query, build));
+        wait_for_sessions(0);
     }
 
     #[test]
