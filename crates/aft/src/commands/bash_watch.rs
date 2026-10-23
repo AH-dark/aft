@@ -134,6 +134,7 @@ struct StreamScan {
     base: u64,
     next: u64,
     has_more: bool,
+    read_timed_out: bool,
     /// A regex match ended exactly at the end of the buffer while more
     /// captured bytes were still to be read. It is checked again once the
     /// next page arrives or the stream is known to end there.
@@ -492,6 +493,18 @@ impl WatchJob {
                 // captured bytes before reporting a terminal non-match.
                 terminal &= !stdout.has_more && !stderr.has_more;
             }
+            // The filesystem access cap can expire before the reply deadline.
+            // Do not spin retrying failed I/O or turn unread output into EOF.
+            if stdout.read_timed_out || stderr.read_timed_out {
+                return Some(waited(
+                    if terminal {
+                        WaitReason::Exited
+                    } else {
+                        WaitReason::Timeout
+                    },
+                    None,
+                ));
+            }
             let now = Instant::now();
             // A nearby process kill may extend an ordinary watch limit, never
             // the reply deadline: the caller must receive its task id in time.
@@ -568,17 +581,21 @@ impl WatchJob {
                 scan.has_more = true;
                 continue;
             }
-            let Ok(page) = self.registry.read_artifact_page_until(
+            let page = match self.registry.read_artifact_page_until(
                 &self.task_id,
                 &self.session,
                 artifact,
                 scan.next,
                 self.budget.deadline,
-            ) else {
-                // A timed-out read did not establish EOF, even for an exited
-                // task. Keep the result incomplete rather than claiming no match.
-                scan.has_more = Instant::now() >= self.budget.deadline;
-                continue;
+            ) {
+                Ok(page) => page,
+                Err(error) => {
+                    // The helper's queue-wait or access cap can expire before the reply deadline.
+                    // A timed-out read did not establish EOF, even for an exited task.
+                    scan.read_timed_out = error.kind() == std::io::ErrorKind::TimedOut;
+                    scan.has_more = scan.read_timed_out || Instant::now() >= self.budget.deadline;
+                    continue;
+                }
             };
             scan.has_more = page.has_more;
             let bytes = page.bytes;
@@ -1262,8 +1279,20 @@ mod tests {
     }
 
     fn wait_with_page_delay(job: WatchJob, page_delay: Duration) -> (WatchJob, Waited, Duration) {
+        wait_with_page_delay_and_access_budget(job, page_delay, None)
+    }
+
+    fn wait_with_page_delay_and_access_budget(
+        job: WatchJob,
+        page_delay: Duration,
+        access_budget: Option<Duration>,
+    ) -> (WatchJob, Waited, Duration) {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            let _io = crate::bounded_io::enter(access_budget.map(|duration| {
+                crate::bounded_io::Budget::after(Duration::from_secs(30))
+                    .with_access_budget(duration)
+            }));
             crate::bash_background::registry::ARTIFACT_PAGE_DELAY
                 .with(|delay| delay.set(Some(page_delay)));
             let started = Instant::now();
@@ -1316,6 +1345,33 @@ mod tests {
             waited.matched,
             Some(("FINAL-MATCH".into(), LAST_PAGE_MATCH, Some("stdout")))
         );
+    }
+
+    #[test]
+    fn approved_terminal_drain_access_timeout_keeps_scan_incomplete() {
+        let (_dir, job) = budgeted_terminal_watch(Duration::from_secs(20));
+        let (job, waited, _elapsed) = wait_with_page_delay_and_access_budget(
+            job,
+            Duration::from_millis(150),
+            Some(Duration::from_millis(50)),
+        );
+        assert!(
+            Instant::now() < job.budget.deadline,
+            "the filesystem access cap, not the reply deadline, must end the read"
+        );
+        assert!(matches!(waited.reason, WaitReason::Timeout));
+        assert!(waited.matched.is_none());
+        let snapshot = job
+            .registry
+            .observed_status(&job.task_id, &job.session, 0)
+            .unwrap();
+        let text = job.render(&snapshot, &waited);
+        assert!(
+            text.contains("task already exited; the pattern scan is incomplete"),
+            "{text}"
+        );
+        assert!(!text.contains("without match"), "{text}");
+        assert!(!text.contains("task exited ("), "{text}");
     }
 
     async fn watch_with_deadline(ctx: Arc<AppContext>, request: RawRequest) -> Response {

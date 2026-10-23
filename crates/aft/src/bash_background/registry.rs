@@ -1790,10 +1790,10 @@ impl BgTaskRegistry {
         artifact: TaskArtifact,
         offset: u64,
         deadline: Instant,
-    ) -> Result<ArtifactPage, String> {
+    ) -> std::io::Result<ArtifactPage> {
         let task = self
             .task_for_session(task_id, session_id)
-            .ok_or_else(|| "task_not_found".to_string())?;
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "task_not_found"))?;
         let registry = self.clone();
         let task_id = task_id.to_owned();
         let session_id = session_id.to_owned();
@@ -1809,7 +1809,6 @@ impl BgTaskRegistry {
             ARTIFACT_PAGE_DELAY.with(|value| value.set(previous));
             result
         })
-        .map_err(|error| error.to_string())
     }
 
     pub(crate) fn read_artifact_page(
