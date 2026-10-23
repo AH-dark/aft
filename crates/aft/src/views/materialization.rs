@@ -282,6 +282,18 @@ fn materialize_reading(
     reader: &impl join::ManifestBlobReader,
     blob_connection: Option<&Connection>,
 ) -> Result<(MaterializeStats, profile::PhaseTimings)> {
+    // Existing databases may be incremental baselines or legacy upgrades. Only
+    // a newly created, unpublished file can trade recovery for cheaper writes.
+    let private_cold = base.is_none() && !database_path.exists();
+    let mut unpublished =
+        private_cold.then(|| super::generation::UnpublishedDerived::new(database_path));
+    #[cfg(test)]
+    let (relaxed, deferred_indexes) = tests::COLD_BUILD_MODE.with(|mode| {
+        let mode = mode.get();
+        (private_cold && mode.0, private_cold && mode.1)
+    });
+    #[cfg(not(test))]
+    let (relaxed, deferred_indexes) = (private_cold, private_cold);
     let write_probe = profile::WriteProbe::start(database_path);
     let mut profile = profile::PhaseTimer::new(if base.is_some() {
         "incremental"
@@ -297,10 +309,22 @@ fn materialize_reading(
         },
         "views::materialization::materialize",
     )?;
-    configure_materialization_connection(&connection)?;
+    if relaxed {
+        configure_private_connection(&connection)?;
+    } else {
+        configure_materialization_connection(&connection)?;
+    }
     initialize_schema(&connection)?;
+    #[cfg(test)]
+    if tests::COLD_WRITE_LIMIT.get() {
+        let pages: u64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        connection.pragma_update(None, "max_page_count", pages)?;
+    }
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if deferred_indexes {
+        crate::callgraph_store::drop_cold_build_secondary_indexes(&transaction)?;
+    }
     let mut base_fingerprint = None;
     if let Some(base_manifest) = base {
         let recorded: Option<String> = transaction
@@ -1221,8 +1245,8 @@ fn materialize_reading(
         // A table with no emitted rows is still an observed zero, not a missing timer.
         profile.observe_empty(phase);
     }
-    // Secondary indexes remain live because updating them as rows change is cheaper
-    // than rebuilding them; that maintenance cost is included in row-phase timings.
+    // Incremental patches retain their indexes; cold builds create them after
+    // dispatch has emitted the last graph rows.
     profile.observe_empty(WritePhase::IndexMaintenance);
     let ordinary_edge_refs = pending_edges
         .iter()
@@ -1267,6 +1291,11 @@ fn materialize_reading(
             .fetch_add(joined.dispatch_type_targets.len() as u64, Relaxed);
     }
     profile.finish("dispatch");
+    if deferred_indexes {
+        let phase = PhaseProbe::start(&transaction);
+        crate::callgraph_store::create_cold_build_secondary_indexes(&transaction)?;
+        profile.record(WritePhase::IndexMaintenance, phase.finish(&transaction));
+    }
     let mut commit_stage = profile::StageTimer::new("commit");
     set_meta_ready(&transaction, true)?;
     crate::callgraph_store::insert_meta(&transaction)?;
@@ -1285,6 +1314,9 @@ fn materialize_reading(
         .then(|| profile::wal_len(database_path));
     commit_stage.finish("metadata", format_args!(""));
     transaction.commit()?;
+    if relaxed {
+        finish_private_database(&connection)?;
+    }
     if let Some(wal_before) = wal_before_commit {
         let autocheckpoint = connection
             .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get::<_, i64>(0))
@@ -1309,6 +1341,9 @@ fn materialize_reading(
     drop(joined.bindings);
     profile.finish("cleanup_memory");
     drop(connection);
+    if let Some(unpublished) = unpublished.as_mut() {
+        unpublished.complete();
+    }
     profile.finish("cleanup_connections");
     Ok((stats, profile.into_timings()))
 }
@@ -1474,6 +1509,52 @@ pub(crate) fn configure_materialization_connection(connection: &Connection) -> R
     // reclaimable, so it is the one knob worth keeping.
     connection.pragma_update(None, "mmap_size", 268_435_456)?;
     connection.pragma_update(None, "temp_store", "MEMORY")?;
+    Ok(())
+}
+
+fn configure_private_connection(connection: &Connection) -> Result<()> {
+    connection.busy_timeout(Duration::from_secs(5))?;
+    // No reader can reach this generation. Errors discard the entire file, and
+    // restart sweeping discards interrupted builds instead of recovering them.
+    connection.pragma_update(None, "journal_mode", "OFF")?;
+    connection.pragma_update(None, "synchronous", "OFF")?;
+    connection.pragma_update(None, "temp_store", "MEMORY")?;
+    connection.pragma_update(None, "mmap_size", 268_435_456)?;
+    Ok(())
+}
+
+fn finish_private_database(connection: &Connection) -> Result<()> {
+    connection.pragma_update(None, "journal_mode", "DELETE")?;
+    connection.pragma_update(None, "synchronous", "FULL")?;
+    // Sync the writer's own VFS file, never a second descriptor: closing a
+    // second descriptor could release this process's SQLite locks.
+    use rusqlite::ffi;
+    let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
+    // SAFETY: the connection and returned VFS file remain owned and open for
+    // this call; FILE_POINTER writes one sqlite3_file pointer to the out slot.
+    let result = unsafe {
+        ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_FILE_POINTER,
+            std::ptr::from_mut(&mut file).cast(),
+        )
+    };
+    if result != ffi::SQLITE_OK {
+        return Err(rusqlite::Error::SqliteFailure(ffi::Error::new(result), None).into());
+    }
+    // SAFETY: SQLite's main file exposes the VFS methods while its owning
+    // connection is alive. Fail closed if the VFS cannot provide xSync.
+    let sync = unsafe {
+        file.as_ref()
+            .and_then(|file| file.pMethods.as_ref())
+            .and_then(|methods| methods.xSync)
+    }
+    .ok_or_else(|| CallGraphStoreError::Unavailable("private derived VFS has no xSync".into()))?;
+    let result = unsafe { sync(file, ffi::SQLITE_SYNC_FULL) };
+    if result != ffi::SQLITE_OK {
+        return Err(rusqlite::Error::SqliteFailure(ffi::Error::new(result), None).into());
+    }
     Ok(())
 }
 

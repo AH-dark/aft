@@ -1,0 +1,103 @@
+//! Paired, isolated measurements of private derived builds on the dense
+//! 20k/60k TypeScript fixtures also used by the callgraph-store I/O benchmark.
+//! Run this ignored test alone with `--nocapture --test-threads=1` on Linux.
+
+use super::*;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+fn written() -> (u64, u64) {
+    let counters = std::fs::read_to_string("/proc/self/io").unwrap();
+    let counter = |name: &str| {
+        counters
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    (counter("write_bytes:"), counter("wchar:"))
+}
+
+fn disk_bytes(path: &Path) -> u64 {
+    ["", "-wal", "-shm", "-journal"]
+        .iter()
+        .map(|suffix| {
+            std::fs::metadata(format!("{}{suffix}", path.display())).map_or(0, |m| m.len())
+        })
+        .sum()
+}
+
+#[test]
+#[ignore = "offline 20k/60k cold-build I/O measurement, several GB of scratch storage"]
+fn measure_private_cold_build_io() {
+    let sizes = std::env::var("AFT_COLD_BENCH_SIZES").unwrap_or_else(|_| "20000,60000".into());
+    for files in sizes.split(',').map(|s| s.parse::<usize>().unwrap()) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let paths = crate::callgraph_store::perf_tests::write_scaling_fixture(&source, files);
+        let sources = paths
+            .iter()
+            .map(|path| {
+                (
+                    path.strip_prefix(&source)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    std::fs::read_to_string(path).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let borrowed = sources
+            .iter()
+            .map(|(p, s)| (p.as_str(), s.as_str()))
+            .collect::<Vec<_>>();
+        let blobs = dir.path().join("blobs.sqlite");
+        let connection = Connection::open(&blobs).unwrap();
+        connection.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)").unwrap();
+        let manifest = manifest(&connection, &borrowed);
+        drop(connection);
+        drop(borrowed);
+        drop(sources);
+        let mut legacy = None;
+        for (label, mode) in [
+            ("legacy", (false, false)),
+            ("indexes_only", (false, true)),
+            ("durability_only", (true, false)),
+            ("private", (true, true)),
+        ] {
+            let path = dir.path().join(format!("{label}.sqlite"));
+            let stop = AtomicBool::new(false);
+            let peak = AtomicU64::new(0);
+            let before = written();
+            let started = Instant::now();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        peak.fetch_max(disk_bytes(&path), Ordering::Relaxed);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                });
+                with_cold_mode(mode, || {
+                    materialize_manifest_view_database(&path, &blobs, &manifest)
+                })
+                .unwrap();
+                peak.fetch_max(disk_bytes(&path), Ordering::Relaxed);
+                stop.store(true, Ordering::Relaxed);
+            });
+            let elapsed = started.elapsed();
+            let after = written();
+            println!("cold_io files={files} mode={label} wall_ms={} physical_write_bytes={} logical_write_bytes={} peak_disk_bytes={} final_bytes={}",
+                elapsed.as_millis(), after.0.saturating_sub(before.0), after.1.saturating_sub(before.1), peak.load(Ordering::Relaxed), disk_bytes(&path));
+            if label == "legacy" {
+                legacy = Some(path);
+            } else {
+                parity::assert_logical_parity(&path, legacy.as_ref().unwrap());
+                println!("cold_io parity files={files} mode={label} every_table_and_index=equal");
+                crate::views::generation::remove_unpublished_derived(&path).unwrap();
+            }
+        }
+    }
+}
