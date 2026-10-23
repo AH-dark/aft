@@ -119,6 +119,14 @@ struct InspectCacheIdentity {
     project_root: PathBuf,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+enum CacheWriterWatchObservation {
+    Subscribed,
+    Failed(String),
+    Activity { release: bool, detail: String },
+}
+
 type CacheOpenGates = Mutex<HashMap<InspectCacheIdentity, Weak<Mutex<()>>>>;
 
 /// A published generation names an immutable cold build; the durable revision
@@ -357,6 +365,7 @@ struct BuilderStateEntry {
     retry_paused_until: Option<(Instant, u64)>,
     /// A resource wait survives source edits: they do not release a foreign lease.
     resource_retry_at: Option<(Instant, u64)>,
+    cache_writer_timeouts: u32,
     /// The manager's input-change epoch when the current (or last) attempt
     /// started. A failure is not paused when inputs changed during the attempt,
     /// because the build may not have seen that change.
@@ -378,6 +387,7 @@ impl BuilderStateEntry {
             identical_failures: 0,
             retry_paused_until: None,
             resource_retry_at: None,
+            cache_writer_timeouts: 0,
             input_epoch_at_start: 0,
             suspension: None,
             progress: "checking cached analysis".into(),
@@ -457,7 +467,9 @@ impl BuilderStateEntry {
         self.last_failure = None;
         self.identical_failures = 0;
         self.retry_paused_until = None;
-        let delay = super::tier2_scheduler::TIER2_CACHE_WRITER_RETRY_BACKOFF;
+        self.cache_writer_timeouts = self.cache_writer_timeouts.saturating_add(1);
+        let delay =
+            super::tier2_scheduler::tier2_cache_writer_retry_backoff(self.cache_writer_timeouts);
         self.resource_retry_at = Some((
             Instant::now() + delay,
             unix_millis_now().saturating_add(delay.as_millis() as u64),
@@ -762,6 +774,43 @@ fn retry_pause_from_states(
     })
 }
 
+fn wake_cache_writer_if_available(
+    identity: &InspectCacheIdentity,
+    states: &Mutex<HashMap<JobKey, BuilderStateEntry>>,
+    waits: &Mutex<HashMap<InspectCacheIdentity, (Instant, String)>>,
+    caches: &Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>,
+) {
+    let Some(dir) = identity.sqlite_path.parent() else {
+        return;
+    };
+    if !matches!(
+        crate::fs_lock::lock_availability(&crate::root_cache::writer_lease_path(dir)),
+        Ok(crate::fs_lock::LockAvailability::Available | crate::fs_lock::LockAvailability::Stale)
+    ) {
+        return;
+    }
+    if let Ok(mut waits) = waits.lock() {
+        waits.remove(identity);
+    }
+    if let Ok(mut caches) = caches.lock() {
+        // A contended reader's short open cooldown must not hide the release.
+        // Outstanding readers retain their Arc and keep serving the snapshot.
+        if caches
+            .get(identity)
+            .is_some_and(|cache| cache.waiting_for_writer())
+        {
+            caches.remove(identity);
+        }
+    }
+    if let Ok(mut states) = states.lock() {
+        for entry in states.values_mut() {
+            if entry.state == Some(InspectBuilderState::WaitingForCacheWriterLease) {
+                entry.resource_retry_at = Some((Instant::now(), unix_millis_now()));
+            }
+        }
+    }
+}
+
 fn callgraph_store_ready_for_dead_code(callgraph_dir: PathBuf, project_root: PathBuf) -> bool {
     match CallGraphStore::open_readonly(callgraph_dir, project_root) {
         Ok(Some(store)) => store
@@ -849,6 +898,10 @@ pub struct InspectManager {
     caches: Arc<Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>>,
     cache_writer_waits: Arc<Mutex<HashMap<InspectCacheIdentity, (Instant, String)>>>,
     cache_open_gates: Arc<CacheOpenGates>,
+    cache_writer_watches:
+        Mutex<HashMap<InspectCacheIdentity, crate::callgraph_store::ReadinessWatcher>>,
+    #[cfg(test)]
+    cache_writer_watch_observer: Mutex<Option<Sender<CacheWriterWatchObservation>>>,
     /// One root-scoped dead-code graph projection. It is cleared with the
     /// manager's other idle artifacts rather than on a separate timer.
     callgraph_projection: Arc<ProjectionSlot>,
@@ -867,7 +920,7 @@ pub struct InspectManager {
     /// read this registry. The waiter map (`in_flight`) fans out completions;
     /// both surfaces treat a category as busy when it has an entry here, and
     /// fall back to the waiter map if the registry is empty.
-    builder_states: Mutex<HashMap<JobKey, BuilderStateEntry>>,
+    builder_states: Arc<Mutex<HashMap<JobKey, BuilderStateEntry>>>,
     /// Advances whenever a watcher-observed change could alter the Tier-2
     /// inputs (a file the scope walk can include, an ignore file, a rescan or
     /// a config change). Compared against each attempt's start epoch.
@@ -1028,6 +1081,9 @@ impl InspectManager {
             caches,
             cache_writer_waits,
             cache_open_gates,
+            cache_writer_watches: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            cache_writer_watch_observer: Mutex::new(None),
             callgraph_projection: Arc::new(Mutex::new(None)),
             oxc_facts_cache: Mutex::new(OxcFactsCache::new()),
             soft_deadline,
@@ -1041,7 +1097,7 @@ impl InspectManager {
             dead_code_borrow_only_roots: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             interactive_tier2_acquisitions: AtomicU64::new(0),
-            builder_states: Mutex::new(HashMap::new()),
+            builder_states: Arc::new(Mutex::new(HashMap::new())),
             tier2_input_epoch: AtomicU64::new(0),
             completed_build_durations: Mutex::new(HashMap::new()),
             checkout_view_verification: Mutex::new(None),
@@ -1244,6 +1300,19 @@ impl InspectManager {
                 }
             }
         }
+        drop(states);
+        if matches!(
+            builder_attempt_terminal(outcome),
+            BuilderAttemptTerminal::CacheWriterLeaseWait
+        ) {
+            // Close the race where the holder released before the failed
+            // attempt registered its resource wait.
+            if let Ok(watches) = self.cache_writer_watches.lock() {
+                for identity in watches.keys() {
+                    self.wake_cache_writer_if_available(identity);
+                }
+            }
+        }
     }
 
     fn tier2_flight_exit_guard(&self, key: JobKey) -> Tier2FlightExitGuard<'_> {
@@ -1442,10 +1511,11 @@ impl InspectManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Nothing to end and no attempt that could miss the change: skip the
         // per-path work on the watcher drain's hot path.
-        if !states
-            .values()
-            .any(|entry| entry.retry_paused_until.is_some() || entry.is_in_flight())
-        {
+        if !states.values().any(|entry| {
+            entry.retry_paused_until.is_some()
+                || entry.is_in_flight()
+                || entry.cache_writer_timeouts > 0
+        }) {
             return false;
         }
         let canonical_root = project_root.map(crate::inspect::job::canonicalize_normalized);
@@ -1473,6 +1543,14 @@ impl InspectManager {
         self.tier2_input_epoch.fetch_add(1, Ordering::SeqCst);
         for entry in states.values_mut() {
             entry.retry_paused_until = None;
+            entry.cache_writer_timeouts = 0;
+            if entry.state == Some(InspectBuilderState::WaitingForCacheWriterLease) {
+                let delay = super::tier2_scheduler::TIER2_CACHE_WRITER_RETRY_BACKOFF;
+                entry.resource_retry_at = Some((
+                    Instant::now() + delay,
+                    unix_millis_now() + delay.as_millis() as u64,
+                ));
+            }
         }
     }
 
@@ -2391,6 +2469,10 @@ impl InspectManager {
     /// [`Self::tier2_any_in_flight`] first so a running scan never loses its
     /// cache while it is being used.
     pub fn evict_idle_caches(&self) {
+        // Drop watches before taking the maps their callbacks may access.
+        if let Ok(mut watches) = self.cache_writer_watches.lock() {
+            watches.clear();
+        }
         if let Ok(mut caches) = self.caches.lock() {
             caches.clear();
         }
@@ -2860,13 +2942,89 @@ impl InspectManager {
         inspect_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Arc<InspectCache>, String> {
-        Self::open_cache_for_paths(
+        let result = Self::open_cache_for_paths(
             &self.caches,
             &self.cache_writer_waits,
             &self.cache_open_gates,
-            inspect_dir,
-            project_root,
-        )
+            inspect_dir.clone(),
+            project_root.clone(),
+        );
+        if result.as_ref().map_or_else(
+            |message| message.contains("writer_lease_timeout:"),
+            |cache| cache.waiting_for_writer(),
+        ) {
+            let (dir, identity) = Self::cache_identity(inspect_dir, project_root);
+            self.watch_cache_writer(&dir, identity);
+        }
+        result
+    }
+
+    fn wake_cache_writer_if_available(&self, identity: &InspectCacheIdentity) {
+        wake_cache_writer_if_available(
+            identity,
+            &self.builder_states,
+            &self.cache_writer_waits,
+            &self.caches,
+        );
+    }
+
+    fn watch_cache_writer(&self, dir: &Path, identity: InspectCacheIdentity) {
+        let Ok(mut watches) = self.cache_writer_watches.lock() else {
+            return;
+        };
+        if watches.contains_key(&identity) {
+            return;
+        }
+        let Ok(dir) = std::fs::canonicalize(dir) else {
+            return;
+        };
+        let lease = crate::root_cache::writer_lease_path(&dir);
+        let states = Arc::clone(&self.builder_states);
+        let waits = Arc::clone(&self.cache_writer_waits);
+        let caches = Arc::clone(&self.caches);
+        let watched_identity = identity.clone();
+        #[cfg(test)]
+        let observer = self.cache_writer_watch_observer.lock().unwrap().clone();
+        #[cfg(test)]
+        let event_observer = observer.clone();
+        let watcher = crate::callgraph_store::watch_readiness_directory(&dir, move |event| {
+            if let Ok(event) = event {
+                let release = crate::callgraph_store::refresh_lease_release_event(&event, &lease);
+                if release {
+                    wake_cache_writer_if_available(&watched_identity, &states, &waits, &caches);
+                }
+                #[cfg(test)]
+                if let Some(observer) = &event_observer {
+                    let _ = observer.send(CacheWriterWatchObservation::Activity {
+                        release,
+                        detail: format!(
+                            "event={event:?} lease={} exists={}",
+                            lease.display(),
+                            lease.exists()
+                        ),
+                    });
+                }
+            }
+        });
+        match watcher {
+            Ok(watcher) => {
+                watches.insert(identity, watcher);
+                #[cfg(test)]
+                if let Some(observer) = observer {
+                    let _ = observer.send(CacheWriterWatchObservation::Subscribed);
+                }
+            }
+            Err(error) => {
+                #[cfg(test)]
+                if let Some(observer) = observer {
+                    let _ = observer.send(CacheWriterWatchObservation::Failed(error.to_string()));
+                }
+                crate::slog_debug!(
+                    "inspect lease readiness watch unavailable: {}; using retry timer",
+                    error
+                );
+            }
+        }
     }
 
     fn open_cache_for_paths(
@@ -12418,18 +12576,16 @@ mod tier2_unreadable_source_tests {
         );
 
         drop(held);
-        // Advance both the resource deadline and the cache-open backoff, not the
-        // input epoch. A lease release needs no watcher edit to permit a retry.
+        // This checks resource retry state, not native notification latency.
+        // Advance both retry clocks without manufacturing an input change.
+        manager.expire_tier2_resource_waits_for_test();
         for (retry_at, _) in manager.cache_writer_waits.lock().unwrap().values_mut() {
             *retry_at = Instant::now();
         }
-        manager
-            .builder_states
-            .lock()
-            .unwrap()
-            .get_mut(&key)
-            .unwrap()
-            .resource_retry_at = Some((Instant::now(), unix_millis_now()));
+        assert!(
+            manager.tier2_resource_wait(category).is_none(),
+            "the controlled resource deadline must permit retry"
+        );
         // The serial worker publishes its completion (removing the category
         // from `in_flight`) before it drops its cold-build limiter permit. While
         // that permit is being torn down, a same-root admission is refused and
@@ -12466,6 +12622,134 @@ mod tier2_unreadable_source_tests {
     }
 
     #[test]
+    fn writer_lease_release_native_watch_acknowledges_retry() {
+        let (_dir, root, snapshot) = fixture();
+        let project_dir = snapshot
+            .inspect_dir
+            .join(crate::path_identity::project_scope_key(&root));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let held = crate::fs_lock::try_acquire(
+            &crate::root_cache::writer_lease_path(&project_dir),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let manager = InspectManager::new();
+        let (events, received) = crossbeam_channel::unbounded();
+        *manager.cache_writer_watch_observer.lock().unwrap() = Some(events);
+        let error = manager
+            .cache_for_paths(snapshot.inspect_dir.clone(), root.clone())
+            .err()
+            .expect("live writer excludes the cache open");
+        assert!(error.contains("writer_lease_timeout:"), "{error}");
+        let category = InspectCategory::Complexity;
+        let key = JobKey::for_project_category(category);
+        manager.record_flight_start(&key);
+        manager.record_builder_attempt_outcome(&key, &JobOutcome::Failed { message: error });
+        assert!(manager.tier2_resource_wait(category).is_some());
+        let mut active = false;
+        loop {
+            match received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("watch subscription acknowledgement")
+            {
+                CacheWriterWatchObservation::Subscribed => break,
+                CacheWriterWatchObservation::Failed(error) => {
+                    panic!("native watch subscription failed: {error}")
+                }
+                CacheWriterWatchObservation::Activity { .. } => active = true,
+            }
+        }
+        // Prove the OS stream is delivering before releasing the lease. Merely
+        // constructing a watcher does not establish that event ordering.
+        std::fs::write(project_dir.join(".readiness-probe"), b"ready").unwrap();
+        while !active {
+            match received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("native watch activity acknowledgement")
+            {
+                CacheWriterWatchObservation::Activity { .. } => active = true,
+                CacheWriterWatchObservation::Failed(error) => {
+                    panic!("native watch failed: {error}")
+                }
+                CacheWriterWatchObservation::Subscribed => {}
+            }
+        }
+        assert!(
+            manager.tier2_resource_wait(category).is_some(),
+            "activity must not release a live holder"
+        );
+        drop(held);
+        assert!(
+            !crate::root_cache::writer_lease_path(&project_dir).exists(),
+            "held lease must have been removed"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut activity = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match received
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| panic!("native lease release callback acknowledgement: {error:?}; observed={activity:?}"))
+            {
+                CacheWriterWatchObservation::Activity { release: true, detail } => {
+                    eprintln!("acknowledged lease release: {detail}");
+                    break;
+                }
+                CacheWriterWatchObservation::Activity { detail, .. } => activity.push(detail),
+                CacheWriterWatchObservation::Failed(error) => {
+                    panic!("native watch failed: {error}")
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            manager.tier2_resource_wait(category).is_none(),
+            "the acknowledged callback must make the retry due"
+        );
+        assert_eq!(manager.tier2_input_epoch.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cache_writer_wait_backoff_doubles_caps_and_resets() {
+        let (_dir, root, _snapshot) = fixture();
+        let manager = InspectManager::new();
+        let key = JobKey::for_project_category(InspectCategory::Complexity);
+        let timeout = JobOutcome::Failed {
+            message: "writer_lease_timeout: inspect writer lease deadline elapsed".into(),
+        };
+        for seconds in [30, 60, 120, 240, 480, 960, 1800, 1800] {
+            manager.record_flight_start(&key);
+            manager.record_builder_attempt_outcome(&key, &timeout);
+            let states = manager.builder_states.lock().unwrap();
+            let retry_at = states[&key].resource_retry_at.unwrap().0;
+            let remaining = retry_at.saturating_duration_since(Instant::now());
+            assert!(remaining <= Duration::from_secs(seconds), "{remaining:?}");
+            assert!(
+                remaining > Duration::from_secs(seconds - 1),
+                "{remaining:?}"
+            );
+        }
+        assert!(
+            manager.note_tier2_input_paths_changed(Some(&root), [root.join("source.ts").as_path()])
+        );
+        manager.record_flight_start(&key);
+        manager.record_builder_attempt_outcome(&key, &timeout);
+        let after_input = manager.builder_states.lock().unwrap()[&key]
+            .resource_retry_at
+            .unwrap()
+            .0;
+        assert!(after_input <= Instant::now() + Duration::from_secs(30));
+        manager.record_builder_attempt_outcome(&key, &JobOutcome::Fresh { payload: json!({}) });
+        manager.record_flight_start(&key);
+        manager.record_builder_attempt_outcome(&key, &timeout);
+        let after_success = manager.builder_states.lock().unwrap()[&key]
+            .resource_retry_at
+            .unwrap()
+            .0;
+        assert!(after_success <= Instant::now() + Duration::from_secs(30));
+    }
+
+    #[test]
     fn repeated_lease_waits_are_bounded_and_explicit_inspect_bypasses_them() {
         let (_dir, root, snapshot) = fixture();
         let manager = Arc::new(InspectManager::new());
@@ -12488,7 +12772,7 @@ mod tier2_unreadable_source_tests {
             let entry = &states[&key];
             let retry_at = entry.resource_retry_at.unwrap().0;
             assert!(retry_at > Instant::now());
-            assert!(retry_at <= Instant::now() + Duration::from_secs(30));
+            assert!(retry_at <= Instant::now() + Duration::from_secs(30 * 60));
             assert!(entry.retry_paused_until.is_none());
             assert!(entry.last_failure.is_none());
         }

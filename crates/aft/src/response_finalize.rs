@@ -1339,7 +1339,9 @@ pub fn query_pending(
     let pending = ctx.pending_changes_for_query(callgraph_command);
     (
         watcher_command && pending.watcher,
-        Some(pending.callgraph).filter(|changes| callgraph_command && !changes.is_empty()),
+        Some(pending.callgraph).filter(|changes| {
+            callgraph_command && (!changes.is_empty() || changes.observe_reconciles())
+        }),
     )
 }
 
@@ -1362,6 +1364,10 @@ pub fn attach_callgraph_pending_gaps(
         return;
     };
     if !response.success {
+        return;
+    }
+    let pending = pending.resolved();
+    if pending.is_empty() {
         return;
     }
     let Some(data) = response.data.as_object_mut() else {
@@ -1391,6 +1397,12 @@ pub fn attach_callgraph_pending_gaps(
         added.push(serde_json::json!({
             "kind": "view_pending",
             "reason": "checkout changes not yet installed in the call graph",
+        }));
+    }
+    if pending.whole_store {
+        added.push(serde_json::json!({
+            "kind": "callgraph_pending",
+            "reason": STORE_PENDING_REASON,
         }));
     }
     let gaps = data
@@ -1603,6 +1615,8 @@ mod callgraph_pending_tests {
             store_paths: store.iter().map(|path| path.to_string()).collect(),
             view_paths: view.iter().map(|path| path.to_string()).collect(),
             whole_checkout,
+            whole_store: false,
+            reconcile_query: None,
         }
     }
 

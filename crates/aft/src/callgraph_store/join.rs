@@ -1311,6 +1311,7 @@ impl ParseBlob {
         }
         Ok(super::FileExtract {
             rel_path: path.to_string(),
+            source_identity: None,
             freshness: crate::cache_freshness::FileFreshness {
                 mtime: std::time::UNIX_EPOCH,
                 size: 0,
