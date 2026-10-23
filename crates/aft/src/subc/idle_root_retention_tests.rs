@@ -766,13 +766,16 @@ fn deferred_filter_release_runs_after_the_last_task_record_is_gone() {
 
     ctx.bash_background().forget_task_record_for_test(&task_id);
     install_release_probe(&ctx);
+    // Wait on the filters themselves: the release clears the embedding slot
+    // before it takes the filter registry, so the slot alone can read as done
+    // while the filters are still loaded.
     sweep_until(
         &mut live_roots,
-        &|_| ctx.semantic_embedding_model().lock().is_none(),
-        "the deferred release never ran after the last task record went away",
+        &|_| !ctx.filter_registry_loaded(),
+        "the deferred release never took the filters after the last task record went away",
     );
     assert!(
-        !ctx.filter_registry_loaded(),
-        "the deferred release must take the filters once no task record remains"
+        ctx.semantic_embedding_model().lock().is_none(),
+        "the deferred release must also release the embedding model"
     );
 }
