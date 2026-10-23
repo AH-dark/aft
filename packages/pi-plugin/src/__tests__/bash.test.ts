@@ -386,10 +386,10 @@ describe("bash tool adapter", () => {
       expect(bash.description).toContain('When remote runs are available, put `runon: "linux"`');
       expect(bash.description).toContain("including chains and pipes");
       expect(bash.description).toContain(
-        "Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit)",
+        "Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs this machine's own operating system or hardware (its sandbox, code signing, service manager, permission prompts or GUI frameworks)",
       );
       expect(bash.description).toContain(
-        "or runs binaries built on this machine: a remote build leaves no binaries or target/ output in the local worktree.",
+        "or runs a binary that already exists on this machine; building and testing still go remote, and a remote build leaves no binaries or target/ output in the local worktree.",
       );
     },
   );
