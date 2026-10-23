@@ -2749,15 +2749,35 @@ fn apply_watcher_path_phase(
     budget: Duration,
     mut apply: impl FnMut(&Path),
 ) -> bool {
+    try_apply_watcher_path_phase(stage, paths, remaining, started, budget, |path| {
+        apply(path);
+        true
+    })
+}
+
+fn try_apply_watcher_path_phase(
+    stage: WatcherDrainApplyPhase,
+    paths: &mut VecDeque<PathBuf>,
+    remaining: &mut usize,
+    started: Instant,
+    budget: Duration,
+    mut apply: impl FnMut(&Path) -> bool,
+) -> bool {
     while *remaining > 0 {
         let path = paths
             .pop_front()
             .expect("watcher apply phase tracks its remaining paths");
-        {
+        let applied = {
             let _watchdog = WatcherDrainUnitGuard::start(stage, &path);
             delay_watcher_unit_for_test();
             wait_on_watcher_phase_commit_gate_for_test(&path);
-            apply(&path);
+            apply(&path)
+        };
+        if !applied {
+            // Retain the unfinished path for the next slice rather than
+            // acknowledging work that a busy subsystem could not apply.
+            paths.push_front(path);
+            return false;
         }
         paths.push_back(path);
         *remaining -= 1;
@@ -3064,6 +3084,7 @@ pub(crate) fn refresh_search_index_after_write(ctx: &AppContext, path: &Path) {
 }
 
 fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, started: Instant) {
+    state.lsp_diagnostics_lock_contended = false;
     let WatcherDrainPhase::Apply {
         mut stage,
         mut paths,
@@ -3278,24 +3299,33 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 }
                 completed
             }
-            WatcherDrainApplyPhase::LspDiagnostics => apply_watcher_path_phase(
+            WatcherDrainApplyPhase::LspDiagnostics => try_apply_watcher_path_phase(
                 WatcherDrainApplyPhase::LspDiagnostics,
                 &mut paths,
                 &mut remaining,
                 started,
                 WATCHER_DRAIN_SLICE_BUDGET,
                 |path| {
-                    let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                    ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                        // Applicability refreshes also take this lock. Keep the
+                        // invalidation pending when they overlap the watcher.
+                        let Some(mut lsp) = ctx.try_lsp() else {
+                            state.lsp_diagnostics_lock_contended = true;
+                            return false;
+                        };
                         if !path.exists() {
-                            status_changed |= ctx.lsp_clear_diagnostics_for_file(path);
-                            return;
+                            status_changed |= lsp.clear_diagnostics_for_file(path);
+                            return true;
                         }
-                        let stale = ctx.lsp_mark_diagnostics_stale_for_file(path);
+                        let stale = lsp.mark_diagnostics_stale_for_file(path);
+                        drop(lsp);
                         status_changed |= stale.changed;
                         if stale.had_entries {
                             ctx.lsp_resync_changed_file_for_diagnostics(path);
                         }
-                    });
+                        true
+                    })
+                    .unwrap_or(true)
                 },
             ),
             WatcherDrainApplyPhase::Complete => true,
@@ -4165,6 +4195,51 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
         ctx.signal_status_changed();
     }
     outcome
+}
+
+#[cfg(test)]
+fn finish_watcher_drain_for_test(
+    ctx: &AppContext,
+    max_paths: usize,
+    mut outcome: DrainBatchOutcome,
+) -> DrainBatchOutcome {
+    // End-of-batch effects are published only after every slice finishes.
+    // The injected slice clock may be frozen, so use real time for the watchdog.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while outcome.has_more {
+        assert!(Instant::now() < deadline, "watcher drain never completed");
+        let next = drain_watcher_events_bounded(ctx, max_paths);
+        outcome.processed += next.processed;
+        outcome.has_more = next.has_more;
+        if next.has_more && next.processed == 0 {
+            std::thread::yield_now();
+        }
+    }
+    outcome
+}
+
+#[cfg(test)]
+fn drain_watcher_to_completion_for_test(ctx: &AppContext, max_paths: usize) -> DrainBatchOutcome {
+    finish_watcher_drain_for_test(ctx, max_paths, drain_watcher_events_bounded(ctx, max_paths))
+}
+
+#[cfg(test)]
+fn finish_watcher_apply_phase_for_test(ctx: &AppContext) {
+    // Finish the admitted batch without consuming paths behind the path cap.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while ctx
+        .watcher_drain_slice()
+        .lock()
+        .as_ref()
+        .is_some_and(|state| matches!(state.phase, WatcherDrainPhase::Apply { .. }))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "watcher apply phase never completed"
+        );
+        assert_eq!(drain_watcher_events_bounded(ctx, 0).processed, 0);
+        std::thread::yield_now();
+    }
 }
 
 #[cfg(test)]
@@ -5045,7 +5120,7 @@ mod tests {
             .send(WatcherDispatchEvent::Paths(files.clone()))
             .unwrap();
 
-        let outcome = drain_watcher_events_bounded(&ctx, files.len());
+        let outcome = drain_watcher_to_completion_for_test(&ctx, files.len());
 
         assert_eq!(outcome.processed, files.len());
         assert!(!outcome.has_more);
@@ -5082,6 +5157,111 @@ mod tests {
         assert_eq!(remaining, 1);
         assert_eq!(applied, vec![PathBuf::from("first.rs")]);
         assert_eq!(paths.front(), Some(&PathBuf::from("second.rs")));
+    }
+
+    #[test]
+    fn watcher_path_phase_retains_busy_path_without_replaying_completed_paths() {
+        let _clock = WatcherDrainTestClock::freeze();
+        let started = watcher_drain_now();
+        let first = PathBuf::from("first.rs");
+        let second = PathBuf::from("second.rs");
+        let mut paths = VecDeque::from([first.clone(), second.clone()]);
+        let mut remaining = paths.len();
+        let mut applied = Vec::new();
+        assert!(!try_apply_watcher_path_phase(
+            WatcherDrainApplyPhase::LspDiagnostics,
+            &mut paths,
+            &mut remaining,
+            started,
+            WATCHER_DRAIN_SLICE_BUDGET,
+            |path| {
+                if path == second {
+                    return false;
+                }
+                applied.push(path.to_path_buf());
+                true
+            },
+        ));
+        assert_eq!(remaining, 1);
+        assert_eq!(paths.front(), Some(&second));
+        assert!(try_apply_watcher_path_phase(
+            WatcherDrainApplyPhase::LspDiagnostics,
+            &mut paths,
+            &mut remaining,
+            started,
+            WATCHER_DRAIN_SLICE_BUDGET,
+            |path| {
+                applied.push(path.to_path_buf());
+                true
+            },
+        ));
+        assert_eq!(remaining, 0);
+        assert_eq!(applied, vec![first, second]);
+    }
+
+    #[test]
+    fn watcher_lsp_retry_probe_requires_a_failed_lock_attempt() {
+        let _clock = WatcherDrainTestClock::freeze();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (ctx, _tx) = watcher_context(&root);
+        let file = root.join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let mut state = WatcherDrainSliceState::new(
+            ctx.configure_generation(),
+            ctx.configure_content_generation(),
+        );
+        state.phase = WatcherDrainPhase::Apply {
+            stage: WatcherDrainApplyPhase::LspDiagnostics,
+            paths: VecDeque::from([file]),
+            remaining: 1,
+            oversized_inline_batch: false,
+        };
+        *ctx.watcher_drain_slice().lock() = Some(state);
+        // A slice can stop at this phase before ever trying the manager lock.
+        assert!(!ctx.watcher_lsp_diagnostics_retry_pending_for_test());
+        {
+            let _held = ctx.lsp();
+            assert!(drain_watcher_events_bounded(&ctx, 1).has_more);
+            assert!(ctx.watcher_lsp_diagnostics_retry_pending_for_test());
+        }
+        assert!(!drain_watcher_to_completion_for_test(&ctx, 1).has_more);
+        assert!(!ctx.watcher_lsp_diagnostics_retry_pending_for_test());
+    }
+
+    #[test]
+    fn watcher_empty_diagnostics_phase_finishes_with_busy_manager() {
+        let _clock = WatcherDrainTestClock::freeze();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (ctx, _tx) = watcher_context(&root);
+        let mut state = WatcherDrainSliceState::new(
+            ctx.configure_generation(),
+            ctx.configure_content_generation(),
+        );
+        state.phase = WatcherDrainPhase::Apply {
+            stage: WatcherDrainApplyPhase::LspDiagnostics,
+            paths: VecDeque::new(),
+            remaining: 0,
+            oversized_inline_batch: false,
+        };
+        *ctx.watcher_drain_slice().lock() = Some(state);
+        // No outstanding paths means no diagnostics lock is needed, even
+        // while another producer owns the manager.
+        let _held_lsp = ctx.lsp();
+
+        let outcome = drain_watcher_events_bounded(&ctx, 1);
+
+        assert_eq!(outcome.processed, 0);
+        assert!(
+            !outcome.has_more,
+            "an empty diagnostics phase cannot defer work"
+        );
+        assert!(!ctx.watcher_lsp_diagnostics_retry_pending_for_test());
+        assert!(matches!(
+            ctx.watcher_drain_slice().lock().as_ref().unwrap().phase,
+            WatcherDrainPhase::Collect
+        ));
     }
 
     /// A burst of watcher events for files whose bytes still match the index
@@ -5147,10 +5327,19 @@ mod tests {
             .send(WatcherDispatchEvent::Paths(files.clone()))
             .unwrap();
 
+        // A background language-server discovery walk can briefly own the manager.
+        // Hold it explicitly so diagnostics always defer, while the retry probe
+        // below proves that every earlier semantic check has finished.
+        let held_lsp = ctx.lsp();
         let outcome = drain_watcher_events_bounded(&ctx, files.len());
 
         assert_eq!(outcome.processed, files.len());
-        assert!(!outcome.has_more);
+        assert!(
+            outcome.has_more,
+            "diagnostics must wait for the held manager"
+        );
+        assert!(ctx.watcher_lsp_diagnostics_retry_pending_for_test());
+        drop(held_lsp);
         let index = ctx
             .semantic_index()
             .read()
@@ -5177,7 +5366,8 @@ mod tests {
     fn watcher_burst_of_real_changes_reports_refreshing() {
         // The drain can defer unfinished work when its wall-clock budget expires,
         // and it sends refresh requests only after processing the whole batch.
-        // Freeze that clock so one call completes before we inspect the queue.
+        // Freeze the slice clock, then finish any retained diagnostics work before
+        // inspecting the end-of-batch refresh queue.
         let _clock = WatcherDrainTestClock::freeze();
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().canonicalize().unwrap();
@@ -5225,7 +5415,18 @@ mod tests {
             .send(WatcherDispatchEvent::Paths(files.clone()))
             .unwrap();
 
-        let outcome = drain_watcher_events_bounded(&ctx, files.len());
+        let outcome = {
+            let _held_lsp = ctx.lsp();
+            let outcome = drain_watcher_events_bounded(&ctx, files.len());
+            assert!(outcome.has_more);
+            assert!(ctx.watcher_lsp_diagnostics_retry_pending_for_test());
+            assert!(
+                request_rx.try_recv().is_err(),
+                "a refresh is published only after the diagnostics phase finishes"
+            );
+            outcome
+        };
+        let outcome = finish_watcher_drain_for_test(&ctx, files.len(), outcome);
 
         match request_rx.try_recv().expect("changed files are queued") {
             SemanticRefreshRequest::Files { paths } => assert_eq!(paths.len(), files.len()),
@@ -8036,6 +8237,8 @@ mod tests {
 
     #[test]
     fn watcher_drain_batch_cap_yields_with_events_remaining() {
+        // Check the admission cap independently of wall-clock preemption.
+        let _clock = WatcherDrainTestClock::freeze();
         let temp = tempfile::tempdir().unwrap();
         let (ctx, tx) = watcher_context(temp.path());
         let cap = 3;
@@ -8089,6 +8292,8 @@ mod watcher_slice_tests {
 
     #[test]
     fn request_watcher_drain_applies_at_most_one_slice() {
+        // This checks the path cap, not wall-clock preemption before the first phase.
+        let _clock = WatcherDrainTestClock::freeze();
         let root = tempfile::tempdir().unwrap();
         let (ctx, tx) = context_with_watcher(root.path());
         let total = WATCHER_PATH_DRAIN_BATCH_CAP * 2 + 1;
@@ -8104,9 +8309,7 @@ mod watcher_slice_tests {
             applied > 0 && applied <= WATCHER_PATH_DRAIN_BATCH_CAP,
             "request applied {applied} paths (burst {total})"
         );
-        while ctx.watcher_drain_has_work() {
-            drain_watcher_events(&ctx);
-        }
+        drain_watcher_to_completion_for_test(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
         assert_eq!(ctx.pending_tier2_paths().len(), total);
     }
 
@@ -8204,7 +8407,7 @@ mod watcher_slice_tests {
             .join("changed.rs")]))
             .unwrap();
 
-        let outcome = drain_watcher_events_bounded(&ctx, 1);
+        let outcome = drain_watcher_to_completion_for_test(&ctx, 1);
 
         assert_eq!(outcome.processed, 1);
         assert_eq!(
@@ -8225,7 +8428,7 @@ mod watcher_slice_tests {
             .path()
             .join("legacy.rs")]))
             .unwrap();
-        let outcome = drain_watcher_events_bounded(&ctx, 1);
+        let outcome = drain_watcher_to_completion_for_test(&ctx, 1);
         assert_eq!(outcome.processed, 1);
         assert_eq!(
             legacy_watcher_refreshes_for_test(),
@@ -8246,13 +8449,22 @@ mod watcher_slice_tests {
 
     #[test]
     fn lsp_watcher_phase_defers_forwarding_until_all_slices_complete() {
+        let _clock = WatcherDrainTestClock::freeze();
         let temp = tempfile::tempdir().unwrap();
-        let (ctx, _) = context_with_watcher(temp.path());
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(temp.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.capture_classified_watcher_forwards_for_test();
         let paths: VecDeque<_> = (0..crate::lsp::manager::WATCHED_FILE_FORWARD_CAP + 10)
             .map(|index| temp.path().join(format!("generated_{index}.rs")))
             .chain(std::iter::once(temp.path().join("Cargo.toml")))
             .collect();
         let count = paths.len();
+        let expected: Vec<_> = paths.iter().cloned().collect();
         let mut state = WatcherDrainSliceState::new(ctx.configure_generation(), 0);
         state.phase = WatcherDrainPhase::Apply {
             stage: WatcherDrainApplyPhase::LspDiagnostics,
@@ -8260,25 +8472,49 @@ mod watcher_slice_tests {
             remaining: count,
             oversized_inline_batch: false,
         };
-        // An expired budget processes exactly one path per slice. A busy
-        // manager forces forwarding to spawn a queue-serving helper thread,
-        // whose counter reveals a send before the whole batch is processed.
-        let held = ctx.lsp();
-        for _ in 0..count {
+        // A contended diagnostics slice retains the entire batch. Forwarding
+        // cannot start until that work is retried after the manager is free.
+        {
+            let _held = ctx.lsp();
+            apply_watcher_slice(&ctx, &mut state, watcher_drain_now());
+            assert!(state.lsp_diagnostics_lock_contended);
+            assert!(matches!(
+                &state.phase,
+                WatcherDrainPhase::Apply {
+                    stage: WatcherDrainApplyPhase::LspDiagnostics,
+                    remaining,
+                    ..
+                } if *remaining == count
+            ));
+            assert!(ctx.take_classified_watcher_forwards_for_test().is_empty());
+        }
+        // Once uncontended, an expired budget applies exactly one path per
+        // slice. Capture forwarding calls directly: the uncontended send path
+        // does not need a queue-serving thread.
+        for applied in 1..=count {
             apply_watcher_slice(
                 &ctx,
                 &mut state,
-                Instant::now() - WATCHER_DRAIN_SLICE_BUDGET,
+                watcher_drain_now() - WATCHER_DRAIN_SLICE_BUDGET,
             );
-            assert_eq!(
-                ctx.lsp_watcher_forward_helpers_spawned_for_test(),
-                0,
+            assert!(matches!(
+                &state.phase,
+                WatcherDrainPhase::Apply { remaining, .. } if *remaining == count - applied
+            ));
+            assert!(
+                ctx.take_classified_watcher_forwards_for_test().is_empty(),
                 "a partial diagnostics slice must not forward a partial watcher batch"
             );
         }
-        apply_watcher_slice(&ctx, &mut state, Instant::now());
-        assert_eq!(ctx.lsp_watcher_forward_helpers_spawned_for_test(), 1);
-        drop(held);
+        apply_watcher_slice(&ctx, &mut state, watcher_drain_now());
+        assert!(matches!(state.phase, WatcherDrainPhase::Collect));
+        assert_eq!(
+            ctx.take_classified_watcher_forwards_for_test(),
+            vec![expected],
+            "forward the complete batch exactly once after all diagnostics slices finish"
+        );
+        apply_watcher_slice(&ctx, &mut state, watcher_drain_now());
+        assert!(ctx.take_classified_watcher_forwards_for_test().is_empty());
     }
 
     #[test]
@@ -8466,6 +8702,7 @@ mod watcher_slice_tests {
 
         let mut slices = 0;
         let mut processed = 0;
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let outcome = drain_watcher_events_bounded(&ctx, path_cap);
             slices += 1;
@@ -8474,14 +8711,15 @@ mod watcher_slice_tests {
             if !outcome.has_more {
                 break;
             }
-            // Convergence guard only: the 250 ms time budget can end a slice
-            // after a handful of paths on a loaded box, so the slice count is
-            // bounded by the mechanism (every slice makes progress), not by a
-            // number that depends on the host's speed.
+            // A busy diagnostics manager can yield without applying another
+            // path, so convergence cannot be bounded by the number of paths.
             assert!(
-                slices <= path_count,
+                Instant::now() < deadline,
                 "single dispatch event did not converge"
             );
+            if outcome.processed == 0 {
+                std::thread::yield_now();
+            }
         }
 
         assert_eq!(processed, path_count);
@@ -8605,6 +8843,7 @@ mod watcher_slice_tests {
 
     #[test]
     fn watcher_rescan_supersedes_pending_paths() {
+        let _clock = WatcherDrainTestClock::freeze();
         let temp = tempfile::tempdir().unwrap();
         let (ctx, tx) = context_with_watcher(temp.path());
         tx.send(WatcherDispatchEvent::Paths(
@@ -8616,6 +8855,7 @@ mod watcher_slice_tests {
         let first = drain_watcher_events_bounded(&ctx, 2);
         assert_eq!(first.processed, 2);
         assert!(first.has_more);
+        finish_watcher_apply_phase_for_test(&ctx);
         assert_eq!(ctx.watcher_drain_pending_path_count(), 3);
 
         let counters = ctx.watcher_counters();
@@ -8671,6 +8911,7 @@ mod watcher_slice_tests {
 
     #[test]
     fn watcher_lifecycle_generation_change_rebases_continuation() {
+        let _clock = WatcherDrainTestClock::freeze();
         let temp = tempfile::tempdir().unwrap();
         let (ctx, tx) = context_with_watcher(temp.path());
         tx.send(WatcherDispatchEvent::Paths(
@@ -8679,7 +8920,12 @@ mod watcher_slice_tests {
                 .collect(),
         ))
         .unwrap();
-        let first = drain_watcher_events_bounded(&ctx, 2);
+        let first = {
+            let _held_lsp = ctx.lsp();
+            let first = drain_watcher_events_bounded(&ctx, 2);
+            assert!(ctx.watcher_lsp_diagnostics_retry_pending_for_test());
+            first
+        };
         assert_eq!(first.processed, 2);
         assert!(first.has_more);
 
@@ -8687,15 +8933,8 @@ mod watcher_slice_tests {
         // rebind) must NOT lose the in-flight paths: the continuation rebases
         // onto the new generation and keeps draining.
         ctx.advance_configure_generation();
-        let second = drain_watcher_events_bounded(&ctx, 2);
-        assert_eq!(second.processed, 2);
-        assert!(second.has_more);
-
-        let mut guard = 0;
-        while drain_watcher_events_bounded(&ctx, 2).has_more {
-            guard += 1;
-            assert!(guard < 16, "rebased continuation must finish draining");
-        }
+        let completed = finish_watcher_drain_for_test(&ctx, 2, first);
+        assert_eq!(completed.processed, 5);
         assert_eq!(ctx.watcher_drain_pending_path_count(), 0);
         assert_eq!(
             ctx.pending_tier2_paths().len(),
@@ -8706,6 +8945,7 @@ mod watcher_slice_tests {
 
     #[test]
     fn watcher_content_generation_change_discards_continuation() {
+        let _clock = WatcherDrainTestClock::freeze();
         let temp = tempfile::tempdir().unwrap();
         let (ctx, tx) = context_with_watcher(temp.path());
         tx.send(WatcherDispatchEvent::Paths(
@@ -8714,7 +8954,12 @@ mod watcher_slice_tests {
                 .collect(),
         ))
         .unwrap();
-        let first = drain_watcher_events_bounded(&ctx, 2);
+        let first = {
+            let _held_lsp = ctx.lsp();
+            let first = drain_watcher_events_bounded(&ctx, 2);
+            assert!(ctx.watcher_lsp_diagnostics_retry_pending_for_test());
+            first
+        };
         assert_eq!(first.processed, 2);
         assert!(first.has_more);
 
@@ -8854,7 +9099,7 @@ mod watcher_slice_tests {
         std::fs::write(&file, "new overlay token\n").expect("edit source");
         tx.send(WatcherDispatchEvent::Paths(vec![file.clone()]))
             .unwrap();
-        drain_watcher_events(&ctx);
+        drain_watcher_to_completion_for_test(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
         assert!(
             !search_index_has_pending_disk_changes(&ctx),
             "gate off: borrow-only watcher must not mutate the RAM delta"
@@ -8863,7 +9108,7 @@ mod watcher_slice_tests {
         ctx.update_config(|config| config.worktree.ram_overlay = true);
         assert!(ctx.ram_overlay_active());
         tx.send(WatcherDispatchEvent::Paths(vec![file])).unwrap();
-        drain_watcher_events(&ctx);
+        drain_watcher_to_completion_for_test(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
         assert!(
             search_index_has_pending_disk_changes(&ctx),
             "flipping the predicate on must let the same watcher arm apply"
@@ -8909,7 +9154,7 @@ mod watcher_slice_tests {
         std::fs::write(&file, "new overlay token\n").expect("edit source");
         tx.send(WatcherDispatchEvent::Paths(vec![file.clone()]))
             .unwrap();
-        drain_watcher_events(&ctx);
+        drain_watcher_to_completion_for_test(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
 
         assert_eq!(
             grep_count(&ctx, "new overlay token", &canonical),
@@ -8999,7 +9244,7 @@ mod watcher_slice_tests {
         std::fs::write(&file, "new overlay token\n").expect("edit source");
         tx.send(WatcherDispatchEvent::Paths(vec![file.clone()]))
             .unwrap();
-        drain_watcher_events(&ctx);
+        drain_watcher_to_completion_for_test(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
 
         load_tx.send(loading).unwrap();
         drain_search_index_events(&ctx);

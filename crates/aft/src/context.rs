@@ -1947,6 +1947,9 @@ pub(crate) struct WatcherDrainSliceState {
     /// rebuilds artifacts wholesale).
     pub(crate) configure_content_generation: u64,
     pub(crate) phase: WatcherDrainPhase,
+    /// Distinguishes a failed LSP lock attempt from entering that phase after
+    /// an earlier phase used up the slice budget.
+    pub(crate) lsp_diagnostics_lock_contended: bool,
     pub(crate) pending_paths: VecDeque<PathBuf>,
     pub(crate) ignore_changed: bool,
     pub(crate) ignore_refresh_due: Option<Instant>,
@@ -2184,6 +2187,7 @@ impl WatcherDrainSliceState {
             configure_generation,
             configure_content_generation,
             phase: WatcherDrainPhase::Collect,
+            lsp_diagnostics_lock_contended: false,
             pending_paths: VecDeque::new(),
             ignore_changed: false,
             ignore_refresh_due: None,
@@ -4344,6 +4348,8 @@ pub struct AppContext {
     lsp_watcher_forward_slot: crate::lsp::manager::WatcherForwardSlot,
     /// How many of those helper threads were started, for tests.
     lsp_watcher_forward_helpers_spawned: AtomicUsize,
+    #[cfg(test)]
+    lsp_classified_watcher_forwards: parking_lot::Mutex<Option<Vec<Vec<PathBuf>>>>,
     /// Document and configuration-file changes waiting for the LSP manager
     /// lock (see [`crate::lsp::pending_changes`]); a busy lock queues them
     /// instead of dropping them.
@@ -5107,6 +5113,8 @@ impl AppContext {
             lsp_post_edit_worker_running: Arc::new(AtomicBool::new(false)),
             lsp_watcher_forward_slot: Default::default(),
             lsp_watcher_forward_helpers_spawned: AtomicUsize::new(0),
+            #[cfg(test)]
+            lsp_classified_watcher_forwards: Default::default(),
             lsp_pending_change_slot: Default::default(),
             configure_generation: Arc::new(AtomicU64::new(0)),
             configure_content_generation: Arc::new(AtomicU64::new(0)),
@@ -12776,6 +12784,26 @@ impl AppContext {
             .map_or(0, |state| state.path_slice_count)
     }
 
+    /// Whether the watcher retained diagnostics work after failing to acquire
+    /// the LSP manager. Merely reaching the phase at a slice boundary is not enough.
+    #[doc(hidden)]
+    pub fn watcher_lsp_diagnostics_retry_pending_for_test(&self) -> bool {
+        self.watcher_drain_slice
+            .lock()
+            .as_ref()
+            .is_some_and(|state| {
+                state.lsp_diagnostics_lock_contended
+                    && matches!(
+                        &state.phase,
+                        WatcherDrainPhase::Apply {
+                            stage: WatcherDrainApplyPhase::LspDiagnostics,
+                            remaining,
+                            ..
+                        } if *remaining > 0
+                    )
+            })
+    }
+
     /// Install a watcher filter thread and its dispatch receiver. The caller
     /// must have stopped any previous watcher runtime first.
     pub fn install_watcher_runtime(
@@ -13554,7 +13582,26 @@ impl AppContext {
     }
 
     pub(crate) fn lsp_forward_classified_watcher_file_events(&self, paths: &[PathBuf]) {
+        #[cfg(test)]
+        if let Some(batches) = self.lsp_classified_watcher_forwards.lock().as_mut() {
+            batches.push(paths.to_vec());
+        }
         self.lsp_forward_or_queue_watcher_changes(paths, false);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_classified_watcher_forwards_for_test(&self) {
+        *self.lsp_classified_watcher_forwards.lock() = Some(Vec::new());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_classified_watcher_forwards_for_test(&self) -> Vec<Vec<PathBuf>> {
+        std::mem::take(
+            self.lsp_classified_watcher_forwards
+                .lock()
+                .as_mut()
+                .expect("classified watcher forward capture must be enabled"),
+        )
     }
 
     pub(crate) fn lsp_note_watcher_ignore_change(&self) {
