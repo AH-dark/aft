@@ -45,6 +45,9 @@ import {
   __setBusyWakeDeferCeilingForTests,
   __setWakeConfirmationWindowForTests,
   appendInTurnBgCompletions,
+  appendPendingWakeRecovery,
+  cancelPendingWakesForContext,
+  clearSessionBgState,
   consumeBgCompletion,
   formatPatternMatchReminder,
   formatSystemReminder,
@@ -809,7 +812,7 @@ describe("OpenCode background notifications", () => {
     );
   });
 
-  test("promptAsync failure does not create an admission confirmation refire", async () => {
+  test("promptAsync pre-admission rejection does not create a confirmation refire", async () => {
     observeOpenCodeBgNotificationEvent({
       type: "session.status",
       properties: { sessionID: "s1", status: { type: "idle" } },
@@ -817,7 +820,7 @@ describe("OpenCode background notifications", () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {
-      throw new Error("send failed");
+      return preAdmissionRejection("send failed");
     });
 
     await handleIdleBgCompletions({
@@ -1242,11 +1245,11 @@ describe("OpenCode background notifications", () => {
     expect(text).toContain("- task task-1 (exit 0)");
   });
 
-  test("failed wake keeps pending completions and retries", async () => {
+  test("rejected wake keeps pending completions and retries", async () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {
-      throw new Error("send failed");
+      return preAdmissionRejection("send failed");
     });
     const fallbackClient = makeClient(promptAsync);
     await handleIdleBgCompletions({
@@ -1272,11 +1275,11 @@ describe("OpenCode background notifications", () => {
     expect(sessionBgStates.get("s1")?.debounceTimer).not.toBeNull();
   });
 
-  test("failed wake hard-stops after capped retries", async () => {
+  test("rejected wake hard-stops after capped retries", async () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {
-      throw new Error("send failed");
+      return preAdmissionRejection("send failed");
     });
     const fallbackClient = makeClient(promptAsync);
     await handleIdleBgCompletions({
@@ -1713,6 +1716,336 @@ describe("OpenCode background notifications", () => {
 });
 
 describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
+  test("deleted session cancels ambiguous SDK requests without recovery or acknowledgement", async () => {
+    const clock = controlledWakeTimers();
+    __setBgNotificationHopTimeoutForTests(50);
+    const promptAsync = mock(() => new Promise(() => {}));
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-deleted", "npm test")] }
+        : { success: true },
+    );
+    const { ctx } = harness(send);
+    try {
+      await handleSubcBgEventsNudge({
+        ctx,
+        directory: "/project",
+        sessionID: "deleted",
+        client: makeClient(promptAsync, []),
+      });
+      await clock.fire(200);
+      const request = promptAsync.mock.calls[0][0] as { signal: AbortSignal };
+      clearSessionBgState("deleted");
+      await clock.flush();
+      expect(request.signal.aborted).toBe(true);
+      expect(sessionBgStates.has("deleted")).toBe(false);
+      await clock.fireIfPresent(50);
+      await clock.fireIfPresent(120_000);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+    } finally {
+      __resetBgNotificationStateForTests();
+      clock.restore();
+    }
+  });
+
+  test("ambiguous V1 wake timeout retains one identity and waits for late acceptance before ack", async () => {
+    const clock = controlledWakeTimers();
+    __setBgNotificationHopTimeoutForTests(50);
+    let accept!: (value: unknown) => void;
+    const operation = new Promise((resolve) => {
+      accept = resolve;
+    });
+    const promptAsync = mock(() => operation);
+    const client = makeClient(promptAsync, [
+      { info: { role: "assistant", agent: "build", providerID: "host", modelID: "previous" } },
+    ]);
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-ambiguous", "npm test")] }
+        : { success: true, acked_task_ids: ["task-ambiguous"] },
+    );
+    const { ctx } = harness(send);
+    const drainCtx = { ctx, directory: "/project", sessionID: "ambiguous", client };
+    try {
+      await handleSubcBgEventsNudge(drainCtx);
+      await clock.fire(200);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      const original = promptAsync.mock.calls[0][0] as {
+        body: { messageID: string };
+        signal?: AbortSignal;
+      };
+      const deliveryID = findTraceEvent("bash_completion_wake_prompt_async_start")?.delivery_id;
+      await clock.fire(50);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      expect(original.signal?.aborted).toBe(true);
+      expect(sessionBgStates.get("ambiguous")?.deliveringTaskIds.has("task-ambiguous")).toBe(true);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+
+      await handleSubcBgEventsNudge(drainCtx);
+      observeOpenCodeBgNotificationEvent({
+        type: "session.status",
+        properties: { sessionID: "ambiguous", status: { type: "busy" } },
+      });
+      observeOpenCodeBgNotificationEvent({
+        type: "session.idle",
+        properties: { sessionID: "ambiguous" },
+      });
+      await clock.flush();
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+
+      accept({ response: { status: 204 } });
+      await clock.flush();
+      const acks = send.mock.calls.filter((call) => call[0] === "bash_ack_completions");
+      expect(acks).toHaveLength(1);
+      expect(acks[0][1]).toMatchObject({ task_ids: ["task-ambiguous"] });
+      expect(findTraceEvent("bash_completion_ack_ok")?.delivery_id).toBe(deliveryID);
+      observeOpenCodeBgNotificationEvent({
+        type: "session.idle",
+        properties: { sessionID: "ambiguous" },
+      });
+      await clock.fireIfPresent(0);
+      await clock.fireIfPresent(5000);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      expect((promptAsync.mock.calls[0][0] as typeof original).body.messageID).toBe(
+        original.body.messageID,
+      );
+    } finally {
+      __resetBgNotificationStateForTests();
+      clock.restore();
+    }
+  });
+
+  test("unprovable V1 wake recovers once after the window and remains available in the next model turn", async () => {
+    const clock = controlledWakeTimers();
+    __setBgNotificationHopTimeoutForTests(50);
+    const promptAsync = mock(() => new Promise(() => {}));
+    const client = makeClient(promptAsync, []);
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-unproven", "npm test")] }
+        : { success: true, acked_task_ids: ["task-unproven"] },
+    );
+    const { ctx } = harness(send);
+    const drainCtx = { ctx, directory: "/project", sessionID: "unproven", client };
+    try {
+      await handleSubcBgEventsNudge(drainCtx);
+      await clock.fire(200);
+      const original = promptAsync.mock.calls[0][0] as { body: unknown };
+      await clock.fire(50);
+      await clock.fire(2000);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+
+      await clock.fire(120_000);
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+      expect((promptAsync.mock.calls[1][0] as { body: unknown }).body).toEqual(original.body);
+      const warnings = sessionWarnSpy.mock.calls.filter(
+        (call) => (call[2] as { event?: string })?.event === "bash_completion_wake_recovery",
+      );
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0][1]).toContain("task-unproven");
+      expect(warnings[0][1]).toContain("duplicate possible");
+      await clock.fire(50);
+      expect(
+        sessionBgStates.get("unproven")?.pendingCompletions.map((item) => item.task_id),
+      ).toEqual(["task-unproven"]);
+      expect(sessionBgStates.get("unproven")?.deliveringTaskIds.size).toBe(0);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+
+      for (let activity = 0; activity < 3; activity++) {
+        await handleSubcBgEventsNudge(drainCtx);
+        observeOpenCodeBgNotificationEvent({
+          type: "session.idle",
+          properties: { sessionID: "unproven" },
+        });
+        await clock.flush();
+        await clock.fireIfPresent(200);
+      }
+      await clock.fireIfPresent(120_000);
+      await clock.fireIfPresent(2000);
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+      const nextTurn = { output: "" };
+      await appendPendingWakeRecovery(drainCtx, nextTurn);
+      expect(nextTurn.output).toContain("task-unproven");
+      expect(sessionBgStates.get("unproven")?.pendingCompletions).toHaveLength(0);
+      expect(sessionBgStates.get("unproven")?.pendingWakeAdmissions.size).toBe(0);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(1);
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+    } finally {
+      __resetBgNotificationStateForTests();
+      clock.restore();
+    }
+  });
+
+  test("unknown V1 wake accepts only exact stored synthetic text and never replays after readback", async () => {
+    const clock = controlledWakeTimers();
+    __setBgNotificationHopTimeoutForTests(50);
+    let snapshot: unknown = { error: { name: "NotFoundError" }, response: { status: 404 } };
+    const promptAsync = mock(
+      (input: unknown) =>
+        new Promise((_, reject) => {
+          (input as { signal?: AbortSignal }).signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+        }),
+    );
+    const message = mock(async () => snapshot);
+    const client = { session: { promptAsync, message, messages: async () => ({ data: [] }) } };
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-readback", "npm test")] }
+        : { success: true, acked_task_ids: ["task-readback"] },
+    );
+    const { ctx } = harness(send);
+    const drainCtx = { ctx, directory: "/project", sessionID: "readback", client };
+    try {
+      await handleSubcBgEventsNudge(drainCtx);
+      await clock.fire(200);
+      const posted = promptAsync.mock.calls[0][0] as {
+        body: { messageID: string; parts: Array<{ text: string; synthetic: boolean }> };
+      };
+      await clock.fire(50);
+      const info = { role: "user", id: posted.body.messageID, sessionID: "readback" };
+      for (const bad of [
+        { info: { ...info, sessionID: "other" }, parts: posted.body.parts },
+        { info, parts: [{ ...posted.body.parts[0], text: "different text" }] },
+        { info, parts: [{ ...posted.body.parts[0], ignored: true }] },
+        { info, parts: [] },
+      ]) {
+        snapshot = { data: bad };
+        await clock.fire(2000);
+        expect(promptAsync).toHaveBeenCalledTimes(1);
+        expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(
+          0,
+        );
+      }
+      snapshot = { data: { info, parts: posted.body.parts } };
+      await clock.fire(2000);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(1);
+      expect(sessionBgStates.get("readback")?.pendingWakeAdmissions.size).toBe(0);
+      await clock.fireIfPresent(120_000);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+    } finally {
+      __resetBgNotificationStateForTests();
+      clock.restore();
+    }
+  });
+
+  test("matching assistant child reconciles an exhausted V1 wake without a third prompt", async () => {
+    const clock = controlledWakeTimers();
+    __setBgNotificationHopTimeoutForTests(50);
+    const promptAsync = mock(() => new Promise(() => {}));
+    const client = makeClient(promptAsync, []);
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-child", "npm test")] }
+        : { success: true, acked_task_ids: ["task-child"] },
+    );
+    const { ctx } = harness(send);
+    const drainCtx = { ctx, directory: "/project", sessionID: "child", client };
+    try {
+      await handleSubcBgEventsNudge(drainCtx);
+      await clock.fire(200);
+      const posted = promptAsync.mock.calls[0][0] as { body: { messageID: string } };
+      await clock.fire(50);
+      await clock.fire(120_000);
+      await clock.fire(50);
+      expect(sessionBgStates.get("child")?.pendingCompletions).toHaveLength(1);
+      observeOpenCodeBgNotificationEvent({
+        type: "message.updated",
+        properties: {
+          info: {
+            role: "assistant",
+            sessionID: "child",
+            parentID: "unrelated",
+            id: "assistant-unrelated",
+          },
+        },
+      });
+      await clock.flush();
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+      observeOpenCodeBgNotificationEvent({
+        type: "message.updated",
+        properties: {
+          info: {
+            role: "assistant",
+            sessionID: "child",
+            parentID: posted.body.messageID,
+            id: "assistant-child",
+          },
+        },
+      });
+      await clock.flush();
+      expect(sessionBgStates.get("child")?.pendingCompletions).toHaveLength(0);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(1);
+      const output = { output: "next reply" };
+      await appendInTurnBgCompletions(drainCtx, output);
+      expect(output.output).toBe("next reply");
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+    } finally {
+      __resetBgNotificationStateForTests();
+      clock.restore();
+    }
+  });
+
+  test("disposing one V1 wake owner cancels its recovery but preserves other owners and unacked work", async () => {
+    const clock = controlledWakeTimers();
+    __setBgNotificationHopTimeoutForTests(50);
+    const send = mock(async (command: string, params: Record<string, unknown>) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion(`task-${params.session_id}`, "npm test")] }
+        : { success: true },
+    );
+    const { ctx: first } = harness(send);
+    const { ctx: second } = harness(send);
+    const promptA = mock(() => new Promise(() => {}));
+    const promptB = mock(() => new Promise(() => {}));
+    const a = {
+      ctx: first,
+      directory: "/project",
+      sessionID: "owner-a",
+      client: makeClient(promptA, []),
+    };
+    const b = {
+      ctx: second,
+      directory: "/project",
+      sessionID: "owner-b",
+      client: makeClient(promptB, []),
+    };
+    try {
+      await handleSubcBgEventsNudge(a);
+      await handleSubcBgEventsNudge(b);
+      await clock.fire(200);
+      await clock.fire(200);
+      cancelPendingWakesForContext(first);
+      await clock.flush();
+      expect(
+        sessionBgStates.get("owner-a")?.pendingCompletions.map((item) => item.task_id),
+      ).toEqual(["task-owner-a"]);
+      expect(sessionBgStates.get("owner-a")?.pendingWakeAdmissions.size).toBe(0);
+      expect(sessionBgStates.get("owner-b")?.pendingWakeAdmissions.size).toBe(1);
+      await clock.fire(50);
+      await clock.fire(120_000);
+      expect(promptA).toHaveBeenCalledTimes(1);
+      expect(promptB).toHaveBeenCalledTimes(2);
+      const reply = { output: "next reply" };
+      await appendInTurnBgCompletions(a, reply);
+      expect(reply.output).toContain("task-owner-a");
+      expect(
+        send.mock.calls.filter(
+          (call) => call[0] === "bash_ack_completions" && call[1].session_id === "owner-a",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      __resetBgNotificationStateForTests();
+      clock.restore();
+    }
+  });
+
   test("a forced drain delivers and acknowledges a durable pattern match", async () => {
     const send = mock(async (command: string) =>
       command === "bash_drain_completions"
@@ -1950,10 +2283,10 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
     expect(sessionBgStates.get("s1")?.deliveredAwaitingAckTaskIds.has("task-1")).toBe(false);
   });
 
-  test("delivery FAILURE re-pends the completion (redeliverable, not stuck in-flight)", async () => {
+  test("pre-admission rejection re-pends the completion (redeliverable, not stuck in-flight)", async () => {
     trackBgTask("s1", "task-1");
     const promptAsync = mock(async () => {
-      throw new Error("promptAsync rejected");
+      return preAdmissionRejection("promptAsync rejected");
     });
     const client = makeClient(promptAsync);
     const send = mock(async () => ({ success: true, acked_task_ids: [] }));
@@ -1966,17 +2299,17 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
     await sleep(50);
 
     const state = sessionBgStates.get("s1");
-    // Delivery failed before departing → cleared from in-flight, back in pending.
+    // The host rejected before scheduling work, so retrying cannot duplicate admission.
     expect(state?.deliveringTaskIds.has("task-1")).toBe(false);
     expect(state?.deliveredAwaitingAckTaskIds.has("task-1")).toBe(false);
     expect(state?.pendingCompletions.some((c) => c.task_id === "task-1")).toBe(true);
   });
 
-  test("legacy model rejection retries the same wake without model before ack", async () => {
+  test("pre-admission model-context rejection retries the same identity without model before ack", async () => {
     const promptAsync = mock(async (input: unknown) => {
       const body = (input as { body?: { model?: unknown } }).body;
       if (body?.model) {
-        throw new Error("ProviderModelNotFoundError: migrated session model is stale");
+        return preAdmissionRejection("model context rejected before admission");
       }
     });
     const client = makeClient(promptAsync, [
@@ -2015,7 +2348,7 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
     let rejectInjection = true;
     const promptAsync = mock(async () => {
       if (rejectInjection) {
-        throw new Error("ProviderModelNotFoundError: migrated session model is stale");
+        return preAdmissionRejection("model context rejected before admission");
       }
     });
     const client = makeClient(promptAsync);
@@ -2055,11 +2388,12 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
   });
 
-  test("a hung session injection times out, clears in-flight state, and redelivers", async () => {
+  test("a hung V1 injection retries only at the bounded readback window with the same identity", async () => {
+    const clock = controlledWakeTimers();
     __setBgNotificationHopTimeoutForTests(50);
     let hangInjection = true;
     const promptAsync = mock(() =>
-      hangInjection ? new Promise<void>(() => {}) : Promise.resolve(undefined),
+      hangInjection ? new Promise(() => {}) : Promise.resolve({ response: { status: 204 } }),
     );
     const client = makeClient(promptAsync);
     const send = mock(async (command: string) =>
@@ -2068,28 +2402,25 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
         : { success: true, acked_task_ids: ["task-hung"] },
     );
     const { ctx } = harness(send);
-    const drainCtx = { ctx, directory: "/tmp/project", sessionID: "s1", client };
-
-    await handleSubcBgEventsNudge(drainCtx);
-    await waitForMockCallCount(promptAsync, 1);
-    await waitUntil(
-      () =>
-        sessionBgStates.get("s1")?.deliveringTaskIds.has("task-hung") === false &&
-        sessionBgStates
-          .get("s1")
-          ?.pendingCompletions.some((item) => item.task_id === "task-hung") === true,
-      1_000,
-    );
-
-    expect(sessionBgStates.get("s1")?.deliveredAwaitingAckTaskIds.has("task-hung")).toBe(false);
-    expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
-
-    hangInjection = false;
-    await handleSubcBgEventsNudge(drainCtx);
-    await waitForMockCallCount(promptAsync, 2);
-    await waitUntil(
-      () => send.mock.calls.filter((call) => call[0] === "bash_ack_completions").length === 1,
-    );
+    const drainCtx = { ctx, directory: "/project", sessionID: "s1", client };
+    try {
+      await handleSubcBgEventsNudge(drainCtx);
+      await clock.fire(200);
+      const original = promptAsync.mock.calls[0][0] as { body: unknown };
+      await clock.fire(50);
+      expect(sessionBgStates.get("s1")?.deliveringTaskIds.has("task-hung")).toBe(true);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+      hangInjection = false;
+      await handleSubcBgEventsNudge(drainCtx);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      await clock.fire(120_000);
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+      expect((promptAsync.mock.calls[1][0] as { body: unknown }).body).toEqual(original.body);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(1);
+    } finally {
+      __resetBgNotificationStateForTests();
+      clock.restore();
+    }
   });
 
   test("a hung drain times out and releases nudge coalescing for the next drain", async () => {
@@ -2170,4 +2501,57 @@ async function waitUntil(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function controlledWakeTimers() {
+  type Handle = ReturnType<typeof setTimeout>;
+  const active = new Map<
+    Handle,
+    { callback: (...args: any[]) => void; delay: number; args: any[] }
+  >();
+  const time = spyOn(Date, "now").mockReturnValue(1000);
+  const set = spyOn(globalThis, "setTimeout").mockImplementation(((
+    callback: (...args: any[]) => void,
+    delay = 0,
+    ...args: any[]
+  ) => {
+    const handle = { unref: () => handle } as unknown as Handle;
+    active.set(handle, { callback, delay, args });
+    return handle;
+  }) as typeof setTimeout);
+  const clear = spyOn(globalThis, "clearTimeout").mockImplementation((handle) => {
+    active.delete(handle as Handle);
+  });
+  const flush = async () => {
+    for (let turn = 0; turn < 30; turn++) await Promise.resolve();
+  };
+  const fireIfPresent = async (delay: number) => {
+    const entry = [...active].find(([, timer]) => timer.delay === delay);
+    if (!entry) return false;
+    const [handle, timer] = entry;
+    active.delete(handle);
+    timer.callback(...timer.args);
+    await flush();
+    return true;
+  };
+  return {
+    flush,
+    fireIfPresent,
+    async fire(delay: number) {
+      expect(await fireIfPresent(delay)).toBe(true);
+    },
+    restore() {
+      set.mockRestore();
+      clear.mockRestore();
+      time.mockRestore();
+    },
+  };
+}
+
+/** SDK-shaped validation failure: the host returns this before forking prompt work. */
+function preAdmissionRejection(message: string) {
+  return {
+    error: { name: "BadRequest", data: { message, kind: "Body" } },
+    response: { status: 400 },
+  };
 }

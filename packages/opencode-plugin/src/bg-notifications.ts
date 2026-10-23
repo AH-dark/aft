@@ -6,6 +6,12 @@ import {
 } from "@cortexkit/aft-bridge";
 import { sessionLog, sessionWarn } from "./logger.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
+import {
+  awaitWakeAdmission,
+  type PendingWakeAdmission,
+  WakeAdmissionRejected,
+  type WakeSessionApi,
+} from "./shared/wake-admission.js";
 import type { PluginContext } from "./types.js";
 
 /**
@@ -135,6 +141,7 @@ type SessionBgState = {
   deliveredAwaitingAckTaskIds: Set<string>;
   hostStatus: "idle" | "busy" | "retry" | undefined;
   wakeAdmissions: Map<string, WakeAdmission>;
+  pendingWakeAdmissions: Map<string, PendingWakeAdmission>;
   confirmedWakeDeliveryIds: Set<string>;
   refiredWakeDeliveryIds: Set<string>;
   wakeDeliveryOrder: string[];
@@ -213,6 +220,7 @@ let lastWakeMessageTimestamp = 0;
 let wakeMessageCounter = 0;
 let subcNudgesInFlight = new WeakMap<PluginContext["pool"], Map<string, Promise<void>>>();
 const subcNudgeLogState = new Map<string, { lastEmittedAt: number; suppressed: number }>();
+const closedWakeContexts = new WeakSet<DrainContext["ctx"]>();
 interface DeferredBusyWake {
   context: DrainContext & { client: unknown };
   deferredAt: number;
@@ -250,6 +258,7 @@ interface DrainContext {
 interface OpenCodeSessionApi {
   promptAsync?: (input: unknown) => Promise<unknown> | unknown;
   messages?: (input: { path: { id: string } }) => Promise<{ data?: unknown[] }>;
+  message?: WakeSessionApi["message"];
 }
 
 interface OpenCodeClient {
@@ -271,6 +280,46 @@ interface WakeAdmission {
   refireTimer: NodeJS.Timeout | null;
   refireQueued: boolean;
 }
+
+interface WakeBatchCallbacks {
+  taskIDs: readonly string[];
+  pending(): void;
+  accepted(): void;
+  cancelled(): void;
+}
+
+function cancelSatisfiedAdmissions(
+  state: SessionBgState,
+  delivered: ReadonlySet<string> = new Set(),
+): void {
+  for (const admission of [...state.pendingWakeAdmissions.values()]) {
+    if (
+      admission.taskIDs.length > 0 &&
+      admission.taskIDs.every((id) => delivered.has(id) || state.consumedTaskIds.has(id))
+    )
+      admission.cancel();
+  }
+}
+
+function wakeTaskBlocked(state: SessionBgState, taskID: string): boolean {
+  for (const admission of state.pendingWakeAdmissions.values()) {
+    if (admission.taskIDs.includes(taskID)) return true;
+  }
+  return false;
+}
+
+/** Stop only the disposing instance's SDK work; leave its unacked batches recoverable. */
+export function cancelPendingWakesForContext(ctx: DrainContext["ctx"]): void {
+  closedWakeContexts.add(ctx);
+  for (const state of sessionBgStates.values()) {
+    for (const admission of [...state.pendingWakeAdmissions.values()]) {
+      // Admissions retain the same context identity through the batch callbacks.
+      if (wakeAdmissionOwners.get(admission) === ctx) admission.cancel();
+    }
+  }
+}
+
+const wakeAdmissionOwners = new WeakMap<PendingWakeAdmission, DrainContext["ctx"]>();
 
 /**
  * Mark a bg task's completion as consumed by an explicit bash_status wait.
@@ -301,6 +350,7 @@ export function consumeBgCompletion(sessionID: string | undefined, taskId: strin
   // fire with empty pending (defensive skip catches that), but firing
   // the timer at all consumes the scheduler slot.
   clearWakeTimerIfNoPending(state);
+  cancelSatisfiedAdmissions(state);
   if (
     state.pendingCompletions.length === 0 &&
     state.pendingLongRunning.length === 0 &&
@@ -603,6 +653,11 @@ export async function appendInTurnBgCompletions(
 
   const deliveredCompletions = [...state.pendingCompletions];
   const deliveredPatternMatches = [...state.pendingPatternMatches];
+  const inTurnTasks = new Set(
+    [...deliveredCompletions, ...deliveredPatternMatches, ...state.pendingLongRunning].map(
+      (item) => item.task_id,
+    ),
+  );
   const completionAcks = completionAcksForDelivery(deliveredCompletions, deliveredPatternMatches);
   const reminder = formatCombinedSystemReminder(
     state.pendingCompletions,
@@ -610,6 +665,7 @@ export async function appendInTurnBgCompletions(
     state.pendingPatternMatches,
   );
   output.output = appendReminder(output.output ?? "", reminder);
+  cancelSatisfiedAdmissions(state, inTurnTasks);
   // Trace #7 of 7: reminder went out as part of an existing tool result
   // instead of through promptAsync. NO wake_prompt_async_start event
   // accompanies this branch — that's the diagnostic signal that the
@@ -648,6 +704,20 @@ export async function appendInTurnBgCompletions(
   // again at fire time.
   clearWakeTimerIfNoPending(state);
   clearDeferredBusyWake(drainContext.sessionID);
+}
+
+/** A new model turn can deliver pending reminders after wake retries are exhausted, without another prompt. */
+export async function appendPendingWakeRecovery(
+  drainContext: DrainContext,
+  output: { output?: string },
+): Promise<void> {
+  const state = sessionBgStates.get(drainContext.sessionID || DEFAULT_SESSION_ID);
+  if (
+    !state ||
+    ![...state.pendingWakeAdmissions.values()].some((admission) => admission.status === "pending")
+  )
+    return;
+  await appendInTurnBgCompletions(drainContext, output);
 }
 
 export async function handleIdleBgCompletions(
@@ -1121,15 +1191,13 @@ export function observeOpenCodeBgNotificationEvent(event: unknown): void {
       const info = props.info;
       if (!info || typeof info !== "object") return;
       const message = info as Record<string, unknown>;
-      if (
-        message.role !== "assistant" ||
-        typeof message.sessionID !== "string" ||
-        typeof message.parentID !== "string"
-      ) {
+      if (typeof message.sessionID !== "string") {
         return;
       }
       const state = sessionBgStates.get(message.sessionID);
       if (!state) return;
+      for (const admission of [...state.pendingWakeAdmissions.values()]) admission.observe(message);
+      if (message.role !== "assistant" || typeof message.parentID !== "string") return;
       for (const admission of state.wakeAdmissions.values()) {
         if (admission.admittedMessageIDs.has(message.parentID)) {
           confirmWakeAdmission(
@@ -1143,6 +1211,16 @@ export function observeOpenCodeBgNotificationEvent(event: unknown): void {
       return;
     }
 
+    if (record.type === "message.part.updated") {
+      const part = props.part as { sessionID?: unknown; messageID?: unknown } | undefined;
+      if (typeof part?.sessionID === "string") {
+        const state = sessionBgStates.get(part.sessionID);
+        for (const admission of state?.pendingWakeAdmissions.values() ?? []) {
+          if (admission.messageID === part.messageID) void admission.reconcile();
+        }
+      }
+      return;
+    }
     if (record.type !== "session.status" && record.type !== "session.idle") return;
     const sessionID = typeof props.sessionID === "string" ? props.sessionID : undefined;
     if (!sessionID) return;
@@ -1154,6 +1232,7 @@ export function observeOpenCodeBgNotificationEvent(event: unknown): void {
           : undefined;
     if (nextStatus !== "idle" && nextStatus !== "busy" && nextStatus !== "retry") return;
     const state = stateFor(sessionID);
+    for (const admission of state.pendingWakeAdmissions.values()) void admission.reconcile();
     const previousStatus = state.hostStatus;
     state.hostStatus = nextStatus;
     if (nextStatus === "busy" && previousStatus === "idle") {
@@ -1207,6 +1286,9 @@ async function triggerWakeIfPending(
     await drainCompletions(drainContext);
   }
   routeExplicitControlCompletions(state, drainContext.sessionID);
+  await Promise.all(
+    [...state.pendingWakeAdmissions.values()].map((admission) => admission.reconcile()),
+  );
   if (!hasWakeEligiblePending(state, includeDeferredCompletions)) return;
   // promptAsync creates a synthetic user message. Autonomous pushes and daemon
   // nudges must not send one while OpenCode is already running a turn: doing so
@@ -1219,7 +1301,7 @@ async function triggerWakeIfPending(
 
   scheduleWake(
     state,
-    async (reminder, deliveredCompletions, deliveredPatternMatches) => {
+    async (reminder, deliveredCompletions, deliveredPatternMatches, batch) => {
       const liveSession = getActiveSessionId() ?? drainContext.sessionID;
       if (liveSession && drainContext.sessionID && drainContext.sessionID !== liveSession) {
         logDroppedForeignSessionFrame(drainContext, drainContext.sessionID, liveSession);
@@ -1246,7 +1328,9 @@ async function triggerWakeIfPending(
         return drainContext.client as OpenCodeClient;
       };
 
-      const sendPrompt = async (client: OpenCodeClient): Promise<string> => {
+      const sendPrompt = async (
+        client: OpenCodeClient,
+      ): Promise<{ deliveryID: string; accepted: boolean }> => {
         // The SDK's generated methods read `this._client`, so the method is
         // invoked on its receiver rather than extracted: a detached call
         // throws "Cannot read properties of undefined (reading '_client')"
@@ -1261,6 +1345,12 @@ async function triggerWakeIfPending(
         const sessionApi = session as typeof session & {
           promptAsync: NonNullable<typeof session.promptAsync>;
         };
+        const deliveryID = `aftdel_${randomUUID()}`;
+        const admittedMessageID = wakeMessageID();
+        if (closedWakeContexts.has(drainContext.ctx)) {
+          batch.cancelled();
+          return { deliveryID, accepted: false };
+        }
         // Pass the previous turn's prompt context (agent + model + variant)
         // explicitly. OpenCode's `createUserMessage` resolves variant
         // relative to the chosen agent's model — passing model alone makes
@@ -1270,6 +1360,10 @@ async function triggerWakeIfPending(
         // Mirrors the resolution `opencode-xtra` uses for its
         // background-agent notifications. See shared/last-assistant-model.ts.
         const promptContext = await resolvePromptContext(client, drainContext.sessionID);
+        if (closedWakeContexts.has(drainContext.ctx)) {
+          batch.cancelled();
+          return { deliveryID, accepted: false };
+        }
         const body: Record<string, unknown> = {
           noReply: false,
           // `synthetic: true` (NOT `ignored`): this is an AGENT-DIRECTED wake —
@@ -1302,9 +1396,7 @@ async function triggerWakeIfPending(
         const attemptPrompt = async (
           attemptBody: Record<string, unknown>,
           mode: "mirrored-context" | "model-free-fallback",
-        ): Promise<string> => {
-          const deliveryID = `aftdel_${randomUUID()}`;
-          const admittedMessageID = wakeMessageID();
+        ): Promise<{ deliveryID: string; accepted: boolean }> => {
           const requestBody = { ...attemptBody, messageID: admittedMessageID };
           const wakeMeta = {
             delivery_id: deliveryID,
@@ -1336,18 +1428,63 @@ async function triggerWakeIfPending(
             taskIDs,
             { event: "bash_completion_wake_prompt_async_start", ...wakeMeta },
           );
+          let admission: Awaited<ReturnType<typeof awaitWakeAdmission>>;
           try {
-            const response = await withBgHopTimeout(
-              Promise.resolve(
-                sessionApi.promptAsync({
-                  path: { id: drainContext.sessionID },
-                  body: requestBody,
-                }),
-              ),
-              "session promptAsync injection",
-            );
-            const failure = promptAsyncFailure(response);
-            if (failure) throw new Error(failure);
+            const wait = awaitWakeAdmission({
+              deliveryID,
+              sessionID: drainContext.sessionID || DEFAULT_SESSION_ID,
+              requestBody,
+              sessionApi,
+              pending: state.pendingWakeAdmissions,
+              timeoutMs: bgHopTimeoutMs,
+              taskIDs: batch.taskIDs,
+              onUnknown: (cause) =>
+                logPerTaskDeliveryHop(
+                  drainContext,
+                  "admission-unknown",
+                  "wake admission unknown; checking host readback",
+                  taskIDs,
+                  {
+                    event: "bash_completion_wake_admission_unknown",
+                    delivery_id: deliveryID,
+                    admitted_message_id: admittedMessageID,
+                    cause: cause instanceof Error ? cause.message : String(cause),
+                  },
+                  "warn",
+                ),
+              onRecovery: () =>
+                sessionWarn(
+                  drainContext.sessionID,
+                  `${LOG_PREFIX} task ${batch.taskIDs.join(",")}: admission unproven; resubmitting once with the same identity; duplicate possible`,
+                  {
+                    event: "bash_completion_wake_recovery",
+                    delivery_id: deliveryID,
+                    admitted_message_id: admittedMessageID,
+                    task_ids: taskIDs,
+                  },
+                ),
+              onPending: batch.pending,
+              onLateAcceptance: () => {
+                batch.accepted();
+                markDeliveredAwaitingAck(state, taskIDs);
+                void ackCompletions(drainContext, deliveredCompletions, deliveryID)
+                  .then((acked) => {
+                    if (acked) confirmAcked(state, taskIDs);
+                  })
+                  .catch((cause) =>
+                    logDeliveryHop(
+                      drainContext,
+                      "ack-error",
+                      "late wake acknowledgement failed",
+                      { cause: String(cause) },
+                      "warn",
+                    ),
+                  );
+              },
+            });
+            const tracked = state.pendingWakeAdmissions.get(deliveryID);
+            if (tracked) wakeAdmissionOwners.set(tracked, drainContext.ctx);
+            admission = await wait;
           } catch (err) {
             logPerTaskDeliveryHop(
               drainContext,
@@ -1365,28 +1502,38 @@ async function triggerWakeIfPending(
             );
             throw err;
           }
+          if (!admission.accepted) {
+            if (!admission.pending) batch.cancelled();
+            return { deliveryID, accepted: false };
+          }
           logPerTaskDeliveryHop(drainContext, `inject-ok-${mode}`, "session inject ok", taskIDs, {
             event: "bash_completion_wake_prompt_async_ok",
             delivery_id: deliveryID,
             attempt: state.wakeRetryAttempts + 1,
             injection_mode: mode,
           });
-          registerWakeAdmission(state, {
-            deliveryID,
-            admittedMessageIDs: new Set([admittedMessageID]),
-            requestBody,
-            sessionApi,
-            drainContext,
-            taskIDs: [...taskIDs],
-            watchId,
-          });
-          return deliveryID;
+          if (!admission.ambiguous && !admission.turnObserved)
+            registerWakeAdmission(state, {
+              deliveryID,
+              admittedMessageIDs: new Set([admittedMessageID]),
+              requestBody,
+              sessionApi,
+              drainContext,
+              taskIDs: [...taskIDs],
+              watchId,
+            });
+          return { deliveryID, accepted: true };
         };
 
         try {
           return await attemptPrompt(body, "mirrored-context");
         } catch (err) {
-          if (!promptContext?.model) throw err;
+          if (
+            !promptContext?.model ||
+            !(err instanceof WakeAdmissionRejected) ||
+            err.status !== 400
+          )
+            throw err;
           const fallbackBody = { ...body };
           delete fallbackBody.model;
           delete fallbackBody.variant;
@@ -1394,9 +1541,9 @@ async function triggerWakeIfPending(
         }
       };
 
-      let deliveryID: string;
+      let result: { deliveryID: string; accepted: boolean };
       try {
-        deliveryID = await sendPrompt(getInProcessClient());
+        result = await sendPrompt(getInProcessClient());
       } catch (err) {
         logPerTaskDeliveryHop(
           drainContext,
@@ -1411,6 +1558,9 @@ async function triggerWakeIfPending(
         );
         throw err;
       }
+      if (!result.accepted) return;
+      const { deliveryID } = result;
+      batch.accepted();
       // Session injection has resolved successfully. Only now may these task IDs
       // enter awaiting-ack state and become eligible for daemon acknowledgement.
       markDeliveredAwaitingAck(state, taskIDs);
@@ -1520,6 +1670,7 @@ export function clearSessionBgState(sessionID: string): void {
   if (state) {
     if (state.debounceTimer) clearTimeout(state.debounceTimer);
     for (const admission of state.wakeAdmissions.values()) clearWakeAdmission(state, admission);
+    for (const admission of [...state.pendingWakeAdmissions.values()]) admission.cancel();
     sessionBgStates.delete(sessionID);
   }
   clearDeferredBusyWake(sessionID);
@@ -1536,6 +1687,7 @@ export function __resetBgNotificationStateForTests(): void {
   for (const state of sessionBgStates.values()) {
     if (state.debounceTimer) clearTimeout(state.debounceTimer);
     for (const admission of state.wakeAdmissions.values()) clearWakeAdmission(state, admission);
+    for (const admission of [...state.pendingWakeAdmissions.values()]) admission.cancel();
   }
   sessionBgStates.clear();
   lastSessionSweepAt = null;
@@ -1746,8 +1898,8 @@ function hasWakeEligiblePending(
 ): boolean {
   return (
     wakeEligibleCompletions(state, includeDeferredCompletions).length > 0 ||
-    state.pendingLongRunning.length > 0 ||
-    state.pendingPatternMatches.length > 0
+    state.pendingLongRunning.some((item) => !wakeTaskBlocked(state, item.task_id)) ||
+    state.pendingPatternMatches.some((item) => !wakeTaskBlocked(state, item.task_id))
   );
 }
 
@@ -1755,11 +1907,10 @@ function wakeEligibleCompletions(
   state: SessionBgState,
   includeDeferredCompletions: boolean,
 ): BgCompletion[] {
-  if (includeDeferredCompletions || state.wakeDeferredTaskIds.size === 0) {
-    return state.pendingCompletions;
-  }
   return state.pendingCompletions.filter(
-    (completion) => !state.wakeDeferredTaskIds.has(completion.task_id),
+    (completion) =>
+      !wakeTaskBlocked(state, completion.task_id) &&
+      (includeDeferredCompletions || !state.wakeDeferredTaskIds.has(completion.task_id)),
   );
 }
 
@@ -1786,7 +1937,8 @@ function scheduleWake(
   sendWake: (
     reminder: string,
     completions: readonly BgCompletion[],
-    patternMatches?: readonly PatternMatchEntry[],
+    patternMatches: readonly PatternMatchEntry[] | undefined,
+    batch: WakeBatchCallbacks,
   ) => Promise<void>,
   onSendFailure: (err: unknown, hardStopped: boolean) => void,
   sessionID?: string,
@@ -1799,8 +1951,8 @@ function scheduleWake(
   const now = Date.now();
   const pendingCount =
     wakeEligibleCompletions(state, includeDeferredCompletions).length +
-    state.pendingLongRunning.length +
-    state.pendingPatternMatches.length;
+    state.pendingLongRunning.filter((item) => !wakeTaskBlocked(state, item.task_id)).length +
+    state.pendingPatternMatches.filter((item) => !wakeTaskBlocked(state, item.task_id)).length;
   if (state.debounceTimer && pendingCount <= state.scheduledCompletionCount) {
     return;
   }
@@ -1836,8 +1988,12 @@ function scheduleWake(
 
   state.debounceTimer = setTimeout(() => {
     const pending = wakeEligibleCompletions(state, includeDeferredCompletions);
-    const pendingLongRunning = state.pendingLongRunning;
-    const pendingPatternMatches = state.pendingPatternMatches;
+    const pendingLongRunning = state.pendingLongRunning.filter(
+      (item) => !wakeTaskBlocked(state, item.task_id),
+    );
+    const pendingPatternMatches = state.pendingPatternMatches.filter(
+      (item) => !wakeTaskBlocked(state, item.task_id),
+    );
     state.debounceTimer = null;
     state.firstCompletionAt = null;
     state.scheduledFireAt = null;
@@ -1875,8 +2031,12 @@ function scheduleWake(
       (completion) => !deliveredTaskIds.has(completion.task_id),
     );
     for (const taskId of deliveredTaskIds) state.wakeDeferredTaskIds.delete(taskId);
-    state.pendingLongRunning = [];
-    state.pendingPatternMatches = [];
+    state.pendingLongRunning = state.pendingLongRunning.filter(
+      (item) => !pendingLongRunning.includes(item),
+    );
+    state.pendingPatternMatches = state.pendingPatternMatches.filter(
+      (item) => !pendingPatternMatches.includes(item),
+    );
     const completionAcks = completionAcksForDelivery(pending, pendingPatternMatches);
     // C-#1 site 1: mark ALL ack-target ids (completions + ack-on-delivery pattern
     // matches, not just `pending`) as delivery-in-flight at the same synchronous
@@ -1884,7 +2044,46 @@ function scheduleWake(
     // a forced drain in the delivery window can't re-accept them.
     const ackTargetIds = completionAcks.map((completion) => completion.task_id);
     markDelivering(state, ackTargetIds);
-    void sendWake(reminder, completionAcks, pendingPatternMatches)
+    const batch: WakeBatchCallbacks = {
+      taskIDs: [
+        ...new Set(
+          [...pending, ...pendingLongRunning, ...pendingPatternMatches].map((item) => item.task_id),
+        ),
+      ],
+      pending: () => {
+        clearDelivering(state, ackTargetIds);
+        state.pendingCompletions = [
+          ...pending.filter(
+            (item) =>
+              !state.consumedTaskIds.has(item.task_id) &&
+              !state.pendingCompletions.some((queued) => queued.task_id === item.task_id),
+          ),
+          ...state.pendingCompletions,
+        ];
+        state.pendingLongRunning = [
+          ...pendingLongRunning.filter((item) => !state.pendingLongRunning.includes(item)),
+          ...state.pendingLongRunning,
+        ];
+        state.pendingPatternMatches = [
+          ...pendingPatternMatches.filter((item) => !state.pendingPatternMatches.includes(item)),
+          ...state.pendingPatternMatches,
+        ];
+      },
+      accepted: () => {
+        state.pendingCompletions = state.pendingCompletions.filter(
+          (item) => !pending.includes(item),
+        );
+        state.pendingLongRunning = state.pendingLongRunning.filter(
+          (item) => !pendingLongRunning.includes(item),
+        );
+        state.pendingPatternMatches = state.pendingPatternMatches.filter(
+          (item) => !pendingPatternMatches.includes(item),
+        );
+        for (const taskID of ackTargetIds) consumeBgCompletion(sessionID, taskID);
+      },
+      cancelled: () => batch.pending(),
+    };
+    void sendWake(reminder, completionAcks, pendingPatternMatches, batch)
       .then(() => {
         state.retryDelayMs = null;
         state.wakeRetryAttempts = 0;
@@ -1953,6 +2152,7 @@ function stateFor(sessionID: string | undefined): SessionBgState {
       deliveredAwaitingAckTaskIds: new Set(),
       hostStatus: undefined,
       wakeAdmissions: new Map(),
+      pendingWakeAdmissions: new Map(),
       confirmedWakeDeliveryIds: new Set(),
       refiredWakeDeliveryIds: new Set(),
       wakeDeliveryOrder: [],
@@ -2031,6 +2231,7 @@ function cleanupIdleSessionStates(now: number): void {
       state.deliveringTaskIds.size ||
       state.deliveredAwaitingAckTaskIds.size ||
       state.wakeAdmissions.size ||
+      state.pendingWakeAdmissions.size ||
       state.wakeDeferredTaskIds.size ||
       state.debounceTimer ||
       state.unknownCompletions.length ||
