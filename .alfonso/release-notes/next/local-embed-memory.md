@@ -1,0 +1,1 @@
+- Local semantic indexing now releases temporary ONNX Runtime CPU memory after each inference instead of retaining the largest attention allocation. Roots, refresh workers and queries share one local model session; idle sessions unload and reload on demand. The memory census reports live embedding sessions and estimated model bytes.

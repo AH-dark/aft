@@ -22,8 +22,11 @@
 
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use ort::session::builder::GraphOptimizationLevel;
+use ort::session::RunOptions;
 use ort::session::Session;
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
@@ -45,7 +48,8 @@ const MINILM_MAX_LENGTH: usize = 512;
 ///
 /// The transient ONNX attention tensor scales with `batch × heads × seq_len²`,
 /// so peak RSS is governed by the *largest single inference*, not total chunk
-/// count (ORT's arena grows to the high-water mark and stays there). Measured:
+/// count. Arena shrinkage releases temporary buffers after each run, but cannot
+/// reduce that transient peak. Measured:
 /// `64 × 512² = 16.78M units → ~4.92 GB peak` — too high for 8–16 GB machines.
 ///
 /// 4.0M units caps the worst case at roughly half that (~2–2.5 GB, re-measured):
@@ -196,15 +200,135 @@ pub(crate) fn intra_thread_derivation() -> IntraThreadDerivation {
     derive_intra_threads(available_parallelism, None, None, None)
 }
 
+/// A root owns a lightweight handle; native state is shared across indexing,
+/// refresh and queries, and may be unloaded even while an idle handle survives.
 pub struct LocalEmbedder {
+    shared: Arc<Mutex<ResidentModel>>,
+}
+
+struct ResidentModel {
+    model: Option<NativeEmbedder>,
+    last_used: Instant,
+}
+
+const MODEL_IDLE_TTL: Duration = Duration::from_secs(60);
+// MiniLM and its lowercase alias are the only accepted model ids; both use this slot.
+static LOCAL_MODEL: Mutex<Option<Weak<Mutex<ResidentModel>>>> = Mutex::new(None);
+static MODEL_REAPER: OnceLock<Result<(), String>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EmbeddingSessionMemory {
+    pub sessions: u64,
+    /// Serialized model size, an estimate of weights, not a native heap reading.
+    pub model_bytes: u64,
+}
+
+static SESSION_MEMORY: Mutex<EmbeddingSessionMemory> = Mutex::new(EmbeddingSessionMemory {
+    sessions: 0,
+    model_bytes: 0,
+});
+
+pub(crate) fn session_memory() -> EmbeddingSessionMemory {
+    *SESSION_MEMORY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl ResidentModel {
+    fn release_if_idle(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.last_used) >= MODEL_IDLE_TTL {
+            self.model.take();
+        }
+    }
+}
+
+impl LocalEmbedder {
+    pub fn new(model: &str) -> Result<Self, String> {
+        validate_model(model)?;
+        let mut registry = LOCAL_MODEL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let shared = match registry.as_ref().and_then(Weak::upgrade) {
+            Some(shared) => shared,
+            None => {
+                let shared = Arc::new(Mutex::new(ResidentModel {
+                    model: Some(NativeEmbedder::new(model)?),
+                    last_used: Instant::now(),
+                }));
+                *registry = Some(Arc::downgrade(&shared));
+                shared
+            }
+        };
+        MODEL_REAPER
+            .get_or_init(|| {
+                std::thread::Builder::new()
+                    .name("embedding-idle".into())
+                    .spawn(|| loop {
+                        std::thread::sleep(Duration::from_secs(15));
+                        let shared = LOCAL_MODEL
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .as_ref()
+                            .and_then(Weak::upgrade);
+                        if let Some(shared) = shared {
+                            // Never queue behind an inference: its completion renews
+                            // the idle clock, and its session must remain resident.
+                            match shared.try_lock() {
+                                Ok(mut resident) => resident.release_if_idle(Instant::now()),
+                                Err(std::sync::TryLockError::Poisoned(error)) => {
+                                    error.into_inner().release_if_idle(Instant::now());
+                                }
+                                Err(std::sync::TryLockError::WouldBlock) => {}
+                            }
+                        }
+                    })
+                    .map(|_| ())
+                    .map_err(|error| format!("failed to start embedding idle reaper: {error}"))
+            })
+            .as_ref()
+            .map_err(Clone::clone)?;
+        Ok(Self { shared })
+    }
+
+    pub fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        // ort::Session::run requires exclusive access. Serializing all users
+        // also bounds simultaneous attention buffers to one inference budget.
+        let mut resident = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if resident.model.is_none() {
+            resident.model = Some(NativeEmbedder::new("all-MiniLM-L6-v2")?);
+        }
+        let result = resident.model.as_mut().unwrap().embed(texts);
+        resident.last_used = Instant::now();
+        result
+    }
+}
+
+fn validate_model(model: &str) -> Result<(), String> {
+    match model {
+        "all-MiniLM-L6-v2" | "all-minilm-l6-v2" => Ok(()),
+        other => Err(format!(
+            "unsupported local embedding model '{other}'. Supported: all-MiniLM-L6-v2"
+        )),
+    }
+}
+
+struct NativeEmbedder {
     /// Released explicitly in `Drop` so the native release can be skipped
     /// once the process has started exiting (see `crate::ort_lifecycle`).
     session: ManuallyDrop<Session>,
     tokenizer: Tokenizer,
     wants_token_type_ids: bool,
+    run_options: ManuallyDrop<RunOptions>,
+    model_bytes: u64,
 }
 
-impl LocalEmbedder {
+impl NativeEmbedder {
     /// Build the embedder for the named model. Only `all-MiniLM-L6-v2` is
     /// supported as the local backend (matches the prior fastembed surface).
     pub fn new(model: &str) -> Result<Self, String> {
@@ -212,14 +336,7 @@ impl LocalEmbedder {
     }
 
     pub(crate) fn with_cache_dir(model: &str, cache_dir: Option<&Path>) -> Result<Self, String> {
-        match model {
-            "all-MiniLM-L6-v2" | "all-minilm-l6-v2" => {}
-            other => {
-                return Err(format!(
-                    "unsupported local embedding model '{other}'. Supported: all-MiniLM-L6-v2"
-                ))
-            }
-        }
+        validate_model(model)?;
 
         // Fail with an actionable message instead of letting ort panic deep
         // inside dlopen on an incompatible/absent ONNX Runtime.
@@ -245,6 +362,15 @@ impl LocalEmbedder {
             // Runtime (dlopen failure) yields the actionable install hint rather
             // than a raw ort error.
             .map_err(format_embedding_init_error)?;
+
+        let mut run_options =
+            RunOptions::new().map_err(|e| format!("failed to create ONNX run options: {e}"))?;
+        // Keep arena reuse within an inference, but return its extensions after
+        // every run instead of retaining the largest attention tensor allocated
+        // by an earlier inference.
+        run_options
+            .add_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
+            .map_err(|e| format!("failed to enable ONNX CPU arena shrinkage: {e}"))?;
 
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| format!("failed to load tokenizer {}: {e}", tokenizer_path.display()))?;
@@ -274,10 +400,22 @@ impl LocalEmbedder {
             wants_token_type_ids
         );
 
+        let model_bytes = std::fs::metadata(&model_path)
+            .map_err(|e| format!("failed to measure embedding model: {e}"))?
+            .len();
+        {
+            let mut memory = SESSION_MEMORY
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            memory.sessions += 1;
+            memory.model_bytes += model_bytes;
+        }
         Ok(Self {
             session: ManuallyDrop::new(session),
             tokenizer,
             wants_token_type_ids,
+            run_options: ManuallyDrop::new(run_options),
+            model_bytes,
         })
     }
 
@@ -391,7 +529,7 @@ impl LocalEmbedder {
 
         let outputs = self
             .session
-            .run(inputs)
+            .run_with_options(inputs, &self.run_options)
             .map_err(|e| format!("ONNX inference failed: {e}"))?;
         let output = outputs
             .values()
@@ -444,17 +582,26 @@ impl LocalEmbedder {
     }
 }
 
-impl Drop for LocalEmbedder {
+impl Drop for NativeEmbedder {
     fn drop(&mut self) {
         match crate::ort_lifecycle::enter() {
             Some(_ort_section) => {
-                // SAFETY: `session` is never used again; this is its only drop.
-                unsafe { ManuallyDrop::drop(&mut self.session) };
+                // SAFETY: native values are never used again; these are their
+                // only drops, protected against ORT static teardown.
+                unsafe {
+                    ManuallyDrop::drop(&mut self.run_options);
+                    ManuallyDrop::drop(&mut self.session);
+                }
             }
             // The process is exiting. Releasing the session now could race
             // ORT's own static teardown, and the OS reclaims the memory anyway.
             None => {}
         }
+        let mut memory = SESSION_MEMORY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        memory.sessions -= 1;
+        memory.model_bytes -= self.model_bytes;
     }
 }
 
@@ -650,6 +797,182 @@ mod tests {
         );
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
         assert!(!storage.join("semantic").exists());
+    }
+
+    static NATIVE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn native_test() -> std::sync::MutexGuard<'static, ()> {
+        NATIVE_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn fixture_corpus() -> Vec<String> {
+        vec![
+            String::new(),
+            "A local semantic query about memory and indexing".into(),
+            "pub fn checksum(input: u64) -> u64 { input.wrapping_mul(37) }".into(),
+            "Café naïve 日本語 🦀".into(),
+            "attention mask pooling ".repeat(600),
+        ]
+    }
+
+    fn bits(vectors: Vec<Vec<f32>>) -> Vec<Vec<u32>> {
+        vectors
+            .into_iter()
+            .map(|v| v.into_iter().map(f32::to_bits).collect())
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "requires cached MiniLM and ONNX Runtime; run explicitly with ORT_DYLIB_PATH"]
+    fn local_embedding_vectors_match_legacy_fixture() {
+        let _serial = native_test();
+        let mut legacy = super::NativeEmbedder::new("all-MiniLM-L6-v2").unwrap();
+        // The old backend used default run options and kept the CPU arena.
+        unsafe { std::mem::ManuallyDrop::drop(&mut legacy.run_options) };
+        legacy.run_options = std::mem::ManuallyDrop::new(ort::session::RunOptions::new().unwrap());
+        let corpus = fixture_corpus();
+        let expected = bits(legacy.embed(&corpus).unwrap());
+        let mut bounded = super::LocalEmbedder::new("all-MiniLM-L6-v2").unwrap();
+        assert_eq!(bits(bounded.embed(&corpus).unwrap()), expected);
+        // Force the same attention-budget split used by long indexing batches.
+        let long = vec![corpus.last().unwrap().clone(); 32];
+        assert_eq!(
+            bits(bounded.embed(&long).unwrap()),
+            bits(legacy.embed(&long).unwrap())
+        );
+    }
+
+    #[test]
+    #[ignore = "requires cached MiniLM and ONNX Runtime; run explicitly with ORT_DYLIB_PATH"]
+    fn local_embedding_one_session_serves_two_roots_and_queries() {
+        let _serial = native_test();
+        let config = crate::config::SemanticBackendConfig::default();
+        let mut root_one =
+            crate::semantic_index::SemanticEmbeddingModel::from_config(&config).unwrap();
+        let mut root_two =
+            crate::semantic_index::SemanticEmbeddingModel::from_config(&config).unwrap();
+        let mut query =
+            crate::semantic_index::SemanticEmbeddingModel::from_config_for_query(&config).unwrap();
+        assert_eq!(
+            super::session_memory().sessions,
+            1,
+            "builds and queries loaded duplicate sessions"
+        );
+        let corpus = fixture_corpus();
+        let expected = bits(root_one.embed(corpus.clone()).unwrap());
+        assert_eq!(bits(root_two.embed(corpus.clone()).unwrap()), expected);
+        assert_eq!(bits(query.embed(corpus).unwrap()), expected);
+        let text = "semantic query worker";
+        let build_vector = root_one.embed(vec![text.into()]).unwrap().remove(0);
+        let query_vector = query
+            .embed_query_cached(
+                text,
+                crate::semantic_index::QueryBudget::from_config(&config),
+            )
+            .unwrap();
+        assert_eq!(bits(vec![query_vector]), bits(vec![build_vector]));
+        assert_eq!(super::session_memory().sessions, 1);
+        // Query workers own provider clones until their request channel closes.
+        drop((root_one, root_two, query));
+        wait_for_sessions(0);
+    }
+
+    fn wait_for_sessions(expected: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while super::session_memory().sessions != expected && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(super::session_memory().sessions, expected);
+    }
+
+    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+    #[test]
+    #[ignore = "process-wide native allocation measurement; requires cached MiniLM and ORT"]
+    fn local_embedding_cpu_arena_releases_high_water() {
+        let _serial = native_test();
+        let mut handle = super::LocalEmbedder::new("all-MiniLM-L6-v2").unwrap();
+        let allocated = || {
+            crate::memory::AllocatorObservation::measure()
+                .snapshot
+                .bytes_in_use
+                .expect("native allocator measurement")
+        };
+        let before = allocated();
+        let corpus = vec!["attention mask pooling ".repeat(600); 15];
+        drop(handle.embed(&corpus).unwrap());
+        let retained = allocated().saturating_sub(before);
+        // The attention budget permits a >1 GB transient allocation. Native
+        // live allocations must not keep that high-water mark after the run.
+        assert!(
+            retained < 256 * 1024 * 1024,
+            "CPU arena retained {retained} bytes after inference"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires cached MiniLM and ONNX Runtime; run explicitly with ORT_DYLIB_PATH"]
+    fn local_embedding_idle_session_unloads_and_reloads_identically() {
+        let _serial = native_test();
+        let mut handle = super::LocalEmbedder::new("all-minilm-l6-v2").unwrap();
+        let corpus = fixture_corpus();
+        let expected = bits(handle.embed(&corpus).unwrap());
+        {
+            let mut resident = handle.shared.lock().unwrap();
+            let last_used = resident.last_used;
+            resident.release_if_idle(
+                last_used + super::MODEL_IDLE_TTL - std::time::Duration::from_nanos(1),
+            );
+            assert_eq!(
+                super::session_memory().sessions,
+                1,
+                "released before the idle deadline"
+            );
+            resident.release_if_idle(last_used + super::MODEL_IDLE_TTL);
+        }
+        assert_eq!(
+            super::session_memory().sessions,
+            0,
+            "idle handle pinned native session"
+        );
+        assert_eq!(super::session_memory().model_bytes, 0);
+        assert_eq!(bits(handle.embed(&corpus).unwrap()), expected);
+        assert_eq!(super::session_memory().sessions, 1);
+    }
+
+    #[test]
+    #[ignore = "requires cached MiniLM and ONNX Runtime; run explicitly with ORT_DYLIB_PATH"]
+    fn local_embedding_root_eviction_unbind_and_census_release_sessions() {
+        let _serial = native_test();
+        for eviction in [0, 1, 2] {
+            let ctx = crate::context::AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config::default(),
+            );
+            *ctx.semantic_embedding_model().lock() = Some(
+                crate::semantic_index::SemanticEmbeddingModel::from_config_for_query(
+                    &crate::config::SemanticBackendConfig::default(),
+                )
+                .unwrap(),
+            );
+            let snapshot = crate::memory::MemorySnapshot::new("ready", Default::default());
+            assert_eq!(snapshot.process.embedding_sessions, 1);
+            assert!(snapshot.process.embedding_model_bytes > 80_000_000);
+            assert!(
+                snapshot.process.total_attributed_bytes >= snapshot.process.embedding_model_bytes
+            );
+            match eviction {
+                0 => assert!(ctx.evict_idle_artifacts()),
+                1 => assert!(ctx.try_evict_idle_artifacts()),
+                _ => ctx.cancel_unbound_artifact_work(),
+            }
+            assert!(ctx.semantic_embedding_model().lock().is_none());
+            wait_for_sessions(0);
+            let snapshot = crate::memory::MemorySnapshot::new("ready", Default::default());
+            assert_eq!(snapshot.process.embedding_sessions, 0);
+            assert_eq!(snapshot.process.embedding_model_bytes, 0);
+        }
     }
 
     #[test]
