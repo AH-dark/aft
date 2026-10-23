@@ -981,8 +981,6 @@ pub struct BackupStore {
     /// not finished yet, as (session, key, backup_id). Once the request has
     /// written, `record_post_mutation_states` stamps each with what it left.
     pending_post_states: Vec<(String, PathBuf, String)>,
-    /// Closed sessions still being annotated by an already-started request.
-    release_after_post_states: HashSet<String>,
     #[cfg(test)]
     enforce_temp_path_policy: bool,
     #[cfg(test)]
@@ -1048,7 +1046,6 @@ impl BackupStore {
             policy: BackupPolicy::default(),
             skipped_backups: HashMap::new(),
             pending_post_states: Vec::new(),
-            release_after_post_states: HashSet::new(),
             #[cfg(test)]
             enforce_temp_path_policy: false,
             #[cfg(test)]
@@ -1097,13 +1094,6 @@ impl BackupStore {
     pub fn release_session_memory(&mut self, session: &str) {
         if self.storage_dir.is_none() {
             return;
-        }
-        if self
-            .pending_post_states
-            .iter()
-            .any(|(pending, _, _)| pending == session)
-        {
-            self.release_after_post_states.insert(session.to_string());
         }
         self.entries.remove(session);
         self.disk_index.remove(session);
@@ -1204,7 +1194,6 @@ impl BackupStore {
         self.disk_index.clear();
         self.session_meta.clear();
         self.skipped_backups.clear();
-        self.release_after_post_states.clear();
         self.clear_db_mirror_sync();
     }
 
@@ -2972,9 +2961,6 @@ impl BackupStore {
     /// the next undo compares the live path against this to notice changes
     /// made outside AFT.
     pub fn record_post_mutation_states(&mut self) {
-        if self.pending_post_states.is_empty() {
-            return;
-        }
         let pending = std::mem::take(&mut self.pending_post_states);
         for (session, key, backup_id) in pending {
             if let Err(error) = self.record_post_mutation_state(&session, &key, &backup_id) {
@@ -2985,8 +2971,16 @@ impl BackupStore {
                 );
             }
         }
-        for session in std::mem::take(&mut self.release_after_post_states) {
-            self.release_session_memory(&session);
+        // A started request may snapshot after its route's close cleanup ran.
+        // Durable stacks are only needed until annotation finishes; releasing
+        // them here also covers those late snapshots without retaining a set
+        // of every session ID the daemon has ever closed.
+        // Keep the verified SQLite mirror baseline: dropping resident metadata
+        // does not change the persisted stack or require a full mirror rebuild.
+        if self.storage_dir.is_some() {
+            self.entries = HashMap::new();
+            self.disk_index = HashMap::new();
+            self.session_meta = HashMap::new();
         }
     }
 
@@ -7961,6 +7955,17 @@ mod tests {
             Some(PathFingerprint::of_bytes(b"changed"))
         );
         assert_eq!(store.history("other", &path).len(), 1);
+
+        // A started call can reach its snapshot only after its route closes.
+        store.release_session_memory("late");
+        store.snapshot("late", &path, "late snapshot").unwrap();
+        fs::write(&path, b"late result").unwrap();
+        store.record_post_mutation_states();
+        assert!(!store.entries.contains_key("late"));
+        assert_eq!(
+            store.history("late", &path)[0].post_state,
+            Some(PathFingerprint::of_bytes(b"late result"))
+        );
     }
 
     #[test]
