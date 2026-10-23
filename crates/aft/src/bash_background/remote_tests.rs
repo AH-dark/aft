@@ -7118,6 +7118,64 @@ async fn runon_cd_outside_checkout_is_refused_before_submit() {
 }
 
 #[tokio::test]
+async fn runon_cd_sequential_targets_follow_the_shell_cwd() {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    let checkout = tempfile::Builder::new()
+        .prefix("aft-runon-cwd-")
+        .tempdir_in(&home)
+        .unwrap();
+    let ctx = remote_test_context(checkout.path());
+    fs::create_dir(checkout.path().join("nested")).unwrap();
+    let marker = checkout.path().join("must-not-run-locally");
+    for (line, refused) in [
+        ("cd nested && cd .. && printf remote", false),
+        ("pushd nested && cd .. && printf remote", false),
+        ("cd nested && cd ../.. && printf remote", true),
+        ("cd \"$X\" && cd .. && printf remote", false),
+        ("cd - && cd .. && printf remote", false),
+        ("popd && cd .. && printf remote", false),
+        ("(cd nested) && cd .. && printf remote", false),
+    ] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let command = format!("{line}; printf local-proof > '{}'", marker.display());
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({"command": command, "runon": "linux", "compressed": false}),
+        );
+        assert!(response.success, "{line}: {response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        if refused {
+            assert_eq!(done.info.status, BgTaskStatus::Failed, "{line}: {done:?}");
+            let refusal = refusal_response(done);
+            assert_eq!(refusal.data["code"], "runon_cd_outside_checkout");
+            let expected = format!(
+                "runon refused: the command changes into {}, which is outside the checkout the build server copies ({}); the command did not run. Set the bash tool's workdir to that folder instead of using cd.",
+                home.display(), checkout.path().canonicalize().unwrap().display()
+            );
+            assert_eq!(refusal.data["message"], expected);
+            assert!(exec_runs(&daemon).is_empty(), "a refusal must never submit");
+        } else {
+            assert_eq!(
+                done.info.status,
+                BgTaskStatus::Completed,
+                "{line}: {done:?}"
+            );
+            let runs = exec_runs(&daemon);
+            assert_eq!(runs.len(), 1, "{line}: {runs:?}");
+            assert_eq!(runs[0]["command"], command);
+        }
+        assert!(!marker.exists(), "runon must never spawn locally");
+    }
+}
+
+#[tokio::test]
 async fn runon_cd_inside_checkout_and_unresolved_or_nested_targets_are_allowed() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = remote_test_context(dir.path());

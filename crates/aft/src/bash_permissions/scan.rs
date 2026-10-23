@@ -257,8 +257,9 @@ pub(crate) struct DirectoryTarget {
     pub literal_absolute: bool,
 }
 
-/// Resolve literal directory changes in the outer shell against the call's
-/// working folder. The scan skips nested shells and function definitions.
+/// Follow literal directory changes in the outer shell in order. Unknown
+/// changes suppress relative targets until the current folder is known again.
+/// The scan skips nested shells and function definitions.
 #[cfg(any(unix, test))]
 pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<DirectoryTarget> {
     fn literal_word(raw: &str) -> Option<String> {
@@ -267,67 +268,129 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
             .then(|| parsed.args.remove(0))
     }
 
-    fn visit(node: Node<'_>, source: &str, cwd: &Path, targets: &mut Vec<DirectoryTarget>) {
+    fn resolve_target(head: &str, parts: &[Part], cwd: Option<&Path>) -> Option<DirectoryTarget> {
+        let raw = parts
+            .iter()
+            .skip(1)
+            .find(|part| !part.text.starts_with('-'))?
+            .text
+            .as_str();
+        let expand_home = raw == "~" || raw.starts_with("~/");
+        // Decode the supported home prefix without allowing other expansions;
+        // quoted or escaped tildes remain ordinary path text.
+        let word = if expand_home {
+            format!("\\{raw}")
+        } else {
+            raw.to_owned()
+        };
+        let text = literal_word(&word)
+            .filter(|text| text != "-" && !(head == "pushd" && text.starts_with('+')))?;
+        let literal_absolute = Path::new(&text).is_absolute();
+        let path = if expand_home {
+            PathBuf::from(std::env::var_os("HOME")?).join(text.strip_prefix("~/").unwrap_or(""))
+        } else if literal_absolute {
+            PathBuf::from(text)
+        } else {
+            cwd?.join(text)
+        };
+        Some(DirectoryTarget {
+            path: super::resolve_with_existing_ancestors(&path),
+            literal_absolute,
+        })
+    }
+
+    fn visit_without_cwd(node: Node<'_>, source: &str, targets: &mut Vec<DirectoryTarget>) {
         match node.kind() {
             "subshell"
             | "command_substitution"
             | "process_substitution"
-            | "function_definition" => {
-                return;
-            }
+            | "function_definition" => return,
             "command" => {
-                let parts = command_parts(source, node);
-                let head = parts.first().and_then(|part| literal_word(&part.text));
-                if matches!(head.as_deref(), Some("cd" | "pushd")) {
-                    if let Some(target) = parts
-                        .iter()
-                        .skip(1)
-                        .find(|part| !part.text.starts_with('-'))
-                    {
-                        let raw = target.text.as_str();
-                        let expand_home = raw == "~" || raw.starts_with("~/");
-                        // The literal decoder rejects active expansions. Escape
-                        // only the supported unquoted home prefix for decoding;
-                        // quoted or escaped tildes remain ordinary path text.
-                        let word = if expand_home {
-                            format!("\\{raw}")
-                        } else {
-                            raw.to_owned()
-                        };
-                        if let Some(text) = literal_word(&word).filter(|text| {
-                            text != "-"
-                                && !(head.as_deref() == Some("pushd") && text.starts_with('+'))
-                        }) {
-                            let literal_absolute = Path::new(&text).is_absolute();
-                            let path = if expand_home {
-                                let Some(home) = std::env::var_os("HOME") else {
-                                    return;
-                                };
-                                PathBuf::from(home).join(text.strip_prefix("~/").unwrap_or(""))
-                            } else {
-                                cwd.join(text)
-                            };
-                            targets.push(DirectoryTarget {
-                                path: super::resolve_with_existing_ancestors(&path),
-                                literal_absolute,
-                            });
-                        }
-                    }
-                }
-                // Do not visit substitutions used as arguments to this command.
+                visit(node, source, &mut None, targets);
                 return;
             }
             _ => {}
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            visit(child, source, cwd, targets);
+            visit_without_cwd(child, source, targets);
+        }
+    }
+
+    fn visit(
+        node: Node<'_>,
+        source: &str,
+        cwd: &mut Option<PathBuf>,
+        targets: &mut Vec<DirectoryTarget>,
+    ) {
+        match node.kind() {
+            "subshell" => {
+                // Treat a nested shell as a conservative boundary for cwd tracking.
+                *cwd = None;
+                return;
+            }
+            "command_substitution" | "process_substitution" | "function_definition" => return,
+            "if_statement"
+            | "for_statement"
+            | "c_style_for_statement"
+            | "while_statement"
+            | "case_statement"
+            | "pipeline"
+            | "negated_command" => {
+                // Branches and pipelines do not establish one outer-shell cwd.
+                // Keep inspecting absolute targets without inferring branch order.
+                *cwd = None;
+                visit_without_cwd(node, source, targets);
+                return;
+            }
+            "command" => {
+                let parts = command_parts(source, node);
+                let head = parts.first().and_then(|part| literal_word(&part.text));
+                match head.as_deref() {
+                    Some(head @ ("cd" | "pushd")) => {
+                        if let Some(target) = resolve_target(head, &parts, cwd.as_deref()) {
+                            *cwd = Some(target.path.clone());
+                            targets.push(target);
+                        } else {
+                            *cwd = None;
+                        }
+                    }
+                    Some("popd" | "source" | "." | "eval") | None => *cwd = None,
+                    _ => {}
+                }
+                // Do not visit substitutions used as arguments to this command.
+                return;
+            }
+            _ => {}
+        }
+        let mut conditional = false;
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "||" {
+                // Either side may determine the next cwd; do not choose one.
+                *cwd = None;
+                conditional = true;
+            } else if child.is_named() {
+                if conditional {
+                    visit_without_cwd(child, source, targets);
+                } else {
+                    visit(child, source, cwd, targets);
+                }
+            }
+        }
+        if conditional {
+            *cwd = None;
         }
     }
 
     let mut targets = Vec::new();
     if let Some(tree) = parse_tree(command) {
-        visit(tree.root_node(), command, cwd, &mut targets);
+        visit(
+            tree.root_node(),
+            command,
+            &mut Some(cwd.to_path_buf()),
+            &mut targets,
+        );
     }
     targets
 }
@@ -760,7 +823,61 @@ mod tests {
     }
 
     #[test]
-    fn top_level_directory_targets_resolve_lists_and_options_against_call_cwd() {
+    fn directory_targets_follow_successive_literal_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            directory_paths("cd nested && cd ..", &cwd),
+            vec![cwd.join("nested"), cwd.clone()]
+        );
+        assert_eq!(
+            directory_paths("pushd nested && cd ../..", &cwd),
+            vec![cwd.join("nested"), cwd.parent().unwrap().to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn directory_targets_stop_resolving_relative_paths_after_unknown_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        for prefix in [
+            "cd \"$X\"",
+            "pushd \"$X\"",
+            "cd -",
+            "pushd +1",
+            "popd",
+            "(cd nested)",
+        ] {
+            let command = format!("{prefix} && cd ..; cd '{}' && cd nested", cwd.display());
+            assert_eq!(
+                directory_paths(&command, &cwd),
+                vec![cwd.clone(), cwd.join("nested")],
+                "{prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_targets_do_not_infer_cwd_after_conditional_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            directory_paths("cd nested || printf fallback; cd ..", &cwd),
+            vec![cwd.join("nested")]
+        );
+        for command in [
+            "if true; then cd nested; fi; cd ..",
+            "while false; do cd nested; done; cd ..",
+            "cd nested | cat; cd ..",
+        ] {
+            assert!(directory_paths(command, &cwd).is_empty(), "{command}");
+        }
+        let command = format!("if false; then cd '{}'; fi; cd ..", cwd.display());
+        assert_eq!(directory_paths(&command, &cwd), vec![cwd]);
+    }
+
+    #[test]
+    fn top_level_directory_targets_resolve_lists_and_options_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap();
         let targets = directory_paths(
@@ -771,8 +888,8 @@ mod tests {
             targets,
             vec![
                 cwd.join("nested"),
-                cwd.parent().unwrap().join("sibling repo"),
-                cwd
+                cwd.join("sibling repo"),
+                cwd.join("sibling repo")
             ]
         );
     }
