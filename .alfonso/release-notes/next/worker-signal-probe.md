@@ -1,1 +1,1 @@
-Worker sandboxes on macOS allow `kill -0` liveness probes across commands while keeping real signals confined; Linux reports Landlock's lack of a signal-zero exception without weakening signal isolation.
+Worker commands on macOS can again run `kill -0` existence checks on processes outside the command; real signals to those processes stay blocked, and the Linux limit is now documented.

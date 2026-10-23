@@ -283,18 +283,15 @@ mod signal_scope {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn native_signal_zero_reports_landlock_cross_command_limit() {
+    fn native_signal_zero_to_unrelated_same_uid_is_refused_by_landlock() {
+        // Landlock has no per-signal exception, so the existence probe is
+        // refused like a real signal; docs/config.md states this limit.
         if !signal_scope_available() {
             return;
         }
         let mut fixture = ProbeFixture::with_worker_jail(true);
         let mut victim = Victim::new();
         let output = probe_signal(&mut fixture, &victim.0.id().to_string(), "0");
-        assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("signal_zero_cross_command=blocked_no_exception"),
-            "missing Landlock signal-zero limitation: {output:?}"
-        );
         assert_refused(output, &mut victim);
     }
 
