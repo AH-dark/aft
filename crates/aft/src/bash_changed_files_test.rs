@@ -780,3 +780,71 @@ fn bash_changed_files_ignored_paths_are_not_reported() {
         "ignored file leaked: {report:?}"
     );
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires a live FSEvents service; run as a focused native gate"
+)]
+fn bash_changed_files_directory_rename_never_claims_a_deleted_directory_file() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    for name in ["one.txt", "two.txt"] {
+        std::fs::write(root.path().join("src").join(name), name).unwrap();
+    }
+    let native = NativeWatcher::new(root.path(), false);
+    native.ready();
+    let capture = native.capture();
+    std::fs::rename(root.path().join("src"), root.path().join("renamed")).unwrap();
+    let report = capture.finish();
+    assert!(
+        !report.files.iter().any(|file| file.path == "src"),
+        "directory reported as a file: {report:?}"
+    );
+    if report.incomplete.is_empty() {
+        for name in [
+            "src/one.txt",
+            "src/two.txt",
+            "renamed/one.txt",
+            "renamed/two.txt",
+        ] {
+            assert!(
+                report
+                    .files
+                    .iter()
+                    .any(|file| file.path.replace('\\', "/") == name),
+                "missing renamed child {name}: {report:?}"
+            );
+        }
+    } else {
+        assert!(
+            report
+                .incomplete
+                .iter()
+                .any(|reason| reason == NOT_CAUGHT_UP),
+            "{report:?}"
+        );
+    }
+}
+
+#[test]
+fn bash_changed_files_directory_kind_is_retained_after_rename() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    let (journal, capture) = capture(root.path(), BashChangedFiles::List);
+    event(
+        &journal,
+        root.path(),
+        "src",
+        notify::EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Any)),
+    );
+    std::fs::rename(root.path().join("src"), root.path().join("renamed")).unwrap();
+    let report = capture.finish();
+    assert!(
+        report.files.is_empty(),
+        "directory type must not be re-inferred from a vanished path: {report:?}"
+    );
+    assert_eq!(report.incomplete, vec![NOT_CAUGHT_UP]);
+    assert!(report.changed_files_list_envelope.total.is_at_least());
+}

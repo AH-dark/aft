@@ -31,7 +31,8 @@ pub(crate) struct Journal {
 struct JournalState {
     sequence: u64,
     gaps: u64,
-    events: VecDeque<(u64, PathBuf, bool)>,
+    unreported_renames: u64,
+    events: VecDeque<(u64, PathBuf, bool, bool)>,
 }
 impl Journal {
     /// Raw watcher intake precedes batch filtering, so reports must apply the
@@ -70,7 +71,20 @@ impl Journal {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rename = matches!(
+            event.kind,
+            notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+        );
         for path in &event.paths {
+            let directory = path.is_dir();
+            if rename && (directory || !path.exists()) {
+                // A vanished rename path is not proof of a deleted file. The
+                // watcher may have reported only the directory, not its children.
+                state.unreported_renames += 1;
+                if !directory {
+                    continue;
+                }
+            }
             state.sequence += 1;
             let sequence = state.sequence;
             if state.events.len() == MAX_EVENTS {
@@ -78,7 +92,7 @@ impl Journal {
             }
             state
                 .events
-                .push_back((sequence, path.clone(), event.kind.is_create()));
+                .push_back((sequence, path.clone(), event.kind.is_create(), directory));
         }
     }
     pub(crate) fn gap(&self) {
@@ -114,12 +128,13 @@ pub(crate) struct Capture {
     journal: Arc<Journal>,
     sequence: u64,
     gaps: u64,
+    unreported_renames: u64,
     mode: BashChangedFiles,
     watcher_active: bool,
     flush: Option<Arc<crate::watcher_backend::flush::FlushControl>>,
     call_deadline: SharedCallDeadline,
     git: Option<GitStart>,
-    end: OnceLock<(u64, u64)>,
+    end: OnceLock<(u64, u64, u64)>,
     report: OnceLock<Report>,
     #[cfg(test)]
     diff_delay_for_test: Duration,
@@ -203,13 +218,15 @@ impl Capture {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (sequence, gaps) = (state.sequence, state.gaps);
+        let (sequence, gaps, unreported_renames) =
+            (state.sequence, state.gaps, state.unreported_renames);
         drop(state);
         Arc::new(Self {
             root,
             journal,
             sequence,
             gaps,
+            unreported_renames,
             mode,
             watcher_active,
             flush: None,
@@ -256,7 +273,7 @@ impl Capture {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (state.sequence, state.gaps)
+            (state.sequence, state.gaps, state.unreported_renames)
         });
     }
     fn render(&self, caught_up: bool, deadline: Instant) -> Report {
@@ -265,15 +282,17 @@ impl Capture {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (end_sequence, end_gaps) = *self.end.get().expect("capture sealed before rendering");
+        let (end_sequence, end_gaps, end_unreported_renames) =
+            *self.end.get().expect("capture sealed before rendering");
+        let unreported_rename = end_unreported_renames != self.unreported_renames;
         let overflow = end_gaps != self.gaps
             || state
                 .events
                 .front()
-                .is_some_and(|(sequence, _, _)| *sequence > self.sequence + 1);
+                .is_some_and(|(sequence, _, _, _)| *sequence > self.sequence + 1);
         let mut paths = BTreeMap::new();
         let mut list_deadline_cut = false;
-        for (sequence, path, created) in &state.events {
+        for (sequence, path, created, directory) in &state.events {
             if *sequence > self.sequence && *sequence <= end_sequence {
                 if Instant::now() >= deadline {
                     list_deadline_cut = true;
@@ -288,7 +307,7 @@ impl Capture {
                             )
                         })
                     {
-                        if !path.is_dir() {
+                        if !directory {
                             paths.entry(relative.to_path_buf()).or_insert(*created);
                         }
                     }
@@ -386,7 +405,7 @@ impl Capture {
         if overflow {
             incomplete.push(OVERFLOW.to_string());
         }
-        if !caught_up || list_deadline_cut {
+        if !caught_up || list_deadline_cut || unreported_rename {
             incomplete.push(NOT_CAUGHT_UP.to_string());
         }
         for reason in &incomplete {
@@ -398,7 +417,7 @@ impl Capture {
                 files.len(),
                 total,
                 false,
-                overflow || !caught_up || list_deadline_cut,
+                overflow || !caught_up || list_deadline_cut || unreported_rename,
                 list_deadline_cut,
             );
         if cut && list_envelope.reason.is_none() {
