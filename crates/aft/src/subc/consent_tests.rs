@@ -361,6 +361,14 @@ fn fixture(fake: Arc<FakeCingulate>) -> Fixture {
 }
 
 fn fixture_in(fake: Arc<FakeCingulate>, dir: tempfile::TempDir) -> Fixture {
+    fixture_with_executor(fake, dir, Arc::new(Executor::new()))
+}
+
+fn fixture_with_executor(
+    fake: Arc<FakeCingulate>,
+    dir: tempfile::TempDir,
+    executor: Arc<Executor>,
+) -> Fixture {
     let head_root = crate::access_policy::policy_path(&dir.path().join("head"));
     let worker_root = crate::access_policy::policy_path(&dir.path().join("worker"));
     std::fs::create_dir_all(&head_root).unwrap();
@@ -389,7 +397,6 @@ fn fixture_in(fake: Arc<FakeCingulate>, dir: tempfile::TempDir) -> Fixture {
         &ctx,
     )
     .unwrap();
-    let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(worker.root.clone(), Arc::clone(&ctx)));
     install_test_transport(Some(Arc::new(SharedFake(Arc::clone(&fake)))));
     Fixture {
@@ -4889,7 +4896,16 @@ fn allow_frame(ask: &WriterFrame) -> Frame {
 #[tokio::test]
 async fn standalone_late_approval_reruns_with_a_renewed_io_budget() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
-    let f = fixture(FakeCingulate::up());
+    let f = fixture_with_executor(
+        FakeCingulate::up(),
+        tempfile::tempdir().unwrap(),
+        Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 2,
+            read_cap: 1,
+            actor_cap: 1,
+            ..crate::executor::ExecutorConfig::default()
+        })),
+    );
     let corr = 9_100_001;
     let _overrides = CallOverrides(corr);
     crate::subc::PLAIN_RUN_IO_BUDGET_FOR_TEST
@@ -4916,8 +4932,33 @@ async fn standalone_late_approval_reruns_with_a_renewed_io_budget() {
         .unwrap();
     // Answer only after the first run's whole I/O budget has passed.
     tokio::time::sleep(Duration::from_millis(3_000)).await;
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocker = f.executor.submit_async(
+        route.root.clone(),
+        Lane::PureRead,
+        "approval-queue-blocker".to_string(),
+        Box::new(move |_| {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(15));
+            Response::success("approval-queue-blocker", json!({}))
+        }),
+    );
+    started_rx.await.unwrap();
     let approved_at = Instant::now();
     assert!(standalone::reply(&writer, &allow_frame(&ask)));
+    wait_for(|| {
+        f.executor
+            .try_dispatch_liveness_snapshot()
+            .is_some_and(|snapshot| snapshot.interactive.queued > 0)
+    })
+    .await;
+    // The approved run must retain its full 1500ms I/O allowance even after
+    // spending twice that long queued behind another read for the same project.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    let admitted_after = Instant::now();
+    release_tx.send(()).unwrap();
+    blocker.await.unwrap();
     let result = standalone_reply(&mut replies).await;
     assert_eq!(result["isError"], false, "{result}");
     assert!(text(&result).contains("head-owned contents"), "{result}");
@@ -4927,8 +4968,8 @@ async fn standalone_late_approval_reruns_with_a_renewed_io_budget() {
         .last()
         .expect("the approved run was given a budget");
     assert!(
-        renewed > approved_at,
-        "the approved run's budget was renewed"
+        renewed > admitted_after + Duration::from_millis(1_000),
+        "approval at {approved_at:?}, admission after {admitted_after:?}, deadline {renewed:?}"
     );
     f.connection_cancel.cancel();
 }

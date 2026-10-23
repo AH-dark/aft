@@ -8624,6 +8624,9 @@ struct PlainToolRun {
     request_id: String,
     ledger_key: Option<crate::db::call_ledger::Key>,
     io_budget: crate::bounded_io::Budget,
+    /// Approved work gets this allowance at executor admission, not while it
+    /// is still queued. The caller's absolute reply deadline remains the cap.
+    approved_io_window: Option<Duration>,
     /// When the caller stops waiting for this call's reply. A call held for an
     /// approval can wait past `io_budget`, so a rerun gets a fresh I/O budget
     /// that ends no later than this.
@@ -8653,7 +8656,8 @@ impl PlainToolRun {
                 request_id: request_id_for_force,
                 ledger_key,
                 io_budget,
-                reply_deadline: _,
+                approved_io_window,
+                reply_deadline,
             } = run_spec;
             if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
                 ctx.mark_standalone_plugin_host();
@@ -8668,6 +8672,14 @@ impl PlainToolRun {
                     Some((scope.clone(), once.clone()))
                 }
                 _ => None,
+            };
+            let io_budget = if let Some(window) = approved_io_window {
+                let budget = crate::bounded_io::Budget::after(window).capped(reply_deadline);
+                #[cfg(test)]
+                standalone::note_rerun_budget_for_test(budget.deadline);
+                budget
+            } else {
+                io_budget
             };
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             phase_trace.mark_job_admitted();
@@ -8841,17 +8853,11 @@ async fn hold_for_consent(
     };
     let rerun = |ask_route| {
         let (done_tx, done_rx) = oneshot::channel::<ToolCallCompletion>();
-        // The approved run gets its own I/O budget: the first run's may have
-        // been spent waiting for the answer. It still ends by the deadline the
-        // held call answers within.
+        // Start the renewed allowance when the executor admits the approved
+        // work. Queueing after approval must not spend its filesystem budget.
         let mut approved_run = plain_run.clone();
-        approved_run.io_budget = crate::bounded_io::Budget::after(
-            reply_deadline
-                .saturating_duration_since(Instant::now())
-                .min(plain_run_io_budget(corr)),
-        );
-        #[cfg(test)]
-        standalone::note_rerun_budget_for_test(approved_run.io_budget.deadline);
+        approved_run.approved_io_window = Some(plain_run_io_budget(corr));
+        approved_run.reply_deadline = reply_deadline;
         let job = approved_run.job(ask_route, PhaseTrace::new(Instant::now()), done_tx);
         let rx = resubmit_active_tool_call(
             executor,
@@ -9829,6 +9835,7 @@ async fn handle_tool_call(
             request_id: request_id.clone(),
             ledger_key: ledger_key.clone(),
             io_budget: crate::bounded_io::Budget::after(plain_run_io_budget(frame.header.corr)),
+            approved_io_window: None,
             reply_deadline: reply_budget.deadline,
         });
         let (setup_tx, setup_rx) = oneshot::channel::<DeferredSetupOutcome>();
@@ -10219,6 +10226,7 @@ async fn handle_tool_call(
         request_id: request_id.clone(),
         ledger_key,
         io_budget: crate::bounded_io::Budget::after(plain_run_io_budget(frame.header.corr)),
+        approved_io_window: None,
         reply_deadline: reply_budget.deadline,
     };
     let job = plain_run.job(
