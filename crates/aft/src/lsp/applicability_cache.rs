@@ -50,6 +50,9 @@ pub(crate) struct ApplicabilityMetrics {
     pub coalesced_hits: u64,
     pub invalidations: BTreeMap<&'static str, u64>,
     pub retained_content_batches: u64,
+    /// Create, remove and rename batches shown not to change the cached
+    /// result, which therefore kept it without a walk.
+    pub retained_topology_batches: u64,
     pub warm_validations: u64,
     pub warm_validation_micros: u64,
     pub warm_validation_dependency_count: usize,
@@ -165,6 +168,18 @@ pub(super) fn observe_path(path: &Path) {
                 } = PathState::read(&path)
                 {
                     capture.input_identities.insert(identity);
+                    // A watcher reports a symlinked input's target, not the
+                    // link. Replacing that target (rename over it) creates a
+                    // new file with a new identity, so record its path too.
+                    if std::fs::symlink_metadata(&path)
+                        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                    {
+                        if let Ok(target) = std::fs::canonicalize(&path) {
+                            capture
+                                .inputs
+                                .insert(crate::inspect::job::normalize_path(&target));
+                        }
+                    }
                 }
             }
             if !path.starts_with(&capture.root) {
@@ -278,6 +293,53 @@ struct State {
     input_identities: HashSet<(u64, u64)>,
     marker_names: HashSet<String>,
     cause: Option<InvalidationCause>,
+    /// The configuration the cached result was walked with, for resolving
+    /// created files the same way the walk would.
+    config: Option<Arc<Config>>,
+    /// In-root directories that hold a recorded input. They include every
+    /// directory the walk visited, because each one records its ignore files.
+    input_dirs: Arc<HashSet<PathBuf>>,
+    /// Present files accepted into the cached result since its walk, counted
+    /// against the walk's entry limit.
+    absorbed_files: usize,
+}
+
+/// What a create, remove or rename batch is checked against for one cached
+/// (root, configuration) result, copied out so filesystem probes run without
+/// the cache locks.
+struct TopologyBasis {
+    flight: Arc<Flight>,
+    generation: u64,
+    root: PathBuf,
+    walk: ApplicabilityWalk,
+    config: Arc<Config>,
+    input_dirs: Arc<HashSet<PathBuf>>,
+    absorbed_files: usize,
+}
+
+/// Ignore-rule files and repository markers the walker reads by itself. Those
+/// in directories the walk visited are recorded inputs; these names also
+/// catch ones created in directories it has not visited yet.
+fn names_ignore_input(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        [".ignore", ".gitignore", ".aftignore", ".git", ".jj"]
+            .iter()
+            .any(|ignore| name == *ignore)
+    }) || path.ends_with(".git/info/exclude")
+        || path.ends_with(".git/config")
+}
+
+/// Every in-root ancestor directory, below `root`, of the in-root inputs.
+fn input_directories(root: &Path, inputs: &HashSet<PathBuf>) -> HashSet<PathBuf> {
+    let mut dirs = HashSet::new();
+    for input in inputs.iter().filter(|input| input.starts_with(root)) {
+        for dir in input.ancestors().skip(1) {
+            if dir == root || !dir.starts_with(root) || !dirs.insert(dir.to_path_buf()) {
+                break;
+            }
+        }
+    }
+    dirs
 }
 
 #[derive(Default)]
@@ -400,6 +462,7 @@ impl ApplicabilityCache {
         } else {
             Vec::new()
         };
+        let mut bases = Vec::new();
         {
             let mut entries = self.entries.lock();
             // Invalidated snapshots from configurations nobody is using must
@@ -436,6 +499,17 @@ impl ApplicabilityCache {
                         matches!(state_of_path, PathState::Present { identity: Some(identity), is_file: true, .. }
                             if state.input_identities.contains(identity))
                     });
+                    if let (Some(walk), Some(config)) = (&state.result, &state.config) {
+                        bases.push(TopologyBasis {
+                            flight: Arc::clone(flight),
+                            generation: state.generation,
+                            root: crate::inspect::job::normalize_path(cached_root),
+                            walk: walk.clone(),
+                            config: Arc::clone(config),
+                            input_dirs: Arc::clone(&state.input_dirs),
+                            absorbed_files: state.absorbed_files,
+                        });
+                    }
                 }
             }
         }
@@ -462,6 +536,18 @@ impl ApplicabilityCache {
             }
             return None;
         }
+        if known
+            && active_configurations > 0
+            && ready
+            && !input_changed
+            && Self::absorb_topology_batch(paths, &normalized_paths, &bases)
+        {
+            let mut metrics = self.metrics.lock();
+            for root in roots {
+                metrics.entry(root).or_default().retained_topology_batches += 1;
+            }
+            return None;
+        }
         let cause = if input_changed {
             InvalidationCause::SelectionInput
         } else if content_only {
@@ -471,6 +557,75 @@ impl ApplicabilityCache {
         };
         self.invalidate(root, cause);
         Some(cause)
+    }
+
+    /// Whether a batch of creates, removes and renames leaves every cached
+    /// result in `bases` as a fresh walk would find it (see
+    /// [`super::manager::ApplicabilityTopologyCheck`]). The caller has ruled
+    /// out recorded inputs and marker names. Files the walk reads to apply
+    /// ignore rules, directories, unreadable paths, removed visited
+    /// directories and removed recorded files still need a walk.
+    fn absorb_topology_batch(
+        paths: &[PathBuf],
+        normalized_paths: &[PathBuf],
+        bases: &[TopologyBasis],
+    ) -> bool {
+        if bases.is_empty() || normalized_paths.iter().any(|path| names_ignore_input(path)) {
+            return false;
+        }
+        let states: Vec<_> = paths.iter().map(|path| PathState::read(path)).collect();
+        let mut absorbed = Vec::with_capacity(bases.len());
+        for basis in bases {
+            let mut check = super::manager::ApplicabilityTopologyCheck::new(
+                &basis.walk,
+                &basis.root,
+                &basis.config,
+            );
+            let mut present_files = 0;
+            for (path, state) in normalized_paths.iter().zip(&states) {
+                if !path.starts_with(&basis.root) {
+                    if basis.root.starts_with(path) {
+                        // The walk root or one of its ancestors changed.
+                        return false;
+                    }
+                    // Recorded inputs outside the root were ruled out by the
+                    // caller; nothing else outside it is walked.
+                    continue;
+                }
+                match state {
+                    PathState::Present { is_file: true, .. } => {
+                        if !check.absorbs_present_file(path) {
+                            return false;
+                        }
+                        present_files += 1;
+                    }
+                    // A directory may hold files nobody reported; a walk
+                    // skips other file types, so they change nothing.
+                    PathState::Present { is_dir: true, .. } | PathState::Unreadable => {
+                        return false;
+                    }
+                    PathState::Present { .. } => {}
+                    PathState::Missing => {
+                        if basis.input_dirs.contains(path) || !check.survives_removed_path(path) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            let entries = basis.walk.entries() + basis.absorbed_files + present_files;
+            if entries >= super::manager::APPLICABILITY_WALK_ENTRY_LIMIT {
+                return false;
+            }
+            absorbed.push(present_files);
+        }
+        for (basis, present_files) in bases.iter().zip(absorbed) {
+            let mut state = basis.flight.state.lock();
+            // A newer generation was invalidated or walked after these events.
+            if state.generation == basis.generation {
+                state.absorbed_files += present_files;
+            }
+        }
+        true
     }
 
     #[cfg(test)]
@@ -624,11 +779,18 @@ impl ApplicabilityCache {
                 "LSP applicability full walk root={} cause={} root_walk_number={} duration_micros={} dependencies={} success={}",
                 root.display(), cause, root_walk_number, elapsed.as_micros(), inputs.len(), result.is_ok()
             );
+            let input_dirs = Arc::new(input_directories(
+                &crate::inspect::job::normalize_path(root),
+                &inputs,
+            ));
             let mut state = flight.state.lock();
             // Under continuous edits, returning one uncached scan preserves the
             // uncached walk's progress. Only unchanged scans may serve new binds.
             if state.generation == running.generation && unchanged(&dependencies) {
                 if let Ok(walk) = &result {
+                    state.input_dirs = input_dirs;
+                    state.config = Some(Arc::new(config.clone()));
+                    state.absorbed_files = 0;
                     state.result = Some(walk.clone());
                     state.dependencies = dependencies;
                     state.inputs = inputs;
