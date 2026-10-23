@@ -1,6 +1,10 @@
+import { randomUUID } from "node:crypto";
 import {
+  type BigIntStats,
   closeSync,
   existsSync,
+  fstatSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -43,11 +47,24 @@ type CheckSlotLock = {
 type CheckLockOwner = {
   pid: number;
   startedMs: number;
+  token: string;
 };
 
 type CheckLockState = {
   pid: number | null;
   startedMs: number;
+};
+
+type CheckLockSnapshot = CheckLockState & {
+  token: string | null;
+  dev: bigint;
+  ino: bigint;
+  content: string;
+};
+
+type CheckSlotTestHooks = {
+  beforeTakeover?: (lockPath: string) => void;
+  beforeRestore?: (lockPath: string) => void;
 };
 
 const DEFAULT_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
@@ -182,7 +199,11 @@ async function maybeRunCheck(
  * preparePackageUpdate() + runNpmInstallSafe() so one updater cannot roll back
  * another updater's successful install from a separate process.
  */
-function claimCheckSlot(storageDir: string | null, intervalMs: number): CheckSlotLock | null {
+function claimCheckSlot(
+  storageDir: string | null,
+  intervalMs: number,
+  testHooks: CheckSlotTestHooks = {},
+): CheckSlotLock | null {
   if (!storageDir) return { release: () => {} }; // No storage available — fail open.
 
   const file = repairRootScopedStorageFile(storageDir, "opencode", TIMESTAMP_FILENAME);
@@ -191,7 +212,7 @@ function claimCheckSlot(storageDir: string | null, intervalMs: number): CheckSlo
 
     mkdirSync(dirname(file), { recursive: true });
     const lockPath = `${file}.lock`;
-    const owner = { pid: process.pid, startedMs: Date.now() };
+    const owner = { pid: process.pid, startedMs: Date.now(), token: randomUUID() };
     let lockFd: number | null = null;
     try {
       // `wx` maps to O_CREAT | O_EXCL | O_WRONLY: exactly one process wins.
@@ -208,27 +229,39 @@ function claimCheckSlot(storageDir: string | null, intervalMs: number): CheckSlo
         }
       }
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      if (!isOrphanedCheckLock(lockPath)) return null;
-
-      // Replacing the orphan atomically avoids a remove/create interval in which
-      // another process could mistake the lock as available and start a second update.
-      const replacementPath = `${lockPath}.tmp.${process.pid}`;
-      writeFileSync(replacementPath, JSON.stringify(owner), { encoding: "utf-8", mode: 0o600 });
+      // Serialize stale-owner observation and removal. A contender can still win
+      // the primary path during reclamation, so admission always ends with wx.
+      const reclaimPath = `${lockPath}.reclaim`;
+      const reclaimFd = claimReclaimGuard(reclaimPath, owner, testHooks);
+      if (reclaimFd === null) return null;
       try {
-        renameSync(replacementPath, lockPath);
-      } catch (replaceError) {
-        rmSync(replacementPath, { force: true });
-        throw replaceError;
+        const state = readCheckLockState(lockPath);
+        if (state !== null) {
+          if (!isOrphanedCheckLock(state)) return null;
+          if (!claimObservedCheckLock(lockPath, state, testHooks)) return null;
+        }
+        // A missing lock needs no removal: exclusive creation must yield to any new owner.
+        try {
+          lockFd = openSync(lockPath, "wx");
+        } catch (claimError) {
+          if ((claimError as NodeJS.ErrnoException).code === "EEXIST") return null;
+          throw claimError;
+        }
+        try {
+          writeFileSync(lockFd, JSON.stringify(owner));
+        } finally {
+          closeSync(lockFd);
+          lockFd = null;
+        }
+      } finally {
+        closeSync(reclaimFd);
+        releaseCheckLock(reclaimPath, owner);
       }
     }
 
     const lock: CheckSlotLock = {
       release: () => {
-        // A stalled owner can resume after its lock was reclaimed. Only remove the
-        // pathname when it still names this acquisition, not a replacement owner.
-        if (checkLockIsOwnedBy(lockPath, owner)) {
-          rmSync(lockPath, { force: true });
-        }
+        releaseCheckLock(lockPath, owner);
       },
     };
 
@@ -250,8 +283,91 @@ function claimCheckSlot(storageDir: string | null, intervalMs: number): CheckSlo
   }
 }
 
-function isOrphanedCheckLock(lockPath: string): boolean {
-  const state = readCheckLockState(lockPath);
+function claimReclaimGuard(
+  reclaimPath: string,
+  owner: CheckLockOwner,
+  testHooks: CheckSlotTestHooks,
+): number | null {
+  try {
+    return writeReclaimGuard(reclaimPath, owner);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+
+  // A crash can leave either owner metadata or an empty file. Reuse the primary
+  // lock's dead-process check and bounded expiry instead of blocking future starts.
+  const observed = readCheckLockState(reclaimPath);
+  if (observed !== null) {
+    if (!isOrphanedCheckLock(observed)) return null;
+    if (!claimObservedCheckLock(reclaimPath, observed, testHooks)) return null;
+  }
+  try {
+    return writeReclaimGuard(reclaimPath, owner);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
+    throw error;
+  }
+}
+
+function restoreClaimedCheckLock(claimedPath: string, lockPath: string): void {
+  try {
+    // Hard-link publication cannot overwrite a newer owner at the original path.
+    linkSync(claimedPath, lockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  rmSync(claimedPath, { force: true });
+}
+
+function claimObservedCheckLock(
+  lockPath: string,
+  observed: CheckLockSnapshot,
+  testHooks: CheckSlotTestHooks = {},
+): boolean {
+  const claimedPath = `${lockPath}.claim.${randomUUID()}`;
+  testHooks.beforeTakeover?.(lockPath);
+  try {
+    // Only the unique claim path may be removed; the original can change owners.
+    renameSync(lockPath, claimedPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw error;
+  }
+
+  let moved: CheckLockSnapshot | null;
+  try {
+    moved = readCheckLockState(claimedPath);
+  } catch (error) {
+    testHooks.beforeRestore?.(lockPath);
+    restoreClaimedCheckLock(claimedPath, lockPath);
+    throw error;
+  }
+  if (
+    moved === null ||
+    moved.dev !== observed.dev ||
+    moved.ino !== observed.ino ||
+    moved.content !== observed.content
+  ) {
+    testHooks.beforeRestore?.(lockPath);
+    restoreClaimedCheckLock(claimedPath, lockPath);
+    return false;
+  }
+  rmSync(claimedPath, { force: true });
+  return true;
+}
+
+function writeReclaimGuard(reclaimPath: string, owner: CheckLockOwner): number {
+  const fd = openSync(reclaimPath, "wx");
+  try {
+    writeFileSync(fd, JSON.stringify(owner));
+    return fd;
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+function isOrphanedCheckLock(state: CheckLockState): boolean {
   const ageMs = Date.now() - state.startedMs;
   if (ageMs >= CHECK_LOCK_STALE_MS) return true;
   if (state.pid === null) return false;
@@ -267,29 +383,58 @@ function isOrphanedCheckLock(lockPath: string): boolean {
   }
 }
 
-function readCheckLockState(lockPath: string): CheckLockState {
-  const fallbackStartedMs = statSync(lockPath).mtimeMs;
+function readCheckLockState(lockPath: string): CheckLockSnapshot | null {
+  let info: BigIntStats;
+  let content: string;
   try {
-    const parsed = JSON.parse(readFileSync(lockPath, "utf-8")) as Partial<CheckLockOwner>;
+    const observed = statSync(lockPath, { bigint: true });
+    const fd = openSync(lockPath, "r");
+    try {
+      info = fstatSync(fd, { bigint: true });
+      if (info.dev !== observed.dev || info.ino !== observed.ino) return null;
+      // Read through the same descriptor whose inode is recorded for rename verification.
+      content = readFileSync(fd, "utf-8");
+    } finally {
+      closeSync(fd);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  const identity = { dev: info.dev, ino: info.ino, content };
+  const fallbackStartedMs = Number(info.mtimeNs) / 1_000_000;
+  try {
+    const parsed = JSON.parse(content) as Partial<CheckLockOwner>;
     const pid =
       Number.isSafeInteger(parsed.pid) && (parsed.pid ?? 0) > 0 ? (parsed.pid ?? null) : null;
     const startedMs =
       typeof parsed.startedMs === "number" && Number.isFinite(parsed.startedMs)
         ? parsed.startedMs
         : fallbackStartedMs;
-    return { pid, startedMs };
+    return {
+      ...identity,
+      pid,
+      startedMs,
+      token: typeof parsed.token === "string" ? parsed.token : null,
+    };
   } catch {
     // A crash between exclusive creation and metadata write leaves an empty lock.
-    return { pid: null, startedMs: fallbackStartedMs };
+    return { ...identity, pid: null, startedMs: fallbackStartedMs, token: null };
   }
 }
 
-function checkLockIsOwnedBy(lockPath: string, owner: CheckLockOwner): boolean {
+function releaseCheckLock(lockPath: string, owner: CheckLockOwner): void {
   try {
-    const parsed = JSON.parse(readFileSync(lockPath, "utf-8")) as Partial<CheckLockOwner>;
-    return parsed.pid === owner.pid && parsed.startedMs === owner.startedMs;
-  } catch {
-    return false;
+    const state = readCheckLockState(lockPath);
+    if (
+      state?.pid === owner.pid &&
+      state.startedMs === owner.startedMs &&
+      state.token === owner.token
+    ) {
+      claimObservedCheckLock(lockPath, state);
+    }
+  } catch (error) {
+    warn(`[auto-update-checker] Could not release check lock: ${String(error)}`);
   }
 }
 

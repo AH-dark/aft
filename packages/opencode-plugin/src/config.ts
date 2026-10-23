@@ -2166,8 +2166,8 @@ export function loadAftConfig(projectDirectory: string): AftConfig {
  * path plus device, inode, size, mtime and ctime, or "absent". Any edit,
  * replacement, chmod or deletion changes it.
  */
-function configFilesIdentity(projectDirectory: string): string {
-  const { userConfigPath, projectConfigPath } = resolveCortexKitConfigPaths(projectDirectory);
+export function configFilesIdentity(projectDirectory: string): string {
+  const { userConfigPath, projectConfigPath } = resolveAftConfigPaths(projectDirectory);
   return [userConfigPath, projectConfigPath]
     .map((path) => {
       try {
@@ -2189,19 +2189,34 @@ function configFilesIdentity(projectDirectory: string): string {
  *
  * The identity is taken before loading, so a file written during the load
  * (including the loader's own migration rewrite) forces one more load next
- * time. A load that throws is not remembered, so a rejected config is retried
- * (and reported) on every call as before.
+ * time. Rejected configurations are remembered by the same identity so an
+ * unchanged invalid file is not repeatedly parsed; other failures remain retryable.
  */
 export function createUnchangedConfigLoader(
   load: (projectDirectory: string) => AftConfig,
 ): (projectDirectory: string) => AftConfig {
-  const lastLoads = new Map<string, { identity: string; config: AftConfig }>();
+  const lastLoads = new Map<
+    string,
+    { identity: string } & (
+      | { config: AftConfig; rejection?: never }
+      | { rejection: ConfigRejectedError; config?: never }
+    )
+  >();
   return (projectDirectory: string): AftConfig => {
     const identity = configFilesIdentity(projectDirectory);
     const last = lastLoads.get(projectDirectory);
-    if (last && last.identity === identity) return last.config;
-    const config = load(projectDirectory);
-    lastLoads.set(projectDirectory, { identity, config });
-    return config;
+    if (last && last.identity === identity) {
+      if (last.rejection) throw last.rejection;
+      return last.config;
+    }
+    try {
+      const config = load(projectDirectory);
+      lastLoads.set(projectDirectory, { identity, config });
+      return config;
+    } catch (error) {
+      if (error instanceof ConfigRejectedError)
+        lastLoads.set(projectDirectory, { identity, rejection: error });
+      throw error;
+    }
   };
 }
