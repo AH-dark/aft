@@ -159,7 +159,13 @@ fn discover_swiftc() -> LookupOutcome {
     {
         let mut command = Command::new("xcrun");
         command.args(["--find", "swiftc"]);
-        xcrun_lookup_outcome(run_command(command, "", Instant::now() + parse_timeout()))
+        xcrun_lookup_outcome(run_command(
+            command,
+            "swiftc",
+            "",
+            Instant::now() + parse_timeout(),
+            false,
+        ))
     }
     #[cfg(not(target_os = "macos"))]
     LookupOutcome::Missing
@@ -252,8 +258,10 @@ fn run_swiftc(path: &Path, source: &str) -> ParseOutcome {
     command.args(["-parse", "-"]);
     parse_outcome(run_command(
         command,
+        "swiftc",
         source,
         Instant::now() + parse_timeout(),
+        false,
     ))
 }
 
@@ -266,13 +274,22 @@ fn parse_outcome(result: Result<SubprocessOutcome, FormatError>) -> ParseOutcome
     }
 }
 
-fn run_command(
+/// Run a syntax-only checker that reads `source` on stdin, killing its
+/// process tree at `deadline`. Shared by the Swift and bash confirmations.
+///
+/// With `may_stop_reading`, a checker that exits before reading all of its
+/// input (bash stops at the first syntax error) is judged by its exit status;
+/// otherwise the failed write makes the run fail.
+pub(super) fn run_command(
     mut command: Command,
+    tool: &str,
     source: &str,
     deadline: Instant,
+    may_stop_reading: bool,
 ) -> Result<SubprocessOutcome, FormatError> {
-    // Do not set an environment or use pre_exec: both force fork on macOS.
-    // process_group keeps posix_spawn available while allowing timeout tree cleanup.
+    // Avoid setting an environment or using pre_exec where possible: both
+    // force fork on macOS. process_group keeps posix_spawn available while
+    // allowing timeout tree cleanup.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -285,12 +302,10 @@ fn run_command(
         .spawn()
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                FormatError::NotFound {
-                    tool: "swiftc".into(),
-                }
+                FormatError::NotFound { tool: tool.into() }
             } else {
                 FormatError::Failed {
-                    tool: "swiftc".into(),
+                    tool: tool.into(),
                     stderr: error.to_string(),
                 }
             }
@@ -299,19 +314,24 @@ fn run_command(
     let input = source.as_bytes().to_vec();
     // A large file can fill stdin; start the deadline wait before waiting for its writer.
     let writer = std::thread::spawn(move || stdin.write_all(&input));
-    let result = crate::format::wait_with_deadline(child, "swiftc", deadline, || false);
+    let result = crate::format::wait_with_deadline(child, tool, deadline, || false);
     if result.is_ok() {
-        writer
+        match writer
             .join()
             .unwrap_or_else(|_| Err(std::io::Error::other("stdin writer panicked")))
-            .map_err(|error| FormatError::Failed {
-                tool: "swiftc".into(),
-                stderr: error.to_string(),
-            })?;
+        {
+            Ok(()) => {}
+            Err(error) if may_stop_reading && error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(error) => {
+                return Err(FormatError::Failed {
+                    tool: tool.into(),
+                    stderr: error.to_string(),
+                })
+            }
+        }
     }
     result
 }
-
 #[cfg(test)]
 type Runner = Box<dyn FnMut(&str) -> ParseOutcome>;
 
@@ -880,8 +900,10 @@ mod tests {
                 command.args(["-c", "exec sleep 30"]);
                 let outcome = parse_outcome(run_command(
                     command,
+                    "swiftc",
                     source,
                     Instant::now() + Duration::from_millis(50),
+                    false,
                 ));
                 assert!(matches!(outcome, ParseOutcome::TimedOut), "{outcome:?}");
                 outcome
@@ -1169,7 +1191,13 @@ mod tests {
             let mut command = Command::new("/bin/sh");
             command.args(["-c", "sleep 6"]);
             let started = Instant::now();
-            let outcome = parse_outcome(run_command(command, "", Instant::now() + parse_timeout()));
+            let outcome = parse_outcome(run_command(
+                command,
+                "swiftc",
+                "",
+                Instant::now() + parse_timeout(),
+                false,
+            ));
             assert!(
                 matches!(outcome, ParseOutcome::Exited(Some(0))),
                 "test-only deadline should let a slow compiler startup finish: {outcome:?}"
@@ -1183,7 +1211,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let command = Command::new(temp.path().join("absent-swiftc"));
         assert!(matches!(
-            parse_outcome(run_command(command, TUPLE, Instant::now() + PARSE_TIMEOUT)),
+            parse_outcome(run_command(
+                command,
+                "swiftc",
+                TUPLE,
+                Instant::now() + PARSE_TIMEOUT,
+                false
+            )),
             ParseOutcome::Missing
         ));
     }
@@ -1215,8 +1249,10 @@ mod tests {
                     .arg(&child_pid_path);
                 let outcome = parse_outcome(run_command(
                     command,
+                    "swiftc",
                     source,
                     Instant::now() + Duration::from_millis(150),
+                    false,
                 ));
                 assert!(matches!(outcome, ParseOutcome::TimedOut));
                 outcome

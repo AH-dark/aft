@@ -2032,6 +2032,7 @@ pub(crate) fn write_format_deferred_created(
     write_format_validate_impl(path, content, config, params, true, None, true)
 }
 
+mod bash;
 mod swift;
 
 fn write_format_validate_impl(
@@ -2098,13 +2099,22 @@ fn write_format_validate_impl(
                 return check.valid;
             }
             let syntax_valid = validate_captured_syntax(path, source);
-            swift::confirm_if_needed(
-                path,
-                source,
-                pre_write_content.as_deref(),
-                &mut was_syntax_valid,
-                syntax_valid,
-            )
+            if bash::applies(path) {
+                bash::confirm_if_needed(
+                    source,
+                    pre_write_content.as_deref(),
+                    &mut was_syntax_valid,
+                    syntax_valid,
+                )
+            } else {
+                swift::confirm_if_needed(
+                    path,
+                    source,
+                    pre_write_content.as_deref(),
+                    &mut was_syntax_valid,
+                    syntax_valid,
+                )
+            }
         });
     let rolled_back = if was_syntax_valid == Some(true) && syntax_valid == Some(false) {
         if let Some(original) = pre_write_content.as_ref() {
@@ -2200,9 +2210,13 @@ pub(crate) struct CreatedFileSyntax {
 /// A new file cannot be rolled back to earlier content, so an invalid result
 /// is kept on disk and reported to the agent instead. The error line comes
 /// from the same tree-sitter parse that produced the verdict. Swift files that
-/// tree-sitter rejects are confirmed with `swiftc -parse` first, so a file the
-/// compiler accepts counts as valid and carries no error line. An unavailable
-/// compiler verdict is unknown and carries a reason instead of an error line.
+/// tree-sitter rejects are confirmed with `swiftc -parse` first, and bash
+/// files with `bash -n`, so a file the compiler or shell accepts counts as
+/// valid and carries no error line. For a bash error the shell confirms, the
+/// line bash names is preferred over tree-sitter's. An unavailable compiler or
+/// shell verdict is unknown and carries a reason instead of an error line;
+/// for bash that includes a missing shell, since tree-sitter-bash alone
+/// rejects some valid scripts.
 pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFileSyntax {
     let Some(tree) = parse_captured_syntax(path, source) else {
         return CreatedFileSyntax {
@@ -2212,13 +2226,26 @@ pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFil
         };
     };
     let root = tree.root_node();
-    let (valid, skipped_reason) =
-        match swift::confirm_created(path, source, Some(!root.has_error())) {
+    let tree_valid = Some(!root.has_error());
+    // The line bash itself named for a syntax error it confirmed.
+    let mut shell_error_line = None;
+    let (valid, skipped_reason) = if tree_valid == Some(false) && bash::applies(path) {
+        match bash::confirm_created(source) {
+            Ok(bash::ShellVerdict::Valid) => (Some(true), None),
+            Ok(bash::ShellVerdict::Broken(line)) => {
+                shell_error_line = line;
+                (Some(false), None)
+            }
+            Err(reason) => (None, Some(reason)),
+        }
+    } else {
+        match swift::confirm_created(path, source, tree_valid) {
             Ok(valid) => (valid, None),
             Err(reason) => (None, Some(reason)),
-        };
+        }
+    };
     let first_error_line = if valid == Some(false) {
-        first_syntax_error_line(root)
+        shell_error_line.or_else(|| first_syntax_error_line(root))
     } else {
         None
     };
