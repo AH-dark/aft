@@ -11,7 +11,13 @@ import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
-import { type AftConfig, createUnchangedConfigLoader, loadAftConfig } from "../config.js";
+import { createProjectAcceptance } from "../bridge-bootstrap.js";
+import {
+  type AftConfig,
+  ConfigRejectedError,
+  createUnchangedConfigLoader,
+  loadAftConfig,
+} from "../config.js";
 
 const cleanup: (() => void)[] = [];
 
@@ -45,6 +51,55 @@ function countingLoader() {
 }
 
 describe("createUnchangedConfigLoader", () => {
+  test("project acceptance revalidates boot roots and aliases after config edits", async () => {
+    const { projectDir, projectPath, userPath } = await fixture("{}", "{}");
+    let loads = 0;
+    let reject = false;
+    const accepts = createProjectAcceptance(projectDir, {
+      loadConfig: () => {
+        loads++;
+        if (reject) throw new ConfigRejectedError(["invalid"]);
+        return {} as AftConfig;
+      },
+    });
+    expect(accepts(projectDir)).toBe(true);
+    reject = true;
+    writeFileSync(projectPath, '{"changed": true}');
+    expect(accepts(projectDir)).toBe(false);
+    expect(accepts(`${projectDir}/.`)).toBe(false);
+    expect(loads).toBe(1);
+    reject = false;
+    writeFileSync(userPath, '{"changed": "again"}');
+    expect(accepts(projectDir)).toBe(true);
+    expect(loads).toBe(2);
+  });
+
+  test("unchanged config rejections reuse the error without reparsing and recover on edits", async () => {
+    const { projectDir, projectPath } = await fixture("{}", "{}");
+    let calls = 0;
+    let reject = true;
+    const load = createUnchangedConfigLoader(() => {
+      calls++;
+      if (reject) throw new ConfigRejectedError(["invalid"]);
+      return {} as AftConfig;
+    });
+    const errors: unknown[] = [];
+    for (let i = 0; i < 4; i++) {
+      try {
+        load(projectDir);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    expect(calls).toBe(1);
+    expect(errors).toHaveLength(4);
+    expect(errors.every((error) => error === errors[0])).toBe(true);
+    reject = false;
+    writeFileSync(projectPath, '{"changed": true}');
+    expect(load(projectDir)).toEqual({});
+    expect(calls).toBe(2);
+  });
+
   test("repeated loads with unchanged files run the full load once", async () => {
     const { projectDir } = await fixture(
       '{ "bash": { "wait_detach_on_user_message": false } }',

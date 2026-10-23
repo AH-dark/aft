@@ -31,6 +31,7 @@
 
 import {
   type AftTransportPool,
+  canonicalizeProjectRoot,
   DEFAULT_DISABLED_TOOLS,
   ensureBinary,
   ensureOnnxRuntime,
@@ -52,6 +53,7 @@ import {
   buildConfigTierConfigureParams,
   type ConfigLoadError,
   ConfigRejectedError,
+  configFilesIdentity,
   deliverConfigLoadNotices,
   getConfigLoadErrors,
   getConfigLoadNotices,
@@ -472,7 +474,7 @@ export async function resolveBootstrapConfig(
  * Answer "may AFT work in this project?" for projects other than the one an
  * entry booted for. There is no config switch that turns AFT off; only a
  * rejected configuration does, until it is fixed. Answers are cached per
- * project and a rejection is logged once.
+ * canonical project and config-file identity; a rejection is logged once per identity.
  */
 export function createProjectAcceptance(
   bootRoot: string,
@@ -481,10 +483,15 @@ export function createProjectAcceptance(
     "loadConfig"
   > = defaultBridgeBootstrapDependencies,
 ): (projectRoot: string) => boolean {
-  const accepted = new Map<string, boolean>([[bootRoot, true]]);
+  const canonicalBootRoot = canonicalizeProjectRoot(bootRoot);
+  const accepted = new Map<string, { identity: string; ok: boolean }>([
+    [canonicalBootRoot, { identity: configFilesIdentity(canonicalBootRoot), ok: true }],
+  ]);
   return (projectRoot) => {
+    projectRoot = canonicalizeProjectRoot(projectRoot);
+    const identity = configFilesIdentity(projectRoot);
     const cached = accepted.get(projectRoot);
-    if (cached !== undefined) return cached;
+    if (cached?.identity === identity) return cached.ok;
     let ok = true;
     try {
       dependencies.loadConfig(projectRoot);
@@ -494,7 +501,7 @@ export function createProjectAcceptance(
       log(`AFT disabled for ${projectRoot}: its configuration was rejected`);
       ok = false;
     }
-    accepted.set(projectRoot, ok);
+    accepted.set(projectRoot, { identity, ok });
     return ok;
   };
 }

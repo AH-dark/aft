@@ -1,4 +1,7 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +15,7 @@ import {
   readTuiPreferencesFile,
   resolveAftPrefs,
   TUI_PREFS_FILE_ENV,
+  watchTuiPreferences,
 } from "../tui/preferences";
 
 let dir: string;
@@ -204,6 +208,38 @@ describe("computeEffectiveOrder", () => {
 });
 
 describe("queueTuiPreferenceUpdate interop", () => {
+  test("preference writes preserve invalid shared files and recover after rejection", async () => {
+    for (const original of ['{"other": {', "[1, 2]", "null", ""]) {
+      await writeFile(file, original);
+      await expect(queueTuiPreferenceUpdate(PLUGIN_KEY, ["collapsed"], true)).rejects.toThrow();
+      expect(await readFile(file, "utf8")).toBe(original);
+    }
+    await writeFile(file, '{"other": {"order": 42}}');
+    await queueTuiPreferenceUpdate(PLUGIN_KEY, ["collapsed"], true);
+    expect((await readTuiPreferencesFile()).other).toEqual({ order: 42 });
+  });
+
+  test("preference writes reject read errors without replacing the existing path", async () => {
+    const original = '{"other": {"order": 42}}';
+    await writeFile(file, original);
+    const readMock = spyOn(fsPromises, "readFile").mockRejectedValueOnce(
+      Object.assign(new Error("unreadable preferences"), { code: "EACCES" }),
+    );
+    try {
+      await expect(queueTuiPreferenceUpdate(PLUGIN_KEY, ["collapsed"], true)).rejects.toThrow(
+        "unreadable preferences",
+      );
+    } finally {
+      readMock.mockRestore();
+    }
+    expect(await readFile(file, "utf8")).toBe(original);
+  });
+
+  test("preference writes initialize only missing shared files", async () => {
+    await queueTuiPreferenceUpdate(PLUGIN_KEY, ["collapsed"], true);
+    expect((await readTuiPreferencesFile()).aft).toEqual({ collapsed: true });
+  });
+
   test("anthropic-auth values and comments survive aft-only collapsed update", async () => {
     const original = `// my shared notes
 {
@@ -232,5 +268,66 @@ describe("queueTuiPreferenceUpdate interop", () => {
     expect(text).toContain("// my shared notes");
     expect(text).toContain("// anthropic-auth plugin");
     expect(text).toContain("// tuned");
+  });
+});
+
+describe("watchTuiPreferences", () => {
+  test("preference watcher handles asynchronous errors and closes only once", () => {
+    let closes = 0;
+    const watcher = Object.assign(new EventEmitter(), { close: () => closes++ });
+    const watchMock = spyOn(fs, "watch").mockReturnValue(watcher as unknown as fs.FSWatcher);
+    try {
+      const stop = watchTuiPreferences(() => {});
+      expect(() => watcher.emit("error", new Error("watch failed"))).not.toThrow();
+      expect(closes).toBe(1);
+      stop();
+      expect(closes).toBe(1);
+    } finally {
+      watchMock.mockRestore();
+    }
+  });
+
+  test("stopping preferences watcher suppresses an in-flight read callback", async () => {
+    let onWatch: ((event: string, filename: string) => void) | undefined;
+    let finishRead: ((text: string) => void) | undefined;
+    let changes = 0;
+    let reads = 0;
+    let readStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      readStarted = resolve;
+    });
+    const watcher = Object.assign(new EventEmitter(), { close: () => {} });
+    const watchMock = spyOn(fs, "watch").mockImplementation(((
+      _dir: unknown,
+      callback: typeof onWatch,
+    ) => {
+      onWatch = callback;
+      return watcher;
+    }) as typeof fs.watch);
+    const readMock = spyOn(fsPromises, "readFile").mockImplementation((() => {
+      reads++;
+      if (reads === 1) return Promise.resolve("old");
+      readStarted();
+      return new Promise<string>((resolve) => {
+        finishRead = resolve;
+      });
+    }) as typeof fsPromises.readFile);
+    let stop: (() => void) | undefined;
+    try {
+      stop = watchTuiPreferences(() => {
+        changes++;
+      });
+      await Promise.resolve();
+      onWatch?.("change", "tui-preferences.jsonc");
+      await started;
+      stop();
+      finishRead?.("new");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(changes).toBe(0);
+    } finally {
+      stop?.();
+      watchMock.mockRestore();
+      readMock.mockRestore();
+    }
   });
 });

@@ -161,18 +161,14 @@ async function writePreference(pluginKey: string, path: string[], value: JsonVal
   let text: string;
   try {
     text = await readFile(file, "utf8");
-  } catch {
-    text = "";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    text = TEMPLATE;
   }
-  if (text.trim() === "") text = TEMPLATE;
-
-  let root: Record<string, unknown>;
-  try {
-    const parsed = parse(text);
-    root = isRecord(parsed) ? (parsed as Record<string, unknown>) : {};
-  } catch {
-    root = {};
-  }
+  // Only a missing file can be initialized. Invalid existing bytes may belong to another plugin.
+  const parsed: unknown = parse(text);
+  if (!isRecord(parsed)) throw new Error("TUI preferences must contain an object");
+  const root = parsed;
 
   if (!isRecord(root[pluginKey])) {
     root[pluginKey] = {};
@@ -193,8 +189,10 @@ export function queueTuiPreferenceUpdate(
   path: string[],
   value: JsonValue,
 ): Promise<void> {
-  writeChain = writeChain.then(() => writePreference(pluginKey, path, value)).catch(() => {});
-  return writeChain;
+  const update = writeChain.then(() => writePreference(pluginKey, path, value));
+  // Keep subsequent writes usable while returning the actual failure to this caller.
+  writeChain = update.catch(() => {});
+  return update;
 }
 
 const WATCH_DEBOUNCE_MS = 150;
@@ -204,6 +202,7 @@ export function watchTuiPreferences(onChange: () => void): () => void {
   const name = basename(file);
   let timer: ReturnType<typeof setTimeout> | null = null;
   let lastSeen: string | null = null;
+  let stopped = false;
   void readFile(file, "utf8")
     .then((text) => {
       if (lastSeen === null) lastSeen = text;
@@ -220,17 +219,22 @@ export function watchTuiPreferences(onChange: () => void): () => void {
         void readFile(file, "utf8")
           .catch(() => null)
           .then((text) => {
-            if (text === null) return;
+            if (stopped || text === null) return;
             if (text === lastSeen) return;
             lastSeen = text;
             onChange();
           });
       }, WATCH_DEBOUNCE_MS);
     });
-    return () => {
+    const stop = () => {
+      if (stopped) return;
+      stopped = true;
       if (timer) clearTimeout(timer);
+      timer = null;
       watcher.close();
     };
+    watcher.on("error", stop);
+    return stop;
   } catch {
     return () => {};
   }
@@ -238,6 +242,6 @@ export function watchTuiPreferences(onChange: () => void): () => void {
 
 export function persistCollapsedIfEnabled(prefs: AftTuiPrefs, collapsed: boolean): void {
   if (prefs.rememberCollapsed) {
-    void queueTuiPreferenceUpdate(PLUGIN_KEY, ["collapsed"], collapsed);
+    void queueTuiPreferenceUpdate(PLUGIN_KEY, ["collapsed"], collapsed).catch(() => {});
   }
 }
