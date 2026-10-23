@@ -84,8 +84,9 @@ impl Health {
             }
             projection.revision
         };
-        // Unknown signature changes can come from another process or eviction.
-        // Keep the same next-tick detection and 30-second backstop as disk reads.
+        // Another process can write the ledger or remove its view directory.
+        // Re-read unknown signatures next tick, with a 30-second backstop for
+        // changes that leave file sizes and modification times unchanged.
         #[cfg(test)]
         super::HEALTH_READS.with(|reads| reads.set(reads.get() + 1));
         let summary = PathStatusStore::open_at(&self.path)
