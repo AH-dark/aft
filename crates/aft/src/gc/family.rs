@@ -1322,7 +1322,7 @@ fn stats() -> &'static Mutex<BTreeMap<PathBuf, SweepStats>> {
     STATS.get_or_init(Mutex::default)
 }
 
-fn update_stats(path: &Path, family: &str, update: impl FnOnce(&mut SweepStats)) {
+fn update_stats<T>(path: &Path, family: &str, update: impl FnOnce(&mut SweepStats) -> T) -> T {
     let mut stats = stats()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1331,7 +1331,7 @@ fn update_stats(path: &Path, family: &str, update: impl FnOnce(&mut SweepStats))
         .or_default();
     entry.family = family.to_owned();
     entry.family_directory = path.parent().unwrap_or(path).display().to_string();
-    update(entry);
+    update(entry)
 }
 
 pub(crate) fn record_stale_rows(path: &Path, family: &str, count: u64) {
@@ -1362,23 +1362,40 @@ impl<'a> SweepFlight<'a> {
         }
     }
     fn finish(&mut self, skipped: Option<&str>) {
-        self.finished = true;
-        update_stats(self.registry.path(), self.registry.family(), |stats| {
-            stats.skipped += u64::from(skipped.is_some());
-            stats.last_outcome = skipped.map_or_else(
-                || "completed".to_owned(),
-                |reason| format!("skipped: {reason}"),
-            );
+        self.record_outcome(skipped, false, |stats| {
             crate::slog_info!("v2 sweep family={} outcome={} acquired={} skipped={} aborted={} stale_rows_touched={}", stats.family, stats.last_outcome, stats.acquired, stats.skipped, stats.aborted, stats.stale_rows_touched);
         });
+    }
+
+    fn record_outcome(
+        &mut self,
+        skipped: Option<&str>,
+        aborted: bool,
+        emit: impl FnOnce(&SweepStats),
+    ) {
+        self.finished = true;
+        let snapshot = update_stats(self.registry.path(), self.registry.family(), |stats| {
+            stats.skipped += u64::from(skipped.is_some());
+            stats.aborted += u64::from(aborted);
+            stats.last_outcome = if aborted {
+                "aborted".to_owned()
+            } else {
+                skipped.map_or_else(
+                    || "completed".to_owned(),
+                    |reason| format!("skipped: {reason}"),
+                )
+            };
+            stats.clone()
+        });
+        // A slow synchronous sink must not hold the statistics lock: touches
+        // in unrelated families also update these counters.
+        emit(&snapshot);
     }
 }
 impl Drop for SweepFlight<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            update_stats(self.registry.path(), self.registry.family(), |stats| {
-                stats.aborted += 1;
-                stats.last_outcome = "aborted".to_owned();
+            self.record_outcome(None, true, |stats| {
                 crate::slog_warn!("v2 sweep family={} outcome=aborted acquired={} skipped={} aborted={} stale_rows_touched={}", stats.family, stats.acquired, stats.skipped, stats.aborted, stats.stale_rows_touched);
             });
         }
@@ -1388,6 +1405,47 @@ impl Drop for SweepFlight<'_> {
 #[cfg(test)]
 mod sweep_stats_tests {
     use super::*;
+
+    #[test]
+    fn sweep_logging_does_not_block_other_family_touches() {
+        for aborted in [false, true] {
+            let log_dir = tempfile::tempdir().unwrap();
+            let touch_dir = tempfile::tempdir().unwrap();
+            let logger = crate::gc::family_read_tests::build(log_dir.path(), 1, |_| true);
+            let touched = crate::gc::family_read_tests::build(touch_dir.path(), 1, |_| true);
+            touched.store.raise_epoch(1).unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let registry = logger.registry.clone();
+            let logging = std::thread::spawn(move || {
+                let mut flight = SweepFlight::new(&registry);
+                flight.record_outcome(None, aborted, |_| {
+                    // Block at the synchronous emission boundary; the normal
+                    // file sink is asynchronous and cannot model this stall.
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let store = touched.store.clone();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let touching = std::thread::spawn(move || {
+                let report = store
+                    .touch(&[crate::gc::family_read_tests::chunk_key(0)])
+                    .unwrap();
+                done_tx.send(report.touched).unwrap();
+            });
+            let completed_while_log_held = done_rx.recv_timeout(Duration::from_secs(2)).ok();
+            release_tx.send(()).unwrap();
+            logging.join().unwrap();
+            touching.join().unwrap();
+            assert_eq!(
+                completed_while_log_held,
+                Some(1),
+                "a blocked sweep log must not stall another family's touch (aborted={aborted})"
+            );
+        }
+    }
 
     #[test]
     fn health_counts_skipped_aborted_and_actual_stale_row_updates_per_family() {
