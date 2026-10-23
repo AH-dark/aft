@@ -310,7 +310,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         file: "bash_permissions/scan.rs",
         enclosing_item: "top_level_directory_targets, MAX_CWD_PATHS, insert",
         location_or_primitive: "MAX_CWD_PATHS",
-        reason: "internal cwd analysis retains at most eight folders per exit-status branch; exceeding that bound makes the folder unknown rather than removing alternatives, and no response list is shortened",
+        reason: "internal cwd analysis retains at most eight folder/mode states per exit-status branch; exceeding that bound makes the folder unknown rather than removing alternatives, and no response list is shortened",
     },
     ExclusionEntry {
         file: "standalone_input.rs",

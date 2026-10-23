@@ -257,48 +257,92 @@ pub(crate) struct DirectoryTarget {
     pub literal_absolute: bool,
 }
 
-/// Follow reachable outer-shell directory changes, retaining cwd alternatives
-/// separately for successful and failed commands so `&&` and `||` stay correlated.
+/// Follow reachable outer-shell folder and physical-mode alternatives, keeping
+/// successful and failed commands separate so `&&` and `||` stay correlated.
 #[cfg(any(unix, test))]
 pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<DirectoryTarget> {
     const MAX_CWD_PATHS: usize = 8;
 
+    #[derive(Clone, PartialEq, Eq)]
+    struct ShellState {
+        cwd: PathBuf,
+        physical: bool,
+    }
     #[derive(Clone)]
     enum Paths {
-        Known(Vec<PathBuf>),
-        Unknown,
+        Known(Vec<ShellState>),
+        // The folder is unknown, but its default cd mode may still be known.
+        Unknown(Option<bool>),
     }
     impl Paths {
         fn empty() -> Self {
             Self::Known(Vec::new())
         }
-        fn one(path: PathBuf) -> Self {
-            Self::Known(vec![path])
+        fn one(cwd: PathBuf, physical: bool) -> Self {
+            Self::Known(vec![ShellState { cwd, physical }])
         }
         fn is_empty(&self) -> bool {
             matches!(self, Self::Known(paths) if paths.is_empty())
         }
-        fn insert(&mut self, path: PathBuf) {
-            if let Self::Known(paths) = self {
-                if !paths.contains(&path) {
-                    // Too many possible folders make the set unknown; never discard
-                    // just the extra folder and keep pretending the set is complete.
-                    if paths.len() >= MAX_CWD_PATHS {
-                        *self = Self::Unknown;
-                    } else {
-                        paths.push(path);
-                    }
+        fn mode(&self) -> Option<bool> {
+            match self {
+                Self::Unknown(mode) => *mode,
+                Self::Known(states) => {
+                    let first = states.first()?.physical;
+                    states
+                        .iter()
+                        .all(|state| state.physical == first)
+                        .then_some(first)
                 }
             }
         }
+        fn insert(&mut self, state: ShellState) {
+            match self {
+                Self::Unknown(mode) => {
+                    if *mode != Some(state.physical) {
+                        *mode = None;
+                    }
+                }
+                Self::Known(paths) if !paths.contains(&state) => {
+                    // Too many possible shell states make the set unknown; never discard
+                    // just the extra folder and keep pretending the set is complete.
+                    if paths.len() >= MAX_CWD_PATHS {
+                        let mode = paths
+                            .iter()
+                            .all(|path| path.physical == state.physical)
+                            .then_some(state.physical);
+                        *self = Self::Unknown(mode);
+                    } else {
+                        paths.push(state);
+                    }
+                }
+                _ => {}
+            }
+        }
         fn union(mut self, other: Self) -> Self {
+            if self.is_empty() {
+                return other;
+            }
             match other {
-                Self::Unknown => Self::Unknown,
+                Self::Unknown(mode) => Self::Unknown(if self.mode() == mode { mode } else { None }),
                 Self::Known(paths) => {
                     for path in paths {
                         self.insert(path);
                     }
                     self
+                }
+            }
+        }
+        fn with_physical(self, physical: bool) -> Self {
+            match self {
+                Self::Unknown(_) => Self::Unknown(Some(physical)),
+                Self::Known(states) => {
+                    let mut result = Self::empty();
+                    for mut state in states {
+                        state.physical = physical;
+                        result.insert(state);
+                    }
+                    result
                 }
             }
         }
@@ -335,18 +379,93 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
         And,
         Or,
     }
+    enum SetModeChange {
+        Unchanged,
+        Set(bool),
+        Unknown,
+    }
 
     fn literal_word(raw: &str) -> Option<String> {
         let mut parsed = crate::bash_rewrite::parser::parse(raw)?;
         (parsed.args.len() == 1 && parsed.appends_to.is_none() && parsed.heredoc.is_none())
             .then(|| parsed.args.remove(0))
     }
+    /// Non-literal arguments while parsing `set` options may change physical mode.
+    fn set_mode_change(parts: &[Part]) -> SetModeChange {
+        let mut change = SetModeChange::Unchanged;
+        let mut args = parts.iter().skip(1);
+        while let Some(part) = args.next() {
+            let Some(word) = literal_word(&part.text) else {
+                return SetModeChange::Unknown;
+            };
+            if matches!(word.as_str(), "--" | "-" | "+") {
+                break;
+            }
+            if !word.starts_with(['-', '+']) {
+                break;
+            }
+            let enabled = word.starts_with('-');
+            let mut flags = word[1..].chars().peekable();
+            while let Some(flag) = flags.next() {
+                match flag {
+                    'P' => change = SetModeChange::Set(enabled),
+                    'o' => {
+                        if flags.peek().is_some() {
+                            return SetModeChange::Unknown;
+                        }
+                        let Some(option) = args.next() else {
+                            return change;
+                        };
+                        let Some(option) = literal_word(&option.text) else {
+                            return SetModeChange::Unknown;
+                        };
+                        if option == "physical" {
+                            change = SetModeChange::Set(enabled);
+                        } else if !matches!(
+                            option.as_str(),
+                            "allexport"
+                                | "braceexpand"
+                                | "emacs"
+                                | "errexit"
+                                | "errtrace"
+                                | "functrace"
+                                | "hashall"
+                                | "histexpand"
+                                | "history"
+                                | "ignoreeof"
+                                | "keyword"
+                                | "monitor"
+                                | "noclobber"
+                                | "noexec"
+                                | "noglob"
+                                | "nolog"
+                                | "notify"
+                                | "nounset"
+                                | "onecmd"
+                                | "pipefail"
+                                | "posix"
+                                | "privileged"
+                                | "verbose"
+                                | "vi"
+                                | "xtrace"
+                        ) {
+                            return SetModeChange::Unknown;
+                        }
+                    }
+                    flag if "abefhkmnptuvxBCEHT".contains(flag) => {}
+                    _ => return SetModeChange::Unknown,
+                }
+            }
+        }
+        change
+    }
     fn resolve_target(
         head: &str,
         parts: &[Part],
         cwd: Option<&Path>,
+        default_physical: bool,
     ) -> Option<(DirectoryTarget, PathBuf)> {
-        let mut physical = false;
+        let mut physical = default_physical;
         let mut options = true;
         let mut operand = None;
         for part in parts.iter().skip(1) {
@@ -420,23 +539,40 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
     ) -> Flow {
         let mut success = Paths::empty();
         let mut emitted: Vec<DirectoryTarget> = Vec::new();
-        let mut resolve = |cwd| {
-            if let Some((target, next_cwd)) = resolve_target(head, parts, cwd) {
-                success.insert(next_cwd);
+        let mut resolve = |cwd, physical, tracked_mode| {
+            if let Some((target, next_cwd)) = resolve_target(head, parts, cwd, physical) {
+                if let Some(physical) = tracked_mode {
+                    success.insert(ShellState {
+                        cwd: next_cwd,
+                        physical,
+                    });
+                } else {
+                    success = Paths::Unknown(None);
+                }
                 if !emitted.iter().any(|previous| previous.path == target.path) {
                     emitted.push(target);
                 }
             } else {
-                success = Paths::Unknown;
+                success = success.clone().union(Paths::Unknown(tracked_mode));
             }
         };
         match &incoming {
             Paths::Known(paths) => {
-                for path in paths {
-                    resolve(Some(path.as_path()));
+                for state in paths {
+                    resolve(
+                        Some(state.cwd.as_path()),
+                        state.physical,
+                        Some(state.physical),
+                    );
                 }
             }
-            Paths::Unknown => resolve(None),
+            Paths::Unknown(Some(physical)) => resolve(None, *physical, Some(*physical)),
+            Paths::Unknown(None) => {
+                // Inspect absolute targets in both modes without guessing how
+                // later relative changes would behave.
+                resolve(None, false, None);
+                resolve(None, true, None);
+            }
         }
         targets.extend(emitted);
         // A failed cd/pushd leaves its incoming directory unchanged.
@@ -452,7 +588,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
     ) {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            let _ = evaluate(child, source, Paths::Unknown, targets);
+            let _ = evaluate(child, source, Paths::Unknown(None), targets);
         }
     }
     fn evaluate(
@@ -465,7 +601,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
             return Flow::success(incoming);
         }
         match node.kind() {
-            "subshell" => return Flow::either(Paths::Unknown),
+            "subshell" => return Flow::either(Paths::Unknown(incoming.mode())),
             "command_substitution" | "process_substitution" => return Flow::either(incoming),
             "function_definition" => return Flow::success(incoming),
             "if_statement"
@@ -477,7 +613,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                 // Unsupported control flow loses cwd precision; independently
                 // resolvable targets remain inspectable without choosing a branch.
                 inspect_independent_children(node, source, targets);
-                return Flow::either(Paths::Unknown);
+                return Flow::either(Paths::Unknown(None));
             }
             "negated_command" => {
                 if let Some(body) = node.named_child(0) {
@@ -512,10 +648,31 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                         directory_change(head, &parts, incoming, targets)
                     }
                     Some("popd") => Flow {
-                        success: Paths::Unknown,
+                        success: Paths::Unknown(incoming.mode()),
                         failure: incoming,
                     },
-                    Some("source" | "." | "eval") | None => Flow::either(Paths::Unknown),
+                    Some("source" | "." | "eval") | None => Flow::either(Paths::Unknown(None)),
+                    Some("set") => {
+                        let flow = match set_mode_change(&parts) {
+                            SetModeChange::Unchanged => Flow::success(incoming.clone()),
+                            SetModeChange::Set(physical) => {
+                                Flow::success(incoming.clone().with_physical(physical))
+                            }
+                            SetModeChange::Unknown => Flow::either(Paths::Unknown(None)),
+                        };
+                        let mut cursor = node.walk();
+                        if node
+                            .named_children(&mut cursor)
+                            .any(|child| child.kind().contains("redirect"))
+                        {
+                            Flow {
+                                success: flow.success,
+                                failure: flow.failure.union(incoming),
+                            }
+                        } else {
+                            flow
+                        }
+                    }
                     Some("false") => Flow::failure(incoming),
                     Some("true" | ":") => {
                         let mut cursor = node.walk();
@@ -535,6 +692,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
         }
         let mut flow: Option<Flow> = None;
         let mut operator = Operator::Sequence;
+        let mut asynchronous_entry = incoming.clone();
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             match child.kind() {
@@ -547,7 +705,9 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                     continue;
                 }
                 "&" => {
-                    flow = flow.map(|_| Flow::either(Paths::Unknown));
+                    // The asynchronous list ran in a child shell. Its final cwd
+                    // and options must not replace the foreground entry state.
+                    flow = flow.map(|_| Flow::success(asynchronous_entry.clone()));
                     operator = Operator::Sequence;
                     continue;
                 }
@@ -558,7 +718,10 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
             flow = Some(match flow.take() {
                 None => evaluate(child, source, incoming.clone(), targets),
                 Some(left) => match operator {
-                    Operator::Sequence => evaluate(child, source, left.all(), targets),
+                    Operator::Sequence => {
+                        asynchronous_entry = left.all();
+                        evaluate(child, source, asynchronous_entry.clone(), targets)
+                    }
                     Operator::And => {
                         let right = evaluate(child, source, left.success, targets);
                         Flow {
@@ -585,7 +748,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
         let _ = evaluate(
             tree.root_node(),
             command,
-            Paths::one(cwd.to_path_buf()),
+            Paths::one(cwd.to_path_buf(), false),
             &mut targets,
         );
     }
@@ -1020,6 +1183,51 @@ mod tests {
     }
 
     #[test]
+    fn directory_targets_background_lists_preserve_foreground() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let cases = [
+            (
+                "cd nested & cd child & cd ..",
+                vec![
+                    cwd.join("nested"),
+                    cwd.join("child"),
+                    cwd.parent().unwrap().to_path_buf(),
+                ],
+            ),
+            (
+                "false && cd nested & cd ..",
+                vec![cwd.parent().unwrap().to_path_buf()],
+            ),
+            ("sleep 1 & false && cd ..", vec![]),
+            (
+                "cd nested && { sleep 1 & cd ..; }",
+                vec![cwd.join("nested"), cwd.clone()],
+            ),
+            ("sleep 1 & cd ..", vec![cwd.parent().unwrap().to_path_buf()]),
+            (
+                "cd nested & cd ..",
+                vec![cwd.join("nested"), cwd.parent().unwrap().to_path_buf()],
+            ),
+            (
+                "cd nested && sleep 1 & cd ..",
+                vec![cwd.join("nested"), cwd.parent().unwrap().to_path_buf()],
+            ),
+            (
+                "cd nested; sleep 1 & cd ..",
+                vec![
+                    cwd.join("nested"),
+                    cwd.clone(),
+                    cwd.parent().unwrap().to_path_buf(),
+                ],
+            ),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(directory_paths(command, &cwd), expected, "{command}");
+        }
+    }
+
+    #[test]
     fn directory_targets_preserve_success_and_failure_reachability() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap();
@@ -1182,6 +1390,162 @@ mod tests {
                 cwd.parent().unwrap().join("$literal")
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_targets_track_shell_physical_mode_and_async_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let deep = root.join("deep");
+        std::fs::create_dir(&deep).unwrap();
+        std::os::unix::fs::symlink("..", deep.join("link")).unwrap();
+        let parent = root.parent().unwrap().to_path_buf();
+        for (command, expected) in [
+            (
+                "set -P; cd link && cd ..",
+                vec![root.clone(), parent.clone()],
+            ),
+            (
+                "set -o physical; cd link && cd ..",
+                vec![root.clone(), parent.clone()],
+            ),
+            (
+                "set -P; set +P; cd link && cd ..",
+                vec![root.clone(), deep.clone()],
+            ),
+            (
+                "set -o physical; set +o physical; cd link && cd ..",
+                vec![root.clone(), deep.clone()],
+            ),
+            (
+                "set -P; cd -L link && cd ..",
+                vec![root.clone(), parent.clone()],
+            ),
+            (
+                "set -P; cd -L link && cd -L ..",
+                vec![root.clone(), deep.clone()],
+            ),
+            (
+                "set -- -P; cd link && cd ..",
+                vec![root.clone(), deep.clone()],
+            ),
+            (
+                "set value -P; cd link && cd ..",
+                vec![root.clone(), deep.clone()],
+            ),
+            (
+                "set -eP; cd link && cd ..",
+                vec![root.clone(), parent.clone()],
+            ),
+            (
+                "set -P +P; cd link && cd ..",
+                vec![root.clone(), deep.clone()],
+            ),
+            (
+                "false && set -P; cd link && cd ..",
+                vec![root.clone(), deep.clone()],
+            ),
+            (
+                "true || set -P; cd link && cd ..",
+                vec![root.clone(), deep.clone()],
+            ),
+            (
+                "set -P; false || cd link && cd ..",
+                vec![root.clone(), parent.clone()],
+            ),
+            (
+                "set -P & cd link && cd ..",
+                vec![root.clone(), deep.clone()],
+            ),
+            (
+                "set -P; set +P & cd link && cd ..",
+                vec![root.clone(), parent.clone()],
+            ),
+            (
+                "set -P && : & cd link && cd ..",
+                vec![root.clone(), deep.clone()],
+            ),
+            ("cd link && : & cd ..", vec![root.clone(), root.clone()]),
+            ("set -o; cd link && cd ..", vec![root.clone(), deep.clone()]),
+        ] {
+            let output = std::process::Command::new("/bin/bash")
+                .args([
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    &format!("{command} && pwd -P; code=$?; wait; exit \"$code\""),
+                ])
+                .current_dir(&deep)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{command}: {output:?}");
+            assert_eq!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .lines()
+                    .last()
+                    .unwrap()
+                    .trim(),
+                expected.last().unwrap().to_str().unwrap(),
+                "{command}"
+            );
+            assert_eq!(directory_paths(command, &deep), expected, "{command}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_targets_unknown_mode_requires_explicit_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let deep = root.join("deep");
+        std::fs::create_dir(&deep).unwrap();
+        std::os::unix::fs::symlink("..", deep.join("link")).unwrap();
+        for prefix in [
+            "source ./script",
+            "eval \"$X\"",
+            "set \"$OPTS\"",
+            "set -o \"$OPT\"",
+            "set -o unsupported",
+            "set -P \"$OPTS\"",
+        ] {
+            assert!(
+                directory_paths(&format!("{prefix}; cd link && cd .."), &deep).is_empty(),
+                "{prefix}"
+            );
+            let logical = format!(
+                "{prefix}; set +P; cd '{}' && cd link && cd ..",
+                deep.display()
+            );
+            assert_eq!(
+                directory_paths(&logical, &deep),
+                vec![deep.clone(), root.clone(), deep.clone()],
+                "{prefix}"
+            );
+            let physical = format!(
+                "{prefix}; set -P; cd '{}' && cd link && cd ..",
+                deep.display()
+            );
+            assert_eq!(
+                directory_paths(&physical, &deep),
+                vec![
+                    deep.clone(),
+                    root.clone(),
+                    root.parent().unwrap().to_path_buf()
+                ],
+                "{prefix}"
+            );
+        }
+        for command in ["set -- \"$X\"; cd ..", "set value \"$X\"; cd .."] {
+            assert_eq!(
+                directory_paths(command, &deep),
+                vec![root.clone()],
+                "{command}"
+            );
+        }
     }
 
     #[cfg(unix)]
