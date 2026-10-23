@@ -33,10 +33,10 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 19;
+pub const CURRENT_SCHEMA_VERSION: u32 = 20;
 
 const MIGRATION_VERSIONS: &[u32] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
 ];
 
 // Performance-only indexes do not change the table format or reader floor.
@@ -989,6 +989,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         17 => conn.execute_batch(access_asks::MIGRATION),
         18 => conn.execute_batch(access_grants::MODES_MIGRATION),
         19 => call_ledger::migrate_result_source(conn),
+        20 => apply_migration_v20(conn),
         _ => Ok(()),
     }
 }
@@ -1002,6 +1003,22 @@ fn apply_migration_v4(conn: &Connection) -> rusqlite::Result<()> {
 
     if !columns.iter().any(|column| column == "restore_meta") {
         conn.execute_batch(MIGRATION_V4)?;
+    }
+    Ok(())
+}
+
+fn apply_migration_v20(conn: &Connection) -> rusqlite::Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(bash_pattern_watches)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|column| column == "each_line") {
+        conn.execute_batch(
+            "ALTER TABLE bash_pattern_watches ADD COLUMN each_line INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    if !columns.iter().any(|column| column == "match_batch") {
+        conn.execute_batch("ALTER TABLE bash_pattern_watches ADD COLUMN match_batch TEXT")?;
     }
     Ok(())
 }
@@ -1401,6 +1418,50 @@ mod tests {
                 panic!("migration V{version} failed when applied a second time: {error}")
             });
         }
+    }
+
+    #[test]
+    fn migration_v20_opens_v19_with_default_first_match_and_new_reader_floor() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = Connection::open(&path).unwrap();
+        for version in 1..=19 {
+            apply_migration_statements(&conn, version).unwrap();
+        }
+        conn.execute("INSERT INTO schema_version(version) VALUES (19)", [])
+            .unwrap();
+        drop(conn);
+        crate::reader_floor::raise(
+            dir.path(),
+            &[(crate::persisted_format::PersistedStore::AftDb, 19)],
+        )
+        .unwrap();
+        assert!(crate::reader_floor::prepare(dir.path()).is_empty());
+        let conn = open(&path).unwrap();
+        assert_eq!(schema_version(&conn), 20);
+        let columns = conn
+            .prepare("PRAGMA table_info(bash_pattern_watches)")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(columns.contains(&("each_line".into(), "INTEGER".into(), true, Some("0".into()))));
+        assert!(columns.contains(&("match_batch".into(), "TEXT".into(), false, None)));
+        assert_eq!(
+            crate::reader_floor::read(dir.path())
+                .unwrap()
+                .unwrap()
+                .get(crate::persisted_format::PersistedStore::AftDb),
+            Some(20)
+        );
     }
 
     #[test]

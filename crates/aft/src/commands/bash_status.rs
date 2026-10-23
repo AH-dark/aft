@@ -256,6 +256,13 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                         offset,
                     ) {
                         Ok(page) => {
+                            data["output_page_text"] =
+                                json!(ctx.bash_background().masked_status_page(
+                                    &task_id,
+                                    artifact,
+                                    offset.min(page.next_offset),
+                                    &page.bytes
+                                ));
                             if mode == BgMode::Pty
                                 && matches!(output_mode.as_deref(), Some("raw" | "both"))
                             {
@@ -286,6 +293,13 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                             offset,
                         ) {
                             Ok(page) => {
+                                data["stderr_page_text"] =
+                                    json!(ctx.bash_background().masked_status_page(
+                                        &task_id,
+                                        crate::bash_background::persistence::TaskArtifact::Stderr,
+                                        offset.min(page.next_offset),
+                                        &page.bytes
+                                    ));
                                 data["stderr_chunk_base64"] =
                                     json!(base64::engine::general_purpose::STANDARD
                                         .encode(page.bytes));

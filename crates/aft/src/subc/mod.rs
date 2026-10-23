@@ -13491,6 +13491,7 @@ pub(crate) mod test_support {
 
     pub(super) fn pattern_match_frame(session_id: &str) -> PushFrame {
         PushFrame::BashPatternMatch(BashPatternMatchFrame {
+            batch: None,
             frame_type: "bash_pattern_match",
             task_id: "task-pattern".to_string(),
             session_id: session_id.to_string(),
