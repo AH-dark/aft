@@ -1968,25 +1968,49 @@ fn real_rustup_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(".rustup"))
 }
 
-#[cfg(target_os = "macos")]
-fn real_cargo() -> PathBuf {
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
-    std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".cargo"))
-        .join("bin/cargo")
-}
-
 /// Run `cargo build --offline` from the worker shell with the throwaway
 /// CARGO_HOME (the shell's HOME default) and the real toolchain.
 #[cfg(target_os = "macos")]
 fn cargo_build(jail: &Jail, prefix: &str, marker: &str) -> String {
     format!(
-        "cd {} && {prefix} RUSTUP_HOME={} {} build --offline -q && echo \"{marker}_$((1+1))\"",
+        "cd {} && command -v cargo && {prefix} RUSTUP_HOME={} cargo build --offline -q && echo \"{marker}_$((1+1))\"",
         quote(&jail.worktree),
         quote(&real_rustup_home()),
-        quote(&real_cargo()),
     )
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_jail_cargo_uses_jailed_path_not_cargo_home() {
+    let mut jail = Jail::start_with_layout_and_env(
+        None,
+        None,
+        true,
+        "strict",
+        false,
+        false,
+        |base, command| {
+            let bin = base.join("toolchain/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            executable(
+                &bin.join("cargo"),
+                "#!/bin/sh\nprintf 'PATH_CARGO %s\\n' \"$*\"\n",
+            );
+            let mut paths = vec![bin];
+            paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+            command.env("PATH", std::env::join_paths(paths).unwrap());
+        },
+    )
+    .await;
+    // The shell must resolve the stub from PATH, without relying on ~/.cargo/bin.
+    assert!(!jail.home.join(".cargo/bin/cargo").exists());
+    let reply = jail.bash(&cargo_build(&jail, "", "PATHCARGO")).await;
+    assert!(reply.contains("PATH_CARGO build --offline -q"), "{reply}");
+    assert!(reply.contains("PATHCARGO_2"), "{reply}");
+    assert!(
+        reply.contains(&jail.base.join("toolchain/bin/cargo").display().to_string()),
+        "{reply}"
+    );
 }
 
 #[cfg(target_os = "macos")]

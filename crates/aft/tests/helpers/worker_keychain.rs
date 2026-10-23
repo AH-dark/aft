@@ -152,13 +152,13 @@ async fn worker_jail_keychain_build_and_tls_compatibility() {
             "fn main() { println!(\"LINKED_BINARY_OK\"); }\n#[test] fn arithmetic() { assert_eq!(2 + 2, 4); }\n",
         ).unwrap();
         let build = jail.bash(&format!(
-            "cd {} && RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= RUSTUP_HOME={} {} build --offline --target-dir target && echo BUILD_$((1+1))",
-            quote(&jail.worktree), quote(&real_rustup_home()), quote(&real_cargo()),
+            "cd {} && command -v cargo && RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= RUSTUP_HOME={} cargo build --offline --target-dir target && echo BUILD_$((1+1))",
+            quote(&jail.worktree), quote(&real_rustup_home()),
         )).await;
         assert!(build.contains("BUILD_2"), "{profile}: {build}");
         let reply = jail.bash(&format!(
-            "cd {} && RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= RUSTUP_HOME={} {} test --offline --target-dir target && ./target/debug/jailcrate && echo TEST_$((1+1))",
-            quote(&jail.worktree), quote(&real_rustup_home()), quote(&real_cargo()),
+            "cd {} && command -v cargo && RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= RUSTUP_HOME={} cargo test --offline --target-dir target && ./target/debug/jailcrate && echo TEST_$((1+1))",
+            quote(&jail.worktree), quote(&real_rustup_home()),
         )).await;
         assert!(reply.contains("1 passed"), "{profile}: {reply}");
         assert!(reply.contains("LINKED_BINARY_OK"), "{profile}: {reply}");
