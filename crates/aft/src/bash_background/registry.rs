@@ -444,6 +444,21 @@ static TERMINAL_PUBLICATION_GATES: std::sync::OnceLock<Mutex<HashMap<String, Kil
     std::sync::OnceLock::new();
 
 #[cfg(test)]
+static REHYDRATED_REGISTRATION_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGate>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn wait_on_rehydrated_registration_gate_for_test(task_id: &str) {
+    let gate = REHYDRATED_REGISTRATION_GATES
+        .get()
+        .and_then(|gates| gates.lock().unwrap().remove(task_id));
+    if let Some(gate) = gate {
+        let _ = gate.reached.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn install_kill_signal_gate_for_test(
     task_id: &str,
@@ -1058,6 +1073,8 @@ pub(crate) struct RegistryInner {
     before_promotion_commit:
         Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     pub(crate) tasks: Mutex<HashMap<String, Arc<BgTask>>>,
+    drain_reply_slots:
+        Mutex<HashMap<(String, String), std::sync::Weak<Mutex<BashDrainReplyState>>>>,
     /// Session owners of output files recovered from task records on disk.
     /// Identity snapshots prevent cached permissions from following a replaced
     /// I/O directory without keeping a descriptor open for each historical task.
@@ -1197,6 +1214,64 @@ struct WaitDetachState {
 
 const PENDING_WAIT_DETACH_TTL: Duration = Duration::from_secs(120);
 
+/// A detach target shares this cache with the task's metadata writers. Its
+/// mutex only protects published values: no disk or task-state work runs under it.
+#[derive(Clone, Default)]
+pub(crate) struct BashDrainReplyCache(Arc<Mutex<BashDrainReplyState>>);
+
+#[derive(Clone, Default)]
+pub(crate) struct BashDrainReplyState {
+    pub(crate) execution_note: Option<String>,
+    pub(crate) deadline: Option<(HardKillDeadline, u64)>,
+    pub(crate) inputs_captured: Option<bool>,
+    /// Artifact-free terminal diagnostics, published with the metadata before
+    /// the full output renderer can finish the canonical response below.
+    pub(crate) uncaptured_terminal_facts: Option<Arc<crate::protocol::Response>>,
+    pub(crate) uncaptured_terminal: Option<Arc<crate::protocol::Response>>,
+}
+
+impl BashDrainReplyCache {
+    fn publish_metadata(&self, metadata: &PersistedTask, renewable: bool) {
+        let note = rendered_execution_note(metadata);
+        let deadline = HardKillDeadline::from_metadata(metadata.timeout_ms, renewable)
+            .map(|deadline| (deadline, metadata.started_at));
+        let inputs_captured = metadata
+            .remote
+            .as_ref()
+            .filter(|remote| remote.explicit_runon)
+            .map(|remote| remote.accepted);
+        let terminal_facts =
+            (inputs_captured == Some(false) && metadata.is_terminal()).then(|| {
+                let mut snapshot = terminal_metadata_snapshot(metadata.clone());
+                if let Some(note) = &note {
+                    snapshot.output_preview = format!("{note}\n");
+                }
+                append_remote_report(&mut snapshot.output_preview, metadata);
+                Arc::new(
+                    crate::commands::bash_orchestrate::foreground_result_response("", snapshot),
+                )
+            });
+        let mut published = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        published.execution_note = note;
+        published.deadline = deadline;
+        published.inputs_captured = inputs_captured;
+        published.uncaptured_terminal_facts = terminal_facts;
+        if inputs_captured != Some(false) || !metadata.is_terminal() {
+            published.uncaptured_terminal = None;
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> BashDrainReplyState {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 pub(crate) struct BgTask {
     /// Absent after replay: secret values must never be persisted or recovered
     /// from payload files. Completion notices withhold output when this is absent.
@@ -1250,6 +1325,7 @@ pub(crate) struct BgTask {
     /// and the worker clears it as its last step.
     #[cfg(unix)]
     pub(crate) remote_worker_running: AtomicBool,
+    drain_reply: BashDrainReplyCache,
     /// Cache construction is serialized independently of task state: renderers
     /// can read artifacts and invoke callbacks without holding the state lock.
     terminal_render: Mutex<()>,
@@ -1583,6 +1659,7 @@ impl BgTaskRegistry {
                 #[cfg(test)]
                 before_promotion_commit: Mutex::new(None),
                 tasks: Mutex::new(HashMap::new()),
+                drain_reply_slots: Mutex::new(HashMap::new()),
                 persisted_artifact_owners: Mutex::new(HashMap::new()),
                 task_read_records: Mutex::new(VecDeque::new()),
                 #[cfg(test)]
@@ -2545,6 +2622,35 @@ impl BgTaskRegistry {
         launch
     }
 
+    pub(crate) fn drain_reply_cache(&self, task_id: &str, session: &str) -> BashDrainReplyCache {
+        // Startup can hand back an ID before inserting the task. Keep that
+        // target and the eventual task on the same slot, without retaining
+        // cache values after both have gone away.
+        let mut slots = self
+            .inner
+            .drain_reply_slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (task_id.to_owned(), session.to_owned());
+        if let Some(cache) = slots.get(&key).and_then(std::sync::Weak::upgrade) {
+            return BashDrainReplyCache(cache);
+        }
+        slots.retain(|_, slot| slot.strong_count() > 0);
+        let cache = BashDrainReplyCache::default();
+        slots.insert(key, Arc::downgrade(&cache.0));
+        cache
+    }
+
+    fn new_drain_reply_cache(
+        &self,
+        metadata: &PersistedTask,
+        renewable: bool,
+    ) -> BashDrainReplyCache {
+        let cache = self.drain_reply_cache(&metadata.task_id, &metadata.session_id);
+        cache.publish_metadata(metadata, renewable);
+        cache
+    }
+
     pub(crate) fn is_remote_task(&self, task_id: &str, session: &str) -> bool {
         self.task_for_session(task_id, session)
             .is_some_and(|t| t.lock_state().is_ok_and(|s| s.metadata.remote.is_some()))
@@ -2693,6 +2799,7 @@ impl BgTaskRegistry {
         };
 
         let cache = self.ensure_terminal_output_cache(task);
+        self.publish_uncaptured_drain_terminal(task, &metadata);
         self.enqueue_completion_from_parts(
             &metadata,
             Some(&buffer),
@@ -2702,6 +2809,27 @@ impl BgTaskRegistry {
         );
         release_terminal_io_handles(task);
         Ok(())
+    }
+
+    fn publish_uncaptured_drain_terminal(&self, task: &Arc<BgTask>, metadata: &PersistedTask) {
+        if metadata
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.explicit_runon && !remote.accepted)
+        {
+            // Use the same canonical terminal rendering as a state-reading
+            // capture reply, including diagnostics, hints and list envelopes.
+            let snapshot = self
+                .snapshot_with_terminal_cache(task, super::output::RUNNING_OUTPUT_PREVIEW_BYTES);
+            let reply = Arc::new(
+                crate::commands::bash_orchestrate::foreground_result_response("", snapshot),
+            );
+            task.drain_reply
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .uncaptured_terminal = Some(reply);
+        }
     }
 
     /// Writes a task's JSON and aft.db row for a caller that does not hold
@@ -2727,6 +2855,10 @@ impl BgTaskRegistry {
         metadata: &PersistedTask,
         db: &mut DeferredDbWrites<'_>,
     ) -> std::io::Result<()> {
+        // Some callers retain the in-memory change even if persistence fails.
+        // Callers that roll it back also restore the published metadata.
+        task.drain_reply
+            .publish_metadata(metadata, task.hard_kill_renewable);
         let layout = resolve_task_layout(&task.paths.session_dir, &task.paths.task_id)?;
         let mut json_writes = task.db_write_order.lock_json_writes();
         write_task_at(&layout, metadata)?;
@@ -2752,6 +2884,8 @@ impl BgTaskRegistry {
         let metadata = update_task_at(&layout, update)?;
         *json_writes += 1;
         db.capture(&metadata);
+        task.drain_reply
+            .publish_metadata(&metadata, task.hard_kill_renewable);
         Ok(metadata)
     }
 
@@ -4175,6 +4309,7 @@ impl BgTaskRegistry {
             terminal_reader_done: Arc::new(AtomicBool::new(true)),
             holds_background_slot: AtomicBool::new(slot.holds_slot()),
             hard_kill_renewable: hard_kill.renewable(),
+            drain_reply: self.new_drain_reply_cache(&metadata, hard_kill.renewable()),
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
@@ -4536,6 +4671,7 @@ impl BgTaskRegistry {
             // A PTY always runs in the background.
             holds_background_slot: AtomicBool::new(true),
             hard_kill_renewable: hard_kill.renewable(),
+            drain_reply: self.new_drain_reply_cache(&metadata, hard_kill.renewable()),
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
@@ -4794,6 +4930,7 @@ impl BgTaskRegistry {
             terminal_reader_done: Arc::new(AtomicBool::new(true)),
             holds_background_slot: AtomicBool::new(slot.holds_slot()),
             hard_kill_renewable: hard_kill.renewable(),
+            drain_reply: self.new_drain_reply_cache(&metadata, hard_kill.renewable()),
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
@@ -8267,6 +8404,10 @@ impl BgTaskRegistry {
             return None;
         }
         state.metadata.timeout_ms = Some(wanted);
+        // Renewals below the persistence step, including failed writes, still
+        // extend the in-memory deadline that a module-drain reply must name.
+        task.drain_reply
+            .publish_metadata(&state.metadata, task.hard_kill_renewable);
         #[cfg(unix)]
         crate::gh_shim_ticket::renew_worker_read_deadline(task_id, Instant::now() + window);
         let persisted = task.persisted_hard_kill_ms.load(Ordering::Relaxed);
@@ -10268,7 +10409,9 @@ impl BgTaskRegistry {
         }
         let mode = metadata.mode.clone();
         let recovered_terminal = metadata.status.is_terminal().then(|| metadata.clone());
-        let task = Arc::new(BgTask {
+        #[cfg(test)]
+        wait_on_rehydrated_registration_gate_for_test(&task_id);
+        let mut task = BgTask {
             completion_secrets: Mutex::new(
                 metadata
                     .has_safe_completion_redaction_after_restart()
@@ -10287,6 +10430,7 @@ impl BgTaskRegistry {
             // launch, which registers through here too, sets its own.
             holds_background_slot: AtomicBool::new(true),
             hard_kill_renewable: renewable,
+            drain_reply: self.drain_reply_cache(&metadata.task_id, &metadata.session_id),
             persisted_hard_kill_ms: AtomicU64::new(persisted_hard_kill_ms),
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.finished_at.map(started_instant_from_unix_millis)),
@@ -10330,13 +10474,13 @@ impl BgTaskRegistry {
                 terminal_output_cache: None,
                 pending_terminal_override: None,
             }),
-        });
+        };
         self.record_live_delivery_session(&task.session_id);
         self.remember_session_harness(&task);
         // A watch's single-record recovery can race configure replay. Keep the
         // first registered task and its runtime instead of replacing its state
         // with another disk snapshot (or orphaning an authoritative child).
-        {
+        let task = {
             let mut tasks = self
                 .inner
                 .tasks
@@ -10345,8 +10489,19 @@ impl BgTaskRegistry {
             if tasks.contains_key(&task_id) {
                 return Ok(());
             }
+            // Only the registration winner may initialize the shared reply.
+            // Its state is still exclusively owned, so publication cannot
+            // wait on task state or overwrite a newer registered writer.
+            let state = task
+                .state
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            task.drain_reply
+                .publish_metadata(&state.metadata, renewable);
+            let task = Arc::new(task);
             tasks.insert(task_id.clone(), Arc::clone(&task));
-        }
+            task
+        };
         self.inner
             .cleanup_queue
             .lock()
@@ -10364,6 +10519,7 @@ impl BgTaskRegistry {
         // pending undelivered matches are re-pushed.
         self.rearm_persisted_watches(&task);
         if let Some(metadata) = recovered_terminal {
+            self.publish_uncaptured_drain_terminal(&task, &metadata);
             if let Some(harness) = metadata
                 .harness
                 .as_deref()
@@ -13667,6 +13823,15 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
                 .unwrap_or(false)
         })
     };
+    let mut snapshot = terminal_metadata_snapshot(metadata);
+    snapshot.output_path = existing_path(row.stdout_path);
+    snapshot.stderr_path = existing_path(row.stderr_path);
+    snapshot
+}
+
+/// Terminal facts without command output or artifact access. The normal
+/// snapshot renderer fills those details once they are available.
+fn terminal_metadata_snapshot(metadata: PersistedTask) -> BgTaskSnapshot {
     let duration_ms = metadata.duration_ms.or_else(|| {
         metadata
             .finished_at
@@ -13699,9 +13864,9 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
         output_preview: String::new(),
         bash_output_list_envelope: None,
         output_truncated: false,
-        output_path: existing_path(row.stdout_path),
+        output_path: None,
         output_incomplete: metadata.output_incomplete,
-        stderr_path: existing_path(row.stderr_path),
+        stderr_path: None,
         pty_rows: (metadata.mode == BgMode::Pty).then_some(metadata.pty_rows.unwrap_or(24)),
         pty_cols: (metadata.mode == BgMode::Pty).then_some(metadata.pty_cols.unwrap_or(80)),
         pty_screen: None,
@@ -13733,12 +13898,48 @@ fn remote_job_id(metadata: &PersistedTask) -> Option<String> {
         .map(|job_id| job_id.to_string())
 }
 
+#[cfg(test)]
+thread_local! {
+    static TASK_STATE_LOCKS_FORBIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Checks frame-loop lock ownership directly, without treating scheduler latency
+/// as evidence of a blocking lock. This guard must stay on its creating thread.
+#[cfg(test)]
+pub(crate) struct TaskStateLockBanForTest {
+    previous: bool,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+pub(crate) fn forbid_task_state_locks_for_test() -> TaskStateLockBanForTest {
+    TaskStateLockBanForTest {
+        previous: TASK_STATE_LOCKS_FORBIDDEN.with(|flag| flag.replace(true)),
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+#[cfg(test)]
+impl Drop for TaskStateLockBanForTest {
+    fn drop(&mut self) {
+        TASK_STATE_LOCKS_FORBIDDEN.with(|flag| flag.set(self.previous));
+    }
+}
+
 impl BgTask {
     /// Unwinding does not make a process terminal. Recover the same state used
     /// by snapshots so timeout, marker and reap paths can settle the task.
     pub(crate) fn lock_state(
         &self,
     ) -> std::sync::LockResult<std::sync::MutexGuard<'_, BgTaskState>> {
+        #[cfg(test)]
+        TASK_STATE_LOCKS_FORBIDDEN.with(|flag| {
+            assert!(
+                !flag.get(),
+                "task state lock attempted on the frame-loop thread for {}",
+                self.task_id
+            );
+        });
         match self.state.lock() {
             Ok(state) => Ok(state),
             Err(poison) => {

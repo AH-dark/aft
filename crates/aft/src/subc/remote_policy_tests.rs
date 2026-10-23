@@ -1819,6 +1819,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
         daemon.wait_for_requests("exec.run", 1).await;
         bash::detach_held_bash_in_background(
             drain::BashDetachTarget {
+                reply_cache: registry.drain_reply_cache(&task, "session"),
                 run_scoped: false,
                 registry: registry.clone(),
                 task_id: task.clone(),

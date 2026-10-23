@@ -266,6 +266,7 @@ pub(super) struct BashDetachTarget {
     pub(super) server_completion: bool,
     pub(super) late_results: bool,
     pub(super) registry: crate::bash_background::BgTaskRegistry,
+    pub(super) reply_cache: crate::bash_background::registry::BashDrainReplyCache,
     pub(super) request_id: String,
     pub(super) ver: u8,
     pub(super) flags: Flags,

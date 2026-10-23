@@ -1149,6 +1149,9 @@ impl TaskSink {
             // no per-record byte offsets are saved to separate them from lost bytes.
             if let Err(error) = registry.persist_task_locked(&sink.task, &state.metadata, &mut db) {
                 state.metadata = previous;
+                sink.task
+                    .drain_reply
+                    .publish_metadata(&state.metadata, sink.task.hard_kill_renewable);
                 return Err(error);
             }
         }
@@ -1201,6 +1204,9 @@ impl TaskSink {
             .persist_task_locked(&self.task, &state.metadata, &mut db);
         if result.is_err() {
             state.metadata.remote = previous;
+            self.task
+                .drain_reply
+                .publish_metadata(&state.metadata, self.task.hard_kill_renewable);
         } else {
             self.output_progress = OutputProgress::of(state.metadata.remote.as_ref().unwrap());
             self.last_progress_persist = self.progress_now();
@@ -1597,6 +1603,9 @@ impl TaskSink {
             .persist_task_locked(&self.task, &state.metadata, &mut db);
         if result.is_err() {
             state.metadata = previous;
+            self.task
+                .drain_reply
+                .publish_metadata(&state.metadata, self.task.hard_kill_renewable);
         } else {
             self.output_progress = OutputProgress::of(state.metadata.remote.as_ref().unwrap());
             self.last_progress_persist = self.progress_now();
@@ -4409,3 +4418,8 @@ fn proves_no_start(error: &exec::Error) -> bool {
 #[cfg(all(test, unix))]
 #[path = "remote_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+pub(crate) use tests::{
+    captured_task_after_losing_replay_for_test, uncaptured_terminal_before_render_for_test,
+};

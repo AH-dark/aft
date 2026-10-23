@@ -413,7 +413,7 @@ async fn every_local_spawn_entrypoint_executes_command_once() {
                 "deferred wait must run its command once"
             );
             eprintln!(
-                "spawn entrypoint deferred-wait: command executed and held-lock wait completed"
+                "spawn entrypoint deferred-wait: command executed and frame-loop lock check completed"
             );
             continue;
         }
@@ -1191,6 +1191,181 @@ fn runon_uncaptured_reply_reports_terminal_outcome_not_starting() {
     // reply will never move to queued or running: the in-flight capture
     // warning would be a false instruction here.
     assert!(!output.contains(REMOTE_INPUT_CAPTURE_WARNING), "{output}");
+
+    let recovered = self::registry();
+    // Startup can publish a detach target before replay inserts its task.
+    // The reserved handle must receive the canonical recovered reply too.
+    let reserved = recovered.drain_reply_cache(&task_id, "session");
+    let metadata = task.state.lock().unwrap().metadata.clone();
+    recovered
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    let expected = with_runon_capture_state(&recovered, &task_id, "session", live_reply());
+    let recovered_task = recovered.task(&task_id).unwrap();
+    let _state = recovered_task.state.lock().unwrap();
+    let _no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
+    let cached = reserved
+        .snapshot()
+        .uncaptured_terminal
+        .expect("replayed terminal drain reply");
+    assert_eq!(cached.data, expected.data);
+    assert_eq!(cached.success, expected.success);
+}
+
+pub(crate) struct UncapturedTerminalBeforeRenderForTest {
+    pub(crate) dir: tempfile::TempDir,
+    pub(crate) registry: BgTaskRegistry,
+    pub(crate) task: Arc<BgTask>,
+    release: crossbeam_channel::Sender<()>,
+    publisher: Option<std::thread::JoinHandle<()>>,
+}
+
+pub(crate) fn captured_task_after_losing_replay_for_test(
+) -> (tempfile::TempDir, BgTaskRegistry, Arc<BgTask>) {
+    let dir = tempfile::tempdir().unwrap();
+    let (source, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf unused");
+    let mut live = source
+        .task(&task_id)
+        .unwrap()
+        .state
+        .lock()
+        .unwrap()
+        .metadata
+        .clone();
+    live.remote.as_mut().unwrap().explicit_runon = true;
+    live.timeout_ms = Some(60_000);
+    live.execution_note = Some("live input capture recorded".into());
+    let mut stale = live.clone();
+    stale.remote.as_mut().unwrap().accepted = false;
+    stale.timeout_ms = Some(10_000);
+    stale.execution_note = Some("stale pre-capture replay".into());
+    let registry = self::registry();
+    let _reserved = registry.drain_reply_cache(&task_id, "session");
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    REHYDRATED_REGISTRATION_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            task_id.clone(),
+            KillSignalGate {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        );
+    struct ReplayJoin {
+        release: crossbeam_channel::Sender<()>,
+        thread: Option<std::thread::JoinHandle<Result<(), String>>>,
+    }
+    impl Drop for ReplayJoin {
+        fn drop(&mut self) {
+            let _ = self.release.send(());
+            if let Some(thread) = self.thread.take() {
+                let result = thread.join();
+                if !std::thread::panicking() {
+                    result.unwrap().unwrap();
+                }
+            }
+        }
+    }
+    let replay = ReplayJoin {
+        release: release_tx,
+        thread: Some({
+            let registry = registry.clone();
+            let paths = paths.clone();
+            std::thread::spawn(move || registry.insert_rehydrated_task(stale, paths, true))
+        }),
+    };
+    reached_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("replay paused before registration");
+    registry.insert_rehydrated_task(live, paths, false).unwrap();
+    let task = registry.task(&task_id).unwrap();
+    assert_eq!(
+        task.drain_reply.snapshot().inputs_captured,
+        Some(true),
+        "live registration must publish first"
+    );
+    // The replay resumes with its older snapshot only after the accepted task
+    // owns the registry entry. It must not mutate that task's shared cache.
+    drop(replay);
+    assert!(Arc::ptr_eq(&task, &registry.task(&task_id).unwrap()));
+    (dir, registry, task)
+}
+
+impl Drop for UncapturedTerminalBeforeRenderForTest {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
+        if let Some(publisher) = self.publisher.take() {
+            let result = publisher.join();
+            if !std::thread::panicking() {
+                result.unwrap();
+            }
+        }
+    }
+}
+
+pub(crate) fn uncaptured_terminal_before_render_for_test(
+    refused: bool,
+) -> UncapturedTerminalBeforeRenderForTest {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, _) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf unused");
+    let task = registry.task(&task_id).unwrap();
+    {
+        let mut state = task.state.lock().unwrap();
+        let remote = state.metadata.remote.as_mut().unwrap();
+        remote.explicit_runon = true;
+        remote.accepted = false;
+        remote.job_id = None;
+    }
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release, release_rx) = crossbeam_channel::bounded(1);
+    TERMINAL_PUBLICATION_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            task_id,
+            KillSignalGate {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        );
+    let publisher = {
+        let registry = registry.clone();
+        let task = task.clone();
+        std::thread::spawn(move || {
+            let verdict = if refused {
+                Verdict::RunLocally {
+                    reason: RefusalReason::Unreachable,
+                    refusal_detail: None,
+                }
+            } else {
+                Verdict::Signalled { signal: 9 }
+            };
+            registry.remote_terminal(
+                &task,
+                verdict,
+                refused.then(|| {
+                    "runon refused: remote refused: unreachable; command was not run".into()
+                }),
+            );
+        })
+    };
+    let fixture = UncapturedTerminalBeforeRenderForTest {
+        dir,
+        registry,
+        task,
+        release,
+        publisher: Some(publisher),
+    };
+    reached_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("terminal metadata published before rendering");
+    fixture
 }
 
 #[test]
