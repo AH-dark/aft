@@ -2498,7 +2498,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             ctx.backup().lock().history("freshness", &path)[0]
-                .content_bytes
+                .content_bytes()
+                .unwrap()
                 .as_ref(),
             b"external\n"
         );

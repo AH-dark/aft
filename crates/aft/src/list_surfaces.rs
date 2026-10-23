@@ -367,6 +367,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "bounded internal mutation-index discovery, not a response list; ignored directories are pruned, examined counts are logged, and unfinished work schedules a background corpus replacement with the index marked not ready",
     },
     ExclusionEntry {
+        file: "backup.rs",
+        enclosing_item: "read_session_disk_index_with_budget, merge_disk_stack_heads",
+        location_or_primitive: "MAX_SESSION_DISCOVERY_ENTRIES, examined >= entry_limit, BackupIoBudget::check, ROLLBACK_CLEANUP_ALLOWANCE",
+        reason: "internal durable undo-stack discovery stops at its entry or deadline budget and returns an error, never a partial path list or false no-history result; rollback uses one independent bounded cleanup allowance after cancellation, and per-file undo avoids the session scan",
+    },
+    ExclusionEntry {
         file: "runtime_drain.rs",
         enclosing_item: "drop",
         location_or_primitive: "budget.exhausted()",

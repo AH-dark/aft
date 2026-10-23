@@ -541,6 +541,7 @@ impl CheckpointStore {
     /// If `files` is empty, snapshots all tracked files for **that session**
     /// from the BackupStore (other sessions' tracked files are not visible).
     /// Overwrites any existing checkpoint with the same name in this session.
+    /// Incomplete tracked-file discovery fails before replacing that checkpoint.
     ///
     /// Unreadable paths (e.g. deleted since their last edit) are skipped with
     /// a warning instead of failing the whole checkpoint. The paths and their
@@ -596,7 +597,7 @@ impl CheckpointStore {
         self.hydrate_session_locked(session)?;
         let explicit_request = !files.is_empty();
         let file_list = match backup_store {
-            Some(backup_store) if files.is_empty() => backup_store.tracked_files(session),
+            Some(backup_store) if files.is_empty() => backup_store.try_tracked_files(session)?,
             _ => files,
         };
 
@@ -3569,6 +3570,86 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "tracked_content");
     }
 
+    fn assert_incomplete_backup_discovery_preserves_checkpoint(expired: bool) {
+        let storage = tempfile::tempdir().unwrap();
+        let path = storage.path().join("tracked.txt");
+        fs::write(&path, b"restore me").unwrap();
+        let mut backup = BackupStore::new();
+        backup.set_storage_dir(storage.path().join("backup"), 72);
+        backup
+            .snapshot(DEFAULT_SESSION_ID, &path, "before edit")
+            .unwrap();
+        let checkpoint_storage = storage.path().join("checkpoints");
+        let mut checkpoints = fresh_checkpoint_store(&checkpoint_storage);
+        checkpoints
+            .create(DEFAULT_SESSION_ID, "useful", vec![path.clone()], &backup)
+            .unwrap();
+        fs::write(&path, b"changed").unwrap();
+        backup.release_memory();
+        if expired {
+            backup.expire_discovery_for_tests();
+        } else {
+            backup.set_discovery_entry_limit_for_tests(0);
+        }
+        let error = checkpoints
+            .create(DEFAULT_SESSION_ID, "useful", vec![], &backup)
+            .unwrap_err();
+        assert!(matches!(error, AftError::IoError { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains(if expired { "deadline" } else { "entry limit" }),
+            "{error}"
+        );
+        drop(checkpoints);
+        let mut restarted = fresh_checkpoint_store(&checkpoint_storage);
+        let restored = restarted.restore(DEFAULT_SESSION_ID, "useful").unwrap();
+        assert_eq!(restored.file_count, 1);
+        assert_eq!(fs::read(&path).unwrap(), b"restore me");
+    }
+
+    #[test]
+    fn backup_checkpoint_discovery_cap_preserves_existing_checkpoint() {
+        assert_incomplete_backup_discovery_preserves_checkpoint(false);
+    }
+
+    #[test]
+    fn backup_checkpoint_discovery_deadline_preserves_existing_checkpoint() {
+        assert_incomplete_backup_discovery_preserves_checkpoint(true);
+    }
+
+    #[test]
+    fn backup_memory_checkpoints_find_released_and_restarted_backup_paths() {
+        let storage = tempfile::tempdir().unwrap();
+        let path = storage.path().join("binary.bin");
+        let bytes = [0, 255, 128, b'\r', b'\n'];
+        for restart in [false, true] {
+            fs::write(&path, bytes).unwrap();
+            let backup_storage = storage.path().join("backup");
+            let mut backup = BackupStore::new();
+            backup.set_storage_dir(backup_storage.clone(), 72);
+            backup
+                .snapshot(DEFAULT_SESSION_ID, &path, "tracked")
+                .unwrap();
+            backup.release_memory();
+            if restart {
+                backup = BackupStore::new();
+                backup.set_storage_dir(backup_storage, 72);
+            }
+            let checkpoint_storage = storage.path().join(format!("checkpoint-{restart}"));
+            let mut checkpoints = fresh_checkpoint_store(&checkpoint_storage);
+            let info = checkpoints
+                .create(DEFAULT_SESSION_ID, "tracked", vec![], &backup)
+                .unwrap();
+            assert_eq!(info.file_count, 1);
+            fs::write(&path, b"changed").unwrap();
+            drop(checkpoints);
+            let mut restarted = fresh_checkpoint_store(&checkpoint_storage);
+            restarted.restore(DEFAULT_SESSION_ID, "tracked").unwrap();
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
     #[test]
     fn restore_recreates_missing_parent_directories() {
         let dir = tempfile::tempdir().unwrap();
@@ -3769,8 +3850,11 @@ mod tests {
             panic!("regular capture must create a regular checkpoint");
         };
         assert_eq!(bytes.as_ref(), b"original bytes");
-        assert_eq!(history[0].content_bytes.as_ref(), b"original bytes");
-        assert!(Arc::ptr_eq(&bytes, &history[0].content_bytes));
+        assert_eq!(
+            history[0].content_bytes().unwrap().as_ref(),
+            b"original bytes"
+        );
+        assert!(Arc::ptr_eq(&bytes, &history[0].content_bytes().unwrap()));
         assert_eq!(crate::backup::capture_read_count(&path), 1);
     }
 
@@ -3798,8 +3882,11 @@ mod tests {
             panic!("regular capture must create a regular checkpoint");
         };
         assert_eq!(bytes.as_ref(), b"fresh disk truth");
-        assert_eq!(history[0].content_bytes.as_ref(), b"fresh disk truth");
-        assert!(Arc::ptr_eq(&bytes, &history[0].content_bytes));
+        assert_eq!(
+            history[0].content_bytes().unwrap().as_ref(),
+            b"fresh disk truth"
+        );
+        assert!(Arc::ptr_eq(&bytes, &history[0].content_bytes().unwrap()));
         assert_eq!(crate::backup::capture_read_count(&path), 2);
     }
 

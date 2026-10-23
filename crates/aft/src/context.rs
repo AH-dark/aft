@@ -7747,6 +7747,15 @@ impl AppContext {
         &self.backup
     }
 
+    /// Route teardown must not wait for a request holding the backup mutex.
+    pub(crate) fn release_backup_session_in_background(
+        self: &Arc<Self>,
+        session: String,
+    ) -> std::thread::JoinHandle<()> {
+        let ctx = Arc::clone(self);
+        std::thread::spawn(move || ctx.backup.lock().release_session_memory(&session))
+    }
+
     /// Session-scoped hashline bindings installed by successful configure calls.
     pub fn hashline_bindings(&self) -> &crate::hashline::integration::BindingRegistry {
         &self.hashline_bindings
@@ -13367,6 +13376,7 @@ impl AppContext {
         self.inspect_manager.evict_idle_caches();
         self.reset_symbol_cache();
         self.clear_tsconfig_membership_cache();
+        self.backup.lock().release_memory();
         true
     }
 
@@ -13518,6 +13528,9 @@ impl AppContext {
         let Some(mut borrowed_index_cache) = self.borrowed_index_cache.try_lock() else {
             return false;
         };
+        let Some(mut backup) = self.backup.try_lock() else {
+            return false;
+        };
         // Last, so a contended lane leaves every other handle in place too.
         if !self.try_release_idle_semantic_lane() {
             return false;
@@ -13526,11 +13539,13 @@ impl AppContext {
         search_index.take();
         semantic_index.take();
         borrowed_index_cache.clear();
+        backup.release_memory();
         drop((
             callgraph_store,
             search_index,
             semantic_index,
             borrowed_index_cache,
+            backup,
         ));
         // Intentional idle eviction starts a new reload lifecycle; a cooldown
         // from an earlier failed load must not suppress the first reopen.
@@ -20630,6 +20645,49 @@ mod callgraph_store_for_ops_tests {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_none());
+    }
+
+    /// Eviction releases resident undo metadata without deleting durable history.
+    #[test]
+    fn backup_memory_idle_eviction_releases_in_memory_backup_stacks() {
+        let root = TempDir::new().expect("project tempdir");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let path = root.path().join("edited.rs");
+        std::fs::write(&path, "fn edited() {}\n".repeat(4096)).unwrap();
+        ctx.backup()
+            .lock()
+            .set_storage_dir(root.path().join("storage"), 72);
+        ctx.backup()
+            .lock()
+            .snapshot("session", &path, "before edit")
+            .unwrap();
+
+        assert_eq!(ctx.backup().lock().resident_entry_count(), 1);
+        assert!(ctx.evict_idle_artifacts());
+        assert_eq!(ctx.backup().lock().resident_entry_count(), 0);
+
+        assert_eq!(ctx.backup().lock().history("session", &path).len(), 1);
+        assert_eq!(ctx.backup().lock().resident_entry_count(), 0);
+        ctx.backup()
+            .lock()
+            .snapshot("session", &path, "second")
+            .unwrap();
+        {
+            let _held = ctx.backup().lock();
+            assert!(
+                !ctx.try_evict_idle_artifacts(),
+                "frame loop cannot wait for backups"
+            );
+        }
+        assert!(ctx.try_evict_idle_artifacts());
+        assert_eq!(ctx.backup().lock().resident_entry_count(), 0);
+        assert_eq!(ctx.backup().lock().history("session", &path).len(), 2);
     }
 }
 

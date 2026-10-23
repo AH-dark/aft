@@ -3819,6 +3819,7 @@ async fn teardown_installed_route(
             if let Some(ctx) = executor.actor_context(&identity.root) {
                 ctx.hashline_bindings()
                     .teardown(identity.root.as_path(), &identity.session);
+                let _ = ctx.release_backup_session_in_background(identity.session.clone());
             }
         }
         if migrated > 0 {
