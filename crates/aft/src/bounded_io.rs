@@ -172,7 +172,7 @@ impl Budget {
             self.measurements.round_trips.load(Ordering::Relaxed),
         )
     }
-    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    #[cfg(test)]
     pub(crate) fn with_access_budget(mut self, duration: Duration) -> Self {
         self.access_budget = duration;
         self

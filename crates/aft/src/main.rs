@@ -5614,7 +5614,17 @@ mod watcher_filter_tests {
             assert_eq!(pending, expected_probe_paths);
             ctx.add_pending_semantic_index_paths(pending);
 
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            // The timer runs on another thread: elapsed backoff alone does not
+            // prove it has published readiness. Wait for that publication before
+            // testing whether it makes completion draining eligible.
+            let ready_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ctx.semantic_refresh_probe_ready() {
+                assert!(
+                    std::time::Instant::now() < ready_by,
+                    "the scheduled breaker probe did not publish readiness within 5s"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             assert!(
                 ctx.completion_drains_have_work(),
                 "a ready breaker probe must schedule completion draining without another event"

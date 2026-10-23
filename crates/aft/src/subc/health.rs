@@ -6286,30 +6286,34 @@ mod tests {
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), test_ctx()));
         let cache = Arc::new(HealthRollupCache::new());
+        let app = crate::context::App::default_shared();
         cache.clock_ms.store(0, Ordering::Relaxed);
-        // No periodic rollup within the test: only a census read can start one.
-        let worker = HealthRollupWorker::start_with_interval(
-            Arc::clone(&cache),
-            Arc::clone(&executor),
-            crate::context::App::default_shared(),
-            Duration::from_secs(3_600),
-        );
-        let published = Instant::now() + Duration::from_secs(10);
-        while cache.snapshot().0.generation == 0 {
-            assert!(
-                Instant::now() < published,
-                "the first rollup never published"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // Seed a known publication without relying on a periodic worker's
+        // nonblocking scheduler snapshot, which may legitimately skip a tick.
+        cache.refresh_for_test(&executor, &app);
         let builds_before = cache.census_builds_for_test();
         cache.clock_ms.store(31_000, Ordering::Relaxed);
-        let started = Instant::now();
-        let census = census_runtime().block_on(fresh_memory_census(
-            &cache,
-            started + MEMORY_CENSUS_REPLY_MARGIN + Duration::from_secs(5),
-        ));
-        worker.shutdown();
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
+        *cache.census_wake.lock().unwrap() = Some(wake_tx);
+        let census = std::thread::scope(|scope| {
+            // No periodic refresh: only the read's census wake can publish.
+            // The blocking test snapshot isolates freshness from lock contention.
+            let cache = &cache;
+            let executor = &executor;
+            let app = &app;
+            scope.spawn(move || {
+                assert_eq!(
+                    wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    RollupWake::Census
+                );
+                cache.refresh_for_test(&executor, &app);
+            });
+            let started = Instant::now();
+            census_runtime().block_on(fresh_memory_census(
+                &cache,
+                started + MEMORY_CENSUS_REPLY_MARGIN + Duration::from_secs(5),
+            ))
+        });
         assert_eq!(
             census["health_rollup_tick"]["age_ms"], 0,
             "the read was served the census from before the quiet period"

@@ -1838,6 +1838,36 @@ impl BgTaskRegistry {
         Ok((page.bytes, page.next_offset))
     }
 
+    /// Bound artifact access as well as the scan loop: a slow disk must not
+    /// spend the watch's reply-delivery margin inside a single page read.
+    pub(crate) fn read_artifact_page_until(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        artifact: TaskArtifact,
+        offset: u64,
+        deadline: Instant,
+    ) -> std::io::Result<ArtifactPage> {
+        let task = self
+            .task_for_session(task_id, session_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "task_not_found"))?;
+        let registry = self.clone();
+        let task_id = task_id.to_owned();
+        let session_id = session_id.to_owned();
+        #[cfg(test)]
+        let delay = ARTIFACT_PAGE_DELAY.with(std::cell::Cell::get);
+        crate::bounded_io::run(&task.paths.dir, Some(deadline), move |_| {
+            #[cfg(test)]
+            let previous = ARTIFACT_PAGE_DELAY.with(|value| value.replace(delay));
+            let result = registry
+                .read_artifact_page(&task_id, &session_id, artifact, offset)
+                .map_err(std::io::Error::other);
+            #[cfg(test)]
+            ARTIFACT_PAGE_DELAY.with(|value| value.set(previous));
+            result
+        })
+    }
+
     pub(crate) fn read_artifact_page(
         &self,
         task_id: &str,
