@@ -9383,7 +9383,7 @@ impl BgTaskRegistry {
 
     /// Drop a task's in-memory record, as the delivered-task cleanup does
     /// once the task's retention ends.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn forget_task_record_for_test(&self, task_id: &str) {
         if let Ok(mut tasks) = self.inner.tasks.lock() {
             tasks.remove(task_id);
