@@ -41,12 +41,15 @@ pub(super) fn applies(path: &Path) -> bool {
     detect_language(path) == Some(LangId::Bash)
 }
 
-/// Confirm a tree-sitter rejection of an existing file's new content, for
-/// the rollback decision. It mirrors the Swift confirmation: when tree-sitter
-/// also rejected the original, the shell is asked about the original first,
+/// Confirm a tree-sitter rejection of an existing file's new content. The
+/// shell's verdict on the new content is the result whatever the original
+/// was, so an edit that repairs a broken script into valid bash the grammar
+/// cannot read is reported valid. The original only feeds the rollback
+/// decision: when tree-sitter also rejected it, the shell is asked about it,
 /// so a valid script tree-sitter misreads is still protected from a broken
-/// edit. When the shell cannot answer, tree-sitter's verdict stands, which
-/// keeps the conservative rollback for a file that was valid before.
+/// edit. When the shell cannot answer about the new content,
+/// tree-sitter's verdict stands, which keeps the conservative rollback for a
+/// file that was valid before.
 pub(super) fn confirm_if_needed(
     source: &str,
     original: Option<&str>,
@@ -60,9 +63,6 @@ pub(super) fn confirm_if_needed(
         && original.is_some_and(|source| verdict(source) == Ok(ShellVerdict::Valid))
     {
         *was_valid = Some(true);
-    }
-    if *was_valid != Some(true) {
-        return is_valid;
     }
     match verdict(source) {
         Ok(ShellVerdict::Valid) => Some(true),
@@ -454,6 +454,70 @@ mod tests {
             write_format_validate(&path, BROKEN_CASE, &config(), &serde_json::json!({})).unwrap();
         assert!(result.rolled_back);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// An edit that repairs a script bash rejects into valid bash the grammar
+    /// cannot read is judged by bash, even though the original is broken.
+    #[test]
+    fn broken_bash_file_repaired_into_a_grammar_gap_is_valid() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = calls.clone();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("script.sh");
+        std::fs::write(&path, BROKEN_CASE).unwrap();
+        assert_eq!(validate_syntax_str(FIXTURE, &path), Some(false));
+        let result = with_runner(
+            Box::new(move |source| {
+                recorded.borrow_mut().push(source.to_owned());
+                let code = match source {
+                    BROKEN_CASE => SYNTAX_ERROR_STATUS,
+                    FIXTURE => 0,
+                    _ => panic!("unexpected bash input: {source}"),
+                };
+                CheckOutcome::Exited {
+                    code: Some(code),
+                    stderr: String::new(),
+                }
+            }),
+            || {
+                crate::edit::write_format_validate(
+                    &path,
+                    FIXTURE,
+                    &config(),
+                    &serde_json::json!({}),
+                )
+                .unwrap()
+            },
+        );
+        assert!(!result.rolled_back);
+        assert_eq!(result.syntax_valid, Some(true));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE);
+        assert_eq!(*calls.borrow(), [BROKEN_CASE, FIXTURE]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_bash_file_repaired_with_real_bash_is_valid() {
+        use crate::edit::write_format_validate;
+        require_bash();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("script.sh");
+        std::fs::write(&path, BROKEN_CASE).unwrap();
+        let result =
+            write_format_validate(&path, GRAMMAR_GAP, &config(), &serde_json::json!({})).unwrap();
+        assert!(!result.rolled_back);
+        assert_eq!(result.syntax_valid, Some(true));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), GRAMMAR_GAP);
+
+        // Still broken after the edit: kept (nothing valid to roll back to)
+        // and reported invalid.
+        std::fs::write(&path, BROKEN_CASE).unwrap();
+        let still_broken = format!("{BROKEN_CASE}{BROKEN_CASE}");
+        let result =
+            write_format_validate(&path, &still_broken, &config(), &serde_json::json!({})).unwrap();
+        assert!(!result.rolled_back);
+        assert_eq!(result.syntax_valid, Some(false));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), still_broken);
     }
 
     #[cfg(windows)]
