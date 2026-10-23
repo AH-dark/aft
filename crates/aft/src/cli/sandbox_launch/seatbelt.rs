@@ -520,6 +520,9 @@ fn escape_path(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    // Seatbelt rendering is macOS-only in production, and this fixture builds
+    // the /var -> /private/var alias with a Unix symlink.
+    #[cfg(unix)]
     #[test]
     fn scoped_var_folder_grants_render_canonical_write_and_read_allows() {
         use aft::access_policy::{AccessGrant, AccessOperation, AccessPolicy, GrantKind};
