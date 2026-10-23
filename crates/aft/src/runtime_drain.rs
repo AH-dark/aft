@@ -3084,6 +3084,7 @@ pub(crate) fn refresh_search_index_after_write(ctx: &AppContext, path: &Path) {
 }
 
 fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, started: Instant) {
+    state.lsp_diagnostics_lock_contended = false;
     let WatcherDrainPhase::Apply {
         mut stage,
         mut paths,
@@ -3309,6 +3310,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                         // Applicability refreshes also take this lock. Keep the
                         // invalidation pending when they overlap the watcher.
                         let Some(mut lsp) = ctx.try_lsp() else {
+                            state.lsp_diagnostics_lock_contended = true;
                             return false;
                         };
                         if !path.exists() {
@@ -5150,6 +5152,36 @@ mod tests {
         ));
         assert_eq!(remaining, 0);
         assert_eq!(applied, vec![first, second]);
+    }
+
+    #[test]
+    fn watcher_lsp_retry_probe_requires_a_failed_lock_attempt() {
+        let _clock = WatcherDrainTestClock::freeze();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (ctx, _tx) = watcher_context(&root);
+        let file = root.join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let mut state = WatcherDrainSliceState::new(
+            ctx.configure_generation(),
+            ctx.configure_content_generation(),
+        );
+        state.phase = WatcherDrainPhase::Apply {
+            stage: WatcherDrainApplyPhase::LspDiagnostics,
+            paths: VecDeque::from([file]),
+            remaining: 1,
+            oversized_inline_batch: false,
+        };
+        *ctx.watcher_drain_slice().lock() = Some(state);
+        // A slice can stop at this phase before ever trying the manager lock.
+        assert!(!ctx.watcher_lsp_diagnostics_retry_pending_for_test());
+        {
+            let _held = ctx.lsp();
+            assert!(drain_watcher_events_bounded(&ctx, 1).has_more);
+            assert!(ctx.watcher_lsp_diagnostics_retry_pending_for_test());
+        }
+        assert!(!drain_watcher_events_bounded(&ctx, 1).has_more);
+        assert!(!ctx.watcher_lsp_diagnostics_retry_pending_for_test());
     }
 
     /// A burst of watcher events for files whose bytes still match the index

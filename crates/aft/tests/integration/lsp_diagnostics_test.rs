@@ -2179,11 +2179,12 @@ fn assert_watcher_external_edit_hides_stale_diagnostics(contend_manager: bool) {
 
     if contend_manager {
         // The watcher starts an applicability refresh that can own this lock.
-        // Hold it across a drain to force that overlap without a timing race.
+        // Keep it held until diagnostics work actually tries the busy manager.
         let _lsp = ctx.lsp();
-        let _ = drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        drain_watcher_until_lsp_diagnostics_retry_pending(&ctx);
     }
     drain_watcher_events(&ctx);
+    assert!(!ctx.watcher_lsp_diagnostics_retry_pending_for_test());
 
     let after_watcher = ctx
         .lsp()
@@ -3229,6 +3230,24 @@ fn drain_watcher_events(ctx: &AppContext) {
     }
 }
 
+fn drain_watcher_until_lsp_diagnostics_retry_pending(ctx: &AppContext) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let outcome = drain_watcher_events_bounded(ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert!(
+            outcome.has_more,
+            "watcher completed without retaining diagnostics work under manager contention"
+        );
+        if ctx.watcher_lsp_diagnostics_retry_pending_for_test() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "watcher never attempted diagnostics invalidation under manager contention"
+        );
+    }
+}
+
 /// A Rust workspace served by the fake language server with the environment
 /// `env` builds from the workspace root, its server started on
 /// `src/main.rs`, and a watcher channel the test feeds.
@@ -3476,16 +3495,16 @@ fn watcher_overflow_under_manager_contention_sends_one_config_notification() {
         .collect();
     paths.push(root.join("Cargo.toml"));
     {
-        // Keep the manager unavailable during a slice. Diagnostics work must
-        // remain pending without losing the capped forwarding batch.
+        // Earlier phases can consume whole slices. Keep the manager unavailable
+        // until diagnostics work has actually tried the lock and retained its batch.
         let _held = ctx.lsp();
         watcher_tx
             .send(WatcherDispatchEvent::Paths(paths))
             .expect("send watcher event");
-        let outcome = drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
-        assert!(outcome.has_more, "the busy diagnostics phase must retry");
+        drain_watcher_until_lsp_diagnostics_retry_pending(&ctx);
     }
     drain_watcher_events(&ctx);
+    assert!(!ctx.watcher_lsp_diagnostics_retry_pending_for_test());
     wait_for_watcher_forward_helper(&ctx);
     let (watched, _) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
     assert_eq!(watched.len(), 1, "one capped forward: {watched:?}");

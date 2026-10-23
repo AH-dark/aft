@@ -1937,6 +1937,9 @@ pub(crate) struct WatcherDrainSliceState {
     /// rebuilds artifacts wholesale).
     pub(crate) configure_content_generation: u64,
     pub(crate) phase: WatcherDrainPhase,
+    /// Distinguishes a failed LSP lock attempt from entering that phase after
+    /// an earlier phase used up the slice budget.
+    pub(crate) lsp_diagnostics_lock_contended: bool,
     pub(crate) pending_paths: VecDeque<PathBuf>,
     pub(crate) ignore_changed: bool,
     pub(crate) ignore_refresh_due: Option<Instant>,
@@ -2174,6 +2177,7 @@ impl WatcherDrainSliceState {
             configure_generation,
             configure_content_generation,
             phase: WatcherDrainPhase::Collect,
+            lsp_diagnostics_lock_contended: false,
             pending_paths: VecDeque::new(),
             ignore_changed: false,
             ignore_refresh_due: None,
@@ -12561,6 +12565,26 @@ impl AppContext {
             .lock()
             .as_ref()
             .map_or(0, |state| state.path_slice_count)
+    }
+
+    /// Whether the watcher retained diagnostics work after failing to acquire
+    /// the LSP manager. Merely reaching the phase at a slice boundary is not enough.
+    #[doc(hidden)]
+    pub fn watcher_lsp_diagnostics_retry_pending_for_test(&self) -> bool {
+        self.watcher_drain_slice
+            .lock()
+            .as_ref()
+            .is_some_and(|state| {
+                state.lsp_diagnostics_lock_contended
+                    && matches!(
+                        &state.phase,
+                        WatcherDrainPhase::Apply {
+                            stage: WatcherDrainApplyPhase::LspDiagnostics,
+                            remaining,
+                            ..
+                        } if *remaining > 0
+                    )
+            })
     }
 
     /// Install a watcher filter thread and its dispatch receiver. The caller
