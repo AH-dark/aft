@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { Database } from "bun:sqlite";
+import { Database, SQLiteError } from "bun:sqlite";
 
 import type { TaskProbe, TaskState } from "./process-observer.js";
 
@@ -20,7 +20,26 @@ export class AftTaskProbe implements TaskProbe {
 
   async states(): Promise<TaskState[]> {
     if (!existsSync(this.databasePath)) return [];
-    const database = new Database(this.databasePath, { readonly: true, strict: true });
+    try {
+      return this.#readStates(true);
+    } catch (error) {
+      if (!(error instanceof SQLiteError)) throw error;
+      // Extended SQLite codes retain the primary result in the low byte.
+      const code = error.errno & 0xff;
+      if (code !== 8 && code !== 14) throw error; // SQLITE_READONLY / SQLITE_CANTOPEN
+      // WAL recovery or shared-memory initialization can require write access.
+      // Retry only the reads with a writable connection; a second failure escapes.
+      return this.#readStates(false);
+    }
+  }
+
+  #readStates(readonly: boolean): TaskState[] {
+    const database = Database.open(this.databasePath, {
+      readonly,
+      readwrite: !readonly,
+      create: false,
+      strict: true,
+    });
     try {
       // AFT writes this database while the probe reads it. Without a busy
       // timeout a read that lands during one of those writes fails at once

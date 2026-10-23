@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { Database, SQLiteError } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import {
   mkdir,
@@ -85,6 +85,7 @@ import {
   waitForTaskStatus,
 } from "./process-observer.js";
 import { readPinnedV1HostVersion } from "./pin.js";
+import { AftTaskProbe } from "./task-probe.js";
 import {
   awaitTurnReadiness,
   CALLGRAPH_READY_TIMEOUT_MS,
@@ -243,6 +244,203 @@ describe("bounded scenario concurrency", () => {
     expect(await running).toEqual(["zero", "one", "two", "three"]);
     expect(completed).toEqual([1, 2, 3, 0]);
     expect(maximumActive).toBe(2);
+  });
+});
+
+describe("AFT task database probe", () => {
+  const expectedStates = [
+    { id: "task-1", status: "completed", status_reason: "exited", pgid: undefined },
+  ];
+
+  function createWriter(databasePath: string): Database {
+    const writer = new Database(databasePath, { create: true, strict: true });
+    writer.exec(`
+        PRAGMA journal_mode = WAL;
+        PRAGMA wal_autocheckpoint = 0;
+        CREATE TABLE bash_tasks (
+          task_id TEXT PRIMARY KEY, status TEXT, pgid INTEGER, metadata TEXT,
+          harness TEXT, started_at INTEGER
+        );
+        INSERT INTO bash_tasks VALUES (
+          'task-1', 'completed', NULL, '{"status_reason":"exited"}', 'opencode', 1
+        );
+      `);
+    return writer;
+  }
+
+  function sqliteError(code: string, errno: number): SQLiteError {
+    const database = new Database(":memory:");
+    try {
+      database.exec("PRAGMA query_only = ON; CREATE TABLE readonly_failure (id INTEGER)");
+    } catch (error) {
+      if (error instanceof SQLiteError) {
+        // Bun constructs SQLiteError internally and its code fields are read-only.
+        return Object.create(error, { code: { value: code }, errno: { value: errno } });
+      }
+      throw error;
+    } finally {
+      database.close();
+    }
+    throw new Error("SQLite did not reject a write to a query-only database");
+  }
+
+  test("reads a closed WAL database without existing sidecars", async () => {
+    const directory = await root();
+    const databasePath = join(directory, "aft.db");
+    createWriter(databasePath).close();
+    expect(await readdir(directory)).toEqual(["aft.db"]);
+    expect(await new AftTaskProbe(databasePath).states()).toEqual(expectedStates);
+  });
+
+  test("reads committed WAL frames left by a killed writer", async () => {
+    const directory = await root();
+    const databasePath = join(directory, "aft.db");
+    createWriter(databasePath).close();
+    const writer = Bun.spawnSync([
+      process.execPath,
+      "-e",
+      `import { Database } from "bun:sqlite";
+       const db = new Database(${JSON.stringify(databasePath)});
+       db.exec("PRAGMA wal_autocheckpoint = 0; UPDATE bash_tasks SET status = 'running'");
+       process.kill(process.pid, "SIGKILL");`,
+    ]);
+    expect(writer.signalCode).toBe("SIGKILL");
+    expect((await stat(`${databasePath}-wal`)).size).toBeGreaterThan(32);
+    expect(await readdir(directory)).toContain("aft.db-shm");
+    expect(await new AftTaskProbe(databasePath).states()).toEqual([
+      { ...expectedStates[0], status: "running" },
+    ]);
+  });
+
+  test("reads committed tasks while a live writer holds a transaction", async () => {
+    const databasePath = join(await root(), "aft.db");
+    const writer = createWriter(databasePath);
+    try {
+      writer.exec("BEGIN IMMEDIATE; UPDATE bash_tasks SET status = 'running'");
+      expect(await new AftTaskProbe(databasePath).states()).toEqual(expectedStates);
+      expect(writer.inTransaction).toBe(true);
+    } finally {
+      writer.close();
+    }
+  });
+
+  test("retries read-only WAL recovery once with a read-write connection", async () => {
+    const databasePath = join(await root(), "aft.db");
+    createWriter(databasePath).close();
+    // A writable directory can let SQLite create sidecars even on a read-only
+    // connection. Inject the recovery error to exercise the retry on every host.
+    const recoveryError = sqliteError("SQLITE_READONLY_RECOVERY", 264);
+    const open = spyOn(Database, "open");
+    const exec = spyOn(Database.prototype, "exec");
+    const close = spyOn(Database.prototype, "close");
+    const query = spyOn(Database.prototype, "query").mockImplementationOnce(() => {
+      throw recoveryError;
+    });
+    try {
+      expect(await new AftTaskProbe(databasePath).states()).toEqual(expectedStates);
+      expect(open.mock.calls).toEqual([
+        [databasePath, { readonly: true, readwrite: false, create: false, strict: true }],
+        [databasePath, { readonly: false, readwrite: true, create: false, strict: true }],
+      ]);
+      expect(exec.mock.calls).toEqual([
+        ["PRAGMA busy_timeout = 5000"],
+        ["PRAGMA busy_timeout = 5000"],
+      ]);
+      expect(close).toHaveBeenCalledTimes(2);
+    } finally {
+      query.mockRestore();
+      close.mockRestore();
+      exec.mockRestore();
+      open.mockRestore();
+    }
+  });
+
+  test.each([
+    ["SQLITE_READONLY", 8],
+    ["SQLITE_READONLY_CANTINIT", 1288],
+    ["SQLITE_CANTOPEN", 14],
+  ] as const)("retries an open failure for %s", async (code, errno) => {
+    const databasePath = join(await root(), "aft.db");
+    createWriter(databasePath).close();
+    const error = sqliteError(code, errno);
+    const open = spyOn(Database, "open").mockImplementationOnce(() => {
+      throw error;
+    });
+    try {
+      expect(await new AftTaskProbe(databasePath).states()).toEqual(expectedStates);
+      expect(open).toHaveBeenCalledTimes(2);
+      expect(open.mock.calls[1]).toEqual([
+        databasePath, { readonly: false, readwrite: true, create: false, strict: true },
+      ]);
+    } finally {
+      open.mockRestore();
+    }
+  });
+
+  test("a failed read-write retry still throws and closes both connections", async () => {
+    const databasePath = join(await root(), "aft.db");
+    createWriter(databasePath).close();
+    const error = sqliteError("SQLITE_CANTOPEN", 14);
+    const close = spyOn(Database.prototype, "close");
+    const query = spyOn(Database.prototype, "query").mockImplementation(() => {
+      throw error;
+    });
+    try {
+      await expect(new AftTaskProbe(databasePath).states()).rejects.toBe(error);
+      expect(query).toHaveBeenCalledTimes(2);
+      expect(close).toHaveBeenCalledTimes(2);
+    } finally {
+      query.mockRestore();
+      close.mockRestore();
+    }
+  });
+
+  test.each([
+    ["SQLITE_BUSY", 5],
+    ["SQLITE_IOERR", 10],
+    ["SQLITE_CORRUPT", 11],
+  ] as const)("does not retry %s", async (code, errno) => {
+    const databasePath = join(await root(), "aft.db");
+    createWriter(databasePath).close();
+    const error = sqliteError(code, errno);
+    const query = spyOn(Database.prototype, "query").mockImplementationOnce(() => {
+      throw error;
+    });
+    try {
+      await expect(new AftTaskProbe(databasePath).states()).rejects.toBe(error);
+      expect(query).toHaveBeenCalledTimes(1);
+    } finally {
+      query.mockRestore();
+    }
+  });
+
+  test("does not retry a non-SQLite error with a readonly code", async () => {
+    const databasePath = join(await root(), "aft.db");
+    createWriter(databasePath).close();
+    const error = Object.assign(new Error("not from SQLite"), { errno: 8 });
+    const query = spyOn(Database.prototype, "query").mockImplementationOnce(() => {
+      throw error;
+    });
+    try {
+      await expect(new AftTaskProbe(databasePath).states()).rejects.toBe(error);
+      expect(query).toHaveBeenCalledTimes(1);
+    } finally {
+      query.mockRestore();
+    }
+  });
+
+  test("a missing task database is not created", async () => {
+    const directory = await root();
+    expect(await new AftTaskProbe(join(directory, "aft.db")).states()).toEqual([]);
+    expect(await readdir(directory)).toEqual([]);
+  });
+
+  test("a corrupt task database still throws", async () => {
+    const databasePath = join(await root(), "aft.db");
+    await writeFile(databasePath, "not a SQLite database");
+    await expect(new AftTaskProbe(databasePath).states()).rejects.toMatchObject({
+      code: "SQLITE_NOTADB",
+    });
   });
 });
 
