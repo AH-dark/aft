@@ -10095,6 +10095,230 @@ export function bannerUnused() {}
         (dir, root, InspectManager::new(), snapshot)
     }
 
+    fn seed_dead_code_fact_cache(
+        manager: &InspectManager,
+        snapshot: &InspectSnapshot,
+    ) -> (InspectJob, Arc<InspectCache>) {
+        let mut job = manager.tier2_reuse_job(snapshot.clone(), InspectCategory::DeadCode, None);
+        job.scope_files = scope_files(
+            &job.project_root,
+            &JobScope::for_project(job.project_root.clone()),
+        );
+        let (graph, _, _) = manager
+            .build_tier2_callgraph_snapshot_with_refresh_and_verdict(&job, false, true, &[])
+            .expect("ready fixture call graph");
+        job.callgraph_snapshot = Some(graph);
+        let facts = run_tier2_scan(&job, None).outcome.expect("seed file facts");
+        let cache = manager.cache_for_snapshot(snapshot).expect("inspect cache");
+        // Seed only per-file facts: no project aggregate has been published yet.
+        cache
+            .apply_contribution_updates_for_config(
+                job.category,
+                Tier2ContributionUpdates {
+                    upserts: facts.contributions,
+                    ..Tier2ContributionUpdates::default()
+                },
+                &job.config,
+            )
+            .unwrap();
+        assert!(cache
+            .get_aggregated_for_config(&job.key, &job.config)
+            .unwrap()
+            .is_none());
+        (job, cache)
+    }
+
+    fn corrupt_cached_dead_code_exports(cache: &InspectCache, file: &str, corruption: &str) {
+        let conn = rusqlite::Connection::open(cache.sqlite_path()).unwrap();
+        let blob: Vec<u8> = conn
+            .query_row(
+                "SELECT contribution FROM tier2_contributions \
+                 WHERE category = 'dead_code' AND project_key = ?1 AND file_path = ?2",
+                rusqlite::params![cache.project_key(), file],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut facts: Value = serde_json::from_slice(&blob).unwrap();
+        assert!(facts["exports"].is_array());
+        assert_eq!(
+            facts["facts_format_version"],
+            super::super::scanners::dead_code::DEAD_CODE_FACTS_FORMAT_VERSION
+        );
+        match corruption {
+            "missing exports" => {
+                facts.as_object_mut().unwrap().remove("exports");
+            }
+            "invalid exports" => facts["exports"] = json!("damaged exports"),
+            _ => panic!("unknown corruption: {corruption}"),
+        }
+        // Leave file hashes, freshness and fact-version metadata intact. Only
+        // the cached fact body is damaged, not the source or its cache key.
+        assert_eq!(
+            conn.execute(
+                "UPDATE tier2_contributions SET contribution = ?3 \
+                 WHERE category = 'dead_code' AND project_key = ?1 AND file_path = ?2",
+                rusqlite::params![
+                    cache.project_key(),
+                    file,
+                    serde_json::to_vec(&facts).unwrap()
+                ],
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    fn assert_cached_dead_code_gap(payload: &Value, file: &str) {
+        assert_eq!(payload["complete"], false, "{payload:#}");
+        assert_eq!(
+            payload["parse_errors"],
+            json!([{
+                "file": file,
+                "message": "cached dead-code contribution could not be decoded",
+            }])
+        );
+    }
+
+    #[test]
+    fn dead_code_cache_gap_before_rollup_survives_project_reuse() {
+        for corruption in ["missing exports", "invalid exports"] {
+            let (_dir, root, manager, snapshot) = dead_code_edge_case_fixture(&[]);
+            let (job, cache) = seed_dead_code_fact_cache(&manager, &snapshot);
+            corrupt_cached_dead_code_exports(&cache, "src/main.rs", corruption);
+            let first = manager
+                .tier2_run_with_reuse_job_result_with_options(
+                    job.clone(),
+                    Tier2ReuseOptions::default(),
+                    None,
+                )
+                .outcome
+                .expect("initial project rollup")
+                .aggregate;
+            assert_cached_dead_code_gap(&first, "src/main.rs");
+            assert!(aggregate_has_file_symbol(
+                &first,
+                "src/dead.rs",
+                "planted_dead"
+            ));
+            assert_eq!(
+                cache
+                    .get_aggregated_for_config(&job.key, &job.config)
+                    .unwrap(),
+                Some(first.clone())
+            );
+
+            super::super::cache::CONTRIBUTION_LOAD_WORK.with(|work| work.set((0, 0, 0)));
+            let reused = manager
+                .tier2_quick_reuse_success(&job, &cache, &Tier2ReuseOptions::default())
+                .unwrap()
+                .expect("unchanged project must reuse its saved aggregate");
+            assert_eq!(
+                super::super::cache::CONTRIBUTION_LOAD_WORK.with(std::cell::Cell::get),
+                (0, 0, 0),
+                "reuse must not decode contribution bodies"
+            );
+            assert_cached_dead_code_gap(&reused.aggregate, "src/main.rs");
+            assert_eq!(reused.aggregate, first);
+
+            // Fresh describes source freshness, not analysis completeness. Both
+            // writer and read-only project lookups must retain the saved gap.
+            let scope = JobScope::for_project(root);
+            for outcome in [
+                manager.tier2_read_cached(snapshot.clone(), job.category, scope.clone()),
+                manager.tier2_read_cached_readonly(snapshot.clone(), job.category, scope),
+            ] {
+                let payload = fresh_payload(outcome);
+                assert_cached_dead_code_gap(&payload, "src/main.rs");
+                assert_eq!(payload, first);
+            }
+        }
+    }
+
+    #[test]
+    fn dead_code_cache_gap_after_rollup_waits_until_recompute() {
+        for corruption in ["missing exports", "invalid exports"] {
+            let (_dir, root, manager, snapshot) = dead_code_edge_case_fixture(&[]);
+            let (job, cache) = seed_dead_code_fact_cache(&manager, &snapshot);
+            let first = manager
+                .tier2_run_with_reuse_job_result_with_options(
+                    job.clone(),
+                    Tier2ReuseOptions::default(),
+                    None,
+                )
+                .outcome
+                .expect("successful initial project rollup")
+                .aggregate;
+            assert_eq!(first["complete"], true);
+            assert!(aggregate_has_file_symbol(
+                &first,
+                "src/dead.rs",
+                "planted_dead"
+            ));
+            let original_hash = cache
+                .contribution_set_hash_for_config(job.category, &job.config)
+                .unwrap();
+            corrupt_cached_dead_code_exports(&cache, "src/dead.rs", corruption);
+            assert_eq!(
+                cache
+                    .contribution_set_hash_for_config(job.category, &job.config)
+                    .unwrap(),
+                original_hash,
+                "fact-body damage does not change the analyzed source hashes"
+            );
+            let reused = manager
+                .tier2_quick_reuse_success(&job, &cache, &Tier2ReuseOptions::default())
+                .unwrap()
+                .expect("unchanged source findings remain reusable");
+            assert_eq!(reused.aggregate, first);
+            assert_eq!(
+                fresh_payload(manager.tier2_read_cached(
+                    snapshot.clone(),
+                    job.category,
+                    JobScope::for_project(root.clone()),
+                )),
+                first
+            );
+
+            // A manifest change invalidates the aggregate key without reparsing
+            // the unchanged Rust file, so the next rollup must read its bad row.
+            let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+            write_fixture_file(
+                &root,
+                "Cargo.toml",
+                &format!("{manifest}\n# refresh rollup\n"),
+                3_200_000_050,
+            );
+            assert_ne!(
+                cache
+                    .contribution_set_hash_for_config(job.category, &job.config)
+                    .unwrap(),
+                original_hash
+            );
+            assert!(manager
+                .tier2_quick_reuse_success(&job, &cache, &Tier2ReuseOptions::default())
+                .unwrap()
+                .is_none());
+            let recomputed = manager
+                .tier2_run_with_reuse_job_result_with_options(
+                    job,
+                    Tier2ReuseOptions::default(),
+                    None,
+                )
+                .outcome
+                .expect("recompute after manifest change");
+            assert!(
+                !recomputed.scanned_files.contains(&root.join("src/dead.rs")),
+                "the corrupted row must not be repaired by rescanning its unchanged source"
+            );
+            assert_cached_dead_code_gap(&recomputed.aggregate, "src/dead.rs");
+            assert!(!aggregate_has_file_symbol(
+                &recomputed.aggregate,
+                "src/dead.rs",
+                "planted_dead"
+            ));
+        }
+    }
+
     /// Runs one dead-code pass over an edge-case fixture and checks the rollup
     /// completes with every walked file covered by stored facts.
     fn assert_dead_code_rollup_completes_with(extra: &[(&str, &str)]) -> Value {
