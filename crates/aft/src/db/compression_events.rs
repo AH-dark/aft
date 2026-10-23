@@ -1085,43 +1085,7 @@ pub fn maybe_spawn_retention(
             ) {
                 Ok(RetentionSweepOutcome::Completed(sweep)) => {
                     RETENTION_CONSECUTIVE_SKIPS.store(0, Ordering::Relaxed);
-                    crate::slog_info!(
-                        "bash task retention: initial_eligible={} removed={} remaining_eligible={:?} passes={} row_ceiling={} worst_count_lock_us={} worst_selection_lock_us={} worst_mutation_lock_us={} worst_lock_us={} elapsed_us={}",
-                        sweep.initial_eligible_rows,
-                        sweep.bash_tasks_removed,
-                        sweep.remaining_eligible_rows,
-                        sweep.passes,
-                        sweep.row_ceiling,
-                        sweep.worst_count_lock_micros,
-                        sweep.worst_selection_lock_micros,
-                        sweep.worst_mutation_lock_micros,
-                        sweep.worst_lock_micros,
-                        sweep.elapsed_micros
-                    );
-                    // The closing count only refreshes the health backlog
-                    // figure; the sweep itself finished, so this is routine.
-                    if let Some(skip) = sweep.count_skip {
-                        crate::slog_debug!(
-                            "bash task retention count skipped: reason={} attempts={} waited_us={} retry_budget_us={}",
-                            skip.reason.as_str(),
-                            skip.attempts,
-                            skip.waited_micros,
-                            RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS
-                        );
-                    }
-                    if sweep.worst_lock_micros > RETENTION_LOCK_BUDGET_MICROS {
-                        crate::slog_warn!(
-                            "bash task retention lock budget exceeded: worst_lock_us={} budget_us={}",
-                            sweep.worst_lock_micros,
-                            RETENTION_LOCK_BUDGET_MICROS
-                        );
-                    }
-                    if sweep.compression_events_removed > 0 {
-                        crate::slog_info!(
-                            "compression retention: folded {} raw events",
-                            sweep.compression_events_removed
-                        );
-                    }
+                    log_completed_retention_sweep(&sweep);
                 }
                 Ok(RetentionSweepOutcome::Skipped(skip)) => {
                     if note_skipped_sweep() {
@@ -1153,6 +1117,46 @@ pub fn maybe_spawn_retention(
     }
 }
 
+fn log_completed_retention_sweep(sweep: &RetentionSweep) {
+    let message = format!(
+        "bash task retention: initial_eligible={} removed={} compression_events_removed={} remaining_eligible={:?} passes={} row_ceiling={} worst_count_lock_us={} worst_selection_lock_us={} worst_mutation_lock_us={} worst_lock_us={} elapsed_us={}",
+        sweep.initial_eligible_rows,
+        sweep.bash_tasks_removed,
+        sweep.compression_events_removed,
+        sweep.remaining_eligible_rows,
+        sweep.passes,
+        sweep.row_ceiling,
+        sweep.worst_count_lock_micros,
+        sweep.worst_selection_lock_micros,
+        sweep.worst_mutation_lock_micros,
+        sweep.worst_lock_micros,
+        sweep.elapsed_micros
+    );
+    if sweep.bash_tasks_removed > 0 || sweep.compression_events_removed > 0 {
+        crate::slog_info!("{message}");
+    } else {
+        crate::slog_debug!("{message}");
+    }
+    // The final eligible-row count only updates the reported remaining-row total;
+    // the sweep has completed, so a missed count is debug-level detail.
+    if let Some(skip) = sweep.count_skip {
+        crate::slog_debug!(
+            "bash task retention count skipped: reason={} attempts={} waited_us={} retry_budget_us={}",
+            skip.reason.as_str(),
+            skip.attempts,
+            skip.waited_micros,
+            RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS
+        );
+    }
+    if sweep.worst_lock_micros > RETENTION_LOCK_BUDGET_MICROS {
+        crate::slog_warn!(
+            "bash task retention lock budget exceeded: worst_lock_us={} budget_us={}",
+            sweep.worst_lock_micros,
+            RETENTION_LOCK_BUDGET_MICROS
+        );
+    }
+}
+
 /// Count a sweep skipped at its opening count and bring the next attempt
 /// forward to the skip retry delay. Returns true only for the skip that makes
 /// the streak reach the starvation threshold, so a starved process warns once
@@ -1176,6 +1180,57 @@ fn note_skipped_sweep() -> bool {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn retention_sweep_for_logging(
+        bash_tasks_removed: usize,
+        compression_events_removed: usize,
+    ) -> RetentionSweep {
+        RetentionSweep {
+            initial_eligible_rows: bash_tasks_removed,
+            remaining_eligible_rows: Some(0),
+            count_skip: None,
+            row_ceiling: 1,
+            passes: 1,
+            bash_tasks_removed,
+            compression_events_removed,
+            worst_count_lock_micros: 1,
+            worst_selection_lock_micros: 1,
+            worst_mutation_lock_micros: 1,
+            worst_lock_micros: 1,
+            elapsed_micros: 1,
+        }
+    }
+
+    #[test]
+    fn retention_summary_is_debug_when_idle_and_one_info_when_changed() {
+        let (_, idle) = crate::logging::capture_log_lines(|| {
+            log_completed_retention_sweep(&retention_sweep_for_logging(0, 0));
+        });
+        assert!(
+            idle.iter().any(|line| {
+                line.starts_with("DEBUG ") && line.contains("bash task retention:")
+            }),
+            "idle retention sweep was not debug-logged: {idle:?}"
+        );
+        assert!(
+            !idle.iter().any(|line| line.starts_with("INFO ")),
+            "idle retention sweep produced an info log: {idle:?}"
+        );
+
+        let (_, changed) = crate::logging::capture_log_lines(|| {
+            log_completed_retention_sweep(&retention_sweep_for_logging(1, 1));
+        });
+        assert_eq!(
+            changed
+                .iter()
+                .filter(|line| line.starts_with("INFO "))
+                .count(),
+            1,
+            "a changed retention sweep should emit one info summary: {changed:?}"
+        );
+        assert!(changed[0].contains("removed=1"));
+        assert!(changed[0].contains("compression_events_removed=1"));
+    }
 
     fn insert_eligible_retention_task(conn: &crate::db::TrackedConnection, task_id: &str) {
         conn.execute(

@@ -167,10 +167,9 @@ pub fn delete_delivered_terminal_bash_task(
            AND status IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown')",
         params![harness, session_id, task_id],
     )?;
-    // A row can produce this warning only once: retries affect zero rows after
-    // the first successful DELETE, preventing a cleanup loop from flooding logs.
+    // Retries affect zero rows after the first successful DELETE.
     if deleted > 0 {
-        crate::slog_warn!("bash task row deleted: task_id={task_id} reason={reason}");
+        crate::slog_debug!("bash task row deleted: task_id={task_id} reason={reason}");
     }
     Ok(deleted)
 }
@@ -647,6 +646,57 @@ fn map_bash_task_row(row: &Row<'_>) -> rusqlite::Result<BashTaskRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_gc_row_deletion_is_debug_logged_not_a_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&temp.path().join("aft.db")).unwrap();
+        let row = BashTaskRow {
+            harness: "opencode".into(),
+            session_id: "session".into(),
+            task_id: "bash-0000000000000100".into(),
+            project_key: "project".into(),
+            command: "true".into(),
+            cwd: ".".into(),
+            status: "completed".into(),
+            exit_code: Some(0),
+            pid: None,
+            pgid: None,
+            started_at: 1,
+            completed_at: Some(1),
+            stdout_path: None,
+            stderr_path: None,
+            compressed: false,
+            timeout_ms: None,
+            completion_delivered: true,
+            output_bytes: None,
+            metadata: String::new(),
+        };
+        upsert_bash_task(&conn, &row).unwrap();
+
+        let (deleted, lines) = crate::logging::capture_log_lines(|| {
+            delete_delivered_terminal_bash_task(
+                &conn,
+                "opencode",
+                "session",
+                &row.task_id,
+                "persisted_gc_delivered_terminal",
+            )
+            .unwrap()
+        });
+
+        assert_eq!(deleted, 1);
+        assert!(
+            lines.iter().any(|line| {
+                line.starts_with("DEBUG ") && line.contains("persisted_gc_delivered_terminal")
+            }),
+            "routine persisted GC deletion was not debug-logged: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("WARN ")),
+            "routine persisted GC deletion was warning-logged: {lines:?}"
+        );
+    }
 
     #[test]
     fn session_history_preserves_sqlite_order_without_a_temp_sort() {

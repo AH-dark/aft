@@ -1006,11 +1006,12 @@ same resolution as indexes and other persistent data: `AFT_STORAGE_DIR`, then
 `~/.local/share/cortexkit/aft` on Linux and macOS, or `%LOCALAPPDATA%/cortexkit/aft`
 on Windows). See [Uninstall paths](#uninstall-paths) for the complete fallback order.
 
-- Rust module processes write `aft-<pid>.log`. Each process file rolls at 20 MB
-  through `.1` to `.5`; files from dead PIDs are removed after seven days.
-- OpenCode and Pi plugin messages share `aft-plugin.log`, which uses the same
-  20 MB / five-generation rotation policy. The `[aft-plugin]` and `[aft-pi]`
-  tags identify the source.
+- Rust module processes write `aft-<pid>.log`. Each process file rolls at 32 MiB
+  into one `.1` backup; files from dead PIDs are removed after 24 hours, and the
+  log folder is kept under 200 MiB.
+- OpenCode and Pi plugin messages share `aft-plugin.log`, which also rolls at
+  32 MiB into one `.1` backup. The `[aft-plugin]` and `[aft-pi]` tags identify
+  the source.
 - Module lines continue to go to stderr as well, so daemon capture remains
   available while the durable files provide a module-owned history.
 

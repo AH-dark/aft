@@ -141,7 +141,7 @@ remove a registration. `tool_surface`, `hoist_builtin_tools` and the `search_ind
 
 ## Logs
 
-Plugin logs go to `<storage_root>/logs/aft-plugin.log` with an `[aft-pi]` tag. The file rotates at 20 MB through five retained generations; Rust module processes use adjacent `aft-<pid>.log` files.
+Plugin logs go to `<storage_root>/logs/aft-plugin.log` with an `[aft-pi]` tag. The file rolls at 32 MiB into one `.1` backup; Rust module processes use adjacent `aft-<pid>.log` files.
 
 Set `AFT_LOG_STDERR=1` to route logs to stderr instead (useful for piping or subprocess tests).
 

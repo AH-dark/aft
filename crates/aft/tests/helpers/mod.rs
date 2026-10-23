@@ -1592,17 +1592,17 @@ pub fn user_config(doc: serde_json::Value) -> serde_json::Value {
 // logger could win — the other module's `take_logs()` would read an empty
 // buffer because records routed to the winner's storage.
 //
-// Fix: a SINGLE process-global logger installed once, routing each record to a
-// THREAD-LOCAL buffer. Because every `#[test]` runs on its own thread, capture
-// is isolated per test and race-free under parallel execution. Tests call
-// `init_test_logger()` (installs once, clears this thread's buffer) and
-// `take_logs()` (drains this thread's buffer).
-// ---------------------------------------------------------------------------
+// A single process-global logger routes each record to the buffer for the test
+// thread that emitted it. `init_test_logger()` captures warnings by default; a
+// test that needs lower-severity records can request a wider thread-local level
+// without widening another test's buffer.
 
 use std::sync::Once as StdOnce;
 
 thread_local! {
     static THREAD_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    static THREAD_LOG_LEVEL: std::cell::Cell<log::LevelFilter> =
+        const { std::cell::Cell::new(log::LevelFilter::Warn) };
 }
 
 static SHARED_LOGGER_INIT: StdOnce = StdOnce::new();
@@ -1611,7 +1611,7 @@ struct ThreadLocalTestLogger;
 
 impl log::Log for ThreadLocalTestLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Warn
+        THREAD_LOG_LEVEL.with(|level| metadata.level().to_level_filter() <= level.get())
     }
 
     fn log(&self, record: &log::Record) {
@@ -1627,19 +1627,27 @@ impl log::Log for ThreadLocalTestLogger {
 /// Install the shared thread-local-capturing logger (once per process) and
 /// clear the CURRENT thread's captured logs so each test starts clean.
 pub fn init_test_logger() {
+    init_test_logger_with_level(log::LevelFilter::Warn);
+}
+
+/// Capture through `level` on this thread without widening another test's
+/// thread-local log buffer.
+pub fn init_test_logger_with_level(level: log::LevelFilter) {
     SHARED_LOGGER_INIT.call_once(|| {
-        // Ignore an already-installed logger: another harness (or a prior
-        // `Once` in legacy code) may have installed one. We only need warn-level
-        // capture, and a failed install must never panic the test binary.
+        // Another test harness may already have installed the process-global
+        // logger. Keep using it if that happened. Debug is the global ceiling so
+        // a thread can request lower-severity capture without widening another buffer.
         let _ = log::set_boxed_logger(Box::new(ThreadLocalTestLogger));
-        log::set_max_level(log::LevelFilter::Warn);
+        log::set_max_level(log::LevelFilter::Debug);
     });
+    THREAD_LOG_LEVEL.with(|thread_level| thread_level.set(level));
     THREAD_LOGS.with(|logs| logs.borrow_mut().clear());
 }
 
-/// Drain and return the warn-level logs captured on the CURRENT thread since
-/// the last `init_test_logger()` / `take_logs()`.
+/// Drain the logs captured on the current thread since the last initialization,
+/// then restore the default warning-level filter.
 pub fn take_logs() -> Vec<String> {
+    THREAD_LOG_LEVEL.with(|level| level.set(log::LevelFilter::Warn));
     THREAD_LOGS.with(|logs| std::mem::take(&mut *logs.borrow_mut()))
 }
 

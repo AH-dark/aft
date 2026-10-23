@@ -7740,6 +7740,15 @@ impl BgTaskRegistry {
                     }
                 }
                 memo.session_read(&session_dir);
+                let related_task_sessions = [session_dir.clone()];
+                if let Err(error) = self
+                    .remove_empty_session_directory_if_unused(&session_dir, &related_task_sessions)
+                {
+                    crate::slog_warn!(
+                        "failed to remove empty persisted-task session directory {}: {error}",
+                        session_dir.display()
+                    );
+                }
             }
         }
         // The collector runs every few seconds; a zero count is the normal
@@ -7748,7 +7757,7 @@ impl BgTaskRegistry {
             crate::slog_info!("retired {retired} undelivered completions of deleted worktrees");
         }
         memo.finish_pass(pass);
-        gc_quarantine(storage_dir);
+        gc_quarantine(self, storage_dir);
         Ok(deleted)
     }
 
@@ -8391,6 +8400,61 @@ impl BgTaskRegistry {
         self.cleanup_finished_at(older_than, Instant::now());
     }
 
+    fn with_session_directory_use_fence<T>(
+        &self,
+        session_dir: &Path,
+        related_task_sessions: &[PathBuf],
+        operation: impl FnOnce() -> std::io::Result<T>,
+    ) -> std::io::Result<Option<T>> {
+        let storage_locks = super::persistence::lock_session_directories(&[session_dir])?;
+        let recovery_key = session_dir.file_name().and_then(|name| name.to_str());
+        let recoveries = self
+            .inner
+            .session_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if recovery_key
+            .and_then(|key| recoveries.get(key))
+            .is_some_and(|state| state.in_flight > 0)
+        {
+            return Ok(None);
+        }
+        let tasks = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tasks.values().any(|task| {
+            !task.is_terminal() && related_task_sessions.contains(&task.paths.session_dir)
+        }) {
+            return Ok(None);
+        }
+        drop(tasks);
+        let result = operation()?;
+        drop(recoveries);
+        drop(storage_locks);
+        Ok(Some(result))
+    }
+
+    fn remove_empty_session_directory_if_unused(
+        &self,
+        session_dir: &Path,
+        related_task_sessions: &[PathBuf],
+    ) -> std::io::Result<()> {
+        if self
+            .with_session_directory_use_fence(session_dir, related_task_sessions, || {
+                super::persistence::remove_empty_session_directory_locked(session_dir)
+            })?
+            .is_none()
+        {
+            log::debug!(
+                "kept empty background task session directory {} while a replay or live task owns it",
+                session_dir.display()
+            );
+        }
+        Ok(())
+    }
+
     fn cleanup_finished_at(&self, older_than: Duration, now: Instant) {
         self.cleanup_finished_at_with(older_than, now, |task| {
             delete_task_bundle_with_legacy_harness_root(
@@ -8477,11 +8541,31 @@ impl BgTaskRegistry {
                 Ok(()) => {
                     self.forget_finished_delete_attempts(&task_id);
                     self.remove_cleanup_task(&task);
+                    let related_task_sessions = [paths.session_dir.clone()];
+                    if let Err(error) = self.remove_empty_session_directory_if_unused(
+                        &paths.session_dir,
+                        &related_task_sessions,
+                    ) {
+                        crate::slog_warn!(
+                            "failed to remove empty background task session directory {}: {error}",
+                            paths.session_dir.display()
+                        );
+                    }
                     log::debug!("deleted persisted background task bundle {task_id}");
                 }
                 Err(error) if is_task_layout_not_found(&error) => {
                     self.forget_finished_delete_attempts(&task_id);
                     self.remove_cleanup_task(&task);
+                    let related_task_sessions = [paths.session_dir.clone()];
+                    if let Err(error) = self.remove_empty_session_directory_if_unused(
+                        &paths.session_dir,
+                        &related_task_sessions,
+                    ) {
+                        crate::slog_warn!(
+                            "failed to remove empty background task session directory {}: {error}",
+                            paths.session_dir.display()
+                        );
+                    }
                     log::debug!(
                         "skipping persisted background task bundle {task_id}: no recognized layout at {}",
                         paths.dir.display()
@@ -13286,7 +13370,7 @@ fn task_artifacts_exist(session_dir: &Path, task_id: &str) -> bool {
 }
 
 /// Quarantine history uses the same resumable iterator budget as task history.
-fn gc_quarantine(storage_dir: &Path) {
+fn gc_quarantine(registry: &BgTaskRegistry, storage_dir: &Path) {
     let root = storage_dir.join("bash-tasks-quarantine");
     let key = canonicalized_path(&root);
     let walk = gc_batches(&root, key);
@@ -13299,25 +13383,67 @@ fn gc_quarantine(storage_dir: &Path) {
         );
     }
     for batch in walk.batches {
-        for name in batch.names {
-            let path = batch.session.join(name);
-            if modified_within(&path, QUARANTINE_GC_GRACE) {
-                continue;
-            }
-            let result = if path.is_dir() {
-                fs::remove_dir_all(&path)
-            } else {
-                fs::remove_file(&path)
-            };
-            if let Err(error) = result {
-                crate::slog_warn!(
-                    "failed to delete old background task quarantine entry {}: {error}",
-                    path.display()
-                );
-            }
+        let session_dir = batch.session;
+        let related_task_sessions =
+            task_session_directories_for_quarantine(storage_dir, &session_dir);
+        let result =
+            registry.with_session_directory_use_fence(&session_dir, &related_task_sessions, || {
+                for name in batch.names {
+                    let path = session_dir.join(name);
+                    if modified_within(&path, QUARANTINE_GC_GRACE) {
+                        continue;
+                    }
+                    let result = if path.is_dir() {
+                        fs::remove_dir_all(&path)
+                    } else {
+                        fs::remove_file(&path)
+                    };
+                    if let Err(error) = result {
+                        crate::slog_warn!(
+                            "failed to delete old background task quarantine entry {}: {error}",
+                            path.display()
+                        );
+                    }
+                }
+                super::persistence::remove_empty_session_directory_locked(&session_dir)
+            });
+        match result {
+            Ok(Some(_)) => {}
+            Ok(None) => log::debug!(
+                "kept background task quarantine session {} while a replay or live task owns it",
+                session_dir.display()
+            ),
+            Err(error) => crate::slog_warn!(
+                "failed to sweep background task quarantine session {}: {error}",
+                session_dir.display()
+            ),
         }
-        // Leave session directories pinned by concurrent quarantine writers.
     }
+}
+
+fn task_session_directories_for_quarantine(
+    storage_dir: &Path,
+    quarantine_session: &Path,
+) -> Vec<PathBuf> {
+    let Some(session_hash) = quarantine_session.file_name() else {
+        return Vec::new();
+    };
+    let mut task_roots = vec![storage_dir.join("bash-tasks")];
+    if storage_dir
+        .file_name()
+        .is_some_and(|name| name == "opencode" || name == "pi")
+    {
+        if let Some(storage_root) = storage_dir.parent() {
+            task_roots.push(storage_root.join("bash-tasks"));
+        }
+    } else {
+        task_roots
+            .extend(["opencode", "pi"].map(|harness| storage_dir.join(harness).join("bash-tasks")));
+    }
+    task_roots
+        .into_iter()
+        .map(|task_root| task_root.join(session_hash))
+        .collect()
 }
 
 /// One pass's share of a resumable walk over a GC root.
@@ -14484,6 +14610,70 @@ mod completion_replay_ordering_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn persisted_gc_removes_existing_empty_task_and_quarantine_sessions() {
+        let storage = tempfile::tempdir().unwrap();
+        let task_session = storage.path().join("bash-tasks").join("empty-task-session");
+        let quarantine_session = storage
+            .path()
+            .join("bash-tasks-quarantine")
+            .join("empty-quarantine-session");
+        std::fs::create_dir_all(&task_session).unwrap();
+        std::fs::create_dir_all(&quarantine_session).unwrap();
+
+        super::BgTaskRegistry::default()
+            .maybe_gc_persisted(storage.path())
+            .unwrap();
+
+        assert!(
+            !task_session.exists(),
+            "persisted GC left an empty task session"
+        );
+        assert!(
+            !quarantine_session.exists(),
+            "quarantine GC left an empty quarantine session"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_gc_keeps_an_empty_session_pinned_by_a_live_task() {
+        let registry = super::BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let task_id = "bash-0000000000000042".to_string();
+        let layout =
+            super::super::persistence::create_task_layout(storage.path(), "live-session", &task_id)
+                .unwrap();
+        let mut metadata = super::PersistedTask::starting(
+            task_id.clone(),
+            "live-session".into(),
+            "sleep 60".into(),
+            storage.path().to_path_buf(),
+            Some(storage.path().to_path_buf()),
+            None,
+            true,
+            false,
+        );
+        metadata.status = super::BgTaskStatus::Running;
+        super::super::persistence::write_task(&layout.paths.json, &metadata).unwrap();
+        registry
+            .insert_rehydrated_task(metadata, layout.paths.clone(), true)
+            .unwrap();
+        let task = registry.task_for_session(&task_id, "live-session").unwrap();
+        let session_dir = task.paths.session_dir.clone();
+        std::fs::remove_dir_all(&task.paths.dir).unwrap();
+
+        registry.maybe_gc_persisted(storage.path()).unwrap();
+
+        assert!(
+            session_dir.exists(),
+            "GC removed a session pinned by a live task"
+        );
+        assert!(registry
+            .task_for_session(&task_id, "live-session")
+            .is_some());
+    }
+
     #[test]
     fn completion_tokenization_failure_skips_all_metrics() {
         for failed in ["raw", "rendered"] {
@@ -19411,6 +19601,54 @@ mod tests {
 
         assert!(registry.task_for_session(&task_id, "session").is_none());
         assert_eq!(registry.finished_delete_attempt_count(&task_id), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_finished_removes_an_empty_task_directory_without_retrying() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let task_id = "bash-0000000000000020".to_string();
+        let layout =
+            super::super::persistence::create_task_layout(storage.path(), "session", &task_id)
+                .unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.clone(),
+            "session".into(),
+            "true".into(),
+            storage.path().to_path_buf(),
+            Some(storage.path().to_path_buf()),
+            None,
+            true,
+            false,
+        );
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        metadata.completion_delivered = true;
+        write_task(&layout.paths.json, &metadata).unwrap();
+        registry
+            .insert_rehydrated_task(metadata, layout.paths.clone(), true)
+            .unwrap();
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        std::fs::remove_dir_all(&task.paths.dir).unwrap();
+        std::fs::create_dir(&task.paths.dir).unwrap();
+        let clock_origin = Instant::now();
+        *task.terminal_at.lock().unwrap() = Some(clock_origin);
+
+        registry.cleanup_finished_at(
+            crate::bash_background::watchdog::FINISHED_RETENTION,
+            clock_origin + Duration::from_secs(24 * 60 * 60 + 1),
+        );
+
+        assert!(registry.task_for_session(&task_id, "session").is_none());
+        assert_eq!(registry.finished_delete_attempt_count(&task_id), 0);
+        assert!(
+            !task.paths.dir.exists(),
+            "empty task directory was left behind"
+        );
+        assert!(
+            !task.paths.session_dir.exists(),
+            "empty session directory was left behind"
+        );
     }
 
     #[test]

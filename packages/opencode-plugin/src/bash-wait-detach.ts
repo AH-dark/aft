@@ -279,6 +279,10 @@ async function sendBashWaitDetach(
   return response.detached === true;
 }
 
+export function waitDetachSummaryLevel(pendingRequest: boolean): "info" | "debug" {
+  return pendingRequest ? "info" : "debug";
+}
+
 export async function signalBashWaitDetachForProject(
   pool: ActiveBridgePool,
   projectRoot: string,
@@ -344,8 +348,10 @@ async function signalActiveBridges(
       `[bash_wait_detach] failed for session ${sessionID}: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
     );
   } else {
-    log(
-      `[bash_wait_detach] ${request ? "pending detach recorded" : "no active wait found"} for session ${sessionID} (signaled ${signaled} bridge(s))`,
-    );
+    const message = request
+      ? `[bash_wait_detach] pending detach recorded for session ${sessionID} (signaled ${signaled} bridge(s))`
+      : `[bash_wait_detach] no active wait found for session ${sessionID} (signaled ${signaled} bridge(s))`;
+    if (waitDetachSummaryLevel(request !== undefined) === "info") log(message);
+    else debug(message);
   }
 }

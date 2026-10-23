@@ -41,6 +41,7 @@ const PASS_BUDGET: Duration = Duration::from_secs(5);
 const PASS_ENTRIES: usize = 64;
 const TREE_ENTRIES: usize = 4096;
 const HISTORY_ENTRIES: usize = 8192;
+static REPORTED_BINDING_READ_ERRORS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 const DOMAINS: [&str; 6] = [
     "views",
     "callgraph",
@@ -1317,6 +1318,178 @@ fn missing_root_scope_key(root: &Path) -> String {
     }
 }
 
+struct BindingReadError {
+    error: io::Error,
+    truncated: bool,
+    digest: Option<[u8; 32]>,
+}
+
+fn read_binding_record(path: &Path) -> Result<(serde_json::Value, Binding), BindingReadError> {
+    let metadata = fs::metadata(path).map_err(|error| BindingReadError {
+        error,
+        truncated: false,
+        digest: None,
+    })?;
+    if metadata.len() > 8 * 1024 * 1024 {
+        return Err(BindingReadError {
+            error: io::Error::other("retention metadata exceeds 8 MiB"),
+            truncated: false,
+            digest: None,
+        });
+    }
+    let bytes = fs::read(path).map_err(|error| BindingReadError {
+        error,
+        truncated: false,
+        digest: None,
+    })?;
+    let record =
+        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|error| BindingReadError {
+            truncated: error.is_eof() && !might_be_versioned_binding(&bytes),
+            digest: (error.is_eof() && !might_be_versioned_binding(&bytes))
+                .then(|| *blake3::hash(&bytes).as_bytes()),
+            error: io::Error::other(error),
+        })?;
+    if let Some(version) = record.get("schema_version") {
+        return Err(BindingReadError {
+            error: io::Error::other(format!(
+                "root binding declares an unknown schema_version {version}"
+            )),
+            truncated: false,
+            digest: None,
+        });
+    }
+    // Root bindings have no reader-floor entry. Preserve unknown fields rather
+    // than letting an older binary erase a record with a newer shape.
+    if let Some(field) = unknown_binding_field(&record) {
+        return Err(BindingReadError {
+            error: io::Error::other(format!("root binding contains unknown field {field:?}")),
+            truncated: false,
+            digest: None,
+        });
+    }
+    let binding = serde_json::from_value(record.clone()).map_err(|error| BindingReadError {
+        error: io::Error::other(error),
+        truncated: false,
+        digest: None,
+    })?;
+    clear_logged_binding_error(path);
+    Ok((record, binding))
+}
+
+fn might_be_versioned_binding(bytes: &[u8]) -> bool {
+    [b"schema".as_slice(), b"version".as_slice()]
+        .into_iter()
+        .any(|marker| bytes.windows(marker.len()).any(|window| window == marker))
+}
+
+fn unknown_binding_field(record: &serde_json::Value) -> Option<&str> {
+    let fields = record.as_object()?;
+    fields.keys().find_map(|field| {
+        (!matches!(
+            field.as_str(),
+            "root"
+                | "artifact_key"
+                | "last_bound_ms"
+                | "volume"
+                | "stable_volume"
+                | "linked_worktree"
+        ))
+        .then_some(field.as_str())
+    })
+}
+
+fn report_binding_read_error_once(path: &Path, message: &str) {
+    let mut reported = REPORTED_BINDING_READ_ERRORS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if reported.len() >= HISTORY_ENTRIES {
+        reported.clear();
+    }
+    if reported.insert(path.to_path_buf()) {
+        crate::slog_warn!(
+            "storage retention skipped unreadable root binding {}: {message}",
+            path.display()
+        );
+    }
+}
+
+fn clear_logged_binding_error(path: &Path) {
+    if let Some(reported) = REPORTED_BINDING_READ_ERRORS.get() {
+        reported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(path);
+    }
+}
+
+fn quarantine_truncated_binding(
+    storage: &Path,
+    path: &Path,
+    expected_digest: [u8; 32],
+) -> io::Result<PathBuf> {
+    let current = fs::read(path)?;
+    if blake3::hash(&current).as_bytes() != &expected_digest {
+        return Err(io::Error::other("root binding changed before quarantine"));
+    }
+    let quarantine_root = storage.join("retention/quarantine/roots");
+    crate::backup::create_private_durable_dir(&quarantine_root)?;
+    let scope = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("root binding has no UTF-8 scope name"))?;
+    let destination = quarantine_root.join(format!("{scope}.truncated.json"));
+    crate::durability::atomic_write(
+        &destination,
+        &current,
+        crate::durability::AtomicWriteDurability::FileAndDirectory,
+    )?;
+    fs::remove_file(path)?;
+    Ok(destination)
+}
+
+fn handle_binding_read_error(
+    storage: &Path,
+    path: &Path,
+    error: BindingReadError,
+    quarantine_truncated: bool,
+    barrier_held: bool,
+) {
+    let quarantine = if error.truncated && quarantine_truncated {
+        let expected_digest = error.digest.expect("truncated binding digest");
+        if barrier_held {
+            quarantine_truncated_binding(storage, path, expected_digest)
+        } else {
+            barrier(storage)
+                .and_then(|_barrier| quarantine_truncated_binding(storage, path, expected_digest))
+        }
+    } else {
+        return report_binding_read_error_once(path, &error.error.to_string());
+    };
+    let message = match quarantine {
+        Ok(destination) => format!(
+            "{}; truncated record moved to {}",
+            error.error,
+            destination.display()
+        ),
+        Err(quarantine_error) => {
+            format!("{}; quarantine failed: {quarantine_error}", error.error)
+        }
+    };
+    report_binding_read_error_once(path, &message);
+}
+
+fn unreadable_binding_sentinel(storage: &Path, scope: &str) -> Binding {
+    Binding {
+        root: storage.join("retention/roots"),
+        artifact_key: scope.to_owned(),
+        last_bound_ms: crate::pins::now_ms(),
+        volume: None,
+        stable_volume: None,
+        linked_worktree: false,
+    }
+}
+
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
     if fs::metadata(path)?.len() > 8 * 1024 * 1024 {
         return Err(io::Error::other("retention metadata exceeds 8 MiB"));
@@ -1392,6 +1565,7 @@ fn bindings_with_admission(
                 .push(binding);
         }
     }
+    let mut root_binding_scopes = HashSet::new();
     for entry in bounded_dirs(&storage.join("retention/roots"), HISTORY_ENTRIES)? {
         if admission {
             yield_to_bind(storage)?;
@@ -1403,25 +1577,58 @@ fn bindings_with_admission(
         {
             continue;
         }
-        let binding: Binding = read_json(&entry.path())?;
+        let path = entry.path();
+        let scope = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        root_binding_scopes.insert(scope.clone());
+        let binding = match read_binding_record(&path) {
+            Ok((_, binding)) => binding,
+            Err(error) => {
+                handle_binding_read_error(storage, &path, error, false, false);
+                // The filename still identifies this scope. Keep it out of
+                // orphan cleanup until a readable binding replaces the record.
+                result
+                    .entry(scope.clone())
+                    .or_default()
+                    .push(unreadable_binding_sentinel(storage, &scope));
+                continue;
+            }
+        };
         if binding.linked_worktree {
             linked_roots.insert(
                 crate::root_cache::canonical_root(&binding.root),
                 (binding.volume.clone(), binding.stable_volume.clone()),
             );
         }
-        let scope = entry
-            .path()
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_owned();
         // A durable binding supersedes the memo's possibly much older timestamp.
         result.entry(scope).or_default().push(binding.clone());
         result
             .entry(binding.artifact_key.clone())
             .or_default()
             .push(binding);
+    }
+    let quarantine_root = storage.join("retention/quarantine/roots");
+    for entry in bounded_dirs(&quarantine_root, HISTORY_ENTRIES)? {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Some(scope) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.strip_suffix(".truncated"))
+        else {
+            continue;
+        };
+        if root_binding_scopes.insert(scope.to_owned()) {
+            result
+                .entry(scope.to_owned())
+                .or_default()
+                .push(unreadable_binding_sentinel(storage, scope));
+        }
     }
     for entry in bounded_dirs(&storage.join("artifact-owners"), HISTORY_ENTRIES)? {
         if admission {
@@ -7837,6 +8044,186 @@ mod storage_retention_tests {
         assert!(registry.member(&scope).unwrap().is_some());
         assert!(path.exists());
     }
+
+    #[test]
+    fn prune_bindings_isolates_truncated_and_unknown_version_records() {
+        let storage = tempfile::tempdir().unwrap();
+        let roots = storage.path().join("retention/roots");
+        fs::create_dir_all(&roots).unwrap();
+
+        let truncated_scope = "truncated-scope";
+        let truncated_path = roots.join(format!("{truncated_scope}.json"));
+        let truncated_bytes = br#"{"root":"/unfinished"#;
+        fs::write(&truncated_path, truncated_bytes).unwrap();
+
+        let future_scope = "future-scope";
+        let future_path = roots.join(format!("{future_scope}.json"));
+        let future_bytes = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 999,
+            "root": storage.path().join("future-missing-root"),
+            "artifact_key": "future-key",
+            "last_bound_ms": 0,
+        }))
+        .unwrap();
+        fs::write(&future_path, &future_bytes).unwrap();
+
+        let eligible_scope = "eligible-scope";
+        let eligible_path = roots.join(format!("{eligible_scope}.json"));
+        let anchor = storage.path().join("anchor");
+        fs::create_dir(&anchor).unwrap();
+        let _volume =
+            test_volume_uuid_guard(storage.path(), &anchor, "retention-test-volume").unwrap();
+        atomic_json(
+            &eligible_path,
+            &Binding {
+                root: storage.path().join("missing-root"),
+                artifact_key: "x".into(),
+                last_bound_ms: 0,
+                volume: Some((anchor, 0)),
+                stable_volume: Some(VolumeIdentity {
+                    uuid: Some("retention-test-volume".into()),
+                    boot_id: None,
+                }),
+                linked_worktree: false,
+            },
+        )
+        .unwrap();
+
+        let mut report = SweepReport {
+            at_ms: u64::MAX,
+            ..Default::default()
+        };
+        let (result, lines) = crate::logging::capture_log_lines(|| {
+            prune_bindings(storage.path(), &|| false, &mut report)
+        });
+
+        assert!(
+            result.is_ok(),
+            "one bad binding aborted pruning: {result:?}"
+        );
+        assert_eq!(report.examined_bindings, 3);
+        assert_eq!(report.skipped_unknown, 2);
+        assert_eq!(report.pruned_bindings, 1);
+        assert!(
+            !eligible_path.exists(),
+            "a later valid binding was not pruned"
+        );
+        assert_eq!(fs::read(&future_path).unwrap(), future_bytes);
+        let quarantine = bounded_dirs(
+            &storage.path().join("retention/quarantine/roots"),
+            HISTORY_ENTRIES,
+        )
+        .unwrap();
+        assert_eq!(quarantine.len(), 1, "truncated binding was not quarantined");
+        let quarantined_path = quarantine[0].path();
+        assert_eq!(fs::read(&quarantined_path).unwrap(), truncated_bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&quarantined_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0,
+                "truncated binding quarantine file is not owner-only"
+            );
+        }
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("unreadable root binding"))
+                .count(),
+            2,
+            "each unknown binding should be logged once: {lines:?}"
+        );
+
+        let history = bindings(storage.path()).unwrap();
+        assert!(history
+            .get(truncated_scope)
+            .is_some_and(|records| { records.iter().any(|binding| binding.root == roots) }));
+        assert!(history
+            .get(future_scope)
+            .is_some_and(|records| { records.iter().any(|binding| binding.root == roots) }));
+    }
+
+    #[test]
+    fn truncated_binding_quarantine_stays_bounded_across_repair_cycles() {
+        let storage = tempfile::tempdir().unwrap();
+        let roots = storage.path().join("retention/roots");
+        fs::create_dir_all(&roots).unwrap();
+        let broken_scope = "repaired-scope";
+        let broken_path = roots.join(format!("{broken_scope}.json"));
+        let live_root = storage.path().join("live-root");
+        let anchor = storage.path().join("volume-anchor");
+        fs::create_dir(&live_root).unwrap();
+        fs::create_dir(&anchor).unwrap();
+        let _volume =
+            test_volume_uuid_guard(storage.path(), &anchor, "retention-cycle-volume").unwrap();
+
+        for cycle in 0..24 {
+            fs::write(&broken_path, br#"{"root":"/unfinished"#).unwrap();
+            let eligible_path = roots.join(format!("eligible-{cycle}.json"));
+            atomic_json(
+                &eligible_path,
+                &Binding {
+                    root: storage.path().join(format!("missing-{cycle}")),
+                    artifact_key: "x".into(),
+                    last_bound_ms: 0,
+                    volume: Some((anchor.clone(), 0)),
+                    stable_volume: Some(VolumeIdentity {
+                        uuid: Some("retention-cycle-volume".into()),
+                        boot_id: None,
+                    }),
+                    linked_worktree: false,
+                },
+            )
+            .unwrap();
+            let mut report = SweepReport {
+                at_ms: u64::MAX,
+                ..Default::default()
+            };
+            prune_bindings(storage.path(), &|| false, &mut report).unwrap();
+            assert!(!eligible_path.exists(), "cleanup stalled in cycle {cycle}");
+            assert_eq!(report.skipped_unknown, 1);
+
+            let quarantine = bounded_dirs(
+                &storage.path().join("retention/quarantine/roots"),
+                HISTORY_ENTRIES,
+            )
+            .unwrap();
+            assert_eq!(
+                quarantine.len(),
+                1,
+                "quarantine history grew during repair cycle {cycle}: {:?}",
+                quarantine
+                    .iter()
+                    .map(|entry| entry.file_name())
+                    .collect::<Vec<_>>()
+            );
+
+            atomic_json(
+                &broken_path,
+                &Binding {
+                    root: live_root.clone(),
+                    artifact_key: "x".into(),
+                    last_bound_ms: crate::pins::now_ms(),
+                    volume: Some((anchor.clone(), 0)),
+                    stable_volume: Some(VolumeIdentity {
+                        uuid: Some("retention-cycle-volume".into()),
+                        boot_id: None,
+                    }),
+                    linked_worktree: false,
+                },
+            )
+            .unwrap();
+            let history = bindings(storage.path()).unwrap();
+            assert!(history.get(broken_scope).is_some_and(|records| {
+                records.iter().any(|binding| binding.root == live_root)
+            }));
+        }
+    }
 }
 
 fn collect_one_family(
@@ -7920,12 +8307,24 @@ fn prune_bindings(
         {
             continue;
         }
-        let record: serde_json::Value = read_json(&entry.path())?;
-        let binding: Binding = serde_json::from_value(record.clone()).map_err(io::Error::other)?;
+        let path = entry.path();
+        let (record, binding) = match read_binding_record(&path) {
+            Ok(record) => record,
+            Err(error) => {
+                let message = error.error.to_string();
+                handle_binding_read_error(storage, &path, error, true, false);
+                report.skipped_unknown += 1;
+                if report.errors.len() < 16 {
+                    report
+                        .errors
+                        .push(format!("{}: binding skipped: {message}", path.display()));
+                }
+                continue;
+            }
+        };
         if record.get("linked_worktree").is_none() && matches!(binding.root.try_exists(), Ok(true))
         {
-            report.upgraded_bindings +=
-                usize::from(upgrade_legacy_binding(storage, &entry.path())?);
+            report.upgraded_bindings += usize::from(upgrade_legacy_binding(storage, &path)?);
             continue;
         }
         if !missing_and_old(&binding, report.at_ms) {
@@ -7998,7 +8397,22 @@ fn prune_bindings(
         let _barrier = barrier(storage)?;
         // A rebind can replace the record while the cache inventory is being
         // read. Never erase that newer observation or its root's history.
-        if read_json::<Binding>(&entry.path())? != binding
+        let current_binding = match read_binding_record(&path) {
+            Ok((_, current_binding)) => current_binding,
+            Err(error) => {
+                let message = error.error.to_string();
+                handle_binding_read_error(storage, &path, error, true, true);
+                report.skipped_unknown += 1;
+                if report.errors.len() < 16 {
+                    report.errors.push(format!(
+                        "{}: binding changed unreadably: {message}",
+                        path.display()
+                    ));
+                }
+                continue;
+            }
+        };
+        if current_binding != binding
             || DOMAINS.iter().any(|domain| {
                 storage.join(domain).join(&scope).exists()
                     || storage.join(domain).join(&binding.artifact_key).exists()
