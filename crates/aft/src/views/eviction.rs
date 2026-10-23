@@ -3325,7 +3325,9 @@ mod tests {
         let queued = FamilyRegistry::open(queued_storage.path(), FAMILY).unwrap();
         let root = stuck_storage.path().join("held-root");
         fs::create_dir_all(&root).unwrap();
-        let held = stuck.register_view("held", &root).unwrap();
+        let held = stuck
+            .register_view_with_storage(stuck_storage.path(), "held", &root)
+            .unwrap();
         publish(&held, &[("held.txt", text(1, 2_000))], 8);
         idle_view(&queued, "idle", 2, 8);
         wait_for_background_enforcement(&stuck);
