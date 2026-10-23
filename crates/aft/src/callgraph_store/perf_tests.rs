@@ -307,6 +307,76 @@ fn callgraph_io_extraction_commits_by_bytes_not_chunk_files() {
     assert_eq!(*batches.lock().unwrap(), vec![300]);
 }
 
+fn tiny_file_fixture(root: &Path) -> Vec<PathBuf> {
+    (0..COLD_BUILD_EXTRACT_MAX_FILES + 17)
+        .map(|index| {
+            write(
+                root,
+                &format!("tiny{index:05}.ts"),
+                if index % 2 == 0 { "" } else { "// tiny\n" },
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn callgraph_io_tiny_file_batches_have_finite_file_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = tiny_file_fixture(&root);
+    let source_bytes: u64 = files
+        .iter()
+        .map(|path| fs::metadata(path).unwrap().len())
+        .sum();
+    assert!(source_bytes < COLD_BUILD_EXTRACT_BATCH_BYTES);
+    let store = CallGraphStore::open(dir.path().join("store"), root).unwrap();
+    let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&batches);
+    set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+        observed.lock().unwrap().push(paths.len());
+    })));
+    let result = store.cold_build_chunked(&files, 100);
+    set_cold_build_extract_observer(None);
+    result.unwrap();
+    assert_eq!(
+        *batches.lock().unwrap(),
+        vec![COLD_BUILD_EXTRACT_MAX_FILES, 17]
+    );
+    assert_eq!(store.indexed_file_count().unwrap(), files.len());
+}
+
+#[test]
+fn callgraph_io_tiny_file_cancellation_stops_after_one_capped_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = tiny_file_fixture(&root);
+    let store = CallGraphStore::open(dir.path().join("store"), root).unwrap();
+    let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+    let expected = epoch.current();
+    let cancel_epoch = epoch.clone();
+    let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&batches);
+    set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+        observed.lock().unwrap().push(paths.len());
+        // Supersede the build after batch admission. It may finish this batch,
+        // but must stop before retaining extracts for the next one.
+        cancel_epoch.next();
+    })));
+    let result = with_publish_epoch(epoch, expected, || store.cold_build_chunked(&files, 100));
+    set_cold_build_extract_observer(None);
+    assert!(matches!(result, Err(CallGraphStoreError::Superseded)));
+    assert_eq!(*batches.lock().unwrap(), vec![COLD_BUILD_EXTRACT_MAX_FILES]);
+    let conn = store.conn.lock().unwrap();
+    assert_eq!(
+        query_count(&conn, "SELECT COUNT(*) FROM files").unwrap(),
+        COLD_BUILD_EXTRACT_MAX_FILES as u64
+    );
+    assert_eq!(
+        staged_build_phase(&conn).unwrap().as_deref(),
+        Some("extracting")
+    );
+}
+
 #[test]
 fn callgraph_io_large_cache_is_build_only() {
     let conn = TrackedConnection::open_in_memory(SqliteStore::CallgraphColdGeneration).unwrap();

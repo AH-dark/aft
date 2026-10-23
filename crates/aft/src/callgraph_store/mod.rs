@@ -92,6 +92,9 @@ static CALLGRAPH_ROOT_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, String>>> =
 // knobs so a large non-git root cannot accidentally opt back into an OOM path.
 const COLD_BUILD_EXTRACT_BATCH_FILES: usize = 256;
 const COLD_BUILD_EXTRACT_BATCH_BYTES: u64 = 32 * 1024 * 1024;
+// Source bytes alone do not bound retained extracts or cancellation latency for
+// empty/tiny files. Keep a finite ceiling while allowing bulk-load commits.
+const COLD_BUILD_EXTRACT_MAX_FILES: usize = 4096;
 // A 20k-reference resolver window kept peak RSS working-set shaped in the
 // committed 20k/40k corpus harness; 100k rows did not.
 const COLD_BUILD_RESOLVE_WINDOW: usize = 20_000;
@@ -6870,7 +6873,7 @@ impl CallGraphStore {
                     &conn,
                     &self.project_root,
                     &after_path,
-                    usize::MAX,
+                    COLD_BUILD_EXTRACT_MAX_FILES,
                     COLD_BUILD_EXTRACT_BATCH_BYTES,
                 )?
                 else {
