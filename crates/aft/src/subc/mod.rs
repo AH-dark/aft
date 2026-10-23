@@ -16803,9 +16803,19 @@ mod tests {
     /// legitimate, so the checks below count Watcher drains only (only they
     /// publish views) and let a retried drain finish before checking that a
     /// future quiet deadline alone wakes nothing. With `lsp_manager_busy` the
-    /// helper holds the manager during every probe and during the first drain
-    /// of each edit, so both cases happen on every run.
-    async fn assert_quiet_view_publication_wake(edit_count: usize, lsp_manager_busy: bool) {
+    /// helper holds the manager during every probe, and during each edit's
+    /// drains until one of them has reached the diagnostics step, so both
+    /// cases happen on every run. `first_drain_runs_out_of_budget` makes the
+    /// first edit's drain spend its whole time slice before that step.
+    async fn assert_quiet_view_publication_wake(
+        edit_count: usize,
+        lsp_manager_busy: bool,
+        first_drain_runs_out_of_budget: bool,
+    ) {
+        assert!(
+            lsp_manager_busy || !first_drain_runs_out_of_budget,
+            "first_drain_runs_out_of_budget relies on lsp_manager_busy to follow the drain to its diagnostics step"
+        );
         use crate::context::ViewRuntimeSnapshot;
         use crate::watcher_filter::WatcherDispatchEvent;
         use std::collections::BTreeSet;
@@ -16956,12 +16966,70 @@ mod tests {
             std::fs::write(&path, format!("pub fn changed_{edit}() {{}}\n")).unwrap();
             changed.insert(path.clone());
             tx.send(WatcherDispatchEvent::Paths(vec![path])).unwrap();
-            assert_eq!(jobs(lsp_manager_busy).await, 1, "each batch gets one drain");
-            if lsp_manager_busy {
+            let slow_slice = (first_drain_runs_out_of_budget && edit == 0).then(|| {
+                // The drain calls the language-server applicability refresh
+                // after its slice clock has started and before its symbol
+                // cache step. Holding the symbol cache from before the drain
+                // until a full budget after that refresh began therefore
+                // makes the drain spend its whole slice, whatever the
+                // scheduling, and park before the diagnostics step.
                 assert!(
-                    ctx.watcher_lsp_diagnostics_retry_pending_for_test(),
-                    "a drain that finds the manager busy keeps its diagnostics step"
+                    !ctx.project_applicability_walk_running(),
+                    "no applicability walk runs before the first edit"
                 );
+                let holder_ctx = Arc::clone(&ctx);
+                let (held_tx, held_rx) = std::sync::mpsc::channel();
+                let holder = std::thread::spawn(move || {
+                    let cache = holder_ctx.symbol_cache();
+                    let _read = cache.read().unwrap();
+                    held_tx.send(()).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !holder_ctx.project_applicability_walk_running() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "the drain's applicability walk was not seen running within 10 s"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    std::thread::sleep(
+                        runtime_drain::WATCHER_DRAIN_SLICE_BUDGET + Duration::from_millis(50),
+                    );
+                });
+                held_rx.recv().unwrap();
+                holder
+            });
+            assert_eq!(jobs(lsp_manager_busy).await, 1, "each batch gets one drain");
+            if let Some(holder) = slow_slice {
+                holder.join().expect("symbol cache holder");
+                let slice = ctx.watcher_drain_slice().lock();
+                assert!(
+                    matches!(
+                        &slice.as_ref().unwrap().phase,
+                        crate::context::WatcherDrainPhase::Apply { stage, .. }
+                            if !matches!(
+                                stage,
+                                crate::context::WatcherDrainApplyPhase::LspDiagnostics
+                                    | crate::context::WatcherDrainApplyPhase::Complete
+                            )
+                    ),
+                    "the first drain runs out of its slice before the diagnostics step"
+                );
+            }
+            if lsp_manager_busy {
+                // Keep the manager held across drains until one reaches the
+                // diagnostics step: a slow drain may spend its slice on
+                // earlier steps first. Six steps come before it and a drain
+                // parks only after a 250 ms slice, so 10 s fails only if the
+                // drain stops making progress.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !ctx.watcher_lsp_diagnostics_retry_pending_for_test() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "a drain that finds the manager busy keeps its diagnostics step"
+                    );
+                    jobs(true).await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
             }
             // Finish drains that stopped early: a busy manager (above) or an
             // exhausted time slice leaves path work that is due at once. 100
@@ -17053,12 +17121,12 @@ mod tests {
 
     #[tokio::test]
     async fn view_publication_quiet_root_wakes_without_other_maintenance() {
-        assert_quiet_view_publication_wake(1, false).await;
+        assert_quiet_view_publication_wake(1, false, false).await;
     }
 
     #[tokio::test]
     async fn view_publication_burst_coalesces_and_returns_idle() {
-        assert_quiet_view_publication_wake(3, false).await;
+        assert_quiet_view_publication_wake(3, false, false).await;
     }
 
     /// Every watcher batch with a project root starts the language-server
@@ -17070,7 +17138,16 @@ mod tests {
     /// Watcher wake after the quiet window.
     #[tokio::test]
     async fn view_publication_wakes_while_the_language_server_manager_is_busy() {
-        assert_quiet_view_publication_wake(3, true).await;
+        assert_quiet_view_publication_wake(3, true, false).await;
+    }
+
+    /// A slow or descheduled drain can spend its whole time slice on the
+    /// steps before the diagnostics step and save the rest of the batch for
+    /// the next drain. The busy-manager checks must wait for the drain that
+    /// actually reaches that step instead of assuming the first one does.
+    #[tokio::test]
+    async fn view_publication_wakes_when_the_first_drain_runs_out_of_budget() {
+        assert_quiet_view_publication_wake(3, true, true).await;
     }
 
     /// The maintenance probes run on the frame loop, which also answers
