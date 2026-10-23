@@ -718,6 +718,27 @@ fn pool_health_snapshot(
 pub(crate) fn helper_health() -> serde_json::Value {
     helper_health_from(&HELPERS)
 }
+
+/// Start every worker the shared filesystem helper pool keeps. The pool
+/// starts workers on demand, up to its configured size, and keeps reusable
+/// workers idle for later calls (only a worker abandoned after a timeout
+/// exits). A test that compares this process's threads before and after some
+/// work fills it first; otherwise the pool growing to meet that work reads as
+/// threads the work kept.
+#[cfg(test)]
+pub(crate) fn fill_helper_pool_for_test() {
+    let pool = Arc::clone(HELPERS.get_or_init(|| Limiter::new(IO_POOL_SIZE)));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    // Holding every permit at once leaves no idle worker to reuse, so each
+    // acquire starts a new one until the pool is at its size.
+    let permits: Vec<Permit> = (0..pool.max)
+        .map(|_| {
+            pool.acquire(deadline)
+                .expect("the filesystem helper pool did not fill")
+        })
+        .collect();
+    drop(permits);
+}
 fn helper_health_from(helpers: &OnceLock<Arc<Limiter>>) -> serde_json::Value {
     // Health runs on the frame loop: observing an unused pool must not start
     // its factory, and observing a busy pool must not wait for its state lock.

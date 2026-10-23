@@ -408,6 +408,14 @@ fn os_thread_ids() -> Option<Vec<u64>> {
     None
 }
 
+/// This process's thread IDs, for tests that compare which threads exist
+/// before and after some work. Linux and macOS tests read richer per-thread
+/// details themselves.
+#[cfg(all(test, windows))]
+pub(crate) fn thread_ids_for_test() -> Option<Vec<u64>> {
+    os_thread_ids()
+}
+
 #[cfg(target_os = "macos")]
 fn os_thread_names() -> (usize, Option<Vec<Option<String>>>) {
     #[repr(C)]

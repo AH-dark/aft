@@ -40,18 +40,663 @@ fn thread_total() -> u64 {
     total
 }
 
-/// Thread names, for the measurement's printed record (Linux only).
-fn thread_names() -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .filter_map(|entry| std::fs::read_to_string(entry.path().join("comm")).ok())
-        .map(|name| name.trim().to_string())
-        .collect();
-    names.sort();
-    names
+/// One thread of this process, as the retention checks report it.
+#[derive(Debug)]
+struct ThreadRecord {
+    /// Kernel thread ID: the Mach thread ID on macOS (the number Rust prints
+    /// in panic messages), the task ID on Linux, the Toolhelp thread ID on
+    /// Windows.
+    id: u64,
+    name: Option<String>,
+    /// How the thread started, read from its stack (macOS only; other
+    /// platforms do not let a process read another thread's registers).
+    start: Option<String>,
+    /// A macOS workqueue thread, including one the kernel created ahead of
+    /// demand that has not run yet. The kernel starts these for libdispatch
+    /// and system frameworks (FSEvents, CoreFoundation, Security), and parks
+    /// and retires them on its own schedule. Every thread AFT starts itself
+    /// comes from `pthread_create` (`std::thread`, rayon, tokio), and AFT's
+    /// FSEvents streams run on its own named run-loop threads, so a
+    /// workqueue thread that outlives a root's teardown holds nothing of
+    /// that root.
+    os_workqueue: bool,
+}
+
+impl std::fmt::Display for ThreadRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "thread {} {:?} started by {}",
+            self.id,
+            self.name.as_deref().unwrap_or("<unnamed>"),
+            self.start
+                .as_deref()
+                .unwrap_or("<start routine not readable on this platform>")
+        )
+    }
+}
+
+/// The IDs of this process's threads. Like [`thread_total`], an empty list
+/// fails the test: the measuring thread itself always exists.
+fn thread_ids() -> std::collections::HashSet<u64> {
+    let ids = thread_inventory::ids();
+    assert!(
+        !ids.is_empty(),
+        "cannot list this process's threads on this platform; the retention checks would be vacuous"
+    );
+    ids.into_iter().collect()
+}
+
+/// The threads started since `baseline` was taken that a root could own, and
+/// separately the macOS workqueue threads started since then, which it
+/// cannot (see [`ThreadRecord::os_workqueue`]). Comparing thread IDs, not
+/// counts, keeps threads the system starts or retires on its own from
+/// passing for, or hiding, a thread a root kept.
+fn threads_started_since(
+    baseline: &std::collections::HashSet<u64>,
+) -> (Vec<ThreadRecord>, Vec<ThreadRecord>) {
+    assert!(
+        !thread_ids().is_empty(),
+        "the thread listing went empty during the measurement"
+    );
+    thread_inventory::records_except(baseline)
+        .into_iter()
+        .partition(|thread| !thread.os_workqueue)
+}
+
+/// Give detached teardown threads (watcher and LSP reapers) time to exit:
+/// polls every 100 ms and returns the threads started since `baseline` once
+/// at most `at_most` of them could belong to a root, the set has not changed
+/// for five samples, or 10 seconds have passed. A settling heuristic, not
+/// proof that teardown finished.
+fn settled_threads_started_since(
+    baseline: &std::collections::HashSet<u64>,
+    at_most: usize,
+) -> (Vec<ThreadRecord>, Vec<ThreadRecord>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ids = |threads: &[ThreadRecord]| threads.iter().map(|t| t.id).collect::<Vec<_>>();
+    let mut previous = threads_started_since(baseline);
+    let mut stable_samples = 0;
+    loop {
+        if previous.0.len() <= at_most || stable_samples >= 5 || Instant::now() >= deadline {
+            return previous;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let current = threads_started_since(baseline);
+        stable_samples = if ids(&current.0) == ids(&previous.0) {
+            stable_samples + 1
+        } else {
+            0
+        };
+        previous = current;
+    }
+}
+
+/// A failure message line per thread.
+fn describe_threads(threads: &[ThreadRecord]) -> String {
+    threads
+        .iter()
+        .map(|thread| format!("\n  {thread}"))
+        .collect()
+}
+
+/// Per-platform thread listing for the retention checks.
+mod thread_inventory {
+    use super::ThreadRecord;
+    use std::collections::HashSet;
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn ids() -> Vec<u64> {
+        let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn records_except(baseline: &HashSet<u64>) -> Vec<ThreadRecord> {
+        ids()
+            .into_iter()
+            .filter(|id| !baseline.contains(id))
+            .map(|id| ThreadRecord {
+                id,
+                name: std::fs::read_to_string(format!("/proc/self/task/{id}/comm"))
+                    .ok()
+                    .map(|name| name.trim().to_string()),
+                start: None,
+                os_workqueue: false,
+            })
+            .collect()
+    }
+
+    #[cfg(windows)]
+    pub(super) fn ids() -> Vec<u64> {
+        crate::lifecycle_census::thread_ids_for_test().unwrap_or_default()
+    }
+
+    #[cfg(windows)]
+    pub(super) fn records_except(baseline: &HashSet<u64>) -> Vec<ThreadRecord> {
+        ids()
+            .into_iter()
+            .filter(|id| !baseline.contains(id))
+            .map(|id| ThreadRecord {
+                id,
+                name: None,
+                start: None,
+                os_workqueue: false,
+            })
+            .collect()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    pub(super) fn ids() -> Vec<u64> {
+        Vec::new()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    pub(super) fn records_except(_baseline: &HashSet<u64>) -> Vec<ThreadRecord> {
+        Vec::new()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) use mach::{ids, records_except};
+
+    #[cfg(target_os = "macos")]
+    mod mach {
+        use super::{HashSet, ThreadRecord};
+        use std::ffi::{c_char, c_int, CStr};
+
+        type Port = u32;
+        type KernReturn = c_int;
+
+        const THREAD_IDENTIFIER_INFO: u32 = 4;
+        const THREAD_EXTENDED_INFO: u32 = 5;
+        #[cfg(target_arch = "aarch64")]
+        const THREAD_STATE_FLAVOR: c_int = 6; // ARM_THREAD_STATE64
+        #[cfg(target_arch = "x86_64")]
+        const THREAD_STATE_FLAVOR: c_int = 4; // x86_THREAD_STATE64
+        /// Clears pointer-authentication bits from saved frame and return
+        /// addresses; macOS user addresses fit in 47 bits.
+        const ADDRESS_MASK: u64 = 0x0000_7fff_ffff_ffff;
+        /// Frames walked per thread. A deeper stack reports no start routine.
+        const MAX_FRAMES: usize = 512;
+        /// Frames that only carry a thread into its work: the pthread and
+        /// workqueue entry points and the Rust standard library's spawn path.
+        const ENTRY_PREFIXES: &[&str] = &[
+            "thread_start",
+            "_pthread_start",
+            "start_wqthread",
+            "_pthread_wqthread",
+            "std::",
+            "core::",
+            "alloc::",
+            "<std::",
+            "<core::",
+            "<alloc::",
+            "__rust",
+        ];
+
+        extern "C" {
+            static mach_task_self_: Port;
+            fn mach_thread_self() -> Port;
+            fn task_threads(task: Port, threads: *mut *mut Port, count: *mut u32) -> KernReturn;
+            fn thread_info(
+                thread: Port,
+                flavor: u32,
+                info: *mut c_int,
+                count: *mut u32,
+            ) -> KernReturn;
+            fn thread_get_state(
+                thread: Port,
+                flavor: c_int,
+                state: *mut u32,
+                count: *mut u32,
+            ) -> KernReturn;
+            fn thread_suspend(thread: Port) -> KernReturn;
+            fn thread_resume(thread: Port) -> KernReturn;
+            fn vm_read_overwrite(
+                task: Port,
+                address: usize,
+                size: usize,
+                data: usize,
+                out_size: *mut usize,
+            ) -> KernReturn;
+            fn mach_port_deallocate(task: Port, name: Port) -> KernReturn;
+            fn vm_deallocate(task: Port, address: usize, size: usize) -> KernReturn;
+        }
+
+        #[repr(C)]
+        #[derive(Default)]
+        struct IdentifierInfo {
+            thread_id: u64,
+            thread_handle: u64,
+            _dispatch_qaddr: u64,
+        }
+
+        #[repr(C)]
+        struct ExtendedInfo {
+            _times: [u64; 2],
+            _fields: [i32; 8],
+            name: [c_char; 64],
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        #[repr(C)]
+        #[derive(Default)]
+        struct ThreadState {
+            _x: [u64; 29],
+            fp: u64,
+            _lr: u64,
+            _sp: u64,
+            pc: u64,
+            _cpsr: u32,
+            _flags: u32,
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        #[repr(C)]
+        #[derive(Default)]
+        struct ThreadState {
+            _rax_to_rsi: [u64; 6],
+            fp: u64,
+            _rsp_to_r15: [u64; 9],
+            pc: u64,
+            _rflags_to_gs: [u64; 4],
+        }
+
+        fn task() -> Port {
+            // SAFETY: the C runtime initializes this before main runs.
+            unsafe { mach_task_self_ }
+        }
+
+        /// Send rights to every thread of this process; the caller releases
+        /// each with [`release`].
+        fn thread_ports() -> Vec<Port> {
+            let mut list: *mut Port = std::ptr::null_mut();
+            let mut count = 0u32;
+            // SAFETY: both out-pointers are valid for writes.
+            if unsafe { task_threads(task(), &mut list, &mut count) } != 0 || list.is_null() {
+                return Vec::new();
+            }
+            // SAFETY: the kernel returned `count` ports at `list`.
+            let ports = unsafe { std::slice::from_raw_parts(list, count as usize) }.to_vec();
+            // SAFETY: `list` is the out-of-line array the kernel allocated.
+            unsafe {
+                vm_deallocate(
+                    task(),
+                    list as usize,
+                    count as usize * std::mem::size_of::<Port>(),
+                );
+            }
+            ports
+        }
+
+        fn release(port: Port) {
+            // SAFETY: `port` is a send right this module received.
+            unsafe {
+                mach_port_deallocate(task(), port);
+            }
+        }
+
+        /// The thread's kernel ID and its thread-local storage base. The
+        /// kernel sets the storage base before the thread first runs code in
+        /// this process, so it is zero only for a thread that never has.
+        fn identity(port: Port) -> Option<(u64, u64)> {
+            let mut info = IdentifierInfo::default();
+            let mut count = (std::mem::size_of::<IdentifierInfo>() / 4) as u32;
+            // SAFETY: `info` is writable storage of `count` 32-bit words.
+            let result = unsafe {
+                thread_info(
+                    port,
+                    THREAD_IDENTIFIER_INFO,
+                    (&mut info as *mut IdentifierInfo).cast(),
+                    &mut count,
+                )
+            };
+            (result == 0).then_some((info.thread_id, info.thread_handle))
+        }
+
+        fn thread_name(port: Port) -> Option<String> {
+            // SAFETY: the record is plain C data.
+            let mut info: ExtendedInfo = unsafe { std::mem::zeroed() };
+            let mut count = (std::mem::size_of::<ExtendedInfo>() / 4) as u32;
+            // SAFETY: `info` is writable storage of `count` 32-bit words.
+            let result = unsafe {
+                thread_info(
+                    port,
+                    THREAD_EXTENDED_INFO,
+                    (&mut info as *mut ExtendedInfo).cast(),
+                    &mut count,
+                )
+            };
+            if result != 0 {
+                return None;
+            }
+            info.name[63] = 0;
+            // SAFETY: the buffer is NUL-terminated just above.
+            let name = unsafe { CStr::from_ptr(info.name.as_ptr()) }.to_string_lossy();
+            (!name.is_empty()).then(|| name.into_owned())
+        }
+
+        pub(in super::super) fn ids() -> Vec<u64> {
+            thread_ports()
+                .into_iter()
+                .filter_map(|port| {
+                    let id = identity(port).map(|(id, _)| id);
+                    release(port);
+                    id
+                })
+                .collect()
+        }
+
+        pub(in super::super) fn records_except(baseline: &HashSet<u64>) -> Vec<ThreadRecord> {
+            // SAFETY: plain Mach call; the returned right is released below.
+            let current = unsafe { mach_thread_self() };
+            let mut records = Vec::new();
+            for port in thread_ports() {
+                if let Some((id, tls_base)) =
+                    identity(port).filter(|(id, _)| !baseline.contains(id))
+                {
+                    let (start, os_workqueue) = if port == current {
+                        (Some("<the measuring thread>".to_string()), false)
+                    } else {
+                        describe_start(tls_base, stack(port))
+                    };
+                    records.push(ThreadRecord {
+                        id,
+                        name: thread_name(port),
+                        start,
+                        os_workqueue,
+                    });
+                }
+                release(port);
+            }
+            release(current);
+            records
+        }
+
+        /// Reads one saved frame record (caller's frame pointer, return
+        /// address). The kernel copies it, so a stale pointer fails the read
+        /// instead of faulting.
+        fn read_frame(address: u64) -> Option<[u64; 2]> {
+            let mut frame = [0u64; 2];
+            let mut read = 0usize;
+            // SAFETY: `frame` is 16 writable bytes; the kernel checks `address`.
+            let result = unsafe {
+                vm_read_overwrite(
+                    task(),
+                    address as usize,
+                    16,
+                    frame.as_mut_ptr() as usize,
+                    &mut read,
+                )
+            };
+            (result == 0 && read == 16).then_some(frame)
+        }
+
+        /// A thread's saved registers and return addresses.
+        struct Stack {
+            /// Program counter and frame pointer; `None` when the thread could
+            /// not be suspended or its registers could not be read.
+            registers: Option<(u64, u64)>,
+            /// Return addresses, innermost first.
+            returns: Vec<u64>,
+        }
+
+        /// Reads the thread's registers and walks its frame pointer chain
+        /// (Apple's ABIs always keep frame pointers). The thread is suspended
+        /// for the walk so its stack holds still; nothing while it is
+        /// suspended allocates or locks, because it may hold the allocator's
+        /// lock.
+        fn stack(port: Port) -> Stack {
+            let mut frames = [0u64; MAX_FRAMES];
+            let mut depth = 0;
+            // SAFETY: suspends another thread of this process; resumed below.
+            if unsafe { thread_suspend(port) } != 0 {
+                return Stack {
+                    registers: None,
+                    returns: Vec::new(),
+                };
+            }
+            let mut state = ThreadState::default();
+            let mut count = (std::mem::size_of::<ThreadState>() / 4) as u32;
+            // SAFETY: `state` is writable storage of `count` 32-bit words.
+            let got_state = unsafe {
+                thread_get_state(
+                    port,
+                    THREAD_STATE_FLAVOR,
+                    (&mut state as *mut ThreadState).cast(),
+                    &mut count,
+                )
+            } == 0;
+            let mut fp = state.fp & ADDRESS_MASK;
+            while got_state && depth < MAX_FRAMES && fp != 0 && fp % 8 == 0 {
+                let Some([next, ret]) = read_frame(fp) else {
+                    break;
+                };
+                let ret = ret & ADDRESS_MASK;
+                if ret == 0 {
+                    break;
+                }
+                frames[depth] = ret;
+                depth += 1;
+                let next = next & ADDRESS_MASK;
+                // Callers' frames sit at higher addresses; anything else is
+                // the end of the chain or a corrupt record.
+                if next <= fp {
+                    break;
+                }
+                fp = next;
+            }
+            // SAFETY: balances the suspend above.
+            unsafe {
+                thread_resume(port);
+            }
+            Stack {
+                registers: got_state.then_some((state.pc & ADDRESS_MASK, state.fp & ADDRESS_MASK)),
+                returns: frames[..depth].to_vec(),
+            }
+        }
+
+        /// The symbol containing `address`, demangled, or the image and
+        /// offset when the image exports no symbol there. A return address
+        /// points after its call, so it is looked up one byte back.
+        fn symbol(address: u64, return_address: bool) -> String {
+            let address = address.saturating_sub(u64::from(return_address));
+            // SAFETY: Dl_info is plain C data that dladdr fills.
+            let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+            // SAFETY: dladdr only reads loader tables for the address.
+            if unsafe { libc::dladdr(address as *const libc::c_void, &mut info) } == 0 {
+                return format!("{address:#x}");
+            }
+            if !info.dli_sname.is_null() {
+                // SAFETY: dladdr returned a NUL-terminated symbol name.
+                let name = unsafe { CStr::from_ptr(info.dli_sname) }.to_string_lossy();
+                // `{:#}` leaves out the hash suffix; other names pass through.
+                return format!("{:#}", rustc_demangle::demangle(&name));
+            }
+            let image = if info.dli_fname.is_null() {
+                "?".to_string()
+            } else {
+                // SAFETY: dladdr returned a NUL-terminated path.
+                let path = unsafe { CStr::from_ptr(info.dli_fname) }.to_string_lossy();
+                path.rsplit('/').next().unwrap_or_default().to_string()
+            };
+            format!("{image}+{:#x}", address - info.dli_fbase as u64)
+        }
+
+        fn is_workqueue_entry(name: &str) -> bool {
+            name == "start_wqthread" || name == "_pthread_wqthread"
+        }
+
+        /// How a thread started, from its stack: the two outermost frames and
+        /// the first frame past the entry and spawn machinery, which for a
+        /// Rust thread is the closure it was spawned with. Also whether it is
+        /// a kernel workqueue thread.
+        ///
+        /// The kernel creates workqueue threads ahead of demand and parks
+        /// them before they ever run: such a thread has all-zero registers
+        /// and no thread-local storage. `pthread_create` (which `std::thread`,
+        /// rayon and tokio use) sets a new thread's registers and storage
+        /// before it is scheduled, so no AFT thread looks like that.
+        fn describe_start(tls_base: u64, stack: Stack) -> (Option<String>, bool) {
+            let Some((pc, fp)) = stack.registers else {
+                return (Some("<stack not readable>".to_string()), false);
+            };
+            if stack.returns.is_empty() {
+                if pc == 0 && fp == 0 && tls_base == 0 {
+                    return (
+                        Some("<kernel workqueue thread that has not run yet>".to_string()),
+                        true,
+                    );
+                }
+                let name = symbol(pc, false);
+                let os_workqueue = is_workqueue_entry(&name);
+                return (Some(format!("{name} (no saved frames)")), os_workqueue);
+            }
+            let outer_first: Vec<String> = stack
+                .returns
+                .iter()
+                .rev()
+                .map(|&f| symbol(f, true))
+                .collect();
+            let os_workqueue = outer_first
+                .iter()
+                .take(2)
+                .any(|name| is_workqueue_entry(name));
+            let mut chain: Vec<&str> = outer_first.iter().take(2).map(String::as_str).collect();
+            if let Some(routine) = outer_first
+                .iter()
+                .find(|name| !ENTRY_PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
+            {
+                if !chain.contains(&routine.as_str()) {
+                    chain.push(routine);
+                }
+            }
+            (Some(chain.join(" > ")), os_workqueue)
+        }
+    }
+}
+
+/// The kernel ID of the calling thread, as the thread inventory reports it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn current_thread_id() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: gettid has no preconditions.
+        unsafe { libc::gettid() as u64 }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut id = 0u64;
+        // SAFETY: a null thread means the calling thread; `id` is writable.
+        unsafe { libc::pthread_threadid_np(0 as libc::pthread_t, &mut id) };
+        id
+    }
+}
+
+/// The retention checks name the threads a root kept. A thread started
+/// after the baseline must be listed with its ID and, on macOS, with the
+/// function it was spawned to run, even when it has no name; and it must not
+/// be mistaken for a system workqueue thread, which the checks leave out.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn thread_inventory_lists_a_new_unnamed_thread_with_its_start_routine() {
+    let baseline = thread_ids();
+    let (id_tx, id_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let probe = std::thread::spawn(move || {
+        id_tx.send(current_thread_id()).unwrap();
+        let _ = stop_rx.recv();
+    });
+    let probe_id = id_rx.recv().unwrap();
+    let (owned, os_workqueue) = threads_started_since(&baseline);
+    stop_tx.send(()).unwrap();
+    probe.join().unwrap();
+
+    let record = owned
+        .iter()
+        .find(|thread| thread.id == probe_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "the probe thread {probe_id} is missing from the threads started since the baseline:{}\nworkqueue:{}",
+                describe_threads(&owned),
+                describe_threads(&os_workqueue)
+            )
+        });
+    let line = record.to_string();
+    assert!(line.contains(&probe_id.to_string()), "{line}");
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(record.name, None, "{line}");
+        let start = record.start.as_deref().unwrap_or_default();
+        assert!(
+            start.contains(
+                "idle_root_retention_tests::thread_inventory_lists_a_new_unnamed_thread_with_its_start_routine"
+            ),
+            "the start routine must name the spawning closure: {line}"
+        );
+    }
+}
+
+/// The macOS check leaves out kernel workqueue threads, so it must recognise
+/// a real one: a libdispatch worker held busy here must be reported as one,
+/// and its start must show the workqueue entry point.
+#[cfg(target_os = "macos")]
+#[test]
+fn thread_inventory_recognises_a_libdispatch_worker() {
+    extern "C" {
+        fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut libc::c_void;
+        fn dispatch_async_f(
+            queue: *mut libc::c_void,
+            context: *mut libc::c_void,
+            work: extern "C" fn(*mut libc::c_void),
+        );
+    }
+    type Handoff = (std::sync::mpsc::Sender<u64>, std::sync::mpsc::Receiver<()>);
+    extern "C" fn hold_worker(context: *mut libc::c_void) {
+        // SAFETY: the test passed a leaked Box<Handoff> and gives it up here.
+        let (id_tx, stop_rx) = *unsafe { Box::from_raw(context.cast::<Handoff>()) };
+        id_tx.send(current_thread_id()).unwrap();
+        let _ = stop_rx.recv();
+    }
+
+    let (id_tx, id_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let handoff: Box<Handoff> = Box::new((id_tx, stop_rx));
+    // SAFETY: the default-priority global queue always exists; the worker
+    // takes ownership of the context.
+    unsafe {
+        dispatch_async_f(
+            dispatch_get_global_queue(0, 0),
+            Box::into_raw(handoff).cast(),
+            hold_worker,
+        );
+    }
+    let worker_id = id_rx.recv().unwrap();
+    // The pool may have started this worker before the test did, so list it
+    // by leaving it out of the baseline rather than relying on its age.
+    let mut baseline = thread_ids();
+    baseline.remove(&worker_id);
+    let (owned, os_workqueue) = threads_started_since(&baseline);
+    stop_tx.send(()).unwrap();
+
+    assert!(
+        !owned.iter().any(|thread| thread.id == worker_id),
+        "the libdispatch worker {worker_id} was counted as a thread a root could own:{}",
+        describe_threads(&owned)
+    );
+    let worker = os_workqueue
+        .iter()
+        .find(|thread| thread.id == worker_id)
+        .unwrap_or_else(|| {
+            panic!("the libdispatch worker {worker_id} is missing from the listing")
+        });
+    let start = worker.start.as_deref().unwrap_or_default();
+    assert!(start.starts_with("start_wqthread"), "{worker}");
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -102,6 +747,10 @@ fn evicted_idle_roots_release_their_per_context_threads() {
     let storage = tempfile::tempdir().unwrap();
     // Warm process-wide state (pools, registries) with one root that is
     // created and dropped, so the baseline holds only process-lifetime work.
+    // The filesystem helper pool starts workers on demand, up to its
+    // configured size, and keeps them; fill it before the baseline so its
+    // growth cannot read as threads the roots kept.
+    crate::bounded_io::fill_helper_pool_for_test();
     {
         let (_dir, root) = test_support::test_root("retention-warmup");
         let ctx = Arc::new(AppContext::from_app(
@@ -117,6 +766,7 @@ fn evicted_idle_roots_release_their_per_context_threads() {
     }
     std::thread::sleep(Duration::from_millis(200));
     let baseline_threads = thread_total();
+    let baseline_thread_ids = thread_ids();
     let baseline_heap = heap_in_use();
 
     let mut dirs = Vec::new();
@@ -157,7 +807,9 @@ fn evicted_idle_roots_release_their_per_context_threads() {
     );
     assert_eq!(outcome.evicted, ROOTS, "every idle root is evicted");
 
-    let evicted_threads = settled_thread_total(baseline_threads + 1);
+    let (kept_threads, os_workqueue_threads) =
+        settled_threads_started_since(&baseline_thread_ids, 1);
+    let evicted_threads = thread_total();
     let evicted_heap = heap_in_use();
     let live_contexts = weak_contexts
         .iter()
@@ -165,13 +817,21 @@ fn evicted_idle_roots_release_their_per_context_threads() {
         .count();
     println!(
         "retention: roots={ROOTS} baseline_threads={baseline_threads} bound_threads={bound_threads} \
-         evicted_threads={evicted_threads} live_contexts={live_contexts} \
-         heap_baseline={baseline_heap:?} heap_evicted={evicted_heap:?}"
+         evicted_threads={evicted_threads} kept_threads={} os_workqueue_threads={} \
+         live_contexts={live_contexts} heap_baseline={baseline_heap:?} heap_evicted={evicted_heap:?}{}{}",
+        kept_threads.len(),
+        os_workqueue_threads.len(),
+        describe_threads(&kept_threads),
+        describe_threads(&os_workqueue_threads),
     );
     assert!(
-        evicted_threads <= baseline_threads + 1,
-        "idle-evicted roots kept {} thread(s) for {ROOTS} roots (baseline {baseline_threads}, after eviction {evicted_threads})",
-        evicted_threads.saturating_sub(baseline_threads)
+        kept_threads.len() <= 1,
+        "idle-evicted roots kept {} thread(s) started after the baseline for {ROOTS} roots:{}\n\
+         (not counted: {} macOS workqueue thread(s), which no root owns:{})",
+        kept_threads.len(),
+        describe_threads(&kept_threads),
+        os_workqueue_threads.len(),
+        describe_threads(&os_workqueue_threads),
     );
 }
 
@@ -420,14 +1080,19 @@ fn evicted_worked_roots_keep_only_bookkeeping() {
 
     // One root goes through the whole cycle first and is then retired, so
     // process-wide state (grammars, SQLite, pools) is warm before the
-    // baseline.
+    // baseline. The filesystem helper pool starts workers on demand, up to
+    // its configured size, and how many the warm-up root needed depends on
+    // load; fill it before the baseline so later growth cannot read as
+    // threads the roots kept.
     crate::cache_freshness::warm_strict_verify_pool_for_test();
+    crate::bounded_io::fill_helper_pool_for_test();
     for (root, _) in cycle(0..1, &mut live_roots) {
         executor.remove_actor(&root);
         live_roots.remove(&root);
     }
     let baseline_heap = settled_heap();
     let baseline_threads = settled_thread_total(0);
+    let baseline_thread_ids = thread_ids();
 
     let evicted = cycle(1..WORKED_ROOTS + 1, &mut live_roots);
     // The reaper hands the reopenable resources (LSP, database pools, config
@@ -460,7 +1125,8 @@ fn evicted_worked_roots_keep_only_bookkeeping() {
         assert_eq!(ctx.symbol_cache().read().unwrap().len(), 0);
         assert!(!ctx.watcher_runtime_active());
     }
-    let evicted_threads = settled_thread_total(baseline_threads);
+    let (kept_threads, os_workqueue_threads) =
+        settled_threads_started_since(&baseline_thread_ids, 1);
     let evicted_heap = settled_heap();
 
     // Drop the evicted contexts: the heap that leaves with them is what each
@@ -481,15 +1147,22 @@ fn evicted_worked_roots_keep_only_bookkeeping() {
     };
     println!(
         "retention: worked_roots={WORKED_ROOTS} baseline_threads={baseline_threads} \
-         evicted_threads={evicted_threads} heap_baseline={baseline_heap:?} \
+         kept_threads={} os_workqueue_threads={} heap_baseline={baseline_heap:?} \
          heap_evicted={evicted_heap:?} heap_dropped={dropped_heap:?} \
-         retained_per_evicted_root={per_root:?}"
+         retained_per_evicted_root={per_root:?}{}{}",
+        kept_threads.len(),
+        os_workqueue_threads.len(),
+        describe_threads(&kept_threads),
+        describe_threads(&os_workqueue_threads),
     );
     assert!(
-        evicted_threads <= baseline_threads + 1,
-        "{WORKED_ROOTS} evicted roots kept {} thread(s): {:?}",
-        evicted_threads.saturating_sub(baseline_threads),
-        thread_names()
+        kept_threads.len() <= 1,
+        "{WORKED_ROOTS} evicted roots kept {} thread(s) started after the baseline:{}\n\
+         (not counted: {} macOS workqueue thread(s), which no root owns:{})",
+        kept_threads.len(),
+        describe_threads(&kept_threads),
+        os_workqueue_threads.len(),
+        describe_threads(&os_workqueue_threads),
     );
     match per_root {
         Some(per_root) => assert!(
