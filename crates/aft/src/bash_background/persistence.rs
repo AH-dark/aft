@@ -1131,7 +1131,7 @@ fn lock_session_directory(session_dir: &Path) -> io::Result<File> {
         .ok_or_else(|| io::Error::other("task session lock was not acquired"))
 }
 
-fn lock_session_directories(session_dirs: &[&Path]) -> io::Result<Vec<File>> {
+pub(crate) fn lock_session_directories(session_dirs: &[&Path]) -> io::Result<Vec<File>> {
     let mut roots = Vec::with_capacity(session_dirs.len());
     for session_dir in session_dirs {
         let task_root = session_dir
@@ -1173,8 +1173,13 @@ fn lock_session_directories(session_dirs: &[&Path]) -> io::Result<Vec<File>> {
 
 /// Remove a session directory only when no task or quarantine writer owns it.
 /// The OS rmdir is the emptiness check and removal, so a racing entry survives.
+#[cfg(test)]
 pub(crate) fn remove_empty_session_directory(session_dir: &Path) -> io::Result<bool> {
     let _session_lock = lock_session_directory(session_dir)?;
+    remove_empty_session_directory_locked(session_dir)
+}
+
+pub(crate) fn remove_empty_session_directory_locked(session_dir: &Path) -> io::Result<bool> {
     match fs::remove_dir(session_dir) {
         Ok(()) => Ok(true),
         Err(error)

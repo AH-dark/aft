@@ -1194,13 +1194,11 @@ fn gc_persisted_deletes_delivered_terminals_older_than_grace() {
     let deleted = registry().maybe_gc_persisted(storage.path()).unwrap();
 
     assert_eq!(deleted, 5);
-    assert!(
-        fs::read_dir(session_tasks_dir(storage.path(), SESSION))
-            .unwrap()
-            .next()
-            .is_none(),
-        "GC should leave no task entries"
-    );
+    match fs::read_dir(session_tasks_dir(storage.path(), SESSION)) {
+        Ok(mut entries) => assert!(entries.next().is_none(), "GC should leave no task entries"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("failed to read task session after GC: {error}"),
+    }
 }
 
 #[test]

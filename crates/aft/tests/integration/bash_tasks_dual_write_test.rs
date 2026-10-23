@@ -472,7 +472,7 @@ fn persisted_gc_deletes_only_old_delivered_terminal_database_rows() {
 
 #[test]
 fn persisted_gc_logs_each_deleted_row_with_task_and_reason() {
-    super::test_helpers::init_test_logger();
+    super::test_helpers::init_test_logger_with_level(log::LevelFilter::Debug);
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
