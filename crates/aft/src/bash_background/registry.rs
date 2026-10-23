@@ -14478,6 +14478,10 @@ mod spawn_tests;
 #[path = "default_kill_test.rs"]
 pub(crate) mod default_kill_tests;
 
+#[cfg(all(test, unix))]
+#[path = "completion_replay_ordering_tests.rs"]
+mod completion_replay_ordering_tests;
+
 #[cfg(test)]
 mod tests {
     #[test]

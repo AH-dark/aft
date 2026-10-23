@@ -751,6 +751,71 @@ impl AftProcess {
         self.pending_frames.push_back(frame);
     }
 
+    /// Snapshot queues without acknowledging completions or polling task status.
+    /// Save already-received frames before querying the daemon: servicing the
+    /// diagnostic request can itself advance deferred configure replay.
+    pub(crate) fn background_failure_context(&mut self, session: &str) -> serde_json::Value {
+        let pending = self
+            .pending_frames
+            .iter()
+            .filter(|frame| frame["session_id"].as_str().is_none_or(|id| id == session))
+            .collect::<Vec<_>>();
+        let queued = diagnostic_frames(&pending);
+        let id = "background-failure-forensics";
+        let request = serde_json::json!({
+            "id": id, "session_id": session, "command": "bash_drain_completions"
+        });
+        let write = self
+            .child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "stdin closed".to_string())
+            .and_then(|stdin| {
+                writeln!(stdin, "{request}")
+                    .and_then(|_| stdin.flush())
+                    .map_err(|error| error.to_string())
+            });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut registry = serde_json::json!({"error": "diagnostic drain timed out"});
+        if let Err(error) = write {
+            registry = serde_json::json!({"error": diagnostic_text(&error, 128)});
+        } else {
+            while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                match self.stdout_rx.recv_timeout(remaining) {
+                    Ok(StdoutEvent::Json(frame)) if frame["id"] == id => {
+                        registry = serde_json::json!({
+                            "success": frame["success"],
+                            "bg_completions": diagnostic_frames(&frame["bg_completions"].as_array()
+                                .map(|items| items.iter().collect::<Vec<_>>()).unwrap_or_default()),
+                            "pending_matches": diagnostic_frames(&frame["pending_matches"].as_array()
+                                .map(|items| items.iter().collect::<Vec<_>>()).unwrap_or_default()),
+                        });
+                        break;
+                    }
+                    Ok(StdoutEvent::Json(frame)) => self.pending_frames.push_back(frame),
+                    Ok(StdoutEvent::Eof) => {
+                        self.stdout_eof = true;
+                        registry = serde_json::json!({"error": "stdout EOF"});
+                        break;
+                    }
+                    Ok(_) | Err(_) => break,
+                }
+            }
+        }
+        let stderr = self.read_stderr_tail();
+        let mut start = stderr.len().saturating_sub(1024);
+        while !stderr.is_char_boundary(start) {
+            start += 1;
+        }
+        serde_json::json!({
+            "pending_frames_before_probe": queued,
+            "registry_pending_after_probe": registry,
+            "child_pid": self.child.id(),
+            "child_elapsed_ms": self.spawned_at.elapsed().as_millis(),
+            "stderr_tail": &stderr[start..],
+        })
+    }
+
     /// Test-only entry point that drives `wait_for_child_exit` with a caller-
     /// supplied short timeout. Used by the exit-timeout forensics unit test to
     /// provoke the panic on a deliberately-still-alive child without widening
@@ -1105,6 +1170,31 @@ impl AftProcess {
             Err(_) => "io error: try_read_next_timeout panicked; see stdout trace".to_string(),
         }
     }
+}
+
+fn diagnostic_text(text: &str, max_bytes: usize) -> &str {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn diagnostic_frames(frames: &[&serde_json::Value]) -> serde_json::Value {
+    let entries = frames
+        .iter()
+        .take(4)
+        .map(|frame| {
+            let mut summary = serde_json::Map::new();
+            for key in ["type", "task_id", "session_id", "status"] {
+                if let Some(value) = frame[key].as_str() {
+                    summary.insert(key.into(), diagnostic_text(value, 64).into());
+                }
+            }
+            serde_json::Value::Object(summary)
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({"count": frames.len(), "first": entries})
 }
 
 pub(crate) fn assert_child_storage_isolated(command: &Command) {
@@ -1556,6 +1646,51 @@ pub fn take_logs() -> Vec<String> {
 #[cfg(test)]
 mod exit_timeout_forensics_tests {
     use super::*;
+
+    #[test]
+    fn background_failure_context_bounds_payloads_and_preserves_pending_frames() {
+        let mut aft = AftProcess::spawn();
+        // Finish the stderr reader before injecting a synthetic tail, so real
+        // startup logging cannot race the payload-boundary assertions below.
+        drop(aft.child.stdin.take());
+        assert!(aft
+            .wait_for_child_exit(SHUTDOWN_TIMEOUT, "forensics fixture shutdown")
+            .success());
+        aft.stderr_capture_thread.take().unwrap().join().unwrap();
+        let frame = serde_json::json!({
+            "type": "bash_completed", "session_id": "forensics-session", "task_id": "other",
+            "output_preview": "sensitive preview must not be printed".repeat(1024),
+        });
+        for _ in 0..20 {
+            aft.queue_pending_frame_for_test(frame.clone());
+        }
+        aft.stderr_tail
+            .lock()
+            .unwrap()
+            .push_back(format!("{}tail-sentinel", "é".repeat(8192)));
+        let context = aft.background_failure_context("forensics-session");
+        assert_eq!(context["pending_frames_before_probe"]["count"], 20);
+        assert_eq!(
+            context["pending_frames_before_probe"]["first"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(context["stderr_tail"]
+            .as_str()
+            .unwrap()
+            .ends_with("tail-sentinel"));
+        assert!(context.to_string().len() < 4096);
+        assert!(!context.to_string().contains("sensitive preview"));
+        for _ in 0..20 {
+            assert_eq!(
+                aft.try_read_next_timeout(Duration::ZERO),
+                Some(frame.clone())
+            );
+        }
+        assert!(aft.shutdown().success());
+    }
 
     #[test]
     fn response_timeout_captures_live_child_stacks_request_and_stderr() {

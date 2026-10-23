@@ -178,6 +178,246 @@ fn wait_for_completion_frame(aft: &mut AftProcess, task_id: &str) -> Value {
     }
 }
 
+struct TaskForensics<'a> {
+    storage: &'a Path,
+    spawned_at: Instant,
+}
+
+impl TaskForensics<'_> {
+    fn describe(&self, aft: &mut AftProcess, task_id: &str) -> String {
+        // Read disk before sending a diagnostic drain, which may advance replay.
+        // Do not print command, environment, output, or watch match contents.
+        let saved = match resolve_task_layout(&session_tasks_dir(self.storage, SESSION), task_id) {
+            Ok(task) => {
+                let paths = task.paths;
+                let metadata = fs::File::open(&paths.json).and_then(|file| {
+                    let mut bytes = Vec::new();
+                    file.take(16 * 1024).read_to_end(&mut bytes)?;
+                    serde_json::from_slice::<Value>(&bytes).map_err(std::io::Error::other)
+                });
+                let state = match metadata {
+                    Ok(metadata) => json!({
+                        "status": metadata["status"],
+                        "completion_delivered": metadata["completion_delivered"],
+                        "notify_on_completion": metadata["notify_on_completion"],
+                        "child_pid": metadata["child_pid"], "pgid": metadata["pgid"],
+                    }),
+                    Err(error) => json!({"metadata_error": format!("{:?}", error.kind())}),
+                };
+                let artifacts = [
+                    ("json", &paths.json),
+                    ("exit", &paths.exit),
+                    ("stdout", &paths.stdout),
+                    ("stderr", &paths.stderr),
+                    ("pty", &paths.pty),
+                    ("pipeline_status", &paths.pipeline_status),
+                    ("command", &paths.command),
+                    ("wrapper", &paths.wrapper),
+                    ("environment", &paths.environment),
+                    ("manifest", &paths.manifest),
+                    ("sandbox_profile", &paths.sandbox_profile),
+                    ("sandbox_unavailable", &paths.sandbox_unavailable),
+                ]
+                .into_iter()
+                .map(|(name, path)| {
+                    let entry = match fs::metadata(path) {
+                        Ok(metadata) => json!({"exists": true, "bytes": metadata.len()}),
+                        Err(error) => {
+                            json!({"exists": false, "error": format!("{:?}", error.kind())})
+                        }
+                    };
+                    (name.to_string(), entry)
+                })
+                .collect::<serde_json::Map<_, _>>();
+                let mut exit = String::new();
+                let _ = fs::File::open(&paths.exit)
+                    .and_then(|file| file.take(32).read_to_string(&mut exit));
+                json!({"state": state, "exit_marker": exit, "artifacts": artifacts})
+            }
+            Err(error) => {
+                // A missing or unreadable metadata file must not hide the
+                // remaining artifacts from the failure report.
+                let session_dir = session_tasks_dir(self.storage, SESSION);
+                let mut directories = vec![(session_dir.join(task_id), 0)];
+                let mut artifacts = serde_json::Map::new();
+                while let Some((directory, depth)) = directories.pop() {
+                    let Ok(entries) = fs::read_dir(&directory) else {
+                        continue;
+                    };
+                    for entry in entries.flatten().take(12) {
+                        if artifacts.len() == 12 {
+                            break;
+                        }
+                        let path = entry.path();
+                        let Ok(metadata) = entry.metadata() else {
+                            continue;
+                        };
+                        let name = path
+                            .strip_prefix(&session_dir)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .chars()
+                            .take(96)
+                            .collect::<String>();
+                        artifacts.insert(name, json!({"exists": true, "bytes": metadata.len()}));
+                        if metadata.is_dir() && depth < 1 {
+                            directories.push((path, depth + 1));
+                        }
+                    }
+                }
+                if let Ok(paths) = task_paths(self.storage, SESSION, task_id) {
+                    for path in task_bundle_files(&paths).into_iter().take(12) {
+                        if artifacts.len() == 12 {
+                            break;
+                        }
+                        if let Ok(metadata) = fs::metadata(&path) {
+                            artifacts.insert(
+                                path.file_name().unwrap().to_string_lossy().into_owned(),
+                                json!({"exists": true, "bytes": metadata.len()}),
+                            );
+                        }
+                    }
+                }
+                json!({"state": {"status": "unavailable"},
+                    "layout_error": format!("{:?}", error.kind()), "artifacts_first_12": artifacts})
+            }
+        };
+        json!({
+            "task_id": task_id, "spawn_elapsed_ms": self.spawned_at.elapsed().as_millis(),
+            "saved_before_probe": saved, "transport": aft.background_failure_context(SESSION),
+        })
+        .to_string()
+    }
+}
+
+fn wait_for_frame_with_forensics(
+    aft: &mut AftProcess,
+    task_id: &str,
+    kind: &str,
+    forensics: &TaskForensics<'_>,
+    timeout: Duration,
+) -> Value {
+    let started = Instant::now();
+    loop {
+        if let Some(frame) = aft.try_read_next_timeout(Duration::from_millis(200)) {
+            if frame["type"] == kind && frame["task_id"] == task_id {
+                return frame;
+            }
+        }
+        assert!(
+            started.elapsed() < timeout,
+            "timed out waiting for {kind} frame for {task_id}\n{}",
+            forensics.describe(aft, task_id)
+        );
+    }
+}
+
+#[test]
+fn missing_background_frame_panic_includes_bounded_non_destructive_forensics() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let mut aft = AftProcess::spawn();
+    configure_background(&mut aft, project.path(), storage.path(), SESSION);
+    let forensics = TaskForensics {
+        storage: storage.path(),
+        spawned_at: Instant::now(),
+    };
+    let task_id = spawn_bg(&mut aft, SESSION, "printf forensics", None);
+    wait_for_completion_frame(&mut aft, &task_id);
+    let frame = json!({"type": "unrelated", "session_id": SESSION, "task_id": "other"});
+    aft.queue_pending_frame_for_test(frame.clone());
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_frame_with_forensics(
+            &mut aft,
+            &task_id,
+            "never-emitted",
+            &forensics,
+            Duration::ZERO,
+        )
+    }))
+    .unwrap_err();
+    let message = failure.downcast_ref::<String>().unwrap();
+    for expected in [
+        "saved_before_probe",
+        "completed",
+        "exit_marker",
+        "artifacts",
+        "registry_pending_after_probe",
+        "pending_frames_before_probe",
+        "spawn_elapsed_ms",
+        "stderr_tail",
+    ] {
+        assert!(message.contains(expected), "missing {expected}: {message}");
+    }
+    assert!(
+        message.len() < 6144,
+        "unbounded forensics: {} bytes",
+        message.len()
+    );
+    aft.queue_pending_frame_for_test(frame.clone());
+    let context = forensics.describe(&mut aft, &task_id);
+    assert!(context.contains(&task_id));
+    assert_eq!(aft.try_read_next_timeout(Duration::ZERO), Some(frame));
+    assert_eq!(
+        drain(&mut aft, SESSION)["bg_completions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "diagnostic drains must not acknowledge a completion"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(feature = "test-timing-hooks")]
+#[test]
+fn short_background_completion_is_not_held_behind_spawn_response() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let gate = project.path().join("spawn-response-gate");
+    fs::write(&gate, "hold").unwrap();
+    let mut aft =
+        AftProcess::spawn_with_env(&[("AFT_TEST_BASH_AFTER_CREATE_GATE", gate.as_os_str())]);
+    configure_background(&mut aft, project.path(), storage.path(), SESSION);
+    let forensics = TaskForensics {
+        storage: storage.path(),
+        spawned_at: Instant::now(),
+    };
+    aft.send_silent(
+        &json!({
+            "id": "gated-spawn", "session_id": SESSION, "command": "bash",
+            "params": {"command": "printf before-response", "background": true, "compressed": false}
+        })
+        .to_string(),
+    );
+    // The existing after-create gate holds the response, not the child or its
+    // watchdog. Observe completion before allowing the spawn handler to return.
+    let started = Instant::now();
+    let completion = loop {
+        if let Some(frame) = aft.try_read_next_timeout(Duration::from_millis(200)) {
+            assert!(
+                frame.get("id").is_none(),
+                "spawn response escaped the gate: {frame}"
+            );
+            if frame["type"] == "bash_completed" {
+                break frame;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "completion held behind spawn response\n{}",
+            forensics.describe(&mut aft, "unpublished-task-id")
+        );
+    };
+    assert_eq!(completion["output_preview"], "before-response");
+    fs::remove_file(&gate).unwrap();
+    let response = aft.read_next();
+    assert_eq!(response["id"], "gated-spawn");
+    assert_eq!(response["task_id"], completion["task_id"]);
+    assert_eq!(response["success"], true);
+    assert!(aft.shutdown().success());
+}
+
 fn shell_quote_path(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
@@ -434,6 +674,10 @@ fn registry() -> BgTaskRegistry {
 }
 
 fn wait_for_path(path: &Path) {
+    wait_for_path_with_diagnostics(path, String::new);
+}
+
+fn wait_for_path_with_diagnostics(path: &Path, mut diagnostics: impl FnMut() -> String) {
     // File publication is the event; the deadline only catches a wedged child
     // or persistence worker and is deliberately outside normal scheduling cost.
     let started = Instant::now();
@@ -446,8 +690,9 @@ fn wait_for_path(path: &Path) {
     {
         assert!(
             started.elapsed() < Duration::from_secs(30),
-            "timed out waiting for {}",
-            path.display()
+            "timed out waiting for {}\n{}",
+            path.display(),
+            diagnostics()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -1838,12 +2083,19 @@ fn configure_replays_background_tasks_from_default_storage_dir() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let storage = cache.path().join("aft");
+    let mut forensics = TaskForensics {
+        storage: &storage,
+        spawned_at: Instant::now(),
+    };
 
     let task_id = {
         let mut aft = AftProcess::spawn_with_env(&[("AFT_CACHE_DIR", cache.path().as_os_str())]);
         configure_background_without_storage(&mut aft, project.path(), SESSION);
+        forensics.spawned_at = Instant::now();
         let task_id = spawn_bg(&mut aft, SESSION, "printf default-replay", None);
-        wait_for_path(&task_file(&storage, SESSION, &task_id, "exit"));
+        wait_for_path_with_diagnostics(&task_file(&storage, SESSION, &task_id, "exit"), || {
+            forensics.describe(&mut aft, &task_id)
+        });
         assert!(aft.shutdown().success());
         task_id
     };
@@ -1857,7 +2109,12 @@ fn configure_replays_background_tasks_from_default_storage_dir() {
         .unwrap()
         .iter()
         .find(|completion| completion["task_id"] == task_id)
-        .unwrap_or_else(|| panic!("missing replayed completion: {drained:?}"));
+        .unwrap_or_else(|| {
+            panic!(
+                "missing replayed completion: {drained:?}\n{}",
+                forensics.describe(&mut aft, &task_id)
+            )
+        });
 
     assert_eq!(completion["status"], "completed");
     assert_eq!(completion["exit_code"], 0);
@@ -3418,12 +3675,22 @@ fn redaction_replay_preserves_masked_preview_and_pattern_frame() {
     let mut owner = AftProcess::spawn();
     configure_background(&mut owner, project.path(), storage.path(), SESSION);
     let env = json!({"DEPLOY_tOkEn": SECRET});
+    let completion_forensics = TaskForensics {
+        storage: storage.path(),
+        spawned_at: Instant::now(),
+    };
     let completion_id = spawn_redaction_task(
         &mut owner,
         "printf 'finished %s\\n' \"$DEPLOY_tOkEn\"",
         env.clone(),
     );
-    let live_completion = wait_for_completion_frame(&mut owner, &completion_id);
+    let live_completion = wait_for_frame_with_forensics(
+        &mut owner,
+        &completion_id,
+        "bash_completed",
+        &completion_forensics,
+        Duration::from_secs(30),
+    );
     assert_eq!(
         live_completion["output_preview"],
         format!("finished {MASKED}\n")
@@ -3432,6 +3699,10 @@ fn redaction_replay_preserves_masked_preview_and_pattern_frame() {
         "while [ ! -e {} ]; do sleep 0.05; done; printf 'READY %s\\n' \"$DEPLOY_tOkEn\"",
         shell_quote_path(&release),
     );
+    let watch_forensics = TaskForensics {
+        storage: storage.path(),
+        spawned_at: Instant::now(),
+    };
     let watch_id = spawn_redaction_task(&mut owner, &command, env);
     let registered = owner.send(
         &json!({
@@ -3442,7 +3713,13 @@ fn redaction_replay_preserves_masked_preview_and_pattern_frame() {
     );
     assert_eq!(registered["success"], true, "{registered:?}");
     drop(release_guard);
-    let live_pattern = wait_for_pattern_frame(&mut owner, &watch_id);
+    let live_pattern = wait_for_frame_with_forensics(
+        &mut owner,
+        &watch_id,
+        "bash_pattern_match",
+        &watch_forensics,
+        Duration::from_secs(30),
+    );
     assert_eq!(live_pattern["match_text"], format!("READY {MASKED}"));
     assert!(live_pattern["context"].as_str().unwrap().contains(MASKED));
     assert!(!live_pattern.to_string().contains(SECRET));
@@ -3457,7 +3734,13 @@ fn redaction_replay_preserves_masked_preview_and_pattern_frame() {
 
     let mut restored = AftProcess::spawn();
     configure_background(&mut restored, project.path(), storage.path(), SESSION);
-    let replayed_pattern = wait_for_pattern_frame(&mut restored, &watch_id);
+    let replayed_pattern = wait_for_frame_with_forensics(
+        &mut restored,
+        &watch_id,
+        "bash_pattern_match",
+        &watch_forensics,
+        Duration::from_secs(30),
+    );
     for field in ["match_text", "match_offset", "context"] {
         assert_eq!(replayed_pattern[field], live_pattern[field], "{field}");
     }
@@ -3467,7 +3750,12 @@ fn redaction_replay_preserves_masked_preview_and_pattern_frame() {
         .unwrap()
         .iter()
         .find(|completion| completion["task_id"] == completion_id)
-        .unwrap();
+        .unwrap_or_else(|| {
+            panic!(
+                "missing replayed completion: {drained:?}\n{}",
+                completion_forensics.describe(&mut restored, &completion_id)
+            )
+        });
     assert_eq!(
         replayed_completion["output_preview"],
         live_completion["output_preview"]
