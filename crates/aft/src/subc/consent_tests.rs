@@ -910,6 +910,7 @@ struct FinishGate {
     request: String,
     after_claim: bool,
     entered: AtomicBool,
+    completed: AtomicBool,
     released: StdMutex<bool>,
     wake: std::sync::Condvar,
 }
@@ -926,6 +927,7 @@ impl FinishGateOverride {
             request: request.into(),
             after_claim,
             entered: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
             released: StdMutex::new(false),
             wake: std::sync::Condvar::new(),
         });
@@ -953,16 +955,88 @@ impl Drop for FinishGateOverride {
 
 pub(super) fn wait_at_finish(request: &str, after_claim: bool) {
     let gate = FINISH_GATE.lock().unwrap().clone();
-    if let Some(gate) =
-        gate.filter(|gate| gate.request == request && gate.after_claim == after_claim)
-    {
-        gate.entered.store(true, Ordering::SeqCst);
-        let released = gate.released.lock().unwrap();
-        let (_released, timeout) = gate
-            .wake
-            .wait_timeout_while(released, Duration::from_secs(10), |released| !*released)
+    if let Some(gate) = gate.filter(|gate| gate.request == request) {
+        if gate.after_claim == after_claim {
+            gate.entered.store(true, Ordering::SeqCst);
+            let released = gate.released.lock().unwrap();
+            let (_released, timeout) = gate
+                .wake
+                .wait_timeout_while(released, Duration::from_secs(10), |released| !*released)
+                .unwrap();
+            assert!(!timeout.timed_out(), "finish gate must be released");
+        }
+        if after_claim {
+            gate.completed.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_deadline_during_finish_preserves_once_for_identical_retry() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    for after_claim in [false, true] {
+        let f = fixture(FakeCingulate::up());
+        set_hold_budget_for_test(Some(Duration::from_secs(1)));
+        let gate = FinishGateOverride::install("subc-41-781", after_claim);
+        let target = f.head_root.join("shared.txt");
+        let mut first = f.send_read(&f.worker, &target, 781).await;
+        wait_for(|| !f.fake.calls("consent.request").is_empty()).await;
+        let request = &f.fake.calls("consent.request")[0];
+        let original = request["call_key"].as_str().unwrap().to_owned();
+        f.fake.answer(
+            &original,
+            json!({"state":"settled", "outcome":"allow_once", "answered_by":"user"}),
+        );
+        wait_for(|| gate.0.entered.load(Ordering::SeqCst)).await;
+
+        // Budget expiry promises a retry; unlike cancellation, it must not
+        // discard the answered approval while blocking finish work completes.
+        let frame = tokio::time::timeout(Duration::from_secs(3), first.recv())
+            .await
+            .unwrap()
             .unwrap();
-        assert!(!timeout.timed_out(), "finish gate must be released");
+        let pending: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(code(&pending), "access_pending", "{pending}");
+        gate.release();
+        wait_for(|| gate.0.completed.load(Ordering::SeqCst)).await;
+        wait_for(|| f.asks().iter().all(|ask| !ask.holder_is_live())).await;
+
+        let allowed = f.read(&f.worker, &target, 782).await;
+        assert!(
+            text(&allowed).contains("head-owned contents"),
+            "identical retry did not use the answered approval: {allowed}"
+        );
+        assert_eq!(
+            f.fake.state.lock().unwrap().asks.len(),
+            1,
+            "retry must reuse the original ask"
+        );
+        assert!(f
+            .fake
+            .calls("consent.request")
+            .iter()
+            .all(|request| request["call_key"] == original));
+        assert!(f.asks().is_empty());
+        assert!(f.worker_grants().is_empty());
+
+        let mut second = f.send_read(&f.worker, &target, 783).await;
+        wait_for(|| f.fake.state.lock().unwrap().asks.len() == 2).await;
+        assert!(
+            second.try_recv().is_err(),
+            "allow_once cannot run another retry"
+        );
+        let requests = f.fake.calls("consent.request");
+        let new_key = requests.last().unwrap()["call_key"].as_str().unwrap();
+        assert_ne!(new_key, original);
+        f.fake
+            .answer(new_key, json!({"state":"settled", "outcome":"deny"}));
+        let frame = tokio::time::timeout(Duration::from_secs(3), second.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let refused: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(code(&refused), "access_declined", "{refused}");
     }
 }
 

@@ -609,12 +609,16 @@ enum Hold {
 }
 
 /// Keep ownership of an approval from the blocking claim through its rerun.
-/// The last owner clears a claim that never reaches a caller or is cancelled.
+/// Cancellation consumes an unused claim; hold expiry can return a one-time
+/// answer to its original ask so an identical retry does not need approval again.
 struct ClaimedAsk {
     db: Arc<StdMutex<crate::db::TrackedConnection>>,
     key: AskKey,
     holder: String,
     armed: AtomicBool,
+    retry_after_deadline: Arc<AtomicBool>,
+    original: Option<Prepared>,
+    elicitation: String,
 }
 
 impl ClaimedAsk {
@@ -622,9 +626,24 @@ impl ClaimedAsk {
         let db = Arc::clone(&self.db);
         let key = self.key.clone();
         let holder = self.holder.clone();
+        let original = self.original.clone();
+        let elicitation = self.elicitation.clone();
+        let retry = self.retry_after_deadline.load(Ordering::SeqCst);
         move || match db.lock() {
             Ok(conn) => {
-                if let Err(error) = asks::consume(&conn, &key, &holder) {
+                let cleaned = match original.filter(|_| retry) {
+                    Some(original) => asks::release_claim(
+                        &conn,
+                        &key,
+                        &holder,
+                        &original.call_key,
+                        Some(&elicitation),
+                        &original.request,
+                        &original.grant,
+                    ),
+                    None => asks::consume(&conn, &key, &holder),
+                };
+                if let Err(error) = cleaned {
                     crate::slog_warn!("consent approval cleanup failed: {error}");
                 }
             }
@@ -634,6 +653,7 @@ impl ClaimedAsk {
 
     async fn clear(self: Arc<Self>) {
         if self.armed.swap(false, Ordering::SeqCst) {
+            self.retry_after_deadline.store(false, Ordering::SeqCst);
             // The cleanup task outlives this await if its caller is cancelled.
             if let Err(error) = tokio::task::spawn_blocking(self.cleanup()).await {
                 crate::slog_warn!("consent approval cleanup task failed: {error}");
@@ -695,6 +715,7 @@ where
         let own = holder.as_ref().map(|claim| claim.holder.clone());
         match hold(&call, grant, deadline, &route_hold, own).await {
             Hold::Run { once, claim } => {
+                claim.retry_after_deadline.store(false, Ordering::SeqCst);
                 holder = Some(claim);
                 let running = rerun(AskRoute::Consent {
                     once,
@@ -1767,6 +1788,8 @@ async fn hold(
         first = false;
         let wait = deadline.saturating_duration_since(now).min(MAX_AWAIT);
         let applied = Arc::new(StdMutex::new(None));
+        let retry_after_deadline = Arc::new(AtomicBool::new(false));
+        let receipt_retry = Arc::clone(&retry_after_deadline);
         let received = Arc::clone(&applied);
         let receipt_call = call.clone();
         let receipt_prep = prep.clone();
@@ -1789,7 +1812,14 @@ async fn hold(
                                 &ask_id,
                                 &receipt_prep.grant,
                             );
-                            let result = finish(&receipt_call, &receipt_prep, settled).await;
+                            let result = finish(
+                                &receipt_call,
+                                &receipt_prep,
+                                settled,
+                                receipt_retry,
+                                &ask_id,
+                            )
+                            .await;
                             *received
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
@@ -1814,7 +1844,12 @@ async fn hold(
                             withdraw(call, &prep, &elicitation).await;
                             return Hold::Answer(refused_answer(call, &prep.grant, "access_withdrawn", None));
                         }
-                        None if Instant::now() >= deadline => break None,
+                        None if Instant::now() >= deadline => {
+                            // Mark expiry before dropping the receipt: its blocking
+                            // claim can still complete after we promise a retry.
+                            retry_after_deadline.store(true, Ordering::SeqCst);
+                            break None;
+                        }
                         None => {}
                     }
                 }
@@ -1829,7 +1864,9 @@ async fn hold(
         }
         match reply.map(|reply| reply.and_then(|record| decode_record(&record))) {
             None | Some(Ok(Settlement::Pending)) => {}
-            Some(Ok(settled)) => return finish(call, &prep, settled).await,
+            Some(Ok(settled)) => {
+                return finish(call, &prep, settled, retry_after_deadline, &elicitation).await
+            }
             Some(Err(error)) => return failed(call, &prep, error).await,
         }
     }
@@ -1863,7 +1900,13 @@ enum Applied {
     NotClaimed,
 }
 
-async fn finish(call: &HeldCall, prep: &Prepared, settled: Settlement) -> Hold {
+async fn finish(
+    call: &HeldCall,
+    prep: &Prepared,
+    settled: Settlement,
+    retry_after_deadline: Arc<AtomicBool>,
+    elicitation: &str,
+) -> Hold {
     match settled {
         Settlement::Pending => unreachable!("finish runs on settled answers"),
         Settlement::Deny { note } => {
@@ -1919,6 +1962,11 @@ async fn finish(call: &HeldCall, prep: &Prepared, settled: Settlement) -> Hold {
                 key: key.clone(),
                 holder: holder.clone(),
                 armed: AtomicBool::new(true),
+                retry_after_deadline,
+                // Claim clears the persisted request fields. Keep the original
+                // card rather than rereading a row another dispatch may own.
+                original: (!scope).then(|| prep.clone()),
+                elicitation: elicitation.to_owned(),
             });
             let ownership = Arc::clone(&claim);
             let claimant = holder.clone();
