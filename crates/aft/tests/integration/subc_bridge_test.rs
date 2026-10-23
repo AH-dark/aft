@@ -5043,7 +5043,10 @@ async fn drive_bash_wait_true_daemon(input: FakeDaemonInput) {
 
 async fn drive_repeat_breaker_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
-        mut stream, root1, ..
+        mut stream,
+        root1,
+        executor,
+        ..
     } = open_fake_daemon_session(input).await;
     std::fs::write(root1.join("stable.repeat-fixture"), "stable")
         .expect("write subc repeat fixture");
@@ -5083,7 +5086,22 @@ async fn drive_repeat_breaker_daemon(input: FakeDaemonInput) {
         }
     }
 
-    super::repeat_breaker_test::assert_transport_repeat_sequence(&texts);
+    super::repeat_breaker_test::assert_transport_repeat_sequence_with_diagnostics(&texts, || {
+        let context = ProjectRootId::from_path(&root1)
+            .ok()
+            .and_then(|root_id| executor.actor_context(&root_id));
+        match context {
+            // Read the hashes the breaker stored, rather than re-hashing replies
+            // that already include reminders and finalizer decorations.
+            Some(ctx) => format!(
+                "recorded repeat-breaker observations: {:#?}",
+                ctx.repeat_breaker()
+            ),
+            None => {
+                "recorded repeat-breaker observations unavailable: root actor not found".to_string()
+            }
+        }
+    });
     send_connection_goodbye(&mut stream).await;
 }
 
