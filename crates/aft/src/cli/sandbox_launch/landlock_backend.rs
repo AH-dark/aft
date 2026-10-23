@@ -1,7 +1,7 @@
 use aft::sandbox_profile::SandboxProfile;
 use landlock::{
     AccessFs, BitFlags, CompatLevel, Compatible, LandlockStatus, PathBeneath, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus, ABI,
+    RulesetCreatedAttr, RulesetStatus, Scope, ABI,
 };
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr};
@@ -21,6 +21,7 @@ pub(super) struct AppliedLandlock {
     pub effective_abi: ABI,
     pub partially_enforced: bool,
     pub yama_same_uid_exposed: bool,
+    pub signal_scope_enforced: bool,
 }
 
 pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String> {
@@ -28,7 +29,7 @@ pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String>
         // Landlock cannot subtract protected paths from a root-wide grant.
         // Grant reads and writes beneath /, then list each unenforced path on
         // stderr in emit_linux_warning; relaxed is not a Linux access boundary.
-        return probe();
+        return probe_with_signal_scope(profile.worker_jail);
     }
     // Recheck after launcher canonicalization: a changed symlink must not turn
     // the configured connection-file deny into an additive Landlock grant.
@@ -118,6 +119,7 @@ pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String>
             .chain([Path::new("/dev/null")]),
         &session_reads,
         yama_same_uid_exposed,
+        profile.worker_jail,
     )
 }
 
@@ -188,8 +190,18 @@ fn session_task_read_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 pub(super) fn probe() -> Result<AppliedLandlock, String> {
+    probe_with_signal_scope(true)
+}
+
+fn probe_with_signal_scope(scope_signals: bool) -> Result<AppliedLandlock, String> {
     close_inherited_fds()?;
-    apply_paths([(Path::new("/"), false)], [Path::new("/")], &[], false)
+    apply_paths(
+        [(Path::new("/"), false)],
+        [Path::new("/")],
+        &[],
+        false,
+        scope_signals,
+    )
 }
 
 fn apply_paths<'a>(
@@ -197,6 +209,7 @@ fn apply_paths<'a>(
     write_paths: impl IntoIterator<Item = &'a Path>,
     exact_read_paths: &[PathBuf],
     yama_same_uid_exposed: bool,
+    scope_signals: bool,
 ) -> Result<AppliedLandlock, String> {
     let read_access = AccessFs::from_read(TARGET_ABI);
     // Refer is a V2 write-class right. Granting it only with writable-root
@@ -288,7 +301,23 @@ fn apply_paths<'a>(
         effective_abi,
         partially_enforced: false,
         yama_same_uid_exposed,
+        signal_scope_enforced: scope_signals && apply_signal_scope()?,
     })
+}
+
+fn apply_signal_scope() -> Result<bool, String> {
+    // Keep optional ABI 6 signal scoping separate from mandatory filesystem
+    // rights: an older kernel must not downgrade the filesystem enforcement
+    // check merely because it cannot mediate signals.
+    let status = Ruleset::default()
+        .set_compatibility(CompatLevel::BestEffort)
+        .scope(Scope::Signal)
+        .map_err(|error| format!("failed to configure Landlock signal scope: {error}"))?
+        .create()
+        .map_err(|error| format!("failed to create Landlock signal scope: {error}"))?
+        .restrict_self()
+        .map_err(|error| format!("failed to restrict Landlock signals: {error}"))?;
+    Ok(status.ruleset == RulesetStatus::FullyEnforced)
 }
 
 fn access_for_opened_path(access: BitFlags<AccessFs>, is_dir: bool) -> BitFlags<AccessFs> {

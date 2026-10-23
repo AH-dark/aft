@@ -55,6 +55,7 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
     let mut source = String::from(
         "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (literal \"/dev/null\"))\n",
     );
+    render_signal_scope(&mut source, profile);
 
     for root in profile.write_allow_roots() {
         source.push_str(&format!(
@@ -142,6 +143,7 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
 
 fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
     let mut source = String::from("(version 1)\n(allow default)\n");
+    render_signal_scope(&mut source, profile);
     for path in &profile.write_deny {
         source.push_str(&format!(
             "(deny file-write* {})\n",
@@ -236,6 +238,16 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
     render_worker_canary_metadata(&mut source, profile)?;
     render_worker_keychain_denies(&mut source, profile)?;
     Ok(source)
+}
+
+fn render_signal_scope(source: &mut String, profile: &SandboxProfile) {
+    if !profile.worker_jail {
+        return;
+    }
+    // Separate sandbox_init calls do not share a signal domain, even with an
+    // identical profile. Host-side AFT cancellation remains available across
+    // commands; a command may signal only processes in its own sandbox.
+    source.push_str("(deny signal)\n(allow signal (target same-sandbox))\n");
 }
 
 fn render_worker_keychain_denies(
@@ -506,6 +518,35 @@ fn escape_path(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_scope_is_limited_to_worker_profiles_in_both_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = SandboxProfile::build(
+            vec![dir.path().to_path_buf()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        for mode in [
+            aft::config::SandboxMode::Strict,
+            aft::config::SandboxMode::Relaxed,
+        ] {
+            profile.mode = mode;
+            profile.worker_jail = false;
+            let operator = render_profile(&profile).unwrap();
+            assert!(!operator.contains("(deny signal)"));
+            profile.worker_jail = true;
+            let source = render_profile(&profile).unwrap();
+            assert!(source.contains("(deny signal)\n(allow signal (target same-sandbox))\n"));
+            assert!(!source.contains("(target pgrp)"));
+        }
+    }
 
     #[test]
     fn worker_keychain_mach_denies_preserve_trust_services() {

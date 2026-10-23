@@ -404,6 +404,10 @@ fn emit_off_worker_gh_warning(profile: &SandboxProfile) {
 
 #[cfg(target_os = "linux")]
 fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::AppliedLandlock) {
+    let signal_scope = signal_scope_label(applied.signal_scope_enforced);
+    if profile.worker_jail {
+        eprintln!("sandbox-launch: signal_scope={signal_scope}");
+    }
     // Landlock's filesystem rights do not mediate AF_UNIX connect. Removing the
     // address from the environment does not hide predictable session-bus paths.
     let session_bus_reason = if profile.worker_jail {
@@ -532,7 +536,9 @@ fn print_support() -> Result<(), SandboxLaunchError> {
     print_json(serde_json::json!({
         "platform": "macos",
         "supported": true,
-        "backend": "seatbelt"
+        "backend": "seatbelt",
+        "signal_scope": "same_command",
+        "signal_scope_profile": "worker"
     }))
 }
 
@@ -541,7 +547,25 @@ fn print_support() -> Result<(), SandboxLaunchError> {
     let applied = landlock_backend::probe().map_err(|error| {
         SandboxLaunchError::unavailable(format!("failed to probe Landlock: {error}"))
     })?;
-    print_json(serde_json::json!({
+    print_json(landlock_support_status(applied))
+}
+
+#[cfg(target_os = "linux")]
+fn signal_scope_label(enforced: bool) -> &'static str {
+    if enforced {
+        "same_command"
+    } else {
+        "not_enforced"
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_support_status(applied: landlock_backend::AppliedLandlock) -> serde_json::Value {
+    let mut unenforced = vec!["sccache_server_unblockable_on_landlock"];
+    if !applied.signal_scope_enforced {
+        unenforced.push("signal_scope");
+    }
+    serde_json::json!({
         "platform": "linux",
         "supported": true,
         "backend": "landlock",
@@ -550,8 +574,10 @@ fn print_support() -> Result<(), SandboxLaunchError> {
         "required_refer_abi": landlock_backend::abi_label(landlock_backend::REQUIRED_REFER_ABI),
         "required_write_abi": landlock_backend::abi_label(landlock_backend::REQUIRED_WRITE_ABI),
         "partially_enforced": applied.partially_enforced,
-        "unenforced": ["sccache_server_unblockable_on_landlock"]
-    }))
+        "signal_scope": signal_scope_label(applied.signal_scope_enforced),
+        "signal_scope_profile": "worker",
+        "unenforced": unenforced
+    })
 }
 
 #[cfg(windows)]
@@ -589,6 +615,25 @@ mod tests {
 
     fn os_args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn older_landlock_signal_scope_is_reported_not_enforced() {
+        for effective_abi in [landlock::ABI::V3, landlock::ABI::V4, landlock::ABI::V5] {
+            let status = landlock_support_status(landlock_backend::AppliedLandlock {
+                effective_abi,
+                partially_enforced: false,
+                yama_same_uid_exposed: false,
+                signal_scope_enforced: false,
+            });
+            assert_eq!(status["signal_scope"], "not_enforced");
+            assert_eq!(status["signal_scope_profile"], "worker");
+            assert!(status["unenforced"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("signal_scope")));
+        }
     }
 
     #[test]
