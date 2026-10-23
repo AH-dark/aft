@@ -858,9 +858,9 @@ fn callgraph_producer_change_republishes_an_existing_generation() {
     let store = owner.open_store(FamilyPlane::Callgraph).unwrap();
     // The current build refuses to materialize under another producer, so the
     // previous generation reuses the database built for the same files.
-    std::fs::copy(
-        views.derived_path(&built_name).unwrap(),
-        views.derived_path(&previous_name.to_string()).unwrap(),
+    crate::views::clone_derived_for_test(
+        &views.derived_path(&built_name).unwrap(),
+        &views.derived_path(&previous_name.to_string()).unwrap(),
     )
     .unwrap();
     let prepared = views

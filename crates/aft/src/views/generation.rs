@@ -883,6 +883,11 @@ pub(super) fn clone_derived_backup(source: &Path, destination: &Path) -> Result<
     Ok(copy)
 }
 
+#[cfg(test)]
+pub(crate) fn clone_derived_for_test(source: &Path, destination: &Path) -> Result<()> {
+    clone_derived(source, destination).map(|_| ())
+}
+
 /// Delete an unpublished derived file set (main file, `-wal`, `-shm`) so the
 /// caller can build a fresh database at the same path. Refuses while this
 /// process has any SQLite connection on the path: deleting a file set under a
@@ -1257,6 +1262,33 @@ mod tests {
                 .unwrap(),
             "committed-in-wal"
         );
+    }
+
+    #[test]
+    fn clone_closed_path_status_store_keeps_committed_wal() {
+        let directory = tempfile::tempdir().unwrap();
+        let view = directory.path().join("view");
+        let source = view.join("derived.sqlite");
+        let destination = directory.path().join("cloned.sqlite");
+        {
+            let mut status = crate::path_status::PathStatusStore::open(&view).unwrap();
+            status.mark_pending(b"first.rs", "waiting", 1).unwrap();
+            status
+                .mark_failed(b"last.rs", "last committed write", 2)
+                .unwrap();
+        }
+        assert_eq!(crate::db::file_identity::open_connections(&source), 0);
+        assert!(fs::metadata(view.join("derived.sqlite-wal")).unwrap().len() > 0);
+        clone_derived_for_test(&source, &destination).unwrap();
+        let copied = crate::path_status::PathStatusStore::open_at(&destination).unwrap();
+        let last = copied
+            .status_for(b"last.rs")
+            .unwrap()
+            .expect("last committed path survived clone");
+        assert_eq!(last.state, crate::path_status::PathState::Failed);
+        assert_eq!(last.reason, "last committed write");
+        assert_eq!(last.since_generation, 2);
+        assert_eq!(copied.summary().unwrap().pending_count, 1);
     }
 
     #[test]

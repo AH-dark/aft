@@ -46,16 +46,16 @@ impl Timer {
 #[ignore = "offline per-step measurement with configurable roots and a large aft.db"]
 fn bench_health_rollup_steps() {
     use super::super::test_support::test_root;
-    // The defaults reproduce the original 40-root run. The variables below
+    // The defaults use 40 roots. The variables below
     // model a busier daemon (the live one runs 100+ roots, hundreds of
     // threads, populated indexes and views that publish continuously):
     //   AFT_ROLLUP_BENCH_ROOTS    bound roots, one installed view each
+    //   AFT_ROLLUP_BENCH_CHECKOUTS_PER_FAMILY  bound checkouts sharing a family
     //   AFT_ROLLUP_BENCH_THREADS  extra idle named threads in the process
     //   AFT_ROLLUP_BENCH_FILES    files in each root's in-memory trigram index
     //   AFT_ROLLUP_BENCH_CHURN=1  between ticks, every root republishes its
     //                             view without changing its path status
-    //                             (open, re-mark, clear, close, as assembly
-    //                             does) and reads one new file into its
+    //                             (open, re-mark, clear, close) and reads one new file into its
     //                             symbol cache; one root in ten also edits a
     //                             file in its trigram index
     //   AFT_ROLLUP_BENCH_ARENA_CHUNKS  resident chunks held by views-on
@@ -72,6 +72,7 @@ fn bench_health_rollup_steps() {
             .unwrap_or(default)
     };
     let roots_count = env_count("AFT_ROLLUP_BENCH_ROOTS", 40);
+    let checkouts_per_family = env_count("AFT_ROLLUP_BENCH_CHECKOUTS_PER_FAMILY", 1).max(1);
     let thread_count = env_count("AFT_ROLLUP_BENCH_THREADS", 0);
     let files_per_root = env_count("AFT_ROLLUP_BENCH_FILES", 0);
     let churn = std::env::var("AFT_ROLLUP_BENCH_CHURN").is_ok_and(|value| value == "1");
@@ -148,7 +149,7 @@ fn bench_health_rollup_steps() {
                 ..crate::config::Config::default()
             },
         ));
-        let family = format!("bench-family-{i}");
+        let family = format!("bench-family-{}", i / checkouts_per_family);
         let registry = crate::views::registry::FamilyRegistry::open(&storage, &family).unwrap();
         for view in 0..10 {
             let scope = format!("bench-{i}-{view}");
@@ -207,6 +208,35 @@ fn bench_health_rollup_steps() {
         ctx.view_health_snapshot()
             .is_some_and(|view| view.pending_paths == 1 && view.failed_paths == 1)
     }));
+    let actors = executor.actor_entries();
+    let mut snapshot_cpu = 0;
+    let mut snapshot_elapsed = std::time::Duration::ZERO;
+    let reads_before = crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
+    for _ in 0..TICKS {
+        if churn {
+            for view_dir in &churn_view_dirs {
+                let mut status = crate::path_status::PathStatusStore::open(view_dir).unwrap();
+                status.mark_pending(b"src/a.rs", "bench", 1).unwrap();
+                status.clear_many([&b"src/gone.rs"[..]]).unwrap();
+            }
+        }
+        let cpu = cpu_ns();
+        let elapsed = std::time::Instant::now();
+        for (_, ctx) in &actors {
+            std::hint::black_box(ctx.view_health_snapshot());
+        }
+        snapshot_cpu += cpu_ns() - cpu;
+        snapshot_elapsed += elapsed.elapsed();
+    }
+    println!(
+        "view_health_snapshot only: roots={roots_count} checkouts_per_family={checkouts_per_family} ticks={TICKS} cpu_us/tick={:.2} elapsed_ms/tick={:.3}",
+        snapshot_cpu as f64 / TICKS as f64 / 1000.,
+        snapshot_elapsed.as_secs_f64() * 1000. / TICKS as f64,
+    );
+    println!(
+        "snapshot phase SQLite reopens={}",
+        crate::path_status::HEALTH_READS.with(std::cell::Cell::get) - reads_before
+    );
     STEPS.with(|steps| *steps.borrow_mut() = Some(BTreeMap::new()));
     let census_builds_before = cache.census_builds_for_test();
     let mut total = 0u64;
@@ -289,6 +319,20 @@ fn bench_health_rollup_steps() {
     println!(
         "memory census measured on {} of {TICKS} ticks",
         cache.census_builds_for_test() - census_builds_before
+    );
+    let mut wal_sizes = BTreeMap::<u64, usize>::new();
+    for registration in &registrations {
+        let bytes = std::fs::metadata(registration.view_dir().join("derived.sqlite-wal"))
+            .map_or(0, |metadata| metadata.len());
+        *wal_sizes.entry(bytes).or_default() += 1;
+    }
+    println!("closed path-status WAL bytes per store (bytes: stores): {wal_sizes:?}");
+    println!(
+        "closed path-status WAL total_bytes={}",
+        wal_sizes
+            .iter()
+            .map(|(bytes, stores)| bytes * *stores as u64)
+            .sum::<u64>()
     );
     let metrics = DispatchPathMetrics::new();
     let pending = HashMap::new();

@@ -144,7 +144,7 @@ fn prepare(f: &Fixture) -> (std::path::PathBuf, std::path::PathBuf) {
     let base = f.dir.path().join("base.sqlite");
     let copy = f.dir.path().join("copy.sqlite");
     materialize_manifest_view_database(&base, &f.blobs, &f.base).unwrap();
-    std::fs::copy(&base, &copy).unwrap();
+    crate::views::generation::clone_derived_for_test(&base, &copy).unwrap();
     (base, copy)
 }
 
@@ -973,7 +973,7 @@ fn bench_controlled_300_path_diff() {
             .dir
             .path()
             .join(format!("controlled-{incremental}.sqlite"));
-        std::fs::copy(&original, &db).unwrap();
+        crate::views::generation::clone_derived_for_test(&original, &db).unwrap();
         let keeper = Connection::open(&db).unwrap();
         keeper
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)")
@@ -2286,7 +2286,7 @@ fn incremental_dispatch_resolves_only_files_whose_inputs_changed() {
                 .dir
                 .path()
                 .join(format!("independent-{label}-{every_file}.sqlite"));
-            std::fs::copy(&base_db, &db).unwrap();
+            crate::views::generation::clone_derived_for_test(&base_db, &db).unwrap();
             let work_before = crate::views::io::work_snapshot();
             dispatch::RESOLVE_EVERY_FILE.with(|cell| cell.set(every_file));
             let stats = apply_manifest_diff(&db, &base, next, &f.blobs);
