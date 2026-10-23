@@ -477,6 +477,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
             provides: vec![
                 cortexkit_role_tool_provider::PROVIDES.to_string(),
                 cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_string(),
+                subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
             ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
@@ -808,13 +809,21 @@ mod tests {
         let capabilities = manifest.capabilities.as_ref().expect("capabilities");
         assert_eq!(
             capabilities.provides,
-            vec!["tool-provider/v1".to_string(), "call-modes/v1".to_string()]
+            vec![
+                "tool-provider/v1".to_string(),
+                "call-modes/v1".to_string(),
+                "scope-workdir/v1".to_string(),
+            ]
         );
         assert!(capabilities.requires.is_empty());
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
             wire.pointer("/capabilities/provides"),
-            Some(&serde_json::json!(["tool-provider/v1", "call-modes/v1"]))
+            Some(&serde_json::json!([
+                "tool-provider/v1",
+                "call-modes/v1",
+                "scope-workdir/v1"
+            ]))
         );
     }
 
@@ -1093,7 +1102,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["tool-provider/v1", "call-modes/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["tool-provider/v1", "call-modes/v1", "scope-workdir/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );

@@ -222,6 +222,8 @@ mod readiness;
 mod remote_policy;
 mod run_scope;
 mod scope_describe;
+#[cfg(test)]
+mod scope_workdir_tests;
 mod stall_watchdog;
 mod standing;
 mod tool_provider;
@@ -7216,6 +7218,33 @@ async fn send_cached_health_response(
     send_frame(tx, metrics, response).await
 }
 
+fn log_scope_workdir_mismatch(
+    identity: &subc_protocol::BindIdentity,
+    scope: Option<&subc_protocol::scope::ScopeStamp>,
+) {
+    let Some(stamp) = scope else { return };
+    let Some(workdir) = stamp.workdir.as_deref() else {
+        return;
+    };
+    // The session folder is diagnostic only. Use the routing root's normalization
+    // for the comparison, without changing bind admission or any project state.
+    let (Ok(project_root), Ok(workdir)) = (
+        ProjectRootId::from_path(&identity.project_root),
+        ProjectRootId::from_path(workdir),
+    ) else {
+        return;
+    };
+    if workdir != project_root {
+        crate::slog_info!(
+            "subc scope workdir differs: project_root={} workdir={} session={} project_id={}",
+            project_root.as_path().display(),
+            workdir.as_path().display(),
+            identity.session,
+            stamp.project_id.as_deref().unwrap_or("none"),
+        );
+    }
+}
+
 /// Channel-0 control requests: RouteBind plus the cached health probe.
 /// Tool-provider binds reconcile RootConfig through the executor's Mutating lane;
 /// management binds install immediately without creating project state.
@@ -7283,6 +7312,7 @@ async fn handle_control_request(
                 ),
                 if role_versions.is_some() { "declared" } else { "none" }
             );
+            log_scope_workdir_mismatch(&identity, scope.as_ref());
             if epoch == 0 {
                 return send_route_bind_error(
                     tx,

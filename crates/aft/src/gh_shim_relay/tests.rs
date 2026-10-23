@@ -581,13 +581,13 @@ fn a_delegating_stamped_route_sends_the_write_under_its_scope() {
     );
     assert_eq!(
         transport.plexus_scopes(),
-        vec![Some(ScopeSelector {
-            owner: subc_protocol::Principal::Reserved {
+        vec![Some(ScopeSelector::new(
+            subc_protocol::Principal::Reserved {
                 module_id: "prefrontal-core".to_string(),
             },
-            scope_ref: "head-ref-1".to_string(),
-            scope_epoch: Some(7),
-        })],
+            "head-ref-1",
+            Some(7),
+        ))],
         "the plexus route is opened under the session's scope at its epoch"
     );
     assert_eq!(lines.len(), 1);

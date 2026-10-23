@@ -136,11 +136,11 @@ pub fn delegating_agent(stamp: &ScopeStamp) -> Option<&str> {
 /// The selector that opens a route under the scope a stamp names, pinned to
 /// the stamp's epoch so a newer session under the same ref is not picked up.
 fn scope_selector(stamp: &ScopeStamp) -> ScopeSelector {
-    ScopeSelector {
-        owner: stamp.owner.clone(),
-        scope_ref: stamp.scope_ref.clone(),
-        scope_epoch: Some(stamp.scope_epoch),
-    }
+    ScopeSelector::new(
+        stamp.owner.clone(),
+        stamp.scope_ref.clone(),
+        Some(stamp.scope_epoch),
+    )
 }
 
 /// The scope stamps of AFT's bound tool routes, keyed by the session each
