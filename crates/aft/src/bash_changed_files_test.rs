@@ -84,10 +84,14 @@ fn bash_changed_files_already_dirty_and_existing_untracked_have_no_diff() {
     }
     let report = capture.finish();
     assert_eq!(report.files.len(), 2);
-    assert!(report
-        .files
-        .iter()
-        .all(|file| file.diff.is_none() && file.reason.as_deref() == Some(DIRTY)));
+    assert!(
+        report
+            .files
+            .iter()
+            .all(|file| file.diff.is_none() && file.reason.as_deref() == Some(DIRTY)),
+        "{report:?}; git={:?}",
+        capture.git
+    );
 }
 #[test]
 fn bash_changed_files_deleted_new_binary_and_large() {
@@ -115,7 +119,11 @@ fn bash_changed_files_deleted_new_binary_and_large() {
     }
     let report = capture.finish();
     let find = |name| report.files.iter().find(|file| file.path == name).unwrap();
-    assert!(find("deleted.txt").diff.as_ref().unwrap().contains("-gone"));
+    assert!(find("deleted.txt")
+        .diff
+        .as_ref()
+        .unwrap_or_else(|| panic!("missing deleted diff: {report:?}; git={:?}", capture.git))
+        .contains("-gone"));
     assert_eq!(find("deleted.txt").status, "deleted");
     assert!(find("deleted.txt")
         .diff
@@ -154,14 +162,23 @@ fn bash_changed_files_caps_files_lines_bytes_and_overflow() {
     assert!(report.files.len() <= MAX_FILES);
     assert!(report.text.len() <= MAX_REPORT_BYTES);
     assert!(serde_json::to_vec(report).unwrap().len() <= MAX_REPORT_BYTES);
-    assert!(report.text.contains("shown 200 of"));
+    assert!(
+        report.text.contains("shown 200 of"),
+        "{report:?}; git={:?}",
+        capture.git
+    );
     assert!(report.text.contains(OVERFLOW));
     assert_eq!(report.changed_files_list_envelope.reason, Some(Reason::Cap));
     assert!(report.changed_files_list_envelope.total.is_at_least());
-    assert!(report
-        .files
-        .iter()
-        .all(|file| file.diff_lines_list_envelope.as_ref().unwrap().shown == MAX_DIFF_LINES));
+    // Expensive Git process startup can exhaust the diff budget before all
+    // listed files get a diff. Every produced diff must still carry its cap.
+    assert!(report.files.iter().all(|file| match &file.diff {
+        Some(_) => file
+            .diff_lines_list_envelope
+            .as_ref()
+            .is_some_and(|envelope| envelope.shown == MAX_DIFF_LINES),
+        None => file.diff_lines_list_envelope.is_none(),
+    }));
 }
 #[test]
 fn bash_changed_files_ring_overrun_and_outside_git_are_honest() {
@@ -847,4 +864,55 @@ fn bash_changed_files_directory_kind_is_retained_after_rename() {
     );
     assert_eq!(report.incomplete, vec![NOT_CAUGHT_UP]);
     assert!(report.changed_files_list_envelope.total.is_at_least());
+}
+
+#[cfg(windows)]
+#[test]
+fn bash_changed_files_windows_canonical_git_root_keeps_before_images() {
+    let root = repo();
+    for project in [
+        root.path().to_path_buf(),
+        root.path().canonicalize().unwrap(),
+    ] {
+        git(root.path(), &["checkout", "--", "clean.txt"]);
+        let (journal, capture) = capture(&project, BashChangedFiles::Diff);
+        assert!(
+            capture.git.is_some(),
+            "Git snapshot unavailable: root={project:?}"
+        );
+        std::fs::write(root.path().join("clean.txt"), "new\n").unwrap();
+        std::fs::create_dir_all(root.path().join("nested")).unwrap();
+        std::fs::write(root.path().join("nested/new.txt"), "added\n").unwrap();
+        event(
+            &journal,
+            &project,
+            "clean.txt",
+            notify::EventKind::Modify(ModifyKind::Any),
+        );
+        event(
+            &journal,
+            &project,
+            "nested/new.txt",
+            notify::EventKind::Create(CreateKind::File),
+        );
+        let report = capture.finish();
+        assert!(
+            report.files.iter().any(|file| file.path == "clean.txt"
+                && file
+                    .diff
+                    .as_ref()
+                    .is_some_and(|diff| diff.contains("-old\n+new"))),
+            "Windows before-image lost: {report:?}; git={:?}",
+            capture.git
+        );
+        assert!(
+            report.files.iter().any(|file| file.path == "nested/new.txt"
+                && file
+                    .diff
+                    .as_ref()
+                    .is_some_and(|diff| diff.contains("+++ b/nested/new.txt"))),
+            "Windows added path lost: {report:?}"
+        );
+        std::fs::remove_dir_all(root.path().join("nested")).unwrap();
+    }
 }

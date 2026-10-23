@@ -2,6 +2,7 @@
 use crate::config::BashChangedFiles;
 use crate::list_envelope::{ListEnvelope, Reason};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,30 @@ const OUTSIDE_GIT: &str =
 const GIT_UNAVAILABLE: &str = "No diffs: git before-images could not be captured within the time/output budget, so only paths are listed.";
 const OVERFLOW: &str = "Incomplete: the file watcher overflowed, so some changes may be missing.";
 pub(crate) const NOT_CAUGHT_UP: &str = "Incomplete: the file watcher had not caught up when the command ended, so some changes may be missing.";
+
+fn comparison_path(path: &Path) -> Cow<'_, Path> {
+    // Git and canonicalize can spell the same Windows path differently.
+    // Use one spelling for comparisons and Git, without rewriting file I/O paths.
+    #[cfg(windows)]
+    {
+        Cow::Owned(crate::windows_path::normalize_windows_path(path))
+    }
+    #[cfg(not(windows))]
+    {
+        Cow::Borrowed(path)
+    }
+}
+
+fn relative_path_text(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        path.to_string_lossy().replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
 
 #[derive(Default, Debug)]
 pub(crate) struct Journal {
@@ -291,6 +316,7 @@ impl Capture {
                 .front()
                 .is_some_and(|(sequence, _, _, _)| *sequence > self.sequence + 1);
         let mut paths = BTreeMap::new();
+        let comparison_root = comparison_path(&self.root);
         let mut list_deadline_cut = false;
         for (sequence, path, created, directory) in &state.events {
             if *sequence > self.sequence && *sequence <= end_sequence {
@@ -298,7 +324,8 @@ impl Capture {
                     list_deadline_cut = true;
                     break;
                 }
-                if let Ok(relative) = path.strip_prefix(&self.root) {
+                let path_key = comparison_path(path);
+                if let Ok(relative) = path_key.strip_prefix(&comparison_root) {
                     if !relative.as_os_str().is_empty()
                         && !relative.components().any(|c| {
                             matches!(
@@ -336,7 +363,7 @@ impl Capture {
             }
             let exists = absolute.symlink_metadata().is_ok();
             let file = ChangedFile {
-                path: path.to_string_lossy().into_owned(),
+                path: relative_path_text(&path),
                 status: if !exists {
                     "deleted"
                 } else if created {
@@ -457,24 +484,26 @@ impl Capture {
             return;
         }
         let absolute = self.root.join(path);
+        let absolute_key = comparison_path(&absolute);
         if path.to_str().is_none() {
             file.reason = Some("no diff: path is not valid UTF-8".into());
             return;
         }
-        if git.dirty.iter().any(|dirty| absolute.starts_with(dirty)) {
+        if git
+            .dirty
+            .iter()
+            .any(|dirty| absolute_key.starts_with(dirty))
+        {
             file.status = if exists { "modified" } else { "deleted" };
             file.reason = Some(DIRTY.into());
             return;
         }
-        let Ok(relative) = absolute.strip_prefix(&git.directory) else {
+        let Ok(relative) = absolute_key.strip_prefix(&git.directory) else {
             file.reason = Some("no diff: path is outside the git root".into());
             return;
         };
-        let spec = format!(
-            "{}:{}",
-            git.head,
-            relative.to_string_lossy().replace('\\', "/")
-        );
+        let git_path = relative_path_text(relative);
+        let spec = format!("{}:{}", git.head, git_path);
         let before = crate::revision_read::bounded_git_bytes(
             &git.directory,
             &["show", &spec],
@@ -491,13 +520,7 @@ impl Capture {
             }
             None if crate::revision_read::bounded_git_bytes(
                 &git.directory,
-                &[
-                    "ls-tree",
-                    "-z",
-                    &git.head,
-                    "--",
-                    &relative.to_string_lossy(),
-                ],
+                &["ls-tree", "-z", &git.head, "--", &git_path],
                 deadline,
                 4096,
             )
@@ -518,7 +541,9 @@ impl Capture {
             if Instant::now() >= deadline {
                 return;
             }
-            if !std::fs::canonicalize(&absolute).is_ok_and(|path| path.starts_with(&self.root)) {
+            if !std::fs::canonicalize(&absolute)
+                .is_ok_and(|path| comparison_path(&path).starts_with(comparison_path(&self.root)))
+            {
                 file.reason = Some("no diff: path resolves outside the project".into());
                 return;
             }
@@ -616,15 +641,17 @@ impl Capture {
 }
 impl GitStart {
     fn read(root: &Path) -> Option<Self> {
+        let root = comparison_path(root);
         let deadline = Instant::now() + Duration::from_millis(250);
         let run = |args: &[&str]| {
-            crate::revision_read::bounded_git_bytes(root, args, deadline, MAX_REPORT_BYTES)
+            crate::revision_read::bounded_git_bytes(&root, args, deadline, MAX_REPORT_BYTES)
         };
         let directory = PathBuf::from(
             String::from_utf8(run(&["rev-parse", "--show-toplevel"])?)
                 .ok()?
                 .trim_end(),
         );
+        let directory = comparison_path(&directory).into_owned();
         let head = String::from_utf8(run(&["rev-parse", "--verify", "HEAD"])?)
             .ok()?
             .trim()
