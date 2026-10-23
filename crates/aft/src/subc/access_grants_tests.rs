@@ -404,6 +404,7 @@ async fn first_read_path_response(
         parsed_body: Default::default(),
         confinement: None,
         launch_restore: None,
+        codemode_policies: None,
         frame,
         phase_trace: PhaseTrace::new(Instant::now()),
     };

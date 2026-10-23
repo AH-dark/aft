@@ -341,6 +341,7 @@ fn admission_frame_for(name: &str, arguments: Value) -> super::super::DecodedFra
         parsed_body: Default::default(),
         confinement: None,
         launch_restore: None,
+        codemode_policies: None,
         frame: Frame::build(
             FrameType::Request,
             control_flags(),

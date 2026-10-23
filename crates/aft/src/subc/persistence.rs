@@ -31,6 +31,75 @@ impl DatabaseWaits {
         self.tasks.is_empty()
     }
 
+    /// Compare codemode candidates only after their own saved policies have
+    /// been read. Share the confinement read budget so a locked database cannot
+    /// block the frame loop or create an unbounded number of blocking readers.
+    pub(super) fn read_codemode_policies(
+        &mut self,
+        mut decoded: DecodedFrame,
+        heads: Vec<RouteIdentity>,
+        executor: &Executor,
+    ) -> Result<(), DecodedFrame> {
+        let Some(candidates) = heads
+            .into_iter()
+            .map(|identity| {
+                executor
+                    .actor_context(&identity.root)
+                    .map(|ctx| (identity, ctx))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Err(decoded);
+        };
+        let deadline = wait_deadline(
+            &decoded,
+            decoded
+                .body()
+                .ok()
+                .and_then(|body| body.get("deadline_ms"))
+                .and_then(Value::as_u64),
+        );
+        if deadline <= Instant::now() || self.pending.len() >= MAX_WAITERS {
+            return Err(decoded);
+        }
+        let Ok(permit) = self.confinement_reads.clone().try_acquire_owned() else {
+            return Err(decoded);
+        };
+        let route = route_key(decoded.frame.header.channel, decoded.frame.header.epoch);
+        let key = (route, decoded.frame.header.corr);
+        let admission = AdmissionWait::from_decoded(&decoded, "tool.call");
+        decoded.confinement = None;
+        let handle = self.tasks.spawn(async move {
+            for (identity, ctx) in &candidates {
+                if remote_policy::awaits_policy_store(ctx, identity) {
+                    crate::database_open::dispatch(ctx);
+                    ctx.wait_for_database_open(deadline).await;
+                }
+            }
+            let read = if deadline <= Instant::now() {
+                Err(remote_policy::policy_unavailable())
+            } else {
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        codemode::SavedPolicies::read(candidates)
+                    }),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .ok_or_else(remote_policy::policy_unavailable)
+            };
+            decoded.codemode_policies = Some(read);
+            decoded
+        });
+        if let Some((old, _)) = self.pending.insert(key, (handle, admission)) {
+            old.abort();
+        }
+        Ok(())
+    }
+
     /// Restore a revived worker's launch authority before any tool preflight,
     /// without blocking the shared reader while saved paths are checked on disk.
     pub(super) fn restore_launch(
@@ -494,6 +563,7 @@ mod tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -536,6 +606,7 @@ mod tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1, Vec::new()).unwrap(),
             phase_trace: PhaseTrace::new(Instant::now()),
         };
@@ -568,6 +639,7 @@ mod tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -669,6 +741,7 @@ mod tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -728,6 +801,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codemode_saved_policies_wait_off_the_frame_loop() {
+        let (dir, root) = test_support::test_root("codemode-policy-held-lock");
+        let ctx = test_support::test_ctx();
+        ctx.set_db(Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        )));
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let (worker, head) = scoped_worker_and_head(&root);
+        let candidates = vec![worker, head];
+        let db = ctx.db().unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _conn = db.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut waits = DatabaseWaits::default();
+        let started = Instant::now();
+        assert!(waits
+            .read_codemode_policies(
+                policy_read_frame(1, crate::bash_background::persistence::unix_millis() + 5000),
+                candidates.clone(),
+                &executor,
+            )
+            .is_ok());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), waits.next())
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let resumed = tokio::time::timeout(Duration::from_secs(5), waits.next())
+            .await
+            .unwrap();
+        let Some(Ok(policies)) = resumed.codemode_policies else {
+            panic!("saved policies were not read");
+        };
+        for candidate in &candidates {
+            assert_eq!(
+                policies.get(&ctx, candidate),
+                Some(Ok(codemode::EffectiveSavedPolicy::default()))
+            );
+        }
+        assert!(waits.is_empty());
+    }
+
+    #[tokio::test]
     async fn confinement_read_runs_off_the_frame_loop_and_holds_admission_until_it_finishes() {
         let (dir, root) = test_support::test_root("confine-read-held-lock");
         let ctx = test_support::test_ctx();
@@ -757,6 +882,7 @@ mod tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -860,6 +986,7 @@ mod tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -928,6 +1055,7 @@ mod tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -1115,6 +1243,7 @@ mod tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),

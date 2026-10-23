@@ -592,6 +592,7 @@ impl Fixture {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame,
             phase_trace: PhaseTrace::new(Instant::now()),
         };
@@ -754,6 +755,7 @@ async fn consent_parked_ask_only_scope_goodbye_ended_withdraws_and_refuses_retry
         parsed_body: Default::default(),
         confinement: None,
         launch_restore: None,
+        codemode_policies: None,
     };
     let reply = |corr, status| {
         let live = status == subc_protocol::scope::ScopeStatus::Live;

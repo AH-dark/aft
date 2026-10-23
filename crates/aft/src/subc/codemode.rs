@@ -51,6 +51,8 @@ pub(super) enum Admission {
     /// A codemode tool call, to run with this identity built from the head
     /// agent's route.
     Owner(RouteIdentity),
+    /// Candidate policies need a bounded read off the frame loop.
+    AwaitPolicies(Vec<RouteIdentity>),
     /// A codemode tool call that must not run. The error is terminal.
     Refused(subc_protocol::ErrorBody),
 }
@@ -91,6 +93,7 @@ pub(super) fn admit(
     routes: &HashMap<RouteChannel, RouteIdentity>,
     route: RouteChannel,
     body: Option<&Value>,
+    saved_policy: impl FnMut(&RouteIdentity) -> Option<SavedPolicyRead>,
 ) -> Admission {
     let Some(run) = routes.get(&route) else {
         return Admission::Unchanged;
@@ -104,8 +107,8 @@ pub(super) fn admit(
     if let Err(error) = tool_provider::admit_call_mode(name, &run.call_mode) {
         return Admission::Refused(error);
     }
-    match resolve_owner(routes, route, run) {
-        Ok(effective) => Admission::Owner(effective),
+    match resolve_owner(routes, route, run, saved_policy) {
+        Ok(admission) => admission,
         Err(error) => {
             crate::slog_warn!(
                 "codemode call refused: tool={name} route={}/{} code={} detail={}",
@@ -135,7 +138,8 @@ fn resolve_owner(
     routes: &HashMap<RouteChannel, RouteIdentity>,
     route: RouteChannel,
     run: &RouteIdentity,
-) -> Result<RouteIdentity, subc_protocol::ErrorBody> {
+    mut saved_policy: impl FnMut(&RouteIdentity) -> Option<SavedPolicyRead>,
+) -> Result<Admission, subc_protocol::ErrorBody> {
     use subc_protocol::scope::{ParentState, ScopeKind};
     let Some(stamp) = run.scope.as_ref() else {
         return Err(not_bound(
@@ -245,35 +249,139 @@ fn resolve_owner(
             Some(run_id),
         ));
     };
+    let mut policies = Vec::new();
     for (other_channel, other) in &heads {
         let fields = head_access_differences(head, other);
         if !fields.is_empty() {
-            let channels = [head_channel.channel, other_channel.channel];
-            crate::slog_info!(
-                "codemode head route ambiguity: run_id={run_id} fields={} channels={},{}",
-                fields.join(","),
-                channels[0],
-                channels[1]
-            );
-            return Err(subc_protocol::ErrorBody::new(
-                RUN_OWNER_NOT_BOUND,
-                format!(
-                    "the head scope's routes {} and {} disagree on access settings: {}",
-                    channels[0],
-                    channels[1],
-                    fields.join(", ")
-                ),
-            )
-            .with_detail(json!({
-                "reason": "head_route_ambiguous",
-                "agent_id": agent_id,
-                "run_id": run_id,
-                "fields": fields,
-                "channels": channels,
-            })));
+            return Err(ambiguous_head(
+                agent_id,
+                run_id,
+                head_channel,
+                other_channel,
+                &fields,
+            ));
+        }
+        policies.push(saved_policy(other));
+    }
+    if heads.len() > 1 {
+        let Some(policies) = policies.into_iter().collect::<Option<Vec<_>>>() else {
+            return Ok(Admission::AwaitPolicies(
+                heads.iter().map(|(_, head)| (*head).clone()).collect(),
+            ));
+        };
+        let policies = policies.into_iter().collect::<Result<Vec<_>, _>>()?;
+        for ((other_channel, _), policy) in heads.iter().zip(&policies) {
+            if policy != &policies[0] {
+                return Err(ambiguous_head(
+                    agent_id,
+                    run_id,
+                    head_channel,
+                    other_channel,
+                    &["saved_policy"],
+                ));
+            }
         }
     }
-    Ok(effective_identity(run, head, agent_id, run_id, route))
+    Ok(Admission::Owner(effective_identity(
+        run, head, agent_id, run_id, route,
+    )))
+}
+
+fn ambiguous_head(
+    agent_id: &str,
+    run_id: &str,
+    head: &RouteChannel,
+    other: &RouteChannel,
+    fields: &[&str],
+) -> subc_protocol::ErrorBody {
+    let channels = [head.channel, other.channel];
+    crate::slog_info!(
+        "codemode head route ambiguity: run_id={run_id} fields={} channels={},{}",
+        fields.join(","),
+        channels[0],
+        channels[1]
+    );
+    subc_protocol::ErrorBody::new(
+        RUN_OWNER_NOT_BOUND,
+        format!(
+            "the head scope's routes {} and {} disagree on access settings: {}",
+            channels[0],
+            channels[1],
+            fields.join(", ")
+        ),
+    )
+    .with_detail(json!({
+        "reason": "head_route_ambiguous", "agent_id": agent_id, "run_id": run_id,
+        "fields": fields, "channels": channels,
+    }))
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct EffectiveSavedPolicy {
+    confined: bool,
+    params: Option<Value>,
+}
+
+pub(super) type SavedPolicyRead = Result<EffectiveSavedPolicy, subc_protocol::ErrorBody>;
+
+struct CandidatePolicy {
+    key: Option<crate::db::remote_exec::PolicyKey>,
+    ctx: Arc<AppContext>,
+    generation: u64,
+    read: SavedPolicyRead,
+}
+
+pub(super) struct SavedPolicies(Vec<CandidatePolicy>);
+
+impl SavedPolicies {
+    /// Read each principal's own policy; never copy a saved row to another principal.
+    pub(super) fn read(candidates: Vec<(RouteIdentity, Arc<AppContext>)>) -> Self {
+        Self(
+            candidates
+                .into_iter()
+                .map(|(identity, ctx)| {
+                    let key = remote_policy::key(&identity, Some("worker"));
+                    let generation = ctx.policy_confinement_generation();
+                    let read = (|| {
+                        let confined = remote_policy::confined(&ctx, &identity)?;
+                        let params = key
+                            .as_ref()
+                            .map(|key| remote_policy::saved_policy(&ctx, key))
+                            .transpose()?
+                            .flatten();
+                        Ok(EffectiveSavedPolicy {
+                            confined,
+                            params: params.map(|params| {
+                                serde_json::to_value(params).expect("saved policy serializes")
+                            }),
+                        })
+                    })();
+                    CandidatePolicy {
+                        key,
+                        ctx,
+                        generation,
+                        read,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    pub(super) fn get(
+        &self,
+        ctx: &Arc<AppContext>,
+        identity: &RouteIdentity,
+    ) -> Option<SavedPolicyRead> {
+        let key = remote_policy::key(identity, Some("worker"));
+        self.0
+            .iter()
+            .find(|policy| {
+                policy.key == key
+                    && Arc::ptr_eq(&policy.ctx, ctx)
+                    && policy.generation == ctx.policy_confinement_generation()
+            })
+            .map(|policy| policy.read.clone())
+    }
 }
 
 fn head_access_differences(head: &RouteIdentity, other: &RouteIdentity) -> Vec<&'static str> {
