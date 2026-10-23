@@ -687,6 +687,42 @@ mod write_amplification_tests {
         writer.execute_batch("ROLLBACK").unwrap();
     }
 
+    #[test]
+    fn obsolete_store_probe_preserves_current_missing_and_newer_formats() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let dir = temp.path().join("store");
+        let key = crate::search_index::artifact_cache_key(&root);
+        assert!(!published_store_is_obsolete(&dir, &key));
+        let (store, _) = CallGraphStore::cold_build_with_lease(dir.clone(), root, &[]).unwrap();
+        let path = store.sqlite_path().to_path_buf();
+        drop(store);
+        assert!(!published_store_is_obsolete(&dir, &key));
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE meta SET v = '1' WHERE k = 'schema_version'", [])
+            .unwrap();
+        assert!(published_store_is_obsolete(&dir, &key));
+        conn.execute(
+            "UPDATE meta SET v = ?1 WHERE k = 'schema_version'",
+            [SCHEMA_VERSION.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE meta SET v = 'previous-output' WHERE k = 'fingerprint'",
+            [],
+        )
+        .unwrap();
+        assert!(published_store_is_obsolete(&dir, &key));
+        conn.execute(
+            "UPDATE meta SET v = ?1 WHERE k = 'schema_version'",
+            [(SCHEMA_VERSION + 1).to_string()],
+        )
+        .unwrap();
+        assert!(!published_store_is_obsolete(&dir, &key));
+        assert!(path.exists());
+    }
+
     /// A store built before the latest resolver change carries the previous
     /// build-output version in its fingerprint. It must not be served (that
     /// would keep the old resolutions forever); a cold build replaces it and
@@ -12368,6 +12404,29 @@ fn published_schema_version(callgraph_dir: &Path, project_key: &str) -> Option<(
         .ok()??;
     let version = raw.trim().parse::<u64>().ok()?;
     Some((target, version))
+}
+
+/// A previously published store needs an upgrade, not a first on-demand build.
+/// Newer formats remain owned by their writer and must never be replaced here.
+pub(crate) fn published_store_is_obsolete(callgraph_dir: &Path, project_key: &str) -> bool {
+    if check_published_format(callgraph_dir, project_key).is_err() {
+        return false;
+    }
+    let Some((path, version)) = published_schema_version(callgraph_dir, project_key) else {
+        return false;
+    };
+    if version < u64::from(STORE_FORMAT_VERSION) {
+        return true;
+    }
+    let fingerprint = open_readonly_connection(&path).ok().and_then(|conn| {
+        conn.query_row("SELECT v FROM meta WHERE k = 'fingerprint'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .ok()
+        .flatten()
+    });
+    fingerprint.is_some_and(|fingerprint| fingerprint != schema_fingerprint())
 }
 
 /// Refuse, by name, a published generation whose schema version is above

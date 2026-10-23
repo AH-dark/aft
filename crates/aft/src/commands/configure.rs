@@ -7994,8 +7994,8 @@ fn run_configure_maintenance_unit_inner(
                 }
             } else if job.warm_callgraph_store {
                 // Non-git roots still build semantic and search indexes eagerly. Their
-                // callgraph is intentionally on-demand, so configure cannot trigger a
-                // corpus-scale cold build while the user is idle.
+                // first callgraph is intentionally on-demand; an obsolete published
+                // store instead uses the upgrade exception in the warm predicate.
                 slog_debug!("callgraph configure warm deferred for non-git root");
             }
             continuation.stage = ConfigureMaintenanceStage::SemanticRelease;
@@ -8756,6 +8756,16 @@ fn delay_configure_storage_sweeps_for_debug() {
 }
 
 fn callgraph_configure_warm_allowed(ctx: &AppContext) -> bool {
+    // An upgrade must replace a previously built graph even for a non-repository
+    // folder. Fresh folders still avoid an unsolicited corpus-scale build.
+    if let Some(root) = ctx.callgraph_project_root() {
+        if let Ok(key) = ctx.memoized_readonly_artifact_cache_key(&root, &ctx.storage_dir()) {
+            if crate::callgraph_store::published_store_is_obsolete(&ctx.callgraph_store_dir(), &key)
+            {
+                return true;
+            }
+        }
+    }
     // Without usable Git, keep callgraph cold builds on demand. An idle
     // configure must not start a corpus-scale build just because Git is missing.
     if !crate::developer_tools::git_usable() {
@@ -19776,6 +19786,84 @@ mod tests {
             assert!(
                 !index_build_started(&all_events, plane),
                 "disabled {plane} index must never start: {all_events:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_git_obsolete_store_rebuilds_at_configure_through_maintenance_limiter() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _watcher = EnvVarGuard::remove("AFT_TEST_DISABLE_FILE_WATCHER");
+        for obsolete_key in ["fingerprint", "schema_version"] {
+            let root = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let source = root.path().join("lib.rs");
+            fs::write(&source, "pub fn marker() {}\n").unwrap();
+            let ctx = test_context();
+            ctx.isolate_cold_build_limiter_for_test(1);
+            let request = configure_request_with_params(json!({
+                "project_root": root.path(), "harness": "opencode", "storage_dir": storage.path(),
+                "config": [user_tier(json!({
+                    "views": { "enabled": false },
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": true }
+                }))]
+            }));
+            assert!(handle_configure_for_test(&request, &ctx).success);
+            let canonical = ctx.callgraph_project_root().unwrap();
+            let (store, _) = crate::callgraph_store::CallGraphStore::cold_build_with_lease(
+                ctx.callgraph_store_dir(),
+                canonical.clone(),
+                &[canonical.join("lib.rs")],
+            )
+            .unwrap();
+            let database = store.sqlite_path().to_path_buf();
+            drop(store);
+            let conn = rusqlite::Connection::open(&database).unwrap();
+            conn.execute(
+                "UPDATE meta SET v = ?1 WHERE k = ?2",
+                rusqlite::params![
+                    if obsolete_key == "schema_version" {
+                        "1"
+                    } else {
+                        "old-output-fingerprint"
+                    },
+                    obsolete_key,
+                ],
+            )
+            .unwrap();
+            drop(conn);
+            let (reached, release) =
+                crate::context::install_callgraph_build_start_gate_for_test(canonical);
+            super::drain_deferred_configure_maintenance(&ctx);
+            let scheduled = ctx.callgraph_store_rx().lock().is_some();
+            // Always release the worker, including on an assertion failure.
+            release.send(()).ok();
+            assert!(
+                scheduled,
+                "obsolete {obsolete_key} must schedule a configure rebuild without navigation"
+            );
+            reached.recv_timeout(Duration::from_secs(5)).unwrap();
+            let admissions = ctx.cold_build_limiter().admission_events();
+            assert_eq!(admissions.len(), 1, "{admissions:?}");
+            assert_eq!(
+                admissions[0].class,
+                crate::cold_build_limiter::ColdBuildAdmissionClass::Maintenance
+            );
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while ctx.callgraph_store_rx().lock().is_some() {
+                crate::runtime_drain::drain_callgraph_store_events(&ctx);
+                assert!(
+                    Instant::now() < deadline,
+                    "configure rebuild did not settle"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(ctx.callgraph_store().read().unwrap().is_some());
+            assert!(
+                !database.exists(),
+                "obsolete generation must be collected after publication"
             );
         }
     }
