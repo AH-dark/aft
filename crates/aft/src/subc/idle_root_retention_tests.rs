@@ -28,8 +28,16 @@ fn run_in_child(test_name: &str) {
     assert!(stdout.contains("1 passed"), "child ran no test:\n{stdout}");
 }
 
+/// This process's thread count. A census that counts nothing would make every
+/// retention check below pass without measuring, so it fails the test
+/// instead: the measuring thread itself always exists.
 fn thread_total() -> u64 {
-    crate::lifecycle_census::thread_census().total
+    let total = crate::lifecycle_census::thread_census().total;
+    assert!(
+        total > 0,
+        "the thread census cannot count threads on this platform; the retention checks would be vacuous"
+    );
+    total
 }
 
 /// Thread names, for the measurement's printed record (Linux only).
@@ -483,11 +491,15 @@ fn evicted_worked_roots_keep_only_bookkeeping() {
         evicted_threads.saturating_sub(baseline_threads),
         thread_names()
     );
-    if let Some(per_root) = per_root {
-        assert!(
+    match per_root {
+        Some(per_root) => assert!(
             per_root < 256 * 1024,
             "an evicted root still holds {per_root} heap bytes"
-        );
+        ),
+        // Only glibc exposes the allocator statistics this check reads.
+        None => println!(
+            "retention: SKIPPED the per-root heap check: no allocator statistics on this platform"
+        ),
     }
 }
 
