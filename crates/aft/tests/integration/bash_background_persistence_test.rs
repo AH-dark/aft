@@ -354,10 +354,29 @@ fn missing_background_frame_panic_includes_bounded_non_destructive_forensics() {
         "unbounded forensics: {} bytes",
         message.len()
     );
+    // Unsolicited status pushes may interleave queued frames. The diagnostic
+    // probe must preserve every other frame in FIFO order.
+    let status_push = json!({"type": "status_changed", "session_id": null});
+    let later_frame = json!({"type": "unrelated", "session_id": SESSION, "task_id": "later"});
+    aft.queue_pending_frame_for_test(status_push.clone());
     aft.queue_pending_frame_for_test(frame.clone());
+    aft.queue_pending_frame_for_test(status_push);
+    aft.queue_pending_frame_for_test(later_frame.clone());
     let context = forensics.describe(&mut aft, &task_id);
     assert!(context.contains(&task_id));
-    assert_eq!(aft.try_read_next_timeout(Duration::ZERO), Some(frame));
+    for expected in [frame, later_frame] {
+        let next = loop {
+            let next = aft.try_read_next_timeout(Duration::ZERO);
+            if next
+                .as_ref()
+                .is_some_and(|frame| frame["type"] == "status_changed")
+            {
+                continue;
+            }
+            break next;
+        };
+        assert_eq!(next, Some(expected));
+    }
     assert_eq!(
         drain(&mut aft, SESSION)["bg_completions"]
             .as_array()
