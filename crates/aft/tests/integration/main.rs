@@ -31,6 +31,7 @@ mod bash_token_count_test;
 mod bash_watch_test;
 mod bind_trust_quota_test;
 mod blob_store_core_test;
+mod callgraph_restart_reuse_test;
 mod callgraph_rust_bin_targets_test;
 mod callgraph_stale_missing_refresh_test;
 mod callgraph_store_name_match_test;

@@ -41,7 +41,7 @@ use tree_sitter::Node;
 #[cfg(not(test))]
 use tree_sitter::Parser;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 /// Highest callgraph generation schema this build reads (and writes).
 pub const STORE_FORMAT_VERSION: u32 = SCHEMA_VERSION as u32;
 const BACKEND_TREESITTER: &str = "treesitter";
@@ -92,6 +92,9 @@ static CALLGRAPH_ROOT_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, String>>> =
 // knobs so a large non-git root cannot accidentally opt back into an OOM path.
 const COLD_BUILD_EXTRACT_BATCH_FILES: usize = 256;
 const COLD_BUILD_EXTRACT_BATCH_BYTES: u64 = 32 * 1024 * 1024;
+// Source bytes alone do not bound retained extracts or cancellation latency for
+// empty/tiny files. Keep a finite ceiling while allowing bulk-load commits.
+const COLD_BUILD_EXTRACT_MAX_FILES: usize = 4096;
 // A 20k-reference resolver window kept peak RSS working-set shaped in the
 // committed 20k/40k corpus harness; 100k rows did not.
 const COLD_BUILD_RESOLVE_WINDOW: usize = 20_000;
@@ -2510,6 +2513,14 @@ pub(crate) fn retire_obsolete_callgraph_refresh_waiters() {
         workers.push(worker);
     }
     for worker in workers {
+        // Configure can switch to a different root before this retirement runs.
+        // Retire by the old admission ticket, not only by the new root's path.
+        worker
+            .shared
+            .stores
+            .lock()
+            .unwrap()
+            .retain(|_, cached| cached.eligibility.is_current());
         // Enqueue holds lifecycle admission before locking the queue. Check
         // tickets outside the queue lock to preserve that lock order. Copy only
         // the eligibility inputs: a batch clone would carry its keepalive
@@ -2556,6 +2567,34 @@ pub(crate) fn retire_obsolete_callgraph_refresh_waiters() {
 struct RefreshWorkerShared {
     queue: Mutex<RefreshQueue>,
     wake: Condvar,
+    stores: Mutex<HashMap<RefreshRoot, CachedRefreshStore>>,
+    store_epoch: std::sync::atomic::AtomicU64,
+}
+
+struct CachedRefreshStore {
+    store: CallGraphStore,
+    eligibility: RefreshReplayEligibility,
+}
+
+/// Release idle refresh connections on configure-generation changes, root
+/// unbind, and idle artifact eviction. Active batches cannot recache afterward.
+pub(crate) fn close_refresh_connections(project_root: &Path) {
+    let worker = ISOLATED_REFRESH_TEST_WORKERS
+        .get()
+        .and_then(|workers| workers.lock().unwrap().get(project_root).cloned())
+        .or_else(|| {
+            CALLGRAPH_REFRESH_WORKER
+                .get()
+                .and_then(|worker| worker.lock().unwrap().clone())
+        });
+    if let Some(worker) = worker {
+        let mut stores = worker.shared.stores.lock().unwrap();
+        worker
+            .shared
+            .store_epoch
+            .fetch_add(1, AtomicOrdering::SeqCst);
+        stores.retain(|root, _| root.project_root != project_root);
+    }
 }
 
 struct RefreshWorker {
@@ -2641,6 +2680,8 @@ impl RefreshWorker {
         let shared = Arc::new(RefreshWorkerShared {
             queue: Mutex::new(RefreshQueue::default()),
             wake: Condvar::new(),
+            stores: Mutex::new(HashMap::new()),
+            store_epoch: std::sync::atomic::AtomicU64::new(0),
         });
         let thread_shared = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
@@ -3219,7 +3260,10 @@ fn callgraph_refresh_worker_loop(shared: &Arc<RefreshWorkerShared>) {
         };
 
         let batch = match work {
-            Work::Shutdown => return,
+            Work::Shutdown => {
+                shared.stores.lock().unwrap().clear();
+                return;
+            }
             Work::Readiness { root, fallback } => {
                 let mut queue = shared.queue.lock().unwrap();
                 let changed = queue.waiting.get_mut(&root).is_some_and(|waiting| {
@@ -3293,12 +3337,14 @@ fn callgraph_refresh_worker_loop(shared: &Arc<RefreshWorkerShared>) {
             released: false,
         };
         let mut open_failure = None;
+        let store_epoch = shared.store_epoch.load(AtomicOrdering::SeqCst);
         let store = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             process_callgraph_refresh_batch(
                 &batch,
                 &mut workspace_crate_prefixes,
                 &mut open_failure,
                 &mut refresh_wal_states,
+                &shared.stores,
             )
         }))
         .unwrap_or_else(|_| {
@@ -3389,22 +3435,57 @@ fn callgraph_refresh_worker_loop(shared: &Arc<RefreshWorkerShared>) {
             let queued = shared.queue.lock().unwrap().queued.contains_key(&root);
             store.finish_refresh_wal(queued);
         }
+        let batch_eligibility = batch.replay_eligibility();
         drop(batch);
 
-        let became_idle = active.release();
+        let became_idle = shared.queue.lock().unwrap().order.is_empty();
 
         if became_idle {
             let checkpoint_due =
                 idle_checkpoint_due(last_idle_checkpoints.get(&root).copied(), Instant::now());
             if checkpoint_due {
-                if let Some(store) = store {
+                if let Some(store) = &store {
                     #[cfg(test)]
-                    hold_idle_writer_for_test(shared, &root.project_root, &store);
+                    {
+                        if refresh_worker_test_seam(&root.project_root)
+                            .idle_writer_held
+                            .is_some()
+                        {
+                            active.release();
+                        }
+                        hold_idle_writer_for_test(shared, &root.project_root, store);
+                    }
                     if store.checkpoint_wal_truncate() {
                         last_idle_checkpoints.insert(root.clone(), Instant::now());
                     }
                 }
             }
+        }
+        if let Some(mut store) = store {
+            // An idle connection has no transaction or writer lease. Keep its
+            // page cache and WAL-index mapping, but let another writer proceed.
+            store.writer_lease = None;
+            let mut stores = shared.stores.lock().unwrap();
+            if shared.store_epoch.load(AtomicOrdering::SeqCst) == store_epoch
+                && batch_eligibility.is_current()
+                && store.is_current()
+            {
+                if stores.len() >= 8 {
+                    if let Some(root) = stores.keys().next().cloned() {
+                        stores.remove(&root);
+                    }
+                }
+                stores.insert(
+                    root,
+                    CachedRefreshStore {
+                        store,
+                        eligibility: batch_eligibility,
+                    },
+                );
+            }
+        }
+        if !active.released {
+            active.release();
         }
     }
 }
@@ -3418,6 +3499,7 @@ fn process_callgraph_refresh_batch(
     workspace_crate_prefixes: &mut HashMap<RefreshRoot, WorkspaceCratePrefixCache>,
     open_failure: &mut Option<RefreshOpenFailure>,
     refresh_wal_states: &mut HashMap<PathBuf, Arc<Mutex<refresh_wal::Policy>>>,
+    stores: &Mutex<HashMap<RefreshRoot, CachedRefreshStore>>,
 ) -> Option<CallGraphStore> {
     // A manifest event is an invalidation signal, not a source file to parse.
     // Drop the root's map even for a superseded batch: the filesystem changed,
@@ -3475,13 +3557,46 @@ fn process_callgraph_refresh_batch(
         project_key_for_store(&batch.root.callgraph_dir, &batch.root.project_root)
             .ok()
             .and_then(|key| read_pointer(&batch.root.callgraph_dir, &key));
+    let cached = stores
+        .lock()
+        .unwrap()
+        .remove(&batch.root)
+        .filter(|cached| cached.eligibility.is_current())
+        .map(|cached| cached.store);
     let opened = if test_seam.fail_open {
+        drop(cached);
         Ok(None)
     } else {
-        CallGraphStore::open_ready_for_refresh(
-            batch.root.callgraph_dir.clone(),
-            batch.root.project_root.clone(),
-        )
+        match cached {
+            Some(mut store) => {
+                match acquire_writer_lease(
+                    &batch.root.callgraph_dir,
+                    &store.project_key,
+                    &batch.root.project_root,
+                ) {
+                    Ok(Some(lease)) => {
+                        store.writer_lease = Some(lease);
+                        // Check after taking the lease: publication could have
+                        // advanced while this idle connection had no writer lock.
+                        if store.is_current() {
+                            Ok(Some(store))
+                        } else {
+                            drop(store);
+                            CallGraphStore::open_ready_for_refresh(
+                                batch.root.callgraph_dir.clone(),
+                                batch.root.project_root.clone(),
+                            )
+                        }
+                    }
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            }
+            None => CallGraphStore::open_ready_for_refresh(
+                batch.root.callgraph_dir.clone(),
+                batch.root.project_root.clone(),
+            ),
+        }
     };
     if let Some(gate) = take_refresh_worker_test_gate(&batch.root.project_root) {
         // The gate is deliberately after open_ready so tests can hold a failed
@@ -3516,8 +3631,8 @@ fn process_callgraph_refresh_batch(
             return None;
         }
     };
-    // Keep the last observation and busy retry across this worker's short-lived
-    // connections, but never carry them into a different published generation.
+    // Keep the last observation and busy retry even if the cached connection is
+    // evicted, but never carry them into a different published generation.
     refresh_wal_states.retain(|path, _| {
         path == &store.sqlite_path || path.parent() != store.sqlite_path.parent()
     });
@@ -6728,6 +6843,7 @@ impl CallGraphStore {
             clear_tables(&tx)?;
             tx.execute("DELETE FROM staging_ref_context", [])?;
             insert_meta(&tx)?;
+            store_workspace_roots(&tx, &[workspace_root.clone()])?;
             drop_cold_build_secondary_indexes(&tx)?;
             set_meta_ready(&tx, false)?;
             set_staged_build_phase(&tx, "extracting")?;
@@ -6757,7 +6873,7 @@ impl CallGraphStore {
                     &conn,
                     &self.project_root,
                     &after_path,
-                    batch_files,
+                    COLD_BUILD_EXTRACT_MAX_FILES,
                     COLD_BUILD_EXTRACT_BATCH_BYTES,
                 )?
                 else {
@@ -11080,7 +11196,9 @@ fn configure_build_connection(conn: &TrackedConnection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.set_wal_autocheckpoint(crate::db::lifecycle::DEFAULT_WAL_AUTOCHECKPOINT_PAGES)?;
-    conn.pragma_update(None, "cache_size", CALLGRAPH_SQLITE_CACHE_KIB)?;
+    // Only staged builds get this cache. The two production cold-build slots
+    // bound its aggregate page-cache budget to 512 MiB.
+    conn.pragma_update(None, "cache_size", -262_144)?;
     Ok(())
 }
 
@@ -11733,8 +11851,11 @@ fn load_staged_file_batch(
          ORDER BY path
          LIMIT ?2",
     )?;
-    let mut rows = statement.query(params![after_path, max_files.max(1) as i64])?;
-    let mut paths = Vec::with_capacity(max_files.max(1));
+    let mut rows = statement.query(params![
+        after_path,
+        max_files.max(1).min(i64::MAX as usize) as i64
+    ])?;
+    let mut paths = Vec::with_capacity(max_files.min(COLD_BUILD_EXTRACT_BATCH_FILES));
     let mut last_path = String::new();
     let mut batch_bytes = 0u64;
     while let Some(row) = rows.next()? {
@@ -11919,6 +12040,10 @@ const SECONDARY_INDEXES: &[(&str, &str)] = &[
         "idx_backend_file_state_file",
         "backend_file_state(file_path, backend)",
     ),
+    (
+        "idx_backend_file_state_nonfresh",
+        "backend_file_state(backend, workspace_root, file_path) WHERE status <> 'fresh'",
+    ),
 ];
 
 fn create_secondary_indexes_sql() -> String {
@@ -12027,6 +12152,7 @@ fn reconcile_workspace_roots(
             "DELETE FROM backend_file_state WHERE workspace_root <> ?1",
             params![&current_root],
         )?;
+        store_workspace_roots(&tx, &[current_root.clone()])?;
         tx.commit()?;
         Ok(())
     })?;
@@ -12058,14 +12184,30 @@ fn same_workspace_root(a: &Path, b: &Path) -> bool {
 }
 
 fn stored_workspace_roots(conn: &Connection) -> Result<Vec<String>> {
+    if let Some(roots) = staged_string(conn, "workspace_roots")? {
+        return serde_json::from_str(&roots).map_err(|error| {
+            CallGraphStoreError::Unavailable(format!("invalid workspace roots metadata: {error}"))
+        });
+    }
     let mut stmt = conn.prepare_cached(
         "SELECT DISTINCT workspace_root
          FROM backend_file_state
          ORDER BY workspace_root",
     )?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    let roots = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    store_workspace_roots(conn, &roots)?;
+    Ok(roots)
+}
+
+fn store_workspace_roots(conn: &Connection, roots: &[String]) -> Result<()> {
+    let roots = serde_json::to_string(roots)
+        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(k, v) VALUES('workspace_roots', ?1)",
+        [roots],
+    )?;
+    Ok(())
 }
 
 fn sample_absolute_data_path(conn: &Connection) -> Result<Option<String>> {
@@ -19654,7 +19796,7 @@ fn stale_backend_file_paths(
     let distinct = if distinct { "DISTINCT " } else { "" };
     let sql = format!(
         "SELECT {distinct}file_path FROM backend_file_state
-         WHERE backend = ?1 AND workspace_root = ?2 AND status = 'stale'
+         WHERE backend = ?1 AND workspace_root = ?2 AND status <> 'fresh' AND status = 'stale'
          ORDER BY file_path"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -19673,7 +19815,7 @@ fn backend_file_paths_with_status(
 ) -> Result<Vec<String>> {
     let mut stmt = conn.prepare_cached(
         "SELECT DISTINCT file_path FROM backend_file_state
-         WHERE backend = ?1 AND workspace_root = ?2 AND status = ?3
+         WHERE backend = ?1 AND workspace_root = ?2 AND status <> 'fresh' AND status = ?3
          ORDER BY file_path",
     )?;
     let rows = stmt.query_map(
@@ -24242,6 +24384,9 @@ mod refresh_worker_tests {
         drop(store);
 
         let conn = Connection::open(&sqlite_path).unwrap();
+        // Model a store written before workspace-root metadata was cached.
+        conn.execute("DELETE FROM meta WHERE k = 'workspace_roots'", [])
+            .unwrap();
         conn.execute(
             "UPDATE backend_file_state SET workspace_root = ?1",
             [worktree.display().to_string()],
@@ -26228,7 +26373,7 @@ export function leaf() {}
         let superseded_for_observer = Arc::clone(&superseded);
         set_cold_build_slice_observer(Some(Arc::new(move |stage, completed, _total| {
             if stage == "extraction"
-                && completed == 1
+                && completed == 3
                 && !superseded_for_observer.swap(true, AtomicOrdering::SeqCst)
             {
                 epoch_for_observer.next();
@@ -26257,7 +26402,7 @@ export function leaf() {}
         );
         assert_eq!(
             query_count(&staged, "SELECT COUNT(*) FROM files").unwrap(),
-            1
+            3
         );
         drop(staged);
 
@@ -26287,8 +26432,8 @@ export function leaf() {}
         assert_eq!(stats.files, 3);
         assert_eq!(
             *extracted.lock().unwrap(),
-            vec!["b.rs".to_string(), "c.rs".to_string()],
-            "the successor must not repeat the committed first slice"
+            Vec::<String>::new(),
+            "the successor must not repeat the committed byte batch"
         );
         drop(store);
         assert!(
@@ -26313,7 +26458,7 @@ export function leaf() {}
         let advanced_for_observer = Arc::clone(&advanced);
         set_cold_build_slice_observer(Some(Arc::new(move |stage, completed, _total| {
             if stage == "extraction"
-                && completed == 1
+                && completed == 2
                 && !advanced_for_observer.swap(true, AtomicOrdering::SeqCst)
             {
                 epoch_for_observer.next();
@@ -29150,6 +29295,7 @@ edition = "2021"
             &mut caches,
             &mut None,
             &mut HashMap::new(),
+            &Mutex::new(HashMap::new()),
         )
         .unwrap();
         assert!(caches[&refresh_root].1.get().is_some());
@@ -29160,6 +29306,7 @@ edition = "2021"
             &mut caches,
             &mut None,
             &mut HashMap::new(),
+            &Mutex::new(HashMap::new()),
         )
         .unwrap();
         assert_direct_caller(&refreshed, "util/run.go", "Run", "main.go", "main");
@@ -30837,6 +30984,32 @@ mod bounded_build_breaker_tests {
     }
 
     #[test]
+    fn callgraph_io_crash_mid_extraction_batch_rolls_back_and_resumes() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        let store = temp.path().join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        for index in 0..300 {
+            std::fs::write(
+                root.join(format!("file-{index}.ts")),
+                format!("export function specimen{index}() {{ return {index}; }}\n"),
+            )
+            .unwrap();
+        }
+        let signal = store.join("specimen-child.reached");
+        let mut child = spawn_build_child(&root, &store, Some("extraction_batch_before_commit"));
+        kill_barrier_child(&mut child, &signal);
+        assert_eq!(durable_staging_state(&staging_path(&root, &store)), (0, 0));
+        assert!(spawn_build_child(&root, &store, None)
+            .wait()
+            .unwrap()
+            .success());
+        let ready = CallGraphStore::open_readonly(store, root).unwrap().unwrap();
+        assert_eq!(ready.indexed_file_count().unwrap(), 300);
+    }
+
+    #[test]
     fn issue_250_respawn_loop_converges_or_trips_without_false_readiness() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("resumable-root");
@@ -30844,11 +31017,13 @@ mod bounded_build_breaker_tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&store).unwrap();
         for index in 0..3 {
-            std::fs::write(
-                root.join(format!("file-{index}.ts")),
-                format!("export function specimen{index}() {{ return {index}; }}\n"),
-            )
-            .unwrap();
+            // Each source exceeds half the byte budget, so successive process
+            // deaths still exercise adoption of one more committed batch.
+            let source = format!(
+                "export function specimen{index}() {{ return {index}; }}\n/*{}*/\n",
+                " ".repeat(COLD_BUILD_EXTRACT_BATCH_BYTES as usize / 2)
+            );
+            std::fs::write(root.join(format!("file-{index}.ts")), source).unwrap();
         }
         let stage = staging_path(&root, &store);
         let signal = store.join("specimen-child.reached");

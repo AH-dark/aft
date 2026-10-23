@@ -166,15 +166,9 @@ fn open_production_store_copy(
 
     if transition {
         // The archive deliberately has next-revision bytes. Re-root only the
-        // copied backend identity before open so root repair cannot cold-build
+        // copied workspace identity before open so root repair cannot cold-build
         // those bytes and silently consume the transition before timing it.
-        Connection::open(&copied_db)
-            .unwrap()
-            .execute(
-                "UPDATE backend_file_state SET workspace_root = ?1",
-                [project_root.to_string_lossy().as_ref()],
-            )
-            .unwrap();
+        reroot_copied_store(&copied_db, &project_root);
         let store =
             CallGraphStore::open(copied_store, project_root).expect("open copied base store");
         assert_eq!(
@@ -231,13 +225,8 @@ fn force_stale(db: &Path, project_root: &Path, changed_file: &Path) {
         .expect("benchmark file belongs to project root")
         .to_string_lossy()
         .replace('\\', "/");
+    reroot_copied_store(db, project_root);
     let conn = Connection::open(db).expect("open copied store for stale marker");
-    let workspace_root = project_root.display().to_string();
-    conn.execute(
-        "UPDATE backend_file_state SET workspace_root = ?1 WHERE workspace_root <> ?1",
-        params![workspace_root],
-    )
-    .expect("re-root copied backend state without touching the source store");
     let changed = conn
         .execute(
             "UPDATE files SET content_hash = ?1, mtime_ns = 0 WHERE path = ?2",
@@ -245,6 +234,26 @@ fn force_stale(db: &Path, project_root: &Path, changed_file: &Path) {
         )
         .expect("force copied row stale");
     assert_eq!(changed, 1, "benchmark file must already be indexed");
+}
+
+fn reroot_copied_store(db: &Path, project_root: &Path) {
+    let mut conn = Connection::open(db).expect("open copied store for workspace identity");
+    let tx = conn.transaction().unwrap();
+    let workspace_root = project_root.display().to_string();
+    tx.execute(
+        "UPDATE backend_file_state SET workspace_root = ?1 WHERE workspace_root <> ?1",
+        params![workspace_root],
+    )
+    .unwrap();
+    // The fixture deliberately transplants an old graph onto next-revision
+    // sources. Update both identities so open does not mistake the copy for a
+    // different live checkout and consume that transition with a cold rebuild.
+    tx.execute(
+        "INSERT OR REPLACE INTO meta(k, v) VALUES('workspace_roots', ?1)",
+        [serde_json::to_string(&[workspace_root]).unwrap()],
+    )
+    .unwrap();
+    tx.commit().unwrap();
 }
 
 fn build_synthetic_store(temp: &TempDir) -> (CallGraphStore, PathBuf) {
@@ -909,4 +918,52 @@ fn transition_copy_does_not_refresh_next_revision_during_open() {
     let stats = copied.refresh_files(&[file]).unwrap();
     assert_eq!(stats.refreshed_own_files, 1);
     assert_ne!(file_hash(copied.sqlite_path()), before_hash);
+}
+
+#[test]
+fn current_schema_copy_with_or_without_root_meta_does_not_cold_rebuild() {
+    let source = tempfile::tempdir().unwrap();
+    let root = source.path().join("project");
+    fs::create_dir(&root).unwrap();
+    let file = root.join("caller.ts");
+    fs::write(&file, "export function before() {}\n").unwrap();
+    let store = CallGraphStore::open(source.path().join("store"), root.clone()).unwrap();
+    store.cold_build(std::slice::from_ref(&file)).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let copied_store = temp.path().join("store-copy");
+    fs::create_dir(&copied_store).unwrap();
+    let key = aft::search_index::artifact_cache_key(&root);
+    let copied_db = copied_store.join(format!("{key}.sqlite"));
+    sqlite_backup(store.sqlite_path(), &copied_db);
+    drop(store);
+    fs::write(&file, "export function after() {}\n").unwrap();
+    for missing_meta in [false, true] {
+        {
+            let conn = Connection::open(&copied_db).unwrap();
+            assert_eq!(
+                conn.query_row("SELECT v FROM meta WHERE k='schema_version'", [], |row| row
+                    .get::<_, String>(0))
+                    .unwrap(),
+                aft::callgraph_store::STORE_FORMAT_VERSION.to_string()
+            );
+            if missing_meta {
+                conn.execute("DELETE FROM meta WHERE k='workspace_roots'", [])
+                    .unwrap();
+            }
+        }
+        let copied = CallGraphStore::open(copied_store.clone(), root.clone()).unwrap();
+        assert_eq!(
+            copied.sqlite_path(),
+            copied_db,
+            "a current-schema copy must open without a cold replacement"
+        );
+        let conn = Connection::open(copied.sqlite_path()).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT name FROM nodes WHERE kind='function'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "before"
+        );
+    }
 }

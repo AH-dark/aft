@@ -92,12 +92,15 @@ pub(super) fn measure<T>(
 }
 
 const GRAPH_TABLES: &[&str] = &[
+    "files",
     "nodes",
     "refs",
     "edges",
     "file_dependencies",
     "dispatch_hints",
     "type_ref_names",
+    "backend_file_state",
+    "resolution_config_fields",
 ];
 
 /// Every graph row, sorted, with the fixture root replaced so two copies of
@@ -107,8 +110,15 @@ fn dump_graph_rows(store: &CallGraphStore) -> String {
     let conn = store.conn.lock().expect("callgraph store mutex poisoned");
     let mut out = String::new();
     for table in GRAPH_TABLES {
+        // Filesystem/build timestamps vary between identical copies of a tree;
+        // graph evidence and freshness content identities must not vary.
+        let columns = match *table {
+            "files" => "path, content_hash, size, lang, is_dead_code_root, is_public_api, surface_fingerprint",
+            "backend_file_state" => "backend, workspace_root, file_path, content_hash, status",
+            _ => "*",
+        };
         let mut statement = conn
-            .prepare(&format!("SELECT * FROM {table}"))
+            .prepare(&format!("SELECT {columns} FROM {table}"))
             .expect("prepare dump");
         let columns = statement.column_count();
         let mut rows = statement
@@ -139,6 +149,400 @@ fn dump_graph_rows(store: &CallGraphStore) -> String {
         }
     }
     out
+}
+
+/// Save a deterministic corpus before an I/O change, then compare the logical
+/// rows and public graph walks against that saved baseline after the change.
+#[test]
+#[ignore = "measurement: AFT_CALLGRAPH_IO_PARITY names the baseline dump"]
+fn callgraph_io_fixture_equivalence() {
+    let dump = PathBuf::from(std::env::var("AFT_CALLGRAPH_IO_PARITY").expect("baseline dump"));
+    fs::create_dir_all(dump.parent().unwrap()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = write_scaling_fixture(&root, 512);
+    let (store, _) =
+        CallGraphStore::cold_build_with_lease_chunked(dir.path().join("store"), root, &files, 100)
+            .unwrap();
+    let rows = dump_graph_rows(&store);
+    let queries = dump_query_outputs(&store, usize::MAX);
+    for (name, value) in [("rows", rows), ("queries", queries)] {
+        let path = dump.with_extension(name);
+        if std::env::var_os("AFT_CALLGRAPH_IO_PARITY_RECORD").is_some() {
+            fs::write(&path, &value).unwrap();
+        } else {
+            assert_eq!(fs::read_to_string(&path).unwrap(), value, "{name} changed");
+        }
+        eprintln!(
+            "parity {name}: lines={} blake3={}",
+            value.lines().count(),
+            blake3::hash(value.as_bytes())
+        );
+    }
+}
+
+fn vm_steps(conn: &Connection, run: impl FnOnce()) -> usize {
+    struct Reset<'a>(&'a Connection);
+    impl Drop for Reset<'_> {
+        fn drop(&mut self) {
+            // Remove the callback before its stack-owned counter disappears,
+            // including when an assertion in the measured closure panics.
+            unsafe {
+                ffi::sqlite3_progress_handler(self.0.handle(), 0, None, std::ptr::null_mut());
+            }
+        }
+    }
+    unsafe extern "C" fn count(context: *mut c_void) -> c_int {
+        // SQLite invokes the callback synchronously while the counter is alive.
+        unsafe { &*(context.cast::<AtomicUsize>()) }.fetch_add(1, AtomicOrdering::Relaxed);
+        0
+    }
+    let steps = AtomicUsize::new(0);
+    unsafe {
+        ffi::sqlite3_progress_handler(
+            conn.handle(),
+            1,
+            Some(count),
+            (&steps as *const AtomicUsize).cast_mut().cast(),
+        );
+    }
+    let reset = Reset(conn);
+    run();
+    drop(reset);
+    steps.load(AtomicOrdering::Relaxed)
+}
+
+#[test]
+fn callgraph_io_status_scans_visit_only_nonfresh_rows() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<60000)
+        INSERT INTO backend_file_state(backend,workspace_root,file_path,content_hash,status,updated_at)
+        SELECT 'treesitter','/project',printf('file%d.ts',x),'hash','fresh',0 FROM n;").unwrap();
+    conn.execute_batch(
+        "INSERT INTO backend_file_state VALUES
+        ('treesitter','/project','stale.ts','hash','stale',0),
+        ('treesitter','/project','binary.ts','hash','undecodable',0)",
+    )
+    .unwrap();
+    let root = Path::new("/project");
+    let steps = vm_steps(&conn, || {
+        assert_eq!(
+            stale_backend_file_paths(&conn, root, true).unwrap(),
+            vec!["stale.ts"]
+        );
+        assert_eq!(
+            backend_file_paths_with_status(&conn, root, BACKEND_STATUS_UNDECODABLE).unwrap(),
+            vec!["binary.ts"]
+        );
+    });
+    assert!(
+        steps < 200,
+        "status scans executed {steps} VM steps for fresh rows"
+    );
+}
+
+#[test]
+fn callgraph_io_root_lookup_uses_meta() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = write_scaling_fixture(&root, 8);
+    let store = CallGraphStore::open(dir.path().join("store"), root.clone()).unwrap();
+    store.cold_build(&files).unwrap();
+    let conn = store.conn.lock().unwrap();
+    let steps = vm_steps(&conn, || {
+        assert_eq!(
+            stored_workspace_roots(&conn).unwrap(),
+            vec![root.display().to_string()]
+        );
+    });
+    assert!(
+        steps < 30,
+        "root lookup executed {steps} VM steps instead of reading meta"
+    );
+}
+
+#[test]
+fn callgraph_io_legacy_root_scan_is_cached_once_and_repair_updates_meta() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let old_root = dir.path().join("moved-away").display().to_string();
+    let mut conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO backend_file_state VALUES('treesitter',?1,'file.ts','hash','fresh',0)",
+        [&old_root],
+    )
+    .unwrap();
+    assert_eq!(stored_workspace_roots(&conn).unwrap(), vec![old_root]);
+    assert!(
+        vm_steps(&conn, || {
+            stored_workspace_roots(&conn).unwrap();
+        }) < 30
+    );
+    assert!(matches!(
+        reconcile_workspace_roots(&mut conn, &root, true).unwrap(),
+        OpenRootRepair::ReRooted
+    ));
+    assert_eq!(
+        stored_workspace_roots(&conn).unwrap(),
+        vec![root.display().to_string()]
+    );
+}
+
+#[test]
+fn callgraph_io_extraction_commits_by_bytes_not_chunk_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = write_scaling_fixture(&root, 300);
+    let store = CallGraphStore::open(dir.path().join("store"), root).unwrap();
+    let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&batches);
+    set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+        observed.lock().unwrap().push(paths.len())
+    })));
+    let result = store.cold_build_chunked(&files, 100);
+    set_cold_build_extract_observer(None);
+    result.unwrap();
+    assert_eq!(*batches.lock().unwrap(), vec![300]);
+}
+
+fn tiny_file_fixture(root: &Path) -> Vec<PathBuf> {
+    (0..COLD_BUILD_EXTRACT_MAX_FILES + 17)
+        .map(|index| {
+            write(
+                root,
+                &format!("tiny{index:05}.ts"),
+                if index % 2 == 0 { "" } else { "// tiny\n" },
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn callgraph_io_tiny_file_batches_have_finite_file_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = tiny_file_fixture(&root);
+    let source_bytes: u64 = files
+        .iter()
+        .map(|path| fs::metadata(path).unwrap().len())
+        .sum();
+    assert!(source_bytes < COLD_BUILD_EXTRACT_BATCH_BYTES);
+    let store = CallGraphStore::open(dir.path().join("store"), root).unwrap();
+    let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&batches);
+    set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+        observed.lock().unwrap().push(paths.len());
+    })));
+    let result = store.cold_build_chunked(&files, 100);
+    set_cold_build_extract_observer(None);
+    result.unwrap();
+    assert_eq!(
+        *batches.lock().unwrap(),
+        vec![COLD_BUILD_EXTRACT_MAX_FILES, 17]
+    );
+    assert_eq!(store.indexed_file_count().unwrap(), files.len());
+}
+
+#[test]
+fn callgraph_io_tiny_file_cancellation_stops_after_one_capped_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = tiny_file_fixture(&root);
+    let store = CallGraphStore::open(dir.path().join("store"), root).unwrap();
+    let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+    let expected = epoch.current();
+    let cancel_epoch = epoch.clone();
+    let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&batches);
+    set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+        observed.lock().unwrap().push(paths.len());
+        // Supersede the build after batch admission. It may finish this batch,
+        // but must stop before retaining extracts for the next one.
+        cancel_epoch.next();
+    })));
+    let result = with_publish_epoch(epoch, expected, || store.cold_build_chunked(&files, 100));
+    set_cold_build_extract_observer(None);
+    assert!(matches!(result, Err(CallGraphStoreError::Superseded)));
+    assert_eq!(*batches.lock().unwrap(), vec![COLD_BUILD_EXTRACT_MAX_FILES]);
+    let conn = store.conn.lock().unwrap();
+    assert_eq!(
+        query_count(&conn, "SELECT COUNT(*) FROM files").unwrap(),
+        COLD_BUILD_EXTRACT_MAX_FILES as u64
+    );
+    assert_eq!(
+        staged_build_phase(&conn).unwrap().as_deref(),
+        Some("extracting")
+    );
+}
+
+#[test]
+fn callgraph_io_large_cache_is_build_only() {
+    let conn = TrackedConnection::open_in_memory(SqliteStore::CallgraphColdGeneration).unwrap();
+    configure_build_connection(&conn).unwrap();
+    let cache: i64 = conn
+        .pragma_query_value(None, "cache_size", |row| row.get(0))
+        .unwrap();
+    assert_eq!(cache, -262144);
+    configure_connection(&conn).unwrap();
+    let cache: i64 = conn
+        .pragma_query_value(None, "cache_size", |row| row.get(0))
+        .unwrap();
+    assert_eq!(cache, CALLGRAPH_SQLITE_CACHE_KIB);
+}
+
+#[test]
+fn callgraph_io_refresh_reuses_connection_and_releases_it_on_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = write_scaling_fixture(&root, 3);
+    let store_dir = dir.path().join("store");
+    let (store, _) =
+        CallGraphStore::cold_build_with_lease(store_dir.clone(), root.clone(), &files).unwrap();
+    let path = store.sqlite_path().to_path_buf();
+    drop(store);
+    let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+    let pending = PendingCallGraphStorePaths::default();
+    let key = RefreshRoot {
+        callgraph_dir: store_dir.clone(),
+        project_root: root.clone(),
+    };
+    for attempt in 0..2 {
+        fs::write(
+            &files[0],
+            format!("export function edited{attempt}() {{}}\n"),
+        )
+        .unwrap();
+        assert!(enqueue_callgraph_store_refresh(
+            store_dir.clone(),
+            root.clone(),
+            vec![files[0].clone()],
+            pending.clone()
+        ));
+        assert!(worker
+            .worker
+            .wait_for_root_with_budget(&root, Duration::from_secs(15)));
+        let stores = worker.worker.shared.stores.lock().unwrap();
+        let store = &stores
+            .get(&key)
+            .expect("idle refresh connection retained")
+            .store;
+        assert!(
+            store.writer_lease.is_none(),
+            "idle connection must not retain the writer lease"
+        );
+        let conn = store.conn.lock().unwrap();
+        if attempt == 0 {
+            conn.execute_batch(
+                "CREATE TEMP TABLE reuse_sentinel(value); INSERT INTO reuse_sentinel VALUES(746)",
+            )
+            .unwrap();
+        } else {
+            assert_eq!(
+                conn.query_row("SELECT value FROM reuse_sentinel", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                746
+            );
+        }
+    }
+    close_refresh_connections(&root);
+    assert_eq!(
+        crate::db::file_identity::open_connections(&path),
+        0,
+        "eviction must close the connection and WAL mapping"
+    );
+    assert!(enqueue_callgraph_store_refresh(
+        store_dir.clone(),
+        root.clone(),
+        vec![files[0].clone()],
+        pending
+    ));
+    assert!(worker
+        .worker
+        .wait_for_root_with_budget(&root, Duration::from_secs(15)));
+    let (next, _) = CallGraphStore::force_cold_build_with_lease_chunked(
+        store_dir.clone(),
+        root.clone(),
+        &files,
+        100,
+    )
+    .unwrap();
+    let next_path = next.sqlite_path().to_path_buf();
+    assert_ne!(path, next_path);
+    drop(next);
+    assert!(enqueue_callgraph_store_refresh(
+        store_dir,
+        root.clone(),
+        vec![files[0].clone()],
+        PendingCallGraphStorePaths::default()
+    ));
+    assert!(worker
+        .worker
+        .wait_for_root_with_budget(&root, Duration::from_secs(15)));
+    assert_eq!(
+        crate::db::file_identity::open_connections(&path),
+        0,
+        "superseded generation must be closed before reusing a writer"
+    );
+    assert_eq!(
+        worker.worker.shared.stores.lock().unwrap()[&key]
+            .store
+            .sqlite_path(),
+        next_path
+    );
+    drop(worker);
+    assert_eq!(
+        crate::db::file_identity::open_connections(&next_path),
+        0,
+        "worker shutdown must close cached connections"
+    );
+}
+
+#[test]
+fn callgraph_io_rebind_retires_the_previous_roots_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "previous-root");
+    let files = write_scaling_fixture(&root, 3);
+    let store_dir = dir.path().join("store");
+    let (store, _) =
+        CallGraphStore::cold_build_with_lease(store_dir.clone(), root.clone(), &files).unwrap();
+    let path = store.sqlite_path().to_path_buf();
+    drop(store);
+    let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+    let generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+    for publication in [false, true] {
+        let lifecycle = SubcLifecycleAdmission::default();
+        let ticket = CallgraphRefreshTicket::new(
+            lifecycle.clone(),
+            Arc::clone(&generation),
+            generation.load(AtomicOrdering::SeqCst),
+            epoch.clone(),
+            epoch.current(),
+        );
+        assert!(enqueue_callgraph_store_refresh_fenced(
+            store_dir.clone(),
+            root.clone(),
+            vec![files[0].clone()],
+            PendingCallGraphStorePaths::default(),
+            ticket
+        ));
+        assert!(worker
+            .worker
+            .wait_for_root_with_budget(&root, Duration::from_secs(15)));
+        assert_eq!(crate::db::file_identity::open_connections(&path), 1);
+        if publication {
+            epoch.next();
+        } else {
+            generation.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        // No path from the replacement configure is needed to retire the old
+        // root's connection, even when configure switches canonical roots.
+        retire_obsolete_callgraph_refresh_waiters();
+        assert_eq!(crate::db::file_identity::open_connections(&path), 0);
+    }
 }
 
 /// `callers`, `call_tree` and `trace_to` output for an evenly spaced sample
@@ -1432,4 +1836,366 @@ fn graph_walks_do_not_resolve_stored_paths_against_the_filesystem_per_node() {
         tree_realpaths <= 2 && trace_realpaths <= 2,
         "a {length}-node walk resolved paths per node: call_tree={tree_realpaths} trace_to={trace_realpaths}"
     );
+}
+
+/// Linux `/proc/self/io` counters. `rchar` counts every byte SQLite asked the
+/// OS for through `pread`, whether or not the page cache served it, so it
+/// shows the read volume a store with a cold OS cache turns into disk reads
+/// (`read_bytes`). The engine's own `legacy_callgraph_refresh` event reports
+/// `read_bytes`, `write_bytes` and `wchar` from the same file.
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcIo {
+    rchar: u64,
+    wchar: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+impl ProcIo {
+    fn sample() -> Self {
+        let text = fs::read_to_string("/proc/self/io").unwrap_or_default();
+        let mut io = Self::default();
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.trim().parse().unwrap_or(0);
+            match key.trim() {
+                "rchar" => io.rchar = value,
+                "wchar" => io.wchar = value,
+                "read_bytes" => io.read_bytes = value,
+                "write_bytes" => io.write_bytes = value,
+                _ => {}
+            }
+        }
+        io
+    }
+
+    fn since(self, before: Self) -> Self {
+        Self {
+            rchar: self.rchar.saturating_sub(before.rchar),
+            wchar: self.wchar.saturating_sub(before.wchar),
+            read_bytes: self.read_bytes.saturating_sub(before.read_bytes),
+            write_bytes: self.write_bytes.saturating_sub(before.write_bytes),
+        }
+    }
+}
+
+impl std::fmt::Display for ProcIo {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "rchar={} wchar={} read_bytes={} write_bytes={}",
+            self.rchar, self.wchar, self.read_bytes, self.write_bytes
+        )
+    }
+}
+
+/// Per-statement totals collected by [`record_statement_profile`].
+#[derive(Clone, Copy, Debug, Default)]
+struct StatementProfile {
+    runs: u64,
+    fullscan_steps: u64,
+    vm_steps: u64,
+    nanos: u64,
+}
+
+static STATEMENT_PROFILES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, StatementProfile>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// SQLite calls this when a statement finishes. The full-scan step counter
+/// counts forward steps a statement took through a full table scan rather
+/// than an index lookup, so a large value marks the "whole-table work" the
+/// measurement looks for.
+unsafe extern "C" fn record_statement_profile(
+    mask: std::os::raw::c_uint,
+    _context: *mut c_void,
+    statement: *mut c_void,
+    elapsed: *mut c_void,
+) -> c_int {
+    if mask != ffi::SQLITE_TRACE_PROFILE as std::os::raw::c_uint {
+        return 0;
+    }
+    let statement = statement.cast::<ffi::sqlite3_stmt>();
+    // SAFETY: for SQLITE_TRACE_PROFILE SQLite passes the finished statement
+    // and a pointer to its elapsed nanoseconds; both are valid for the call.
+    let (fullscan_steps, vm_steps, nanos, sql) = unsafe {
+        let fullscan = ffi::sqlite3_stmt_status(statement, ffi::SQLITE_STMTSTATUS_FULLSCAN_STEP, 1);
+        let vm = ffi::sqlite3_stmt_status(statement, ffi::SQLITE_STMTSTATUS_VM_STEP, 1);
+        let nanos = *(elapsed as *const i64);
+        let text = ffi::sqlite3_sql(statement);
+        let sql = if text.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(text)
+                .to_string_lossy()
+                .into_owned()
+        };
+        (fullscan, vm, nanos, sql)
+    };
+    let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sql = sql.chars().take(220).collect::<String>();
+    let mut profiles = STATEMENT_PROFILES.lock().unwrap();
+    let entry = profiles.entry(sql).or_default();
+    entry.runs += 1;
+    entry.fullscan_steps += fullscan_steps.max(0) as u64;
+    entry.vm_steps += vm_steps.max(0) as u64;
+    entry.nanos += nanos.max(0) as u64;
+    0
+}
+
+fn trace_statements(conn: &TrackedConnection) {
+    STATEMENT_PROFILES.lock().unwrap().clear();
+    // SAFETY: the handle belongs to a live connection; the callback keeps no
+    // pointer past its own call.
+    let rc = unsafe {
+        ffi::sqlite3_trace_v2(
+            conn.handle(),
+            ffi::SQLITE_TRACE_PROFILE as std::os::raw::c_uint,
+            Some(record_statement_profile),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, ffi::SQLITE_OK, "install SQLite profile trace");
+}
+
+/// Print profile totals and up to 12 statements, ordered by full-scan steps
+/// and then by VM steps.
+fn report_statement_profiles(label: &str) {
+    let profiles = std::mem::take(&mut *STATEMENT_PROFILES.lock().unwrap());
+    let mut rows = profiles.into_iter().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        (right.1.fullscan_steps, right.1.vm_steps).cmp(&(left.1.fullscan_steps, left.1.vm_steps))
+    });
+    let total_fullscan: u64 = rows.iter().map(|(_, profile)| profile.fullscan_steps).sum();
+    let total_vm: u64 = rows.iter().map(|(_, profile)| profile.vm_steps).sum();
+    eprintln!(
+        "{label}: statements={} fullscan_steps={total_fullscan} vm_steps={total_vm}",
+        rows.len()
+    );
+    for (sql, profile) in rows.iter().take(12) {
+        eprintln!(
+            "{label}:   fullscan_steps={} vm_steps={} runs={} ms={} sql={sql}",
+            profile.fullscan_steps,
+            profile.vm_steps,
+            profile.runs,
+            profile.nanos / 1_000_000
+        );
+    }
+}
+
+/// Root-relative path of module `index` in [`write_scaling_fixture`].
+fn scaling_fixture_path(index: usize) -> String {
+    format!("src/m{:04}/f{:03}.ts", index / 100, index % 100)
+}
+
+/// `files` TypeScript modules, 100 per directory. Each imports two functions
+/// and a class from other modules, declares a class with two methods, and
+/// makes direct, imported and method calls, so every graph table (nodes,
+/// refs, edges, dependencies, dispatch hints) grows with the file count.
+fn write_scaling_fixture(root: &Path, files: usize) -> Vec<PathBuf> {
+    (0..files)
+        .map(|index| {
+            let other = (index * 7 + 3) % files;
+            let next = (index + 1) % files;
+            // Method names repeat every 997 modules, so a method call has a
+            // few same-named candidates (as in real code) rather than one per
+            // module, which would make dispatch quadratic in the file count.
+            let method = index % 997;
+            let next_method = next % 997;
+            let source = format!(
+                "import {{ f{other}a, f{other}b }} from '../m{:04}/f{:03}';\n\
+                 import {{ Widget{next} }} from '../m{:04}/f{:03}';\n\
+                 export class Widget{index} {{\n\
+                 \x20 render{method}(): number {{ return this.paint{method}() + helper{index}(); }}\n\
+                 \x20 paint{method}(): number {{ return {index}; }}\n\
+                 }}\n\
+                 export function f{index}a(x: number): number {{ return f{other}a(x) + f{index}b(x); }}\n\
+                 export function f{index}b(x: number): number {{ const w = new Widget{next}(); return w.render{next_method}() + x; }}\n\
+                 function helper{index}(): number {{ return f{other}b({index}); }}\n",
+                other / 100,
+                other % 100,
+                next / 100,
+                next % 100,
+            );
+            write(root, &scaling_fixture_path(index), &source)
+        })
+        .collect()
+}
+
+fn sqlite_file_bytes(path: &Path) -> (u64, u64) {
+    let database = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let wal = fs::metadata(sqlite_file_set_path(path, "-wal"))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    (database, wal)
+}
+
+/// Cold build and one-file refreshes of generated stores of growing size,
+/// through the same entry points the engine uses: a leased, staged cold
+/// build that publishes a generation, then three one-file edits sharing a
+/// refresh connection, as the refresh worker does between lifecycle changes.
+///
+/// Prints `/proc/self/io` deltas for each step and, for the refresh body,
+/// statement profile totals and the 12 statements with the most full-scan
+/// steps, then VM steps. Linux only: elsewhere the counters
+/// read as zero. Sizes come from `AFT_CALLGRAPH_SCALING_FILES`
+/// (comma-separated, default `5000,20000,60000`). Run it alone
+/// (`--ignored --test-threads=1`): the counters are process-wide.
+#[test]
+#[ignore = "measurement: prints cold-build and refresh I/O by store size"]
+fn measure_cold_build_and_one_file_refresh_io_by_store_size() {
+    let sizes = std::env::var("AFT_CALLGRAPH_SCALING_FILES")
+        .unwrap_or_else(|_| "5000,20000,60000".to_string())
+        .split(',')
+        .map(|size| size.trim().parse::<usize>().expect("file count"))
+        .collect::<Vec<_>>();
+    for files_count in sizes {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = fixture_root(&dir, "project");
+        let files = write_scaling_fixture(&root, files_count);
+        let source_bytes: u64 = files
+            .iter()
+            .map(|path| fs::metadata(path).unwrap().len())
+            .sum();
+        let artifact_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &artifact_key, false);
+        let callgraph_dir = dir.path().join("callgraph").join(artifact_key);
+
+        callgraph::clear_workspace_package_cache();
+        // Sample the counters as each named build phase starts, so the cold
+        // build's I/O can be split by phase. The "publication" span also
+        // covers the WAL checkpoint, journal switch and rename that follow it.
+        let marks = Arc::new(std::sync::Mutex::new(Vec::<(&'static str, ProcIo)>::new()));
+        let observer_marks = Arc::clone(&marks);
+        set_cold_build_phase_observer(Some(Arc::new(move |phase: &'static str| {
+            if matches!(
+                phase,
+                "extraction" | "symbol_export_index" | "resolution" | "publication"
+            ) {
+                observer_marks
+                    .lock()
+                    .unwrap()
+                    .push((phase, ProcIo::sample()));
+            }
+        })));
+        let before = ProcIo::sample();
+        let started = Instant::now();
+        let (store, stats) = CallGraphStore::cold_build_with_lease_chunked(
+            callgraph_dir.clone(),
+            root.clone(),
+            &files,
+            100,
+        )
+        .expect("cold build");
+        let after = ProcIo::sample();
+        set_cold_build_phase_observer(None);
+        let cold = after.since(before);
+        let marks = std::mem::take(&mut *marks.lock().unwrap());
+        let mut previous = ("staging setup and inventory", before);
+        for (phase, sample) in marks.into_iter().chain([("end", after)]) {
+            eprintln!(
+                "scaling files={files_count} cold_build phase={} {}",
+                previous.0,
+                sample.since(previous.1)
+            );
+            previous = (phase, sample);
+        }
+        let cold_ms = started.elapsed().as_millis();
+        let (database_bytes, wal_bytes) = sqlite_file_bytes(store.sqlite_path());
+        let rows = {
+            let conn = store.conn.lock().unwrap();
+            [
+                "files",
+                "nodes",
+                "refs",
+                "edges",
+                "dispatch_hints",
+                "backend_file_state",
+            ]
+            .iter()
+            .map(|table| {
+                let count: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                format!("{table}={count}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+        };
+        eprintln!(
+            "scaling files={files_count} source_bytes={source_bytes} cold_ms={cold_ms} \
+             edges={} database_bytes={database_bytes} wal_bytes={wal_bytes} {rows}",
+            stats.edges
+        );
+        eprintln!(
+            "scaling files={files_count} cold_build {cold} wchar_per_file={} \
+             wchar_per_database_byte={:.1}",
+            cold.wchar / files_count as u64,
+            cold.wchar as f64 / database_bytes.max(1) as f64
+        );
+        drop(store);
+
+        let mut cached_refresh = None;
+        for (attempt, index) in [0usize, files_count / 2, files_count - 1]
+            .into_iter()
+            .enumerate()
+        {
+            let path = root.join(scaling_fixture_path(index));
+            let mut text = fs::read_to_string(&path).unwrap();
+            text.push_str(&format!(
+                "export function added{attempt}(x: number): number {{ return f{index}a(x); }}\n"
+            ));
+            fs::write(&path, text).unwrap();
+
+            let before_open = ProcIo::sample();
+            let store = cached_refresh.take().unwrap_or_else(|| {
+                CallGraphStore::open_ready_for_refresh(callgraph_dir.clone(), root.clone())
+                    .expect("open for refresh")
+                    .expect("ready store")
+            });
+            let open = ProcIo::sample().since(before_open);
+            trace_statements(&store.conn.lock().unwrap());
+            let before_refresh = ProcIo::sample();
+            let started = Instant::now();
+            let (refresh_stats, profile) = store
+                .refresh_files_profiled(std::slice::from_ref(&path))
+                .expect("refresh");
+            let refresh = ProcIo::sample().since(before_refresh);
+            let refresh_ms = started.elapsed().as_millis();
+            let (database_bytes, wal_bytes) = sqlite_file_bytes(store.sqlite_path());
+            eprintln!(
+                "scaling files={files_count} refresh#{attempt} open {open}; refresh {refresh} \
+                 ms={refresh_ms} refreshed_own_files={} database_bytes={database_bytes} \
+                 wal_bytes={wal_bytes}",
+                refresh_stats.refreshed_own_files
+            );
+            eprintln!(
+                "scaling files={files_count} refresh#{attempt} phases: {}",
+                profile.report()
+            );
+            report_statement_profiles(&format!("scaling files={files_count} refresh#{attempt}"));
+            // The open-time root check runs before the trace can be
+            // installed, so run that one statement again under the trace.
+            {
+                let conn = store.conn.lock().unwrap();
+                trace_statements(&conn);
+                let before_roots = ProcIo::sample();
+                let roots = stored_workspace_roots(&conn).unwrap();
+                eprintln!(
+                    "scaling files={files_count} refresh#{attempt} open-time root check \
+                     roots={} {}",
+                    roots.len(),
+                    ProcIo::sample().since(before_roots)
+                );
+            }
+            report_statement_profiles(&format!(
+                "scaling files={files_count} refresh#{attempt} open-time"
+            ));
+            cached_refresh = Some(store);
+        }
+    }
 }
