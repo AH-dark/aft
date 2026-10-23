@@ -4530,7 +4530,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         clear_failed_spawns,
         warm_callgraph_store: next_config.indexes.callgraph
             && !root_too_broad
-            && !equivalent_warm_config
+            && (!equivalent_warm_config || ctx.configure_callgraph_upgrade_pending())
             && (!equivalent_callgraph_build || !callgraph_build_in_progress),
         supersede_search_artifact_persistence: !equivalent_warm_config,
         supersede_callgraph_artifact_persistence: !equivalent_callgraph_build,
@@ -7033,6 +7033,7 @@ struct ConfigureMaintenanceContinuation {
     semantic_waits_for_callgraph_start: bool,
     view_load: Option<crossbeam_channel::Receiver<Result<PreparedConfigureView, String>>>,
     replay_retry_at: Option<Instant>,
+    callgraph_upgrade_retry_at: Option<Instant>,
     replay_error_logged: bool,
 }
 
@@ -7045,20 +7046,31 @@ impl ConfigureMaintenanceContinuation {
             semantic_waits_for_callgraph_start: false,
             view_load: None,
             replay_retry_at: None,
+            callgraph_upgrade_retry_at: None,
             replay_error_logged: false,
         }
+    }
+
+    fn retry_at(&self) -> Option<Instant> {
+        self.callgraph_upgrade_retry_at.or(self.replay_retry_at)
     }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct ConfigureMaintenanceState {
     jobs: VecDeque<ConfigureMaintenanceContinuation>,
-    // Freeze retry eligibility across one full drain, even if healthy sessions
-    // take longer to scan than a failed session's backoff.
+    // Freeze retry eligibility across one full drain so a deferred unit cannot
+    // become due again while other units run and monopolize the same drain.
     replay_retry_cutoff: Option<Instant>,
 }
 
 impl ConfigureMaintenanceState {
+    pub(crate) fn callgraph_upgrade_pending(&self) -> bool {
+        self.jobs
+            .iter()
+            .any(|continuation| continuation.callgraph_upgrade_retry_at.is_some())
+    }
+
     pub(crate) fn jobs_is_empty(&self) -> bool {
         self.jobs.is_empty()
     }
@@ -7067,7 +7079,7 @@ impl ConfigureMaintenanceState {
         let now = self.replay_retry_cutoff.unwrap_or_else(Instant::now);
         self.jobs.iter().any(|continuation| {
             continuation
-                .replay_retry_at
+                .retry_at()
                 .is_none_or(|deadline| deadline <= now)
         })
     }
@@ -7077,7 +7089,7 @@ impl ConfigureMaintenanceState {
         let Some(index) = self.jobs.iter().position(|continuation| {
             ctx.subc_unbound_quiesced()
                 || continuation
-                    .replay_retry_at
+                    .retry_at()
                     .is_none_or(|deadline| deadline <= now)
         }) else {
             return false;
@@ -7214,20 +7226,21 @@ pub(crate) fn drain_deferred_configure_maintenance_unit(
     let result = run_configure_maintenance_unit(ctx, &mut continuation);
     match result {
         ConfigureMaintenanceUnitResult::Continue => {
-            // One root cursor needs only one delayed continuation. Later session
-            // binds can finish after replaying their own tasks, rather than
-            // accumulating duplicate retries for the same failed directory.
-            let redundant_retry = continuation.replay_retry_at.is_some()
+            // Keep one delayed continuation per stage/root/harness. Replay and
+            // callgraph admission retries must not discard each other's work.
+            let redundant_retry = continuation.retry_at().is_some()
                 && state.jobs.iter().any(|pending| {
-                    pending.replay_retry_at.is_some()
+                    pending.retry_at().is_some()
+                        && pending.stage == continuation.stage
                         && pending.job.harness_dir == continuation.job.harness_dir
                         && pending.job.root_path == continuation.job.root_path
                         && pending.job.generation >= continuation.job.generation
                 });
             if !redundant_retry {
-                if continuation.replay_retry_at.is_some() {
+                if continuation.retry_at().is_some() {
                     state.jobs.retain(|pending| {
-                        pending.replay_retry_at.is_none()
+                        pending.retry_at().is_none()
+                            || pending.stage != continuation.stage
                             || pending.job.harness_dir != continuation.job.harness_dir
                             || pending.job.root_path != continuation.job.root_path
                     });
@@ -7949,10 +7962,18 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::Callgraph;
         }
         ConfigureMaintenanceStage::Callgraph => {
+            // A queued upgrade has already identified obsolete data. A later
+            // metadata probe must not erase that intent while admission waits.
+            let retrying_upgrade = continuation.callgraph_upgrade_retry_at.take().is_some();
+            let upgrade_required = job.warm_callgraph_store
+                && !ctx.config().views.enabled
+                && (retrying_upgrade || callgraph_store_upgrade_required(ctx));
             // Start semantic indexing only after the callgraph reports `build_started`.
             // This preserves the intended start order without waiting for either build.
-            if job.warm_callgraph_store && callgraph_configure_warm_allowed(ctx) {
-                let access = ctx.schedule_callgraph_store_warm();
+            if job.warm_callgraph_store
+                && (upgrade_required || callgraph_configure_warm_allowed(ctx))
+            {
+                let (access, capacity_deferred) = ctx.schedule_callgraph_store_warm();
                 continuation.semantic_waits_for_callgraph_start = should_wait_for_callgraph_start(
                     &access,
                     ctx.callgraph_store_rx().lock().is_some(),
@@ -7960,6 +7981,11 @@ fn run_configure_maintenance_unit_inner(
                 match access {
                     CallgraphStoreAccess::Ready(_) => {
                         slog_debug!("callgraph store ready at configure maintenance");
+                    }
+                    CallgraphStoreAccess::Building if capacity_deferred => {
+                        slog_debug!(
+                            "callgraph store configure warm waiting for cold-build capacity"
+                        );
                     }
                     CallgraphStoreAccess::Building => {
                         slog_info!("callgraph store warm build scheduled by configure maintenance");
@@ -7991,6 +8017,13 @@ fn run_configure_maintenance_unit_inner(
                 if ctx.configure_generation() != job.generation {
                     forget_configure_job_binding(ctx, job);
                     return ConfigureMaintenanceUnitResult::Complete;
+                }
+                if capacity_deferred && upgrade_required {
+                    // Retain the upgrade in this root's configure-maintenance
+                    // continuation. Maintenance retries it; unbinding cancels it.
+                    continuation.callgraph_upgrade_retry_at =
+                        Some(Instant::now() + Duration::from_secs(1));
+                    return ConfigureMaintenanceUnitResult::Continue;
                 }
             } else if job.warm_callgraph_store {
                 // Non-git roots still build semantic and search indexes eagerly. Their
@@ -8758,13 +8791,8 @@ fn delay_configure_storage_sweeps_for_debug() {
 fn callgraph_configure_warm_allowed(ctx: &AppContext) -> bool {
     // An upgrade must replace a previously built graph even for a non-repository
     // folder. Fresh folders still avoid an unsolicited corpus-scale build.
-    if let Some(root) = ctx.callgraph_project_root() {
-        if let Ok(key) = ctx.memoized_readonly_artifact_cache_key(&root, &ctx.storage_dir()) {
-            if crate::callgraph_store::published_store_is_obsolete(&ctx.callgraph_store_dir(), &key)
-            {
-                return true;
-            }
-        }
+    if callgraph_store_upgrade_required(ctx) {
+        return true;
     }
     // Without usable Git, keep callgraph cold builds on demand. An idle
     // configure must not start a corpus-scale build just because Git is missing.
@@ -8783,6 +8811,18 @@ fn callgraph_configure_warm_allowed(ctx: &AppContext) -> bool {
         || ctx
             .callgraph_project_root()
             .is_some_and(|root| !crate::search_index::git_root_probe_confirms_non_repo(&root))
+}
+
+fn callgraph_store_upgrade_required(ctx: &AppContext) -> bool {
+    ctx.callgraph_project_root().is_some_and(|root| {
+        ctx.memoized_readonly_artifact_cache_key(&root, &ctx.storage_dir())
+            .is_ok_and(|key| {
+                crate::callgraph_store::published_store_is_obsolete(
+                    &ctx.callgraph_store_dir(),
+                    &key,
+                )
+            })
+    })
 }
 
 #[cfg(test)]
@@ -19787,6 +19827,218 @@ mod tests {
                 !index_build_started(&all_events, plane),
                 "disabled {plane} index must never start: {all_events:#?}"
             );
+        }
+    }
+
+    #[test]
+    fn obsolete_non_git_upgrade_waits_for_capacity_and_runs_once() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _watcher = EnvVarGuard::remove("AFT_TEST_DISABLE_FILE_WATCHER");
+        let fixture = busy_obsolete_non_git_upgrade();
+        let ctx = &fixture.ctx;
+        let mut pending = ctx
+            .take_parked_configure_tail()
+            .expect("a refused upgrade must remain pending on the root");
+        assert_eq!(pending.jobs.len(), 1);
+        assert_eq!(
+            pending.jobs.front().unwrap().stage,
+            super::ConfigureMaintenanceStage::Callgraph
+        );
+        assert!(pending
+            .jobs
+            .front()
+            .unwrap()
+            .callgraph_upgrade_retry_at
+            .is_some());
+        assert!(!ctx.callgraph_cold_build_active());
+        assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 0);
+        pending.jobs.front_mut().unwrap().callgraph_upgrade_retry_at = Some(Instant::now());
+        pending.replay_retry_cutoff = Some(Instant::now());
+        while super::drain_deferred_configure_maintenance_unit(ctx, &mut pending) {}
+        assert!(
+            pending.callgraph_upgrade_pending(),
+            "a still-full limiter must retain the upgrade for another tick"
+        );
+        pending.replay_retry_cutoff = None;
+        ctx.park_configure_tail(pending);
+
+        assert!(handle_configure_for_test(&fixture.request, ctx).success);
+        super::drain_deferred_configure_maintenance(ctx);
+        assert!(
+            ctx.configure_callgraph_upgrade_pending(),
+            "an equivalent bind must retain the project's pending upgrade"
+        );
+
+        let navigation = RawRequest {
+            id: "pending-upgrade-navigation".into(),
+            command: "callers".into(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({"file": fixture.source, "symbol": "marker"}),
+        };
+        let response = crate::commands::callers::handle_callers(&navigation, ctx);
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "callgraph_building");
+
+        let (reached, release) = crate::context::install_callgraph_build_start_gate_for_test(
+            ctx.callgraph_project_root().unwrap(),
+        );
+        drop(fixture.slots);
+        pending = ctx.take_parked_configure_tail().unwrap();
+        pending.jobs.front_mut().unwrap().callgraph_upgrade_retry_at = Some(Instant::now());
+        pending.replay_retry_cutoff = Some(Instant::now());
+        while super::drain_deferred_configure_maintenance_unit(ctx, &mut pending) {}
+        release.send(()).ok();
+        reached
+            .recv_timeout(Duration::from_secs(5))
+            .expect("freeing a slot must admit the pending upgrade");
+        assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 1);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while ctx.callgraph_cold_build_active() {
+            crate::runtime_drain::drain_callgraph_store_events(ctx);
+            assert!(Instant::now() < deadline, "upgrade did not settle");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for _ in 0..3 {
+            super::drain_deferred_configure_maintenance(ctx);
+        }
+        assert!(
+            ctx.callgraph_store().read().unwrap().is_some(),
+            "upgrade settled without a reader: denial={:?}, suspension={:?}",
+            ctx.callgraph_store_build_denial(),
+            ctx.callgraph_store_build_suspension()
+        );
+        assert_eq!(
+            ctx.callgraph_cold_build_spawn_count_for_test(),
+            1,
+            "later maintenance must not rebuild the same upgrade twice"
+        );
+    }
+
+    #[test]
+    fn obsolete_non_git_upgrade_pending_unbind_cancels_retry() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _watcher = EnvVarGuard::remove("AFT_TEST_DISABLE_FILE_WATCHER");
+        let fixture = busy_obsolete_non_git_upgrade();
+        let ctx = &fixture.ctx;
+        let pending = ctx
+            .take_parked_configure_tail()
+            .expect("a refused upgrade must remain pending until admission or unbind");
+        assert!(pending
+            .jobs
+            .front()
+            .unwrap()
+            .callgraph_upgrade_retry_at
+            .is_some());
+        ctx.park_configure_tail(pending);
+        ctx.mark_subc_unbound();
+        assert_eq!(super::cancel_deferred_configure_maintenance(ctx), 1);
+        drop(fixture.slots);
+        super::drain_deferred_configure_maintenance(ctx);
+        assert!(ctx.configure_tail_idle());
+        assert!(matches!(
+            ctx.schedule_callgraph_store_warm().0,
+            CallgraphStoreAccess::Unavailable
+        ));
+        assert!(!ctx.callgraph_cold_build_active());
+        assert!(ctx.callgraph_store().read().unwrap().is_none());
+        assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 0);
+        ctx.mark_subc_bound();
+        super::drain_deferred_configure_maintenance(ctx);
+        assert_eq!(
+            ctx.callgraph_cold_build_spawn_count_for_test(),
+            0,
+            "a canceled pending upgrade must not survive a later bind without a new configure"
+        );
+    }
+
+    #[test]
+    fn obsolete_non_git_upgrade_pending_inspect_has_no_clean_dead_code() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _watcher = EnvVarGuard::remove("AFT_TEST_DISABLE_FILE_WATCHER");
+        let fixture = busy_obsolete_non_git_upgrade();
+        assert!(fixture.ctx.configure_callgraph_upgrade_pending());
+        let inspect = RawRequest {
+            id: "pending-upgrade-inspect".into(),
+            command: "inspect".into(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({"sections": ["dead_code"]}),
+        };
+        let response = crate::commands::inspect::handle_inspect_tool_call(&inspect, &fixture.ctx);
+        assert_eq!(response.data["complete"], false, "{response:?}");
+        assert!(
+            response.data["summary"]["dead_code"]["count"].is_null(),
+            "{response:?}"
+        );
+        let text = response.data["text"].as_str().unwrap();
+        assert!(text.starts_with("PARTIAL"), "{text}");
+        assert!(!text.contains("Dead code: 0"), "{text}");
+        assert_eq!(fixture.ctx.callgraph_cold_build_spawn_count_for_test(), 0);
+    }
+
+    struct BusyObsoleteNonGitUpgrade {
+        ctx: TestContext,
+        _root: tempfile::TempDir,
+        _storage: tempfile::TempDir,
+        source: PathBuf,
+        request: RawRequest,
+        slots: Vec<crate::cold_build_limiter::ColdBuildPermit>,
+    }
+
+    fn busy_obsolete_non_git_upgrade() -> BusyObsoleteNonGitUpgrade {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "pub fn marker() {}\n").unwrap();
+        let ctx = test_context();
+        ctx.isolate_cold_build_limiter_for_test(2);
+        let slots = (0..2)
+            .map(|_| ctx.take_cold_build_slot_for_test().unwrap())
+            .collect();
+        let request = configure_request_with_params(json!({
+            "project_root": root.path(), "harness": "opencode", "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "views": { "enabled": false },
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true },
+                "inspect": { "diagnostics_timeout_ms": 10_000, "categories": {
+                    "diagnostics": false, "todos": false, "dead_code": true,
+                    "unused_exports": false, "duplicates": false,
+                    "cycles": false, "complexity": false
+                } }
+            }))]
+        }));
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        let canonical = ctx.callgraph_project_root().unwrap();
+        let (store, _) = crate::callgraph_store::CallGraphStore::cold_build_with_lease(
+            ctx.callgraph_store_dir(),
+            canonical.clone(),
+            &[canonical.join("lib.rs")],
+        )
+        .unwrap();
+        let database = store.sqlite_path().to_path_buf();
+        drop(store);
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        conn.execute(
+            "UPDATE meta SET v = 'old-output-fingerprint' WHERE k = 'fingerprint'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        super::drain_deferred_configure_maintenance(&ctx);
+        BusyObsoleteNonGitUpgrade {
+            ctx,
+            _root: root,
+            _storage: storage,
+            source,
+            request,
+            slots,
         }
     }
 

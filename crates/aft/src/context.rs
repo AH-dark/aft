@@ -4558,6 +4558,13 @@ enum CallgraphBackgroundWork {
     LegacyMigration,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallgraphBuildAdmission {
+    Started,
+    CapacityDeferred,
+    NotStarted,
+}
+
 #[derive(Clone)]
 struct CallgraphViewInstallTestGate {
     reached: crossbeam_channel::Sender<String>,
@@ -6968,6 +6975,13 @@ impl AppContext {
         &self,
     ) -> Option<crate::commands::configure::ConfigureMaintenanceState> {
         self.parked_configure_tail.lock().take()
+    }
+
+    pub(crate) fn configure_callgraph_upgrade_pending(&self) -> bool {
+        self.parked_configure_tail
+            .lock()
+            .as_ref()
+            .is_some_and(|state| state.callgraph_upgrade_pending())
     }
 
     pub(crate) fn configure_maintenance_has_capacity(&self) -> bool {
@@ -9977,6 +9991,7 @@ impl AppContext {
                 self.callgraph_build_wait_window()
             },
             true,
+            None,
         )
     }
 
@@ -9990,8 +10005,16 @@ impl AppContext {
     ///
     /// Warming the store is not a use of the graph: it never starts a linked
     /// worktree's on-demand build (see `LazyCallgraph`).
-    pub(crate) fn schedule_callgraph_store_warm(&self) -> CallgraphStoreAccess {
-        self.callgraph_store_for_ops_with_wait(Duration::ZERO, false)
+    /// The second return value identifies a full cold-build limiter rather than
+    /// another building/unavailable state, so configure can retain upgrade work.
+    pub(crate) fn schedule_callgraph_store_warm(&self) -> (CallgraphStoreAccess, bool) {
+        let mut capacity_deferred = false;
+        let access = self.callgraph_store_for_ops_with_wait(
+            Duration::ZERO,
+            false,
+            Some(&mut capacity_deferred),
+        );
+        (access, capacity_deferred)
     }
 
     /// The store for a reader that needs the graph now but must not wait for
@@ -10000,7 +10023,7 @@ impl AppContext {
     /// use of the graph: when main's graph cannot answer, it starts a linked
     /// worktree's on-demand build.
     pub(crate) fn callgraph_store_for_query_without_wait(&self) -> CallgraphStoreAccess {
-        self.callgraph_store_for_ops_with_wait(Duration::ZERO, true)
+        self.callgraph_store_for_ops_with_wait(Duration::ZERO, true, None)
     }
 
     /// True when this root builds its call graph only on first use: a linked
@@ -10188,7 +10211,7 @@ impl AppContext {
                     })
                 })
             {
-                return self.callgraph_store_for_ops_with_wait(Duration::ZERO, false);
+                return self.callgraph_store_for_ops_with_wait(Duration::ZERO, false, None);
             }
         }
         CallgraphStoreAccess::Building
@@ -10198,6 +10221,7 @@ impl AppContext {
         &self,
         wait: Duration,
         demand: bool,
+        capacity_deferred: Option<&mut bool>,
     ) -> CallgraphStoreAccess {
         // HOME roots and unbound roots do no heavy work at all; configure
         // also forces the callgraph off there, so check this first to keep
@@ -10463,11 +10487,14 @@ impl AppContext {
             // A concurrent caller may have installed a receiver after the
             // snapshot above. The spawn path deduplicates that race, and the
             // common wait path below joins whichever build won.
-            let _ = self.spawn_callgraph_store_cold_build(
+            let admission = self.spawn_callgraph_store_cold_build(
                 project_root.clone(),
                 callgraph_dir.clone(),
                 work,
             );
+            if let Some(capacity_deferred) = capacity_deferred {
+                *capacity_deferred = admission == CallgraphBuildAdmission::CapacityDeferred;
+            }
         }
 
         if !wait.is_zero() {
@@ -10695,15 +10722,15 @@ impl AppContext {
         project_root: PathBuf,
         callgraph_dir: PathBuf,
         work: CallgraphBackgroundWork,
-    ) -> bool {
+    ) -> CallgraphBuildAdmission {
         if !self.heavy_root_work_allowed() || !self.callgraph_writer() {
-            return false;
+            return CallgraphBuildAdmission::NotStarted;
         }
         let generation = self.configure_generation();
         self.run_if_subc_bound_generation(generation, || {
             self.spawn_callgraph_store_cold_build_admitted(project_root, callgraph_dir, work)
         })
-        .unwrap_or(false)
+        .unwrap_or(CallgraphBuildAdmission::NotStarted)
     }
 
     /// Start a callgraph worker after lifecycle admission has been acquired.
@@ -10712,7 +10739,7 @@ impl AppContext {
         project_root: PathBuf,
         callgraph_dir: PathBuf,
         work: CallgraphBackgroundWork,
-    ) -> bool {
+    ) -> CallgraphBuildAdmission {
         let session_id = crate::log_ctx::current_session();
         let chunk_size = self.config().callgraph_chunk_size;
         let build_generation = self.configure_generation();
@@ -10721,7 +10748,7 @@ impl AppContext {
 
         let mut rx_guard = self.callgraph_store_rx.lock();
         if rx_guard.is_some() {
-            return false;
+            return CallgraphBuildAdmission::NotStarted;
         }
 
         let limiter = self.cold_build_limiter();
@@ -10737,7 +10764,7 @@ impl AppContext {
                 "callgraph store background work deferred by cold build limit ({})",
                 limiter.limit()
             );
-            return false;
+            return CallgraphBuildAdmission::CapacityDeferred;
         };
 
         let force_token = match work {
@@ -10882,7 +10909,7 @@ impl AppContext {
                 &project_root,
             );
         });
-        true
+        CallgraphBuildAdmission::Started
     }
 
     /// Access the callgraph-store background-build receiver (drained by the
@@ -17952,7 +17979,7 @@ mod callgraph_store_for_ops_tests {
         let (reached, release) = install_callgraph_build_start_gate(project_root);
 
         assert!(matches!(
-            ctx.schedule_callgraph_store_warm(),
+            ctx.schedule_callgraph_store_warm().0,
             CallgraphStoreAccess::Building
         ));
         reached
@@ -18022,7 +18049,7 @@ mod callgraph_store_for_ops_tests {
         ctx.set_unbound_build_abandon_grace_for_test(grace);
         let (reached, release) = install_callgraph_build_start_gate(project_root.clone());
         assert!(matches!(
-            ctx.schedule_callgraph_store_warm(),
+            ctx.schedule_callgraph_store_warm().0,
             CallgraphStoreAccess::Building
         ));
         reached
@@ -18189,7 +18216,7 @@ mod callgraph_store_for_ops_tests {
                 (delay, reached, release)
             });
         assert!(matches!(
-            ctx.schedule_callgraph_store_warm(),
+            ctx.schedule_callgraph_store_warm().0,
             CallgraphStoreAccess::Building
         ));
         if let Some((delay, reached, release)) = delayed_start {
@@ -18220,7 +18247,7 @@ mod callgraph_store_for_ops_tests {
         tx.send(ready).expect("queue Ready event");
         *ctx.callgraph_store_rx().lock() = Some(rx);
         assert!(matches!(
-            ctx.callgraph_store_for_ops_with_wait(Duration::from_secs(60), true),
+            ctx.callgraph_store_for_ops_with_wait(Duration::from_secs(60), true, None),
             CallgraphStoreAccess::Building
         ));
         assert!(
