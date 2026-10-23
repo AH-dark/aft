@@ -560,6 +560,30 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
 
 
 class MacOSUnitWorkflowTests(unittest.TestCase):
+    def test_libtest_codegen_is_split_without_rebuilding_dependencies(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
+        job = suite["jobs"]["unit-macos-libtest-archive"]
+        self.assertEqual(
+            job["env"].get("LIBTEST_CARGO_CONFIG"),
+            "profile.test.package.agent-file-tools.codegen-units=256",
+        )
+        self.assertEqual(job["env"]["CARGO_INCREMENTAL"], "0")
+        self.assertNotIn("CARGO_PROFILE_TEST_CODEGEN_UNITS", job["env"])
+        self.assertEqual(job["timeout-minutes"], "30")
+        cargo_steps = [step["run"] for step in job["steps"] if "run" in step]
+        build_steps = [command for command in cargo_steps if command.startswith("cargo ")]
+        self.assertEqual(len(build_steps), 3)
+        for command in build_steps:
+            self.assertIn('--config "$LIBTEST_CARGO_CONFIG"', command)
+        archive = next(command for command in build_steps if "nextest archive" in command)
+        self.assertIn("--timings", archive)
+        self.assertIn('cp -R target/cargo-timings "$RUNNER_TEMP/macos-libtest-timings"', cargo_steps)
+        upload = next(step for step in job["steps"] if step.get("with", {}).get("name") == "macos-libtest-archive")
+        paths = upload["with"]["path"].splitlines()
+        self.assertIn("${{ runner.temp }}/macos-libtest-timings/", paths)
+        self.assertTrue(all(path.startswith("${{ runner.temp }}/") for path in paths))
+
     def test_unit_archive_compilation_isolated_and_real_cli_is_retained(self) -> None:
         lib = workflow_job("unit-macos-libtest-archive")
         binary = workflow_job("unit-macos-bin-archive")

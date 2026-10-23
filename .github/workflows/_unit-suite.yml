@@ -707,6 +707,10 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
+      # Non-incremental Cargo builds default to 16 codegen units. Split the
+      # large library harness more finely without changing dependency profiles,
+      # debug assertions, unwind behavior, or the backtrace probe's line tables.
+      LIBTEST_CARGO_CONFIG: profile.test.package.agent-file-tools.codegen-units=256
     steps:
       - uses: actions/checkout@v5
 
@@ -726,15 +730,18 @@ jobs:
       - name: Build nextest archive (macOS lib tests)
         # The selected integration probe makes Cargo build the real aft CLI.
         # Its tests are filtered out; only the library bucket enters this archive.
-        run: cargo nextest archive --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --archive-file "$MACOS_LIBTEST_ARCHIVE"
+        run: cargo nextest archive --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --config "$LIBTEST_CARGO_CONFIG" --timings --archive-file "$MACOS_LIBTEST_ARCHIVE"
         env:
           MACOS_LIBTEST_ARCHIVE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
 
       - name: Run the serial backtrace probe with local debug objects
-        run: cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists
+        run: cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG"
 
       - name: Capture lib source inventory
-        run: cargo nextest list --workspace --lib --profile gate -T json --cargo-quiet > "$RUNNER_TEMP/macos-libtest-inventory.json"
+        run: cargo nextest list --workspace --lib --profile gate -T json --cargo-quiet --config "$LIBTEST_CARGO_CONFIG" > "$RUNNER_TEMP/macos-libtest-inventory.json"
+
+      - name: Preserve libtest build timings
+        run: cp -R target/cargo-timings "$RUNNER_TEMP/macos-libtest-timings"
 
       - name: Report macOS libtest archive size
         run: |
@@ -749,6 +756,7 @@ jobs:
           path: |
             ${{ runner.temp }}/macos-libtest-nextest.tar.zst
             ${{ runner.temp }}/macos-libtest-inventory.json
+            ${{ runner.temp }}/macos-libtest-timings/
           compression-level: 0
           if-no-files-found: error
 
