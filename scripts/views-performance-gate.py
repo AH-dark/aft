@@ -733,6 +733,7 @@ def rowid_layout_gate(args):
     corpus = manifest["corpora"][args.corpus]
     # These are Git object reads, not reads of a possibly modified checkout.
     payload = subprocess.check_output(["git", "-C", str(args.source), "show", f"{corpus['commit']}:Cargo.lock"])
+    Path("target").mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="v3-layout-", dir="target") as scratch:
         payload_path = Path(scratch).resolve() / "corpus-payload"
         payload_path.write_bytes(payload)
