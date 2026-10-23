@@ -14483,12 +14483,27 @@ mod tests {
             )
             .unwrap();
         }
+        // A background refresh of language-server applicability can hold the
+        // LSP lock while watcher work arrives. Force that overlap so the batch
+        // leaves a continuation instead of depending on background timing.
+        let held_lsp = ctx.lsp();
         watcher_tx
             .send(crate::watcher_filter::WatcherDispatchEvent::Paths(
                 files.clone(),
             ))
             .unwrap();
-        crate::runtime_drain::drain_watcher_events(&ctx);
+        let unchanged_started = Instant::now();
+        let unchanged_drain = crate::runtime_drain::drain_watcher_events_bounded(
+            &ctx,
+            crate::runtime_drain::WATCHER_PATH_DRAIN_BATCH_CAP,
+        );
+        let unchanged_elapsed = unchanged_started.elapsed();
+        let unchanged_continuation = format!("{:?}", ctx.watcher_drain_slice().lock());
+        assert!(
+            unchanged_drain.has_more,
+            "the held LSP lock defers the batch"
+        );
+        drop(held_lsp);
 
         {
             let index = ctx.semantic_index().read().unwrap();
@@ -14504,37 +14519,72 @@ mod tests {
             0
         );
 
-        // A real edit to one file follows inside the worker's quiet window.
+        // A real edit follows while the unchanged batch still needs draining.
         // The embed count below cannot by itself prove the unchanged files
         // were left alone, because the refresh worker reuses vectors for chunk
         // text it already embedded; the entry and vector checks above and the
         // queue check in the runtime_drain tests carry that. What it does pin
         // is that the whole round trip costs the backend one input: the edit.
         let edited = files[3].clone();
-        fs::write(&edited, "pub fn edited_symbol_marker() -> u32 { 99 }\n").unwrap();
+        let edited_content = "pub fn edited_symbol_marker() -> u32 { 99 }\n";
+        fs::write(&edited, edited_content).unwrap();
+        let edited_hash = blake3::hash(edited_content.as_bytes());
         watcher_tx
             .send(crate::watcher_filter::WatcherDispatchEvent::Paths(vec![
                 edited.clone(),
             ]))
             .unwrap();
-        crate::runtime_drain::drain_watcher_events(&ctx);
+        let edited_started = Instant::now();
+        let edited_drain = crate::runtime_drain::drain_watcher_events_bounded(
+            &ctx,
+            crate::runtime_drain::WATCHER_PATH_DRAIN_BATCH_CAP,
+        );
+        let edited_elapsed = edited_started.elapsed();
 
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut watcher_turns = 0;
         loop {
+            // A dispatch drain is one bounded slice, and the edited path can
+            // still be queued behind the unchanged batch's LSP continuation.
+            // Drive idle watcher turns as well as semantic completions, just
+            // as the runtime does when no more file events arrive.
+            let watcher_drain = crate::runtime_drain::drain_watcher_events_bounded(
+                &ctx,
+                crate::runtime_drain::WATCHER_PATH_DRAIN_BATCH_CAP,
+            );
+            watcher_turns += 1;
             crate::runtime_drain::drain_semantic_refresh_events(&ctx);
-            if non_probe_inputs(&server).len() > inputs_after_build
-                && ctx
-                    .semantic_index_status()
-                    .read()
-                    .unwrap()
-                    .refreshing_count()
-                    == 0
-            {
+            let refresh_inputs = non_probe_inputs(&server).split_off(inputs_after_build);
+            let edited_embedded = refresh_inputs
+                .iter()
+                .any(|input| input.contains("edited_symbol_marker"));
+            let refreshing = ctx
+                .semantic_index_status()
+                .read()
+                .unwrap()
+                .refreshing_count();
+            // A request reaching the server is not a completion barrier: the
+            // worker's Started event may arrive just after the drain above.
+            let edited_installed = ctx
+                .semantic_index()
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .recorded_file_freshness(&edited)
+                .is_some_and(|freshness| freshness.content_hash == edited_hash);
+            if edited_embedded && refreshing == 0 && edited_installed {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "refresh of the edited file did not complete"
+                "refresh of the edited file did not complete: edited_embedded={edited_embedded}, \
+                 refreshing={refreshing}, edited_installed={edited_installed}, refresh_inputs={refresh_inputs:?}; \
+                 watcher events: unchanged Paths({files:?}) => {unchanged_drain:?} in {unchanged_elapsed:?}, \
+                 edited Paths({edited:?}) => {edited_drain:?} in {edited_elapsed:?}; \
+                 unchanged continuation={unchanged_continuation}; \
+                 idle watcher turns={watcher_turns}, last={watcher_drain:?}, watcher continuation={:?}",
+                ctx.watcher_drain_slice().lock()
             );
             std::thread::sleep(Duration::from_millis(10));
         }
