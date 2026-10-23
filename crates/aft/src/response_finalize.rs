@@ -177,6 +177,19 @@ fn acknowledge_terminal_bash_reply(
     if !response.success || !matches!(command, "bash" | "bash_watch") {
         return;
     }
+    // A fast background child can exit before its launch reply is built. That
+    // reply has a terminal status but only launch guidance in `output`; only a
+    // foreground result includes the command's `output_preview`. Acknowledging
+    // launch guidance would discard a queued completion or suppress its later
+    // publication, even though the caller has not received the result.
+    if command == "bash"
+        && !response
+            .data
+            .get("output_preview")
+            .is_some_and(Value::is_string)
+    {
+        return;
+    }
     if !response
         .data
         .get("status")
