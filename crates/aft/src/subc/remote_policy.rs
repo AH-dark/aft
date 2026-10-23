@@ -161,6 +161,7 @@ pub(super) fn catalog(
             // A worker unconfined until now may be remembered as such: mark it
             // confined before the fence commits, so no call can still be
             // admitted on the older answer once the fence is saved.
+            ctx.invalidate_saved_policy_reads();
             store::freeze(
                 &conn,
                 &key,
@@ -475,14 +476,7 @@ pub(super) fn lookup(
         }
         RemoteSource::Worker(key) => {
             let key = key.as_ref()?;
-            let db = ctx.db()?;
-            let conn = db.lock().ok()?;
-            let policy = store::lookup(
-                &conn,
-                key,
-                crate::bash_background::persistence::unix_millis(),
-            )
-            .ok()??;
+            let policy = saved_policy(ctx, key).ok()??;
             Some(crate::bash_background::RemoteLaunch {
                 explicit_runon: false,
                 params: policy,
@@ -495,6 +489,30 @@ pub(super) fn lookup(
             })
         }
     }
+}
+
+/// Read the saved worker policy using the ordinary remote-launch lookup. When
+/// this epoch has no row, it inherits the newest earlier epoch for the same
+/// principal, scope, root, harness and session. Call only off the frame loop:
+/// lookup locks aft.db.
+pub(super) fn saved_policy(
+    ctx: &AppContext,
+    key: &PolicyKey,
+) -> Result<Option<crate::exec_remote::FrozenParams>, subc_protocol::ErrorBody> {
+    let Some(db) = ctx.db() else {
+        return if ctx.database_runtime_unconfigured() {
+            Ok(None)
+        } else {
+            Err(policy_unavailable())
+        };
+    };
+    let conn = db.lock().map_err(|_| policy_unavailable())?;
+    store::lookup(
+        &conn,
+        key,
+        crate::bash_background::persistence::unix_millis(),
+    )
+    .map_err(|_| policy_unavailable())
 }
 
 #[cfg(test)]

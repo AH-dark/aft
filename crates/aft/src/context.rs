@@ -8033,6 +8033,17 @@ impl AppContext {
         self.policy_confinement.lock().generation
     }
 
+    /// Advance the saved-policy generation and clear cached unconfined answers
+    /// before saving catalog params. Candidate comparisons retain this generation
+    /// so a save invalidates their older answers. The caller holds aft.db's lock
+    /// until the save finishes, so readers cannot observe a pre-save row under
+    /// the new generation.
+    pub(crate) fn invalidate_saved_policy_reads(&self) {
+        let mut memo = self.policy_confinement.lock();
+        memo.unconfined.clear();
+        memo.generation = memo.generation.wrapping_add(1);
+    }
+
     /// Remember that the aft.db handle `db` said `key` is unconfined, unless a
     /// key was marked confined since `generation` was taken: that read may
     /// predate the fence, so it is not kept and the next call reads again.

@@ -449,6 +449,8 @@ struct DecodedFrame {
     /// The route's confinement answer from memory or an off-loop database read
     /// by `persistence::DatabaseWaits::read_confinement`. `None` until checked.
     confinement: Option<remote_policy::CarriedConfinement>,
+    /// Candidate head policies read off-loop before codemode chooses an owner.
+    codemode_policies: Option<Result<codemode::SavedPolicies, subc_protocol::ErrorBody>>,
     /// Result of restoring launch grants for this frame; retain it so later
     /// admission waits do not repeat restoration.
     launch_restore: Option<Result<(), subc_protocol::ErrorBody>>,
@@ -5284,7 +5286,7 @@ where
                 if !database_waited && !ledger_waited && frame.frame.header.ty == FrameType::Request && frame.frame.header.channel != 0 {
                     dispatch_path_metrics.tool_received_decoded(&frame);
                 }
-                let DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore } = frame;
+                let DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies } = frame;
 
                 match frame.header.ty {
                     FrameType::Ping if frame.header.channel == 0 => {
@@ -5349,7 +5351,7 @@ where
                         if standalone::reply(&writer_tx, &frame) {
                             continue;
                         }
-                        let decoded = DecodedFrame {frame, phase_trace, parsed_body, confinement, launch_restore};
+                        let decoded = DecodedFrame {frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies};
                         let decoded = if !ledger_waited {
                             match ledger_edge.authorize(decoded, &pending_bash_asks, &executor) {
                                 Ok(()) => continue,
@@ -5427,15 +5429,37 @@ where
                     }
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
-                        let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore };
+                        let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
                         // A codemode program's tool call runs with its head agent's
                         // access: every step below sees the head-derived identity.
                         let codemode_routes;
-                        let (routes_for_call, codemode_call) = match codemode::admit(&routes, route, decoded.body().ok()) {
+                        let (routes_for_call, codemode_call) = match codemode::admit(&routes, route, decoded.body().ok(), |identity| {
+                            let Some(ctx) = executor.actor_context(&identity.root) else {
+                                return Some(Err(remote_policy::policy_unavailable()));
+                            };
+                            if remote_policy::key(identity, Some("worker")).is_none() || ctx.database_runtime_unconfigured() {
+                                return Some(Ok(codemode::EffectiveSavedPolicy::default()));
+                            }
+                            match decoded.codemode_policies.as_ref()? {
+                                Ok(policies) => policies.get(&ctx, identity),
+                                Err(error) => Some(Err(error.clone())),
+                            }
+                        }) {
                             codemode::Admission::Unchanged => (&routes, false),
                             codemode::Admission::Owner(effective) => {
                                 codemode_routes = codemode::overlay(&routes, route, effective);
                                 (&codemode_routes, true)
+                            }
+                            codemode::Admission::AwaitPolicies(heads) => {
+                                match database_waits.read_codemode_policies(decoded, heads, &executor) {
+                                    Ok(()) => continue,
+                                    Err(decoded) => {
+                                        if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, remote_policy::policy_unavailable()).await {
+                                            break Err(error);
+                                        }
+                                        continue;
+                                    }
+                                }
                             }
                             codemode::Admission::Refused(error) => {
                                 if let Some(run) = routes.get(&route) {
@@ -6563,6 +6587,7 @@ where
                         parsed_body: Default::default(),
                         confinement: None,
                         launch_restore: None,
+                        codemode_policies: None,
                         frame,
                         phase_trace: PhaseTrace::new(received_at),
                     };
@@ -20916,7 +20941,7 @@ mod tests {
             )
             .unwrap();
             let mut waits = persistence::DatabaseWaits::default();
-            let decoded = DecodedFrame { parsed_body: Default::default(), confinement: None, launch_restore: None, frame, phase_trace: PhaseTrace::new(Instant::now()) };
+            let decoded = DecodedFrame { parsed_body: Default::default(), confinement: None, launch_restore: None, codemode_policies: None, frame, phase_trace: PhaseTrace::new(Instant::now()) };
             let decoded = match waits.defer(decoded, &routes, executor) {
                 Ok(()) => waits.next().await,
                 Err(decoded) => decoded,
@@ -21517,7 +21542,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let mut waits = persistence::DatabaseWaits::default();
-            let frame = DecodedFrame { parsed_body: Default::default(), confinement: None, launch_restore: None, frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1,
+            let frame = DecodedFrame { parsed_body: Default::default(), confinement: None, launch_restore: None, codemode_policies: None, frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1,
                 serde_json::to_vec(&json!({"name": "db_set_host_state", "arguments": {"key": "retry", "value": "ok"}})).unwrap()).unwrap(),
             phase_trace: PhaseTrace::new(Instant::now()), };
             assert!(waits.defer(frame, &routes, &executor).is_ok());
@@ -22410,6 +22435,7 @@ mod admission_mechanism_tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),

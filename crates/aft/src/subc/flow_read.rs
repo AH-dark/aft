@@ -6,9 +6,12 @@ use subc_protocol::{
     session::ModuleControlResponseToModule,
 };
 
+pub(super) fn principal_is_flow_read_carrier(principal: &AuthenticatedPrincipal) -> bool {
+    matches!(principal, AuthenticatedPrincipal::RouteBind { principal_id: Some(id), .. } if id == "reserved:basal")
+}
+
 fn route_checks(identity: &RouteIdentity) -> Result<&ScopeStamp, Refusal> {
-    if !matches!(&identity.spawn_principal, AuthenticatedPrincipal::RouteBind { principal_id: Some(id), .. } if id == "reserved:basal")
-    {
+    if !principal_is_flow_read_carrier(&identity.spawn_principal) {
         return Err(Refusal::RouteNotAdmitted("principal"));
     }
     let stamp = identity

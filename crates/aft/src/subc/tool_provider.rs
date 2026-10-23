@@ -2241,6 +2241,7 @@ impl LedgerEdge {
                         parsed_body: Default::default(),
                         confinement: None,
                         launch_restore: None,
+                        codemode_policies: None,
                     });
                 }
                 Err(error) => log::warn!("withdrawn call could not be ended: {error}"),
@@ -4872,6 +4873,7 @@ mod route_tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame,
             phase_trace: PhaseTrace::new(Instant::now()),
         };
@@ -4997,6 +4999,7 @@ mod route_tests {
                 parsed_body: Default::default(),
                 confinement: None,
                 launch_restore: None,
+                codemode_policies: None,
                 frame: Frame::build(
                     FrameType::Request,
                     control_flags(),
@@ -5612,6 +5615,7 @@ mod route_tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -6401,6 +6405,7 @@ mod ledger_terminal_tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -6467,6 +6472,7 @@ mod ledger_terminal_tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -6663,7 +6669,7 @@ mod ledger_terminal_tests {
         let (edge, mut ready) = LedgerEdge::new();
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
-            confinement: None, launch_restore: None,
+            confinement: None, launch_restore: None, codemode_policies: None,
             frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 7, serde_json::to_vec(&json!({"name":"read", "arguments":{"filePath":"README.md"}, "call_key":"drain-key"})).unwrap()).unwrap(),
             phase_trace: PhaseTrace::new(std::time::Instant::now()),
         };
@@ -6736,6 +6742,7 @@ mod ledger_terminal_tests {
                         parsed_body: Default::default(),
                         confinement: None,
                         launch_restore: None,
+                        codemode_policies: None,
                         frame: request(),
                         phase_trace: crate::run_tool_call::PhaseTrace::new(
                             std::time::Instant::now(),
@@ -6779,6 +6786,7 @@ mod ledger_terminal_tests {
                         parsed_body: Default::default(),
                         confinement: None,
                         launch_restore: None,
+                        codemode_policies: None,
                         frame: request(),
                         phase_trace: crate::run_tool_call::PhaseTrace::new(
                             std::time::Instant::now(),
@@ -7081,6 +7089,7 @@ mod authorization_failure_tests {
         let allow = || DecodedFrame {
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             parsed_body: Default::default(),
             frame: Frame::build(
                 FrameType::Response,
