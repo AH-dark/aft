@@ -1926,13 +1926,23 @@ fn check_call_for_data_flow(
             let target_file = store.project_root().join(&target.file);
             for (pos, _tracked, approximate) in &arg_positions {
                 if let Some(param_name) = params.get(*pos) {
+                    // The incoming hop uses the stored parameter name and location.
+                    // Check the destination's parsed content before emitting that hop,
+                    // not only when the recursive body walk starts afterwards.
+                    let target_stale = match files.load(&target_file)? {
+                        Some(facts) => {
+                            !content_matches_store(store, &target.file, facts.content_hash)?
+                        }
+                        None => false,
+                    };
+                    let approximate = *approximate || target_stale;
                     hops.push(callgraph::DataFlowHop {
                         file: target.file.clone(),
                         symbol: target.symbol.clone(),
                         variable: param_name.clone(),
                         line: target.line,
                         flow_type: "parameter".to_string(),
-                        approximate: *approximate,
+                        approximate,
                     });
                     trace_data_inner(
                         store,
@@ -1941,7 +1951,7 @@ fn check_call_for_data_flow(
                         &target_file,
                         &target.symbol,
                         param_name,
-                        *approximate,
+                        approximate,
                         max_depth,
                         current_depth + 1,
                         hops,
@@ -3390,7 +3400,7 @@ mod trace_to_tests {
         }
 
         fn resolved_self_calls_of(&self, _node: &StoreNode) -> CallGraphResult<Vec<StoreCallSite>> {
-            unreachable!("not used by these adapter tests")
+            Ok(Vec::new())
         }
 
         fn unresolved_calls_of(
@@ -3604,6 +3614,103 @@ mod trace_to_tests {
             impact_result(&store, Path::new(&target.file), &target.symbol, 1, true).unwrap();
         assert_eq!(stale.callers[0].call_expression, None);
         assert_eq!(stale.callers[0].approximate, Some(true));
+    }
+
+    fn trace_data_across_files_with_unindexed_edits(
+        edit_source: bool,
+        edit_destination: bool,
+    ) -> callgraph::TraceDataResult {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = CountingStore::new();
+        store.root = temp.path().canonicalize().unwrap();
+        let source_text = "function entry(x: number) { sink(x); }\n";
+        let destination_text = "function sink(p: number) { const copied = p; }\n";
+        let mut source = node("entry", false);
+        source.signature = Some("function entry(x: number)".into());
+        let mut destination = node("sink", false);
+        destination.signature = Some("function sink(p: number)".into());
+        for (node, text) in [(&source, source_text), (&destination, destination_text)] {
+            store.add_node(node.clone());
+            std::fs::write(store.root.join(&node.file), text).unwrap();
+            store.stored_hashes.insert(
+                node.file.clone(),
+                crate::cache_freshness::hash_bytes(text.as_bytes())
+                    .to_hex()
+                    .to_string(),
+            );
+        }
+        store.add_outgoing(&source, &destination);
+        let site = &mut store
+            .outgoing
+            .get_mut(&(source.file.clone(), source.symbol.clone()))
+            .unwrap()[0];
+        site.byte_start = source_text.find("sink(x)").unwrap();
+        site.byte_end = site.byte_start + "sink(x)".len();
+        if edit_source {
+            std::fs::write(
+                store.root.join(&source.file),
+                format!("// source shifted\n{source_text}"),
+            )
+            .unwrap();
+        }
+        if edit_destination {
+            std::fs::write(
+                store.root.join(&destination.file),
+                format!("// destination shifted\n{destination_text}"),
+            )
+            .unwrap();
+        }
+        trace_data_result(
+            &store,
+            &store.root.join(&source.file),
+            "entry",
+            "x",
+            5,
+            std::sync::Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new())),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn trace_data_destination_only_edit_marks_the_first_parameter_hop_approximate() {
+        let trace = trace_data_across_files_with_unindexed_edits(false, true);
+        let first = trace.hops.first().expect("parameter hop into destination");
+        assert_eq!(first.flow_type, "parameter");
+        assert_eq!(first.file, "sink.ts");
+        assert_eq!(first.variable, "p");
+        assert_eq!(
+            first.line, 1,
+            "the hop still uses the stored parameter location"
+        );
+        assert!(first.approximate, "{first:?}");
+        assert!(trace
+            .hops
+            .iter()
+            .any(|hop| hop.variable == "copied" && hop.approximate));
+    }
+
+    #[test]
+    fn trace_data_source_only_edit_keeps_the_first_parameter_hop_approximate() {
+        let trace = trace_data_across_files_with_unindexed_edits(true, false);
+        let first = trace.hops.first().expect("name-only parameter hop");
+        assert_eq!(first.flow_type, "parameter");
+        assert_eq!(first.file, "entry.ts");
+        assert_eq!(first.variable, "x");
+        assert!(first.approximate, "{first:?}");
+    }
+
+    #[test]
+    fn trace_data_unchanged_files_keep_the_first_parameter_hop_exact() {
+        let trace = trace_data_across_files_with_unindexed_edits(false, false);
+        let first = trace.hops.first().expect("parameter hop into destination");
+        assert_eq!(first.flow_type, "parameter");
+        assert_eq!(first.file, "sink.ts");
+        assert_eq!(first.variable, "p");
+        assert!(!first.approximate, "{first:?}");
+        assert!(trace
+            .hops
+            .iter()
+            .any(|hop| hop.variable == "copied" && !hop.approximate));
     }
 
     #[test]
