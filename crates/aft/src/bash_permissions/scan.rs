@@ -250,17 +250,24 @@ pub(super) fn collect_commands<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tre
     }
 }
 
+#[cfg(any(unix, test))]
+#[derive(Debug)]
+pub(crate) struct DirectoryTarget {
+    pub path: PathBuf,
+    pub literal_absolute: bool,
+}
+
 /// Resolve literal directory changes in the outer shell against the call's
 /// working folder. The scan skips nested shells and function definitions.
 #[cfg(any(unix, test))]
-pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<PathBuf> {
+pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<DirectoryTarget> {
     fn literal_word(raw: &str) -> Option<String> {
         let mut parsed = crate::bash_rewrite::parser::parse(raw)?;
         (parsed.args.len() == 1 && parsed.appends_to.is_none() && parsed.heredoc.is_none())
             .then(|| parsed.args.remove(0))
     }
 
-    fn visit(node: Node<'_>, source: &str, cwd: &Path, targets: &mut Vec<PathBuf>) {
+    fn visit(node: Node<'_>, source: &str, cwd: &Path, targets: &mut Vec<DirectoryTarget>) {
         match node.kind() {
             "subshell"
             | "command_substitution"
@@ -291,6 +298,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Path
                             text != "-"
                                 && !(head.as_deref() == Some("pushd") && text.starts_with('+'))
                         }) {
+                            let literal_absolute = Path::new(&text).is_absolute();
                             let path = if expand_home {
                                 let Some(home) = std::env::var_os("HOME") else {
                                     return;
@@ -299,7 +307,10 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Path
                             } else {
                                 cwd.join(text)
                             };
-                            targets.push(super::resolve_with_existing_ancestors(&path));
+                            targets.push(DirectoryTarget {
+                                path: super::resolve_with_existing_ancestors(&path),
+                                literal_absolute,
+                            });
                         }
                     }
                 }
@@ -726,11 +737,33 @@ fn push_ask(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, ask: Perm
 mod tests {
     use super::*;
 
+    fn directory_paths(command: &str, cwd: &Path) -> Vec<PathBuf> {
+        top_level_directory_targets(command, cwd)
+            .into_iter()
+            .map(|target| target.path)
+            .collect()
+    }
+
+    #[test]
+    fn directory_targets_preserve_literal_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let absolute = dir.path().canonicalize().unwrap();
+        let command = format!("cd '{}'; cd nested; cd '~/literal'", absolute.display());
+        let targets = top_level_directory_targets(&command, &absolute);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.literal_absolute)
+                .collect::<Vec<_>>(),
+            [true, false, false]
+        );
+    }
+
     #[test]
     fn top_level_directory_targets_resolve_lists_and_options_against_call_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap();
-        let targets = top_level_directory_targets(
+        let targets = directory_paths(
             "cd -- nested && printf ok; pushd '../sibling repo'; cd ./other/..",
             &cwd,
         );
@@ -758,10 +791,7 @@ mod tests {
             "(cd /outside; printf nested)",
             "f() { cd /outside; }; printf defined",
         ] {
-            assert!(
-                top_level_directory_targets(command, dir.path()).is_empty(),
-                "{command}"
-            );
+            assert!(directory_paths(command, dir.path()).is_empty(), "{command}");
         }
     }
 
@@ -770,11 +800,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap();
         assert_eq!(
-            top_level_directory_targets("cd '~/nested'", &cwd),
+            directory_paths("cd '~/nested'", &cwd),
             vec![cwd.join("~/nested")]
         );
         assert_eq!(
-            top_level_directory_targets(
+            directory_paths(
                 "cd ../sibling\\ repo; cd '../literal*'; cd '../$literal'",
                 &cwd
             ),
@@ -796,7 +826,7 @@ mod tests {
         std::fs::create_dir_all(&sibling).unwrap();
         std::os::unix::fs::symlink(&sibling, checkout.join("link")).unwrap();
         assert_eq!(
-            top_level_directory_targets("cd link/missing", &checkout),
+            directory_paths("cd link/missing", &checkout),
             vec![sibling.canonicalize().unwrap().join("missing")]
         );
     }

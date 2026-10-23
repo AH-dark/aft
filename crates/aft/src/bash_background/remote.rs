@@ -123,6 +123,9 @@ pub(super) fn remote_refusal(metadata: &super::PersistedTask) -> Option<super::R
         return None;
     }
     let remote = metadata.remote.as_ref().filter(|r| r.explicit_runon)?;
+    if let Some(refusal) = remote.pre_start_refusal.as_ref() {
+        return Some(refusal.as_response());
+    }
     if remote.terminal.is_none() && remote.job_id.is_none() {
         return Some(super::RemoteRefusal {
             code: "remote_unavailable",
@@ -704,6 +707,24 @@ impl RemoteOutputIncomplete {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "code")]
+pub(crate) enum RemotePreStartRefusal {
+    #[serde(rename = "runon_cd_outside_checkout")]
+    CdOutsideCheckout { message: String, ran: Ran },
+}
+
+impl RemotePreStartRefusal {
+    fn as_response(&self) -> super::RemoteRefusal {
+        match self {
+            Self::CdOutsideCheckout { message, .. } => super::RemoteRefusal {
+                code: "runon_cd_outside_checkout",
+                message: message.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RemoteTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_platform: Option<Platform>,
@@ -736,6 +757,8 @@ pub(crate) struct RemoteTask {
     pub unknown_len: u64,
     pub cancel_requested: bool,
     pub terminal: Option<TerminalRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_start_refusal: Option<RemotePreStartRefusal>,
     #[serde(default)]
     pub fallback_digest: Option<String>,
     #[serde(default)]
@@ -1622,21 +1645,73 @@ impl std::fmt::Display for RemoteRequestError {
 const RUNON_CD_OUTSIDE_CHECKOUT_MESSAGE: &str = "runon refused: the command changes into <path>, which is outside the checkout the build server copies (<checkout root>); the command did not run. Set the bash tool's workdir to that folder instead of using cd.";
 
 #[cfg(unix)]
-fn runon_cd_refusal(command: &str, cwd: &Path) -> Result<Option<String>, exec::Error> {
-    let Some(checkout) = worktree_root_containing(cwd)? else {
-        return Ok(None);
-    };
-    let cwd = cwd
+const RUNON_CD_WINDOWS_ABSOLUTE_MESSAGE: &str = "runon refused: the command changes into <path>, which is not valid on the Windows runner because absolute command paths are not translated (checkout <checkout root>); the command did not run. Set the bash tool's workdir to that folder instead of using cd.";
+
+#[cfg(unix)]
+fn runon_cd_refusal(command: &str, request: &RunRequest) -> Result<Option<String>, exec::Error> {
+    let checkout = Path::new(&request.workspace_key);
+    let cwd = Path::new(&request.cwd)
         .canonicalize()
         .map_err(|error| exec::Error::Protocol(error.to_string()))?;
+    // Sibling wire paths are absolute and are not rebased on Linux. A linked
+    // worktree also gets a mount beside the workspace under each sibling name.
+    let alias_parent = checkout
+        .join(".git")
+        .is_file()
+        .then(|| checkout.parent())
+        .flatten();
+    let mut siblings = Vec::new();
+    for sibling in &request.siblings {
+        let path = Path::new(sibling);
+        siblings.push(
+            path.canonicalize()
+                .unwrap_or_else(|_| crate::path_identity::lexical_normalize(path)),
+        );
+        if let Some((parent, name)) = alias_parent.zip(path.file_name()) {
+            siblings.push(crate::path_identity::lexical_normalize(&parent.join(name)));
+        }
+    }
+    let mut homes: Vec<PathBuf> = crate::commands::configure::resolve_account_home_dir()
+        .into_iter()
+        .collect();
+    if let Some(home) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+    {
+        homes.push(
+            home.canonicalize()
+                .unwrap_or_else(|_| crate::path_identity::lexical_normalize(&home)),
+        );
+    }
+    let windows = request.platform == Some(Platform::Windows);
     Ok(
         crate::bash_permissions::scan::top_level_directory_targets(command, &cwd)
             .into_iter()
-            .find(|target| !target.starts_with(&checkout))
-            .map(|target| {
-                RUNON_CD_OUTSIDE_CHECKOUT_MESSAGE
-                    .replace("<checkout root>", &checkout.display().to_string())
-                    .replace("<path>", &target.display().to_string())
+            .find_map(|target| {
+                let template = if windows && target.literal_absolute {
+                    RUNON_CD_WINDOWS_ABSOLUTE_MESSAGE
+                } else {
+                    let copied = target.path.starts_with(checkout)
+                        || siblings
+                            .iter()
+                            .any(|sibling| target.path.starts_with(sibling));
+                    // System and unknown paths may exist on the runner. Reject only
+                    // paths identified as local home content or another checkout.
+                    let local_only = homes.iter().any(|home| target.path.starts_with(home))
+                        || crate::root_identity::nearest_git_marker(&target.path)
+                            .ok()
+                            .flatten()
+                            .is_some();
+                    if copied || !local_only {
+                        return None;
+                    }
+                    RUNON_CD_OUTSIDE_CHECKOUT_MESSAGE
+                };
+                Some(
+                    template
+                        .replace("<checkout root>", &checkout.display().to_string())
+                        .replace("<path>", &target.path.display().to_string()),
+                )
             }),
     )
 }
@@ -1754,6 +1829,7 @@ impl BgTaskRegistry {
             unknown_len: 0,
             cancel_requested: false,
             terminal: None,
+            pre_start_refusal: None,
             fallback_digest: None,
             env_not_forwarded: None,
             queue_position: None,
@@ -1884,7 +1960,7 @@ impl BgTaskRegistry {
             .and_then(|request| {
                 if explicit_runon {
                     if let Some(message) =
-                        runon_cd_refusal(command, &workdir).map_err(RemoteRequestError::Build)?
+                        runon_cd_refusal(command, &request).map_err(RemoteRequestError::Build)?
                     {
                         return Err(RemoteRequestError::CdOutsideCheckout(message));
                     }
@@ -2014,14 +2090,7 @@ impl BgTaskRegistry {
             }
         }
         if let Some((Err(RemoteRequestError::CdOutsideCheckout(message)), _)) = initial.as_ref() {
-            self.remote_terminal(
-                &task,
-                Verdict::RunLocally {
-                    reason: RefusalReason::Unreachable,
-                    refusal_detail: None,
-                },
-                Some(message.clone()),
-            );
+            self.refuse_cd_before_start(&task, message);
             return Ok(());
         }
         let connection = remote
@@ -2834,6 +2903,40 @@ impl BgTaskRegistry {
                 }
             })
         })
+    }
+
+    /// The path check runs before runner connection or submission. Record that
+    /// the command did not run, without a runner verdict or local fallback.
+    fn refuse_cd_before_start(&self, task: &Arc<BgTask>, message: &str) {
+        {
+            let mut db = DeferredDbWrites::new(self, task);
+            let Ok(mut state) = task.state.lock() else {
+                return;
+            };
+            if state.metadata.is_terminal() {
+                return;
+            }
+            let Some(remote) = state.metadata.remote.as_mut() else {
+                return;
+            };
+            remote.pre_start_refusal = Some(RemotePreStartRefusal::CdOutsideCheckout {
+                message: message.to_owned(),
+                ran: Ran::None,
+            });
+            state.metadata.execution_note = Some(message.to_owned());
+            state
+                .metadata
+                .mark_terminal(BgTaskStatus::Failed, None, Some(message.to_owned()));
+            persist_terminal_artifacts(&task.paths, &mut state.metadata);
+            state.metadata.pipeline_status_unavailable =
+                Some("command refused before start; no pipeline segments ran".into());
+            task.mark_terminal_now();
+            let _ = self.persist_task_locked(task, &state.metadata, &mut db);
+            task.kill_settled.notify_all();
+        }
+        let _ = self.post_terminal_transition(task, true);
+        self.inner.terminal_transition.notify_waiters();
+        let _ = self.inner.wake_tx.try_send(());
     }
 
     fn refuse_remote_before_dispatch(&self, task: &Arc<BgTask>, error: &str) -> Result<(), String> {
