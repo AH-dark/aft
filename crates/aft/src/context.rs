@@ -4193,6 +4193,8 @@ pub struct AppContext {
     lsp_watcher_forward_slot: crate::lsp::manager::WatcherForwardSlot,
     /// How many of those helper threads were started, for tests.
     lsp_watcher_forward_helpers_spawned: AtomicUsize,
+    #[cfg(test)]
+    lsp_classified_watcher_forwards: parking_lot::Mutex<Option<Vec<Vec<PathBuf>>>>,
     /// Document and configuration-file changes waiting for the LSP manager
     /// lock (see [`crate::lsp::pending_changes`]); a busy lock queues them
     /// instead of dropping them.
@@ -4948,6 +4950,8 @@ impl AppContext {
             lsp_post_edit_worker_running: Arc::new(AtomicBool::new(false)),
             lsp_watcher_forward_slot: Default::default(),
             lsp_watcher_forward_helpers_spawned: AtomicUsize::new(0),
+            #[cfg(test)]
+            lsp_classified_watcher_forwards: Default::default(),
             lsp_pending_change_slot: Default::default(),
             configure_generation: Arc::new(AtomicU64::new(0)),
             configure_content_generation: Arc::new(AtomicU64::new(0)),
@@ -13314,7 +13318,26 @@ impl AppContext {
     }
 
     pub(crate) fn lsp_forward_classified_watcher_file_events(&self, paths: &[PathBuf]) {
+        #[cfg(test)]
+        if let Some(batches) = self.lsp_classified_watcher_forwards.lock().as_mut() {
+            batches.push(paths.to_vec());
+        }
         self.lsp_forward_or_queue_watcher_changes(paths, false);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_classified_watcher_forwards_for_test(&self) {
+        *self.lsp_classified_watcher_forwards.lock() = Some(Vec::new());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_classified_watcher_forwards_for_test(&self) -> Vec<Vec<PathBuf>> {
+        std::mem::take(
+            self.lsp_classified_watcher_forwards
+                .lock()
+                .as_mut()
+                .expect("classified watcher forward capture must be enabled"),
+        )
     }
 
     pub(crate) fn lsp_note_watcher_ignore_change(&self) {

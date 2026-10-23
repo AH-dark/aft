@@ -8346,13 +8346,22 @@ mod watcher_slice_tests {
 
     #[test]
     fn lsp_watcher_phase_defers_forwarding_until_all_slices_complete() {
+        let _clock = WatcherDrainTestClock::freeze();
         let temp = tempfile::tempdir().unwrap();
-        let (ctx, _) = context_with_watcher(temp.path());
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(temp.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.capture_classified_watcher_forwards_for_test();
         let paths: VecDeque<_> = (0..crate::lsp::manager::WATCHED_FILE_FORWARD_CAP + 10)
             .map(|index| temp.path().join(format!("generated_{index}.rs")))
             .chain(std::iter::once(temp.path().join("Cargo.toml")))
             .collect();
         let count = paths.len();
+        let expected: Vec<_> = paths.iter().cloned().collect();
         let mut state = WatcherDrainSliceState::new(ctx.configure_generation(), 0);
         state.phase = WatcherDrainPhase::Apply {
             stage: WatcherDrainApplyPhase::LspDiagnostics,
@@ -8360,25 +8369,49 @@ mod watcher_slice_tests {
             remaining: count,
             oversized_inline_batch: false,
         };
-        // An expired budget processes exactly one path per slice. A busy
-        // manager forces forwarding to spawn a queue-serving helper thread,
-        // whose counter reveals a send before the whole batch is processed.
-        let held = ctx.lsp();
-        for _ in 0..count {
+        // A contended diagnostics slice retains the entire batch. Forwarding
+        // cannot start until that work is retried after the manager is free.
+        {
+            let _held = ctx.lsp();
+            apply_watcher_slice(&ctx, &mut state, watcher_drain_now());
+            assert!(state.lsp_diagnostics_lock_contended);
+            assert!(matches!(
+                &state.phase,
+                WatcherDrainPhase::Apply {
+                    stage: WatcherDrainApplyPhase::LspDiagnostics,
+                    remaining,
+                    ..
+                } if *remaining == count
+            ));
+            assert!(ctx.take_classified_watcher_forwards_for_test().is_empty());
+        }
+        // Once uncontended, an expired budget applies exactly one path per
+        // slice. Capture forwarding calls directly: the uncontended send path
+        // does not need a queue-serving thread.
+        for applied in 1..=count {
             apply_watcher_slice(
                 &ctx,
                 &mut state,
-                Instant::now() - WATCHER_DRAIN_SLICE_BUDGET,
+                watcher_drain_now() - WATCHER_DRAIN_SLICE_BUDGET,
             );
-            assert_eq!(
-                ctx.lsp_watcher_forward_helpers_spawned_for_test(),
-                0,
+            assert!(matches!(
+                &state.phase,
+                WatcherDrainPhase::Apply { remaining, .. } if *remaining == count - applied
+            ));
+            assert!(
+                ctx.take_classified_watcher_forwards_for_test().is_empty(),
                 "a partial diagnostics slice must not forward a partial watcher batch"
             );
         }
-        apply_watcher_slice(&ctx, &mut state, Instant::now());
-        assert_eq!(ctx.lsp_watcher_forward_helpers_spawned_for_test(), 1);
-        drop(held);
+        apply_watcher_slice(&ctx, &mut state, watcher_drain_now());
+        assert!(matches!(state.phase, WatcherDrainPhase::Collect));
+        assert_eq!(
+            ctx.take_classified_watcher_forwards_for_test(),
+            vec![expected],
+            "forward the complete batch exactly once after all diagnostics slices finish"
+        );
+        apply_watcher_slice(&ctx, &mut state, watcher_drain_now());
+        assert!(ctx.take_classified_watcher_forwards_for_test().is_empty());
     }
 
     #[test]
