@@ -1015,6 +1015,8 @@ pub struct BackupStore {
     discovery_entry_limit: usize,
     #[cfg(test)]
     discovery_entries_examined: AtomicU64,
+    #[cfg(test)]
+    discovery_deadline_override: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -1086,6 +1088,8 @@ impl BackupStore {
             discovery_entry_limit: MAX_SESSION_DISCOVERY_ENTRIES,
             #[cfg(test)]
             discovery_entries_examined: AtomicU64::new(0),
+            #[cfg(test)]
+            discovery_deadline_override: None,
         }
     }
 
@@ -1160,6 +1164,16 @@ impl BackupStore {
     #[cfg(test)]
     pub(crate) fn release_after_next_snapshot_for_tests(&mut self) {
         self.release_after_next_snapshot = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_discovery_entry_limit_for_tests(&mut self, limit: usize) {
+        self.discovery_entry_limit = limit;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_discovery_for_tests(&mut self) {
+        self.discovery_deadline_override = Some(Instant::now());
     }
 
     #[cfg(test)]
@@ -2327,9 +2341,24 @@ impl BackupStore {
             .map_or(0, |(meta, _)| meta.count)
     }
 
-    /// Return all files that have at least one backup entry in this session
-    /// (memory + disk). Other sessions' files are not visible.
+    /// Best-effort tracked-file count input for status displays. Callers that
+    /// create restore points must use `try_tracked_files` instead.
     pub fn tracked_files(&self, session: &str) -> Vec<PathBuf> {
+        self.try_tracked_files(session).unwrap_or_else(|error| {
+            crate::slog_warn!("backup path discovery failed for session {session}: {error}");
+            self.cached_tracked_files(session).into_iter().collect()
+        })
+    }
+
+    /// Return the complete session path inventory or the discovery failure;
+    /// never let an incomplete scan become an empty or partial checkpoint.
+    pub fn try_tracked_files(&self, session: &str) -> Result<Vec<PathBuf>, AftError> {
+        let mut files = self.cached_tracked_files(session);
+        files.extend(self.read_session_disk_index(session)?.into_keys());
+        Ok(files.into_iter().collect())
+    }
+
+    fn cached_tracked_files(&self, session: &str) -> HashSet<PathBuf> {
         let mut files: std::collections::HashSet<PathBuf> = self
             .entries
             .get(session)
@@ -2340,13 +2369,7 @@ impl BackupStore {
                 files.insert(key.clone());
             }
         }
-        match self.read_session_disk_index(session) {
-            Ok(disk) => files.extend(disk.into_keys()),
-            Err(error) => {
-                crate::slog_warn!("backup path discovery failed for session {session}: {error}")
-            }
-        }
-        files.into_iter().collect()
+        files
     }
 
     /// Preview the file path that `restore_latest` would write for `(session, path)`.
@@ -4447,6 +4470,10 @@ impl BackupStore {
         }
 
         let deadline = backup_discovery_deadline();
+        #[cfg(test)]
+        let deadline = self
+            .discovery_deadline_override
+            .map_or(deadline, |override_| override_.min(deadline));
         #[cfg(not(test))]
         let entry_limit = MAX_SESSION_DISCOVERY_ENTRIES;
         #[cfg(test)]
