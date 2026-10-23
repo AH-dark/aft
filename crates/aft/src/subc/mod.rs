@@ -7239,6 +7239,58 @@ fn normalized_scope_workdir(workdir: &Path) -> Option<PathBuf> {
     }
 }
 
+const MAX_SCOPE_WORKDIR_DIAGNOSTICS: usize = 2;
+
+#[derive(Default)]
+struct ScopeWorkdirDiagnostics {
+    in_flight: StdMutex<HashSet<String>>,
+    pool: OnceLock<crate::bounded_io::IsolatedPool>,
+    #[cfg(test)]
+    idle: std::sync::Condvar,
+}
+
+static SCOPE_WORKDIR_DIAGNOSTICS: LazyLock<Arc<ScopeWorkdirDiagnostics>> =
+    LazyLock::new(|| Arc::new(ScopeWorkdirDiagnostics::default()));
+
+struct ScopeWorkdirPermit {
+    diagnostics: Arc<ScopeWorkdirDiagnostics>,
+    workdir: String,
+}
+
+impl ScopeWorkdirDiagnostics {
+    fn try_admit(self: &Arc<Self>, workdir: &str) -> Result<ScopeWorkdirPermit, &'static str> {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if in_flight.contains(workdir) {
+            return Err("workdir_already_in_flight");
+        }
+        if in_flight.len() >= MAX_SCOPE_WORKDIR_DIAGNOSTICS {
+            return Err("diagnostic_capacity_exhausted");
+        }
+        // The daemon supplies the canonical spelling, including missing tails.
+        // Admission must not touch the filesystem to derive a different key.
+        in_flight.insert(workdir.to_owned());
+        Ok(ScopeWorkdirPermit {
+            diagnostics: Arc::clone(self),
+            workdir: workdir.to_owned(),
+        })
+    }
+}
+
+impl Drop for ScopeWorkdirPermit {
+    fn drop(&mut self) {
+        self.diagnostics
+            .in_flight
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.workdir);
+        #[cfg(test)]
+        self.diagnostics.idle.notify_all();
+    }
+}
+
 fn schedule_scope_workdir_comparison(
     identity: &subc_protocol::BindIdentity,
     scope: Option<&subc_protocol::scope::ScopeStamp>,
@@ -7249,14 +7301,26 @@ fn schedule_scope_workdir_comparison(
     };
     #[cfg(test)]
     let observed = scope_workdir_tests::take_comparison_observer();
+    let permit = match SCOPE_WORKDIR_DIAGNOSTICS.try_admit(workdir) {
+        Ok(permit) => permit,
+        Err(reason) => {
+            log_scope_workdir_comparison(identity, stamp, Err(io::Error::other(reason)));
+            #[cfg(test)]
+            if let Some(observed) = observed {
+                let _ = observed.send(());
+            }
+            return;
+        }
+    };
     let budget = crate::bounded_io::Budget::after(crate::bounded_io::IO_BUDGET);
     let deadline = tokio::time::Instant::from_std(budget.deadline);
     let project_root = identity.project_root.clone();
     let workdir = workdir.to_owned();
     // A diagnostic must not delay frame processing or serialize project work. The
     // bounded helper owns all filesystem work; the blocking task only waits for it.
-    let worker =
-        tokio::task::spawn_blocking(move || compare_scope_workdir(project_root, workdir, budget));
+    let worker = tokio::task::spawn_blocking(move || {
+        compare_scope_workdir(project_root, workdir, budget, permit)
+    });
     let identity = identity.clone();
     let stamp = stamp.clone();
     tokio::spawn(async move {
@@ -7284,12 +7348,21 @@ fn compare_scope_workdir(
     project_root: PathBuf,
     workdir: String,
     budget: crate::bounded_io::Budget,
+    permit: ScopeWorkdirPermit,
 ) -> io::Result<Option<(PathBuf, PathBuf)>> {
     // A stamped folder can have a missing tail. Normalize its existing prefix
     // like a routing root, including Windows path spelling, then append that tail.
     // Bound the whole walk, including direct canonicalization of the project root.
+    let pool = permit
+        .diagnostics
+        .pool
+        .get_or_init(|| crate::bounded_io::IsolatedPool::new(MAX_SCOPE_WORKDIR_DIAGNOSTICS))
+        .clone();
     crate::bounded_io::with_budget(Some(budget), || {
-        crate::bounded_io::run(Path::new(&workdir), None, move |workdir| {
+        pool.run(Path::new(&workdir), None, move |workdir| {
+            // Keep both the capacity slot and this folder's deduplication key
+            // until the actual filesystem job exits, not merely until timeout.
+            let _permit = permit;
             let (Ok(project_root), Some(workdir)) = (
                 ProjectRootId::from_path(project_root),
                 normalized_scope_workdir(&workdir),
