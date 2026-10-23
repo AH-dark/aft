@@ -696,6 +696,33 @@ fn job_log_reply_with_ansi_and_split_characters_is_accepted() {
     assert_eq!((reply.offset, reply.length, reply.total_bytes), (1, 14, 16));
 }
 
+// Pinned to Plexus's own vector (copied byte for byte; see the fixture
+// directory's README for the source commit and path): 18 raw bytes starting
+// with a colour code and ending inside a three-byte character, whose display
+// body is 10 bytes.
+#[test]
+fn job_log_reply_matches_plexus_display_text_vector() {
+    let request: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/plexus-github-read-bot/job-log-range-display-text.request.json"
+    ))
+    .unwrap();
+    let reply: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/plexus-github-read-bot/job-log-range-display-text.reply.json"
+    ))
+    .unwrap();
+    let request: WireRequest =
+        serde_json::from_value(request["call"]["arguments"].clone()).unwrap();
+    let ReadReply::JobLog(decoded) = executor::decode_reply(&request, &reply).unwrap() else {
+        panic!("job log request must decode to a job log reply");
+    };
+    assert_eq!(decoded.body, "\u{2713} ok\n\u{FFFD}");
+    assert_eq!(decoded.body.len(), 10);
+    assert_eq!(
+        (decoded.offset, decoded.length, decoded.total_bytes),
+        (100, 18, 4000)
+    );
+}
+
 // Every remaining raw-range rule still rejects its own violation. The bodies
 // deliberately differ from `length`, so no case passes or fails on body size.
 #[test]
