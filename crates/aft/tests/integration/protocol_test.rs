@@ -10,6 +10,24 @@
 use super::helpers::AftProcess;
 
 #[test]
+fn oversized_input_recovers_after_draining_the_actual_wire_frame() {
+    use std::io::Read;
+    let mut aft = AftProcess::spawn();
+    let response = aft.send_streamed_line(
+        br#"{"id":"too-large","command":"ping","padding":""#,
+        std::io::repeat(b'x').take(64 * 1024 * 1024),
+        br#""}"#,
+    );
+    assert_eq!(response["id"], "_parse_error");
+    assert_eq!(response["code"], "request_too_large");
+    assert!(response["message"].as_str().unwrap().contains("64 MiB"));
+    let next = aft.send(r#"{"id":"after-oversize","command":"ping"}"#);
+    assert_eq!(next["id"], "after-oversize");
+    assert_eq!(next["success"], true);
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn invalid_utf8_is_a_recoverable_protocol_line() {
     let mut aft = AftProcess::spawn();
     let response = aft.send_bytes(b"\xff");

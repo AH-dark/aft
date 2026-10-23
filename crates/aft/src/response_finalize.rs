@@ -530,17 +530,14 @@ pub struct PendingResponses {
 }
 
 impl PendingResponses {
-    pub fn register(&mut self, pending: PendingResponse) {
-        self.entries.retain(|entry| {
-            let keep = entry.request_id != pending.request_id;
-            if !keep {
-                if let Some(cancellation) = &entry.cancellation {
-                    cancellation.request_cancel();
-                }
-            }
-            keep
-        });
+    /// IDs are unique across sessions while pending on one standalone connection.
+    /// Rejected work stays owned by the caller; the original slot is untouched.
+    pub fn register(&mut self, pending: PendingResponse) -> Result<(), Box<PendingResponse>> {
+        if self.contains(&pending.request_id) {
+            return Err(Box::new(pending));
+        }
         self.entries.push(pending);
+        Ok(())
     }
 
     /// Signal cooperative cancellation without removing the response slot.
@@ -622,6 +619,8 @@ impl PendingResponses {
             .any(|entry| entry.request_id == request_id)
     }
 
+    /// Cancellation-only cleanup after the transport is no longer writable.
+    /// Use `drain_on_shutdown_delivering` to account for terminal replies.
     pub fn drain_on_shutdown(&mut self) {
         for pending in self.entries.drain(..) {
             if let Some(cancellation) = &pending.cancellation {
@@ -630,8 +629,8 @@ impl PendingResponses {
         }
     }
 
-    /// Resolve shutdown-aware entries before removing them from the registry.
-    /// Entries without a shutdown terminal retain the legacy drop behavior.
+    /// Resolve every shutdown entry, using a fallback cancellation reply
+    /// when a producer has not supplied its own shutdown terminal.
     pub fn drain_on_shutdown_with(&mut self, ctx: &AppContext) -> Vec<ResolvedPending> {
         let mut resolved = Vec::new();
         self.drain_on_shutdown_delivering(ctx, |response| resolved.push(response));
@@ -652,14 +651,20 @@ impl PendingResponses {
             if let Some(cancellation) = &pending.cancellation {
                 cancellation.request_cancel();
             }
-            if let Some(shutdown) = pending.on_shutdown.as_mut() {
-                let response = shutdown(ctx);
-                deliver(ResolvedPending {
-                    response,
-                    session_id: pending.session_id,
-                    attach_command: pending.attach_command,
-                });
-            }
+            let response = if let Some(shutdown) = pending.on_shutdown.as_mut() {
+                shutdown(ctx)
+            } else {
+                Response::error(
+                    &pending.request_id,
+                    "request_cancelled",
+                    "request cancelled because the connection is shutting down",
+                )
+            };
+            deliver(ResolvedPending {
+                response,
+                session_id: pending.session_id,
+                attach_command: pending.attach_command,
+            });
         }
     }
 }
@@ -902,6 +907,81 @@ mod tests {
     use crate::protocol::Response;
 
     #[test]
+    fn duplicate_registration_preserves_original_response_and_cancellation() {
+        let ctx = standalone_ctx();
+        let original_cancel = crate::executor::JobCancellation::new();
+        let mut pending = PendingResponses::default();
+        pending
+            .register(
+                PendingResponse::polling(
+                    "same".into(),
+                    "first".into(),
+                    "read".into(),
+                    Box::new(|_| {
+                        Some(Response::success(
+                            "same",
+                            serde_json::json!({"owner":"original"}),
+                        ))
+                    }),
+                )
+                .with_cancellation(original_cancel.clone()),
+            )
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
+        assert!(pending
+            .register(PendingResponse::polling(
+                "same".into(),
+                "second".into(),
+                "read".into(),
+                Box::new(|_| Some(Response::success(
+                    "same",
+                    serde_json::json!({"owner":"replacement"})
+                )))
+            ))
+            .is_err());
+        assert!(
+            !original_cancel.cancel_requested_before_commit(),
+            "duplicate must not cancel the original work"
+        );
+        let ready = pending.poll_ready(&ctx);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].response.data["owner"], "original");
+    }
+
+    #[test]
+    fn shutdown_without_callback_has_one_correlated_terminal_and_cancels_first() {
+        let ctx = standalone_ctx();
+        let cancellation = crate::executor::JobCancellation::new();
+        let mut pending = PendingResponses::default();
+        pending
+            .register(
+                PendingResponse::polling(
+                    "fallback".into(),
+                    "session".into(),
+                    "read".into(),
+                    Box::new(|_| None),
+                )
+                .with_cancellation(cancellation.clone())
+                .with_admitted_config(ctx.config()),
+            )
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
+        ctx.update_config(|config| config.restrict_to_project_root = true);
+        let mut delivered = Vec::new();
+        pending.drain_on_shutdown_delivering(&ctx, |resolved| {
+            assert!(cancellation.cancel_requested_before_commit());
+            assert!(
+                !ctx.config().restrict_to_project_root,
+                "shutdown finalization must retain admission config"
+            );
+            delivered.push(resolved);
+        });
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].response.id, "fallback");
+        assert_eq!(delivered[0].response.data["code"], "request_cancelled");
+        assert!(pending.is_empty());
+        pending.drain_on_shutdown_delivering(&ctx, |_| panic!("terminal delivered twice"));
+    }
+
+    #[test]
     fn pending_response_channel_without_connection_scope_retains_timer() {
         let (_sender, receiver) = super::pending_response_channel::<Response>();
         let pending = PendingResponse::from_receiver(
@@ -1132,17 +1212,19 @@ mod tests {
     fn shutdown_delivery_emits_terminal_before_removing_entry() {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         let mut pending = PendingResponses::default();
-        pending.register(
-            PendingResponse::polling(
-                "inspect-shutdown".to_string(),
-                String::new(),
-                String::new(),
-                Box::new(|_| None),
+        pending
+            .register(
+                PendingResponse::polling(
+                    "inspect-shutdown".to_string(),
+                    String::new(),
+                    String::new(),
+                    Box::new(|_| None),
+                )
+                .with_shutdown(Box::new(|_| {
+                    Response::error("inspect-shutdown", "daemon_shutdown", "shutdown")
+                })),
             )
-            .with_shutdown(Box::new(|_| {
-                Response::error("inspect-shutdown", "daemon_shutdown", "shutdown")
-            })),
-        );
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
 
         let resolved = pending.drain_on_shutdown_with(&ctx);
         assert_eq!(resolved.len(), 1);

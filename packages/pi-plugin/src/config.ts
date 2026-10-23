@@ -11,6 +11,7 @@ import {
   legacyConfigNoticeMessage,
   legacyProjectConfigLocationNotice,
   MIN_WORKER_WAIT_MAX_MS,
+  malformedSecurityConfigErrors,
   mergeIndexes,
   migrateAftConfigFile as migrateLegacyAftConfigFile,
   noticeDigest,
@@ -44,7 +45,8 @@ export { ConfigRejectedError } from "@cortexkit/aft-bridge";
 const ACTIVE_HARNESS = "pi";
 
 function isConfigRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+  // comment-json boxes scalar roots; they are not configuration objects.
+  return Object.prototype.toString.call(value) === "[object Object]";
 }
 
 function normalizeConfigForActiveHarness(value: unknown): unknown {
@@ -1430,7 +1432,7 @@ export function getConfigLoadErrors(): readonly ConfigLoadError[] {
 
 export function formatConfigParseFailureMessage(configPath: string, errorMessage: string): string {
   return (
-    `AFT config at ${configPath} failed to parse and was ignored (running on defaults): ${errorMessage}. ` +
+    `AFT config at ${configPath} failed to parse and was rejected; no configuration was applied: ${errorMessage}. ` +
     "Fix the syntax or run `npx @cortexkit/aft doctor`."
   );
 }
@@ -1484,9 +1486,9 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
     configLoadSources.push(configPath);
     configLoadTexts.set(configPath, content);
     const rawConfig = parseJsonc<Record<string, unknown>>(content);
-    if (!rawConfig || typeof rawConfig !== "object" || Array.isArray(rawConfig)) {
+    if (!isConfigRecord(rawConfig)) {
       recordConfigParseFailure(configPath, "root must be an object");
-      return null;
+      throw new ConfigRejectedError(["invalid_config_document"], configPath);
     }
     // comment-json attaches Symbol(before/after:<key>) props to track comments.
     // Zod stringifies keys when building error paths, which throws on those
@@ -1494,10 +1496,11 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
     // Validate against a symbol-free deep copy.
     cleanConfig = stripJsoncSymbols(rawConfig);
   } catch (err) {
+    if (err instanceof ConfigRejectedError) throw err;
     const errorMsg = err instanceof Error ? err.message : String(err);
     error(`Error loading config from ${configPath}: ${errorMsg}`);
     recordConfigParseFailure(configPath, errorMsg);
-    return null;
+    throw new ConfigRejectedError(["invalid_config_document"], configPath);
   }
 
   // Retired keys are translated on the raw document, before schema
@@ -1547,6 +1550,12 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
     log(`Config loaded from ${configPath}`);
     parsed = result.data;
   } else {
+    const rejected = malformedSecurityConfigErrors(
+      normalizeConfigForActiveHarness(cleanConfig),
+      ACTIVE_HARNESS,
+      result.error.issues,
+    );
+    if (rejected.length > 0) throw new ConfigRejectedError(rejected, configPath);
     const errorMsg = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ");
     warn(`Config validation error in ${configPath}: ${errorMsg}`);
     configValidationErrors.push({ path: configPath, message: errorMsg });
@@ -1584,6 +1593,7 @@ function parseConfigPartially(rawConfig: Record<string, unknown>): AftConfig {
         partialConfig[key] = parsed[key];
       }
     } else {
+      warn(`Discarded invalid configuration section: ${key}`);
       const sectionErrors = sectionResult.error.issues
         .filter((i) => i.path[0] === key)
         .map((i) => `${i.path.join(".")}: ${i.message}`)
@@ -2140,7 +2150,8 @@ export function buildConfigTierConfigureParams(
  * Load and resolve the user and project config for one project. The result
  * always carries a sorted `disabled_tools` list and fully resolved `indexes`.
  * Retired keys are translated, never refused. Throws {@link ConfigRejectedError}
- * when the resolved configuration is incomplete.
+ * when a document or security setting is invalid, or the resolved configuration
+ * is incomplete. A rejected reload must keep the last-good configuration.
  */
 export function loadAftConfig(projectDirectory: string): AftConfig {
   configLoadErrors = [];
@@ -2161,8 +2172,8 @@ export function loadAftConfig(projectDirectory: string): AftConfig {
     });
   }
 
-  // A missing or unreadable user file behaves like `{}`, which still receives
-  // the absent-base disabled default.
+  // Only a missing user file receives the absent-base disabled default;
+  // unreadable or invalid candidates reject the load.
   let config: AftConfig = loadConfigFromPath(userConfigPath, "user") ?? {
     disabled_tools: [...DEFAULT_DISABLED_TOOLS],
   };

@@ -885,6 +885,22 @@ impl AftProcess {
         self.read_json_line()
     }
 
+    /// Stream a single line without materializing a large test payload in memory.
+    pub fn send_streamed_line(
+        &mut self,
+        prefix: &[u8],
+        mut payload: impl std::io::Read,
+        suffix: &[u8],
+    ) -> serde_json::Value {
+        let stdin = self.child.stdin.as_mut().expect("stdin handle");
+        stdin.write_all(prefix).expect("write prefix");
+        std::io::copy(&mut payload, stdin).expect("stream payload");
+        stdin.write_all(suffix).expect("write suffix");
+        stdin.write_all(b"\n").expect("write delimiter");
+        stdin.flush().expect("flush stdin");
+        self.read_json_line()
+    }
+
     /// Send a raw line and collect response lines until `predicate` returns true.
     pub fn send_until<F>(&mut self, request: &str, mut predicate: F) -> Vec<serde_json::Value>
     where

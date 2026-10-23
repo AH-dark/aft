@@ -95,6 +95,26 @@ pub(super) fn catalog(
     let powershell = crate::bash_background::powershell_available();
     let worker_wait_max_ms = ctx.config().bash.worker_wait_max_ms;
     let (request, catalog_preset) = tool_provider::validate_catalog_request(body)?;
+    let routing_policy = if preset == "worker"
+        && (original.contains_key("remote_exec")
+            || original.contains_key("siblings")
+            || original.contains_key("confine"))
+    {
+        Some(
+            crate::exec_remote::FrozenParams::decode(&original).map_err(|error| {
+                let field = if error.starts_with("remote_exec:") {
+                    "params.remote_exec"
+                } else if error.starts_with("confine:") {
+                    "params.confine"
+                } else {
+                    "params.siblings"
+                };
+                cortexkit_role_tool_provider::errors::invalid_request(field, error)
+            })?,
+        )
+    } else {
+        None
+    };
     access_grants::catalog(original.get("allow_paths"), identity, ctx, &preset)?;
     // A head preflighting a worker plan validates its override without changing
     // its own session. The actual worker fetch persists the override on its scope.
@@ -125,28 +145,7 @@ pub(super) fn catalog(
         })?;
     }
     if let Some(key) = key(identity, Some(&preset)) {
-        if original.contains_key("remote_exec")
-            || original.contains_key("siblings")
-            || original.contains_key("confine")
-        {
-            let policy = match crate::exec_remote::FrozenParams::decode(&original) {
-                Ok(policy) => policy,
-                Err(error) => {
-                    log::warn!(
-                        "remote execution routing disabled: malformed catalog params: {error}"
-                    );
-                    crate::exec_remote::FrozenParams {
-                        confine: original
-                            .get("confine")
-                            .map(|_| crate::exec_remote::RootConfinement::Root),
-                        host: original
-                            .get("host")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        ..Default::default()
-                    }
-                }
-            };
+        if let Some(policy) = routing_policy {
             let Some(db) = ctx.db() else {
                 return Err(cortexkit_role_tool_provider::errors::invalid_request(
                     "params",

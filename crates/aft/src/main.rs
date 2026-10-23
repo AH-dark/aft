@@ -1,4 +1,5 @@
 mod cli;
+mod standalone_input;
 
 #[cfg(test)]
 #[path = "../tests/helpers/context_storage.rs"]
@@ -30,8 +31,14 @@ use aft::lsp::child_registry::LspChildRegistry;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
 use aft::response_finalize::{DispatchOutcome, PendingResponse, PendingResponses};
 use aft::runtime_registry::RuntimeRegistry;
+use standalone_input::{
+    HeldInput, InputBudget, InputFrame, OversizedLine, MAX_HELD_BYTES, MAX_HELD_ITEMS,
+    MAX_LINE_BYTES, MAX_RETAINED_BYTES, MAX_RETAINED_ITEMS,
+};
 use std::collections::VecDeque;
-use std::io::{self, BufRead, Write};
+#[cfg(test)]
+use std::io::BufRead;
+use std::io::{self, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -440,7 +447,9 @@ fn main() {
     let mut pending = PendingResponses::default();
     let mut configure_maintenance = aft::runtime_drain::StandaloneConfigureMaintenance::default();
     let mut queued_lines = VecDeque::new();
-    let (line_tx, line_rx) = crossbeam_channel::unbounded::<io::Result<String>>();
+    let input_budget = InputBudget::new(MAX_RETAINED_BYTES, MAX_RETAINED_ITEMS);
+    let reader_budget = Arc::clone(&input_budget);
+    let (line_tx, line_rx) = crossbeam_channel::bounded::<InputFrame>(MAX_RETAINED_ITEMS);
     let (deferred_wake_tx, deferred_wake_rx) = crossbeam_channel::bounded::<()>(1);
     // Holding a sender here keeps the wake channel connected for the whole
     // loop even if the process-wide slot was already taken, so waiting on it
@@ -456,13 +465,22 @@ fn main() {
     // has been written. This keeps file mutations strictly serialized: a second
     // edit of the same file cannot start until the first one has finished.
     let mut validation_gate: Option<String> = None;
-    let mut held_lines: VecDeque<io::Result<String>> = VecDeque::new();
+    let mut held_lines = HeldInput::new(MAX_HELD_BYTES, MAX_HELD_ITEMS);
     const VALIDATION_GATE_POLL_INTERVAL: Duration = DRAIN_INTERVAL;
     thread::spawn(move || {
         let stdin = io::stdin();
-        let reader = stdin.lock();
-        for line_result in reader.lines() {
-            if line_tx.send(line_result).is_err() {
+        let mut reader = stdin.lock();
+        loop {
+            let (result, fatal) =
+                match standalone_input::read_bounded_line(&mut reader, MAX_LINE_BYTES) {
+                    Ok(Some(line)) => (line.result, false),
+                    Ok(None) => break,
+                    Err(error) => (Err(error), true),
+                };
+            let Some(frame) = reader_budget.admit(result) else {
+                break;
+            };
+            if line_tx.send(frame).is_err() || fatal {
                 break;
             }
         }
@@ -509,7 +527,7 @@ fn main() {
         } else {
             pending_poll_interval
         };
-        let line_result = if let Some(result) = queued_lines.pop_front() {
+        let line_frame = if let Some(result) = queued_lines.pop_front() {
             result
         } else {
             match wait_for_loop_input(&line_rx, &deferred_wake_rx, recv_timeout) {
@@ -578,10 +596,10 @@ fn main() {
             }
         };
 
-        let line = match line_result {
+        let line = match &line_frame.result {
             Ok(l) => l,
             Err(e) => {
-                if let Some(response) = recoverable_stdin_error(&e) {
+                if let Some(response) = recoverable_stdin_error(e) {
                     if let Err(error) = write_response(registry.current(), &response) {
                         aft::slog_error!("stdout write error: {}", error);
                         break;
@@ -601,73 +619,92 @@ fn main() {
         let mut shutdown_after_response = false;
         let response = match serde_json::from_str::<RawRequest>(trimmed) {
             Ok(req) => {
-                if gated && !is_served_during_pending_validation(&req.command) {
-                    held_lines.push_back(Ok(line.clone()));
-                    continue;
-                }
-                if !gated {
-                    // The first request after each configure waits for the request-critical
-                    // prefix. The remaining project-runtime and indexing work stays
-                    // cooperative, so even ping runs before another suffix unit.
-                    configure_maintenance.drain_prefix(registry.current());
-                    if configure_maintenance.has_pending(registry.current()) {
-                        aft::runtime_drain::note_configure_maintenance_yield(
-                            queued_lines.len() + 1,
-                        );
-                    }
-                    // Install any completed search index before applying watcher changes.
-                    // These bounded, non-blocking drains let each request use the freshest
-                    // available index without waiting for configure maintenance.
-                    aft::logging::note_drain_slice();
-                    drain_non_configure_runtime_events(&registry);
-                }
-                let request_id = req.id.clone();
-                let session_id = req.session().to_string();
-                let command = req.command.clone();
-                let attach_command = attach_command_for_request(&req);
-                let session_id_for_log = req.session_id.clone();
-                // P3-02/P3-03 seam: request-root identity is absent in
-                // standalone; the selected single runtime is the root today.
-                // P3-03 adds an explicit root selector here instead of path inference.
-                let runtime = registry.current();
-                runtime.note_request();
-                // Keep the query snapshot/gaps pinned through standalone finalization.
-                let _request_pin = runtime.pin_config();
-                let gates_on_validation = offloads_full_validation(&req, runtime);
-                let dispatch_result = if req.command == "cancel_request" {
-                    Ok(DispatchOutcome::Immediate(handle_cancel_request(
-                        &req,
-                        &mut pending,
-                    )))
+                if let Some(response) = duplicate_pending_response(&req, &pending) {
+                    Some(response)
                 } else {
-                    catch_unwind(AssertUnwindSafe(|| {
-                        log_ctx::with_session(session_id_for_log, || dispatch_outcome(req, runtime))
-                    }))
-                };
-                match dispatch_result {
-                    Ok(DispatchOutcome::Immediate(mut response)) => {
-                        aft::response_finalize::finalize_response(
-                            &mut response,
-                            runtime,
-                            &session_id,
-                            &attach_command,
-                        );
-                        Some(response)
-                    }
-                    Ok(DispatchOutcome::Deferred(pending_response)) => {
-                        if gates_on_validation {
-                            validation_gate = Some(request_id.clone());
+                    if gated && !is_served_during_pending_validation(&req.command) {
+                        if let Err(_refused) = held_lines.push(line_frame) {
+                            if let Err(error) = write_response(
+                                registry.current(),
+                                &input_queue_full_response(&req.id),
+                            ) {
+                                aft::slog_error!("stdout write error: {}", error);
+                                break;
+                            }
                         }
-                        pending.register(pending_response.with_admitted_config(runtime.config()));
-                        None
+                        continue;
                     }
-                    Err(payload) => {
-                        shutdown_after_response = true;
-                        Some(dispatch_panic_response(
-                            request_id,
-                            &command,
-                            payload.as_ref(),
-                        ))
+                    if !gated {
+                        // The first request after each configure waits for the request-critical
+                        // prefix. The remaining project-runtime and indexing work stays
+                        // cooperative, so even ping runs before another suffix unit.
+                        configure_maintenance.drain_prefix(registry.current());
+                        if configure_maintenance.has_pending(registry.current()) {
+                            aft::runtime_drain::note_configure_maintenance_yield(
+                                queued_lines.len() + 1,
+                            );
+                        }
+                        // Install any completed search index before applying watcher changes.
+                        // These bounded, non-blocking drains let each request use the freshest
+                        // available index without waiting for configure maintenance.
+                        aft::logging::note_drain_slice();
+                        drain_non_configure_runtime_events(&registry);
+                    }
+                    let request_id = req.id.clone();
+                    let session_id = req.session().to_string();
+                    let command = req.command.clone();
+                    let attach_command = attach_command_for_request(&req);
+                    let session_id_for_log = req.session_id.clone();
+                    // Standalone requests share one selected runtime. The envelope
+                    // has no separate root selector, so do not infer a runtime from
+                    // a file path inside an individual tool's arguments.
+                    let runtime = registry.current();
+                    runtime.note_request();
+                    // Keep the request's configuration snapshot pinned through
+                    // standalone response finalization.
+                    let _request_pin = runtime.pin_config();
+                    let gates_on_validation = offloads_full_validation(&req, runtime);
+                    let dispatch_result = catch_unwind(AssertUnwindSafe(|| {
+                        log_ctx::with_session(session_id_for_log, || {
+                            dispatch_with_pending_admission(req, runtime, &mut pending)
+                        })
+                    }));
+                    match dispatch_result {
+                        Ok(DispatchOutcome::Immediate(mut response)) => {
+                            aft::response_finalize::finalize_response(
+                                &mut response,
+                                runtime,
+                                &session_id,
+                                &attach_command,
+                            );
+                            Some(response)
+                        }
+                        Ok(DispatchOutcome::Deferred(pending_response)) => {
+                            match pending
+                                .register(pending_response.with_admitted_config(runtime.config()))
+                            {
+                                Ok(()) => {
+                                    if gates_on_validation {
+                                        validation_gate = Some(request_id.clone());
+                                    }
+                                    None
+                                }
+                                Err(rejected) => {
+                                    if let Some(cancellation) = rejected.cancellation {
+                                        cancellation.request_cancel();
+                                    }
+                                    Some(duplicate_request_response(&request_id))
+                                }
+                            }
+                        }
+                        Err(payload) => {
+                            shutdown_after_response = true;
+                            Some(dispatch_panic_response(
+                                request_id,
+                                &command,
+                                payload.as_ref(),
+                            ))
+                        }
                     }
                 }
             }
@@ -733,6 +770,7 @@ fn main() {
         }
     }
 
+    input_budget.close();
     let shutdown_started = Instant::now();
     aft::slog_info!(
         "shutdown phase=begin graceful_stdin={}",
@@ -881,7 +919,7 @@ fn wake_standalone_loop_for_deferred_response() {
 /// What the standalone loop woke up for.
 enum LoopInput {
     /// A line read from stdin.
-    Line(io::Result<String>),
+    Line(InputFrame),
     /// A deferred worker finished and its response can be written.
     DeferredResponseReady,
     /// Nothing arrived within the wait; time for periodic work.
@@ -891,7 +929,7 @@ enum LoopInput {
 }
 
 fn wait_for_loop_input(
-    line_rx: &crossbeam_channel::Receiver<io::Result<String>>,
+    line_rx: &crossbeam_channel::Receiver<InputFrame>,
     deferred_wake_rx: &crossbeam_channel::Receiver<()>,
     timeout: Duration,
 ) -> LoopInput {
@@ -906,8 +944,8 @@ fn wait_for_loop_input(
 }
 
 fn collect_queued_lines(
-    line_rx: &crossbeam_channel::Receiver<io::Result<String>>,
-    queued_lines: &mut VecDeque<io::Result<String>>,
+    line_rx: &crossbeam_channel::Receiver<InputFrame>,
+    queued_lines: &mut VecDeque<InputFrame>,
 ) -> usize {
     while let Ok(line) = line_rx.try_recv() {
         queued_lines.push_back(line);
@@ -1689,6 +1727,35 @@ fn dispatch_outcome_on_route(req: RawRequest, ctx: &Arc<AppContext>) -> Dispatch
     DispatchOutcome::Immediate(dispatch(req, ctx))
 }
 
+fn dispatch_with_pending_admission(
+    req: RawRequest,
+    ctx: &Arc<AppContext>,
+    pending: &mut PendingResponses,
+) -> DispatchOutcome {
+    if let Some(response) = duplicate_pending_response(&req, pending) {
+        return DispatchOutcome::Immediate(response);
+    }
+    if req.command == "cancel_request" {
+        DispatchOutcome::Immediate(handle_cancel_request(&req, pending))
+    } else {
+        dispatch_outcome(req, ctx)
+    }
+}
+
+fn duplicate_pending_response(req: &RawRequest, pending: &PendingResponses) -> Option<Response> {
+    pending
+        .contains(&req.id)
+        .then(|| duplicate_request_response(&req.id))
+}
+
+fn duplicate_request_response(id: &str) -> Response {
+    Response::error(
+        id,
+        "duplicate_request_id",
+        "request id is already pending on this connection",
+    )
+}
+
 /// Direct protocol commands that write through `edit::write_format_validate`
 /// and can therefore run the project type checker.
 fn is_validating_mutation_command(command: &str) -> bool {
@@ -2014,9 +2081,27 @@ fn parse_error_request_id(line: &str) -> String {
 }
 
 fn recoverable_stdin_error(error: &io::Error) -> Option<Response> {
-    // BufRead::lines consumes the entire invalid line, so the next read is framed.
+    if let Some(oversized) = error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<OversizedLine>())
+    {
+        return Some(Response::error(
+            "_parse_error",
+            "request_too_large",
+            oversized.to_string(),
+        ));
+    }
+    // The bounded reader drains the invalid line before admitting the next frame.
     (error.kind() == io::ErrorKind::InvalidData)
         .then(|| Response::error("_parse_error", "parse_error", "request is not valid UTF-8"))
+}
+
+fn input_queue_full_response(id: &str) -> Response {
+    Response::error(
+        id,
+        "request_queue_full",
+        "request queue is full while validation is pending; retry after the current edit finishes",
+    )
 }
 
 #[cfg(test)]
@@ -2078,6 +2163,88 @@ mod core_framing_tests {
     use super::*;
 
     #[test]
+    fn input_limit_refusals_preserve_error_envelope_and_correlation_rules() {
+        let error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            OversizedLine {
+                limit: MAX_LINE_BYTES,
+            },
+        );
+        let oversized = recoverable_stdin_error(&error).unwrap();
+        assert_eq!(oversized.id, "_parse_error");
+        assert_eq!(oversized.data["code"], "request_too_large");
+        assert_eq!(oversized.data["message"], "request exceeds the 64 MiB (67108864 bytes) input limit; split it into smaller requests");
+        assert!(!oversized.success);
+        let held = input_queue_full_response("held-id");
+        assert_eq!(held.id, "held-id");
+        assert_eq!(held.data["code"], "request_queue_full");
+        assert_eq!(held.data["message"], "request queue is full while validation is pending; retry after the current edit finishes");
+        assert_eq!(
+            serde_json::to_value(held)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn duplicate_pending_id_is_rejected_before_dispatch_across_sessions() {
+        let ctx = Arc::new(
+            AppContext::new(
+                Box::new(aft::parser::TreeSitterProvider::new()),
+                crate::context_storage::isolate(Config::default()),
+            )
+            .with_test_checkpoint_store(),
+        );
+        let mut pending = PendingResponses::default();
+        pending
+            .register(PendingResponse::polling(
+                "shared-id".into(),
+                "first-session".into(),
+                "read".into(),
+                Box::new(|_| {
+                    Some(Response::success(
+                        "shared-id",
+                        serde_json::json!({"original":true}),
+                    ))
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&dispatched);
+        DISPATCH_CONFIG_PROBE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |_| {
+                observed.store(true, Ordering::SeqCst);
+            }))
+        });
+        let request: RawRequest = serde_json::from_value(
+            serde_json::json!({"id":"shared-id","session_id":"second-session","command":"ping"}),
+        )
+        .unwrap();
+        let outcome = dispatch_with_pending_admission(request, &ctx, &mut pending);
+        DISPATCH_CONFIG_PROBE.with(|slot| slot.borrow_mut().take());
+        assert!(
+            !dispatched.load(Ordering::SeqCst),
+            "duplicate rejection must precede dispatch work"
+        );
+        let DispatchOutcome::Immediate(response) = outcome else {
+            panic!("duplicate must be refused immediately")
+        };
+        assert_eq!(response.data["code"], "duplicate_request_id");
+        assert_eq!(pending.poll_ready(&ctx)[0].response.data["original"], true);
+        let reused: RawRequest =
+            serde_json::from_value(serde_json::json!({"id":"shared-id","command":"ping"})).unwrap();
+        let DispatchOutcome::Immediate(reused) =
+            dispatch_with_pending_admission(reused, &ctx, &mut pending)
+        else {
+            panic!("ping is immediate")
+        };
+        assert!(reused.success, "an id may be reused after its terminal");
+    }
+
+    #[test]
     fn offloaded_worker_wakes_loop_after_finishing() {
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
         DEFERRED_RESPONSE_WAKER
@@ -2112,15 +2279,17 @@ mod core_framing_tests {
         )
         .with_test_checkpoint_store();
         let mut pending = PendingResponses::default();
-        pending.register(
-            PendingResponse::polling(
-                "pinned".into(),
-                "s".into(),
-                "ping".into(),
-                Box::new(|_| Some(Response::success("pinned", serde_json::json!({})))),
+        pending
+            .register(
+                PendingResponse::polling(
+                    "pinned".into(),
+                    "s".into(),
+                    "ping".into(),
+                    Box::new(|_| Some(Response::success("pinned", serde_json::json!({})))),
+                )
+                .with_admitted_config(ctx.config()),
             )
-            .with_admitted_config(ctx.config()),
-        );
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
         ctx.update_config(|config| config.restrict_to_project_root = true);
         finalize_ready_pending(&ctx, &mut pending, |_| {
             assert!(
@@ -2408,22 +2577,24 @@ mod pending_response_tests {
         let mut pending = PendingResponses::default();
         let poll_calls = Arc::new(AtomicUsize::new(0));
         let calls_for_poll = Arc::clone(&poll_calls);
-        pending.register(PendingResponse::polling(
-            "pending-registry".to_string(),
-            session_id.to_string(),
-            "read".to_string(),
-            Box::new(move |_| {
-                let next = calls_for_poll.fetch_add(1, Ordering::SeqCst) + 1;
-                if next <= 2 {
-                    None
-                } else {
-                    Some(Response::success(
-                        "pending-registry",
-                        serde_json::json!({"ready": true}),
-                    ))
-                }
-            }),
-        ));
+        pending
+            .register(PendingResponse::polling(
+                "pending-registry".to_string(),
+                session_id.to_string(),
+                "read".to_string(),
+                Box::new(move |_| {
+                    let next = calls_for_poll.fetch_add(1, Ordering::SeqCst) + 1;
+                    if next <= 2 {
+                        None
+                    } else {
+                        Some(Response::success(
+                            "pending-registry",
+                            serde_json::json!({"ready": true}),
+                        ))
+                    }
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
 
         let mut writer = Vec::new();
         for expected_calls in 1..=2 {
@@ -2501,7 +2672,9 @@ mod pending_response_tests {
         let mut pending = PendingResponses::default();
         match outcome {
             aft::response_finalize::DispatchOutcome::Deferred(pending_response) => {
-                pending.register(pending_response);
+                pending
+                    .register(pending_response)
+                    .unwrap_or_else(|_| panic!("pending request id must be unique"));
             }
             aft::response_finalize::DispatchOutcome::Immediate(response) => {
                 panic!("expected deferred wait-mode bash, got immediate response: {response:?}");
@@ -2617,15 +2790,17 @@ mod pending_response_tests {
         let mut pending = PendingResponses::default();
         let poll_calls = Arc::new(AtomicUsize::new(0));
         let calls_for_poll = Arc::clone(&poll_calls);
-        pending.register(PendingResponse::polling(
-            "pending-drain".to_string(),
-            "session-drain".to_string(),
-            "read".to_string(),
-            Box::new(move |_| {
-                calls_for_poll.fetch_add(1, Ordering::SeqCst);
-                None
-            }),
-        ));
+        pending
+            .register(PendingResponse::polling(
+                "pending-drain".to_string(),
+                "session-drain".to_string(),
+                "read".to_string(),
+                Box::new(move |_| {
+                    calls_for_poll.fetch_add(1, Ordering::SeqCst);
+                    None
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
         let mut writer = Vec::new();
 
         assert_eq!(
@@ -2667,15 +2842,17 @@ mod pending_response_tests {
 
         let events_for_pending = Arc::clone(&events);
         let mut pending = PendingResponses::default();
-        pending.register(PendingResponse::polling(
-            "pending-order".to_string(),
-            "session-order".to_string(),
-            "bash".to_string(),
-            Box::new(move |_| {
-                events_for_pending.lock().unwrap().push("pending");
-                Some(Response::success("pending-order", serde_json::json!({})))
-            }),
-        ));
+        pending
+            .register(PendingResponse::polling(
+                "pending-order".to_string(),
+                "session-order".to_string(),
+                "bash".to_string(),
+                Box::new(move |_| {
+                    events_for_pending.lock().unwrap().push("pending");
+                    Some(Response::success("pending-order", serde_json::json!({})))
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
         let mut writer = Vec::new();
 
         assert_eq!(
@@ -2695,22 +2872,24 @@ mod pending_response_tests {
         let mut pending = PendingResponses::default();
         let poll_calls = Arc::new(AtomicUsize::new(0));
         let calls_for_poll = Arc::clone(&poll_calls);
-        pending.register(PendingResponse::polling(
-            "pending-long".to_string(),
-            "session-long".to_string(),
-            "read".to_string(),
-            Box::new(move |_| {
-                let next = calls_for_poll.fetch_add(1, Ordering::SeqCst) + 1;
-                if next <= 50 {
-                    None
-                } else {
-                    Some(Response::success(
-                        "pending-long",
-                        serde_json::json!({"ready_after_ticks": next}),
-                    ))
-                }
-            }),
-        ));
+        pending
+            .register(PendingResponse::polling(
+                "pending-long".to_string(),
+                "session-long".to_string(),
+                "read".to_string(),
+                Box::new(move |_| {
+                    let next = calls_for_poll.fetch_add(1, Ordering::SeqCst) + 1;
+                    if next <= 50 {
+                        None
+                    } else {
+                        Some(Response::success(
+                            "pending-long",
+                            serde_json::json!({"ready_after_ticks": next}),
+                        ))
+                    }
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
         let mut writer = Vec::new();
 
         for expected_calls in 1..=50 {
@@ -2740,32 +2919,36 @@ mod pending_response_tests {
         let second_ready = Arc::new(AtomicBool::new(false));
         let second_ready_for_poll = Arc::clone(&second_ready);
         let mut pending = PendingResponses::default();
-        pending.register(PendingResponse::polling(
-            "pending-ready".to_string(),
-            "session-multi".to_string(),
-            "read".to_string(),
-            Box::new(|_| {
-                Some(Response::success(
-                    "pending-ready",
-                    serde_json::json!({"which": "ready"}),
-                ))
-            }),
-        ));
-        pending.register(PendingResponse::polling(
-            "pending-later".to_string(),
-            "session-multi".to_string(),
-            "read".to_string(),
-            Box::new(move |_| {
-                if second_ready_for_poll.load(Ordering::SeqCst) {
+        pending
+            .register(PendingResponse::polling(
+                "pending-ready".to_string(),
+                "session-multi".to_string(),
+                "read".to_string(),
+                Box::new(|_| {
                     Some(Response::success(
-                        "pending-later",
-                        serde_json::json!({"which": "later"}),
+                        "pending-ready",
+                        serde_json::json!({"which": "ready"}),
                     ))
-                } else {
-                    None
-                }
-            }),
-        ));
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
+        pending
+            .register(PendingResponse::polling(
+                "pending-later".to_string(),
+                "session-multi".to_string(),
+                "read".to_string(),
+                Box::new(move |_| {
+                    if second_ready_for_poll.load(Ordering::SeqCst) {
+                        Some(Response::success(
+                            "pending-later",
+                            serde_json::json!({"which": "later"}),
+                        ))
+                    } else {
+                        None
+                    }
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
         let mut writer = Vec::new();
 
         assert_eq!(
@@ -2795,18 +2978,20 @@ mod pending_response_tests {
         let poll_calls = Arc::new(AtomicUsize::new(0));
         let calls_for_poll = Arc::clone(&poll_calls);
         let mut pending = PendingResponses::default();
-        pending.register(PendingResponse::polling(
-            "pending-shutdown".to_string(),
-            "session-shutdown".to_string(),
-            "read".to_string(),
-            Box::new(move |_| {
-                calls_for_poll.fetch_add(1, Ordering::SeqCst);
-                Some(Response::success(
-                    "pending-shutdown",
-                    serde_json::json!({"should_not_write": true}),
-                ))
-            }),
-        ));
+        pending
+            .register(PendingResponse::polling(
+                "pending-shutdown".to_string(),
+                "session-shutdown".to_string(),
+                "read".to_string(),
+                Box::new(move |_| {
+                    calls_for_poll.fetch_add(1, Ordering::SeqCst);
+                    Some(Response::success(
+                        "pending-shutdown",
+                        serde_json::json!({"should_not_write": true}),
+                    ))
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
         let mut writer = Vec::new();
 
         pending.drain_on_shutdown();
@@ -2965,7 +3150,9 @@ mod deferred_semantic_search_tests {
     fn register_deferred(outcome: DispatchOutcome) -> PendingResponses {
         let mut pending = PendingResponses::default();
         match outcome {
-            DispatchOutcome::Deferred(response) => pending.register(response),
+            DispatchOutcome::Deferred(response) => pending
+                .register(response)
+                .unwrap_or_else(|_| panic!("pending request id must be unique")),
             DispatchOutcome::Immediate(response) => {
                 panic!("semantic search must be deferred, got {response:?}")
             }

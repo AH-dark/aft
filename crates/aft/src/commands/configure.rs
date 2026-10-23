@@ -21213,7 +21213,7 @@ mod tests {
             "project_root": project.path(), "harness": "runner", "storage_dir": ctx._storage.path(),
             "config": [user_tier(json!({
                 "indexes": {"trigram": true, "semantic": true, "callgraph": true},
-                "semantic": {"backend": "openai-compatible", "base_url": "http://127.0.0.1:1"},
+                "semantic": {"backend": "openai_compatible", "base_url": "http://127.0.0.1:1"},
                 "views": {"enabled": true},
             }))],
         }));

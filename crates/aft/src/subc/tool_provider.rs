@@ -1242,6 +1242,7 @@ pub(super) fn note_native_outcome(
 pub(super) struct LedgerEdge {
     calls: std::sync::Mutex<std::collections::HashMap<(super::RouteChannel, u64), LedgerCall>>,
     waiting: std::sync::Mutex<std::collections::HashMap<(super::RouteChannel, u64), LedgerWait>>,
+    authorizing: std::sync::Mutex<std::collections::HashSet<super::ReverseCorrKey>>,
     ready: tokio::sync::mpsc::UnboundedSender<super::DecodedFrame>,
     recent_sweeps: std::sync::Mutex<
         std::collections::HashMap<crate::path_identity::ProjectRootId, std::time::Instant>,
@@ -1658,6 +1659,7 @@ impl LedgerEdge {
                 calls: Default::default(),
                 waiting: Default::default(),
                 recent_sweeps: Default::default(),
+                authorizing: Default::default(),
                 ready,
             }),
             receiver,
@@ -2474,10 +2476,11 @@ impl LedgerEdge {
         {
             return Err(decoded);
         };
-        let Some(ask) = asks.get(&ReverseCorrKey {
+        let ask_key = ReverseCorrKey {
             route,
             corr: decoded.frame.header.corr,
-        }) else {
+        };
+        let Some(ask) = asks.get(&ask_key) else {
             return Err(decoded);
         };
         let (root, key) = {
@@ -2487,41 +2490,72 @@ impl LedgerEdge {
             };
             (call.root.clone(), call.key.clone())
         };
+        // Ignore duplicate allow replies while the first database update runs.
+        // A duplicate's failed transition must not consume the permission entry
+        // before the first update can release its authorized reply.
+        if !self.authorizing.lock().unwrap().insert(ask_key) {
+            return Ok(());
+        }
         let edge = self.clone();
         let rx = executor.submit_async(
             root,
             Lane::Mutating,
             "ledger-authorize".into(),
             Box::new(move |ctx| {
-                let allowed = ctx
-                    .db()
-                    .and_then(|db| {
-                        db.lock().ok().map(|conn| {
-                            ledger::transition(&conn, &key, State::Prepared, State::Authorized)
-                                .and_then(|authorized| {
-                                    if authorized {
-                                        ledger::transition(
-                                            &conn,
-                                            &key,
-                                            State::Authorized,
-                                            State::DispatchStarted,
-                                        )
-                                    } else {
-                                        Ok(false)
-                                    }
-                                })
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false);
-                Response::success("ledger-authorize", json!({"allowed":allowed}))
+                let authorization = (|| {
+                    let db = ctx
+                        .db()
+                        .ok_or_else(|| "Call ledger is unavailable".to_owned())?;
+                    let conn = db
+                        .lock()
+                        .map_err(|_| "Call ledger database mutex is poisoned".to_owned())?;
+                    let authorized =
+                        ledger::transition(&conn, &key, State::Prepared, State::Authorized)
+                            .map_err(|error| error.to_string())?;
+                    if !authorized {
+                        return Ok(false);
+                    }
+                    ledger::transition(&conn, &key, State::Authorized, State::DispatchStarted)
+                        .map_err(|error| error.to_string())
+                })();
+                match authorization {
+                    Ok(true) => Response::success("ledger-authorize", json!({"allowed":true})),
+                    result => Response::error(
+                        "ledger-authorize",
+                        "database_unavailable",
+                        match result {
+                            Err(error) => error,
+                            _ => "Durable authorization transition was not applied".to_owned(),
+                        },
+                    ),
+                }
             }),
         );
         tokio::spawn(async move {
             let response = await_executor_response(rx, "ledger-authorize".into()).await;
-            if response.data["allowed"] == true {
-                let _ = edge.ready.send(decoded);
+            let mut decoded = decoded;
+            if response.data["allowed"] != true {
+                log::warn!(
+                    "call ledger authorization failed channel={} epoch={} corr={}: {}",
+                    route.channel,
+                    route.epoch,
+                    ask_key.corr,
+                    response.data
+                );
+                decoded.frame = build_error_frame(
+                    decoded.frame.header.ver,
+                    route.channel,
+                    route.epoch,
+                    ask_key.corr,
+                    decoded.frame.header.flags,
+                    "database_unavailable",
+                    AUTHORIZATION_FAILURE_MESSAGE,
+                )
+                .expect("bounded authorization failure uses a valid ask header");
+                decoded.parsed_body = Default::default();
             }
+            let _ = edge.ready.send(decoded);
+            edge.authorizing.lock().unwrap().remove(&ask_key);
         });
         Ok(())
     }
@@ -2530,14 +2564,14 @@ impl LedgerEdge {
         self: &std::sync::Arc<Self>,
         actual: super::WriterSender,
         executor: std::sync::Arc<crate::executor::Executor>,
-        metrics: std::sync::Arc<super::DispatchPathMetrics>,
+        _metrics: std::sync::Arc<super::DispatchPathMetrics>,
     ) -> (super::WriterSender, tokio::task::JoinHandle<()>) {
         use super::*;
         use crate::db::call_ledger::{self as ledger, RecordedFrame, State};
         let (sender, mut receiver) = mpsc::channel::<WriterFrame>(WRITER_QUEUE_CAPACITY);
         let edge = self.clone();
         let task = tokio::spawn(async move {
-            while let Some(outgoing) = receiver.recv().await {
+            while let Some(mut outgoing) = receiver.recv().await {
                 let route = route_key(outgoing.header.channel, outgoing.header.epoch);
                 let terminal = matches!(
                     outgoing.header.ty,
@@ -2579,7 +2613,6 @@ impl LedgerEdge {
                     continue;
                 }
                 let actual = actual.clone();
-                let metrics = metrics.clone();
                 let recorded = RecordedFrame {
                     ty: outgoing.header.ty,
                     body: copy_terminal_body(&outgoing.body),
@@ -2590,45 +2623,70 @@ impl LedgerEdge {
                     Lane::Mutating,
                     "ledger-settle".into(),
                     Box::new(move |ctx| {
-                        if let Some(db) = ctx.db() {
-                            if let Ok(conn) = db.lock() {
-                                let row = ledger::get(&conn, &call.key).ok().flatten();
-                                let reason = row
-                                    .as_ref()
-                                    .filter(|row| row.state == State::Prepared)
-                                    .map(|_| {
-                                        if std::time::Instant::now() >= call.expires_at {
-                                            "expired"
-                                        } else {
-                                            "denied"
-                                        }
-                                    });
-                                let inferred = ledger::outcome(&record_for_job);
-                                let outcome = if reason.is_some() {
-                                    "bash_denied_untrusted".into()
-                                } else if record_for_job.ty == FrameType::Response
-                                    && inferred == "unknown"
-                                {
-                                    row.and_then(|row| row.outcome)
-                                        .filter(|outcome| outcome != "ok")
-                                        .unwrap_or(inferred)
-                                } else {
-                                    inferred
-                                };
-                                if let Err(error) = ledger::settle(
-                                    &conn,
-                                    &call.key,
-                                    &record_for_job,
-                                    &outcome,
-                                    reason,
-                                    ledger::now_ms(),
-                                ) {
-                                    return Response::error(
-                                        "ledger-settle",
-                                        "database_unavailable",
-                                        error.to_string(),
-                                    );
-                                }
+                        let Some(db) = ctx.db() else {
+                            return Response::error(
+                                "ledger-settle",
+                                "database_unavailable",
+                                "Call ledger is unavailable",
+                            );
+                        };
+                        let Ok(conn) = db.lock() else {
+                            return Response::error(
+                                "ledger-settle",
+                                "database_unavailable",
+                                "Call ledger database mutex is poisoned",
+                            );
+                        };
+                        let row = ledger::get(&conn, &call.key).ok().flatten();
+                        let reason =
+                            row.as_ref()
+                                .filter(|row| row.state == State::Prepared)
+                                .map(|_| {
+                                    if std::time::Instant::now() >= call.expires_at {
+                                        "expired"
+                                    } else {
+                                        "denied"
+                                    }
+                                });
+                        let inferred = ledger::outcome(&record_for_job);
+                        let outcome = if reason.is_some() {
+                            "bash_denied_untrusted".into()
+                        } else if record_for_job.ty == FrameType::Response && inferred == "unknown"
+                        {
+                            row.and_then(|row| row.outcome)
+                                .filter(|outcome| outcome != "ok")
+                                .unwrap_or(inferred)
+                        } else {
+                            inferred
+                        };
+                        match ledger::settle(
+                            &conn,
+                            &call.key,
+                            &record_for_job,
+                            &outcome,
+                            reason,
+                            ledger::now_ms(),
+                        ) {
+                            Ok(true) => {}
+                            Ok(false)
+                                if ledger::get(&conn, &call.key)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|row| row.frame)
+                                    .is_some_and(|frame| {
+                                        frame.ty == record_for_job.ty
+                                            && frame.body == record_for_job.body
+                                    }) => {}
+                            result => {
+                                return Response::error(
+                                    "ledger-settle",
+                                    "database_unavailable",
+                                    match result {
+                                        Err(error) => error.to_string(),
+                                        _ => "Call ledger did not retain this terminal result"
+                                            .to_owned(),
+                                    },
+                                )
                             }
                         }
                         Response::success("ledger-settle", json!({}))
@@ -2637,8 +2695,14 @@ impl LedgerEdge {
                 tokio::spawn(async move {
                     let settled = await_executor_response(rx, "ledger-settle".into()).await;
                     if !settled.success {
-                        decrement_counted_channel(&metrics.writer_queued);
-                        return;
+                        log::warn!(
+                            "call ledger settlement failed channel={} epoch={} corr={}: {}",
+                            outgoing.header.channel,
+                            outgoing.header.epoch,
+                            outgoing.header.corr,
+                            settled.data
+                        );
+                        outgoing.frame = uncertain_settlement_frame(&outgoing.frame);
                     }
                     if actual.send(outgoing).await.is_err() {
                         return;
@@ -2665,6 +2729,26 @@ fn detach_shell_row(ctx: &crate::context::AppContext, key: &crate::db::call_ledg
     if let Some(task) = task {
         ctx.bash_background().settle_detached_call(&task);
     }
+}
+
+pub(super) const AUTHORIZATION_FAILURE_MESSAGE: &str =
+    "Authorization could not be durably recorded; the command was not started.";
+
+const SETTLEMENT_RESULT_EXCERPT_BYTES: usize = 8192;
+
+fn uncertain_settlement_frame(original: &subc_protocol::Frame) -> subc_protocol::Frame {
+    // Untrusted routes already omit native structured fields from this wire
+    // body. Excerpt that filtered body; do not rebuild it from a native response.
+    let prefix_len = original.body.len().min(SETTLEMENT_RESULT_EXCERPT_BYTES);
+    let prefix = String::from_utf8_lossy(&original.body[..prefix_len]);
+    let end = prefix.floor_char_boundary(SETTLEMENT_RESULT_EXCERPT_BYTES);
+    let truncated = prefix_len < original.body.len() || end < prefix.len();
+    super::build_error_frame_with_detail(original.header.ver, original.header.channel,
+        original.header.epoch, original.header.corr, original.header.flags,
+        "outcome_unknown",
+        "The request produced a terminal result, but AFT could not confirm that it was durably recorded. Its durable outcome is uncertain; replay is not guaranteed.",
+        json!({"original_result_excerpt": &prefix[..end], "original_result_truncated": truncated}),
+    ).expect("bounded settlement error uses a valid terminal header")
 }
 
 fn ledger_refusal_result(
@@ -6703,5 +6787,370 @@ mod ledger_terminal_tests {
             result.text,
             "semantic_search: database_unavailable — ledger offline"
         );
+    }
+}
+
+#[cfg(test)]
+mod settlement_failure_tests {
+    use super::*;
+    use crate::subc::*;
+
+    async fn failed_settlement(case: &str, body: Vec<u8>) -> Frame {
+        let (_dir, root) = test_support::test_root("ledger-settlement-failure");
+        let executor = Arc::new(Executor::new());
+        let key = crate::db::call_ledger::Key {
+            carrier: "fixture".into(),
+            call_key: "uncertain".into(),
+        };
+        if case != "missing-actor" {
+            let ctx = test_support::test_ctx();
+            if case != "missing-db" {
+                let db = Arc::new(std::sync::Mutex::new(
+                    crate::db::open(&_dir.path().join("aft.db")).unwrap(),
+                ));
+                {
+                    let conn = db.lock().unwrap();
+                    if case != "absent-row" {
+                        crate::db::call_ledger::admit(
+                            &conn,
+                            &key,
+                            "digest",
+                            None,
+                            crate::db::call_ledger::State::DispatchStarted,
+                        )
+                        .unwrap();
+                    }
+                    if case == "already-retained" {
+                        crate::db::call_ledger::settle(
+                            &conn,
+                            &key,
+                            &crate::db::call_ledger::RecordedFrame {
+                                ty: FrameType::Response,
+                                body: body.clone(),
+                            },
+                            "ok",
+                            None,
+                            crate::db::call_ledger::now_ms(),
+                        )
+                        .unwrap();
+                    }
+                    if case == "sql" {
+                        conn.execute_batch("CREATE TRIGGER refuse_settlement BEFORE UPDATE ON call_ledger BEGIN SELECT RAISE(ABORT, 'settlement fixture failure'); END;").unwrap();
+                    }
+                }
+                if case == "poisoned-db" {
+                    let poison = db.clone();
+                    let _ = std::thread::spawn(move || {
+                        let _guard = poison.lock().unwrap();
+                        panic!("poison settlement fixture");
+                    })
+                    .join();
+                }
+                ctx.set_db(db);
+            }
+            executor.register_actor(root.clone(), ctx);
+        }
+        let (edge, _) = LedgerEdge::new();
+        let route = route_key(42, 3);
+        edge.calls.lock().unwrap().insert(
+            (route, 7),
+            LedgerCall {
+                root,
+                key,
+                shell: false,
+                detached: false,
+                withdrawn: None,
+                expires_at: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (actual, mut receiver) = tokio::sync::mpsc::channel(4);
+        let (writer, proxy) = edge.proxy(actual, executor.clone(), metrics.clone());
+        let original = Frame::build(FrameType::Response, control_flags(), 42, 3, 7, body).unwrap();
+        send_reliable_writer_frame(&writer, &metrics, original, "settlement fixture")
+            .await
+            .unwrap();
+        drop(writer);
+        proxy.await.unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .expect("failed settlement must still answer the original caller");
+        assert_eq!(
+            terminal.header.ty,
+            if case == "already-retained" {
+                FrameType::Response
+            } else {
+                FrameType::Error
+            },
+            "{case}"
+        );
+        assert_eq!(
+            (
+                terminal.header.channel,
+                terminal.header.epoch,
+                terminal.header.corr
+            ),
+            (42, 3, 7)
+        );
+        assert_eq!(terminal.header.flags, control_flags());
+        assert_eq!(metrics.writer_queued.load(Ordering::Relaxed), 1);
+        decrement_counted_channel(&metrics.writer_queued);
+        assert_eq!(metrics.writer_queued.load(Ordering::Relaxed), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .is_none(),
+            "one original request has one terminal"
+        );
+        terminal.frame
+    }
+
+    async fn check_failure(case: &str) {
+        let body = serde_json::to_vec(&serde_json::json!({"isError":false,"content":[{"type":"text","text":"already produced"}]})).unwrap();
+        let terminal = failed_settlement(case, body.clone()).await;
+        let error: Value = serde_json::from_slice(&terminal.body).unwrap();
+        assert_eq!(error["code"], "outcome_unknown");
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .contains("replay is not guaranteed"));
+        assert_eq!(
+            error["detail"]["original_result_excerpt"],
+            String::from_utf8(body).unwrap()
+        );
+        assert_eq!(error["detail"]["original_result_truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn missing_actor_settlement_answers_once_with_uncertain_durable_outcome() {
+        check_failure("missing-actor").await;
+    }
+    #[tokio::test]
+    async fn sql_settlement_failure_answers_once_with_uncertain_durable_outcome() {
+        check_failure("sql").await;
+    }
+    #[tokio::test]
+    async fn missing_database_settlement_does_not_claim_replayable_success() {
+        check_failure("missing-db").await;
+    }
+    #[tokio::test]
+    async fn poisoned_database_settlement_does_not_claim_replayable_success() {
+        check_failure("poisoned-db").await;
+    }
+
+    #[tokio::test]
+    async fn absent_ledger_row_does_not_claim_successful_settlement() {
+        check_failure("absent-row").await;
+    }
+
+    #[tokio::test]
+    async fn already_retained_matching_terminal_is_forwarded_without_uncertainty() {
+        let body = serde_json::to_vec(&serde_json::json!({"isError":false,"content":[{"type":"text","text":"already produced"}]})).unwrap();
+        let terminal = failed_settlement("already-retained", body.clone()).await;
+        assert_eq!(terminal.body, body);
+    }
+
+    #[tokio::test]
+    async fn uncertain_settlement_result_detail_is_bounded_and_disclosed() {
+        let body = serde_json::to_vec(&serde_json::json!({"isError":false,"content":[{"type":"text","text":"é".repeat(16384)}]})).unwrap();
+        let terminal = failed_settlement("sql", body).await;
+        let error: Value = serde_json::from_slice(&terminal.body).unwrap();
+        let excerpt = error["detail"]["original_result_excerpt"].as_str().unwrap();
+        assert!(excerpt.len() <= 8192);
+        assert_eq!(error["detail"]["original_result_truncated"], true);
+    }
+}
+
+#[cfg(test)]
+mod authorization_failure_tests {
+    use super::*;
+    use crate::subc::*;
+
+    fn pending_ask(root: &ProjectRootId) -> PendingBashAsk {
+        let identity =
+            test_support::route_identity_with_trust(root, "authorization", BindTrust::Untrusted);
+        PendingBashAsk {
+            route: route_key(42, 3),
+            tool_corr: 78,
+            tool_flags: control_flags(),
+            tool_ver: PROTOCOL_VERSION,
+            root: root.clone(),
+            project_root: root.as_path().to_path_buf(),
+            session_id: identity.session.clone(),
+            spawn_principal: identity.spawn_principal.clone(),
+            edit_slot_survives: None,
+            call_key: Some("authorization".into()),
+            request_id: "authorization".into(),
+            arguments: json!({"command":"printf must-not-run"}),
+            format_context: crate::subc_format::FormatContext::default(),
+            cancel: bash::BashWaitCancel {
+                run_scope: None,
+                scope: None,
+                late_results: false,
+                ledger_carrier: None,
+                connection: PersistentCancelSignal::new(),
+                route: PersistentCancelSignal::new(),
+                drain: drain::ModuleDrainWindow::default(),
+            },
+            grants: Vec::new(),
+            repeat: None,
+            worker_session: false,
+            worker_preset: false,
+            reply_budget: crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None),
+            asked_at: Instant::now(),
+            expires_at: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    async fn authorization_failure(case: &str) {
+        let (_dir, root) = test_support::test_root("authorization-failure");
+        let executor = Arc::new(Executor::new());
+        let ctx = test_support::test_ctx();
+        let key = crate::db::call_ledger::Key {
+            carrier: "fixture".into(),
+            call_key: "authorization".into(),
+        };
+        if case != "missing-db" {
+            let db = Arc::new(std::sync::Mutex::new(
+                crate::db::open(&_dir.path().join("aft.db")).unwrap(),
+            ));
+            {
+                let conn = db.lock().unwrap();
+                crate::db::call_ledger::admit(
+                    &conn,
+                    &key,
+                    "digest",
+                    None,
+                    crate::db::call_ledger::State::Prepared,
+                )
+                .unwrap();
+                let state = if case == "first-transition" {
+                    "Authorized"
+                } else {
+                    "DispatchStarted"
+                };
+                conn.execute_batch(&format!("CREATE TRIGGER refuse_authorization BEFORE UPDATE ON call_ledger WHEN NEW.state='{state}' BEGIN SELECT RAISE(ABORT, 'authorization fixture failure'); END;")).unwrap();
+            }
+            ctx.set_db(db);
+        }
+        executor.register_actor(root.clone(), ctx);
+        let route = route_key(42, 3);
+        let (edge, mut ready) = LedgerEdge::new();
+        edge.calls.lock().unwrap().insert(
+            (route, 78),
+            LedgerCall {
+                root: root.clone(),
+                key,
+                shell: true,
+                detached: false,
+                withdrawn: None,
+                expires_at: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        let reverse = ReverseCorrKey { route, corr: 100 };
+        let mut asks = HashMap::from([(reverse, pending_ask(&root))]);
+        let allow = || DecodedFrame {
+            confinement: None,
+            launch_restore: None,
+            parsed_body: Default::default(),
+            frame: Frame::build(
+                FrameType::Response,
+                control_flags(),
+                42,
+                3,
+                100,
+                br#"{"decision":"allow"}"#.to_vec(),
+            )
+            .unwrap(),
+            phase_trace: PhaseTrace::new(Instant::now()),
+        };
+        assert!(edge.authorize(allow(), &asks, &executor).is_ok());
+        assert!(edge.authorize(allow(), &asks, &executor).is_ok());
+        let failure = tokio::time::timeout(Duration::from_secs(1), ready.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure.frame.header.ty, FrameType::Error);
+        assert_eq!(failure.frame.header.corr, 100);
+        let error: Value = serde_json::from_slice(&failure.frame.body).unwrap();
+        assert_eq!(error["code"], "database_unavailable");
+        let identity =
+            test_support::route_identity_with_trust(&root, "authorization", BindTrust::Untrusted);
+        let routes = HashMap::from([(route, identity)]);
+        let (writer, mut replies) = tokio::sync::mpsc::channel(8);
+        let (bash_tx, mut bash_rx) = tokio::sync::mpsc::channel(8);
+        let (touch_tx, _) = tokio::sync::mpsc::channel(8);
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let mut live = HashMap::new();
+        let mut cancels = HashMap::new();
+        let shutdown = Arc::new(Notify::new());
+        let dispatch: DispatchFn =
+            |_, _| panic!("failed authorization must never dispatch a command");
+        handle_bash_elicitation_reply(
+            &writer,
+            &failure.frame,
+            true,
+            &mut asks,
+            &routes,
+            &mut live,
+            &executor,
+            &shutdown,
+            &bash_tx,
+            &touch_tx,
+            &metrics,
+            &mut cancels,
+            dispatch,
+        )
+        .await
+        .unwrap();
+        assert!(asks.is_empty());
+        let reply = replies.recv().await.unwrap();
+        assert_eq!(reply.header.corr, 78);
+        let body: Value = serde_json::from_slice(reply.body()).unwrap();
+        assert_eq!(body["isError"], true);
+        assert!(body["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("could not be durably recorded"));
+        handle_bash_elicitation_reply(
+            &writer,
+            &failure.frame,
+            true,
+            &mut asks,
+            &routes,
+            &mut live,
+            &executor,
+            &shutdown,
+            &bash_tx,
+            &touch_tx,
+            &metrics,
+            &mut cancels,
+            dispatch,
+        )
+        .await
+        .unwrap();
+        assert!(replies.try_recv().is_err());
+        assert!(bash_rx.try_recv().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), ready.recv())
+                .await
+                .is_err(),
+            "duplicate allows have one authorization completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_prepared_authorization_resolves_one_ask_without_execution() {
+        authorization_failure("first-transition").await;
+    }
+    #[tokio::test]
+    async fn failed_dispatch_transition_resolves_one_ask_without_execution() {
+        authorization_failure("second-transition").await;
+    }
+    #[tokio::test]
+    async fn missing_authorization_database_resolves_one_ask_without_execution() {
+        authorization_failure("missing-db").await;
     }
 }
