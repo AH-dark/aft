@@ -7239,7 +7239,7 @@ fn normalized_scope_workdir(workdir: &Path) -> Option<PathBuf> {
     }
 }
 
-fn log_scope_workdir_mismatch(
+fn schedule_scope_workdir_comparison(
     identity: &subc_protocol::BindIdentity,
     scope: Option<&subc_protocol::scope::ScopeStamp>,
 ) {
@@ -7247,23 +7247,83 @@ fn log_scope_workdir_mismatch(
     let Some(workdir) = stamp.workdir.as_deref() else {
         return;
     };
+    #[cfg(test)]
+    let observed = scope_workdir_tests::take_comparison_observer();
+    let budget = crate::bounded_io::Budget::after(crate::bounded_io::IO_BUDGET);
+    let deadline = tokio::time::Instant::from_std(budget.deadline);
+    let project_root = identity.project_root.clone();
+    let workdir = workdir.to_owned();
+    // A diagnostic must not delay frame processing or serialize project work. The
+    // bounded helper owns all filesystem work; the blocking task only waits for it.
+    let worker =
+        tokio::task::spawn_blocking(move || compare_scope_workdir(project_root, workdir, budget));
+    let identity = identity.clone();
+    let stamp = stamp.clone();
+    tokio::spawn(async move {
+        // Include time queued in Tokio's blocking pool in the same budget. Late
+        // filesystem results are discarded and cannot produce a mismatch record.
+        let result = match tokio::time::timeout_at(deadline, worker).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(io::Error::other(format!(
+                "comparison worker failed: {error}"
+            ))),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "filesystem comparison budget expired",
+            )),
+        };
+        log_scope_workdir_comparison(&identity, &stamp, result);
+        #[cfg(test)]
+        if let Some(observed) = observed {
+            let _ = observed.send(());
+        }
+    });
+}
+
+fn compare_scope_workdir(
+    project_root: PathBuf,
+    workdir: String,
+    budget: crate::bounded_io::Budget,
+) -> io::Result<Option<(PathBuf, PathBuf)>> {
     // A stamped folder can have a missing tail. Normalize its existing prefix
     // like a routing root, including Windows path spelling, then append that tail.
-    // This comparison is diagnostic only and does not change project state.
-    let (Ok(project_root), Some(workdir)) = (
-        ProjectRootId::from_path(&identity.project_root),
-        normalized_scope_workdir(Path::new(workdir)),
-    ) else {
-        return;
-    };
-    if workdir.as_path() != project_root.as_path() {
-        crate::slog_info!(
+    // Bound the whole walk, including direct canonicalization of the project root.
+    crate::bounded_io::with_budget(Some(budget), || {
+        crate::bounded_io::run(Path::new(&workdir), None, move |workdir| {
+            let (Ok(project_root), Some(workdir)) = (
+                ProjectRootId::from_path(project_root),
+                normalized_scope_workdir(&workdir),
+            ) else {
+                return Ok(None);
+            };
+            Ok((workdir.as_path() != project_root.as_path())
+                .then(|| (project_root.into_path_buf(), workdir)))
+        })
+    })
+}
+
+fn log_scope_workdir_comparison(
+    identity: &subc_protocol::BindIdentity,
+    stamp: &subc_protocol::scope::ScopeStamp,
+    result: io::Result<Option<(PathBuf, PathBuf)>>,
+) {
+    match result {
+        Ok(Some((project_root, workdir))) => crate::slog_info!(
             "subc scope workdir differs: project_root={} workdir={} session={} project_id={}",
-            project_root.as_path().display(),
+            project_root.display(),
             workdir.display(),
             identity.session,
             stamp.project_id.as_deref().unwrap_or("none"),
-        );
+        ),
+        Ok(None) => {}
+        Err(error) => crate::slog_info!(
+            "subc scope workdir comparison skipped: project_root={} workdir={} session={} project_id={} reason={}",
+            identity.project_root.display(),
+            stamp.workdir.as_deref().unwrap_or("none"),
+            identity.session,
+            stamp.project_id.as_deref().unwrap_or("none"),
+            error,
+        ),
     }
 }
 
@@ -7334,7 +7394,7 @@ async fn handle_control_request(
                 ),
                 if role_versions.is_some() { "declared" } else { "none" }
             );
-            log_scope_workdir_mismatch(&identity, scope.as_ref());
+            schedule_scope_workdir_comparison(&identity, scope.as_ref());
             if epoch == 0 {
                 return send_route_bind_error(
                     tx,

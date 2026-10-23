@@ -1,12 +1,28 @@
 use super::*;
 use subc_protocol::scope::{ScopeKind, ScopeStamp};
 
+thread_local! {
+    static COMPARISON_OBSERVER: std::cell::RefCell<Option<oneshot::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn take_comparison_observer() -> Option<oneshot::Sender<()>> {
+    COMPARISON_OBSERVER.with(|observer| observer.borrow_mut().take())
+}
+
 fn stamp() -> ScopeStamp {
     ScopeStamp::new(Principal::Direct, "session-scope", 4, ScopeKind::Head)
 }
 
 // Exercise admission and completion, not a second implementation of root selection.
 fn bind(root: &Path, scope: Option<ScopeStamp>) -> (Vec<String>, Vec<u8>) {
+    bind_observed(root, scope, |_| {})
+}
+
+fn bind_observed(
+    root: &Path,
+    scope: Option<ScopeStamp>,
+    after_ack: impl FnOnce(&mut Option<oneshot::Receiver<()>>),
+) -> (Vec<String>, Vec<u8>) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -53,6 +69,14 @@ fn bind(root: &Path, scope: Option<ScopeStamp>) -> (Vec<String>, Vec<u8>) {
             let mut pending = HashMap::new();
             let mut installed = HashMap::new();
             let mut routes = HashMap::new();
+            let mut observed = scope
+                .as_ref()
+                .and_then(|stamp| stamp.workdir.as_ref())
+                .map(|_| {
+                    let (tx, rx) = oneshot::channel();
+                    COMPARISON_OBSERVER.with(|observer| *observer.borrow_mut() = Some(tx));
+                    rx
+                });
             handle_control_request(
                 &writer_tx,
                 &frame,
@@ -139,6 +163,13 @@ fn bind(root: &Path, scope: Option<ScopeStamp>) -> (Vec<String>, Vec<u8>) {
                 (ack.header.channel, ack.header.epoch, ack.header.corr),
                 (0, 0, 91)
             );
+            after_ack(&mut observed);
+            if let Some(observed) = observed {
+                tokio::time::timeout(Duration::from_secs(8), observed)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
             ack.body.clone()
         })
     });
@@ -147,6 +178,70 @@ fn bind(root: &Path, scope: Option<ScopeStamp>) -> (Vec<String>, Vec<u8>) {
         .filter(|line| line.contains("subc scope workdir"))
         .collect();
     (lines, reply)
+}
+
+#[cfg(unix)]
+#[test]
+fn scope_workdir_held_lookup_does_not_delay_bind_ack() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let workdir = root.join("held-workdir");
+    let held = crate::bounded_io::stall_running_helper(&workdir);
+    let started = Instant::now();
+    let (lines, reply) = bind_observed(
+        &root,
+        Some(stamp().with_workdir(Some(workdir.to_string_lossy().into_owned()))),
+        |observed| {
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "diagnostic delayed bind ACK by {:?}",
+                started.elapsed()
+            );
+            held.reached
+                .recv_timeout(Duration::from_secs(1))
+                .expect("workdir lookup reached the held helper");
+            assert!(
+                matches!(
+                    observed.as_mut().unwrap().try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ),
+                "comparison finished while its lookup was held"
+            );
+            drop(held);
+        },
+    );
+    assert_eq!(reply, br#"{"op":"route.bind"}"#);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("subc scope workdir differs:"),
+        "{lines:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn scope_workdir_expired_lookup_logs_skipped_without_guessing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let workdir = root.join("timed-out-workdir");
+    let held = crate::bounded_io::stall_running_helper(&workdir);
+    let (lines, reply) = bind_observed(
+        &root,
+        Some(stamp().with_workdir(Some(workdir.to_string_lossy().into_owned()))),
+        |_| {
+            held.reached
+                .recv_timeout(Duration::from_secs(1))
+                .expect("workdir lookup reached the held helper");
+        },
+    );
+    drop(held);
+    assert_eq!(reply, br#"{"op":"route.bind"}"#);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("subc scope workdir comparison skipped:"),
+        "{lines:?}"
+    );
+    assert!(!lines[0].contains("workdir differs:"), "{lines:?}");
 }
 
 #[test]
@@ -179,6 +274,8 @@ fn scope_workdir_mismatch_logs_once_and_preserves_project_root() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let folder = root.join("missing-session-folder");
+    let expected_root = ProjectRootId::from_path(&root).unwrap();
+    let expected_folder = expected_root.as_path().join("missing-session-folder");
     let (lines, _) = bind(
         &root,
         Some(
@@ -194,8 +291,8 @@ fn scope_workdir_mismatch_logs_once_and_preserves_project_root() {
         "{line}"
     );
     for value in [
-        root.to_str().unwrap(),
-        folder.to_str().unwrap(),
+        expected_root.as_path().to_str().unwrap(),
+        expected_folder.to_str().unwrap(),
         "folder-session",
         "project-mismatch",
     ] {
