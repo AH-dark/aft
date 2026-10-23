@@ -53,6 +53,7 @@ import {
   formatSystemReminder,
   handleIdleBgCompletions,
   handlePushedBgCompletion,
+  handlePushedBgLongRunning,
   handlePushedPatternMatch,
   handleSubcBgEventsNudge,
   ingestBgCompletions,
@@ -1716,6 +1717,114 @@ describe("OpenCode background notifications", () => {
 });
 
 describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
+  for (const { includeOtherTask, returnPending, name } of [
+    {
+      includeOtherTask: false,
+      returnPending: false,
+      name: "inline watch consumption cancels its in-flight wake without restoring exit or still-running reminders",
+    },
+    {
+      includeOtherTask: true,
+      returnPending: false,
+      name: "wake disposal restores unconsumed tasks but not inline-consumed reminders from the same batch",
+    },
+    {
+      includeOtherTask: true,
+      returnPending: true,
+      name: "inline watch consumption removes restored reminders without discarding another pending task",
+    },
+  ]) {
+    test(name, async () => {
+      const clock = controlledWakeTimers();
+      __setBgNotificationHopTimeoutForTests(50);
+      const promptAsync = mock(() => new Promise(() => {}));
+      const send = mock(async (command: string) =>
+        command === "bash_drain_completions"
+          ? { success: true, bg_completions: [] }
+          : { success: true, acked_task_ids: ["task-other"] },
+      );
+      const { ctx } = harness(send);
+      const sessionID = "inline-watch";
+      const drainCtx = {
+        ctx,
+        directory: "/project",
+        sessionID,
+        client: makeClient(promptAsync, []),
+      };
+      const tasks = includeOtherTask ? ["task-covered", "task-other"] : ["task-covered"];
+      try {
+        for (const task_id of tasks) {
+          await handlePushedPatternMatch(drainCtx, {
+            task_id,
+            session_id: sessionID,
+            watch_id: `watch-${task_id}`,
+            match_text: "",
+            match_offset: 0,
+            context: "",
+            once: true,
+            reason: "task_exit",
+          });
+          await handlePushedBgLongRunning(drainCtx, {
+            task_id,
+            session_id: sessionID,
+            command: "npm test",
+            elapsed_ms: 60_000,
+          });
+        }
+        await clock.fire(tasks.length * 400);
+        expect(promptAsync).toHaveBeenCalledTimes(1);
+        const request = promptAsync.mock.calls[0][0] as { signal: AbortSignal };
+        const state = sessionBgStates.get(sessionID)!;
+        expect(state.pendingPatternMatches).toHaveLength(0);
+        expect(state.pendingLongRunning).toHaveLength(0);
+
+        if (returnPending) {
+          await clock.fire(50);
+          await clock.fire(120_000);
+          await clock.fire(50);
+          expect(state.pendingPatternMatches.map((item) => item.task_id)).toEqual(tasks);
+          expect(state.pendingLongRunning.map((item) => item.task_id)).toEqual(tasks);
+        }
+
+        consumeBgCompletion(sessionID, "task-covered");
+        await clock.flush();
+        if (includeOtherTask && !returnPending) {
+          // The other task still needs delivery, so inline consumption alone must not cancel it.
+          expect(request.signal.aborted).toBe(false);
+          cancelPendingWakesForContext(ctx);
+          await clock.flush();
+        }
+        expect(request.signal.aborted).toBe(true);
+        expect(state.pendingWakeAdmissions.size).toBe(returnPending ? 1 : 0);
+        const remaining = includeOtherTask ? ["task-other"] : [];
+        expect(state.pendingLongRunning.map((item) => item.task_id)).toEqual(remaining);
+        expect(state.pendingPatternMatches.map((item) => item.task_id)).toEqual(remaining);
+
+        const nextReply = { output: "next tool result" };
+        await appendInTurnBgCompletions(drainCtx, nextReply);
+        expect(state.pendingWakeAdmissions.size).toBe(0);
+        expect(nextReply.output).not.toContain("task-covered");
+        if (includeOtherTask) {
+          expect(nextReply.output).toContain("task-other");
+          expect(nextReply.output).toContain("task task-other exited:");
+          expect(nextReply.output).toContain("[BACKGROUND BASH STILL RUNNING]");
+        } else {
+          expect(nextReply.output).toBe("next tool result");
+        }
+        const laterReply = { output: "later tool result" };
+        await appendInTurnBgCompletions(drainCtx, laterReply);
+        expect(laterReply.output).toBe("later tool result");
+        await handleIdleBgCompletions(drainCtx);
+        await clock.fireIfPresent(200);
+        await clock.fireIfPresent(120_000);
+        expect(promptAsync).toHaveBeenCalledTimes(returnPending ? 2 : 1);
+      } finally {
+        __resetBgNotificationStateForTests();
+        clock.restore();
+      }
+    });
+  }
+
   test("deleted session cancels ambiguous SDK requests without recovery or acknowledgement", async () => {
     const clock = controlledWakeTimers();
     __setBgNotificationHopTimeoutForTests(50);

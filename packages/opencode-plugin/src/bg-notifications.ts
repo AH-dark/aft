@@ -322,9 +322,9 @@ export function cancelPendingWakesForContext(ctx: DrainContext["ctx"]): void {
 const wakeAdmissionOwners = new WeakMap<PendingWakeAdmission, DrainContext["ctx"]>();
 
 /**
- * Mark a bg task's completion as consumed by an explicit bash_status wait.
- * Removes it from pendingCompletions so the next wake/in-turn drain
- * doesn't double-notify the agent.
+ * Mark a task's queued reminders as consumed by an inline bash wait result.
+ * Remove its completion, exit and still-running notices so later tool replies
+ * or wake prompts do not repeat information the agent already received.
  */
 export function consumeBgCompletion(sessionID: string | undefined, taskId: string): void {
   // Use stateFor (not getSessionState) so the suppression set is recorded
@@ -333,6 +333,10 @@ export function consumeBgCompletion(sessionID: string | undefined, taskId: strin
   // entry there to drop it.
   const state = stateFor(sessionID);
   state.pendingCompletions = state.pendingCompletions.filter((c) => c.task_id !== taskId);
+  state.pendingLongRunning = state.pendingLongRunning.filter((item) => item.task_id !== taskId);
+  state.pendingPatternMatches = state.pendingPatternMatches.filter(
+    (item) => item.task_id !== taskId,
+  );
   state.wakeDeferredTaskIds.delete(taskId);
   if (!state.consumedTaskIds.has(taskId)) {
     state.consumedTaskIds.add(taskId);
@@ -2052,6 +2056,7 @@ function scheduleWake(
       ],
       pending: () => {
         clearDelivering(state, ackTargetIds);
+        // An inline wait can consume a task during admission; restore only unconsumed task IDs.
         state.pendingCompletions = [
           ...pending.filter(
             (item) =>
@@ -2061,11 +2066,18 @@ function scheduleWake(
           ...state.pendingCompletions,
         ];
         state.pendingLongRunning = [
-          ...pendingLongRunning.filter((item) => !state.pendingLongRunning.includes(item)),
+          ...pendingLongRunning.filter(
+            (item) =>
+              !state.consumedTaskIds.has(item.task_id) && !state.pendingLongRunning.includes(item),
+          ),
           ...state.pendingLongRunning,
         ];
         state.pendingPatternMatches = [
-          ...pendingPatternMatches.filter((item) => !state.pendingPatternMatches.includes(item)),
+          ...pendingPatternMatches.filter(
+            (item) =>
+              !state.consumedTaskIds.has(item.task_id) &&
+              !state.pendingPatternMatches.includes(item),
+          ),
           ...state.pendingPatternMatches,
         ];
       },
