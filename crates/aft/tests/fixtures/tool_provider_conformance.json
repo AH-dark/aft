@@ -2,19 +2,19 @@
   "registry_artifacts": [
     {
       "name": "cortexkit-role-tool-provider",
-      "version": "0.7.2",
+      "version": "0.8.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "60e9b39e9efd8d14b6705fc362a9c6afae7ad4ffb4179787e6dbd0c723ba27a9",
+      "checksum": "192ba87687c8617f14e14b14a5b7ff17757e13d9f2bd8f6429535fa8e427ae85",
       "dependency_kind": "normal",
-      "release_tag": "cortexkit-role-tool-provider-v0.7.2"
+      "release_tag": "cortexkit-role-tool-provider-v0.8.0"
     },
     {
       "name": "cortexkit-role-tool-provider-conformance",
-      "version": "0.7.1",
+      "version": "0.8.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "20d31ccc5eb0d9b6f80b7d18a24c497d57ea987ed7b019963ac0ea089fb53b97",
+      "checksum": "934da6effe205c9c619c03d7b6e36905248681f7996baaf45fce7f2f167830a9",
       "dependency_kind": "dev",
-      "release_tag": "cortexkit-role-tool-provider-conformance-v0.7.1"
+      "release_tag": "cortexkit-role-tool-provider-conformance-v0.8.0"
     },
     {
       "name": "cortexkit-role-harness",
