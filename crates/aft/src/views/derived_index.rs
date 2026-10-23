@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 
 use crate::views::{Manifest, ManifestEntry, RegularPlanes, SyntheticPlanes};
 
@@ -250,6 +250,7 @@ pub(super) fn forget(path: &Path, scope: &str, generation: &str) -> rusqlite::Re
 /// The identity recorded for `scope`, for tests.
 #[cfg(test)]
 pub(super) fn recorded_identity(path: &Path, scope: &str) -> Option<[u8; 32]> {
+    use rusqlite::OptionalExtension;
     let identity: Vec<u8> = open(path)
         .ok()?
         .query_row(

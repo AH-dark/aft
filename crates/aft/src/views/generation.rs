@@ -682,6 +682,7 @@ pub(super) fn schedule_derived_checkpoint(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CloneMechanism {
     /// An APFS copy-on-write clone of a quiescent source: no page is rewritten.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Clonefile,
     /// A page-by-page SQLite backup, which writes the whole database again.
     Backup(BackupCopy),
@@ -1364,6 +1365,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
     /// A WAL-mode donor with committed rows, like a published derived file.
     fn wal_donor(path: &Path) -> crate::db::file_identity::IdentityConnection {
         let connection =
@@ -1384,10 +1386,12 @@ mod tests {
         connection
     }
 
+    #[cfg(target_os = "macos")]
     fn wal_len(path: &Path) -> u64 {
         fs::metadata(format!("{}-wal", path.display())).map_or(0, |metadata| metadata.len())
     }
 
+    #[cfg(unix)]
     fn state(path: &Path) -> String {
         Connection::open(path)
             .unwrap()
@@ -1472,6 +1476,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
     const LOCK_PROBE_ENV: &str = "AFT_TEST_CLONE_LOCK_PROBE_DATABASE";
 
     /// Report, from another process, whether some process holds SQLite's
