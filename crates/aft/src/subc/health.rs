@@ -4857,16 +4857,25 @@ mod tests {
     }
 
     #[test]
-    fn view_health_local_failure_is_in_next_rollup_without_sqlite_reopen() {
+    fn view_health_local_batches_are_in_next_rollup_with_one_refresh() {
         let (_dir, executor, _ctx, view_dir) = view_health_fixture();
         let app = App::default_shared();
         let cache = HealthRollupCache::new();
         assert_eq!(rolled_up_view(&cache, &executor, &app)["pending_paths"], 1);
         let before = crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
+        let scans = crate::path_status::HEALTH_SUMMARY_READS.with(std::cell::Cell::get);
         {
             let mut status = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
+            for _ in 0..20 {
+                status.mark_pending(b"a.rs", "pending", 1).unwrap();
+            }
             status.mark_failed(b"a.rs", "missing payload", 1).unwrap();
         }
+        assert_eq!(
+            crate::path_status::HEALTH_SUMMARY_READS.with(std::cell::Cell::get),
+            scans,
+            "local batches must not scan health on the writer"
+        );
         let next = rolled_up_view(&cache, &executor, &app);
         assert_eq!(
             next["failed_paths"], 1,
@@ -4875,8 +4884,14 @@ mod tests {
         assert_eq!(next["pending_paths"], 0);
         assert_eq!(
             crate::path_status::HEALTH_READS.with(std::cell::Cell::get),
-            before,
-            "a local commit must supply its projection without reopening SQLite"
+            before + 1,
+            "all local batches must share one refresh on the next tick"
+        );
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["failed_paths"], 1);
+        assert_eq!(
+            crate::path_status::HEALTH_READS.with(std::cell::Cell::get),
+            before + 1,
+            "an unchanged tick must reuse the projection"
         );
     }
 

@@ -15,6 +15,7 @@ pub(crate) mod health;
 #[cfg(test)]
 thread_local! {
     pub(crate) static HEALTH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static HEALTH_SUMMARY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Maximum paths included in a refresh-status response; counts include paths beyond this limit.
@@ -490,7 +491,7 @@ impl PathStatusStore {
             }
         }
         transaction.commit()?;
-        self.publish_health();
+        self.invalidate_health();
         Ok(())
     }
 
@@ -511,7 +512,7 @@ impl PathStatusStore {
             params![rel_path],
         )?;
         if changed > 0 {
-            self.publish_health();
+            self.invalidate_health();
         }
         Ok(())
     }
@@ -534,7 +535,7 @@ impl PathStatusStore {
         }
         transaction.commit()?;
         if changed > 0 {
-            self.publish_health();
+            self.invalidate_health();
         }
         Ok(())
     }
@@ -590,6 +591,8 @@ impl PathStatusStore {
     }
 
     pub fn summary(&self) -> Result<PathStatusSummary, PathStatusError> {
+        #[cfg(test)]
+        HEALTH_SUMMARY_READS.with(|reads| reads.set(reads.get() + 1));
         let (pending_count, failed_count) = self.connection.query_row(
             "SELECT
                  COALESCE(SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END), 0),
@@ -731,7 +734,7 @@ impl PathStatusStore {
         }
         transaction.commit()?;
         if !changes.is_empty() {
-            self.publish_health();
+            self.invalidate_health();
         }
         Ok(changes.clear.len() + changes.fail.len() + changes.skips.len())
     }
@@ -769,15 +772,15 @@ impl PathStatusStore {
             params![rel_path, state.as_str(), reason, generation, mark],
         )?;
         transaction.commit()?;
-        self.publish_health();
+        self.invalidate_health();
         Ok(())
     }
 
-    fn publish_health(&mut self) {
+    fn invalidate_health(&self) {
         // Without a context observing this ledger, the first health read can
         // build its projection lazily. Writers must not pay for unused health.
         if std::sync::Arc::strong_count(&self.health) > 1 {
-            self.health.committed(self);
+            self.health.committed();
         }
     }
 

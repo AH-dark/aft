@@ -57,20 +57,12 @@ impl Health {
         health
     }
 
-    /// A local writer publishes through its already-open connection. The next
-    /// health tick need not reopen SQLite just because its WAL changed.
-    pub(super) fn committed(&self, store: &PathStatusStore) -> u64 {
-        let revision = self.projection.lock().revision;
-        let before = files(&self.path);
-        let summary = store.health_summary().ok().map(Arc::new);
-        let after = files(&self.path);
+    /// Mark the projection dirty after a successful commit. Writers do no
+    /// health queries; the next snapshot coalesces all intervening batches.
+    pub(super) fn committed(&self) {
         let mut projection = self.projection.lock();
-        let uncontended = projection.revision == revision;
         projection.revision = projection.revision.wrapping_add(1);
-        projection.files = (uncontended && before == after).then_some(after);
-        projection.read_at = Instant::now();
-        projection.summary = summary;
-        projection.revision
+        projection.files = None;
     }
 
     pub(crate) fn snapshot(&self) -> (u64, Option<Arc<PathStatusSummary>>) {
@@ -101,7 +93,7 @@ impl Health {
             return (revision, summary);
         }
         projection.revision = projection.revision.wrapping_add(1);
-        projection.files = (current_files == after).then_some(after);
+        projection.files = (summary.is_some() && current_files == after).then_some(after);
         projection.read_at = Instant::now();
         projection.summary = summary.clone();
         (projection.revision, summary)
@@ -120,6 +112,10 @@ impl Drop for Health {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "health_bench.rs"]
+mod bench;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,7 +123,45 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashSet};
 
     #[test]
-    fn local_writers_publish_pending_failed_clear_and_settled_skips() {
+    fn local_batches_defer_summary_until_next_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let health = Health::for_view(dir.path());
+        let mut writer = PathStatusStore::open(dir.path()).unwrap();
+        health.snapshot();
+        let scans = super::super::HEALTH_SUMMARY_READS.with(std::cell::Cell::get);
+        let reads = super::super::HEALTH_READS.with(std::cell::Cell::get);
+        for _ in 0..20 {
+            writer.mark_pending(b"a", "waiting", 1).unwrap();
+        }
+        writer.mark_failed(b"a", "missing payload", 2).unwrap();
+        assert_eq!(
+            super::super::HEALTH_SUMMARY_READS.with(std::cell::Cell::get),
+            scans,
+            "committed batches must not scan health tables on the writer"
+        );
+        assert_eq!(super::super::HEALTH_READS.with(std::cell::Cell::get), reads);
+        let next = health.snapshot().1.unwrap();
+        assert_eq!(next.pending_count, 0);
+        assert_eq!(next.failed_count, 1);
+        assert_eq!(
+            super::super::HEALTH_SUMMARY_READS.with(std::cell::Cell::get),
+            scans + 1,
+            "all committed batches must share one health refresh"
+        );
+        assert_eq!(
+            super::super::HEALTH_READS.with(std::cell::Cell::get),
+            reads + 1
+        );
+        assert_eq!(health.snapshot().1.unwrap().failed_count, 1);
+        assert_eq!(
+            super::super::HEALTH_SUMMARY_READS.with(std::cell::Cell::get),
+            scans + 1,
+            "an unchanged snapshot must reuse the summary"
+        );
+    }
+
+    #[test]
+    fn local_writers_refresh_pending_failed_clear_and_settled_skips() {
         let dir = tempfile::tempdir().unwrap();
         let health = Health::for_view(dir.path());
         health.snapshot();
@@ -169,7 +203,35 @@ mod tests {
             health.snapshot().1.unwrap().skipped_by_reason,
             settled.skipped_by_reason
         );
-        assert_eq!(super::super::HEALTH_READS.with(std::cell::Cell::get), reads);
+        assert_eq!(
+            super::super::HEALTH_READS.with(std::cell::Cell::get),
+            reads + 6
+        );
+    }
+
+    #[test]
+    fn failed_refresh_retries_on_next_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let health = Health::for_view(dir.path());
+        let writer = PathStatusStore::open(dir.path()).unwrap();
+        assert!(health.snapshot().1.is_some());
+        writer
+            .connection
+            .execute_batch("ALTER TABLE path_status RENAME COLUMN state TO broken_state")
+            .unwrap();
+        let reads = super::super::HEALTH_READS.with(std::cell::Cell::get);
+        assert!(health.snapshot().1.is_none());
+        assert!(health.snapshot().1.is_none());
+        assert_eq!(
+            super::super::HEALTH_READS.with(std::cell::Cell::get),
+            reads + 2,
+            "failed refreshes must remain dirty rather than wait for the 30-second backstop"
+        );
+        writer
+            .connection
+            .execute_batch("ALTER TABLE path_status RENAME COLUMN broken_state TO state")
+            .unwrap();
+        assert!(health.snapshot().1.is_some());
     }
 
     #[test]
