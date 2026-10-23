@@ -27,15 +27,12 @@ use super::process::LiveDescendant;
 use super::BgTaskStatus;
 
 #[cfg(test)]
-type SessionCreateGate = (
-    PathBuf,
-    std::sync::mpsc::Sender<()>,
-    std::sync::mpsc::Receiver<()>,
-);
+type SessionCreateGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
 #[cfg(test)]
-static SESSION_CREATE_GATE: std::sync::OnceLock<std::sync::Mutex<Option<SessionCreateGate>>> =
-    std::sync::OnceLock::new();
+static SESSION_CREATE_GATES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, SessionCreateGate>>,
+> = std::sync::OnceLock::new();
 
 #[cfg(test)]
 fn install_session_create_gate_for_test(
@@ -43,23 +40,23 @@ fn install_session_create_gate_for_test(
 ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    *SESSION_CREATE_GATE
+    let previous = SESSION_CREATE_GATES
         .get_or_init(Default::default)
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-        Some((session_dir.to_path_buf(), entered_tx, release_rx));
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(session_dir.to_path_buf(), (entered_tx, release_rx));
+    assert!(previous.is_none(), "session create gate already installed");
     (entered_rx, release_tx)
 }
 
 #[cfg(test)]
 fn wait_on_session_create_gate_for_test(session_dir: &Path) {
-    let gate = SESSION_CREATE_GATE
+    let gate = SESSION_CREATE_GATES
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
-        .filter(|(gated, _, _)| gated == session_dir);
-    if let Some((_, entered, release)) = gate {
+        .remove(session_dir);
+    if let Some((entered, release)) = gate {
         let _ = entered.send(());
         let _ = release.recv();
     }
@@ -3678,6 +3675,45 @@ mod tests {
             assert!(created.paths.dir.is_dir());
         });
         assert!(session_dir.join("bash-0000000000000002").is_dir());
+    }
+
+    #[test]
+    fn parallel_session_layout_creators_keep_their_own_gates() {
+        let storage = tempfile::tempdir().unwrap();
+        let session_a = super::session_tasks_dir(storage.path(), "parallel-gate-a");
+        let session_b = super::session_tasks_dir(storage.path(), "parallel-gate-b");
+        let (entered_a, release_a) = super::install_session_create_gate_for_test(&session_a);
+        let (entered_b, release_b) = super::install_session_create_gate_for_test(&session_b);
+
+        std::thread::scope(|scope| {
+            let creator_a = scope.spawn(|| {
+                super::create_task_layout(
+                    storage.path(),
+                    "parallel-gate-a",
+                    "bash-0000000000000030",
+                )
+            });
+            entered_a
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("session A creator lost its gate");
+
+            let creator_b = scope.spawn(|| {
+                super::create_task_layout(
+                    storage.path(),
+                    "parallel-gate-b",
+                    "bash-0000000000000031",
+                )
+            });
+            release_a.send(()).unwrap();
+            let created_a = creator_a.join().unwrap().unwrap();
+            entered_b
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("session B creator lost its gate");
+            release_b.send(()).unwrap();
+            let created_b = creator_b.join().unwrap().unwrap();
+            assert!(created_a.paths.dir.is_dir());
+            assert!(created_b.paths.dir.is_dir());
+        });
     }
 
     // Freeze the scope-blind version-7 task shape rather than deserializing
