@@ -5886,6 +5886,7 @@ mod route_tests {
                 request_id: "tool-policy-dispatch".into(),
                 ledger_key: None,
                 io_budget: crate::bounded_io::Budget::after(Duration::from_secs(30)),
+                approved_io_window: None,
                 reply_deadline: Instant::now() + Duration::from_secs(30),
             };
             let (done, completion) = oneshot::channel();

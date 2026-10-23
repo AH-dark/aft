@@ -413,6 +413,7 @@ enum RuffAvailability {
     Available,
     Unavailable,
     Unknown,
+    Refused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -689,8 +690,14 @@ fn ruff_format_available(
     tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     project_root: Option<&Path>,
 ) -> RuffAvailability {
+    // A shared version result cannot authorize this request's launch. Prepare
+    // under its policy first, even when another session warmed the cache.
+    let command = match ruff_version_command(tool_policy, project_root) {
+        Ok(command) => command,
+        Err(status) => return status,
+    };
     ruff_format_availability_with_probe(project_root, || {
-        ruff_format_available_uncached(tool_policy, project_root)
+        ruff_version_command_available(command, Instant::now() + AVAILABILITY_PROBE_BUDGET)
     })
 }
 
@@ -708,7 +715,10 @@ fn ruff_format_availability_with_probe(
     }
 
     let result = probe();
-    if result != RuffAvailability::Unknown {
+    if matches!(
+        result,
+        RuffAvailability::Available | RuffAvailability::Unavailable
+    ) {
         if let Ok(mut cache) = TOOL_AVAILABILITY_CACHE.lock() {
             cache.insert(key, (result, Instant::now()));
         }
@@ -716,19 +726,15 @@ fn ruff_format_availability_with_probe(
     result
 }
 
-fn ruff_format_available_uncached(
+fn ruff_version_command(
     tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     project_root: Option<&Path>,
-) -> RuffAvailability {
-    let command = match resolve_tool("ruff", project_root) {
-        Some(command) => command,
-        None => return RuffAvailability::Unavailable,
-    };
-    let version_command = match external_tool_command(tool_policy, &command, &["--version"]) {
-        Ok(command) => command,
-        Err(_) => return RuffAvailability::Unavailable,
-    };
-    ruff_version_command_available(version_command, Instant::now() + AVAILABILITY_PROBE_BUDGET)
+) -> Result<Command, RuffAvailability> {
+    let command = resolve_tool("ruff", project_root).ok_or(RuffAvailability::Unavailable)?;
+    external_tool_command(tool_policy, &command, &["--version"]).map_err(|error| {
+        crate::slog_warn!("ruff version launch refused by request policy: {error}");
+        RuffAvailability::Refused
+    })
 }
 
 fn ruff_version_command_available(version_command: Command, deadline: Instant) -> RuffAvailability {
@@ -1648,6 +1654,7 @@ fn formatter_excluded_path(stderr: &str) -> bool {
 ///   PATH and not in project's `node_modules/.bin`
 /// - `"formatter_version_check_timeout"` — Ruff did not answer its version check
 ///   before the probe deadline
+/// - `"sandbox_unavailable"` — the request's policy refused the Ruff version launch
 /// - `"formatter_excluded_path"` — formatter ran but refused to process this
 ///   path because the project formatter config (e.g. biome.json `files.includes`,
 ///   prettier `.prettierignore`) excludes it. NOT an error in AFT or the user's
@@ -1721,6 +1728,13 @@ pub fn auto_format(
                     path.display()
                 );
                 return (false, Some("formatter_version_check_timeout".to_string()));
+            }
+            RuffAvailability::Refused => {
+                crate::slog_warn!(
+                    "format: {} (skipped: sandbox_unavailable: Ruff version launch refused)",
+                    path.display()
+                );
+                return (false, Some("sandbox_unavailable".to_string()));
             }
         }
     }
@@ -2848,6 +2862,69 @@ pub fn validate_full(
 mod tests {
     #[cfg(unix)]
     #[test]
+    fn ruff_policy_refusal_does_not_poison_another_sessions_version_cache() {
+        use crate::sandbox_spawn::{SpawnPlan, ToolLaunchPolicy};
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("node_modules/.bin");
+        fs::create_dir_all(&bin).unwrap();
+        let runs = root.path().join("ruff-runs");
+        let ruff = bin.join("ruff");
+        crate::executable_cache::write_executable(&ruff, format!(
+            "#!/bin/sh\nif [ \"$1\" = --warm-up ]; then exit 0; fi\nif [ \"$1\" = --version ]; then printf 'probe\\n' >> '{0}'; printf 'ruff 0.1.2\\n'; else printf 'format\\n' >> '{0}'; fi\n",
+            runs.display()
+        ).as_bytes()).unwrap();
+        // Warm the fixture before timing the probe: macOS's first-run security
+        // check can otherwise consume the short version deadline.
+        assert!(Command::new(&ruff)
+            .arg("--warm-up")
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.path().join("ruff.toml"), "\n").unwrap();
+        let path = root.path().join("main.py");
+        fs::write(&path, "print('hello')\n").unwrap();
+        let config = Config {
+            format_on_edit: true,
+            project_root: Some(root.path().to_path_buf()),
+            ..Config::default()
+        };
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config.clone(),
+        );
+        let refused = crate::sandbox_spawn::with_spawn_plan_for_test(
+            SpawnPlan::refused_for_test("sandbox_unavailable"),
+            || ToolLaunchPolicy::resolve(&ctx),
+        );
+        let allowed = ToolLaunchPolicy::resolve(&ctx);
+        let refused_result = crate::log_ctx::with_session(Some("ruff-worker".into()), || {
+            auto_format(&refused, &path, &config)
+        });
+        assert!(!runs.exists(), "a refused session must not run Ruff");
+        let allowed_result = crate::log_ctx::with_session(Some("ruff-head".into()), || {
+            auto_format(&allowed, &path, &config)
+        });
+        assert_eq!(
+            allowed_result,
+            (true, None),
+            "another session's refusal must not cache tool absence"
+        );
+        assert_eq!(refused_result, (false, Some("sandbox_unavailable".into())));
+        let warm_refusal = crate::log_ctx::with_session(Some("ruff-worker".into()), || {
+            auto_format(&refused, &path, &config)
+        });
+        assert_eq!(warm_refusal, (false, Some("sandbox_unavailable".into())));
+        let warm_allowed = crate::log_ctx::with_session(Some("ruff-head".into()), || {
+            auto_format(&allowed, &path, &config)
+        });
+        assert_eq!(warm_allowed, (true, None));
+        assert_eq!(fs::read_to_string(runs).unwrap(), "probe\nformat\nformat\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn formatter_checker_and_ruff_probe_refuse_without_running_project_code() {
         use crate::sandbox_spawn::{SpawnPlan, ToolLaunchPolicy};
         use std::os::unix::fs::PermissionsExt;
@@ -2896,8 +2973,8 @@ mod tests {
         let batch = validate_full_batch(&policy, &[path], &config);
         assert_eq!(batch.files[0].skipped_reason.as_deref(), Some("error"));
         assert_eq!(
-            ruff_format_available_uncached(&policy, config.project_root.as_deref()),
-            RuffAvailability::Unavailable
+            ruff_format_available(&policy, config.project_root.as_deref()),
+            RuffAvailability::Refused
         );
         assert!(
             !marker.exists(),

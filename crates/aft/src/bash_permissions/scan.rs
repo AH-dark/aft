@@ -814,6 +814,7 @@ fn command_parts(source: &str, node: Node<'_>) -> Vec<Part> {
                 | "string"
                 | "raw_string"
                 | "concatenation"
+                | "number"
         ) {
             out.push(Part {
                 text: node_text(source, child).to_string(),
@@ -987,13 +988,26 @@ fn track_cwd_change(
                 || args
                     .clone()
                     .any(|arg| arg.starts_with('+') || arg.starts_with('-'));
-            let next = if rotates { None } else { target(scan_cwd) };
-            directory_stack.push(std::mem::replace(scan_cwd, next));
+            let next = if rotates {
+                None
+            } else {
+                target(scan_cwd).filter(|path| path.is_dir())
+            };
+            if next.is_none() {
+                // Rotation reorders the stack rather than pushing the old cwd.
+                // Unmodeled forms cannot leave saved entries that a later popd
+                // might mistake for a known directory.
+                directory_stack.clear();
+                *scan_cwd = None;
+            } else {
+                directory_stack.push(std::mem::replace(scan_cwd, next));
+            }
         }
         "popd" => {
-            *scan_cwd = if options_only {
+            *scan_cwd = if parts.len() == 1 {
                 directory_stack.pop().flatten()
             } else {
+                directory_stack.clear();
                 None
             };
         }
@@ -1443,6 +1457,49 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotated_directory_stack_cannot_restore_a_stale_project_directory() {
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path().display();
+        for change in [
+            "pushd +1",
+            "pushd -1",
+            "pushd",
+            "pushd missing-directory",
+            "pushd \"$UNKNOWN\"",
+            "popd +1",
+            "popd -1",
+            "popd -n",
+        ] {
+            let command = format!(
+                "pushd /usr; pushd /etc; pushd '{project_path}'; {change}; popd; rm notes.txt"
+            );
+            assert_eq!(
+                external_ask_shapes(&command, project.path()),
+                vec![(vec!["notes.txt".into()], Vec::new())],
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_directory_stack_options_are_preserved() {
+        let command = "popd -1";
+        let tree = parse_tree(command).unwrap();
+        let mut commands = Vec::new();
+        collect_commands(tree.root_node(), &mut commands);
+        assert_eq!(commands.len(), 1);
+        let parts = command_parts(command, commands[0]);
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<Vec<_>>(),
+            ["popd", "-1"]
+        );
     }
 
     #[test]
