@@ -943,7 +943,7 @@ fn bash_changed_files_foreground_and_background_completion_notice() {
     let configured = aft.send(&serde_json::json!({
         "id": "changed-files-config", "command": "configure", "harness": "opencode",
         "project_root": project.path(), "storage_dir": storage.path(),
-        "config": user_config(serde_json::json!({"bash": {"changed_files": "diff", "rewrite": false}, "sandbox": {"profile": "off"}}))
+        "config": user_config(serde_json::json!({"bash": {"changed_files": "diff", "rewrite": false}, "sandbox": {"profile": {"head": "off"}}}))
     }).to_string());
     assert_eq!(configured["success"], true, "{configured}");
     // Establish native service readiness before testing command-exit delivery.
@@ -1085,7 +1085,7 @@ fn bash_changed_files_flush_timeout_reports_incomplete() {
             std::ffi::OsStr::new("1"),
         ),
     ]);
-    let configured = aft.send(&serde_json::json!({"id":"flush-timeout-config", "command":"configure", "harness":"opencode", "project_root":project.path(), "storage_dir":storage.path(), "config":user_config(serde_json::json!({"bash":{"changed_files":"list","rewrite":false},"sandbox":{"profile":"off"}}))}).to_string());
+    let configured = aft.send(&serde_json::json!({"id":"flush-timeout-config", "command":"configure", "harness":"opencode", "project_root":project.path(), "storage_dir":storage.path(), "config":user_config(serde_json::json!({"bash":{"changed_files":"list","rewrite":false},"sandbox":{"profile":{"head":"off"}}}))}).to_string());
     assert_eq!(configured["success"], true, "{configured}");
     let result = aft.send(&serde_json::json!({"id":"flush-timeout-command", "method":"bash", "params":{"command":"printf last > late.txt", "notify_on_completion":false}}).to_string());
     assert_eq!(result["success"], true, "{result}");
