@@ -9359,6 +9359,37 @@ impl BgTaskRegistry {
 
     /// Whether any task is still under watch, without waiting: `None` when
     /// the watch map is locked by another thread right now.
+    /// Whether the registry still holds any task record, running or
+    /// finished. A finished task's output can be compressed again later (a
+    /// render that has to be redone, or a completion re-masked for changed
+    /// secrets), so its root keeps what that compression needs.
+    pub(crate) fn has_task_records(&self) -> bool {
+        self.inner
+            .tasks
+            .lock()
+            .map(|tasks| !tasks.is_empty())
+            .unwrap_or(true)
+    }
+
+    /// [`Self::has_task_records`] without waiting: `None` when the task map
+    /// is locked.
+    pub(crate) fn try_has_task_records(&self) -> Option<bool> {
+        match self.inner.tasks.try_lock() {
+            Ok(tasks) => Some(!tasks.is_empty()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => Some(true),
+        }
+    }
+
+    /// Drop a task's in-memory record, as the delivered-task cleanup does
+    /// once the task's retention ends.
+    #[cfg(all(test, unix))]
+    pub(crate) fn forget_task_record_for_test(&self, task_id: &str) {
+        if let Ok(mut tasks) = self.inner.tasks.lock() {
+            tasks.remove(task_id);
+        }
+    }
+
     pub(crate) fn try_has_running_tasks(&self) -> Option<bool> {
         match self.inner.watchdog_tasks.try_lock() {
             Ok(tasks) => Some(!tasks.is_empty()),

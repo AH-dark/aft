@@ -957,17 +957,21 @@ impl CheckoutSemanticSlot {
             .clone()
     }
 
-    /// Forgets a loaded lane of an idle root without waiting, so its
-    /// checkout runtime can drop, the view unbinds and the family arena drops
-    /// the runs no other view holds. The worker sees its channel close and
-    /// exits. The slot then reads as never started, so the next semantic
-    /// query's reload check starts a new lane, which loads the view again
-    /// from the family store.
+    /// Forgets the lane of an idle root without waiting. A loaded lane's
+    /// checkout runtime can then drop, the view unbinds and the family arena
+    /// drops the runs no other view holds. A lane still loading (waiting for
+    /// its start signal, or retrying an unreachable backend) is forgotten as
+    /// well: it would otherwise keep its worker thread and partial load for
+    /// as long as the root stays unbound. Either worker sees its epoch end or
+    /// its channel close and exits. The slot then reads as never started, so
+    /// the next semantic query's reload check starts a new lane, which loads
+    /// the view again from the family store.
     ///
     /// `None` when the lane's locks are held (the caller retries later);
-    /// `Some(None)` when no runtime is loaded, in which case the lane is left
-    /// as it is: a loading lane is still working and a failed one keeps its
-    /// named cause; `Some(Some(runtime))` with the runtime the slot let go.
+    /// `Some(None)` when the slot held no runtime to hand back: a still-loading
+    /// lane was released and its worker exits on its own, and a failed lane
+    /// keeps its named cause; `Some(Some(runtime))` with the loaded runtime
+    /// the slot let go.
     pub(crate) fn try_release_idle(&self) -> Option<Option<Arc<CheckoutSemantic>>> {
         let _publishing = try_lock(&self.publish)?;
         let mut state = match self.state.try_write() {
@@ -975,20 +979,23 @@ impl CheckoutSemanticSlot {
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return None,
         };
-        if !matches!(&*state, Some(CheckoutSemanticState::Ready(_))) {
+        if !matches!(
+            &*state,
+            Some(CheckoutSemanticState::Ready(_) | CheckoutSemanticState::Loading)
+        ) {
             return Some(None);
         }
         // Under the publish lock, like every other epoch change, so no
         // publication of the released lane can still be in flight.
         self.epoch.fetch_add(1, Ordering::SeqCst);
         let released = match state.take() {
-            Some(CheckoutSemanticState::Ready(runtime)) => runtime,
-            _ => unreachable!("the lane was checked to be ready under its write lock"),
+            Some(CheckoutSemanticState::Ready(runtime)) => Some(runtime),
+            _ => None,
         };
         drop(state);
         *lock(&self.wake) = None;
         *lock(&self.retry) = None;
-        Some(Some(released))
+        Some(released)
     }
 
     /// Whether a views-on semantic lane was started for the root, in any

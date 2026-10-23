@@ -209,6 +209,8 @@ mod consent;
 mod drain;
 mod flow_read;
 mod health;
+#[cfg(test)]
+mod idle_root_retention_tests;
 mod perf_sweep;
 mod standalone;
 #[doc(hidden)]
@@ -2266,6 +2268,7 @@ fn reap_idle_roots_with_presence(
     let pending_bind_roots = roots_with_bind_in_flight(pending_binds, live_roots);
     let mut census = ReapBlockerCensus::default();
     let mut candidates = Vec::new();
+    let mut evicted_contexts: Option<Option<HashMap<ProjectRootId, Arc<AppContext>>>> = None;
 
     for (root_id, meta) in live_roots.iter_mut() {
         // A missing directory makes a bound route obsolete, but one failed
@@ -2343,6 +2346,22 @@ fn reap_idle_roots_with_presence(
             // Route teardown marks the lifecycle admission gate before the last
             // channel disappears. Requiring zero bound channels and a quiesced
             // lifecycle prevents a still-bound root from losing its watcher.
+            // An evicted root may still owe part of its idle release: the
+            // output filters stay while background task records remain, and
+            // an evicted root is not reaped again, so retry here once the
+            // records are gone.
+            // One non-waiting snapshot of the actors serves every evicted root
+            // in this sweep.
+            if meta.idle_artifacts_evicted && !has_bound_route && meta.unbound_quiesced {
+                let contexts = evicted_contexts.get_or_insert_with(|| {
+                    executor
+                        .try_actor_entries()
+                        .map(|entries| entries.into_iter().collect::<HashMap<_, _>>())
+                });
+                if let Some(ctx) = contexts.as_ref().and_then(|contexts| contexts.get(root_id)) {
+                    ctx.retry_deferred_idle_release();
+                }
+            }
             if has_bound_route || !meta.unbound_quiesced || meta.idle_artifacts_evicted {
                 continue;
             }

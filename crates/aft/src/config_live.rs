@@ -314,6 +314,17 @@ impl ConfigLiveState {
         self.watches.lock().user.is_some()
     }
 
+    /// Remove the root's own config file watches. Each stops when the
+    /// returned handle drops; the next [`sync_config_watches`] restarts the
+    /// ones the root's state still calls for.
+    pub(crate) fn take_watches(&self) -> Vec<ConfigFileWatch> {
+        let mut watches = self.watches.lock();
+        [watches.user.take(), watches.project_fallback.take()]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     #[cfg(test)]
     fn wait_for_watch_attachment(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);

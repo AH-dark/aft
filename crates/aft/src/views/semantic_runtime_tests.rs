@@ -610,6 +610,31 @@ fn idle_eviction_releases_the_lane_and_trims_only_its_own_runs() {
     );
 }
 
+/// A lane that never finished loading (its worker waiting for a start signal
+/// or retrying an unreachable backend) is released by idle eviction too, so
+/// its worker exits instead of waiting for as long as the root stays unbound.
+#[test]
+fn idle_eviction_releases_a_lane_that_is_still_loading() {
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config::default(),
+    );
+    let slot = ctx.checkout_semantic();
+    let (epoch, wake) = slot.begin();
+    assert!(slot.active(), "a begun lane reads as loading");
+
+    assert!(ctx.try_evict_idle_artifacts());
+    assert!(!slot.active(), "idle eviction kept a loading semantic lane");
+    assert!(
+        !slot.is_current(epoch),
+        "the loading worker's epoch must end"
+    );
+    assert!(
+        wake.recv().is_err(),
+        "the loading lane's worker channel stayed open"
+    );
+}
+
 /// The memory census counts a family's arena runs once, however many views
 /// of the family are loaded, and adds them once to the process total.
 #[test]

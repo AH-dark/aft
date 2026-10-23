@@ -1144,11 +1144,21 @@ impl RootHealthSnapshot {
 }
 
 pub struct StatusEmitter {
-    latest: Arc<Mutex<Option<PendingStatusSnapshot>>>,
-    notify: mpsc::Sender<()>,
+    state: Arc<StatusEmitterState>,
+    notify: mpsc::Sender<Weak<StatusEmitterState>>,
     context: Mutex<Weak<AppContext>>,
     #[cfg(test)]
     pub(crate) snapshot_builds: AtomicUsize,
+}
+
+/// The part of a context's status emitter that the process-wide debounce
+/// thread reads when a window closes. That thread holds it only weakly between
+/// signals, so it never keeps a dropped context's emitter alive.
+struct StatusEmitterState {
+    latest: Mutex<Option<PendingStatusSnapshot>>,
+    progress_sender: SharedProgressSender,
+    /// Whether this emitter's last push is still being built and sent.
+    emitting: AtomicBool,
 }
 
 enum PendingStatusSnapshot {
@@ -2379,15 +2389,13 @@ pub(crate) struct ConfigureMaintenanceJob {
 
 impl StatusEmitter {
     fn new(progress_sender: SharedProgressSender) -> Self {
-        let (notify, rx) = mpsc::channel();
-        let latest = Arc::new(Mutex::new(None));
-        let latest_for_thread = Arc::clone(&latest);
-        std::thread::spawn(move || {
-            status_debounce_loop(rx, latest_for_thread, progress_sender);
-        });
         Self {
-            latest,
-            notify,
+            state: Arc::new(StatusEmitterState {
+                latest: Mutex::new(None),
+                progress_sender,
+                emitting: AtomicBool::new(false),
+            }),
+            notify: status_debounce_sender(),
             context: Mutex::new(Weak::new()),
             #[cfg(test)]
             snapshot_builds: AtomicUsize::new(0),
@@ -2400,66 +2408,213 @@ impl StatusEmitter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if let Ok(mut latest) = self.latest.lock() {
+        if let Ok(mut latest) = self.state.latest.lock() {
             *latest = Some(PendingStatusSnapshot::Ready(snapshot, context));
         }
-        let _ = self.notify.send(());
+        let _ = self.notify.send(Arc::downgrade(&self.state));
     }
 
     fn signal_context(&self, context: Weak<AppContext>) {
-        if let Ok(mut latest) = self.latest.lock() {
+        if let Ok(mut latest) = self.state.latest.lock() {
             *latest = Some(PendingStatusSnapshot::Context(context));
         }
-        let _ = self.notify.send(());
+        let _ = self.notify.send(Arc::downgrade(&self.state));
     }
 }
 
-fn status_debounce_loop(
-    rx: mpsc::Receiver<()>,
-    latest: Arc<Mutex<Option<PendingStatusSnapshot>>>,
-    progress_sender: SharedProgressSender,
-) {
-    while rx.recv().is_ok() {
-        let deadline = Instant::now() + Duration::from_millis(STATUS_DEBOUNCE_MS);
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            match rx.recv_timeout(remaining) {
-                Ok(()) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            }
-        }
+/// The sender into the one debounce thread that serves every context's status
+/// emitter. A thread per context would sit blocked for as long as the context
+/// lives, and the daemon keeps a context for every root it has served, idle
+/// or not.
+fn status_debounce_sender() -> mpsc::Sender<Weak<StatusEmitterState>> {
+    static SENDER: std::sync::LazyLock<mpsc::Sender<Weak<StatusEmitterState>>> =
+        std::sync::LazyLock::new(|| {
+            let (notify, rx) = mpsc::channel();
+            std::thread::Builder::new()
+                .name("aft-status-debounce".to_string())
+                .spawn(move || status_debounce_loop(rx))
+                .expect("spawn status debounce thread");
+            notify
+        });
+    SENDER.clone()
+}
 
-        let snapshot = latest.lock().ok().and_then(|mut latest| latest.take());
-        let Some(snapshot) = snapshot else { continue };
-        let sender = progress_sender
-            .lock()
-            .ok()
-            .and_then(|sender| sender.clone());
-        if let Some(sender) = sender {
-            // Census work happens only for the surviving signal, outside the
-            // emitter lock. Upgrade at emission so queued signals cannot keep a
-            // retired actor (and its watchers/servers) alive.
-            let snapshot = match snapshot {
-                PendingStatusSnapshot::Ready(snapshot, context) => match context.upgrade() {
-                    Some(context) => crate::status_push::project(&context, snapshot),
-                    None => snapshot,
-                },
-                PendingStatusSnapshot::Context(context) => {
-                    let Some(context) = context.upgrade() else {
-                        continue;
-                    };
-                    let Some(snapshot) = context.try_build_status_push_snapshot() else {
-                        // Keep the previous bar; the next producer signal retries.
-                        continue;
-                    };
-                    snapshot
-                }
+/// Coalesce status signals per emitter: the first signal opens a window of
+/// `STATUS_DEBOUNCE_MS`, later signals inside it only replace the pending
+/// snapshot, and the window's close pushes the latest one. Windows of
+/// different emitters run independently. Returns once every sender is gone.
+///
+/// This thread only keeps time. Building a push can read the project's
+/// filesystem, which may sit on a slow or unavailable mount, so each push is
+/// built and sent on a thread of its own: one stalled project then delays
+/// only its own status. An emitter whose previous push is still running gets
+/// its window re-armed, so its latest snapshot follows once that push ends
+/// and it never has more than one push thread.
+fn status_debounce_loop(rx: mpsc::Receiver<Weak<StatusEmitterState>>) {
+    // Every window has the same length, so arrival order is deadline order.
+    let mut windows: VecDeque<(Instant, Weak<StatusEmitterState>)> = VecDeque::new();
+    loop {
+        let now = Instant::now();
+        while windows
+            .front()
+            .is_some_and(|(deadline, _)| *deadline <= now)
+        {
+            let Some((_, state)) = windows.pop_front() else {
+                break;
             };
-            sender(PushFrame::StatusChanged(StatusChangedFrame::new(
-                None, snapshot,
-            )));
+            // A context dropped inside its window pushes nothing.
+            let Some(strong) = state.upgrade() else {
+                continue;
+            };
+            if strong.emitting.swap(true, Ordering::AcqRel) {
+                windows.push_back((now + Duration::from_millis(STATUS_DEBOUNCE_MS), state));
+                continue;
+            }
+            spawn_status_emit(strong);
+        }
+        let signalled = match windows.front() {
+            Some((deadline, _)) => {
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(state) => state,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+            None => match rx.recv() {
+                Ok(state) => state,
+                Err(_) => return,
+            },
+        };
+        if !windows
+            .iter()
+            .any(|(_, open)| Weak::ptr_eq(open, &signalled))
+        {
+            windows.push_back((
+                Instant::now() + Duration::from_millis(STATUS_DEBOUNCE_MS),
+                signalled,
+            ));
         }
     }
+}
+
+/// Hold a status emission for `root` until the test releases it, so a test
+/// can stand in for a project whose filesystem stalls the status build.
+#[cfg(test)]
+pub(crate) struct StatusEmitGateForTest {
+    root: PathBuf,
+    pub(crate) reached: crossbeam_channel::Receiver<()>,
+    pub(crate) release: crossbeam_channel::Sender<()>,
+}
+
+#[cfg(test)]
+type StatusEmitGates = parking_lot::Mutex<
+    std::collections::HashMap<
+        PathBuf,
+        (
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        ),
+    >,
+>;
+
+#[cfg(test)]
+fn status_emit_gates() -> &'static StatusEmitGates {
+    static GATES: std::sync::OnceLock<StatusEmitGates> = std::sync::OnceLock::new();
+    GATES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn gate_status_emit_for_test(root: &Path) -> StatusEmitGateForTest {
+    let (reached_tx, reached) = crossbeam_channel::unbounded();
+    let (release, release_rx) = crossbeam_channel::unbounded();
+    status_emit_gates()
+        .lock()
+        .insert(root.to_path_buf(), (reached_tx, release_rx));
+    StatusEmitGateForTest {
+        root: root.to_path_buf(),
+        reached,
+        release,
+    }
+}
+
+#[cfg(test)]
+impl Drop for StatusEmitGateForTest {
+    fn drop(&mut self) {
+        status_emit_gates().lock().remove(&self.root);
+        let _ = self.release.send(());
+    }
+}
+
+#[cfg(test)]
+fn wait_on_status_emit_gate_for_test(context: &AppContext) {
+    let Some(root) = context.config().project_root.clone() else {
+        return;
+    };
+    let gate = status_emit_gates().lock().get(&root).cloned();
+    if let Some((reached, release)) = gate {
+        let _ = reached.send(());
+        let _ = release.recv_timeout(Duration::from_secs(30));
+    }
+}
+
+fn spawn_status_emit(state: Arc<StatusEmitterState>) {
+    let spawned = std::thread::Builder::new()
+        .name("aft-status-emit".to_string())
+        .spawn({
+            let state = Arc::clone(&state);
+            move || {
+                emit_pending_status(&state);
+                state.emitting.store(false, Ordering::Release);
+            }
+        });
+    if spawned.is_err() {
+        // No thread to spare: push inline rather than drop the status.
+        emit_pending_status(&state);
+        state.emitting.store(false, Ordering::Release);
+    }
+}
+
+fn emit_pending_status(state: &StatusEmitterState) {
+    let snapshot = state
+        .latest
+        .lock()
+        .ok()
+        .and_then(|mut latest| latest.take());
+    let Some(snapshot) = snapshot else { return };
+    let sender = state
+        .progress_sender
+        .lock()
+        .ok()
+        .and_then(|sender| sender.clone());
+    let Some(sender) = sender else { return };
+    // Census work happens only for the surviving signal, outside the
+    // emitter lock. Upgrade at emission so queued signals cannot keep a
+    // retired actor (and its watchers/servers) alive.
+    let snapshot = match snapshot {
+        PendingStatusSnapshot::Ready(snapshot, context) => match context.upgrade() {
+            Some(context) => {
+                #[cfg(test)]
+                wait_on_status_emit_gate_for_test(&context);
+                crate::status_push::project(&context, snapshot)
+            }
+            None => snapshot,
+        },
+        PendingStatusSnapshot::Context(context) => {
+            let Some(context) = context.upgrade() else {
+                return;
+            };
+            #[cfg(test)]
+            wait_on_status_emit_gate_for_test(&context);
+            let Some(snapshot) = context.try_build_status_push_snapshot() else {
+                // Keep the previous bar; the next producer signal retries.
+                return;
+            };
+            snapshot
+        }
+    };
+    sender(PushFrame::StatusChanged(StatusChangedFrame::new(
+        None, snapshot,
+    )));
 }
 use crate::cache_freshness::FileFreshness;
 use crate::search_index::SearchIndex;
@@ -4298,6 +4453,14 @@ pub struct AppContext {
     /// Set to true once the filter_registry has been populated. Avoids
     /// double-loading on hot paths without holding a write lock.
     filter_registry_loaded: std::sync::atomic::AtomicBool,
+    /// Set when idle eviction cleared the shared registry slot, until a
+    /// background bash spawn has loaded it again (see
+    /// [`AppContext::reload_released_filter_registry`]).
+    filter_registry_released: std::sync::atomic::AtomicBool,
+    /// Set when an idle release kept the filters because the root still held
+    /// background task records. The idle reaper retries the release once the
+    /// last record is gone (see [`AppContext::retry_deferred_idle_release`]).
+    filter_release_deferred: AtomicBool,
     /// Live `experimental.bash.compress` flag, kept in sync with `config`
     /// from the configure handler. Exposed via [`AppContext::bash_compress_flag`]
     /// so the BgTaskRegistry's watchdog-thread compressor can read it without
@@ -4998,6 +5161,8 @@ impl AppContext {
             )),
             filter_registry_rebuild_count: AtomicU64::new(0),
             filter_registry_loaded: std::sync::atomic::AtomicBool::new(false),
+            filter_registry_released: std::sync::atomic::AtomicBool::new(false),
+            filter_release_deferred: AtomicBool::new(false),
             bash_compress_flag: Arc::new(std::sync::atomic::AtomicBool::new(bash_compress_enabled)),
             gitignore: Arc::new(std::sync::RwLock::new(None)),
             gitignore_generation: Arc::new(AtomicU64::new(0)),
@@ -5974,6 +6139,42 @@ impl AppContext {
     #[cfg(test)]
     pub fn filter_registry_rebuild_count_for_test(&self) -> u64 {
         self.filter_registry_rebuild_count.load(Ordering::SeqCst)
+    }
+
+    /// Whether the compiled filter registry is resident.
+    #[cfg(test)]
+    pub(crate) fn filter_registry_loaded(&self) -> bool {
+        self.filter_registry_loaded.load(Ordering::Acquire)
+    }
+
+    /// Take the compiled filters of an idle root out of the shared slot. They
+    /// are rebuilt from the same sources by the next
+    /// [`Self::filter_registry`] or [`Self::shared_filter_registry`] call, or
+    /// by [`Self::reload_released_filter_registry`] when a background bash
+    /// task is spawned. The compiled builtin filters
+    /// alone take over a megabyte per root, which an evicted root has no use
+    /// for.
+    pub(crate) fn take_filter_registry(&self) -> crate::compress::toml_filter::FilterRegistry {
+        let mut slot = self
+            .filter_registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Cleared under the same write lock that publishes the flag
+        // everywhere else, so the slot and the flag never disagree.
+        self.filter_registry_loaded.store(false, Ordering::Release);
+        self.filter_registry_released.store(true, Ordering::Release);
+        std::mem::take(&mut *slot)
+    }
+
+    /// Load the filters again if idle eviction took them. A background bash
+    /// task's output is compressed on the watchdog thread through the shared
+    /// handle, which reads the registry as it is and cannot load it. A root
+    /// whose registry was never released keeps the cost of its first load
+    /// where it was (configure, or the first compression).
+    pub(crate) fn reload_released_filter_registry(&self) {
+        if self.filter_registry_released.swap(false, Ordering::AcqRel) {
+            self.ensure_filter_registry_loaded();
+        }
     }
 
     pub fn app(&self) -> Arc<App> {
@@ -13088,9 +13289,11 @@ impl AppContext {
             .map(|runtime| runtime.family_arena_bytes())
     }
 
-    /// Let go of this root's loaded views-on semantic lane when its artifacts
-    /// are evicted for idleness. Without this an idle root keeps its overlay
-    /// and pins every arena run its view names until the daemon exits.
+    /// Let go of this root's views-on semantic lane, loaded or still loading,
+    /// when its artifacts are evicted for idleness. Without this an idle root
+    /// keeps its overlay and pins every arena run its view names until the
+    /// daemon exits, and a lane that never finished loading keeps its worker
+    /// thread.
     ///
     /// The checkout runtime drops once its worker notices the closed lane and
     /// exits; the view then unbinds and the family arena drops every run no
@@ -13163,11 +13366,57 @@ impl AppContext {
                 }
                 lsp.shutdown_all();
             }
-            let _ = ctx.subc_lifecycle.run_if_unbound(|| {
+            let released = ctx.subc_lifecycle.run_if_unbound(|| {
                 ctx.bash_background.clear_db_pool();
                 ctx.backup.lock().clear_db_pool();
+                // The root's own config file watches each hold a thread (and on
+                // macOS an FSEvents run loop). Nothing reloads an unbound
+                // root's config; a rebind's configure starts them again.
+                let watches = ctx.config_live.take_watches();
+                // A query embedding model is rebuilt on the next semantic
+                // query. A local model holds its ONNX session and a query
+                // thread, which an evicted root has no use for. A model in
+                // use is left alone rather than waited for.
+                let model = ctx
+                    .semantic_embedding_model
+                    .try_lock()
+                    .and_then(|mut model| model.take());
+                // Background task output is compressed through the shared
+                // filter handle, which cannot load a released registry. A
+                // root that still holds task records keeps its filters, so a
+                // later render of that output compresses exactly as it would
+                // have without the eviction.
+                let deferred = ctx.bash_background.has_task_records();
+                ctx.filter_release_deferred
+                    .store(deferred, Ordering::Release);
+                let filters = (!deferred).then(|| ctx.take_filter_registry());
+                (watches, model, filters)
             });
+            // Dropped after the lifecycle check releases, so their shutdown
+            // never holds up a rebind.
+            drop(released);
         });
+    }
+
+    /// Run the idle release again for an evicted root whose filters were kept
+    /// because it still held background task records, once the last record
+    /// is gone. The idle reaper calls this on every sweep for evicted,
+    /// unbound roots: an evicted root is not reaped again, so nothing else
+    /// would retry. Returns whether a release was started. Waits on nothing;
+    /// a locked task map means "not yet".
+    pub(crate) fn retry_deferred_idle_release(self: &Arc<Self>) -> bool {
+        if !self.filter_release_deferred.load(Ordering::Acquire)
+            || self.bash_background.try_has_task_records() != Some(false)
+        {
+            return false;
+        }
+        // Cleared before the release starts, so the next sweep does not start
+        // a second one; the release sets it again if records came back.
+        if !self.filter_release_deferred.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        self.release_idle_reopenable_resources_in_background();
+        true
     }
 
     /// Final cleanup for an actor whose project directory no longer exists.
@@ -15439,6 +15688,35 @@ mod core_regressions {
         ctx.reset_filter_registry();
         ctx.install_lazy_filter_registry(stale);
         assert!(ctx.filter_registry().lookup("stale-command").is_none());
+    }
+
+    /// Idle eviction takes the compiled filters; the background bash spawn
+    /// path loads them again, because the watchdog's shared handle cannot.
+    #[test]
+    fn released_filter_registry_is_reloaded_for_background_bash() {
+        let ctx = context();
+        ctx.reset_filter_registry();
+        let handle = Arc::clone(&ctx.filter_registry);
+        let builtin = handle.read().unwrap().all().len();
+        assert!(builtin > 0, "builtin filters are compiled at reset");
+
+        let taken = ctx.take_filter_registry();
+        assert_eq!(taken.all().len(), builtin);
+        assert!(!ctx.filter_registry_loaded());
+        assert_eq!(
+            handle.read().unwrap().all().len(),
+            0,
+            "the shared slot is emptied"
+        );
+
+        let rebuilds = ctx.filter_registry_rebuild_count_for_test();
+        ctx.reload_released_filter_registry();
+        assert!(ctx.filter_registry_loaded());
+        assert_eq!(handle.read().unwrap().all().len(), builtin);
+        assert_eq!(ctx.filter_registry_rebuild_count_for_test(), rebuilds + 1);
+        // Only a release triggers the spawn-path load.
+        ctx.reload_released_filter_registry();
+        assert_eq!(ctx.filter_registry_rebuild_count_for_test(), rebuilds + 1);
     }
 
     /// In the configure timing line (`configure_ack_phase_snapshot`, used by
@@ -19530,13 +19808,11 @@ mod status_emitter_tests {
         // Status hydrates checkpoints even before configure. Keep its namespace
         // and file lock private instead of sharing the cwd-wide default store.
         *ctx.checkpoint().lock() = CheckpointStore::unbound_in_for_test(&ctx.storage_dir());
-        // Disconnect the constructor's idle worker and queue the whole burst
-        // before starting its replacement. Scheduler pauses must not split the
+        // Route this emitter to a private debounce loop and queue the whole
+        // burst before starting it. Scheduler pauses must not split the
         // signals across debounce windows.
         let (notify, notifications) = mpsc::channel();
         ctx.status_emitter.notify = notify;
-        let latest = Arc::clone(&ctx.status_emitter.latest);
-        let progress_sender = Arc::clone(&ctx.progress_sender);
         let ctx = Arc::new(ctx);
         ctx.bind_status_context();
         for _ in 0..12 {
@@ -19549,7 +19825,7 @@ mod status_emitter_tests {
 
         let (done_tx, done_rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            status_debounce_loop(notifications, latest, progress_sender);
+            status_debounce_loop(notifications);
             let _ = done_tx.send(());
         });
         // These deadlines guard hangs, not the duration of a snapshot build.
@@ -19657,6 +19933,57 @@ mod status_emitter_tests {
         );
     }
 
+    /// A context for `root` whose status pushes arrive on the returned
+    /// receiver, registered the way a transport root is.
+    fn bound_ctx_with_frame_rx(root: &Path) -> (Arc<AppContext>, mpsc::Receiver<PushFrame>) {
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        let (tx, rx) = mpsc::channel();
+        ctx.set_progress_sender(Some(Arc::new(Box::new(move |frame| {
+            let _ = tx.send(frame);
+        }))));
+        ctx.bind_status_context();
+        (ctx, rx)
+    }
+
+    /// Building one project's status can touch its filesystem, which may sit
+    /// on a slow or unavailable mount. While that build waits, another
+    /// project's status must still go out within its debounce window.
+    #[test]
+    fn a_stalled_status_build_does_not_delay_another_context() {
+        let slow_root = tempfile::tempdir().unwrap();
+        let fast_root = tempfile::tempdir().unwrap();
+        let (slow, slow_rx) = bound_ctx_with_frame_rx(slow_root.path());
+        let (fast, fast_rx) = bound_ctx_with_frame_rx(fast_root.path());
+        let gate = gate_status_emit_for_test(slow_root.path());
+
+        slow.status_emitter().signal(slow.build_status_snapshot());
+        gate.reached
+            .recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 5_000))
+            .expect("the slow project's status build started");
+        fast.status_emitter().signal(fast.build_status_snapshot());
+        let fast_frame = fast_rx.recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 2_000));
+        // Release before asserting, so a failure does not leave the shared
+        // status machinery blocked for other tests.
+        let _ = gate.release.send(());
+        assert!(
+            matches!(fast_frame, Ok(PushFrame::StatusChanged(_))),
+            "another project's status waited for the stalled build"
+        );
+        assert!(
+            matches!(
+                slow_rx.recv_timeout(Duration::from_secs(10)),
+                Ok(PushFrame::StatusChanged(_))
+            ),
+            "the stalled project's status goes out once its build finishes"
+        );
+    }
+
     fn ctx_with_frame_rx() -> (AppContext, mpsc::Receiver<PushFrame>) {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         let (tx, rx) = mpsc::channel();
@@ -19731,10 +20058,34 @@ mod status_emitter_tests {
     }
 
     #[test]
-    fn status_emitter_shutdown_cleanly_exits_debounce_thread() {
+    fn status_emitter_dropped_context_pushes_nothing() {
+        // A context dropped inside its open debounce window must not push.
         let (ctx, rx) = ctx_with_frame_rx();
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
         drop(ctx);
-        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(rx
+            .recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 300))
+            .is_err());
+    }
+
+    #[test]
+    fn status_emitter_windows_are_per_context() {
+        // Contexts share one debounce thread; a burst on one context must not
+        // absorb another context's push.
+        let (first, first_rx) = ctx_with_frame_rx();
+        let (second, second_rx) = ctx_with_frame_rx();
+        for _ in 0..5 {
+            first.status_emitter().signal(first.build_status_snapshot());
+            second
+                .status_emitter()
+                .signal(second.build_status_snapshot());
+        }
+        for rx in [&first_rx, &second_rx] {
+            let frame = rx
+                .recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 2_000))
+                .expect("each context pushes its own status");
+            assert!(matches!(frame, PushFrame::StatusChanged(_)));
+        }
     }
 
     #[test]

@@ -366,7 +366,44 @@ fn os_thread_ids() -> Option<Vec<u64>> {
     Some(ids)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// This process's thread IDs from a Toolhelp snapshot, or `None` when the
+/// snapshot could not be taken. The snapshot lists every thread on the
+/// system, so it is filtered to this process.
+#[cfg(windows)]
+fn os_thread_ids() -> Option<Vec<u64>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+
+    let pid = std::process::id();
+    // SAFETY: plain FFI call; the returned handle is checked and closed below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
+        return None;
+    }
+    // SAFETY: THREADENTRY32 is a plain C record; dwSize is set before use.
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    let mut ids = Vec::new();
+    // SAFETY: snapshot is a valid Toolhelp handle and entry is writable with
+    // its size recorded in dwSize.
+    let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while more {
+        if entry.th32OwnerProcessID == pid {
+            ids.push(u64::from(entry.th32ThreadID));
+        }
+        // SAFETY: as for Thread32First.
+        more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: snapshot is a handle this function owns.
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    (!ids.is_empty()).then_some(ids)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn os_thread_ids() -> Option<Vec<u64>> {
     None
 }
@@ -426,7 +463,14 @@ fn os_thread_names() -> (usize, Option<Vec<Option<String>>>) {
     (count, Some(names))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Windows counts threads from a Toolhelp snapshot but does not read their
+/// names (that takes a handle per thread), so the census is unclassified.
+#[cfg(windows)]
+fn os_thread_names() -> (usize, Option<Vec<Option<String>>>) {
+    (os_thread_ids().map_or(0, |ids| ids.len()), None)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn os_thread_names() -> (usize, Option<Vec<Option<String>>>) {
     (0, Some(Vec::new()))
 }

@@ -13,7 +13,7 @@ use super::cache::{
     InspectCache, InspectCacheError, InspectCacheRead, InspectDbTimings, Tier2ContributionUpdates,
     WRITER_RETRY_BACKOFF,
 };
-use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
+use super::dispatch::{default_worker, InspectDispatcher, InspectWorker};
 use super::freshness::{verify_contribution_file, ContributionFreshness};
 use super::job::{
     is_test_tree_file, CallgraphSnapshot, ExcludedTestTally, FileContribution, InspectCategory,
@@ -840,7 +840,7 @@ fn deferred_view_key(root: &Path) -> PathBuf {
 pub struct InspectManager {
     deferred_view_refreshes: Mutex<HashMap<PathBuf, DeferredViewRefresh>>,
     root_work_cancellation: Arc<Mutex<crate::executor::JobCancellation>>,
-    request_tx: Sender<InspectJob>,
+    dispatcher: InspectDispatcher,
     result_rx: Receiver<InspectResult>,
     #[allow(dead_code)]
     pool: Arc<rayon::ThreadPool>,
@@ -1016,13 +1016,13 @@ impl InspectManager {
             }
             result
         });
-        let handles = start_dispatch_loop(guarded_worker);
+        let dispatcher = InspectDispatcher::new(guarded_worker);
         Self {
             deferred_view_refreshes: Mutex::new(HashMap::new()),
             root_work_cancellation,
-            request_tx: handles.request_tx,
-            result_rx: handles.result_rx,
-            pool: handles.pool,
+            result_rx: dispatcher.result_rx.clone(),
+            pool: Arc::clone(&dispatcher.pool),
+            dispatcher,
             in_flight: Mutex::new(HashMap::new()),
             in_flight_changed: Condvar::new(),
             caches,
@@ -4486,9 +4486,8 @@ impl InspectManager {
             callgraph_writer: snapshot.callgraph_writer,
             callgraph_snapshot,
         };
-        self.request_tx
-            .send(job)
-            .map_err(|_| "inspect dispatch loop is unavailable".to_string())
+        self.dispatcher.submit(job);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
