@@ -760,8 +760,9 @@ fn handle_glob_edit_match(
             &req.id,
             "match_not_found",
             format!(
-                "edit_match: '{}' not found in any files matching '{}'",
-                match_str, pattern
+                "edit_match: {} not found in any files matching '{}'",
+                crate::fuzzy_match::describe_searched_text(match_str),
+                pattern
             ),
         );
     }
@@ -1166,7 +1167,6 @@ mod tests {
     /// the transcript. The nearest-miss excerpt that follows is already
     /// bounded (ten lines of at most 240 characters).
     #[test]
-    #[ignore = "fails today (#759): the not-found error repeats the entire match text"]
     fn not_found_error_does_not_repeat_a_large_match() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("small.rs");
@@ -1194,6 +1194,12 @@ mod tests {
             message.len()
         );
         assert!(message.len() < 4 * 1024, "{} byte error", message.len());
+        assert!(
+            message.starts_with(
+                "edit_match: '    let absent_0 = 0;…' (400 lines, 9490 bytes) not found in "
+            ),
+            "{message}"
+        );
     }
 
     /// A failed match with a 64 KiB or 256 KiB `match` against a large file
@@ -1251,7 +1257,8 @@ mod tests {
             assert_eq!(
                 response.data["message"].as_str().unwrap(),
                 format!(
-                    "edit_match: '{needle}' not found in {}{}",
+                    "edit_match: {} not found in {}{}",
+                    crate::fuzzy_match::describe_searched_text(&needle),
                     path.display(),
                     crate::fuzzy_match::render_edit_not_found_detail(&source, &needle, "x")
                 ),
@@ -1569,8 +1576,8 @@ fn handle_single_file_edit_match(
             &req.id,
             "match_not_found",
             format!(
-                "edit_match: '{}' not found in {}{}",
-                match_str,
+                "edit_match: {} not found in {}{}",
+                crate::fuzzy_match::describe_searched_text(match_str),
                 file,
                 crate::fuzzy_match::render_edit_not_found_detail(&source, match_str, replacement,),
             ),

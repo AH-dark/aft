@@ -475,9 +475,9 @@ fn resolve_edit_with_offsets(
 
         if fuzzy_matches.is_empty() {
             let message = format!(
-                "batch: edit[{}] match '{}' not found in file{}",
+                "batch: edit[{}] match {} not found in file{}",
                 index,
-                match_str,
+                crate::fuzzy_match::describe_searched_text(match_str),
                 crate::fuzzy_match::render_edit_not_found_detail(source, match_str, replacement),
             );
             return Err(Response::error(req_id, "batch_edit_failed", message));
@@ -777,7 +777,6 @@ mod a03_tests {
     /// batch path. Its error should name the miss without pasting the whole
     /// match back; the nearest-miss excerpt that follows is already bounded.
     #[test]
-    #[ignore = "fails today (#759): the batch not-found error repeats the entire match text"]
     fn not_found_error_does_not_repeat_a_large_match() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("small.rs");
@@ -804,6 +803,10 @@ mod a03_tests {
             message.len()
         );
         assert!(message.len() < 4 * 1024, "{} byte error", message.len());
+        assert!(
+            message.starts_with("batch: edit[0] match '    let absent_0 = 0;…' (400 lines, 9490 bytes) not found in "),
+            "{message}"
+        );
     }
 
     #[test]
