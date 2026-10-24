@@ -69,14 +69,13 @@ pub(super) fn confirm_if_needed(
     }
 
     // Tree-sitter can also misread a previously accepted Swift file. Establish
-    // a safe original before deciding whether the new content needs rollback.
+    // a safe original for the rollback decision. The compiler's verdict on the
+    // new content applies whatever the original was, so an edit that repairs a
+    // broken file into valid Swift tree-sitter misreads is reported valid.
     if *was_valid == Some(false)
         && original.is_some_and(|source| matches!(parse(source), ParseOutcome::Exited(Some(0))))
     {
         *was_valid = Some(true);
-    }
-    if *was_valid != Some(true) {
-        return is_valid;
     }
 
     confirm_with_compiler(path, source, is_valid)
@@ -159,7 +158,13 @@ fn discover_swiftc() -> LookupOutcome {
     {
         let mut command = Command::new("xcrun");
         command.args(["--find", "swiftc"]);
-        xcrun_lookup_outcome(run_command(command, "", Instant::now() + parse_timeout()))
+        xcrun_lookup_outcome(run_command(
+            command,
+            "swiftc",
+            "",
+            Instant::now() + parse_timeout(),
+            false,
+        ))
     }
     #[cfg(not(target_os = "macos"))]
     LookupOutcome::Missing
@@ -252,8 +257,10 @@ fn run_swiftc(path: &Path, source: &str) -> ParseOutcome {
     command.args(["-parse", "-"]);
     parse_outcome(run_command(
         command,
+        "swiftc",
         source,
         Instant::now() + parse_timeout(),
+        false,
     ))
 }
 
@@ -266,13 +273,22 @@ fn parse_outcome(result: Result<SubprocessOutcome, FormatError>) -> ParseOutcome
     }
 }
 
-fn run_command(
+/// Run a syntax-only checker that reads `source` on stdin, killing its
+/// process tree at `deadline`. Shared by the Swift and bash confirmations.
+///
+/// With `may_stop_reading`, a checker that exits before reading all of its
+/// input (bash stops at the first syntax error) is judged by its exit status;
+/// otherwise the failed write makes the run fail.
+pub(super) fn run_command(
     mut command: Command,
+    tool: &str,
     source: &str,
     deadline: Instant,
+    may_stop_reading: bool,
 ) -> Result<SubprocessOutcome, FormatError> {
-    // Do not set an environment or use pre_exec: both force fork on macOS.
-    // process_group keeps posix_spawn available while allowing timeout tree cleanup.
+    // Avoid setting an environment or using pre_exec where possible: both
+    // force fork on macOS. process_group keeps posix_spawn available while
+    // allowing timeout tree cleanup.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -285,12 +301,10 @@ fn run_command(
         .spawn()
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                FormatError::NotFound {
-                    tool: "swiftc".into(),
-                }
+                FormatError::NotFound { tool: tool.into() }
             } else {
                 FormatError::Failed {
-                    tool: "swiftc".into(),
+                    tool: tool.into(),
                     stderr: error.to_string(),
                 }
             }
@@ -299,19 +313,24 @@ fn run_command(
     let input = source.as_bytes().to_vec();
     // A large file can fill stdin; start the deadline wait before waiting for its writer.
     let writer = std::thread::spawn(move || stdin.write_all(&input));
-    let result = crate::format::wait_with_deadline(child, "swiftc", deadline, || false);
+    let result = crate::format::wait_with_deadline(child, tool, deadline, || false);
     if result.is_ok() {
-        writer
+        match writer
             .join()
             .unwrap_or_else(|_| Err(std::io::Error::other("stdin writer panicked")))
-            .map_err(|error| FormatError::Failed {
-                tool: "swiftc".into(),
-                stderr: error.to_string(),
-            })?;
+        {
+            Ok(()) => {}
+            Err(error) if may_stop_reading && error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(error) => {
+                return Err(FormatError::Failed {
+                    tool: tool.into(),
+                    stderr: error.to_string(),
+                })
+            }
+        }
     }
     result
 }
-
 #[cfg(test)]
 type Runner = Box<dyn FnMut(&str) -> ParseOutcome>;
 
@@ -422,6 +441,9 @@ mod tests {
         );
     }
 
+    /// An original the compiler does not confirm is never rolled back to, so
+    /// the edit is kept whatever the original's outcome. The new content is
+    /// still judged by the compiler; here it confirms the error.
     #[test]
     fn swift_parser_invalid_original_keeps_edit_without_rollback() {
         for outcome in [
@@ -433,18 +455,28 @@ mod tests {
         ] {
             let calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let count = calls.clone();
+            let updated = BROKEN.repeat(2);
+            let expected = updated.clone();
             let mut outcome = Some(outcome);
             with_runner(
                 Box::new(move |source| {
                     count.set(count.get() + 1);
-                    assert_eq!(source, BROKEN, "only the original should be parsed");
-                    outcome.take().expect("only one compiler call")
+                    match count.get() {
+                        1 => {
+                            assert_eq!(source, BROKEN, "the original is checked first");
+                            outcome.take().unwrap()
+                        }
+                        2 => {
+                            assert_eq!(source, expected, "then the new content");
+                            ParseOutcome::Exited(Some(1))
+                        }
+                        _ => panic!("only two compiler calls"),
+                    }
                 }),
                 || {
                     let temp = tempfile::tempdir().unwrap();
                     let path = temp.path().join("broken.swift");
                     std::fs::write(&path, BROKEN).unwrap();
-                    let updated = BROKEN.repeat(2);
                     let result = write_format_validate(
                         &path,
                         &updated,
@@ -458,10 +490,49 @@ mod tests {
                     assert!(!result.rolled_back);
                     assert_eq!(result.syntax_valid, Some(false));
                     assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
-                    assert_eq!(calls.get(), 1);
+                    assert_eq!(calls.get(), 2);
                 },
             );
         }
+    }
+
+    /// An edit that repairs a file the compiler rejects into valid Swift that
+    /// tree-sitter misreads is judged by the compiler, even though the
+    /// original is broken.
+    #[test]
+    fn swift_parser_broken_original_repaired_uses_compiler_verdict() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = calls.clone();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("broken.swift");
+        std::fs::write(&path, BROKEN).unwrap();
+        assert_eq!(validate_syntax_str(TUPLE, &path), Some(false));
+        let result = with_runner(
+            Box::new(move |source| {
+                recorded.borrow_mut().push(source.to_owned());
+                match source {
+                    BROKEN => ParseOutcome::Exited(Some(1)),
+                    TUPLE => ParseOutcome::Exited(Some(0)),
+                    _ => panic!("unexpected compiler input: {source}"),
+                }
+            }),
+            || {
+                write_format_validate(
+                    &path,
+                    TUPLE,
+                    &Config {
+                        format_on_edit: false,
+                        ..Config::default()
+                    },
+                    &serde_json::json!({}),
+                )
+                .unwrap()
+            },
+        );
+        assert!(!result.rolled_back);
+        assert_eq!(result.syntax_valid, Some(true));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
+        assert_eq!(*calls.borrow(), [BROKEN, TUPLE]);
     }
 
     #[test]
@@ -880,8 +951,10 @@ mod tests {
                 command.args(["-c", "exec sleep 30"]);
                 let outcome = parse_outcome(run_command(
                     command,
+                    "swiftc",
                     source,
                     Instant::now() + Duration::from_millis(50),
+                    false,
                 ));
                 assert!(matches!(outcome, ParseOutcome::TimedOut), "{outcome:?}");
                 outcome
@@ -989,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn swift_parser_skips_valid_new_content_and_unknown_original() {
+    fn swift_parser_skips_valid_new_content() {
         let calls = std::rc::Rc::new(std::cell::Cell::new(0));
         let count = calls.clone();
         with_runner(
@@ -1001,7 +1074,6 @@ mod tests {
                 for (was_valid, is_valid) in [
                     (Some(true), Some(true)),
                     (Some(false), Some(true)),
-                    (None, Some(false)),
                     (Some(true), None),
                 ] {
                     let mut original_valid = was_valid;
@@ -1022,8 +1094,37 @@ mod tests {
         assert_eq!(
             calls.get(),
             0,
-            "no parser call for valid new content or an unknown original"
+            "no parser call for new content tree-sitter accepts or cannot judge"
         );
+    }
+
+    /// With an unknown original, the compiler still judges rejected new
+    /// content; the original stays unknown, so nothing can be rolled back.
+    #[test]
+    fn swift_parser_unknown_original_still_confirms_new_content() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = calls.clone();
+        with_runner(
+            Box::new(move |source| {
+                recorded.borrow_mut().push(source.to_owned());
+                ParseOutcome::Exited(Some(0))
+            }),
+            || {
+                let mut original_valid = None;
+                assert_eq!(
+                    confirm_if_needed(
+                        Path::new("test.swift"),
+                        TUPLE,
+                        Some(TUPLE),
+                        &mut original_valid,
+                        Some(false),
+                    ),
+                    Some(true)
+                );
+                assert_eq!(original_valid, None);
+            },
+        );
+        assert_eq!(*calls.borrow(), [TUPLE]);
     }
 
     #[cfg(target_os = "macos")]
@@ -1169,7 +1270,13 @@ mod tests {
             let mut command = Command::new("/bin/sh");
             command.args(["-c", "sleep 6"]);
             let started = Instant::now();
-            let outcome = parse_outcome(run_command(command, "", Instant::now() + parse_timeout()));
+            let outcome = parse_outcome(run_command(
+                command,
+                "swiftc",
+                "",
+                Instant::now() + parse_timeout(),
+                false,
+            ));
             assert!(
                 matches!(outcome, ParseOutcome::Exited(Some(0))),
                 "test-only deadline should let a slow compiler startup finish: {outcome:?}"
@@ -1183,7 +1290,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let command = Command::new(temp.path().join("absent-swiftc"));
         assert!(matches!(
-            parse_outcome(run_command(command, TUPLE, Instant::now() + PARSE_TIMEOUT)),
+            parse_outcome(run_command(
+                command,
+                "swiftc",
+                TUPLE,
+                Instant::now() + PARSE_TIMEOUT,
+                false
+            )),
             ParseOutcome::Missing
         ));
     }
@@ -1215,8 +1328,10 @@ mod tests {
                     .arg(&child_pid_path);
                 let outcome = parse_outcome(run_command(
                     command,
+                    "swiftc",
                     source,
                     Instant::now() + Duration::from_millis(150),
+                    false,
                 ));
                 assert!(matches!(outcome, ParseOutcome::TimedOut));
                 outcome

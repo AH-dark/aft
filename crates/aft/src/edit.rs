@@ -2032,6 +2032,7 @@ pub(crate) fn write_format_deferred_created(
     write_format_validate_impl(path, content, config, params, true, None, true)
 }
 
+mod bash;
 mod swift;
 
 fn write_format_validate_impl(
@@ -2098,13 +2099,22 @@ fn write_format_validate_impl(
                 return check.valid;
             }
             let syntax_valid = validate_captured_syntax(path, source);
-            swift::confirm_if_needed(
-                path,
-                source,
-                pre_write_content.as_deref(),
-                &mut was_syntax_valid,
-                syntax_valid,
-            )
+            if bash::applies(path) {
+                bash::confirm_if_needed(
+                    source,
+                    pre_write_content.as_deref(),
+                    &mut was_syntax_valid,
+                    syntax_valid,
+                )
+            } else {
+                swift::confirm_if_needed(
+                    path,
+                    source,
+                    pre_write_content.as_deref(),
+                    &mut was_syntax_valid,
+                    syntax_valid,
+                )
+            }
         });
     let rolled_back = if was_syntax_valid == Some(true) && syntax_valid == Some(false) {
         if let Some(original) = pre_write_content.as_ref() {
@@ -2200,9 +2210,13 @@ pub(crate) struct CreatedFileSyntax {
 /// A new file cannot be rolled back to earlier content, so an invalid result
 /// is kept on disk and reported to the agent instead. The error line comes
 /// from the same tree-sitter parse that produced the verdict. Swift files that
-/// tree-sitter rejects are confirmed with `swiftc -parse` first, so a file the
-/// compiler accepts counts as valid and carries no error line. An unavailable
-/// compiler verdict is unknown and carries a reason instead of an error line.
+/// tree-sitter rejects are confirmed with `swiftc -parse` first, and bash
+/// files with `bash -n`, so a file the compiler or shell accepts counts as
+/// valid and carries no error line. For a bash error the shell confirms, the
+/// line bash names is preferred over tree-sitter's. An unavailable compiler or
+/// shell verdict is unknown and carries a reason instead of an error line;
+/// for bash that includes a missing shell, since tree-sitter-bash alone
+/// rejects some valid scripts.
 pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFileSyntax {
     let Some(tree) = parse_captured_syntax(path, source) else {
         return CreatedFileSyntax {
@@ -2212,13 +2226,26 @@ pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFil
         };
     };
     let root = tree.root_node();
-    let (valid, skipped_reason) =
-        match swift::confirm_created(path, source, Some(!root.has_error())) {
+    let tree_valid = Some(!root.has_error());
+    // The line bash itself named for a syntax error it confirmed.
+    let mut shell_error_line = None;
+    let (valid, skipped_reason) = if tree_valid == Some(false) && bash::applies(path) {
+        match bash::confirm_created(source) {
+            Ok(bash::ShellVerdict::Valid) => (Some(true), None),
+            Ok(bash::ShellVerdict::Broken(line)) => {
+                shell_error_line = line;
+                (Some(false), None)
+            }
+            Err(reason) => (None, Some(reason)),
+        }
+    } else {
+        match swift::confirm_created(path, source, tree_valid) {
             Ok(valid) => (valid, None),
             Err(reason) => (None, Some(reason)),
-        };
+        }
+    };
     let first_error_line = if valid == Some(false) {
-        first_syntax_error_line(root)
+        shell_error_line.or_else(|| first_syntax_error_line(root))
     } else {
         None
     };
@@ -2229,30 +2256,35 @@ pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFil
     }
 }
 
-/// 1-based start line of the first ERROR or MISSING node in document order.
+/// 1-based line of the first token the parser could not fit, in document
+/// order: the first stray token inside an ERROR node, or a MISSING node.
 ///
-/// tree-sitter sets `has_error` on a node exactly when its subtree contains an
-/// ERROR or MISSING node, so the walk only descends into subtrees that carry
-/// one and returns `None` only for a tree without errors. It is iterative
-/// because deeply nested syntax trees could overflow a recursive walk.
-pub(crate) fn first_syntax_error_line(root: tree_sitter::Node<'_>) -> Option<usize> {
-    let mut cursor = root.walk();
-    loop {
-        let node = cursor.node();
-        if node.is_error() || node.is_missing() {
-            return Some(node.start_position().row + 1);
+/// Error recovery can wrap many valid statements in one ERROR node whose
+/// start is a line with no mistake on it; the tokens the parser actually got
+/// stuck on follow those complete statements. So inside an ERROR the walk
+/// skips complete, error-free subtrees and comments, and reports the first
+/// bare token, or descends into a nested error that comes first. Outside an
+/// ERROR it follows the first child whose subtree carries an error
+/// (tree-sitter's `has_error`). An ERROR with nothing else to point at is
+/// reported at its own start. Returns `None` only for a tree without errors.
+/// The walk is iterative so deeply nested trees cannot overflow the stack.
+pub(crate) fn first_syntax_error_line(mut node: tree_sitter::Node<'_>) -> Option<usize> {
+    let line = |node: tree_sitter::Node<'_>| node.start_position().row + 1;
+    'descend: loop {
+        if node.is_missing() {
+            return Some(line(node));
         }
-        if node.has_error() && cursor.goto_first_child() {
-            continue;
-        }
-        loop {
-            if cursor.goto_next_sibling() {
-                break;
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.has_error() || child.is_error() || child.is_missing() {
+                node = child;
+                continue 'descend;
             }
-            if !cursor.goto_parent() {
-                return None;
+            if node.is_error() && !child.is_extra() && child.child_count() == 0 {
+                return Some(line(child));
             }
         }
+        return node.is_error().then(|| line(node));
     }
 }
 
@@ -2300,6 +2332,75 @@ mod tests {
     }
 
     use super::*;
+
+    /// A valid script whose escaped `[ ... \< ... ]` comparison tree-sitter-bash
+    /// cannot parse. Error recovery wraps lines 6-69 in one ERROR that starts
+    /// at `set -u`; inside it, the complete statements of lines 6-18 are
+    /// followed by the bare `while` and `[` tokens of line 19, where the parse
+    /// got stuck.
+    const BASH_GRAMMAR_GAP_FIXTURE: &str = include_str!("../tests/fixtures/aft-window-6deceda4.sh");
+
+    #[test]
+    fn syntax_error_line_points_at_stuck_token_not_recovery_wrapper() {
+        let path = Path::new("new.sh");
+        let tree = parse_captured_syntax(path, BASH_GRAMMAR_GAP_FIXTURE).unwrap();
+        let mut cursor = tree.root_node().walk();
+        let outer = tree
+            .root_node()
+            .children(&mut cursor)
+            .find(|child| child.is_error())
+            .unwrap();
+        assert_eq!(outer.start_position().row + 1, 6);
+        assert_eq!(first_syntax_error_line(tree.root_node()), Some(19));
+
+        // Truly broken: the recovery ERROR starts at `in` on line 3 and holds
+        // the valid `a)` item before the stray `b` on line 5, the line
+        // `bash -n` reports.
+        let broken_case = "set -u\necho a\ncase x in\n  a) echo ;;\n  b echo ;;\nesac\n";
+        let tree = parse_captured_syntax(path, broken_case).unwrap();
+        assert_eq!(first_syntax_error_line(tree.root_node()), Some(5));
+
+        let broken = "#!/usr/bin/env bash\nset -u\nif true; then\n  )\nfi\n";
+        let tree = parse_captured_syntax(path, broken).unwrap();
+        assert_eq!(first_syntax_error_line(tree.root_node()), Some(4));
+        let clean = parse_captured_syntax(path, "set -u\necho ok\n").unwrap();
+        assert_eq!(first_syntax_error_line(clean.root_node()), None);
+    }
+
+    /// The bisected trigger: an escaped `\<` (or `\>`) string comparison inside
+    /// `[ ... ]`. The other suspects in the fixture parse cleanly on their own.
+    #[test]
+    fn bash_syntax_grammar_gap_is_escaped_comparison() {
+        let path = Path::new("new.sh");
+        for source in [
+            "[ a \\< b ]\n",
+            "[ a \\> b ]\n",
+            "while [ a \\< b ]; do :; done\n",
+        ] {
+            let tree = parse_captured_syntax(path, source).unwrap();
+            assert!(
+                tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+        }
+        let fixture_lines: Vec<&str> = BASH_GRAMMAR_GAP_FIXTURE.lines().collect();
+        for source in [
+            // `aft_pid()`: `python3 -c` with a single-quoted program after a
+            // `\` line continuation (fixture lines 14-17).
+            fixture_lines[13..17].join("\n"),
+            // `awk 'NR==2{...}'` inside `$(...)` (fixture line 20).
+            fixture_lines[19].to_string(),
+            "while [ a = b ]; do :; done\n".to_string(),
+        ] {
+            let tree = parse_captured_syntax(path, &source).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+        }
+    }
 
     #[test]
     fn created_file_syntax_reports_first_error_line() {
