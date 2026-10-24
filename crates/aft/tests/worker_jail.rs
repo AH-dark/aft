@@ -3433,28 +3433,22 @@ async fn worker_gh_read_log_failed_whole_job_fallback_through_sandboxed_gh() {
         .tool_reply(
             "bash",
             json!({
-                "command":"gh run view 40083893167 --repo cortexkit/aft --log-failed",
+                "command":"gh run view 40083893167 --repo cortexkit/aft --log-failed > gh-log-failed.txt",
                 "timeout":300_000
             }),
         )
         .await;
     let text = response.to_string();
     assert_eq!(response["structuredContent"]["exit_code"], 0, "{text}");
-    let output = response["structuredContent"]["output"]
-        .as_str()
-        .expect(&text);
     let expected = log
         .lines()
         .map(|line| format!("Landing policy\tUNKNOWN STEP\t{line}\n"))
         .collect::<String>();
-    let (command_output, trailer) = output.rsplit_once('\n').expect("bash task trailer line");
-    assert!(
-        regex::Regex::new(r"^\[task bash-[0-9a-f]{16}\]$")
-            .unwrap()
-            .is_match(trailer),
-        "unexpected bash task trailer: {trailer:?}"
-    );
-    assert_eq!(format!("{command_output}\n"), expected);
+    // Compare gh's own stdout from a file: AFT's bash reply adds its task
+    // line and, on some sandboxes, notes of its own after the command output.
+    let gh_output = std::fs::read_to_string(jail.worktree.join("gh-log-failed.txt"))
+        .unwrap_or_else(|error| panic!("gh output file missing ({error}): {text}"));
+    assert_eq!(gh_output, expected, "{text}");
     let calls = jail.read_holder.lock().unwrap().calls.clone();
     assert_eq!(calls.len(), 2, "{calls:?}");
     assert_eq!(
