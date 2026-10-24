@@ -478,14 +478,13 @@ fn wait_for_semantic_stale_generation_discard_for_test(timeout: Duration) -> boo
     !result.timed_out() || semantic_stale_generation_discards_for_test() > 0
 }
 
-// The watcher already coalesces filesystem events for 250 ms. Keep a short
-// worker window for corpus-build replay bursts without adding a second full debounce.
 // Quiet window before a semantic re-embed batch runs. Embedding costs ~1-2s
 // per collect under load, and nobody semantically searches a file within
 // seconds of editing it — a long window coalesces an agent's whole edit burst
 // into one collect instead of one per save. Freshness is preserved where it
 // matters: unembedded changed files are already excluded from results by the
-// stale-file mask, and grep/read see changes instantly.
+// stale-file mask, and grep/read see changes instantly. A batch is admitted
+// after at most four quiet windows even if requests keep arriving.
 const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 15_000;
 
 /// Test seam: rigs that assert on semantic refresh timing override the quiet

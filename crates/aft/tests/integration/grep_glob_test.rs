@@ -1979,6 +1979,30 @@ mod explicit_target_regressions {
         ])
     }
 
+    #[test]
+    fn ignored_reports_fixture_has_valid_unborn_git_metadata() {
+        let project = ignored_reports_project();
+        let head = std::fs::read_to_string(project.path().join(".git/HEAD"))
+            .expect("ignore fixture must have a complete Git repository");
+        assert!(head.starts_with("ref: refs/heads/"), "{head}");
+        let inside = std::process::Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(inside.status.success(), "{inside:?}");
+        assert_eq!(String::from_utf8(inside.stdout).unwrap().trim(), "true");
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            !head.status.success(),
+            "fixture should be an unborn repository"
+        );
+    }
+
     fn reports_request(command: &str, path: Option<&str>) -> Value {
         let mut request = json!({"id": "reports", "command": command,
         "pattern": if command == "grep" { r"\d+ pass; \d+ fail" } else { "common-auth-body-*.log" }});
