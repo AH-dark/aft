@@ -14894,8 +14894,12 @@ fn rust_pub_use_reexport_parts(
     }
 
     if let Some(brace_start) = body.find("::{") {
-        let module_path = body[..brace_start].trim().to_string();
-        let names = rust_reexport_names_from_specs(&body[brace_start + 3..body.rfind('}')?]);
+        rust_use_group_close(body)?;
+        let module_path = body.get(..brace_start)?.trim().to_string();
+        // Validate a real group, but retain the legacy range (including trailing
+        // comments) until a planned extraction output version change.
+        let specs = body.get(brace_start + 3..body.rfind('}')?)?;
+        let names = rust_reexport_names_from_specs(specs);
         if names.is_empty() {
             return None;
         }
@@ -14908,6 +14912,96 @@ fn rust_pub_use_reexport_parts(
         return None;
     }
     Some((module_path.trim().to_string(), names, false))
+}
+
+fn rust_use_group_close(body: &str) -> Option<usize> {
+    let bytes = body.as_bytes();
+    let mut pos = 0;
+    let mut depth: usize = 0;
+    while let Some(&byte) = bytes.get(pos) {
+        let rest = bytes.get(pos..)?;
+        if rest.starts_with(b"//") {
+            pos += rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+            continue;
+        }
+        if rest.starts_with(b"/*") {
+            pos += 2;
+            let mut comments = 1;
+            while comments > 0 {
+                let rest = bytes.get(pos..)?;
+                if rest.starts_with(b"/*") {
+                    comments += 1;
+                    pos += 2;
+                } else if rest.starts_with(b"*/") {
+                    comments -= 1;
+                    pos += 2;
+                } else {
+                    bytes.get(pos)?;
+                    pos += 1;
+                }
+            }
+            continue;
+        }
+        // Raw strings may also have byte or C prefixes; scanning reaches their
+        // `r` after the prefix without interpreting their contents as code.
+        if byte == b'r' {
+            let hashes = rest[1..].iter().take_while(|&&b| b == b'#').count();
+            if rest.get(1 + hashes) == Some(&b'"') {
+                pos += 2 + hashes;
+                loop {
+                    let &next = bytes.get(pos)?;
+                    pos += 1;
+                    if next == b'"' && bytes.get(pos..pos + hashes)?.iter().all(|&b| b == b'#') {
+                        pos += hashes;
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        if byte == b'"' || (byte == b'\'' && rust_use_char_literal(body.get(pos..)?)) {
+            pos += 1;
+            loop {
+                let &next = bytes.get(pos)?;
+                pos += 1;
+                if next == b'\\' {
+                    bytes.get(pos)?;
+                    pos += 1;
+                } else if next == byte {
+                    break;
+                }
+            }
+            continue;
+        }
+        if depth == 0 && rest.starts_with(b"::{") {
+            depth = 1;
+            pos += 3;
+            continue;
+        }
+        if depth > 0 {
+            if byte == b'{' {
+                depth += 1;
+            } else if byte == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(pos);
+                }
+            }
+        }
+        pos += 1;
+    }
+    None
+}
+
+fn rust_use_char_literal(rest: &str) -> bool {
+    // Apostrophes also introduce lifetimes. A character has either an escape or
+    // one UTF-8 character followed by its closing quote.
+    if rest.as_bytes().get(1) == Some(&b'\\') {
+        return true;
+    }
+    rest.strip_prefix('\'')
+        .and_then(|text| text.chars().next())
+        .is_some_and(|ch| rest.as_bytes().get(1 + ch.len_utf8()) == Some(&b'\''))
 }
 
 fn rust_reexport_names_from_specs(specs: &str) -> HashMap<String, String> {
@@ -28664,6 +28758,263 @@ pub fn handle_{name}(ctx: &AppContext) -> usize {{
             });
         }
         Ok(values.join("\u{1f}"))
+    }
+}
+
+#[cfg(test)]
+mod rust_use_parser_tests {
+    use super::*;
+
+    fn import(raw_text: &str) -> ImportStatement {
+        ImportStatement {
+            module_path: String::new(),
+            names: Vec::new(),
+            default_import: Some("pub".to_string()),
+            namespace_import: None,
+            kind: ImportKind::Value,
+            group: ImportGroup::Internal,
+            byte_range: 0..raw_text.len(),
+            raw_text: raw_text.to_string(),
+            form: ImportForm::RustUse {
+                visibility: Some("pub".to_string()),
+                named: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn rust_reexport_rejects_close_before_unclosed_group() {
+        let raw_text = format!("pub use macro! {{}} {}::{{name;", "長".repeat(180));
+        assert!(raw_text.len() > 541);
+        assert_eq!(rust_pub_use_reexport_parts(&import(&raw_text)), None);
+    }
+
+    // Frozen pre-fix implementation: valid use declarations must retain their
+    // existing extraction output, even when the text parser is imperfect.
+    fn old_rust_pub_use_reexport_parts(
+        import: &ImportStatement,
+    ) -> Option<(String, HashMap<String, String>, bool)> {
+        let body = rust_use_body(&import.raw_text).unwrap_or(import.module_path.as_str());
+        let body = body.trim();
+        if let Some(module_path) = body.strip_suffix("::*") {
+            return Some((module_path.trim().to_string(), HashMap::new(), true));
+        }
+
+        if let Some(brace_start) = body.find("::{") {
+            let module_path = body[..brace_start].trim().to_string();
+            let names = rust_reexport_names_from_specs(&body[brace_start + 3..body.rfind('}')?]);
+            if names.is_empty() {
+                return None;
+            }
+            return Some((module_path, names, false));
+        }
+
+        let (module_path, spec) = body.rsplit_once("::")?;
+        let names = rust_reexport_names_from_specs(spec);
+        if names.is_empty() {
+            return None;
+        }
+        Some((module_path.trim().to_string(), names, false))
+    }
+
+    #[test]
+    fn rust_reexport_rejects_unclosed_groups() {
+        for raw_text in [
+            "pub use a::{",
+            "pub use a::{b, c;",
+            "pub use a::{b::{c, d};",
+            "pub use a::{b /* } */;",
+            "pub use a::{b // }\n;",
+            "pub use a::{b /* nested /* } */ } */;",
+        ] {
+            assert_eq!(
+                rust_pub_use_reexport_parts(&import(raw_text)),
+                None,
+                "{raw_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_reexport_preserves_nested_groups_and_unicode() {
+        let nested = rust_pub_use_reexport_parts(&import("pub use a::{b::{c, d}, e};"));
+        assert_eq!(
+            nested,
+            Some((
+                "a".into(),
+                [
+                    ("b::{c".into(), "b::{c".into()),
+                    ("d}".into(), "d}".into()),
+                    ("e".into(), "e".into())
+                ]
+                .into_iter()
+                .collect(),
+                false,
+            ))
+        );
+        let unicode = rust_pub_use_reexport_parts(&import("pub use 長::道::{名 as 別名, café};"));
+        assert_eq!(
+            unicode,
+            Some((
+                "長::道".into(),
+                [("別名".into(), "名".into()), ("café".into(), "café".into())]
+                    .into_iter()
+                    .collect(),
+                false
+            ))
+        );
+    }
+
+    #[test]
+    fn rust_use_group_matching_ignores_comments_and_literals() {
+        for specs in [
+            "b::{c, d}, e",
+            "b /* } { /* } */ } */",
+            "b // } {\n, c",
+            r#"m!("} {", "escaped \" }", b"}", c"{")"#,
+            r####"m!(r"}", r###"}"# {"###, br#"}"#, cr#"{"#)"####,
+            r#"m!('}', '{', '\'', '\\', '\u{7d}', '長', 'a)"#,
+        ] {
+            let body = format!("a::{{{specs}}} trailing {{}}");
+            assert_eq!(rust_use_group_close(&body), Some(4 + specs.len()), "{body}");
+            let unclosed = format!("pub use a::{{{specs};");
+            assert_eq!(
+                rust_pub_use_reexport_parts(&import(&unclosed)),
+                None,
+                "{unclosed}"
+            );
+        }
+        for raw_text in [
+            "pub use a::{m!(\"}\");",
+            "pub use a::{m!(\"unterminated }",
+            "pub use a::{m!(r###\"unterminated }\"##);",
+            "pub use a::{b /* unterminated }",
+            "pub use a /* ::{b} */ ::c;",
+            "pub use macro!(\"::{b}\");",
+        ] {
+            assert_eq!(
+                rust_pub_use_reexport_parts(&import(raw_text)),
+                None,
+                "{raw_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_reexport_preserves_legacy_comment_ranges() {
+        // These imperfect names are kept for output compatibility. Correct them
+        // at the next planned extraction output version bump, not in a panic fix.
+        for (raw_text, module, name) in [
+            ("pub use a::{b} /* } */;", "a", "b} /*"),
+            ("pub use a /* ::{ */ ::{b};", "a /*", "*/ ::{b"),
+        ] {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(raw_text, None).unwrap();
+            assert!(!tree.root_node().has_error(), "{raw_text}");
+            let node = tree.root_node().named_child(0).unwrap();
+            let parsed = rust_import_from_use_node(raw_text, node).unwrap();
+            assert_eq!(parsed.raw_text, raw_text);
+            assert_eq!(
+                rust_pub_use_reexport_parts(&parsed),
+                Some((
+                    module.into(),
+                    [(name.into(), name.into())].into_iter().collect(),
+                    false
+                ))
+            );
+            assert_eq!(
+                rust_pub_use_reexport_parts(&parsed),
+                old_rust_pub_use_reexport_parts(&parsed)
+            );
+        }
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn pick<'a>(&mut self, choices: &'a [&'a str]) -> &'a str {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            choices[(self.0 % choices.len() as u64) as usize]
+        }
+    }
+
+    fn generated_use_spec(rng: &mut Rng, depth: usize) -> String {
+        let name = rng.pick(&["b", "名", "café", "r#type", "long_name"]);
+        match rng.pick(&["plain", "alias", "nested", "comment"]) {
+            "alias" => format!("{name} as {}", rng.pick(&["別名", "renamed", "r#match"])),
+            "nested" if depth > 0 => format!(
+                "{name}::{{{}, {}}}",
+                generated_use_spec(rng, depth - 1),
+                generated_use_spec(rng, depth - 1)
+            ),
+            "comment" => format!(
+                "{name} /* {} */",
+                rng.pick(&["}", "{", "/* } */", "\"::{\"", "長"])
+            ),
+            _ => name.to_string(),
+        }
+    }
+
+    #[test]
+    fn rust_use_generated_inputs_never_panic_and_preserve_well_formed_output() {
+        let mut rng = Rng(0x937a_b501_4cdf_628e);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        for _ in 0..4096 {
+            let prefix = rng.pick(&["a", "長::道", "crate::r#type", "::外部"]);
+            let spec = generated_use_spec(&mut rng, 3);
+            let gap = rng.pick(&["", " /* ::{ */", " /* } */"]);
+            let suffix = rng.pick(&["", " /* } */", " /* { */", " // }\n"]);
+            let body = match rng.pick(&["group", "named", "wildcard"]) {
+                "named" => format!("{prefix}::{spec}"),
+                "wildcard" => format!("{prefix}::*"),
+                _ => format!("{prefix}{gap}::{{{spec}, self,}}{suffix}"),
+            };
+            let raw_text = format!(
+                "{}use {body};",
+                rng.pick(&["pub ", "pub(crate) ", "pub(super) ", ""])
+            );
+            let parsed = import(&raw_text);
+            assert!(
+                !parser
+                    .parse(&raw_text, None)
+                    .unwrap()
+                    .root_node()
+                    .has_error(),
+                "{raw_text}"
+            );
+            assert_eq!(
+                rust_pub_use_reexport_parts(&parsed),
+                old_rust_pub_use_reexport_parts(&parsed),
+                "{raw_text}"
+            );
+
+            let mut malformed = format!("pub use {body}");
+            for _ in 0..12 {
+                malformed.push_str(rng.pick(&[
+                    "::{", "}", "{", ";", "'", "\"", "\\", "/*", "*/", "//", "\n", "名", "🦀",
+                    " as ", "r###\"", "#", ",",
+                ]));
+            }
+            let result = std::panic::catch_unwind(|| {
+                let parsed = import(&malformed);
+                rust_use_body(&malformed);
+                rust_use_visibility(&malformed);
+                rust_use_list_names(&malformed);
+                rust_reexport_names_from_specs(&malformed);
+                quoted_module_path(&malformed);
+                parse_reexport_names(&malformed);
+                rust_pub_use_reexport_parts(&parsed);
+            });
+            assert!(result.is_ok(), "{malformed}");
+        }
     }
 }
 
