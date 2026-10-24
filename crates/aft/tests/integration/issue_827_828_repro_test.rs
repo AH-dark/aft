@@ -364,3 +364,77 @@ fn ast_search_renders_variadic_capture_as_source_text() {
 
     aft.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Line endings: a line comment ends at `\r` as well as `\n`
+// ---------------------------------------------------------------------------
+
+/// Runs remove on one file and returns the remove reply and new contents.
+fn remove_from_file(name: &str, source: &str, module: &str) -> (Value, String) {
+    let (_dir, root) = project(&[(name, source)]);
+    let mut aft = configured(&root);
+    let resp = tool_call(
+        &mut aft,
+        "remove",
+        "import",
+        json!({ "op": "remove", "filePath": name, "module": module }),
+    );
+    let content = fs::read_to_string(root.join(name)).unwrap();
+    aft.shutdown();
+    (resp, content)
+}
+
+#[test]
+fn remove_with_cr_only_line_endings_deletes_only_the_import_line() {
+    let (resp, content) = remove_from_file(
+        "cr.ts",
+        "import { y } from \"./y\"; // y\rimport { w } from \"./w\";\rexport const all = [w];\r",
+        "./y",
+    );
+    assert_eq!(resp["success"], true, "remove should succeed: {resp:?}");
+    assert_eq!(
+        content, "import { w } from \"./w\";\rexport const all = [w];\r",
+        "only the removed import's line may go; the lines after it must stay"
+    );
+}
+
+#[test]
+fn remove_with_crlf_line_endings_deletes_the_import_line_and_its_comment() {
+    let (resp, content) = remove_from_file(
+        "crlf.ts",
+        "import { y } from \"./y\"; // y\r\nimport { w } from \"./w\";\r\n\r\nexport const all = [w];\r\n",
+        "./y",
+    );
+    assert_eq!(resp["success"], true, "remove should succeed: {resp:?}");
+    assert_eq!(
+        content,
+        "import { w } from \"./w\";\r\n\r\nexport const all = [w];\r\n"
+    );
+
+    let (resp, content) = remove_from_file(
+        "crlf.py",
+        "import os  # noqa\r\nimport sys\r\n\r\nprint(sys)\r\n",
+        "os",
+    );
+    assert_eq!(resp["success"], true, "remove should succeed: {resp:?}");
+    assert_eq!(content, "import sys\r\n\r\nprint(sys)\r\n");
+}
+
+#[test]
+fn organize_with_cr_only_line_endings_keeps_code_after_the_last_import() {
+    let (_, content) = organize_file(
+        "cr_organize.ts",
+        "import { b } from \"./b\";\rimport { a } from \"./a\"; // about a\rexport const all = [a, b];\r",
+    );
+    // The organized block is joined with `\n`; what matters is that the code
+    // after the last import stays after the imports and is not moved into
+    // the block as part of the last import's comment.
+    assert!(
+        content.starts_with("import { a } from \"./a\"; // about a\n"),
+        "{content:?}"
+    );
+    assert!(
+        content.ends_with("import { b } from \"./b\";\rexport const all = [a, b];\r"),
+        "{content:?}"
+    );
+}

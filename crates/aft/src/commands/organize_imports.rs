@@ -546,7 +546,7 @@ pub(crate) fn same_line_tail(after_statement: &str, lang: LangId) -> Option<Same
             }
             Some(' ') | Some('\t') => offset += 1,
             Some(_) => match comment_len_at(rest, lang) {
-                CommentAt::Comment(len) if !rest[..len].contains('\n') => {
+                CommentAt::Comment(len) if !rest[..len].contains(['\n', '\r']) => {
                     offset += len;
                     comment_end = offset;
                 }
@@ -587,8 +587,11 @@ fn statement_has_comment(raw: &str, lang: LangId) -> bool {
     false
 }
 
+/// Length of a line comment: everything up to the line break. A line break
+/// is `\n`, `\r\n` or a lone `\r` (old Mac files), so stopping at `\n`
+/// alone would run a comment across every following line of a CR-only file.
 fn line_comment_len(rest: &str) -> usize {
-    rest.find('\n').unwrap_or(rest.len())
+    rest.find(['\n', '\r']).unwrap_or(rest.len())
 }
 
 fn supports_slash_line_comments(lang: LangId) -> bool {
