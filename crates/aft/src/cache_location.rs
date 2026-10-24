@@ -17,11 +17,21 @@ mod tests;
 use serde::{Deserialize, Serialize};
 
 pub const CACHE_DIR_UNAVAILABLE: &str = "cache_dir_unavailable";
+pub const CACHE_DIR_BUSY: &str = "cache_dir_busy";
+pub(crate) fn cache_status_code(reason: &str) -> &'static str {
+    if reason.starts_with(CACHE_DIR_BUSY) {
+        CACHE_DIR_BUSY
+    } else {
+        CACHE_DIR_UNAVAILABLE
+    }
+}
 pub const CACHE_DIR_ON_STORAGE_DEVICE: &str = "cache_dir_on_storage_device";
 /// `storage.cache_dir` contains the durable storage root or sits inside it.
 pub const CACHE_DIR_OVERLAPS_STORAGE: &str = "cache_dir_overlaps_storage";
 pub(crate) fn unavailable_code(reason: &str) -> &'static str {
-    if reason.starts_with(CACHE_DIR_ON_STORAGE_DEVICE) {
+    if reason.starts_with(CACHE_DIR_BUSY) {
+        CACHE_DIR_BUSY
+    } else if reason.starts_with(CACHE_DIR_ON_STORAGE_DEVICE) {
         CACHE_DIR_ON_STORAGE_DEVICE
     } else if reason.starts_with(CACHE_DIR_OVERLAPS_STORAGE) {
         CACHE_DIR_OVERLAPS_STORAGE
@@ -803,9 +813,20 @@ pub(crate) fn unavailable_warning(
     path: &Path,
     reason: &str,
 ) -> crate::config_resolve::ConfigWarning {
+    let code = unavailable_code(reason);
     crate::config_resolve::ConfigWarning {
-        code: unavailable_code(reason), key: "storage.cache_dir", tier: "user".into(), value: path.display().to_string(),
-        message: format!("storage.cache_dir {} is unavailable ({reason}); AFT is running without its caches until it is back.", path.display()),
+        code,
+        key: "storage.cache_dir",
+        tier: "user".into(),
+        value: path.display().to_string(),
+        message: if code == CACHE_DIR_BUSY {
+            format!(
+                "Cache coordination is busy at {} ({reason}); retry configuration.",
+                path.display()
+            )
+        } else {
+            format!("storage.cache_dir {} is unavailable ({reason}); AFT is running without its caches until it is back.", path.display())
+        },
     }
 }
 
@@ -831,7 +852,23 @@ const USE_LOCK_WAIT: Duration = Duration::from_secs(2);
 const USE_LOCK_WAIT: Duration = Duration::from_millis(400);
 
 fn take_shared_pinned(root: PinnedDir) -> io::Result<Arc<CacheLease>> {
-    let file = open_use_lock(&root)?;
+    let file = open_use_lock(&root).map_err(|error| {
+        // A bounded create/reopen failure already carries its operation, path
+        // and retryable type; do not flatten it into a cache-folder failure.
+        #[cfg(unix)]
+        if error.get_ref().is_some_and(|error| {
+            error.is::<crate::bash_background::persistence::CoordinationCreateContended>()
+        }) {
+            return error;
+        }
+        io::Error::new(
+            error.kind(),
+            format!(
+                "open shared use lock {}: {error}",
+                root.path().join(IN_USE).display()
+            ),
+        )
+    })?;
     let deadline = std::time::Instant::now() + USE_LOCK_WAIT;
     loop {
         match file.try_lock_shared() {

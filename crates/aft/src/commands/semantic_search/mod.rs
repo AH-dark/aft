@@ -760,11 +760,10 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut response = handle_semantic_search_with_disk_fallback(req, ctx, false);
     if let Some(reason) = ctx.cache_unavailable_reason() {
-        response.data["cache_unavailable_reason"] =
-            serde_json::json!(crate::root_cache::CACHE_DIR_UNAVAILABLE);
+        let code = crate::root_cache::cache_status_code(&reason);
+        response.data["cache_unavailable_reason"] = serde_json::json!(code);
         if let Some(output) = response.data["text"].as_str() {
-            response.data["text"] =
-                serde_json::json!(format!("cache_dir_unavailable: {reason}\n\n{output}"));
+            response.data["text"] = serde_json::json!(format!("{code}: {reason}\n\n{output}"));
         }
     }
     response
@@ -934,6 +933,12 @@ fn handle_semantic_search_with_disk_fallback(
         );
     }
     if let Some(reason) = ctx.cache_unavailable_reason() {
+        let code = crate::root_cache::cache_status_code(&reason);
+        let disclosure = if code == crate::root_cache::CACHE_DIR_BUSY {
+            "cache_dir_busy; bounded lexical walk only"
+        } else {
+            "cache_dir_unavailable; bounded lexical walk only"
+        };
         let params = match serde_json::from_value::<SemanticSearchParams>(req.params.clone()) {
             Ok(params) => params,
             Err(error) => return Response::error(&req.id, "invalid_request", error.to_string()),
@@ -944,17 +949,16 @@ fn handle_semantic_search_with_disk_fallback(
             ctx,
             &params,
             &shape,
-            crate::root_cache::CACHE_DIR_UNAVAILABLE,
-            format!("cache_dir_unavailable: {reason}"),
-            "cache_dir_unavailable; bounded lexical walk only",
+            code,
+            format!("{code}: {reason}"),
+            disclosure,
             false,
             false,
             vec![],
             external_root.as_deref().unwrap_or(&project_root),
             params.top_k,
         );
-        response.data["cache_unavailable_reason"] =
-            serde_json::json!(crate::root_cache::CACHE_DIR_UNAVAILABLE);
+        response.data["cache_unavailable_reason"] = serde_json::json!(code);
         return response;
     }
     let (shape, facts) = extensions.classify(&raw_query);

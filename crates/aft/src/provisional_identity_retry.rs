@@ -1,4 +1,4 @@
-//! Background retry for a root whose bind found aft.db busy.
+//! Background bind retries for transient database or cache coordination contention.
 //!
 //! A bind reads older standing-root pins from aft.db without waiting, so a
 //! database held by another writer leaves the root's identity provisional:
@@ -19,6 +19,11 @@
 //! attached daemon it also, like a route bind, takes over from standing-root
 //! maintenance every entry that shares the now settled key before the
 //! session's indexes start loading.
+//!
+//! A bind whose cache coordination file stayed busy after its bounded open
+//! attempts uses the same admission and root-lifetime checks for one replay
+//! after the first delay. It does not probe legacy pins or repeat indefinitely:
+//! if that replay is still busy, the busy degradation remains until another bind.
 //!
 //! The replay runs with the admission a bind of the root gets, never inside
 //! the maintenance job that noticed the free database. Configure publishes
@@ -112,10 +117,19 @@ fn delay_before(attempts: u32, timing: Timing) -> Duration {
         .min(timing.max_delay)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetryKind {
+    Identity,
+    CacheCoordination,
+}
+
 #[derive(Clone)]
 struct PendingRetry {
-    /// The configure request whose bind left the identity provisional.
+    /// The configure request whose bind left a retryable degradation.
     request: RawRequest,
+    kind: RetryKind,
+    root: std::path::PathBuf,
+    connect_generation: u64,
     /// The configure generation that bind published. Any later configure
     /// moves it, which makes this retry stale.
     generation: u64,
@@ -160,21 +174,35 @@ pub(crate) fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, suc
         // next drain finds the retry stale and drops it.
         return;
     }
-    let busy_at_bind = ctx
-        .degraded_reasons()
+    let reasons = ctx.degraded_reasons();
+    let kind = if reasons
         .iter()
-        .any(|reason| reason == PROVISIONAL_IDENTITY_REASON);
+        .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY)
+    {
+        Some(RetryKind::CacheCoordination)
+    } else if reasons
+        .iter()
+        .any(|reason| reason == PROVISIONAL_IDENTITY_REASON)
+    {
+        Some(RetryKind::Identity)
+    } else {
+        None
+    };
     let mut slot = ctx.provisional_identity_retry().0.lock();
-    if !busy_at_bind {
+    let Some(kind) = kind else {
         // Settled, provisional for a reason a retry cannot fix, or not
         // needing an identity at all: nothing to retry.
         *slot = None;
         return;
-    }
+    };
+    let Some(root) = ctx.canonical_cache_root_opt() else {
+        *slot = None;
+        return;
+    };
     let now = Instant::now();
     if slot.is_none() {
         crate::slog_info!(
-            "identity provisional (aft.db busy) for root={}; retrying in the background",
+            "bind met transient coordination contention for root={}; retrying in the background",
             ctx.canonical_cache_root_opt()
                 .map(|root| root.display().to_string())
                 .unwrap_or_default()
@@ -182,6 +210,9 @@ pub(crate) fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, suc
     }
     *slot = Some(PendingRetry {
         request: request.clone(),
+        kind,
+        root,
+        connect_generation: ctx.connect_generation(),
         generation: ctx.configure_generation(),
         armed_at: now,
         attempts: 0,
@@ -198,7 +229,7 @@ pub(crate) fn cancel(ctx: &AppContext) -> bool {
 
 /// Why `retry` is no longer safe to replay, if it is not. It may be replayed
 /// only for the configure generation that armed it, while the root is bound
-/// and its identity is still provisional because aft.db was busy. Otherwise
+/// and its retryable degradation is still present. Otherwise
 /// the root is unbound, a newer configure superseded the retry, the root is
 /// missing, the identity is provisional for a reason a retry cannot fix, or
 /// it has already settled and must not be keyed again.
@@ -221,15 +252,26 @@ fn stale_reason(ctx: &AppContext, retry: &PendingRetry) -> Option<&'static str> 
     if retry.generation != ctx.configure_generation() {
         return Some("superseded");
     }
-    match ctx.artifact_identity_provisional_reason() {
-        None => return Some("settled"),
-        Some(reason) if reason != PROVISIONAL_IDENTITY_REASON => {
-            return Some("not_provisional");
+    match retry.kind {
+        RetryKind::CacheCoordination => {
+            if !ctx
+                .degraded_reasons()
+                .iter()
+                .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY)
+            {
+                return Some("settled");
+            }
         }
-        Some(_) => {}
+        RetryKind::Identity => match ctx.artifact_identity_provisional_reason() {
+            None => return Some("settled"),
+            Some(reason) if reason != PROVISIONAL_IDENTITY_REASON => {
+                return Some("not_provisional");
+            }
+            Some(_) => {}
+        },
     }
-    if ctx.canonical_cache_root_opt().is_none() {
-        return Some("no_root");
+    if ctx.canonical_cache_root_opt().as_ref() != Some(&retry.root) {
+        return Some("root_changed");
     }
     None
 }
@@ -255,11 +297,13 @@ pub(crate) fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
         return None;
     }
     let root = ctx.canonical_cache_root_opt()?;
-    let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
     retry.attempts = retry.attempts.saturating_add(1);
-    if !crate::root_identity::legacy_pins_readable(&root, &storage) {
-        reschedule(ctx, &root, retry, timing());
-        return None;
+    if retry.kind == RetryKind::Identity {
+        let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+        if !crate::root_identity::legacy_pins_readable(&root, &storage) {
+            reschedule(ctx, &root, retry, timing());
+            return None;
+        }
     }
     Some(PreparedReplay {
         retry: std::sync::Arc::new(parking_lot::Mutex::new(Some(retry))),
@@ -348,7 +392,23 @@ impl PreparedReplay {
             self.retry.lock().take();
             return skipped(id, reason);
         }
-        let response = crate::commands::configure::handle_configure(&retry.request, ctx);
+        let response = match retry.kind {
+            RetryKind::Identity => {
+                crate::commands::configure::handle_configure(&retry.request, ctx)
+            }
+            RetryKind::CacheCoordination => {
+                // Cache recovery must preserve the running configuration,
+                // including edits deferred until the next real connect.
+                let mut prepared = (*ctx.config()).clone();
+                crate::root_cache::prepare_cache_root(&mut prepared);
+                crate::commands::configure::handle_cache_recovery(
+                    &retry.request,
+                    retry.connect_generation,
+                    ctx,
+                    &prepared,
+                )
+            }
+        };
         if response.data["code"] == "configure_needs_exclusive" {
             // A shared-hold run handed its worker back before changing the
             // root; the executor runs this job again as an exclusive writer.
@@ -385,7 +445,22 @@ fn finish_replay(
         return;
     }
     let mut rearmed = slot.0.lock();
+    if retry.kind == RetryKind::CacheCoordination {
+        // Configure may re-arm on another busy result. A cache creation gets
+        // only one automatic replay, not a new retry chain after every bind.
+        if rearmed
+            .as_ref()
+            .is_some_and(|next| next.kind == RetryKind::CacheCoordination)
+        {
+            rearmed.take();
+            crate::slog_warn!("cache coordination remains busy for root={} after its automatic retry; next bind can retry", root.display());
+        }
+        return;
+    }
     match rearmed.take() {
+        Some(next) if next.kind != retry.kind => {
+            *rearmed = Some(next);
+        }
         // The database was taken again between the check and the replay, so
         // the replay re-armed the retry: keep the original window and backoff
         // instead of starting over.

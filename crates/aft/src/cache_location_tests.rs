@@ -1183,6 +1183,149 @@ fn hold_use_lock_exclusively(root: &Path) -> File {
     holder
 }
 
+#[cfg(unix)]
+#[test]
+fn cache_location_concurrent_coordination_create_keeps_cache_available() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("storage");
+    let sibling = Arc::new(Mutex::new(None));
+    let held = Arc::clone(&sibling);
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&attempts);
+    let sibling_path = storage.join(IN_USE);
+    let mut first = true;
+    let mut config = Config {
+        storage_dir: Some(storage.clone()),
+        ..Default::default()
+    };
+    let warning = crate::bash_background::persistence::with_openat_file_hook(
+        Box::new(move |dirfd, name, flags| {
+            if name != std::ffi::OsStr::new(IN_USE) {
+                return None;
+            }
+            observed.lock().unwrap().push((dirfd, flags));
+            if !first {
+                return None;
+            }
+            first = false;
+            // Darwin can report ENOENT to a losing openat(O_CREAT) even though
+            // the winner has already created the entry in this same directory.
+            let file = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let file = File::options()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .truncate(false)
+                            .open(&sibling_path)
+                            .unwrap();
+                        file.lock_shared().unwrap();
+                        file
+                    })
+                    .join()
+                    .unwrap()
+            });
+            *held.lock().unwrap() = Some(file);
+            Some(Err(io::Error::from_raw_os_error(libc::ENOENT)))
+        }),
+        || prepare_cache_root(&mut config),
+    );
+    assert!(
+        warning.is_none(),
+        "concurrent creator disabled caches: {warning:?}"
+    );
+    assert!(cache_unavailable(&config).is_none());
+    let lease = config.cache_lease.as_ref().unwrap();
+    let actual = lease._file.metadata().unwrap();
+    let sibling = sibling.lock().unwrap();
+    let expected = sibling.as_ref().unwrap().metadata().unwrap();
+    assert_eq!(
+        (actual.dev(), actual.ino()),
+        (expected.dev(), expected.ino())
+    );
+    let attempts = attempts.lock().unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[0].0, attempts[1].0,
+        "reopen must use the same pinned parent"
+    );
+    assert_ne!(attempts[0].1 & libc::O_CREAT, 0);
+    assert_eq!(attempts[1].1, attempts[0].1 & !libc::O_CREAT);
+    assert_ne!(attempts[1].1 & libc::O_NOFOLLOW, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_location_coordination_create_exhaustion_is_typed_busy() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = PinnedDir::repair_open_path(temp.path()).unwrap();
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&attempts);
+    let error = crate::bash_background::persistence::with_openat_file_hook(
+        Box::new(move |_, name, flags| {
+            assert_eq!(name, std::ffi::OsStr::new(IN_USE));
+            observed.lock().unwrap().push(flags);
+            Some(Err(io::Error::from_raw_os_error(libc::ENOENT)))
+        }),
+        || {
+            root.repair_coordination_file(std::ffi::OsStr::new(IN_USE))
+                .unwrap_err()
+        },
+    );
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert!(error
+        .get_ref()
+        .unwrap()
+        .is::<crate::bash_background::persistence::CoordinationCreateContended>());
+    assert!(error
+        .to_string()
+        .contains(&root.path().join(IN_USE).display().to_string()));
+    let warning = unavailable_warning(root.path(), &error.to_string());
+    assert_eq!(warning.code, CACHE_DIR_BUSY);
+    assert!(warning.message.contains("retry configuration"));
+    assert!(!warning.message.contains("is unavailable"));
+    let attempts = attempts.lock().unwrap();
+    assert_eq!(attempts.len(), 6);
+    for (attempt, flags) in attempts.iter().enumerate() {
+        assert_eq!(flags & libc::O_CREAT != 0, attempt % 2 == 0);
+        assert_ne!(flags & libc::O_NOFOLLOW, 0);
+    }
+    assert!(!temp.path().join(IN_USE).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_location_coordination_reopen_refuses_a_sibling_symlink() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("storage");
+    let outside = temp.path().join("outside");
+    fs::write(&outside, b"canary").unwrap();
+    fs::create_dir(&storage).unwrap();
+    let root = PinnedDir::repair_open_path(&storage).unwrap();
+    let destination = outside.clone();
+    let link = storage.join(IN_USE);
+    let mut first = true;
+    let error = crate::bash_background::persistence::with_openat_file_hook(
+        Box::new(move |_, _, _| {
+            if !first {
+                return None;
+            }
+            first = false;
+            std::os::unix::fs::symlink(&destination, &link).unwrap();
+            Some(Err(io::Error::from_raw_os_error(libc::ENOENT)))
+        }),
+        || {
+            root.repair_coordination_file(std::ffi::OsStr::new(IN_USE))
+                .unwrap_err()
+        },
+    );
+    assert_ne!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(fs::read(&outside).unwrap(), b"canary");
+}
+
 #[test]
 fn cache_location_busy_use_lock_without_cache_dir_never_blocks_durable_writes() {
     // Without `storage.cache_dir` the use lock sits on durable storage. A

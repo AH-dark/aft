@@ -198,8 +198,8 @@ pub fn observed_index_status(ctx: &AppContext, plane: IndexPlane) -> IndexObserv
             unavailable_reason: Some(cause::ROOT_TOO_BROAD.into()),
         };
     }
-    if ctx.cache_unavailable_reason().is_some() {
-        return IndexObservation::unavailable(crate::root_cache::CACHE_DIR_UNAVAILABLE);
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        return IndexObservation::unavailable(crate::root_cache::cache_status_code(&reason));
     }
     // Configure forces every index off for a HOME root (degraded mode). That
     // is not the user's resolved choice, so report it as unavailable with its
@@ -354,9 +354,13 @@ fn observe_semantic(ctx: &AppContext) -> IndexObservation {
 
 /// Classify a failed semantic build into a named cause.
 pub fn semantic_failure_cause(ctx: &AppContext, message: &str) -> &'static str {
-    if ctx.cache_unavailable_reason().is_some()
-        || message.contains(crate::root_cache::CACHE_DIR_UNAVAILABLE)
-    {
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        return crate::root_cache::cache_status_code(&reason);
+    }
+    if message.contains(crate::root_cache::CACHE_DIR_BUSY) {
+        return crate::root_cache::CACHE_DIR_BUSY;
+    }
+    if message.contains(crate::root_cache::CACHE_DIR_UNAVAILABLE) {
         return crate::root_cache::CACHE_DIR_UNAVAILABLE;
     }
     if crate::semantic_admission::is_not_opened_status(message) {

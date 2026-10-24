@@ -996,7 +996,7 @@ pub struct RootHealthSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RootHealthSummary {
-    cache_unavailable: bool,
+    cache_unavailable: Option<&'static str>,
     state: RootHealthState,
     search_index_status: Option<&'static str>,
     semantic_index: Option<SemanticHealthComponentSnapshot>,
@@ -1016,7 +1016,7 @@ impl RootHealthSummary {
     fn busy() -> Self {
         Self {
             state: RootHealthState::Busy,
-            cache_unavailable: false,
+            cache_unavailable: None,
             search_index_status: None,
             semantic_index: None,
             callgraph_store_status: None,
@@ -1077,9 +1077,7 @@ impl RootHealthSummary {
                 _ => (None, None),
             };
         RootHealthSnapshot {
-            cache_unavailable_reason: self
-                .cache_unavailable
-                .then_some(crate::root_cache::CACHE_DIR_UNAVAILABLE),
+            cache_unavailable_reason: self.cache_unavailable,
             project_root: project_root.display().to_string(),
             actor_count: 1,
             state: self.state,
@@ -5464,7 +5462,9 @@ impl AppContext {
             Ok(guard) => Arc::clone(&*guard),
             Err(_) => return RootHealthSummary::busy(),
         };
-        let cache_unavailable = crate::root_cache::cache_unavailable(&config).is_some();
+        let cache_unavailable_reason = crate::root_cache::cache_unavailable(&config)
+            .map(|reason| crate::root_cache::cache_status_code(&reason));
+        let cache_unavailable = cache_unavailable_reason.is_some();
         // Answers from other subsystems are taken before any of this
         // context's guards below. The guards are held until the summary is
         // built, and the frame loop's maintenance probes read the same
@@ -5755,7 +5755,7 @@ impl AppContext {
         };
 
         RootHealthSummary {
-            cache_unavailable,
+            cache_unavailable: cache_unavailable_reason,
             state: RootHealthState::Ready,
             search_index_status: Some(search_index_status),
             semantic_index: Some(semantic_index),

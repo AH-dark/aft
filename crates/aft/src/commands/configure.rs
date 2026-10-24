@@ -4111,9 +4111,10 @@ fn handle_configure_inner(
 
     let storage_root = crate::root_cache::cache_root(&next_config);
     let durable_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
-    let cache_available = crate::root_cache::cache_unavailable(&next_config).is_none();
-    if !cache_available {
-        degraded_reasons.push(crate::root_cache::CACHE_DIR_UNAVAILABLE.into());
+    let cache_reason = crate::root_cache::cache_unavailable(&next_config);
+    let cache_available = cache_reason.is_none();
+    if let Some(reason) = cache_reason {
+        degraded_reasons.push(crate::root_cache::cache_status_code(&reason).into());
     }
     // Choose a durable identity at the first bind that needs an artifact key.
     // With indexes and views off, keep the no-key, no-Git-probe fast path.
@@ -5318,10 +5319,11 @@ fn schedule_artifact_loads_admitted(
     semantic_view_work_allowed: bool,
 ) -> ArtifactLoadStarts {
     if let Some(reason) = ctx.cache_unavailable_reason() {
+        let code = crate::root_cache::cache_status_code(&reason);
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            SemanticIndexStatus::Failed(format!("cache_dir_unavailable: {reason}"));
+            SemanticIndexStatus::Failed(format!("{code}: {reason}"));
         return (None, None);
     }
     let canonical_cache_root = ctx.canonical_cache_root();
@@ -14177,6 +14179,131 @@ mod tests {
                 ctx.cache_unavailable_reason().is_none(),
                 "{failure}: {:?}",
                 ctx.cache_unavailable_reason()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_cache_coordination_busy_bind_retries_once_while_bound() {
+        fn inject_busy(
+            _: std::os::fd::RawFd,
+            name: &std::ffi::OsStr,
+            _: i32,
+        ) -> Option<std::io::Result<std::fs::File>> {
+            (name == std::ffi::OsStr::new(".aft-in-use.lock"))
+                .then(|| Err(std::io::Error::from_raw_os_error(libc::ENOENT)))
+        }
+        for outcome in [
+            "recover",
+            "edited",
+            "still_busy",
+            "unbound",
+            "unbound_after_poll",
+        ] {
+            crate::provisional_identity_retry::with_timing_for_test(
+                Duration::ZERO,
+                Duration::from_secs(1),
+                || {
+                    let temp = tempfile::tempdir().unwrap();
+                    let project = temp.path().join("project");
+                    let storage = temp.path().join("storage");
+                    fs::create_dir(&project).unwrap();
+                    init_git_fixture(&project);
+                    fs::write(project.join("needle.rs"), "fn contention_needle() {}\n").unwrap();
+                    let ctx =
+                        AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+                    let request = configure_request_with_params(json!({
+                        "project_root": project, "storage_dir": storage, "harness": "opencode",
+                        "config": [user_tier(json!({"indexes": {"trigram": true, "semantic": false, "callgraph": false}}))],
+                    }));
+                    let response = crate::bash_background::persistence::with_openat_file_hook(
+                        Box::new(inject_busy),
+                        || handle_configure_for_test(&request, &ctx),
+                    );
+                    assert!(response.success, "{response:?}");
+                    assert!(ctx
+                        .degraded_reasons()
+                        .iter()
+                        .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY));
+                    assert!(!ctx
+                        .degraded_reasons()
+                        .iter()
+                        .any(|reason| reason == "cache_dir_unavailable"));
+                    let search: RawRequest = serde_json::from_value(json!({
+                        "id": "busy-search", "command": "semantic_search", "query": "contention_needle"
+                    })).unwrap();
+                    let search =
+                        crate::commands::semantic_search::handle_semantic_search(&search, &ctx);
+                    assert!(search.success, "{search:?}");
+                    assert_eq!(
+                        search.data["cache_unavailable_reason"],
+                        crate::root_cache::CACHE_DIR_BUSY
+                    );
+                    assert_eq!(
+                        ctx.try_health_snapshot(&project).cache_unavailable_reason,
+                        Some(crate::root_cache::CACHE_DIR_BUSY)
+                    );
+                    for plane in [
+                        crate::feature_status::IndexPlane::Trigram,
+                        crate::feature_status::IndexPlane::Semantic,
+                        crate::feature_status::IndexPlane::Callgraph,
+                    ] {
+                        assert_eq!(
+                            crate::feature_status::observed_index_status(&ctx, plane)
+                                .unavailable_reason
+                                .as_deref(),
+                            Some(crate::root_cache::CACHE_DIR_BUSY)
+                        );
+                    }
+                    assert!(ctx.provisional_identity_retry().is_armed());
+                    let root = fs::canonicalize(&project).unwrap();
+                    assert!(ctx.cached_artifact_cache_key(&root).is_none());
+
+                    if outcome == "edited" {
+                        ctx.update_config(|config| config.indexes.trigram = false);
+                    }
+                    if outcome == "unbound_after_poll" {
+                        let replay = crate::provisional_identity_retry::poll(&ctx).unwrap();
+                        ctx.mark_subc_unbound();
+                        let response =
+                            replay.run(&ctx, |_| panic!("unbound root must not hand off or index"));
+                        assert!(response.success);
+                    } else if outcome == "unbound" {
+                        ctx.mark_subc_unbound();
+                        assert!(!crate::provisional_identity_retry::drain_inline(&ctx));
+                    } else if outcome == "still_busy" {
+                        assert!(crate::bash_background::persistence::with_openat_file_hook(
+                            Box::new(inject_busy),
+                            || crate::provisional_identity_retry::drain_inline(&ctx),
+                        ));
+                    } else {
+                        assert!(crate::provisional_identity_retry::drain_inline(&ctx));
+                    }
+                    assert!(
+                        !ctx.provisional_identity_retry().is_armed(),
+                        "only one automatic cache retry is allowed"
+                    );
+                    assert!(!crate::provisional_identity_retry::drain_inline(&ctx));
+                    if outcome == "recover" || outcome == "edited" {
+                        assert!(ctx.cache_unavailable_reason().is_none());
+                        assert!(!ctx
+                            .degraded_reasons()
+                            .iter()
+                            .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY));
+                        assert_eq!(ctx.config().indexes.trigram, outcome == "recover");
+                        assert_eq!(
+                            ctx.cached_artifact_cache_key(&root).is_some(),
+                            outcome == "recover"
+                        );
+                    } else {
+                        assert!(ctx.cached_artifact_cache_key(&root).is_none());
+                        assert!(ctx
+                            .cache_unavailable_reason()
+                            .unwrap()
+                            .starts_with(crate::root_cache::CACHE_DIR_BUSY));
+                    }
+                },
             );
         }
     }
