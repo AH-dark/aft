@@ -578,11 +578,16 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
             self.assertIn('--config "$LIBTEST_CARGO_CONFIG"', command)
         archive = next(command for command in build_steps if "nextest archive" in command)
         self.assertIn("--timings", archive)
-        self.assertIn('cp -R target/cargo-timings "$RUNNER_TEMP/macos-libtest-timings"', cargo_steps)
         upload = next(step for step in job["steps"] if step.get("with", {}).get("name") == "macos-libtest-archive")
         paths = upload["with"]["path"].splitlines()
-        self.assertIn("${{ runner.temp }}/macos-libtest-timings/", paths)
         self.assertTrue(all(path.startswith("${{ runner.temp }}/") for path in paths))
+        # Timings survive a failure in any step after the archive build.
+        timings = next(step for step in job["steps"] if step.get("with", {}).get("name") == "macos-libtest-timings")
+        self.assertIn("always()", timings["if"])
+        self.assertEqual(timings["with"]["path"], "target/cargo-timings/")
+        steps = job["steps"]
+        archive_index = next(i for i, step in enumerate(steps) if "nextest archive" in step.get("run", ""))
+        self.assertEqual(steps.index(timings), archive_index + 1)
 
     def test_unit_archive_compilation_isolated_and_real_cli_is_retained(self) -> None:
         lib = workflow_job("unit-macos-libtest-archive")
