@@ -7180,11 +7180,12 @@ fn scoped_inspect_reports_a_file_unknown_when_its_changed_text_cannot_be_sent() 
         scoped_diagnostics_inspect_outside(&ctx, "unsendable-after", file.to_str().unwrap());
     assert_eq!(after["complete"], false, "{after:#}");
     let gaps = uncovered_files(&after);
+    // The full agent-visible reason, pinned word for word: the wording was
+    // approved as written, so any change to it must show up here.
     assert!(
         gaps.iter().any(|(gap, reason)| gap == &diagnostic_path(&file)
-            && reason.contains(
-                "changed on disk since the server last analyzed it, and AFT could not send it the current text"
-            )),
+            && reason
+                == "changed on disk since the server last analyzed it, and AFT could not send it the current text; retry aft_inspect"),
         "the file must be named unknown with the reason: {after:#}"
     );
     assert!(
