@@ -8541,6 +8541,66 @@ mod git_policy_cache_tests {
         ));
     }
 
+    /// Retarget the symlinked directory that holds an absent system config at
+    /// a directory where that config already exists. Git then reads the new
+    /// file, so the cached policy must be resolved again. Then retarget it at
+    /// a missing directory: a dangling link must never be cached.
+    #[test]
+    fn git_policy_cache_retargeted_config_directory_symlink_invalidates() {
+        let fixture = Fixture::new();
+        // Leave core.hooksPath unset locally so the system config decides it.
+        std::fs::write(
+            fixture.root.join(".git/config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+        )
+        .unwrap();
+        let dir_a = fixture.root.join("dir-a");
+        let dir_b = fixture.root.join("dir-b");
+        let b_hooks = fixture.root.join("b-hooks");
+        std::fs::create_dir(&dir_a).unwrap();
+        std::fs::create_dir(&dir_b).unwrap();
+        std::fs::create_dir(&b_hooks).unwrap();
+        std::fs::write(
+            dir_b.join("gitconfig"),
+            format!("[core]\n hooksPath = {}\n", b_hooks.display()),
+        )
+        .unwrap();
+        let link = fixture.root.join("link");
+        std::os::unix::fs::symlink("dir-a", &link).unwrap();
+        set_system_config(&fixture, &link.join("gitconfig"));
+        let retarget = |target: &str| {
+            let staged = fixture.root.join("link.next");
+            std::os::unix::fs::symlink(target, &staged).unwrap();
+            std::fs::rename(&staged, &link).unwrap();
+        };
+
+        let (first, cold) = fixture.resolve();
+        assert!(cold > 0);
+        assert_ne!(first.hooks, vec![b_hooks.clone()]);
+        assert_eq!(fixture.resolve().1, 0, "the absent config must be cached");
+
+        retarget("dir-b");
+        let (policy, calls) = fixture.resolve();
+        assert!(
+            calls > 0,
+            "retargeting the config directory must invalidate"
+        );
+        assert_eq!(policy.hooks, vec![b_hooks.clone()]);
+        assert_eq!(fixture.resolve().1, 0);
+
+        retarget("dir-missing");
+        let (policy, calls) = fixture.resolve();
+        assert!(
+            calls > 0,
+            "retargeting to a dangling directory must invalidate"
+        );
+        assert_ne!(policy.hooks, vec![b_hooks.clone()]);
+        assert!(
+            fixture.resolve().1 > 0,
+            "a config behind a dangling directory symlink must not be cached"
+        );
+    }
+
     /// A dangling symlink keeps its own identity when its target is created,
     /// so a policy that depends on one is never reused.
     #[test]
