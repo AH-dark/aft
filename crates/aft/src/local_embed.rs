@@ -3,11 +3,13 @@
 //!
 //! Replaces the `fastembed` crate. We own the ORT session so we can cap
 //! intra-op threads — `fastembed` hardcoded `with_intra_threads(all cores)`,
-//! which pegged every core during indexing. We cap to half of the process's
+//! which pegged every core during indexing. Builds cap to half of the process's
 //! available parallelism, the container CPU quota when present, and eight
 //! threads overall. The half-core policy measured 1.7x faster with 3.5x less
 //! CPU than oversubscribing all cores; the quota cap prevents ORT from creating
 //! host-sized pools inside CPU-constrained containers.
+//! Queries use one native thread and inline single-text tokenization, avoiding
+//! indexing-sized thread-pool wakeups and queues for sporadic searches.
 //!
 //! The pipeline reproduces fastembed's MiniLM path byte-for-byte (verified:
 //! cosine 1.000000 vs fastembed across code + prose), so existing semantic
@@ -213,6 +215,13 @@ pub struct LocalEmbedder {
 struct ResidentModel {
     model: Option<NativeEmbedder>,
     last_used: Instant,
+    role: InferenceRole,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InferenceRole {
+    Build,
+    Query,
 }
 
 const MODEL_IDLE_TTL: Duration = Duration::from_secs(60);
@@ -242,7 +251,9 @@ pub(crate) fn session_memory() -> EmbeddingSessionMemory {
 
 impl ResidentModel {
     fn release_if_idle(&mut self, now: Instant) {
-        if now.saturating_duration_since(self.last_used) >= MODEL_IDLE_TTL {
+        if self.role == InferenceRole::Build
+            && now.saturating_duration_since(self.last_used) >= MODEL_IDLE_TTL
+        {
             self.model.take();
         }
     }
@@ -253,8 +264,8 @@ impl LocalEmbedder {
         validate_model(model)?;
         // Initialize the query model before background work becomes available.
         // Its registry and inference lock never depend on the build session.
-        let query_keepalive = shared_model(&QUERY_MODEL, model)?;
-        let shared = shared_model(&BUILD_MODEL, model)?;
+        let query_keepalive = shared_model(model, InferenceRole::Query)?;
+        let shared = shared_model(model, InferenceRole::Build)?;
         MODEL_REAPER
             .get_or_init(|| {
                 std::thread::Builder::new()
@@ -292,7 +303,7 @@ impl LocalEmbedder {
     pub(crate) fn new_for_query(model: &str) -> Result<Self, String> {
         validate_model(model)?;
         Ok(Self {
-            shared: shared_model(&QUERY_MODEL, model)?,
+            shared: shared_model(model, InferenceRole::Query)?,
             _query_keepalive: None,
         })
     }
@@ -308,7 +319,7 @@ impl LocalEmbedder {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if resident.model.is_none() {
-            resident.model = Some(NativeEmbedder::new("all-MiniLM-L6-v2")?);
+            resident.model = Some(NativeEmbedder::new("all-MiniLM-L6-v2", resident.role)?);
         }
         let result = resident.model.as_mut().unwrap().embed(texts);
         resident.last_used = Instant::now();
@@ -316,10 +327,11 @@ impl LocalEmbedder {
     }
 }
 
-fn shared_model(
-    registry: &Mutex<Option<Weak<Mutex<ResidentModel>>>>,
-    model: &str,
-) -> Result<Arc<Mutex<ResidentModel>>, String> {
+fn shared_model(model: &str, role: InferenceRole) -> Result<Arc<Mutex<ResidentModel>>, String> {
+    let registry = match role {
+        InferenceRole::Build => &BUILD_MODEL,
+        InferenceRole::Query => &QUERY_MODEL,
+    };
     let mut registry = registry
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -327,8 +339,9 @@ fn shared_model(
         return Ok(shared);
     }
     let shared = Arc::new(Mutex::new(ResidentModel {
-        model: Some(NativeEmbedder::new(model)?),
+        model: Some(NativeEmbedder::new(model, role)?),
         last_used: Instant::now(),
+        role,
     }));
     *registry = Some(Arc::downgrade(&shared));
     Ok(shared)
@@ -351,16 +364,17 @@ struct NativeEmbedder {
     wants_token_type_ids: bool,
     run_options: ManuallyDrop<RunOptions>,
     model_bytes: u64,
+    role: InferenceRole,
 }
 
 impl NativeEmbedder {
     /// Build the embedder for the named model. Only `all-MiniLM-L6-v2` is
     /// supported as the local backend (matches the prior fastembed surface).
-    pub fn new(model: &str) -> Result<Self, String> {
-        Self::with_cache_dir(model, None)
+    fn new(model: &str, role: InferenceRole) -> Result<Self, String> {
+        Self::with_cache_dir(model, role, None)
     }
 
-    pub(crate) fn with_cache_dir(model: &str, cache_dir: Option<&Path>) -> Result<Self, String> {
+    fn with_cache_dir(model: &str, role: InferenceRole, cache_dir: Option<&Path>) -> Result<Self, String> {
         validate_model(model)?;
 
         // Fail with an actionable message instead of letting ort panic deep
@@ -370,7 +384,13 @@ impl NativeEmbedder {
         let (model_path, tokenizer_path) = resolve_model_files(cache_dir)?;
 
         let thread_derivation = intra_thread_derivation();
-        let threads = thread_derivation.threads;
+        // Short queries run on their caller instead of waking an indexing-sized
+        // native thread pool after each idle interval. Builds retain their cap.
+        let threads = if role == InferenceRole::Query {
+            1
+        } else {
+            thread_derivation.threads
+        };
         // Environment creation and model loading are native ORT work; hold the
         // exit gate so process exit cannot destroy ORT's statics underneath it.
         let _ort_section = crate::ort_lifecycle::enter().ok_or_else(|| {
@@ -390,12 +410,14 @@ impl NativeEmbedder {
 
         let mut run_options =
             RunOptions::new().map_err(|e| format!("failed to create ONNX run options: {e}"))?;
-        // Keep arena reuse within an inference, but return its extensions after
-        // every run instead of retaining the largest attention tensor allocated
-        // by an earlier inference.
-        run_options
-            .add_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
-            .map_err(|e| format!("failed to enable ONNX CPU arena shrinkage: {e}"))?;
+        // Builds return their large temporary tensors after each run. Queries
+        // embed one truncated text and keep their much smaller arena warm, so
+        // sporadic searches reuse buffers instead of reallocating them.
+        if role == InferenceRole::Build {
+            run_options
+                .add_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
+                .map_err(|e| format!("failed to enable ONNX CPU arena shrinkage: {e}"))?;
+        }
 
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| format!("failed to load tokenizer {}: {e}", tokenizer_path.display()))?;
@@ -416,7 +438,7 @@ impl NativeEmbedder {
         slog_info!(
             "local embedder ready: model=all-MiniLM-L6-v2 intra_threads={} intra_threads_source={} available_parallelism={} cgroup_quota_threads={} token_type_ids={}",
             threads,
-            thread_derivation.source,
+            if role == InferenceRole::Query { "query_latency" } else { thread_derivation.source },
             thread_derivation.available_parallelism,
             thread_derivation
                 .quota_threads
@@ -441,6 +463,7 @@ impl NativeEmbedder {
             wants_token_type_ids,
             run_options: ManuallyDrop::new(run_options),
             model_bytes,
+            role,
         })
     }
 
@@ -459,11 +482,19 @@ impl NativeEmbedder {
             return Ok(Vec::new());
         }
 
-        let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        let encodings = self
-            .tokenizer
-            .encode_batch(text_refs, true)
-            .map_err(|e| format!("tokenize batch: {e}"))?;
+        // A single query must not queue on the process-wide Rayon pool that
+        // background chunk collection and batch tokenization also use.
+        let encodings = if self.role == InferenceRole::Query && texts.len() == 1 {
+            vec![self
+                .tokenizer
+                .encode(texts[0].as_str(), true)
+                .map_err(|e| format!("tokenize query: {e}"))?]
+        } else {
+            let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            self.tokenizer
+                .encode_batch(text_refs, true)
+                .map_err(|e| format!("tokenize batch: {e}"))?
+        };
 
         // Greedily partition (order-preserving) into sub-batches bounded by the
         // attention-unit budget. `cost = (count) × max_len²`; flush before
@@ -853,7 +884,8 @@ mod tests {
     #[ignore = "requires cached MiniLM and ONNX Runtime; run explicitly with ORT_DYLIB_PATH"]
     fn local_embedding_vectors_match_legacy_fixture() {
         let _serial = native_test();
-        let mut legacy = super::NativeEmbedder::new("all-MiniLM-L6-v2").unwrap();
+        let mut legacy =
+            super::NativeEmbedder::new("all-MiniLM-L6-v2", super::InferenceRole::Build).unwrap();
         // The old backend used default run options and kept the CPU arena.
         unsafe { std::mem::ManuallyDrop::drop(&mut legacy.run_options) };
         legacy.run_options = std::mem::ManuallyDrop::new(ort::session::RunOptions::new().unwrap());
@@ -962,7 +994,12 @@ mod tests {
             1,
             "idle build must unload without releasing the warm query session"
         );
-        assert!(query.shared.lock().unwrap().model.is_some());
+        {
+            let mut resident = query.shared.lock().unwrap();
+            let after_idle = resident.last_used + super::MODEL_IDLE_TTL * 2;
+            resident.release_if_idle(after_idle);
+            assert!(resident.model.is_some(), "query lease lost its warm model");
+        }
         assert_eq!(bits(query.embed(&corpus).unwrap()), expected);
         assert_eq!(bits(handle.embed(&corpus).unwrap()), expected);
         assert_eq!(super::session_memory().sessions, 2);

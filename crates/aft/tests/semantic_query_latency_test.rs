@@ -11,6 +11,32 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[test]
+#[ignore = "requires native ORT and cached MiniLM; compares query scheduling with the build reference"]
+fn native_query_role_vectors_match_build_baseline() {
+    let mut baseline = aft::local_embed::LocalEmbedder::new("all-MiniLM-L6-v2").unwrap();
+    let mut query =
+        SemanticEmbeddingModel::from_config_for_query(&SemanticBackendConfig::default()).unwrap();
+    let corpus = [
+        String::new(),
+        "where is semantic model memory bounded".into(),
+        "pub fn checksum(input: u64) -> u64 { input.wrapping_mul(37) }".into(),
+        "Café naïve 日本語 🦀".into(),
+        "attention mask pooling ".repeat(600),
+    ];
+    for text in corpus {
+        // The build reference uses batched tokenization and its CPU thread cap;
+        // query encoding runs inline with one native thread and a warm arena.
+        let expected = baseline.embed(&[text.clone()]).unwrap().remove(0);
+        let actual = query.embed(vec![text]).unwrap().remove(0);
+        assert_eq!(
+            actual.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+            expected.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+            "query scheduling changed embedding bits",
+        );
+    }
+}
+
+#[test]
 #[ignore = "bounded manual MiniLM latency measurement; requires native ORT, cached model and probe paths"]
 fn native_query_embedding_latency_probe() {
     let root = PathBuf::from(std::env::var_os("AFT_LATENCY_ROOT").expect("AFT_LATENCY_ROOT"));
