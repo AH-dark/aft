@@ -464,7 +464,7 @@ fn v20_full_log_window_with_split_characters_at_both_edges_is_accepted() {
 }
 
 #[test]
-fn v20_log_failed_selects_failed_jobs_and_steps_across_page_boundaries() {
+fn v20_log_failed_whole_job_fallback_is_complete_across_page_boundaries() {
     let plan = planned(&["run", "view", "8", "--log-failed"]);
     let log = b"2026-10-19T10:00:01Z ok\n2026-10-19T10:00:03Z bad\n";
     let mut requests = Vec::new();
@@ -484,9 +484,158 @@ fn v20_log_failed_selects_failed_jobs_and_steps_across_page_boundaries() {
     }, &mut output).unwrap();
     assert_eq!(
         String::from_utf8(output).unwrap(),
-        "build\ttest\t2026-10-19T10:00:03Z bad\n"
+        "build\tUNKNOWN STEP\t2026-10-19T10:00:01Z ok\nbuild\tUNKNOWN STEP\t2026-10-19T10:00:03Z bad\n"
     );
     assert_eq!(requests.len(), 5);
+}
+
+fn landing_policy_job() -> Value {
+    json!({"id":120842790454_u64,"name":"Landing policy","conclusion":"failure","steps":[
+        {"name":"Run actions/checkout@v4","number":2,"started_at":"2026-10-24T09:57:11Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"success"},
+        {"name":"Original PR commit identity and agent attribution","number":3,"started_at":"2026-10-24T09:57:22Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"failure"},
+        {"name":"No ignored files tracked under .cortexkit","number":4,"started_at":"2026-10-24T09:57:22Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"skipped"},
+        {"name":"Post Run actions/checkout@v4","number":22,"started_at":"2026-10-24T09:57:22Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"success"},
+        {"name":"Complete job","number":23,"started_at":"2026-10-24T09:57:22Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"success"}
+    ]})
+}
+
+fn render_failed_log(body: &str, job: Value) -> (Result<i32, ReadError>, Vec<u8>) {
+    let plan = planned(&["run", "view", "40083893167", "--log-failed"]);
+    let mut output = Vec::new();
+    let result = render::run(
+        &plan,
+        &mut |request| match request {
+            ReadRequest::Get { .. } => Ok(reply(json!({"jobs":[job.clone()]}))),
+            ReadRequest::JobLog {
+                range: Some(range), ..
+            } => {
+                assert_eq!(range.offset, 0);
+                // Like the Plexus display-text vector, raw storage contains colour
+                // escapes that are absent from the decoded display body.
+                let raw_length = body.len() as u64 + 9;
+                decoded_log_reply(request, body, 0, raw_length, raw_length)
+            }
+            _ => panic!("unexpected request"),
+        },
+        &mut output,
+    );
+    (result, output)
+}
+
+#[test]
+fn v20_log_failed_real_same_second_steps_print_whole_job_as_unknown_step() {
+    // The companion native fixture preserves the operator's per-step archive;
+    // this excerpt is from the worker's whole-job display-text response.
+    let body = include_str!("../../tests/fixtures/gh_shim/run-40083893167-job-display.txt");
+    let (result, output) = render_failed_log(body, landing_policy_job());
+    assert_eq!(result.unwrap(), 0);
+    let expected = concat!(
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:21.4042950Z ##[group]Checking out the ref\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:21.4043428Z [command]/usr/bin/git checkout --progress --force 4bfc477d907853824afb483e0f2e95f99d9b5cd8\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0036415Z HEAD is now at 4bfc477d9 mason: defer glob edit write checks until content matches\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0073427Z ##[endgroup]\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0128480Z [command]/usr/bin/git log -1 --format=%H\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0158498Z 4bfc477d907853824afb483e0f2e95f99d9b5cd8\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0377683Z ##[group]Run python3 scripts/landing-policy.py --event \"$GITHUB_EVENT_NAME\" --event-path \"$GITHUB_EVENT_PATH\"\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0378545Z python3 scripts/landing-policy.py --event \"$GITHUB_EVENT_NAME\" --event-path \"$GITHUB_EVENT_PATH\"\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0617811Z shell: /usr/bin/bash -e {0}\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0618129Z env:\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0618375Z   SCCACHE_IDLE_TIMEOUT: 0\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0618678Z   SCCACHE_GHA_RW_MODE: READ_ONLY\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0621822Z   GH_TOKEN: ***\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0622087Z ##[endgroup]\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.1681605Z Landing policy: REFUSED: 7e98a53e8e8d856b919fe52ad0ea8d6662fafc8f: land/storage-floor agent commit missing alfonso-aft co-author trailer\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.1783209Z ##[error]Process completed with exit code 1.\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.1960957Z Post job cleanup.\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.2803101Z [command]/usr/bin/git version\n",
+    );
+    assert_eq!(String::from_utf8(output).unwrap(), expected);
+}
+
+#[test]
+fn v20_log_failed_empty_and_unattributed_logs_follow_whole_job_fallback() {
+    for body in [
+        "",
+        "not a timestamp or a step boundary\n",
+        "2026-10-24T09:57:23.1Z outside all steps\n",
+        "2026-10-24T09:57:22.1Z could be checkout, failed step, or cleanup\n",
+        "\u{feff}last line without newline",
+    ] {
+        let (result, output) = render_failed_log(body, landing_policy_job());
+        assert_eq!(result.unwrap(), 0);
+        let expected = if body.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Landing policy\tUNKNOWN STEP\t{}\n",
+                body.trim_end_matches('\n')
+            )
+        };
+        assert_eq!(String::from_utf8(output).unwrap(), expected);
+    }
+}
+
+#[test]
+fn v20_log_failed_accepts_native_gh_failure_states_in_job_order() {
+    let plan = planned(&["run", "view", "8", "--log-failed"]);
+    let mut output = Vec::new();
+    render::run(
+        &plan,
+        &mut |request| match request {
+            ReadRequest::Get { .. } => Ok(reply(json!({"jobs":[
+                {"id":4,"name":"required / review","conclusion":"action_required"},
+                {"id":3,"name":"startup","conclusion":"startup_failure"},
+                {"id":2,"name":"timeout","conclusion":"timed_out"},
+                {"id":1,"name":"failed","conclusion":"failure"}
+            ]}))),
+            ReadRequest::JobLog { .. } => Ok(log_reply(b"line\r\n", 0, 6)),
+            _ => panic!("unexpected request"),
+        },
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        concat!(
+            "required / review\tUNKNOWN STEP\tline\n",
+            "startup\tUNKNOWN STEP\tline\n",
+            "timeout\tUNKNOWN STEP\tline\n",
+            "failed\tUNKNOWN STEP\tline\n"
+        )
+    );
+}
+
+#[test]
+fn v20_log_failed_skips_successful_jobs() {
+    let plan = planned(&["run", "view", "40083893167", "--log-failed"]);
+    let mut output = Vec::new();
+    let mut log_ids = Vec::new();
+    let result = render::run(
+        &plan,
+        &mut |request| match request {
+            ReadRequest::Get { .. } => Ok(reply(json!({"jobs":[
+                {"id":1,"name":"successful job","conclusion":"success"},
+                landing_policy_job(),
+                {"id":2,"name":"skipped job","conclusion":"skipped"}
+            ]}))),
+            ReadRequest::JobLog {
+                job_id,
+                range: Some(range),
+            } => {
+                log_ids.push(*job_id);
+                assert_eq!(range.offset, 0);
+                decoded_log_reply(request, "failed job log\n", 0, 15, 15)
+            }
+            _ => panic!("unexpected request"),
+        },
+        &mut output,
+    );
+    assert_eq!(result.unwrap(), 0);
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        "Landing policy\tUNKNOWN STEP\tfailed job log\n"
+    );
+    assert_eq!(log_ids, vec![120842790454]);
 }
 
 #[test]
@@ -964,7 +1113,7 @@ fn review_checks_include_failure_or_pending_status_from_later_page() {
 }
 
 #[test]
-fn review_failed_log_steps_use_precise_half_open_intervals() {
+fn review_failed_log_whole_job_fallback_does_not_infer_from_precise_timestamps() {
     let plan = planned(&["run", "view", "8", "--log-failed"]);
     let log = b"2026-10-19T10:00:02.1000000Z passing\n2026-10-19T10:00:02.2000000Z boundary failure\n2026-10-19T10:00:02.3000000Z failure\n2026-10-19T10:00:02.4000000Z after failure\n";
     let mut output = Vec::new();
@@ -981,7 +1130,7 @@ fn review_failed_log_steps_use_precise_half_open_intervals() {
         }
         _ => panic!("unexpected request"),
     }, &mut output).unwrap();
-    assert_eq!(String::from_utf8(output).unwrap(), "build\ttest\t2026-10-19T10:00:02.2000000Z boundary failure\nbuild\ttest\t2026-10-19T10:00:02.3000000Z failure\n");
+    assert_eq!(String::from_utf8(output).unwrap(), "build\tUNKNOWN STEP\t2026-10-19T10:00:02.1000000Z passing\nbuild\tUNKNOWN STEP\t2026-10-19T10:00:02.2000000Z boundary failure\nbuild\tUNKNOWN STEP\t2026-10-19T10:00:02.3000000Z failure\nbuild\tUNKNOWN STEP\t2026-10-19T10:00:02.4000000Z after failure\n");
 }
 
 #[test]

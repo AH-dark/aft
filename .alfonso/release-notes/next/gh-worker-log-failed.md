@@ -1,0 +1,1 @@
+- Sandboxed workers' `gh run view --log-failed` prints the failed jobs' logs again instead of nothing; like GitHub CLI with whole-job logs, lines are labelled `UNKNOWN STEP`.
