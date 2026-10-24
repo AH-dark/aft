@@ -3,7 +3,7 @@
 //! native sessions rather than one instance's mutex.
 
 use aft::config::SemanticBackendConfig;
-use aft::semantic_index::{SemanticEmbeddingModel, SemanticIndex};
+use aft::semantic_index::{QueryBudget, SemanticEmbeddingModel, SemanticIndex};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +42,7 @@ fn native_query_embedding_latency_probe() {
     let root = PathBuf::from(std::env::var_os("AFT_LATENCY_ROOT").expect("AFT_LATENCY_ROOT"));
     let output = PathBuf::from(std::env::var_os("AFT_LATENCY_OUTPUT").expect("AFT_LATENCY_OUTPUT"));
     let label = std::env::var("AFT_LATENCY_LABEL").expect("AFT_LATENCY_LABEL");
+    let query_api = std::env::var_os("AFT_LATENCY_QUERY_API").is_some();
     let mut config = SemanticBackendConfig::default();
     config.query_timeout_ms = 500;
     config.route_project_root = Some(root.with_file_name("query-root"));
@@ -90,6 +91,8 @@ fn native_query_embedding_latency_probe() {
             std::thread::sleep(Duration::from_millis(50));
         }
         let mut samples = Vec::new();
+        let mut errors = Vec::new();
+        let cache_before = query.query_embedding_cache_stats();
         let mut idle_sessions = Vec::new();
         for number in 0..20 {
             if state == "first_after_idle" {
@@ -116,13 +119,21 @@ fn native_query_embedding_latency_probe() {
             }
             let text = format!("where is semantic model memory bounded for query {state} {number}");
             let started = Instant::now();
-            // Call SemanticEmbeddingModel::embed synchronously to time native
-            // work without censoring long samples at the query API's deadline.
-            // Compare every sample with the independently configured budget.
-            let vectors = query.embed(vec![text]).unwrap();
+            // Native-work mode avoids censoring long waits at the deadline.
+            // API mode also measures worker handoff and records budget failures.
+            let result = if query_api {
+                query
+                    .embed_query_cached(&text, QueryBudget::from_config(&config))
+                    .map(|vector| vec![vector])
+            } else {
+                query.embed(vec![text])
+            };
             let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-            assert_eq!(vectors.len(), 1);
-            assert_eq!(vectors[0].len(), 384);
+            if let Ok(vectors) = &result {
+                assert_eq!(vectors.len(), 1);
+                assert_eq!(vectors[0].len(), 384);
+            }
+            errors.push(result.err());
             samples.push(elapsed_ms);
             eprintln!("LATENCY {label} {state} {number} {elapsed_ms:.3}ms");
         }
@@ -132,21 +143,36 @@ fn native_query_embedding_latency_probe() {
         }
         let mut sorted = samples.clone();
         sorted.sort_by(f64::total_cmp);
+        let cache_after = query.query_embedding_cache_stats();
+        if query_api {
+            assert_eq!(cache_after.0 - cache_before.0, 0, "measured a cache hit");
+            assert_eq!(
+                cache_after.1 - cache_before.1,
+                20,
+                "missing query cache misses"
+            );
+        }
         let row = json!({
             "state": state, "samples_ms": samples, "p50_ms": sorted[9],
             "sessions_before_idle_queries": idle_sessions,
             "p95_ms": sorted[18], "max_ms": sorted[19],
             "budget_ms": budget_ms,
             "over_budget": sorted.iter().filter(|ms| **ms > budget_ms as f64).count(),
+            "successes": errors.iter().filter(|error| error.is_none()).count(),
+            "errors": errors,
         });
         states.push(row);
         std::fs::write(
             &output,
             serde_json::to_vec_pretty(&json!({
-                "label": label, "initial_load_ms": load_ms, "states": states,
+                "label": label, "query_api": query_api, "initial_load_ms": load_ms, "states": states,
             }))
             .unwrap(),
         )
         .unwrap();
     }
+    assert!(
+        states.iter().all(|row| row["successes"] == 20),
+        "query embedding failed; see recorded outcomes"
+    );
 }
