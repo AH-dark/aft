@@ -1661,6 +1661,8 @@ struct LocalFallback {
     shell_path: PathBuf,
     env: HashMap<String, String>,
     capture_pipeline: bool,
+    // Keep the submitting request's local ceiling even if configuration reloads.
+    memory_limit_mib: Option<u64>,
     linux_scope: bool,
 }
 
@@ -1790,6 +1792,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         slot: super::super::TaskSlot,
         notify: bool,
@@ -1805,6 +1808,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             slot,
             notify,
@@ -1825,6 +1829,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         mut env: HashMap<String, String>,
         hard_kill: super::super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         slot: super::super::TaskSlot,
         notify: bool,
@@ -1917,6 +1922,7 @@ impl BgTaskRegistry {
             &shell_path,
             env.get("AFT_INTERNAL_LINUX_SCOPE")
                 .is_some_and(|v| v == "1"),
+            memory_limit_mib,
         )?;
         metadata.remote.as_mut().unwrap().fallback_digest = Some(digest);
         let handles =
@@ -2038,6 +2044,7 @@ impl BgTaskRegistry {
             plan,
             shell_path,
             linux_scope,
+            memory_limit_mib,
             env,
             capture_pipeline,
         };
@@ -3004,7 +3011,7 @@ impl BgTaskRegistry {
             .map_err(|e| e.to_string())?;
         #[cfg(test)]
         tests::after_local_fallback_marker(&task.task_id);
-        let mut memory_monitor = self.prepare_memory_limit(&task.task_id)?;
+        let mut memory_monitor = Self::prepare_memory_limit(local.memory_limit_mib, &task.task_id)?;
         let mut child = spawn_detached_child(
             &local.plan,
             &metadata.command,
@@ -3089,13 +3096,14 @@ impl BgTaskRegistry {
         let restore = (|| {
             let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)
                 .map_err(|e| e.to_string())?;
-            let (plan, shell_path, env, linux_scope) = crate::sandbox_spawn::restore_local_launch(
-                &layout,
-                remote
-                    .fallback_digest
-                    .as_deref()
-                    .ok_or("local snapshot digest absent")?,
-            )?;
+            let (plan, shell_path, env, linux_scope, memory_limit_mib) =
+                crate::sandbox_spawn::restore_local_launch(
+                    &layout,
+                    remote
+                        .fallback_digest
+                        .as_deref()
+                        .ok_or("local snapshot digest absent")?,
+                )?;
             let metadata = task
                 .state
                 .lock()
@@ -3121,6 +3129,7 @@ impl BgTaskRegistry {
                     env,
                     capture_pipeline,
                     linux_scope,
+                    memory_limit_mib,
                 },
                 reason,
                 refusal_detail,

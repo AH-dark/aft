@@ -216,6 +216,27 @@ pub(crate) mod remote;
 #[cfg(target_os = "linux")]
 pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 
+#[cfg(test)]
+thread_local! {
+    static MEMORY_PREPARE_GATE_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn with_memory_prepare_gate_for_test<R>(
+    gate: impl FnOnce() + 'static,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<Box<dyn FnOnce()>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MEMORY_PREPARE_GATE_FOR_TEST.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore =
+        Restore(MEMORY_PREPARE_GATE_FOR_TEST.with(|slot| slot.replace(Some(Box::new(gate)))));
+    run()
+}
+
 /// How long a reader that must answer with a settled status (`bash_status`,
 /// a second kill) waits for a kill already in flight on the same task: the
 /// SIGTERM grace period plus a margin for the SIGKILL, the reap and the
@@ -1066,7 +1087,6 @@ struct ProjectReplayDiskBatch {
 }
 
 pub(crate) struct RegistryInner {
-    memory_limit_mib: AtomicU64,
     memory_monitors: Mutex<HashMap<String, super::memory_limit::Monitor>>,
     #[cfg(unix)]
     db_hint_jobs:
@@ -1680,7 +1700,6 @@ impl BgTaskRegistry {
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
         Self {
             inner: Arc::new(RegistryInner {
-                memory_limit_mib: AtomicU64::new(0),
                 memory_monitors: Mutex::new(HashMap::new()),
                 #[cfg(unix)]
                 db_hint_jobs: Mutex::new(HashMap::new()),
@@ -3986,17 +4005,15 @@ impl BgTaskRegistry {
             .store(interval_ms, Ordering::SeqCst);
     }
 
-    pub(crate) fn set_memory_limit(&self, mib: Option<u64>) {
-        self.inner
-            .memory_limit_mib
-            .store(mib.unwrap_or(0), Ordering::Relaxed);
-    }
-
     fn prepare_memory_limit(
-        &self,
+        memory_limit_mib: Option<u64>,
         task_id: &str,
     ) -> Result<Option<super::memory_limit::Monitor>, String> {
-        let mib = self.inner.memory_limit_mib.load(Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(gate) = MEMORY_PREPARE_GATE_FOR_TEST.with(|slot| slot.borrow_mut().take()) {
+            gate();
+        }
+        let mib = memory_limit_mib.unwrap_or(0);
         if mib == 0 {
             return Ok(None);
         }
@@ -4112,6 +4129,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -4127,6 +4145,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -4149,6 +4168,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -4164,6 +4184,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             super::TaskSlot::Background { max: max_running },
             notify_on_completion,
@@ -4183,6 +4204,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         slot: super::TaskSlot,
         notify_on_completion: bool,
@@ -4198,6 +4220,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             slot,
             notify_on_completion,
@@ -4218,6 +4241,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -4235,6 +4259,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -4260,6 +4285,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))] mut env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         slot: super::TaskSlot,
         notify_on_completion: bool,
@@ -4378,7 +4404,7 @@ impl BgTaskRegistry {
         metadata.completion_ticket_digest = completion_secrets.ticket_digest.clone();
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
-        let mut memory_monitor = self.prepare_memory_limit(&task_id)?;
+        let mut memory_monitor = Self::prepare_memory_limit(memory_limit_mib, &task_id)?;
         metadata.memory_policy = memory_monitor
             .as_ref()
             .map(|monitor| monitor.policy.clone());
@@ -4643,6 +4669,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -4661,6 +4688,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -4682,6 +4710,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -4766,7 +4795,7 @@ impl BgTaskRegistry {
         metadata.pty_rows = Some(rows);
         metadata.pty_cols = Some(cols);
         super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
-        let mut memory_monitor = self.prepare_memory_limit(&task_id)?;
+        let mut memory_monitor = Self::prepare_memory_limit(memory_limit_mib, &task_id)?;
         metadata.memory_policy = memory_monitor
             .as_ref()
             .map(|monitor| monitor.policy.clone());
@@ -4939,6 +4968,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -4954,6 +4984,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -4976,6 +5007,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -4991,6 +5023,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             super::TaskSlot::Background { max: max_running },
             notify_on_completion,
@@ -5013,6 +5046,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         slot: super::TaskSlot,
         notify_on_completion: bool,
@@ -5050,7 +5084,7 @@ impl BgTaskRegistry {
             Some(completion_secrets.has_non_ticket_secrets);
         metadata.completion_ticket_digest = completion_secrets.ticket_digest.clone();
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
-        let mut memory_monitor = self.prepare_memory_limit(&task_id)?;
+        let mut memory_monitor = Self::prepare_memory_limit(memory_limit_mib, &task_id)?;
         metadata.memory_policy = memory_monitor
             .as_ref()
             .map(|monitor| monitor.policy.clone());
@@ -15352,6 +15386,7 @@ mod tests {
                 missing_workdir.clone(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -16010,6 +16045,7 @@ mod tests {
                                 storage.clone(),
                                 HashMap::new(),
                                 crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                                None,
                                 storage.clone(),
                                 1,
                                 true,
@@ -16289,6 +16325,7 @@ mod tests {
                 storage.clone(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(300)),
+                None,
                 storage.clone(),
                 10,
                 true,
@@ -16559,15 +16596,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let release = dir.path().join("release");
         let original = BgTaskRegistry::default();
-        let task_id = original.spawn_with_shell(
-            SpawnPlan::Unsandboxed,
-            &format!("sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; printf \"381 tests run: 381 passed\\n\" >&2; exit 1' | true", release.display()),
-            crate::bash_background::BashShell::Bash, PathBuf::from("/bin/bash"),
-            "session".into(),
-            dir.path().into(), HashMap::new(),
-            crate::bash_background::HardKill::After(Duration::from_secs(30)), dir.path().into(), 10, true, false,
-            Some(dir.path().into()),
-        ).unwrap();
+        let task_id = original.spawn_with_shell(SpawnPlan::Unsandboxed, &format!("sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; printf \"381 tests run: 381 passed\\n\" >&2; exit 1' | true", release.display()), crate::bash_background::BashShell::Bash, PathBuf::from("/bin/bash"), "session".into(), dir.path().into(), HashMap::new(), crate::bash_background::HardKill::After(Duration::from_secs(30)), None, dir.path().into(), 10, true, false, Some(dir.path().into())).unwrap();
         let paths = original.task(&task_id).unwrap().paths.clone();
         original.detach();
         drop(original);
@@ -17077,6 +17106,7 @@ mod tests {
                     dir.path().to_path_buf(),
                     HashMap::new(),
                     crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    None,
                     dir.path().to_path_buf(),
                     10,
                     true,
@@ -17382,6 +17412,7 @@ mod tests {
                 other_dir.path().into(),
                 HashMap::new(),
                 super::super::HardKill::After(Duration::from_millis(100)),
+                None,
                 other_dir.path().into(),
                 1,
                 true,
@@ -18153,6 +18184,7 @@ mod tests {
                 project.clone(),
                 HashMap::new(),
                 super::super::HardKill::After(Duration::from_secs(30)),
+                None,
                 project.clone(),
                 1,
                 false,
@@ -18188,6 +18220,7 @@ mod tests {
                 dir.path().into(),
                 HashMap::new(),
                 super::super::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().into(),
                 1,
                 false,
@@ -18230,6 +18263,7 @@ mod tests {
                 root.path().to_path_buf(),
                 HashMap::new(),
                 super::super::HardKill::After(Duration::from_secs(30)),
+                None,
                 root.path().to_path_buf(),
                 1,
                 false,
@@ -18451,6 +18485,7 @@ mod tests {
                 missing_workdir.clone(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 crate::bash_background::TaskSlot::Background { max: 1 },
                 true,
@@ -19379,6 +19414,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -19474,6 +19510,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -19530,6 +19567,7 @@ mod tests {
                 root.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -19622,6 +19660,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -19666,6 +19705,7 @@ mod tests {
                 root.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -19770,6 +19810,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -19836,6 +19877,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -20323,6 +20365,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -20393,6 +20436,7 @@ mod tests {
                     project.path().to_path_buf(),
                     HashMap::new(),
                     crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    None,
                     storage.path().to_path_buf(),
                     10,
                     false,
@@ -20505,6 +20549,7 @@ mod tests {
                     project.path().to_path_buf(),
                     HashMap::new(),
                     crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    None,
                     storage.path().to_path_buf(),
                     QUICK_TASKS * 2,
                     false,
@@ -20526,6 +20571,7 @@ mod tests {
                 project.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 QUICK_TASKS * 2,
                 false,
@@ -20712,6 +20758,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -20875,6 +20922,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -20977,6 +21025,7 @@ mod tests {
                 storage.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -21066,6 +21115,7 @@ mod tests {
                 storage.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -21116,6 +21166,7 @@ mod tests {
                     storage.path().to_path_buf(),
                     HashMap::new(),
                     crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    None,
                     storage.path().to_path_buf(),
                     10,
                     true,
@@ -21187,6 +21238,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -21269,6 +21321,7 @@ mod tests {
                 storage.to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(120)),
+                None,
                 storage.to_path_buf(),
                 10,
                 true,
@@ -21464,6 +21517,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -21494,6 +21548,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -21550,6 +21605,7 @@ mod tests {
                 dir.to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.to_path_buf(),
                 10,
                 true,
@@ -21822,6 +21878,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -21883,6 +21940,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -22300,6 +22358,7 @@ mod tests {
                 project.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -22403,6 +22462,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 environment,
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 false,
@@ -22617,6 +22677,7 @@ mod tests {
                 project.to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                None,
                 storage.to_path_buf(),
                 10,
                 true,
@@ -22644,6 +22705,7 @@ mod tests {
                     root.clone(),
                     HashMap::new(),
                     super::super::HardKill::After(Duration::from_secs(60)),
+                    None,
                     storage.path().to_path_buf(),
                     10,
                     true,
@@ -23058,6 +23120,7 @@ mod tests {
                     project.path().to_path_buf(),
                     HashMap::new(),
                     crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                    None,
                     storage.path().to_path_buf(),
                     10,
                     false,
@@ -23149,6 +23212,7 @@ mod tests {
                 project.path().to_path_buf(),
                 env,
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -23568,6 +23632,7 @@ mod tests {
                 project.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -23591,6 +23656,7 @@ mod tests {
                 project.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -24069,6 +24135,7 @@ mod tests {
                 storage.to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.to_path_buf(),
                 10,
                 true,
@@ -24139,6 +24206,7 @@ mod tests {
                 storage.into(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.into(),
                 10,
                 true,
@@ -24222,6 +24290,7 @@ mod tests {
                     storage.to_path_buf(),
                     HashMap::new(),
                     crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    None,
                     storage.to_path_buf(),
                     10,
                     true,
@@ -24299,6 +24368,7 @@ mod tests {
                 storage.to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.to_path_buf(),
                 10,
                 true,
@@ -24335,6 +24405,7 @@ mod tests {
                 storage.to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.to_path_buf(),
                 10,
                 true,
@@ -24402,6 +24473,7 @@ mod tests {
                 storage.to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.to_path_buf(),
                 10,
                 true,

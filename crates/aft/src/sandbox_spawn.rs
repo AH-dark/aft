@@ -348,6 +348,9 @@ struct SavedLocalLaunch {
     command: Vec<u8>,
     payload_digest: [u8; 32],
     linux_scope: bool,
+    // Snapshots without a stored ceiling represent originally uncapped launches.
+    #[serde(default)]
+    memory_limit_mib: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -361,6 +364,7 @@ pub(crate) fn save_local_launch(
     principal: &AuthenticatedPrincipal,
     shell: &Path,
     linux_scope: bool,
+    memory_limit_mib: Option<u64>,
 ) -> Result<String, String> {
     let prepared = plan
         .prepared_task()
@@ -396,6 +400,7 @@ pub(crate) fn save_local_launch(
         command: prepared.0.command_bytes.as_ref().clone(),
         payload_digest: *prepared.0.digest.as_bytes(),
         linux_scope,
+        memory_limit_mib,
     };
     let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?;
     let mut file = crate::bash_background::persistence::create_control_file(
@@ -419,7 +424,16 @@ pub(crate) fn save_local_launch(
 pub(crate) fn restore_local_launch(
     task: &crate::bash_background::persistence::ResolvedTask,
     expected: &str,
-) -> Result<(SpawnPlan, PathBuf, HashMap<String, String>, bool), String> {
+) -> Result<
+    (
+        SpawnPlan,
+        PathBuf,
+        HashMap<String, String>,
+        bool,
+        Option<u64>,
+    ),
+    String,
+> {
     let mut file =
         crate::bash_background::persistence::open_control_file(task, REMOTE_LOCAL_LAUNCH)
             .map_err(|e| e.to_string())?;
@@ -476,6 +490,7 @@ pub(crate) fn restore_local_launch(
         snapshot.shell_path,
         env,
         snapshot.linux_scope,
+        snapshot.memory_limit_mib,
     ))
 }
 

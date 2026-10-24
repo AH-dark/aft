@@ -1250,8 +1250,6 @@ pub(crate) fn spawn(
     #[cfg(unix)]
     ctx.bash_background()
         .set_db_schema_hints(ctx.config().bash.db_schema_hints);
-    ctx.bash_background()
-        .set_memory_limit(ctx.config().bash.memory_limit_mib);
     #[cfg(unix)]
     let remote_result = remote.map(|launch| {
         ctx.bash_background().spawn_remote_typed(
@@ -1263,6 +1261,7 @@ pub(crate) fn spawn(
             workdir.clone(),
             env.clone(),
             hard_kill,
+            config.bash.memory_limit_mib,
             storage_dir.clone(),
             slot,
             notify_on_completion,
@@ -1288,6 +1287,7 @@ pub(crate) fn spawn(
             workdir,
             env,
             hard_kill,
+            config.bash.memory_limit_mib,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -1306,6 +1306,7 @@ pub(crate) fn spawn(
             workdir,
             env,
             hard_kill,
+            config.bash.memory_limit_mib,
             storage_dir,
             slot,
             notify_on_completion,

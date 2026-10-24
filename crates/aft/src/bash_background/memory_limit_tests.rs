@@ -3,6 +3,110 @@ use super::*;
 const ALLOCATOR: &str =
     "bash_background::registry::memory_limit_tests::memory_limit_allocator_child";
 
+#[cfg(unix)]
+pub(super) fn memory_request_context(
+    project: &Path,
+    storage: &Path,
+    cap: Option<u64>,
+) -> Arc<crate::context::AppContext> {
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(project.into());
+    config.storage_dir = Some(storage.into());
+    config.bash.memory_limit_mib = cap;
+    config.sandbox.profile.head = serde_json::from_str("\"off\"").unwrap();
+    Arc::new(crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        config,
+    ))
+}
+
+#[cfg(unix)]
+pub(super) fn spawn_memory_request(
+    ctx: &crate::context::AppContext,
+    request_id: &str,
+    remote: Option<super::super::RemoteLaunch>,
+) -> crate::protocol::Response {
+    super::super::spawn(
+        request_id,
+        "session",
+        "exit 0",
+        super::super::BashShell::Bash,
+        PathBuf::from("/bin/sh"),
+        None,
+        None,
+        super::super::HardKill::After(Duration::from_secs(30)),
+        ctx,
+        false,
+        false,
+        false,
+        false,
+        24,
+        80,
+        Vec::new(),
+        false,
+        None,
+        remote,
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_limit_interleaved_requests_keep_admitted_caps_across_reload() {
+    for new_cap in [None, Some(128)] {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = memory_request_context(project.path(), storage.path(), Some(64));
+        let original = ctx.config();
+        let a_ctx = ctx.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let request_a = std::thread::spawn(move || {
+            let _pin = a_ctx.pin_config_to(original);
+            with_memory_prepare_gate_for_test(
+                move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+                },
+                || spawn_memory_request(&a_ctx, "memory-request-a", None),
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        let mut reloaded = ctx.config().as_ref().clone();
+        reloaded.bash.memory_limit_mib = new_cap;
+        ctx.set_config(reloaded);
+        let request_b = {
+            let _pin = ctx.pin_config();
+            spawn_memory_request(&ctx, "memory-request-b", None)
+        };
+        release_tx.send(()).unwrap();
+        let request_a = request_a.join().unwrap();
+        assert!(request_a.success, "{request_a:?}");
+        assert!(request_b.success, "{request_b:?}");
+        let cap_for = |response: &crate::protocol::Response| {
+            let task = ctx
+                .bash_background()
+                .task_for_test(response.data["task_id"].as_str().unwrap())
+                .unwrap();
+            let state = task.lock_state().unwrap();
+            state
+                .metadata
+                .memory_policy
+                .as_ref()
+                .map(|policy| policy.mib)
+        };
+        assert_eq!(
+            cap_for(&request_a),
+            Some(64),
+            "request A lost its admitted cap"
+        );
+        assert_eq!(
+            cap_for(&request_b),
+            new_cap,
+            "request B inherited another request's cap"
+        );
+    }
+}
+
 #[test]
 fn memory_limit_allocator_child() {
     let Some(mib) = std::env::var("AFT_TEST_ALLOCATE_MIB")
@@ -20,7 +124,6 @@ fn memory_limit_allocator_child() {
 fn allocate_past_cap(pty: bool, foreground: bool, aggregate: bool, require_kernel: bool) {
     let temp = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
-    registry.set_memory_limit(Some(64));
     let executable = std::env::current_exe().unwrap();
     #[cfg(unix)]
     let command = format!("'{}' --exact {ALLOCATOR} --nocapture", executable.display());
@@ -65,6 +168,7 @@ fn allocate_past_cap(pty: bool, foreground: bool, aggregate: bool, require_kerne
                 temp.path().into(),
                 env,
                 timeout,
+                Some(64),
                 temp.path().into(),
                 4,
                 true,
@@ -85,6 +189,7 @@ fn allocate_past_cap(pty: bool, foreground: bool, aggregate: bool, require_kerne
                 temp.path().into(),
                 env,
                 timeout,
+                Some(64),
                 temp.path().into(),
                 if foreground {
                     super::super::TaskSlot::Foreground
@@ -205,7 +310,6 @@ fn memory_limit_report_is_not_a_timeout() {
 fn memory_limit_quick_piped_success_keeps_exit_zero() {
     let temp = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
-    registry.set_memory_limit(Some(512));
     registry
         .inner
         .watchdog_started
@@ -223,16 +327,23 @@ fn memory_limit_quick_piped_success_keeps_exit_zero() {
         super::super::BashShell::Powershell,
         PathBuf::from("pwsh.exe"),
     );
+    #[cfg(unix)]
+    let command = "exit 0";
+    // An explicit exit in Invoke-Expression ends the wrapper before it records
+    // the exit code. Use a normal zero-return command to isolate job accounting.
+    #[cfg(windows)]
+    let command = "[Console]::Write('ok')";
     let id = registry
         .spawn_with_shell(
             SpawnPlan::Unsandboxed,
-            "exit 0",
+            command,
             shell,
             shell_path,
             "quick-success".into(),
             temp.path().into(),
             env,
             super::super::HardKill::After(Duration::from_secs(5)),
+            Some(512),
             temp.path().into(),
             4,
             true,
@@ -268,7 +379,6 @@ fn memory_limit_quick_piped_success_keeps_exit_zero() {
 fn memory_limit_fast_successful_pty_keeps_exit_zero() {
     let temp = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
-    registry.set_memory_limit(Some(64));
     // Observe the completed child before the first memory scan, without a timer race.
     registry
         .inner
@@ -284,6 +394,7 @@ fn memory_limit_fast_successful_pty_keeps_exit_zero() {
             temp.path().into(),
             HashMap::new(),
             super::super::HardKill::After(Duration::from_secs(5)),
+            Some(64),
             temp.path().into(),
             4,
             true,
