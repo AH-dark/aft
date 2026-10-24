@@ -1954,7 +1954,10 @@ mod tests {
     #[test]
     fn literal_absolute_directory_change_ends_the_unknown_state() {
         let project = tempfile::tempdir().unwrap();
-        let usr = vec![(vec!["/usr/*".to_string()], vec!["/usr/*".to_string()])];
+        let usr = vec![(
+            vec!["/usr/aft-scan-probe".to_string()],
+            vec!["/usr/aft-scan-probe".to_string()],
+        )];
         assert_eq!(
             external_ask_shapes(
                 "cd \"$TARGET\" && cd /usr && rm aft-scan-probe",
@@ -1978,15 +1981,17 @@ mod tests {
     #[test]
     fn trailing_redirect_after_a_list_belongs_to_the_last_command() {
         let project = tempfile::tempdir().unwrap();
-        let usr = vec![(vec!["/usr/*".to_string()], vec!["/usr/*".to_string()])];
-        for command in [
-            "cd /usr && echo hi > out.txt",
-            "true && echo hi > /usr/aft-scan-probe",
-            "echo hi | cat > /usr/aft-scan-probe",
+        for (command, target) in [
+            ("cd /usr && echo hi > out.txt", "/usr/out.txt"),
+            (
+                "true && echo hi > /usr/aft-scan-probe",
+                "/usr/aft-scan-probe",
+            ),
+            ("echo hi | cat > /usr/aft-scan-probe", "/usr/aft-scan-probe"),
         ] {
             assert_eq!(
                 external_ask_shapes(command, project.path()),
-                usr,
+                vec![(vec![target.to_string()], vec![target.to_string()])],
                 "{command}"
             );
         }
