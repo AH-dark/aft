@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -68,6 +69,19 @@ describe("cache/config regressions", () => {
   test("Windows ARM64 resolves its published platform package key", () => {
     expect(platformKey("win32", "arm64")).toBe("win32-arm64");
     expect(platformKey("linux", "mips")).toBeNull();
+  });
+
+  test("dangling config links are refused without replacing the link", () => {
+    fixture((root) => {
+      const target = join(root, "missing", "target.json");
+      const alias = join(root, "config.json");
+      symlinkSync(target, alias);
+      const linkTarget = readlinkSync(alias);
+      expect(() => writeJsoncFile(alias, { updated: true }, "json")).toThrow(/symlink target/);
+      expect(lstatSync(alias).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(alias)).toBe(linkTarget);
+      expect(readdirSync(root)).toEqual(["config.json"]);
+    });
   });
 
   test("malformed encoded cache names remain reportable and clearable", async () => {

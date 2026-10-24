@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   realpathSync,
@@ -69,6 +70,11 @@ export function writeJsoncFile(
   _format: JsoncFormat = "json",
 ): void {
   mkdirSync(dirname(path), { recursive: true });
+  // existsSync follows links, so a dangling link must not be treated as a new file.
+  const link = lstatSync(path, { throwIfNoEntry: false });
+  if (link?.isSymbolicLink() && !existsSync(path)) {
+    throw new Error(`Cannot write ${path}: config symlink target is missing or unreadable`);
+  }
   const target = existsSync(path) ? realpathSync(path) : path;
   const mode = existsSync(target) ? statSync(target).mode & 0o777 : undefined;
   const temporary = `${target}.tmp-${randomUUID()}`;
