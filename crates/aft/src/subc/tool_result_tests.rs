@@ -719,6 +719,389 @@ async fn tool_result_ledger_records_before_projection_and_replays_by_route() {
     output.await.unwrap().unwrap();
 }
 
+async fn assert_keyed_projection_replay_is_exact(result: ToolCallResult, trust: BindTrust) {
+    use crate::db::call_ledger as ledger;
+    let (dir, root) = test_support::test_root("exact-projection-replay");
+    let ctx = test_support::test_ctx();
+    let path = dir.path().join("aft.db");
+    ctx.set_db(Arc::new(StdMutex::new(crate::db::open(&path).unwrap())));
+    let executor = Arc::new(Executor::new());
+    executor.register_actor(root.clone(), ctx.clone());
+    let identity = |enabled| {
+        let mut identity = test_support::route_identity(&root, "exact-projection");
+        let data = Arc::get_mut(&mut identity.0).unwrap();
+        data.role = tool_provider::RouteRole::ToolProviderV1;
+        data.trust = trust;
+        data.tool_result_body = enabled;
+        identity
+    };
+    let key = tool_provider::LedgerEdge::key(&identity(true), "exact-result");
+    let (edge, mut ready) = tool_provider::LedgerEdge::new();
+    let metrics = Arc::new(DispatchPathMetrics::new());
+    let (actual, receiver) = mpsc::channel(10);
+    let (pong, pong_receiver) = mpsc::channel(1);
+    let (mut daemon, module) = tokio::io::duplex(64 * 1024);
+    let output = spawn_writer_task(module, receiver, pong_receiver, metrics.clone());
+    let (writer, proxy) = edge.proxy(actual, executor.clone(), metrics.clone());
+    let decode = |corr| {
+        DecodedFrame {
+        parsed_body: Default::default(), confinement: None, launch_restore: None, codemode_policies: None,
+        frame: Frame::build(FrameType::Request, control_flags(), 42, 1, corr,
+            serde_json::to_vec(&json!({"name":"read","arguments":{"path":"fixture.png"},"call_key":"exact-result"})).unwrap()).unwrap(),
+        phase_trace: PhaseTrace::new(Instant::now()),
+    }
+    };
+    let routes = HashMap::from([(route_key(42, 1), identity(true))]);
+    assert!(edge
+        .defer(decode(7), &routes, &executor, &writer, &metrics)
+        .is_ok());
+    tokio::time::timeout(Duration::from_secs(5), ready.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(edge
+        .defer(decode(10), &routes, &executor, &writer, &metrics)
+        .is_ok());
+    executor
+        .submit_async(
+            root.clone(),
+            Lane::Mutating,
+            "replay-admission-barrier".into(),
+            Box::new(|_| Response::success("replay-admission-barrier", json!({}))),
+        )
+        .await
+        .unwrap();
+    let mut legacy_data = result.response.data.clone();
+    if let Some(parts) = legacy_data
+        .get_mut("attachments")
+        .and_then(Value::as_array_mut)
+    {
+        for part in parts {
+            part.as_object_mut().unwrap().remove("alt");
+        }
+    }
+    let legacy = wire::tests::legacy_tool_response_body(
+        &ToolCallResult {
+            text: result.text.clone(),
+            response: Response {
+                id: result.response.id.clone(),
+                success: result.response.success,
+                data: legacy_data,
+            },
+        },
+        trust != BindTrust::Untrusted,
+    );
+    let outgoing = wire::build_tool_response_frame(
+        PROTOCOL_VERSION,
+        route_key(42, 1),
+        7,
+        control_flags(),
+        &result,
+        opted_in(trust),
+    )
+    .unwrap();
+    send_reliable_writer_frame(&writer, &metrics, outgoing, "exact-replay test")
+        .await
+        .unwrap();
+    let receive = async |daemon: &mut tokio::io::DuplexStream| {
+        tokio::time::timeout(Duration::from_secs(5), read_frame(daemon))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    };
+    let first = receive(&mut daemon).await;
+    let attached = receive(&mut daemon).await;
+    assert_eq!(
+        std::collections::BTreeSet::from([first.header.corr, attached.header.corr]),
+        std::collections::BTreeSet::from([7, 10])
+    );
+    let decoded: ToolResult = serde_json::from_slice(&first.body).unwrap();
+    validate(&decoded).unwrap();
+    let first_value: Value = serde_json::from_slice(&first.body).unwrap();
+    assert_eq!(
+        first_value.get("structuredContent").is_some(),
+        trust != BindTrust::Untrusted
+    );
+    if result.response.success {
+        assert_eq!(
+            first_value["content"][1]["data"],
+            result.response.data["attachments"][0]["data"]
+        );
+    } else {
+        assert_eq!(first_value["errorCode"], "path_outside_root");
+    }
+    assert_eq!(
+        first.body, attached.body,
+        "attached duplicate must match the first {trust:?} reply"
+    );
+    let conn = crate::db::open(&path).unwrap();
+    assert_eq!(
+        ledger::get(&conn, &key)
+            .unwrap()
+            .unwrap()
+            .frame
+            .unwrap()
+            .body,
+        legacy
+    );
+    let retained = ledger::get_for_replay(&conn, &key)
+        .unwrap()
+        .unwrap()
+        .tool_result_source
+        .unwrap();
+    assert!(retained.len() < ledger::MAX_TOOL_RESULT_SOURCE_BYTES);
+    let rendered = retained_result::render(
+        &retained,
+        &legacy,
+        trust != BindTrust::Untrusted,
+        result_body::MAX_RESULT_BYTES,
+    )
+    .unwrap();
+    assert_eq!(rendered.bytes, first.body);
+    // A new ledger edge and database connection rule out an in-memory replay cache.
+    let (restarted, _ready) = tool_provider::LedgerEdge::new();
+    ctx.set_db(Arc::new(StdMutex::new(crate::db::open(&path).unwrap())));
+    for (enabled, corr) in [(true, 11), (false, 12)] {
+        assert!(restarted
+            .defer(
+                decode(corr),
+                &HashMap::from([(route_key(42, 1), identity(enabled))]),
+                &executor,
+                &writer,
+                &metrics
+            )
+            .is_ok());
+        let replay = receive(&mut daemon).await;
+        assert_eq!(replay.header.corr, corr);
+        assert_eq!(
+            replay.body,
+            if enabled {
+                first.body.clone()
+            } else {
+                legacy.clone()
+            },
+            "settled replay must use the receiving route's format"
+        );
+    }
+    drop(writer);
+    proxy.await.unwrap();
+    drop(pong);
+    output.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn tool_result_keyed_image_replay_is_exact_on_untrusted_and_trusted_routes() {
+    use base64::Engine;
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 7))
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
+    for trust in [BindTrust::Untrusted, BindTrust::FirstParty] {
+        assert_keyed_projection_replay_is_exact(ToolCallResult { text: "read image".into(), response: Response::success("exact-id", json!({"attachments":[{"kind":"image","mime":"image/png","data":data,"width":8,"height":7,"alt":"native image description, not the call path"}]})) }, trust).await;
+    }
+}
+
+#[tokio::test]
+async fn tool_result_keyed_error_replay_is_exact_on_untrusted_and_trusted_routes() {
+    for trust in [BindTrust::Untrusted, BindTrust::FirstParty] {
+        assert_keyed_projection_replay_is_exact(
+            ToolCallResult {
+                text: "outside root".into(),
+                response: Response::error("exact-id", "path_outside_root", "outside root"),
+            },
+            trust,
+        )
+        .await;
+    }
+}
+
+#[test]
+fn tool_result_retention_is_bounded_trust_independent_and_keeps_legacy_view() {
+    use base64::Engine;
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 7))
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    let image = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
+    let result = ToolCallResult {
+        text: "a string containing ,\"structuredContent\": is not a field".into(),
+        response: Response::error_with_data(
+            "id",
+            "path_outside_root",
+            "outside",
+            json!({"attachments":[{"kind":"image","mime":"image/png","data":image,"width":8,"height":7,"alt":"native image"}],"score":1.2345678901234567,"structuredContent":{"private":"not model input"}}),
+        ),
+    };
+    let mut outgoing = wire::build_tool_response_frame(
+        PROTOCOL_VERSION,
+        route_key(1, 1),
+        1,
+        control_flags(),
+        &result,
+        opted_in(BindTrust::Untrusted),
+    )
+    .unwrap();
+    let legacy = outgoing.frame.body.clone();
+    let source = outgoing
+        .tool_result_source_for_retention()
+        .unwrap()
+        .unwrap();
+    assert_eq!(outgoing.frame.body, legacy);
+    assert!(source.len() < crate::db::call_ledger::MAX_TOOL_RESULT_SOURCE_BYTES);
+    assert_eq!(
+        source
+            .windows(image.len())
+            .filter(|bytes| *bytes == image.as_bytes())
+            .count(),
+        1,
+        "the source retains only one copy of each image payload"
+    );
+    let first = project_frame(outgoing);
+    for trust in [BindTrust::Untrusted, BindTrust::FirstParty] {
+        let frame = Frame::build(
+            FrameType::Response,
+            control_flags(),
+            1,
+            1,
+            1,
+            legacy.clone(),
+        )
+        .unwrap();
+        let replay = project_frame(wire::WriterFrame::retained_tool_response_with_source(
+            frame,
+            opted_in(trust),
+            None,
+            Some(source.clone()),
+        ));
+        let expected = project_frame(
+            wire::build_tool_response_frame(
+                PROTOCOL_VERSION,
+                route_key(1, 1),
+                1,
+                control_flags(),
+                &result,
+                opted_in(trust),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            replay.body, expected.body,
+            "the original untrusted view must not discard data needed by a trusted replay"
+        );
+        if trust == BindTrust::Untrusted {
+            assert_eq!(replay.body, first.body);
+        }
+    }
+    let frame = Frame::build(
+        FrameType::Response,
+        control_flags(),
+        1,
+        1,
+        1,
+        legacy.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        project_frame(wire::WriterFrame::retained_tool_response_with_source(
+            frame,
+            wire::ToolResponsePolicy {
+                trust: BindTrust::FirstParty,
+                tool_result_body: false
+            },
+            None,
+            Some(vec![0xff])
+        ))
+        .body,
+        legacy
+    );
+
+    let oversized = ToolCallResult {
+        text: "large hidden result".into(),
+        response: Response::success(
+            "id",
+            json!({"opaque":"x".repeat(result_body::MAX_RESULT_BYTES)}),
+        ),
+    };
+    let mut outgoing = wire::build_tool_response_frame(
+        PROTOCOL_VERSION,
+        route_key(1, 1),
+        1,
+        control_flags(),
+        &oversized,
+        opted_in(BindTrust::Untrusted),
+    )
+    .unwrap();
+    let legacy = outgoing.frame.body.clone();
+    let source = outgoing
+        .tool_result_source_for_retention()
+        .unwrap()
+        .unwrap();
+    assert!(
+        source.len() < 4096,
+        "an unretentable result becomes one bounded named refusal"
+    );
+    let first = project_frame(outgoing);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&first.body).unwrap()["errorCode"],
+        "response_too_large"
+    );
+    let frame = Frame::build(FrameType::Response, control_flags(), 1, 1, 1, legacy).unwrap();
+    let replay = project_frame(wire::WriterFrame::retained_tool_response_with_source(
+        frame,
+        opted_in(BindTrust::Untrusted),
+        None,
+        Some(source),
+    ));
+    assert_eq!(first.body, replay.body);
+
+    let view_limited = ToolCallResult {
+        text: "t".repeat(1024 * 1024),
+        response: Response::success("id", json!({"opaque":"x".repeat(2 * 1024 * 1024)})),
+    };
+    let mut outgoing = wire::build_tool_response_frame(
+        PROTOCOL_VERSION,
+        route_key(1, 1),
+        1,
+        control_flags(),
+        &view_limited,
+        opted_in(BindTrust::Untrusted),
+    )
+    .unwrap();
+    let legacy = outgoing.frame.body.clone();
+    let source = outgoing
+        .tool_result_source_for_retention()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&project_frame(outgoing).body).unwrap()["isError"],
+        false
+    );
+    let frame = Frame::build(FrameType::Response, control_flags(), 1, 1, 1, legacy).unwrap();
+    let replay = project_frame(wire::WriterFrame::retained_tool_response_with_source(
+        frame,
+        opted_in(BindTrust::FirstParty),
+        None,
+        Some(source),
+    ));
+    let expected = project_frame(
+        wire::build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(1, 1),
+            1,
+            control_flags(),
+            &view_limited,
+            opted_in(BindTrust::FirstParty),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        replay.body, expected.body,
+        "each receiving view still applies the same serialized reply cap"
+    );
+}
+
 thread_local! {
     static REPLIES: Cell<usize> = const { Cell::new(0) };
     static CODES: std::cell::RefCell<std::collections::BTreeSet<String>> = const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };

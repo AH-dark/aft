@@ -1849,6 +1849,7 @@ impl LedgerEdge {
         let metrics = metrics.clone();
         let root = identity.root.clone();
         let request_id = format!("ledger-{}-{}", route.channel, decoded.frame.header.corr);
+        let include_tool_result_body = identity.tool_result_body;
         let response_key = key.clone();
         let cancel = PersistentCancelSignal::new();
         let terminal_claim = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1902,7 +1903,7 @@ impl LedgerEdge {
                     }
                     ledger::reduce_expired(&conn, &key, now)
                         .and_then(|_| {
-                            ledger::admit(
+                            ledger::admit_with_tool_result_source(
                                 &conn,
                                 &key,
                                 &digest,
@@ -1912,6 +1913,7 @@ impl LedgerEdge {
                                 } else {
                                     State::DispatchStarted
                                 },
+                                include_tool_result_body,
                             )
                         })
                         .map_err(|error| {
@@ -2004,9 +2006,15 @@ impl LedgerEdge {
                             "ledger-attach".into(),
                             Box::new(move |ctx| {
                                 let row = ctx.db().and_then(|db| {
-                                    db.lock()
+                                    db.lock().ok().and_then(|conn| {
+                                        if include_tool_result_body {
+                                            ledger::get_for_replay(&conn, &key)
+                                        } else {
+                                            ledger::get(&conn, &key)
+                                        }
                                         .ok()
-                                        .and_then(|conn| ledger::get(&conn, &key).ok().flatten())
+                                        .flatten()
+                                    })
                                 });
                                 let _ = row_tx.send(row);
                                 Response::success("ledger-attach", json!({}))
@@ -2029,10 +2037,11 @@ impl LedgerEdge {
                                     let _ = send_reliable_writer_frame(
                                         &writer,
                                         &metrics,
-                                        WriterFrame::retained_tool_response(
+                                        WriterFrame::retained_tool_response_with_source(
                                             frame,
                                             identity.reply_policy(),
                                             call.arguments.get("path").and_then(Value::as_str),
+                                            row.tool_result_source,
                                         ),
                                         "attached ledger result",
                                     )
@@ -2076,10 +2085,11 @@ impl LedgerEdge {
                         let _ = send_reliable_writer_frame(
                             &writer,
                             &metrics,
-                            WriterFrame::retained_tool_response(
+                            WriterFrame::retained_tool_response_with_source(
                                 frame,
                                 identity.reply_policy(),
                                 call.arguments.get("path").and_then(Value::as_str),
+                                row.tool_result_source,
                             ),
                             "ledger replay",
                         )
@@ -2658,6 +2668,11 @@ impl LedgerEdge {
                     continue;
                 }
                 let actual = actual.clone();
+                let (tool_body_for_job, projection_error) =
+                    match outgoing.tool_result_source_for_retention() {
+                        Ok(body) => (body, None),
+                        Err(error) => (None, Some(error.to_string())),
+                    };
                 let recorded = RecordedFrame {
                     ty: outgoing.header.ty,
                     body: copy_terminal_body(&outgoing.body),
@@ -2668,6 +2683,9 @@ impl LedgerEdge {
                     Lane::Mutating,
                     "ledger-settle".into(),
                     Box::new(move |ctx| {
+                        if let Some(error) = projection_error {
+                            return Response::error("ledger-settle", "database_unavailable", error);
+                        }
                         let Some(db) = ctx.db() else {
                             return Response::error(
                                 "ledger-settle",
@@ -2704,23 +2722,27 @@ impl LedgerEdge {
                         } else {
                             inferred
                         };
-                        match ledger::settle(
+                        match ledger::settle_with_tool_result_source(
                             &conn,
                             &call.key,
                             &record_for_job,
                             &outcome,
                             reason,
                             ledger::now_ms(),
+                            tool_body_for_job.as_deref(),
                         ) {
                             Ok(true) => {}
                             Ok(false)
-                                if ledger::get(&conn, &call.key)
+                                if ledger::get_for_replay(&conn, &call.key)
                                     .ok()
                                     .flatten()
-                                    .and_then(|row| row.frame)
-                                    .is_some_and(|frame| {
-                                        frame.ty == record_for_job.ty
-                                            && frame.body == record_for_job.body
+                                    .is_some_and(|row| {
+                                        row.tool_result_source.as_deref()
+                                            == tool_body_for_job.as_deref()
+                                            && row.frame.is_some_and(|frame| {
+                                                frame.ty == record_for_job.ty
+                                                    && frame.body == record_for_job.body
+                                            })
                                     }) => {}
                             result => {
                                 return Response::error(

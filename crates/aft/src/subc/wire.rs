@@ -135,6 +135,7 @@ pub(super) struct WriterFrame {
     body_storage: WriterFrameBody,
     pub(super) tool_response_trace: Option<ToolResponseWriteTrace>,
     result_projection: Option<(ToolResponsePolicy, usize, Option<ToolCallResult>)>,
+    prepared_projection: Option<Arc<Vec<u8>>>,
 }
 
 impl From<Frame> for WriterFrame {
@@ -158,6 +159,7 @@ impl WriterFrame {
             body_storage: WriterFrameBody::Owned,
             tool_response_trace: None,
             result_projection: None,
+            prepared_projection: None,
         }
     }
 
@@ -168,6 +170,7 @@ impl WriterFrame {
             body_storage: WriterFrameBody::SharedPush(body),
             tool_response_trace: None,
             result_projection: None,
+            prepared_projection: None,
         }
     }
 
@@ -223,14 +226,151 @@ impl WriterFrame {
         outgoing
     }
 
+    pub(super) fn retained_tool_response_with_source(
+        frame: Frame,
+        policy: ToolResponsePolicy,
+        image_alt: Option<&str>,
+        source: Option<Vec<u8>>,
+    ) -> Self {
+        let Some(source) =
+            source.filter(|_| policy.tool_result_body && frame.header.ty == FrameType::Response)
+        else {
+            return Self::retained_tool_response(frame, policy, image_alt);
+        };
+        let rendered = super::retained_result::render(
+            &source,
+            &frame.body,
+            !matches!(policy.trust, BindTrust::Untrusted),
+            super::result_body::MAX_RESULT_BYTES,
+        );
+        let refusal = match rendered {
+            Ok(rendered) if rendered.size < super::result_body::MAX_RESULT_BYTES => {
+                let valid = serde_json::from_slice::<
+                    cortexkit_role_tool_provider::result::ToolResult,
+                >(&rendered.bytes)
+                .ok()
+                .is_some_and(|result| {
+                    cortexkit_role_tool_provider::result::validate(&result).is_ok()
+                });
+                if valid {
+                    let mut outgoing = Self::plain(frame);
+                    outgoing.prepared_projection = Some(Arc::new(rendered.bytes));
+                    return outgoing;
+                }
+                Response::error(
+                    "retained-tool-reply",
+                    super::result_body::FALLBACK_ERROR_CODE,
+                    "retained tool reply could not be decoded",
+                )
+            }
+            Ok(rendered) => super::result_body::too_large(
+                "response_too_large",
+                rendered.size,
+                "narrow the call with paths, pattern, or offset/limit",
+            ),
+            Err(_) => Response::error(
+                "retained-tool-reply",
+                super::result_body::FALLBACK_ERROR_CODE,
+                "retained tool reply could not be decoded",
+            ),
+        };
+        let result = ToolCallResult {
+            text: refusal.data["message"].as_str().unwrap().into(),
+            response: refusal,
+        };
+        build_tool_response_frame(
+            frame.header.ver,
+            super::route_key(frame.header.channel, frame.header.epoch),
+            frame.header.corr,
+            frame.header.flags,
+            &result,
+            policy,
+        )
+        .expect("bounded retained-result refusal must serialize")
+    }
+
+    /// Retain a bounded trust-independent source, not the first consumer's view.
+    /// Rendered text is inherited from the unchanged legacy frame where possible;
+    /// each image payload is stored once, with raw JSON fields preserved exactly.
+    pub(super) fn tool_result_source_for_retention(
+        &mut self,
+    ) -> Result<Option<Vec<u8>>, SubcError> {
+        let Some((mut projected, result, policy, body_limit)) = self.take_projected_result()?
+        else {
+            return Ok(None);
+        };
+        let limit = crate::db::call_ledger::MAX_TOOL_RESULT_SOURCE_BYTES;
+        let mut source = super::retained_result::encode(&result, &self.frame.body, limit)
+            .map_err(SubcError::Json)?;
+        if source.size >= limit {
+            let response = super::result_body::too_large(
+                "response_too_large",
+                source.size,
+                "narrow the call with paths, pattern, or offset/limit",
+            );
+            let fallback = ToolCallResult {
+                text: response.data["message"].as_str().unwrap().into(),
+                response,
+            };
+            let header = &self.frame.header;
+            let (frame, fallback) = build_result_body_frame(
+                header.ver,
+                super::route_key(header.channel, header.epoch),
+                header.corr,
+                header.flags,
+                fallback,
+                policy.trust,
+                body_limit,
+            )?;
+            projected = frame;
+            source = super::retained_result::encode(&fallback, &self.frame.body, limit)
+                .map_err(SubcError::Json)?;
+        }
+        debug_assert!(source.size < limit);
+        self.prepared_projection = Some(Arc::new(projected.body));
+        Ok(Some(source.bytes))
+    }
+
     /// The ledger proxy forwards legacy response bytes unchanged. The final
     /// transport writer projects the reply after the ledger has persisted those bytes.
     pub(super) fn project_tool_result(&mut self) -> Result<(), SubcError> {
-        let Some((policy, limit, source)) = self.result_projection.take() else {
+        self.prepare_tool_result()?;
+        let Some(body) = self.prepared_projection.take() else {
             return Ok(());
         };
         if self.frame.header.ty != FrameType::Response {
             return Ok(());
+        }
+        let body = Arc::try_unwrap(body).unwrap_or_else(|body| body.as_ref().clone());
+        let header = &self.frame.header;
+        self.frame = Frame::build_with_version(
+            header.ver,
+            header.ty,
+            header.flags,
+            header.channel,
+            header.epoch,
+            header.corr,
+            body,
+        )
+        .map_err(SubcError::FrameBuild)?;
+        Ok(())
+    }
+
+    fn prepare_tool_result(&mut self) -> Result<(), SubcError> {
+        if let Some((projected, _, _, _)) = self.take_projected_result()? {
+            self.prepared_projection = Some(Arc::new(projected.body));
+        }
+        Ok(())
+    }
+
+    fn take_projected_result(
+        &mut self,
+    ) -> Result<Option<(Frame, ToolCallResult, ToolResponsePolicy, usize)>, SubcError> {
+        let Some((policy, limit, source)) = self.result_projection.take() else {
+            return Ok(None);
+        };
+        if self.frame.header.ty != FrameType::Response {
+            return Ok(None);
         }
         let mut result = match source {
             Some(result) => result,
@@ -248,16 +388,16 @@ impl WriterFrame {
             };
         }
         let header = &self.frame.header;
-        self.frame = build_result_body_frame(
+        let projected = build_result_body_frame(
             header.ver,
             super::route_key(header.channel, header.epoch),
             header.corr,
             header.flags,
-            &result,
+            result,
             policy.trust,
             limit,
         )?;
-        Ok(())
+        Ok(Some((projected.0, projected.1, policy, limit)))
     }
 
     pub(super) fn frame(&self) -> &Frame {
@@ -1081,13 +1221,13 @@ fn build_result_body_frame(
     route: RouteChannel,
     corr: u64,
     flags: Flags,
-    result: &ToolCallResult,
+    mut result: ToolCallResult,
     trust: BindTrust,
     max_body_len: usize,
-) -> Result<Frame, SubcError> {
+) -> Result<(Frame, ToolCallResult), SubcError> {
     let include_structured = !matches!(trust, BindTrust::Untrusted);
     let mut body = serialize_tool_response_body_with_text(
-        result,
+        &result,
         include_structured,
         &result.text,
         false,
@@ -1101,14 +1241,14 @@ fn build_result_body_frame(
             body.len(),
             "narrow the call with paths, pattern, or offset/limit",
         );
-        let fallback = ToolCallResult {
+        result = ToolCallResult {
             text: response.data["message"].as_str().unwrap().into(),
             response,
         };
         body = serialize_tool_response_body_with_text(
-            &fallback,
+            &result,
             include_structured,
-            &fallback.text,
+            &result.text,
             false,
             true,
         )
@@ -1123,6 +1263,7 @@ fn build_result_body_frame(
         corr,
         body,
     )
+    .map(|frame| (frame, result))
     .map_err(SubcError::FrameBuild)
 }
 

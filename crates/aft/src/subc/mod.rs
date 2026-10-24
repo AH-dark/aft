@@ -225,6 +225,7 @@ mod push;
 mod readiness;
 mod remote_policy;
 pub(crate) mod result_body;
+mod retained_result;
 mod run_scope;
 mod scope_describe;
 #[cfg(test)]
@@ -1286,11 +1287,16 @@ pub(crate) fn recovered_bash_frame(
     snapshot: crate::bash_background::registry::BgTaskSnapshot,
     key: &crate::db::call_ledger::Key,
     project_root: &Path,
-) -> Option<(crate::db::call_ledger::RecordedFrame, String)> {
+) -> Option<(
+    crate::db::call_ledger::RecordedFrame,
+    String,
+    Option<Vec<u8>>,
+)> {
     if snapshot.info.status == crate::bash_background::BgTaskStatus::FateUnknown {
         return Some((
             crate::db::call_ledger::not_retained(key, "unknown"),
             "unknown".into(),
+            None,
         ));
     }
     let now = Instant::now();
@@ -1327,12 +1333,39 @@ pub(crate) fn recovered_bash_frame(
         BindTrust::Untrusted,
     )
     .ok()?;
+    // Recovery no longer has the vanished consumer's format declaration. Keep
+    // its legacy bytes, plus a bounded complete result for a future opt-in replay.
+    let mut projected = build_tool_response_frame(
+        PROTOCOL_VERSION,
+        route_key(1, 1),
+        1,
+        control_flags(),
+        &result,
+        wire::ToolResponsePolicy {
+            trust: BindTrust::FirstParty,
+            tool_result_body: true,
+        },
+    )
+    .ok()?;
+    projected.frame = Frame::build_with_version(
+        frame.header.ver,
+        frame.header.ty,
+        frame.header.flags,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+        frame.frame.body.clone(),
+    )
+    .ok()?;
+    let tool_result_body = projected.tool_result_source_for_retention().ok()?;
+    drop(projected);
     Some((
         crate::db::call_ledger::RecordedFrame {
             ty: frame.header.ty,
             body: frame.frame.body,
         },
         outcome,
+        tool_result_body,
     ))
 }
 

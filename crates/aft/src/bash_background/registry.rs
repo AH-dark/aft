@@ -3146,7 +3146,7 @@ impl BgTaskRegistry {
             carrier: key.requester.clone(),
             call_key: key.key.clone(),
         };
-        if let Some((frame, outcome)) = crate::subc::recovered_bash_frame(
+        if let Some((frame, outcome, tool_result_body)) = crate::subc::recovered_bash_frame(
             snapshot,
             &ledger_key,
             metadata
@@ -3160,13 +3160,14 @@ impl BgTaskRegistry {
                 frame.body.len()
             );
             if let Ok(conn) = pool.lock() {
-                if let Err(error) = crate::db::call_ledger::observe_task(
+                if let Err(error) = crate::db::call_ledger::observe_task_with_tool_result_source(
                     &conn,
                     &key.requester,
                     &key.key,
                     &metadata.task_id,
                     Some(&frame),
                     &outcome,
+                    tool_result_body.as_deref(),
                 ) {
                     crate::slog_warn!("call ledger recovered settlement failed: {error}");
                 }
@@ -18405,8 +18406,17 @@ mod tests {
                 carrier: "reserved:carrier".into(),
                 call_key: "terminal".into(),
             };
-            let (frame, _) = crate::subc::recovered_bash_frame(snapshot, &key, dir.path())
-                .expect("terminal recovered frame");
+            let (frame, _, retained_body) =
+                crate::subc::recovered_bash_frame(snapshot, &key, dir.path())
+                    .expect("terminal recovered frame");
+            let retained = retained_body
+                .as_deref()
+                .expect("recovered native result is retained");
+            assert!(retained.len() < crate::db::call_ledger::MAX_TOOL_RESULT_SOURCE_BYTES);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(retained).unwrap()["version"],
+                1
+            );
             let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
             assert_eq!(body["content"][0]["text"], live_text);
             assert!(

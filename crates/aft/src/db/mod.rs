@@ -33,10 +33,10 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 18;
+pub const CURRENT_SCHEMA_VERSION: u32 = 19;
 
 const MIGRATION_VERSIONS: &[u32] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
 ];
 
 // Performance-only indexes do not change the table format or reader floor.
@@ -988,6 +988,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         16 => conn.execute_batch(access_grants::MIGRATION),
         17 => conn.execute_batch(access_asks::MIGRATION),
         18 => conn.execute_batch(access_grants::MODES_MIGRATION),
+        19 => call_ledger::migrate_result_source(conn),
         _ => Ok(()),
     }
 }
@@ -1505,9 +1506,18 @@ mod tests {
         assert!(!sqlite_names(&conn, "index").contains(&"idx_bash_tasks_task_owner".to_string()));
         drop(conn);
 
-        assert!(crate::reader_floor::prepare(dir.path()).is_empty());
+        // Today's startup baseline includes newer table formats; this fixture
+        // intentionally models only the optional index on the historical schema.
+        std::fs::write(
+            crate::reader_floor::floor_path(dir.path()),
+            br#"{"floor_schema":1,"stores":{"aft.db":18}}"#,
+        )
+        .unwrap();
         let floor_before = std::fs::read(crate::reader_floor::floor_path(dir.path())).unwrap();
-        let conn = open(&path).unwrap();
+        // Isolate the optional index at its historical table version; writable
+        // opens now also perform later table-format migrations.
+        let conn = Connection::open(&path).unwrap();
+        ensure_additive_indexes(&conn).unwrap();
         assert_eq!(schema_version(&conn), 18);
         assert_eq!(
             crate::reader_floor::read(dir.path())
@@ -1544,6 +1554,42 @@ mod tests {
                 .unwrap();
             assert!(statement.query([]).unwrap().next().unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn result_source_migration_preserves_legacy_frames_and_sets_reader_floor() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = Connection::open(&path).unwrap();
+        for version in 1..=18 {
+            apply_migration_statements(&conn, version).unwrap();
+        }
+        conn.execute("INSERT INTO schema_version(version) VALUES (18)", [])
+            .unwrap();
+        let legacy = br#"{"content":[{"type":"text","text":"legacy"}],"isError":true}"#;
+        conn.execute("INSERT INTO call_ledger(carrier,call_key,digest,state,event_id,frame_type,frame_body) VALUES ('carrier','key','digest','Settled','event','Response',?1)", [legacy.as_slice()]).unwrap();
+        drop(conn);
+        assert!(crate::reader_floor::prepare(dir.path()).is_empty());
+        let conn = open(&path).unwrap();
+        assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
+        let row = call_ledger::get_for_replay(
+            &conn,
+            &call_ledger::Key {
+                carrier: "carrier".into(),
+                call_key: "key".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.frame.unwrap().body, legacy);
+        assert!(row.tool_result_source.is_none());
+        assert_eq!(
+            crate::reader_floor::read(dir.path())
+                .unwrap()
+                .unwrap()
+                .get(crate::persisted_format::PersistedStore::AftDb),
+            Some(u64::from(CURRENT_SCHEMA_VERSION))
+        );
     }
 
     #[test]
