@@ -311,7 +311,7 @@ describe("runAutoInstall", () => {
     // npm must be resolved beyond a GUI-stripped PATH, then converted to a
     // platform-safe invocation (npm.cmd requires cmd.exe on Windows).
     expect(source).toMatch(/resolveNpm\(\)/);
-    expect(source).toContain("lspNpmInstallInvocation(npm, target, before)");
+    expect(source).toContain("await lspNpmInstallInvocation(npm, target, before)");
     expect(source).toMatch(/spawn\(invocation\.command, invocation\.args,/);
     expect(source).toContain("npmSpawnEnv(npm)");
     expect(source).toContain("terminateNpmProcessTree(child, invocation)");

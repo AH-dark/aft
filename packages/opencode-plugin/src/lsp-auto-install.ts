@@ -290,7 +290,7 @@ export function ensureInstallAnchor(cwd: string): void {
   }
 }
 
-function runInstall(
+async function runInstall(
   spec: NpmServerSpec,
   version: string,
   cwd: string,
@@ -298,36 +298,37 @@ function runInstall(
   before: string | undefined,
   signal?: AbortSignal,
 ): Promise<boolean> {
+  const target = `${spec.npm}@${version}`;
+  log(`[lsp] installing ${target} to ${cwd}`);
+
+  if (signal?.aborted) {
+    warn(`[lsp] install ${target} aborted before spawn`);
+    return false;
+  }
+
+  // Resolve npm beyond PATH. Windows npm is `npm.cmd` (Node's spawn does not
+  // auto-resolve `.cmd`), and GUI/Desktop launches often have a stripped PATH
+  // with no version-manager bin dir, so a bare `npm` spawn fails with ENOENT.
+  // resolveNpm() handles discovery, npmSpawnEnv() makes npm's node sibling
+  // reachable, and the shared policy safely routes Windows shims through cmd.exe
+  // without enabling shell parsing on other platforms.
+  const npm = resolveNpm();
+  if (!npm) {
+    warn(`[lsp] npm not found on PATH or known locations; cannot install ${target}`);
+    return false;
+  }
+
+  const invocation = await lspNpmInstallInvocation(npm, target, before);
+  if (signal?.aborted) {
+    warn(`[lsp] install ${target} aborted during npm capability probe`);
+    return false;
+  }
+  if (!invocation) {
+    warn(`[lsp] npm cannot enforce the publication cutoff; cannot install ${target}`);
+    return false;
+  }
+  ensureInstallAnchor(cwd);
   return new Promise((resolve) => {
-    const target = `${spec.npm}@${version}`;
-    log(`[lsp] installing ${target} to ${cwd}`);
-
-    if (signal?.aborted) {
-      warn(`[lsp] install ${target} aborted before spawn`);
-      resolve(false);
-      return;
-    }
-
-    // Resolve npm beyond PATH. Windows npm is `npm.cmd` (Node's spawn does not
-    // auto-resolve `.cmd`), and GUI/Desktop launches often have a stripped PATH
-    // with no version-manager bin dir, so a bare `npm` spawn fails with ENOENT.
-    // resolveNpm() handles discovery, npmSpawnEnv() makes npm's node sibling
-    // reachable, and the shared policy safely routes Windows shims through cmd.exe
-    // without enabling shell parsing on other platforms.
-    const npm = resolveNpm();
-    if (!npm) {
-      warn(`[lsp] npm not found on PATH or known locations; cannot install ${target}`);
-      resolve(false);
-      return;
-    }
-
-    const invocation = lspNpmInstallInvocation(npm, target, before);
-    if (!invocation) {
-      warn(`[lsp] npm cannot enforce the publication cutoff; cannot install ${target}`);
-      resolve(false);
-      return;
-    }
-    ensureInstallAnchor(cwd);
     const child = spawn(invocation.command, invocation.args, {
       stdio: ["ignore", "pipe", "pipe"],
       cwd,
