@@ -292,7 +292,10 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let missing_on_disk = presence.dropped;
     let presence_budget_exhausted = presence.budget_exhausted;
     let files = presence.present;
-    let total = files.len();
+    let admitted_count = files.len();
+    // The public count includes discovered candidates beyond the returned page.
+    // Missing or denied candidates checked in this window are already excluded.
+    let total = admitted_count.saturating_add(presence.unexamined);
     let all_candidates_checked = presence.unexamined == 0;
     let result_truncated = presence.unexamined > 0 || presence_budget_exhausted;
 
@@ -307,6 +310,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     });
     if !all_candidates_checked {
         body["total_lower_bound"] = serde_json::json!(total);
+        body["admitted_count"] = serde_json::json!(admitted_count);
         body["candidate_count"] = serde_json::json!(candidate_count);
         body["unexamined_files"] = serde_json::json!(presence.unexamined);
     }
@@ -871,6 +875,58 @@ fn format_directory_label(directory: Option<&Path>) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn glob_bulk_fixture_preserves_examined_lower_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(dir.path()).unwrap();
+        let bulk = project.join("bulk");
+        std::fs::create_dir(&bulk).unwrap();
+        for index in 0..140 {
+            std::fs::write(bulk.join(format!("fixture-{index:03}.txt")), "fixture\n").unwrap();
+        }
+        let mut observed = Vec::new();
+        for indexed in [false, true] {
+            let ctx = AppContext::new(
+                crate::context::default_language_provider_factory(),
+                crate::config::Config {
+                    project_root: Some(project.clone()),
+                    ..Default::default()
+                },
+            );
+            if indexed {
+                *ctx.search_index().write().unwrap() =
+                    Some(crate::search_index::SearchIndex::build(&project));
+            }
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "glob-bulk-lower-bound", "command": "glob", "pattern": "bulk/*.txt"
+            }))
+            .unwrap();
+            let response = handle_glob(&request, &ctx);
+            assert!(response.success, "{response:?}");
+            let body = &response.data;
+            let lower_bound = body["total_lower_bound"]
+                .as_u64()
+                .or_else(|| body["total"].as_u64())
+                .unwrap();
+            let rendered = crate::subc_format::format_response("glob", &response, false);
+            let trailer = rendered.lines().last().unwrap().to_owned();
+            println!(
+                "GLOB_BULK_FIXTURE indexed={indexed} lower_bound={lower_bound} returned={} trailer={trailer}",
+                body["files"].as_array().unwrap().len()
+            );
+            assert_eq!(body["files"].as_array().unwrap().len(), 100);
+            observed.push((indexed, lower_bound, trailer));
+        }
+        let trailer = "shown 5 of ≥140 files (cap) · narrow: path";
+        assert_eq!(
+            observed,
+            vec![
+                (false, 140, trailer.to_owned()),
+                (true, 140, trailer.to_owned())
+            ]
+        );
+    }
+
     fn exact_file_glob_fixture() -> (tempfile::TempDir, AppContext, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let project = std::fs::canonicalize(dir.path()).unwrap();
@@ -1220,7 +1276,8 @@ mod tests {
         assert_eq!(body["files"].as_array().unwrap().len(), 100);
         assert!(body["total"].is_null());
         assert_eq!(body["candidate_count"], 1000);
-        assert_eq!(body["total_lower_bound"], 100);
+        assert_eq!(body["total_lower_bound"], 1000);
+        assert_eq!(body["admitted_count"], 100);
         assert_eq!(body["unexamined_files"], 900);
         assert_eq!(body["complete"], false);
         let expected = (900..1000)

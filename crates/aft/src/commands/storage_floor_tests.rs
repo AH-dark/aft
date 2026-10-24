@@ -949,7 +949,7 @@ fn storage_floor_read_list_policy_is_loaded_once_per_call() {
 }
 
 #[test]
-fn storage_floor_glob_unexamined_tail_is_not_an_exact_total() {
+fn storage_floor_glob_lower_bound_includes_discovered_tail() {
     let f = Fixture::new();
     for index in 0..180 {
         std::fs::write(
@@ -966,10 +966,52 @@ fn storage_floor_glob_unexamined_tail_is_not_an_exact_total() {
     assert_eq!(response.data["candidate_count"], 180);
     assert_eq!(response.data["unexamined_files"], 80);
     assert!(response.data["total"].is_null());
-    assert_eq!(response.data["total_lower_bound"], 100);
+    assert_eq!(response.data["total_lower_bound"], 180);
+    assert_eq!(response.data["admitted_count"], 100);
     assert_eq!(response.data["complete"], false);
     assert_eq!(
         response.data["files_list_envelope"]["total"],
-        json!({"kind":"at_least", "value":100})
+        json!({"kind":"at_least", "value":180})
+    );
+}
+
+#[test]
+fn storage_floor_glob_discovered_lower_bound_subtracts_known_floor_skips() {
+    let f = Fixture::new();
+    let bulk = f._root.path().join("bulk");
+    std::fs::create_dir(&bulk).unwrap();
+    for index in 0..140 {
+        std::fs::write(bulk.join(format!("fixture-{index:03}.txt")), "ordinary\n").unwrap();
+    }
+    let alias = bulk.join("denied.txt");
+    std::fs::write(&alias, "ordinary\n").unwrap();
+    filetime::set_file_mtime(&alias, filetime::FileTime::from_unix_time(2_000_000_000, 0)).unwrap();
+    *f.ctx.search_index().write().unwrap() =
+        Some(crate::search_index::SearchIndex::build(f._root.path()));
+    std::fs::remove_file(&f.store).unwrap();
+    let connection = rusqlite::Connection::open(&f.store).unwrap();
+    connection
+        .execute_batch("CREATE TABLE source(value TEXT);")
+        .unwrap();
+    let _connection =
+        crate::db::file_identity::IdentityConnection::new(connection, "glob count alias fixture");
+    std::fs::remove_file(&alias).unwrap();
+    std::fs::hard_link(&f.store, &alias).unwrap();
+    #[cfg(unix)]
+    let alias_opens = crate::bounded_io::tests::watch_opens(&alias);
+
+    let response =
+        super::glob::handle_glob(&request("glob", json!({"pattern": "bulk/*.txt"})), &f.ctx);
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data["candidate_count"], 141, "{response:?}");
+    assert_eq!(response.data["admitted_count"], 100, "{response:?}");
+    assert_eq!(response.data["unexamined_files"], 40, "{response:?}");
+    assert_eq!(response.data["total_lower_bound"], 140, "{response:?}");
+    assert!(has_floor_skip(&response, &alias), "{response:?}");
+    #[cfg(unix)]
+    assert_eq!(
+        alias_opens.opens.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "indexed live alias opened"
     );
 }
