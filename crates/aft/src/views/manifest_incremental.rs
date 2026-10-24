@@ -27,12 +27,27 @@ pub(super) struct CachedManifest {
     pub tree: String,
     pub metadata: Arc<BTreeMap<Vec<u8>, fs::Metadata>>,
     pub admission: crate::db::file_identity::AdmissionSnapshot,
+    pub head: Option<HeadSnapshot>,
+}
+
+#[derive(Clone)]
+pub(super) struct HeadSnapshot {
+    tree: String,
+    index: IndexStamp,
+    entries: Arc<Vec<crate::alias::TrackedPath>>,
+}
+
+pub(super) struct HeadRead {
+    pub tree: String,
+    pub entries: Arc<Vec<crate::alias::TrackedPath>>,
+    pub cached: bool,
+    pub snapshot: Option<HeadSnapshot>,
 }
 
 #[derive(Default)]
 struct RootCache {
     previous: Option<CachedManifest>,
-    head: Option<(String, IndexStamp, Arc<Vec<crate::alias::TrackedPath>>)>,
+    head: Option<HeadSnapshot>,
     publications: u64,
     last_full: Option<Instant>,
     mismatch_pending: bool,
@@ -85,6 +100,7 @@ pub(super) fn previous(view: &ViewStore, generation: Option<&str>) -> Option<Cac
 pub(super) fn remember(view: &ViewStore, cached: CachedManifest, full_verified: bool) {
     let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
     let cache = caches.entry(view.view_dir().to_path_buf()).or_default();
+    cache.head = cached.head.clone();
     cache.previous = Some(cached);
     if full_verified {
         cache.publications = 0;
@@ -96,10 +112,7 @@ pub(super) fn remember(view: &ViewStore, cached: CachedManifest, full_verified: 
 /// Rescans also refresh attributes: check-attr reads the index, whose attributes
 /// can change without a new HEAD tree. Attribute edits and index replacements
 /// must not reuse that cache, even when the watcher reports only a source edit.
-pub(super) fn head(
-    request: &AssemblyRequest,
-    view: &ViewStore,
-) -> Result<(String, Arc<Vec<crate::alias::TrackedPath>>, bool)> {
+pub(super) fn head(request: &AssemblyRequest, view: &ViewStore) -> Result<HeadRead> {
     let output = std::process::Command::new("git")
         .current_dir(&request.project_root)
         .args(["rev-parse", "HEAD^{tree}"])
@@ -117,14 +130,19 @@ pub(super) fn head(
             path.rsplit(|byte| *byte == b'/').next() == Some(b".gitattributes".as_slice())
         });
     if eligible {
-        if let Some((oid, stamp, entries)) = caches()
+        if let Some(snapshot) = caches()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(view.view_dir())
             .and_then(|cache| cache.head.clone())
         {
-            if oid == tree && Some(&stamp) == index.as_ref() {
-                return Ok((tree, entries, true));
+            if snapshot.tree == tree && Some(&snapshot.index) == index.as_ref() {
+                return Ok(HeadRead {
+                    tree,
+                    entries: snapshot.entries.clone(),
+                    cached: true,
+                    snapshot: Some(snapshot),
+                });
             }
         }
     }
@@ -132,13 +150,19 @@ pub(super) fn head(
         head_tree_entries(&request.project_root)
             .map_err(|error| ViewError::InvalidManifest(error.to_string()))?,
     );
-    caches()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(view.view_dir().to_path_buf())
-        .or_default()
-        .head = index.map(|stamp| (tree.clone(), stamp, entries.clone()));
-    Ok((tree, entries, false))
+    // This listing is only a candidate. A failed or cancelled preparation must
+    // leave the served manifest's index invalidation pending for the retry.
+    let snapshot = index.map(|index| HeadSnapshot {
+        tree: tree.clone(),
+        index,
+        entries: entries.clone(),
+    });
+    Ok(HeadRead {
+        tree,
+        entries,
+        cached: false,
+        snapshot,
+    })
 }
 
 pub(super) struct PreparationVerification {
@@ -487,13 +511,81 @@ mod tests {
         let (project, storage, mut request) = fixture();
         let view = ViewStore::open(storage.path(), &request.scope).unwrap();
         request.changed_paths.insert(b"f0.rs".to_vec());
-        let (_, _, cached) = head(&request, &view).unwrap();
-        assert!(cached);
+        assert!(head(&request, &view).unwrap().cached);
         fs::write(project.path().join(".gitattributes"), "*.rs filter=lfs\n").unwrap();
         git(project.path(), &["add", ".gitattributes"]);
-        let (_, entries, cached) = head(&request, &view).unwrap();
-        assert!(!cached, "staged attributes changed without a HEAD move");
-        assert!(entries.iter().all(|entry| entry.filtered));
+        let head = head(&request, &view).unwrap();
+        assert!(
+            !head.cached,
+            "staged attributes changed without a HEAD move"
+        );
+        assert!(head.entries.iter().all(|entry| entry.filtered));
+    }
+
+    #[test]
+    fn views_failed_preparation_does_not_consume_index_invalidation() {
+        let (project, _storage, mut request) = fixture();
+        fs::write(project.path().join("f0.rs"), "pub fn dirty() {}\n").unwrap();
+        request.changed_paths.insert(b"f0.rs".to_vec());
+        publish(&request);
+        git(project.path(), &["reset", "--quiet", "--hard", "HEAD"]);
+        // A same-tree index rewrite must remain unvalidated after failure.
+        fs::write(project.path().join(".gitattributes"), "*.rs text\n").unwrap();
+        git(project.path(), &["add", ".gitattributes"]);
+        fs::write(project.path().join("f1.rs"), "pub fn reported() {}\n").unwrap();
+        request.changed_paths = BTreeSet::from([b"f1.rs".to_vec()]);
+        let failure = prepare_checkout_deferring(&request, true, &mut |phase| {
+            if phase == "working_tree_read" {
+                Err(ViewError::InvalidManifest(
+                    "injected post-HEAD failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(failure.is_err());
+        assert_eq!(
+            publish(&request).to_json_bytes().unwrap(),
+            rebuild_manifest(&request).to_json_bytes().unwrap(),
+            "the retry must read the reset file, not reuse its pre-reset dirty key"
+        );
+    }
+
+    #[test]
+    fn views_head_snapshot_waits_for_commit_even_for_a_no_op() {
+        let (project, storage, mut request) = fixture();
+        let view = ViewStore::open(storage.path(), &request.scope).unwrap();
+        let before = caches()
+            .lock()
+            .unwrap()
+            .get(view.view_dir())
+            .unwrap()
+            .head
+            .as_ref()
+            .unwrap()
+            .index
+            .clone();
+        fs::write(project.path().join(".gitattributes"), "*.rs text\n").unwrap();
+        git(project.path(), &["add", ".gitattributes"]);
+        request.changed_paths.insert(b"f0.rs".to_vec());
+        let prepared = prepare_checkout_deferring(&request, true, &mut |_| Ok(())).unwrap();
+        assert!(
+            caches()
+                .lock()
+                .unwrap()
+                .get(view.view_dir())
+                .unwrap()
+                .head
+                .as_ref()
+                .unwrap()
+                .index
+                == before
+        );
+        drop(prepared);
+        assert!(!head(&request, &view).unwrap().cached);
+        let mut prepared = prepare_checkout_deferring(&request, true, &mut |_| Ok(())).unwrap();
+        assert!(!prepared.commit().unwrap().published);
+        assert!(head(&request, &view).unwrap().cached);
     }
 
     #[cfg(unix)]

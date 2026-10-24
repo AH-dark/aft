@@ -414,9 +414,6 @@ impl PreparedAssembly {
             match outcome? {
                 PublishOutcome::Published => {
                     self.report.published = true;
-                    if let Some((view, cached, verified)) = self.manifest_cache.take() {
-                        manifest_incremental::remember(&view, cached, verified);
-                    }
                     // Only moved aside here: the commit runs under the root's
                     // write gate and the process-wide job table, and the
                     // index is a shared SQLite file another process may hold.
@@ -472,6 +469,9 @@ impl PreparedAssembly {
             // manifest equals the current generation's, so it describes the
             // generation being served and applies as is.
             self.accept_settlement();
+        }
+        if let Some((view, cached, verified)) = self.manifest_cache.take() {
+            manifest_incremental::remember(&view, cached, verified);
         }
         self.profile.finish();
         Ok(AssemblyReport {
@@ -681,7 +681,12 @@ pub fn prepare_checkout_deferring(
     let marked_through = status
         .mark_epoch()
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    let (head_tree, head, head_cached) = manifest_incremental::head(request, &view)?;
+    let manifest_incremental::HeadRead {
+        tree: head_tree,
+        entries: head,
+        cached: head_cached,
+        snapshot: mut head_snapshot,
+    } = manifest_incremental::head(request, &view)?;
     profile.head_ms = head_started.elapsed().as_millis();
     timing.phase("head_tree");
     let mut callgraph = BlobStore::open(
@@ -902,12 +907,13 @@ pub fn prepare_checkout_deferring(
     if verify {
         let mut full_request = request.clone();
         full_request.changed_paths.clear();
-        let (_, full_head, _) = manifest_incremental::head(&full_request, &view)?;
+        let full_head = manifest_incremental::head(&full_request, &view)?;
+        head_snapshot = full_head.snapshot;
         let mut full_skips = Vec::new();
         let mut full_reads = std::collections::HashSet::new();
         let mut full = manifest_incremental::full_candidates(
             &reader,
-            &full_head,
+            &full_head.entries,
             &mut full_skips,
             &mut full_reads,
             phase,
@@ -1271,8 +1277,8 @@ pub fn prepare_checkout_deferring(
         // still replaces one whose derived file fails the readiness check.
         && (base_ready || (defer_derived && !current_derived_built))
     {
-        manifest_incremental::remember(
-            &view,
+        prepared.manifest_cache = Some((
+            view.clone(),
             manifest_incremental::CachedManifest {
                 generation: current_generation.clone().expect("no-op generation"),
                 manifest: manifest.clone(),
@@ -1280,9 +1286,10 @@ pub fn prepare_checkout_deferring(
                 tree: head_tree.clone(),
                 metadata: std::sync::Arc::new(member_metadata),
                 admission,
+                head: head_snapshot,
             },
             verification_due,
-        );
+        ));
         prepared.profile.outcome = "no_op";
         prepared.profile.seed_source = if base_ready { "own" } else { "deferred" };
         prepared.profile.cold_build_reason = "none";
@@ -1592,6 +1599,7 @@ pub fn prepare_checkout_deferring(
             tree: head_tree,
             metadata: std::sync::Arc::new(member_metadata),
             admission,
+            head: head_snapshot,
         },
         verification_due,
     ));
