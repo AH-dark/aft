@@ -291,6 +291,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_files(0)
+    }
+    fn with_files(files: usize) -> Self {
         let _ = env_logger::Builder::new()
             .is_test(true)
             .filter_module("aft::views::generation", log::LevelFilter::Info)
@@ -300,6 +303,13 @@ impl Fixture {
         let root_path = std::fs::canonicalize(project.path()).unwrap();
         git(&root_path, &["init", "--quiet"]);
         std::fs::write(root_path.join("tracked.rs"), "pub fn previous() {}\n").unwrap();
+        for file in 0..files {
+            std::fs::write(
+                root_path.join(format!("file_{file}.rs")),
+                format!("pub fn previous_{file}() {{}}\n"),
+            )
+            .unwrap();
+        }
         commit(&root_path);
         let mut config = Config {
             project_root: Some(root_path.clone()),
@@ -374,17 +384,18 @@ impl Fixture {
         commit(self.project.path());
     }
     fn schedule(&self) {
+        self.schedule_paths(BTreeSet::from([b"tracked.rs".to_vec()]));
+    }
+    fn schedule_paths(&self, paths: BTreeSet<Vec<u8>>) {
         let response = self
             .executor
             .submit(
                 self.root.clone(),
                 Lane::MaintenanceCommit,
                 "views.schedule".to_owned(),
-                Box::new(|ctx| {
-                    match schedule(ctx, BTreeSet::from([b"tracked.rs".to_vec()]), true) {
-                        Ok(()) => Response::success("views.schedule", serde_json::json!({})),
-                        Err(error) => Response::error("views.schedule", "publication", error),
-                    }
+                Box::new(move |ctx| match schedule(ctx, paths, true) {
+                    Ok(()) => Response::success("views.schedule", serde_json::json!({})),
+                    Err(error) => Response::error("views.schedule", "publication", error),
                 }),
             )
             .recv_timeout(Duration::from_secs(60))
@@ -405,6 +416,296 @@ impl Fixture {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+
+    fn assert_cold_parity(&self) {
+        let runtime = self.ctx.view_runtime_snapshot().unwrap();
+        let generation = runtime.generation.unwrap();
+        let manifest = runtime.manifest.unwrap();
+        let cold_dir = tempfile::tempdir().unwrap();
+        let cold = cold_dir.path().join("cold.sqlite");
+        let blobs = crate::blob_store::BlobStore::open(
+            &runtime.storage,
+            &runtime.family,
+            crate::blob_store::BlobPlane::Callgraph,
+        )
+        .unwrap();
+        crate::views::materialization::materialize_manifest_view_database(
+            &cold,
+            blobs.path(),
+            &manifest,
+        )
+        .unwrap();
+        crate::views::materialization::parity::assert_logical_parity(
+            &self.view.derived_path(&generation).unwrap(),
+            &cold,
+        );
+        self.ctx.publish_view_paths(BTreeSet::new(), true).unwrap();
+        let rebuilt = self.ctx.view_runtime_snapshot().unwrap().manifest.unwrap();
+        assert_eq!(
+            manifest.to_json_bytes().unwrap(),
+            rebuilt.to_json_bytes().unwrap(),
+            "the incremental manifest must equal a full read of the final tree"
+        );
+    }
+}
+
+#[test]
+fn publication_burst_is_single_flight_and_converges() {
+    let fixture = Fixture::with_files(20);
+    fixture.change("first");
+    let gate = Gate::new(&fixture.job_root(), "derived");
+    fixture.schedule();
+    gate.started();
+    for edit in 0..20 {
+        let path = format!("file_{edit}.rs");
+        std::fs::write(
+            fixture.project.path().join(&path),
+            format!("pub fn edit_{edit}() {{}}\n"),
+        )
+        .unwrap();
+        fixture.schedule_paths(BTreeSet::from([path.into_bytes()]));
+    }
+    let in_flight = health_snapshot()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["root"] == fixture.job_root().to_string_lossy().as_ref())
+        .count();
+    drop(gate);
+    fixture.wait_idle_for(Duration::from_secs(60));
+    assert_eq!(CAS_TIMINGS.lock()[&fixture.job_root()].len(), 2);
+    assert_eq!(in_flight, 1, "edits must not start competing publications");
+    assert_eq!(
+        crate::views::assembly::publication_outcomes_for_test(&fixture.job_root()),
+        vec!["published", "published", "published"]
+    );
+    fixture.assert_cold_parity();
+}
+
+#[test]
+fn publication_failed_batch_is_included_in_follow_up() {
+    let fixture = Fixture::with_files(1);
+    fixture.change("failed_batch");
+    let failures = Failures::new(fixture.job_root());
+    let gate = Gate::new(&fixture.job_root(), "working_tree_read");
+    fixture.schedule();
+    gate.started();
+    let tracked = fixture.project.path().join("tracked.rs");
+    std::fs::remove_file(&tracked).unwrap();
+    std::fs::create_dir(&tracked).unwrap();
+    std::fs::write(
+        fixture.project.path().join("file_0.rs"),
+        "pub fn pending() {}\n",
+    )
+    .unwrap();
+    fixture.schedule_paths(BTreeSet::from([b"file_0.rs".to_vec()]));
+    let retry_gate = Gate::new(&fixture.job_root(), "retry_wait");
+    drop(gate);
+    failures.next();
+    retry_gate.started();
+    std::fs::remove_dir(&tracked).unwrap();
+    std::fs::write(&tracked, "pub fn failed_batch() {}\n").unwrap();
+    drop(retry_gate);
+    fixture.wait_idle_for(Duration::from_secs(60));
+    assert_eq!(CAS_TIMINGS.lock()[&fixture.job_root()].len(), 1);
+    assert_eq!(
+        crate::views::assembly::publication_outcomes_for_test(&fixture.job_root()),
+        vec!["published", "cancelled_or_failed", "published"]
+    );
+    fixture.assert_cold_parity();
+}
+
+#[test]
+fn publication_rescan_only_promotes_its_first_follow_up_to_full_read() {
+    let fixture = Fixture::with_files(2);
+    fixture.change("rescan");
+    let gate = Gate::new(&fixture.job_root(), "derived");
+    fixture.schedule_paths(BTreeSet::new());
+    gate.started();
+    std::fs::write(
+        fixture.project.path().join("file_0.rs"),
+        "pub fn first() {}\n",
+    )
+    .unwrap();
+    fixture.schedule_paths(BTreeSet::from([b"file_0.rs".to_vec()]));
+    let follow_up = Gate::new(&fixture.job_root(), "derived");
+    drop(gate);
+    follow_up.started();
+    std::fs::write(
+        fixture.project.path().join("file_1.rs"),
+        "pub fn second() {}\n",
+    )
+    .unwrap();
+    fixture.schedule_paths(BTreeSet::from([b"file_1.rs".to_vec()]));
+    let pending = {
+        let jobs = JOBS.lock();
+        let job = jobs
+            .values()
+            .find(|job| job.root == fixture.job_root())
+            .unwrap();
+        assert!(
+            job.paths.is_empty(),
+            "the first follow-up must read everything"
+        );
+        job.pending.as_ref().unwrap().paths.clone()
+    };
+    drop(follow_up);
+    fixture.wait_idle_for(Duration::from_secs(60));
+    assert_eq!(pending, BTreeSet::from([b"file_1.rs".to_vec()]));
+    assert_eq!(CAS_TIMINGS.lock()[&fixture.job_root()].len(), 3);
+    fixture.assert_cold_parity();
+}
+
+#[test]
+fn publication_unbind_abandons_in_flight_and_pending_work() {
+    let fixture = Fixture::new();
+    fixture
+        .ctx
+        .set_unbound_build_abandon_grace_for_test(Duration::ZERO);
+    fixture.change("unbound");
+    let gate = Gate::new(&fixture.job_root(), "derived");
+    fixture.schedule();
+    gate.started();
+    fixture.schedule();
+    fixture.ctx.mark_subc_unbound();
+    drop(gate);
+    fixture.wait_idle_for(Duration::from_secs(60));
+    assert_eq!(
+        fixture.view.current_generation().unwrap().as_deref(),
+        Some(fixture.initial.as_str())
+    );
+    assert!(!CAS_TIMINGS.lock().contains_key(&fixture.job_root()));
+}
+
+#[test]
+fn publication_follow_up_converges_to_final_tree() {
+    let fixture = Fixture::with_files(2);
+    fixture.change("first");
+    let gate = Gate::new(&fixture.job_root(), "cas");
+    fixture.schedule();
+    gate.started();
+    for file in 0..2 {
+        let path = format!("file_{file}.rs");
+        std::fs::write(
+            fixture.project.path().join(&path),
+            format!("pub fn final_{file}() {{}}\n"),
+        )
+        .unwrap();
+        fixture.schedule_paths(BTreeSet::from([path.into_bytes()]));
+    }
+    drop(gate);
+    fixture.wait_idle_for(Duration::from_secs(60));
+    fixture.assert_cold_parity();
+}
+
+#[test]
+fn publication_conflict_follow_up_uses_winning_base() {
+    let fixture = Fixture::with_files(1);
+    fixture.change("older");
+    let gate = Gate::new(&fixture.job_root(), "cas");
+    fixture.schedule();
+    gate.started();
+    std::fs::write(
+        fixture.project.path().join("tracked.rs"),
+        "pub fn winner() {}\n",
+    )
+    .unwrap();
+    let winner = fixture
+        .ctx
+        .publish_view_paths(BTreeSet::new(), true)
+        .unwrap()
+        .generation
+        .unwrap();
+    std::fs::write(
+        fixture.project.path().join("file_0.rs"),
+        "pub fn pending() {}\n",
+    )
+    .unwrap();
+    fixture.schedule_paths(BTreeSet::from([b"file_0.rs".to_vec()]));
+    drop(gate);
+    fixture.wait_idle_for(Duration::from_secs(60));
+    assert_ne!(
+        fixture.view.current_generation().unwrap().as_deref(),
+        Some(winner.as_str())
+    );
+    assert_eq!(
+        CAS_TIMINGS.lock()[&fixture.job_root()].len(),
+        1,
+        "the stale attempt must not commit"
+    );
+    fixture.assert_cold_parity();
+}
+
+#[test]
+fn publication_configure_invalidates_old_work_without_losing_pending_paths() {
+    let fixture = Fixture::with_files(2);
+    fixture.change("older");
+    let gate = Gate::new(&fixture.job_root(), "cas");
+    fixture.schedule();
+    gate.started();
+    std::fs::write(
+        fixture.project.path().join("file_0.rs"),
+        "pub fn pending_before() {}\n",
+    )
+    .unwrap();
+    fixture.schedule_paths(BTreeSet::from([b"file_0.rs".to_vec()]));
+    cancel_for_context(&fixture.ctx);
+    fixture
+        .ctx
+        .configure_content_generation_flag()
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    std::fs::write(
+        fixture.project.path().join("file_1.rs"),
+        "pub fn pending_after() {}\n",
+    )
+    .unwrap();
+    fixture.schedule_paths(BTreeSet::from([b"file_1.rs".to_vec()]));
+    drop(gate);
+    fixture.wait_idle_for(Duration::from_secs(60));
+    assert_eq!(
+        CAS_TIMINGS.lock()[&fixture.job_root()].len(),
+        1,
+        "the old configuration must not commit"
+    );
+    fixture.assert_cold_parity();
+}
+
+/// Run alone because the assembly delay environment applies to every root in
+/// the process. The release file holds all attempts while the edit burst lands.
+#[test]
+#[ignore = "5k-file before/after measurement; run with --ignored --test-threads=1"]
+fn publication_burst_5k_measurement() {
+    let fixture = Fixture::with_files(5000);
+    fixture.change("first");
+    let release = fixture._storage.path().join("publication-release");
+    std::env::set_var("AFT_TEST_VIEW_PUBLICATION_GATE_FILE", &release);
+    std::env::set_var("AFT_TEST_VIEW_PUBLICATION_DELAY_MS", "25");
+    let gate = Gate::new(&fixture.job_root(), "manifest");
+    let started = Instant::now();
+    fixture.schedule();
+    gate.started();
+    drop(gate);
+    for edit in 0..20 {
+        let path = format!("file_{edit}.rs");
+        std::fs::write(
+            fixture.project.path().join(&path),
+            format!("pub fn final_{edit}() {{}}\n"),
+        )
+        .unwrap();
+        fixture.schedule_paths(BTreeSet::from([path.into_bytes()]));
+    }
+    std::fs::write(&release, "release").unwrap();
+    fixture.wait_idle_for(Duration::from_secs(300));
+    std::env::remove_var("AFT_TEST_VIEW_PUBLICATION_GATE_FILE");
+    std::env::remove_var("AFT_TEST_VIEW_PUBLICATION_DELAY_MS");
+    let outcomes = crate::views::assembly::publication_outcomes_for_test(&fixture.job_root());
+    eprintln!("BURST_5K edits=20 files=5000 attempts={} committed={} published={} cancelled_or_failed={} total_ms={} outcomes={:?}",
+        outcomes.len() - 1,
+        CAS_TIMINGS.lock().get(&fixture.job_root()).map_or(0, Vec::len),
+        outcomes[1..].iter().filter(|outcome| **outcome == "published").count(),
+        outcomes[1..].iter().filter(|outcome| **outcome == "cancelled_or_failed").count(),
+        started.elapsed().as_millis(), &outcomes[1..]);
+    fixture.assert_cold_parity();
 }
 fn git(root: &Path, args: &[&str]) {
     let mut command = std::process::Command::new("git");
@@ -1288,13 +1589,16 @@ fn publication_build_does_not_delay_same_root_bind_and_read() {
 }
 
 #[test]
-fn superseded_publication_cancels_before_derived_and_removes_generation_files() {
+fn invalidated_publication_cancels_before_derived_and_removes_generation_files() {
     let fixture = Fixture::new();
     fixture.change("older");
     let completions = Completions::new(fixture.job_root());
     let gate = Gate::new(fixture.job_root().as_path(), "blobs");
     fixture.schedule();
     let older = gate.started();
+    cancel_for_context(&fixture.ctx);
+    drop(gate);
+    assert_eq!(completions.next(), older);
     fixture.change("newer");
     let newer_gate = Gate::new(fixture.job_root().as_path(), "cas");
     fixture.schedule();
@@ -1305,13 +1609,10 @@ fn superseded_publication_cancels_before_derived_and_removes_generation_files() 
         .unwrap_or(0);
     std::thread::sleep(Duration::from_millis(delay));
     drop(newer_gate);
-    // The newer job must finish while the obsolete assembly remains held.
-    // Waiting for its lifecycle completion also observes cleanup, not just CAS.
+    // Waiting for lifecycle completion also observes cleanup, not just CAS.
     assert_eq!(completions.next(), newer_id);
     let newer = fixture.view.current_generation().unwrap();
     assert_ne!(newer.as_deref(), Some(fixture.initial.as_str()));
-    drop(gate);
-    assert_eq!(completions.next(), older);
     assert_eq!(fixture.view.current_generation().unwrap(), newer);
     assert!(
         !PHASES.lock()[fixture.job_root().as_path()]
