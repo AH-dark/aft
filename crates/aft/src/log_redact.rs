@@ -21,6 +21,11 @@
 //! Deliberately NOT masked: bare `key=value` fields outside a URL query. AFT's
 //! own structured lines use `key=` for index keys, and masking them would
 //! destroy the forensic value of the log.
+//!
+//! Shell commands quoted in a log line additionally go through
+//! [`redact_command`], which masks credentials typed inline in a command
+//! (`GITHUB_TOKEN=...`, `--password ...`). Those shapes are command-only for
+//! the reason above.
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -94,6 +99,129 @@ static KEY_QUERY: LazyLock<Regex> = LazyLock::new(|| compile(r#"(?i)([?&]key=)([
 /// contains nothing to mask, so the common case allocates nothing.
 pub fn aft_redactor(text: &str) -> Cow<'_, str> {
     redact_with_range(text, None)
+}
+
+// Shell-command credential shapes. These are applied only to command text
+// (see [`redact_command`]), not to every log line: AFT's own structured log
+// fields are lowercase `key=value` pairs and must stay readable.
+//
+// The leading `(^|[^...])` group stands in for a look-behind, which the regex
+// crate lacks; replacements re-emit it.
+
+/// `NAME=value` where NAME is UPPER_SNAKE and contains a credential word
+/// followed by `=` or `_` (`GITHUB_TOKEN=`, `export DB_PASSWORD=`,
+/// `AWS_SECRET_ACCESS_KEY_ID=`). Plain substrings do not count: `MAX_TOKENS`,
+/// `TOKENIZERS_PARALLELISM`, `GIT_AUTHOR_NAME` and `GH_SHIM_BYPASS` stay.
+static COMMAND_SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    compile(
+        r#"(^|[^A-Za-z0-9_])([A-Z][A-Z0-9_]*?(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY|AUTH_KEY|_KEY|_PAT|_AUTH)(?:_[A-Z0-9]+)*=)("[^"]*"|'[^']*'|[^\s;&|)'"]+)"#,
+    )
+});
+/// Assignment names ending in one of these name where a credential lives or
+/// who owns it, not the credential (`SSH_KEY_PATH=`, `AWS_ACCESS_KEY_ID=`).
+const COMMAND_NON_SECRET_NAME_SUFFIXES: [&str; 16] = [
+    "_PATH=",
+    "_FILE=",
+    "_DIR=",
+    "_NAME=",
+    "_URL=",
+    "_ID=",
+    "_HOST=",
+    "_PORT=",
+    "_USER=",
+    "_USERNAME=",
+    "_ENV=",
+    "_COUNT=",
+    "_LEN=",
+    "_LENGTH=",
+    "_TTL=",
+    "_MODE=",
+];
+/// Long options whose value is a credential, as `--flag=value` or
+/// `--flag value`. `--secret` is deliberately absent: gcloud and others use it
+/// for a secret's name.
+static COMMAND_SECRET_FLAG: LazyLock<Regex> = LazyLock::new(|| {
+    compile(
+        r#"(^|[^A-Za-z0-9_-])(--(?:password|passwd|pass|token|api-key|apikey|client-secret|auth-token|access-token|bearer)(?:=|[ \t]+))("[^"]*"|'[^']*'|[^\s;&|]+)"#,
+    )
+});
+/// The MySQL family's attached password, `-p<value>`. Other tools' `-p`
+/// (cargo's package, ssh's port, mkdir's parents) is never touched.
+static COMMAND_MYSQL_PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
+    compile(r"\b((?:mysql|mariadb|mysqladmin|mysqldump)\b[^;&|\n]*?\s-p)([^\s;&|]+)")
+});
+/// `sshpass -p <value>`.
+static COMMAND_SSHPASS_PASSWORD: LazyLock<Regex> =
+    LazyLock::new(|| compile(r"\b(sshpass[ \t]+-p[ \t]*)([^\s;&|]+)"));
+/// The password half of `curl -u user:password` (or `--user`).
+static COMMAND_CURL_USER_PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
+    compile(r#"\b(curl\b[^;&|\n]*?\s(?:-u|--user)[ \t]+["']?[^:\s"']+:)([^\s"']+)"#)
+});
+
+/// A value that names another value instead of holding one: a variable or
+/// command substitution (`$GH_TOKEN`, `"$(gcloud secrets ...)"`), an empty
+/// string, a placeholder this module already wrote, or the next option.
+fn command_value_is_reference(value: &str) -> bool {
+    let unquoted = value.trim_matches(|ch| ch == '"' || ch == '\'');
+    unquoted.is_empty() || unquoted.starts_with(['$', '<', '-'])
+}
+
+/// Mask credentials typed inline in a shell command, for logs that quote the
+/// command. Applies [`aft_redactor`] plus command-only shapes: secret-named
+/// `NAME=value` assignments (including after `export` or `env`), credential
+/// long options, MySQL's `-p<value>`, `sshpass -p` and `curl -u user:pass`.
+/// Mask the whole command before shortening it for a log line: a token cut
+/// short no longer matches its pattern.
+pub fn redact_command(command: &str) -> Cow<'_, str> {
+    let mut out = Cow::Borrowed(command);
+    if command.contains('=') {
+        out = replace_in(
+            out,
+            None,
+            &COMMAND_SECRET_ASSIGNMENT,
+            |caps: &Captures<'_>| {
+                let name = &caps[2];
+                if command_value_is_reference(&caps[3])
+                    || COMMAND_NON_SECRET_NAME_SUFFIXES
+                        .iter()
+                        .any(|suffix| name.ends_with(suffix))
+                {
+                    caps[0].to_string()
+                } else {
+                    format!("{}{name}{SECRET_PLACEHOLDER}", &caps[1])
+                }
+            },
+        );
+    }
+    if command.contains("--") {
+        out = replace_in(out, None, &COMMAND_SECRET_FLAG, |caps: &Captures<'_>| {
+            if command_value_is_reference(&caps[3]) {
+                caps[0].to_string()
+            } else {
+                format!("{}{}{SECRET_PLACEHOLDER}", &caps[1], &caps[2])
+            }
+        });
+    }
+    for (needle, pattern) in [
+        ("mysql", &COMMAND_MYSQL_PASSWORD),
+        ("mariadb", &COMMAND_MYSQL_PASSWORD),
+        ("sshpass", &COMMAND_SSHPASS_PASSWORD),
+        ("curl", &COMMAND_CURL_USER_PASSWORD),
+    ] {
+        if command.contains(needle) {
+            out = replace_in(out, None, pattern, |caps: &Captures<'_>| {
+                if command_value_is_reference(&caps[2]) {
+                    caps[0].to_string()
+                } else {
+                    format!("{}{SECRET_PLACEHOLDER}", &caps[1])
+                }
+            });
+        }
+    }
+    match aft_redactor(&out) {
+        Cow::Borrowed(_) => out,
+        Cow::Owned(masked) => Cow::Owned(masked),
+    }
 }
 
 // Separate limits bound byte scanning and expensive candidate hashes. Long
@@ -856,6 +984,41 @@ mod tests {
     struct MaskedCase {
         input: String,
         expected: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CommandFixture {
+        masked: Vec<MaskedCase>,
+        untouched: Vec<String>,
+    }
+
+    /// Credentials typed inline in shell commands are masked, and none of the
+    /// ordinary commands beside them change: the untouched list holds every
+    /// command line from this repository's scripts, workflows and package.json
+    /// scripts plus common cargo, git, npm, ssh and docker invocations.
+    #[test]
+    fn command_credentials_are_masked_without_touching_ordinary_commands() {
+        let fixture: CommandFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/command_redaction_cases.json"
+        ))
+        .expect("command redaction fixture parses");
+        assert_eq!(fixture.masked.len(), 24);
+        assert!(fixture.untouched.len() > 800);
+        for case in &fixture.masked {
+            let masked = redact_command(&case.input);
+            assert_eq!(masked, case.expected, "input: {}", case.input);
+            assert_eq!(redact_command(&masked), masked, "not idempotent");
+        }
+        // A few corpus lines hold URL userinfo (`ssh://git@host`), which the
+        // shared log patterns already mask in every log line. The command
+        // shapes themselves must change nothing.
+        let mangled: Vec<_> = fixture
+            .untouched
+            .iter()
+            .filter(|command| redact_command(command) != aft_redactor(command))
+            .map(|command| format!("{command} -> {}", redact_command(command)))
+            .collect();
+        assert!(mangled.is_empty(), "{}", mangled.join("\n"));
     }
 
     fn fixture() -> Fixture {

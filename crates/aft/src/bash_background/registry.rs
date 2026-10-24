@@ -225,7 +225,9 @@ const KILL_IN_FLIGHT_WAIT: Duration =
     Duration::from_secs(super::process::TERMINATE_GRACE.as_secs() + 2);
 
 fn log_bash_spawn(task_id: &str, pid: u32, session: &str, root: &Path, command: &str) {
-    let command: String = command
+    // Mask before shortening: a credential cut by the length limit would no
+    // longer match its pattern.
+    let command: String = crate::log_redact::redact_command(command)
         .chars()
         .take(200)
         .map(|character| match character {
@@ -22489,7 +22491,6 @@ mod tests {
     /// credentials in common shell shapes must not reach the file, and the
     /// ordinary commands beside them must survive unchanged.
     #[test]
-    #[ignore = "fails today (#825): spawn logs keep NAME=value, credential flags and secrets cut by the 200-char limit"]
     fn spawn_log_masks_inline_command_credentials() {
         let root = Path::new("/project");
         let durable = |command: &str| -> String {
