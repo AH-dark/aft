@@ -117,6 +117,15 @@ fn inject_worker_test_threads_with(
     }
 }
 
+/// Whether `name` is one of the worker test-thread budget names AFT fills in.
+/// A configured `bash.env` value for either must not reach this budget, and
+/// the config loader refuses both, so a caller that merges configuration into
+/// a launch environment drops them first.
+pub(crate) fn is_worker_test_thread_env_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    name == NEXT_TEST_THREADS_ENV || name == RUST_TEST_THREADS_ENV
+}
+
 fn has_test_thread_override(environment: &HashMap<String, String>, name: &str) -> bool {
     #[cfg(windows)]
     {

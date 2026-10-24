@@ -121,6 +121,16 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         } else {
             configured.names
         };
+        // AFT's worker test-thread budget is written by `inject` below, which
+        // keeps a value the request already carries; configured thread counts
+        // must not reach it, and a value rejected at load could not apply
+        // anyway. The disclosure still names them, so nothing is silent.
+        let names = names
+            .into_iter()
+            .filter(|(key, _)| {
+                !crate::agent_child_env::is_worker_test_thread_env_name(key)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
         // The request map is the process-creation channel, with call-specific
         // values taking precedence over the configured stable defaults.
         for (key, value) in &names {
@@ -129,12 +139,10 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 .entry(key.clone())
                 .or_insert_with(|| value.clone());
         }
-        if !names.is_empty() {
-            applied_env.push(crate::config_resolve::ConfiguredBashEnv {
-                names,
-                tier: configured.tier,
-            });
-        }
+        applied_env.push(crate::config_resolve::ConfiguredBashEnv {
+            names,
+            tier: configured.tier,
+        });
     }
     let disclosure = crate::commands::bash_remote_env::Disclosure::build(
         &applied_env,
@@ -2878,4 +2886,7 @@ exec "$@"
         assert_eq!(observations[0].requested_tier, RequestedSandboxTier::Native);
         stop_spawned_test_task(&ctx, &retried);
     }
+    #[cfg(unix)]
+    #[path = "bash_env_tests.rs"]
+    mod bash_env_tests;
 }
