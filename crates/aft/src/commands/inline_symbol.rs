@@ -414,6 +414,21 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         lang,
         assignment_var.as_deref(),
     );
+    // The body's lines are joined with LF. In a file whose call-site line
+    // ends in CRLF, every inlined line ends in CRLF too, so the file's line
+    // endings stay consistent.
+    let call_line_end = source[replacement_node.end_byte()..]
+        .find('\n')
+        .map(|at| replacement_node.end_byte() + at);
+    let crlf = match call_line_end {
+        Some(at) => at > 0 && source.as_bytes()[at - 1] == b'\r',
+        None => source.contains("\r\n"),
+    };
+    let replacement_text = if crlf {
+        replacement_text.replace('\n', "\r\n")
+    } else {
+        replacement_text
+    };
 
     // Expand replacement start backwards over horizontal whitespace to start
     // of line. Stop at start-of-file or newline.

@@ -203,6 +203,8 @@ fn inline_symbol_python() {
     // Verify call was replaced, at the call site's indentation: the body's
     // second line must not keep the function body's own indentation on top
     // of the call site's (`        result = total` is an IndentationError).
+    // A Windows checkout gives the fixture CRLF endings, so the text is
+    // compared with endings normalized and the endings are checked apart.
     let content = std::fs::read_to_string(&file).expect("read file");
     assert!(
         !content.contains("add(x, y)"),
@@ -210,12 +212,44 @@ fn inline_symbol_python() {
         content
     );
     assert!(
-        content.contains("def main():\n    x = 10\n    y = 20\n    total = x + y\n    result = total\n    print(result)\n"),
+        content.replace("\r\n", "\n").contains(
+            "def main():\n    x = 10\n    y = 20\n    total = x + y\n    result = total\n    print(result)\n"
+        ),
         "inlined body should sit at the call site's indentation:\n{}",
         content
     );
+    assert_consistent_line_endings(&content);
 
     aft.shutdown();
+}
+
+/// Every line ends the same way: all CRLF when the file has any CRLF, all
+/// LF otherwise. An inline that wrote LF lines into a CRLF file would mix
+/// them.
+fn assert_consistent_line_endings(content: &str) {
+    let crlf = content.matches("\r\n").count();
+    let lf = content.matches('\n').count();
+    assert!(
+        crlf == 0 || crlf == lf,
+        "line endings are mixed ({crlf} CRLF of {lf} lines): {content:?}"
+    );
+}
+
+/// The same inline into a file with CRLF endings, written explicitly so the
+/// case is covered on every platform: the inlined lines keep CRLF.
+#[test]
+fn inline_symbol_python_keeps_crlf_line_endings() {
+    let source = "def add(a, b):\r\n    total = a + b\r\n    return total\r\n\r\ndef main():\r\n    x = 10\r\n    y = 20\r\n    result = add(x, y)\r\n    print(result)\r\n";
+    let (resp, content) = inline_in_fresh_file("crlf.py", source, "add", 8);
+    assert_eq!(
+        resp["success"], true,
+        "CRLF python inline should succeed: {resp:?}"
+    );
+    assert!(
+        content.contains("    total = x + y\r\n    result = total\r\n    print(result)\r\n"),
+        "inlined lines should keep CRLF: {content:?}"
+    );
+    assert_consistent_line_endings(&content);
 }
 
 /// A Python body with a nested block keeps its relative nesting when it is
