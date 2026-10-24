@@ -4916,6 +4916,13 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[test]
     fn blocking_bash_hands_back_before_client_deadline() {
+        fn held_running_stub(req: RawRequest, ctx: &AppContext) -> Response {
+            let response = gated_running_stub(req, ctx);
+            let timing = BASH_TIMING_FOR_TEST.with(|slot| slot.borrow().clone().unwrap());
+            BashTimingForTest::wait(&timing.result, "spawn result");
+            response
+        }
+
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .start_paused(true)
@@ -4943,7 +4950,7 @@ mod grant_path_tests {
                         deadline_test_call_owned(
                             &executor,
                             &root,
-                            gated_running_stub,
+                            held_running_stub,
                             args,
                             budget,
                             false,
@@ -4951,12 +4958,15 @@ mod grant_path_tests {
                     });
                     tokio::select! {
                         biased;
-                        done = rx.recv() => panic!("{mode}: answered before reply watchdog: {:?}", done.map(|done| copy_response(done.response_for_test()))),
-                        _ = timing.reply.armed.notified() => {},
+                        done = rx.recv() => panic!("{mode}: answered before registration: {:?}", done.map(|done| copy_response(done.response_for_test()))),
+                        _ = timing.committed.notified() => {},
                     }
 
                     // Keep ordinary task observation off the blocking pool so only the
                     // Tokio reply-deadline timer can hand back the still-running task.
+                    // Prevent polling the child before the blocker below holds
+                    // the only pool thread: held_running_stub delays returning
+                    // the task id until timing.result is released.
                     let (occupied_tx, occupied_rx) = std::sync::mpsc::channel();
                     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
                     let blocker = tokio::task::spawn_blocking(move || {
@@ -4964,6 +4974,12 @@ mod grant_path_tests {
                         let _ = release_rx.recv();
                     });
                     occupied_rx.recv().unwrap();
+                    BashTimingForTest::release(&timing.result);
+                    tokio::select! {
+                        biased;
+                        done = rx.recv() => panic!("{mode}: answered before reply watchdog: {:?}", done.map(|done| copy_response(done.response_for_test()))),
+                        _ = timing.reply.armed.notified() => {},
+                    }
                     timing.reply.fire.notify_one();
                     tokio::time::advance(Duration::from_millis(1499)).await;
                     assert!(matches!(
