@@ -3621,8 +3621,10 @@ async fn cross_command_broker_isolation(profile: &str) {
     let paths = jail.worktree.join("broker-a-paths");
     let finish = jail.worktree.join("broker-a-finish");
     let corr = jail.submit_held_bash(json!({"command":format!(
-        "printf '%s\\n%s\\n%s\\n' \"$AFT_GH_READ_SOCKET\" \"$AFT_GH_READ_CAPABILITY_FILE\" \"$$\" > {}; while ! test -f {}; do sleep 0.02; done",
-        quote(&paths), quote(&finish)),"background":true,"timeout":30_000})).await;
+        "printf '%s\\n%s\\n%s\\n' \"$AFT_GH_READ_SOCKET\" \"$AFT_GH_READ_CAPABILITY_FILE\" \"$$\" > {}.tmp && mv {}.tmp {}; while ! test -f {}; do sleep 0.02; done",
+        quote(&paths), quote(&paths), quote(&paths), quote(&finish)),"background":true,"timeout":30_000})).await;
+    // The file is renamed into place whole: the test polls for it and must
+    // never read a partly written list of three lines.
     let paths = wait_test_file(&paths).await;
     let parts: Vec<_> = paths.lines().collect();
     assert_eq!(parts.len(), 3);

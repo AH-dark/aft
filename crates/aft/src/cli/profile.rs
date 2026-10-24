@@ -971,6 +971,8 @@ fn version_for_loaded_image(loaded_id: &str, disk_id: Option<&str>, image: &Path
     version_for_loaded_image_with(loaded_id, disk_id, || binary_version(image))
 }
 
+// Used by the macOS loaded-image reader and by its tests on every platform.
+#[cfg(any(target_os = "macos", test))]
 fn version_for_loaded_image_with(
     loaded_id: &str,
     disk_id: Option<&str>,
