@@ -1,17 +1,14 @@
-//! Reproductions for two reported tool defects, driven through the agent tool
-//! path (`tool_call`), which is what the OpenCode plugin sends.
+//! Regression tests for two reported tool defects, driven through the agent
+//! tool path (`tool_call`), which is what the OpenCode plugin sends.
 //!
-//! Issue #828 (`aft_import`): a trailing same-line comment splits organize into
-//! independent segments, Python groups sort by raw statement text, a leading
-//! comment loses its import when a segment is reordered, and `remove` leaves
-//! the removed statement's trailing comment behind.
+//! Issue #828 (`aft_import`): comments stay with the import they describe when
+//! organize reorders it (a trailing `# noqa` no longer splits a group), Python
+//! groups follow isort's default order, and `remove` deletes the removed
+//! statement's same-line comment with it.
 //!
-//! Issue #827 (`ast_grep_replace` / `ast_grep_search`): a dry run previews a
-//! rewrite that apply refuses for invalid syntax, and a variadic capture is
-//! displayed with its punctuation tokens joined by commas (`1,,,2`).
-//!
-//! Each test is ignored while the defect is open; run them with
-//! `--ignored` to see the current failure.
+//! Issue #827 (`ast_grep_replace` / `ast_grep_search`): a dry run refuses a
+//! rewrite that apply would refuse for invalid syntax, and a variadic capture
+//! is displayed as its source text instead of its node texts joined by commas.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -65,7 +62,6 @@ fn line_index(content: &str, line: &str) -> usize {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "fails today (#828): a trailing `# noqa` on an import splits organize into separately sorted segments"]
 fn organize_python_trailing_comment_does_not_split_stdlib_group() {
     let source = "import sys\nimport os\nimport zeta.side  # noqa\nimport abc\nfrom . import rel\nfrom collections import OrderedDict\nimport json\n\nprint(sys, os, abc, rel, OrderedDict, json)\n";
     let (_dir, root) = project(&[("case.py", source)]);
@@ -113,7 +109,6 @@ fn organize_python_trailing_comment_does_not_split_stdlib_group() {
 }
 
 #[test]
-#[ignore = "fails today (#828): Python groups sort by raw statement text, so `from x import` lines precede `import y` lines"]
 fn organize_python_sorts_group_by_module_not_raw_text() {
     let source = "import json\nfrom collections import OrderedDict\nimport abc\n\nprint(json, OrderedDict, abc)\n";
     let (_dir, root) = project(&[("sorting.py", source)]);
@@ -128,21 +123,20 @@ fn organize_python_sorts_group_by_module_not_raw_text() {
     assert_eq!(resp["success"], true, "organize should succeed: {resp:?}");
     let content = fs::read_to_string(root.join("sorting.py")).unwrap();
 
-    // Both isort conventions (plain imports first, or one module-ordered list)
-    // put `import abc` before `from collections ...` and `import json`.
+    // isort's default order: plain `import` lines by module, then `from`
+    // lines by module.
     let abc = line_index(&content, "import abc");
     let collections = line_index(&content, "from collections import OrderedDict");
     let json_line = line_index(&content, "import json");
     assert!(
-        abc < collections && abc < json_line,
-        "stdlib group is not in module order:\n{content}"
+        abc < json_line && json_line < collections,
+        "stdlib group is not in isort's default order:\n{content}"
     );
 
     aft.shutdown();
 }
 
 #[test]
-#[ignore = "fails today (#828): organize reorders a comment-bounded segment and leaves the leading comment above a different import"]
 fn organize_ts_leading_comment_stays_with_its_import() {
     let source = "import \"./z-side\";\nimport {z} from \"./z\";\n// about y\nimport {y} from \"./y\";\nimport fs from \"fs\";\nimport \"reflect-metadata\";\nimport {x} from \"./x\";\nimport path from \"path\";\n\nexport const all = [z, y, fs, x, path];\n";
     let (_dir, root) = project(&[("case.ts", source)]);
@@ -179,7 +173,6 @@ fn organize_ts_leading_comment_stays_with_its_import() {
 }
 
 #[test]
-#[ignore = "fails today (#828): remove deletes the statement but leaves its same-line trailing comment on its own line"]
 fn remove_takes_the_trailing_same_line_comment_with_the_import() {
     let ts = "// about y\nimport { y } from \"./y\"; // trailing\nimport { w } from \"./w\";\n\nexport const all = [w];\n";
     let py = "import os  # noqa\nimport sys\n\nprint(sys)\n";
@@ -220,12 +213,88 @@ fn remove_takes_the_trailing_same_line_comment_with_the_import() {
     aft.shutdown();
 }
 
+/// Runs organize on one file and returns the organize reply and new contents.
+fn organize_file(name: &str, source: &str) -> (Value, String) {
+    let (_dir, root) = project(&[(name, source)]);
+    let mut aft = configured(&root);
+    let resp = tool_call(
+        &mut aft,
+        "organize",
+        "import",
+        json!({ "op": "organize", "filePath": name }),
+    );
+    assert_eq!(resp["success"], true, "organize should succeed: {resp:?}");
+    let content = fs::read_to_string(root.join(name)).unwrap();
+    aft.shutdown();
+    (resp, content)
+}
+
+#[test]
+fn organize_keeps_a_comment_inside_a_named_import_list() {
+    let (_, content) = organize_file(
+        "inner.ts",
+        "import { b, // why b\n  a } from \"./m\";\nimport z from \"z\";\n\nexport const all = [a, b, z];\n",
+    );
+    assert_eq!(
+        content,
+        "import z from \"z\";\n\nimport { b, // why b\n  a } from \"./m\";\n\nexport const all = [a, b, z];\n",
+        "a statement with a comment inside is kept verbatim and still sorted"
+    );
+}
+
+#[test]
+fn organize_moves_the_last_imports_same_line_comment_with_it() {
+    let (_, content) = organize_file(
+        "last.ts",
+        "import { b } from \"./b\";\nimport { a } from \"./a\"; // about a\n\nexport const all = [a, b];\n",
+    );
+    assert_eq!(
+        content,
+        "import { a } from \"./a\"; // about a\nimport { b } from \"./b\";\n\nexport const all = [a, b];\n"
+    );
+}
+
+#[test]
+fn organize_keeps_the_comments_of_a_removed_duplicate() {
+    let (resp, content) = organize_file(
+        "dup.ts",
+        "import { a } from \"./a\";\nimport { a } from \"./a\"; // dup\nimport { b } from \"./b\";\n\nexport const all = [a, b];\n",
+    );
+    assert_eq!(resp["removed_duplicates"], 1, "{resp:?}");
+    assert_eq!(
+        content,
+        "import { a } from \"./a\"; // dup\nimport { b } from \"./b\";\n\nexport const all = [a, b];\n"
+    );
+}
+
+#[test]
+fn organize_rust_merge_keeps_the_same_line_comment() {
+    let (_, content) = organize_file(
+        "merge.rs",
+        "use std::path::PathBuf; // pb\nuse std::path::Path;\n\nfn main() {}\n",
+    );
+    assert_eq!(
+        content,
+        "use std::path::{Path, PathBuf}; // pb\n\nfn main() {}\n"
+    );
+}
+
+#[test]
+fn organize_keeps_a_section_comment_followed_by_a_blank_line_as_a_boundary() {
+    let source =
+        "import B from \"b\";\n// section\n\nimport A from \"a\";\n\nexport const all = [A, B];\n";
+    let (_, content) = organize_file("section.ts", source);
+    assert_eq!(
+        content, source,
+        "a comment separated from the next import by a blank line still splits the sort"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #827 ast_grep_replace / ast_grep_search
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "fails today (#827): dry run reports success for a rewrite that apply refuses as invalid syntax"]
 fn ast_replace_dry_run_refuses_rewrite_that_apply_would_refuse() {
     let original = "foo(1, 2);\nfoo(3, 4);\n";
     let (_dir, root) = project(&[("dry.ts", original)]);
@@ -259,13 +328,23 @@ fn ast_replace_dry_run_refuses_rewrite_that_apply_would_refuse() {
         !text.contains("Would replace"),
         "the preview must not promise a replacement apply refuses:\n{text}"
     );
+    assert_eq!(preview["success"], false, "{preview:?}");
+    assert_eq!(preview["code"], "invalid_rewrite", "{preview:?}");
+    let file = fs::canonicalize(root.join("dry.ts")).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            "ast_replace: dry run: rewritten code failed syntax validation in {}; apply would refuse this rewrite (no files were written)",
+            file.display()
+        ),
+        "the preview must name the refused file"
+    );
     assert_eq!(fs::read_to_string(root.join("dry.ts")).unwrap(), original);
 
     aft.shutdown();
 }
 
 #[test]
-#[ignore = "fails today (#827): a variadic capture renders as its node texts joined by commas, punctuation included (`1,,,2`)"]
 fn ast_search_renders_variadic_capture_as_source_text() {
     let (_dir, root) = project(&[("search.ts", "foo(1, 2);\n")]);
     let mut aft = configured(&root);

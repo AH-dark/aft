@@ -1932,7 +1932,14 @@ fn format_ast_search(data: &Value) -> String {
                 }
                 if let Some(meta_vars) = m.get("meta_variables").and_then(Value::as_object) {
                     if !meta_vars.is_empty() {
+                        let capture_text = m.get("meta_variable_text").and_then(Value::as_object);
                         for (key, value) in meta_vars {
+                            // A `$$$` capture shows its source text, not its
+                            // node list, when the engine supplied it.
+                            let value = capture_text
+                                .and_then(|texts| texts.get(key))
+                                .filter(|text| text.is_string())
+                                .unwrap_or(value);
                             output.push_str(&format!(
                                 "  {}\n",
                                 format_ast_search_capture(key, value, match_text, line)
