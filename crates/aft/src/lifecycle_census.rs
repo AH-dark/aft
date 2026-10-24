@@ -105,6 +105,18 @@ impl LifecycleCensusCache {
             Err(std::sync::TryLockError::WouldBlock) => LifecycleCensusSnapshot::default(),
         }
     }
+
+    pub(crate) fn lsp_applicability_for_root(
+        &self,
+        root: &str,
+    ) -> Option<crate::lsp::manager::ApplicabilityMetrics> {
+        let snapshot = match self.snapshot.try_read() {
+            Ok(snapshot) => snapshot,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        snapshot.lsp.applicability_by_root.get(root).cloned()
+    }
 }
 
 /// Collect the process census after root contexts have been snapshotted by the

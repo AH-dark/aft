@@ -93,38 +93,55 @@ fn removal_health_for_status(req: &RawRequest) -> Option<serde_json::Value> {
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatusSnapshotKind {
+    Explicit,
+    Push,
+}
+
 impl AppContext {
     pub fn build_status_snapshot(&self) -> StatusPayload {
-        #[cfg(test)]
-        self.status_emitter()
-            .snapshot_builds
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.build_status_snapshot_for_session(DEFAULT_SESSION_ID)
     }
 
     pub fn build_status_snapshot_for_session(&self, session_id: &str) -> StatusPayload {
-        self.build_status_snapshot_with_counts(session_id, self.status_bar_count_values())
+        self.build_status_snapshot_with_counts(
+            session_id,
+            self.status_bar_count_values(),
+            StatusSnapshotKind::Explicit,
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn try_build_status_snapshot(&self) -> Option<StatusPayload> {
         let counts = self.try_status_bar_count_values()?;
-        #[cfg(test)]
-        self.status_emitter()
-            .snapshot_builds
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(self.build_status_snapshot_with_counts(DEFAULT_SESSION_ID, counts))
+        Some(self.build_status_snapshot_with_counts(
+            DEFAULT_SESSION_ID,
+            counts,
+            StatusSnapshotKind::Explicit,
+        ))
     }
 
     pub(crate) fn try_build_status_push_snapshot(&self) -> Option<StatusPayload> {
-        self.try_build_status_snapshot()
-            .map(|snapshot| crate::status_push::project(self, snapshot))
+        let counts = self.try_status_bar_count_values()?;
+        let snapshot = self.build_status_snapshot_with_counts(
+            DEFAULT_SESSION_ID,
+            counts,
+            StatusSnapshotKind::Push,
+        );
+        Some(crate::status_push::project(self, snapshot))
     }
 
     fn build_status_snapshot_with_counts(
         &self,
         session_id: &str,
         status_bar_values: crate::context::StatusBarCountValues,
+        kind: StatusSnapshotKind,
     ) -> StatusPayload {
+        #[cfg(test)]
+        self.status_emitter()
+            .snapshot_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let config = self.config();
 
         // Search index status. Status is a control-path snapshot, so lock
@@ -398,8 +415,6 @@ impl AppContext {
             0
         };
         let compression = self.compression_stats_for_session(session_id);
-        let (backup_skipped_too_large_total, backup_skipped_temp_path_total) =
-            crate::backup::backup_skipped_totals();
 
         // Degraded-mode reasons recorded by `handle_configure` when the
         // project root doesn't look like a real project (`home_root`). Heavy
@@ -417,7 +432,13 @@ impl AppContext {
         // Everything under the storage root that this build refused because a
         // newer build wrote it (or the reader floor requires a newer reader).
         let storage_root = crate::bash_background::storage_dir(config.storage_dir.as_deref());
-        let storage_refusals = crate::persisted_format::refusals_under(&storage_root);
+        // Push projection supplies only this project's refusals. Do not build
+        // the full-storage list that it would immediately discard.
+        let storage_refusals = if kind == StatusSnapshotKind::Explicit {
+            crate::persisted_format::refusals_under(&storage_root)
+        } else {
+            Vec::new()
+        };
         for refusal in &storage_refusals {
             // A single unreadable task does not disable bash for any other
             // task or session. Health still lists it by path below; a floor
@@ -519,46 +540,13 @@ impl AppContext {
         if let Some(reason) = diagnostics_reason {
             status_bar_values["diagnostics_reason"] = serde_json::json!(reason);
         }
-        let memory_root = self
-            .canonical_cache_root_opt()
-            .or_else(|| config.project_root.clone());
-        let callgraph_write_metrics = memory_root
-            .as_deref()
-            .and_then(|root| self.cached_artifact_cache_key(root))
-            .map(|project_key| {
-                crate::callgraph_store::callgraph_write_metrics_for_project(&project_key)
-            })
-            .unwrap_or_default();
-        let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
-        // `MemorySnapshot::new` uses the process-wide allocator observation so
-        // status never walks allocator zones on a request worker.
-        let memory = serde_json::to_value(self.memory_snapshot(memory_root.as_deref()))
-            .unwrap_or(serde_json::Value::Null);
         let watcher = serde_json::to_value(self.watcher_counters().snapshot())
             .unwrap_or(serde_json::Value::Null);
-        // The control-path status response reads the health worker's published
-        // lifecycle snapshot; it never probes processes or opens a database.
-        let lifecycle = self.app().lifecycle_census_snapshot();
-        let mut runtime = serde_json::json!({
+        let runtime = serde_json::json!({
             "live_watchers": self.app().watcher_count(),
             "live_actor_roots": self.app().actor_root_count(),
             "open_routes": self.app().open_route_count(),
-            "callgraph_commits_60s_total": callgraph_write_metrics_total.commits_60s,
-            "callgraph_pages_or_bytes_written_60s_total": callgraph_write_metrics_total
-                .pages_or_bytes_written_60s,
         });
-        #[cfg(unix)]
-        {
-            runtime["bash_spawn"] = crate::posix_spawn::health();
-        }
-        if callgraph_write_metrics.commits_60s > 0 {
-            runtime["callgraph_commits_60s"] =
-                serde_json::json!(callgraph_write_metrics.commits_60s);
-        }
-        if callgraph_write_metrics.pages_or_bytes_written_60s > 0 {
-            runtime["callgraph_pages_or_bytes_written_60s"] =
-                serde_json::json!(callgraph_write_metrics.pages_or_bytes_written_60s);
-        }
 
         let mut payload = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
@@ -570,9 +558,6 @@ impl AppContext {
             "artifact_owner": artifact_owner,
             "degraded": degraded,
             "degraded_reasons": degraded_reasons,
-            "storage_refusals": storage_refusals,
-            "storage_retention": crate::storage_retention::snapshot(&self.cache_dir()),
-            "git": crate::developer_tools::git_status_json(),
             "features": {
                 "format_on_edit": config.format_on_edit,
                 "validate_on_edit": config.validate_on_edit.as_deref().unwrap_or("off"),
@@ -590,13 +575,7 @@ impl AppContext {
             "disk": disk_info,
             "lsp_servers": lsp_count,
             "symbol_cache": symbol_cache_stats,
-            "memory": memory,
             "watcher": watcher,
-            "lsp": lifecycle.lsp,
-            "threads": lifecycle.threads,
-            "sqlite": lifecycle.sqlite,
-            "children": lifecycle.children,
-            "fds": lifecycle.fds,
             "runtime": runtime,
             "compression": compression,
             "storage_dir": storage_dir,
@@ -604,8 +583,6 @@ impl AppContext {
             "cache_unavailable_reason": self.cache_unavailable_reason().map(|reason| crate::root_cache::unavailable_code(&reason)),
             // Project-wide (all sessions): total in-memory checkpoint count.
             "checkpoints_total": checkpoint_total,
-            "backup_skipped_too_large_total": backup_skipped_too_large_total,
-            "backup_skipped_temp_path_total": backup_skipped_temp_path_total,
             // Current session slice: only when the caller passed `session_id`.
             "session": {
                 "id": session_id,
@@ -616,6 +593,71 @@ impl AppContext {
         if config.views.enabled {
             payload["views"] = serde_json::to_value(self.view_health_snapshot())
                 .unwrap_or(serde_json::Value::Null);
+        }
+        if kind == StatusSnapshotKind::Push {
+            // Read only this root's LSP applicability rather than cloning
+            // applicability for every root and the other lifecycle details.
+            let root = config.project_root.clone().unwrap_or_default();
+            let normalized = crate::inspect::job::canonicalize_normalized(&root)
+                .display()
+                .to_string();
+            let mut roots = serde_json::Map::new();
+            if let Some(own) = self.app().lifecycle_lsp_applicability_for_root(&normalized) {
+                roots.insert(normalized, serde_json::json!(own));
+            }
+            payload["lsp"] = serde_json::json!({"applicability_by_root": roots});
+        } else {
+            // Process details belong to explicit reads only. In particular,
+            // memory attribution walks every registered project's context.
+            let memory_root = self
+                .canonical_cache_root_opt()
+                .or_else(|| config.project_root.clone());
+            let callgraph_write_metrics = memory_root
+                .as_deref()
+                .and_then(|root| self.cached_artifact_cache_key(root))
+                .map(|project_key| {
+                    crate::callgraph_store::callgraph_write_metrics_for_project(&project_key)
+                })
+                .unwrap_or_default();
+            let callgraph_write_metrics_total =
+                crate::callgraph_store::callgraph_write_metrics_total();
+            // The allocator observation is cached; attribution still walks roots.
+            payload["memory"] = serde_json::to_value(self.memory_snapshot(memory_root.as_deref()))
+                .unwrap_or(serde_json::Value::Null);
+            // The health worker publishes lifecycle details off the reply path.
+            let lifecycle = self.app().lifecycle_census_snapshot();
+            payload["lsp"] = serde_json::json!(lifecycle.lsp);
+            payload["threads"] = serde_json::json!(lifecycle.threads);
+            payload["sqlite"] = serde_json::json!(lifecycle.sqlite);
+            payload["children"] = serde_json::json!(lifecycle.children);
+            payload["fds"] = serde_json::json!(lifecycle.fds);
+            payload["storage_refusals"] = serde_json::json!(storage_refusals);
+            payload["storage_retention"] =
+                serde_json::json!(crate::storage_retention::snapshot(&self.cache_dir()));
+            payload["git"] = crate::developer_tools::git_status_json();
+            let (backup_skipped_too_large_total, backup_skipped_temp_path_total) =
+                crate::backup::backup_skipped_totals();
+            payload["backup_skipped_too_large_total"] =
+                serde_json::json!(backup_skipped_too_large_total);
+            payload["backup_skipped_temp_path_total"] =
+                serde_json::json!(backup_skipped_temp_path_total);
+            let runtime = &mut payload["runtime"];
+            runtime["callgraph_commits_60s_total"] =
+                serde_json::json!(callgraph_write_metrics_total.commits_60s);
+            runtime["callgraph_pages_or_bytes_written_60s_total"] =
+                serde_json::json!(callgraph_write_metrics_total.pages_or_bytes_written_60s);
+            #[cfg(unix)]
+            {
+                runtime["bash_spawn"] = crate::posix_spawn::health();
+            }
+            if callgraph_write_metrics.commits_60s > 0 {
+                runtime["callgraph_commits_60s"] =
+                    serde_json::json!(callgraph_write_metrics.commits_60s);
+            }
+            if callgraph_write_metrics.pages_or_bytes_written_60s > 0 {
+                runtime["callgraph_pages_or_bytes_written_60s"] =
+                    serde_json::json!(callgraph_write_metrics.pages_or_bytes_written_60s);
+            }
         }
         payload
     }
@@ -706,6 +748,134 @@ mod tests {
             session_id: None,
             params: json!({}),
         }
+    }
+
+    fn registered_status_contexts(
+        count: usize,
+    ) -> (tempfile::TempDir, Vec<std::sync::Arc<AppContext>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let app = crate::context::App::default_shared();
+        let contexts = (0..count)
+            .map(|i| {
+                let root = dir.path().join(format!("project-{i}"));
+                std::fs::create_dir(&root).unwrap();
+                let mut config = Config::default();
+                config.project_root = Some(root.clone());
+                config.storage_dir = Some(dir.path().join("storage"));
+                config.backup.enabled = Some(false);
+                let ctx = std::sync::Arc::new(AppContext::from_app(app.clone(), config));
+                // Actor registration keys the census by project identity, not
+                // the caller's spelling of a temporary or symlinked path.
+                let memory_root = cortexkit_paths::ProjectRootId::from_path(&root)
+                    .expect("fixture root identity")
+                    .as_path()
+                    .to_path_buf();
+                app.register_memory_context(memory_root, &ctx);
+                ctx
+            })
+            .collect();
+        (dir, contexts)
+    }
+
+    #[test]
+    fn status_push_skips_process_census_but_explicit_status_builds_one() {
+        use std::sync::atomic::Ordering;
+
+        let (_dir, contexts) = registered_status_contexts(2);
+        let ctx = &contexts[0];
+        let census_builds = &ctx.status_emitter().memory_census_builds;
+        let push = ctx.try_build_status_push_snapshot().unwrap();
+        assert_eq!(
+            census_builds.load(Ordering::Relaxed),
+            0,
+            "push built a process census"
+        );
+        assert!(push.get("memory").is_none());
+
+        let explicit = handle_status(&request(), ctx).data;
+        assert_eq!(census_builds.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            explicit["memory"]["roots_total"],
+            2,
+            "memory root keys: {:?}",
+            explicit["memory"]["roots"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ctx.try_build_status_push_snapshot().unwrap(),
+            crate::status_push::project(ctx, explicit)
+        );
+        assert_eq!(census_builds.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn status_memory_actor_registration_keeps_one_row_for_aliased_current_root() {
+        use cortexkit_paths::ProjectRootId;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        #[cfg(unix)]
+        let root = {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&real, &alias).unwrap();
+            alias
+        };
+        #[cfg(windows)]
+        let root = std::fs::canonicalize(&real).unwrap();
+        let root_id = ProjectRootId::from_path(&root).unwrap();
+        assert_ne!(root, root_id.as_path());
+
+        let app = crate::context::App::default_shared();
+        let mut config = Config::default();
+        config.project_root = Some(root.clone());
+        config.storage_dir = Some(dir.path().join("storage"));
+        config.backup.enabled = Some(false);
+        let ctx = Arc::new(AppContext::from_app(app.clone(), config));
+        let executor = crate::executor::Executor::new();
+        assert!(executor.register_actor(root_id.clone(), ctx.clone()));
+        let registered: Vec<_> = app
+            .try_memory_contexts()
+            .unwrap()
+            .into_iter()
+            .map(|(root, _)| root)
+            .collect();
+        eprintln!("configured root: {root:?}; actor census keys: {registered:?}");
+        assert_eq!(registered, vec![root_id.as_path().to_path_buf()]);
+
+        let explicit = handle_status(&request(), &ctx).data;
+        let roots = explicit["memory"]["roots"].as_object().unwrap();
+        eprintln!(
+            "explicit memory root keys: {:?}",
+            roots.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(explicit["memory"]["roots_total"], 1);
+        assert!(roots.contains_key(&root_id.as_path().display().to_string()));
+    }
+
+    #[test]
+    #[ignore = "manual push snapshot timing with 200 registered projects"]
+    fn status_push_snapshot_time_with_200_projects() {
+        let (_dir, contexts) = registered_status_contexts(200);
+        let ctx = &contexts[0];
+        assert_eq!(ctx.app().try_memory_contexts().unwrap().len(), 200);
+        for _ in 0..5 {
+            std::hint::black_box(ctx.try_build_status_push_snapshot().unwrap());
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..50 {
+            std::hint::black_box(ctx.try_build_status_push_snapshot().unwrap());
+        }
+        eprintln!(
+            "200 projects, 50 push snapshots: {:?} total, {:?}/push",
+            start.elapsed(),
+            start.elapsed() / 50
+        );
     }
 
     #[test]
