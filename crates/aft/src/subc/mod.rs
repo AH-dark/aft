@@ -5150,12 +5150,7 @@ where
         // Merge queued and overflow updates before retrying pending status.
         // A slow writer must get the newest state, not an older pending copy
         // followed by the update that was already waiting in the channel.
-        let overflow_batch = lossy_overflow.drain();
-        let mut batch = Vec::new();
-        while let Ok(item) = lossy_rx.try_recv() {
-            batch.push(item);
-        }
-        batch.extend(overflow_batch);
+        let batch = push::drain_lossy_push_batch(&mut lossy_rx, &lossy_overflow);
         if !batch.is_empty() {
             let (processed, deferred) = push::drain_reliable_push_turn(
                 &writer_tx,
@@ -5973,10 +5968,7 @@ where
                 // combined batch is sorted back into producer order before
                 // coalescing drops stale updates for the same key.
                 let mut batch = vec![(order, root_id, frame)];
-                while let Ok(item) = lossy_rx.try_recv() {
-                    batch.push(item);
-                }
-                batch.extend(lossy_overflow.drain());
+                batch.extend(push::drain_lossy_push_batch(&mut lossy_rx, &lossy_overflow));
                 push::process_lossy_push_envelope_batch(
                     &writer_tx,
                     &dispatch_path_metrics,
