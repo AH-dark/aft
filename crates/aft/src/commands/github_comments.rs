@@ -371,6 +371,7 @@ fn apply_comment_match(
             &matches,
             match_text,
             replacement,
+            None,
         )
         .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))?;
         Ok((updated, matches.len()))
@@ -383,6 +384,7 @@ fn apply_comment_match(
             matched,
             match_text,
             replacement,
+            None,
         )
         .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))?;
         let updated = crate::edit::replace_byte_range(

@@ -87,7 +87,14 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let line_offsets = edit::LineOffsets::new(&source);
     for (i, edit_val) in edits.iter().enumerate() {
-        match resolve_edit_with_offsets(&source, &line_offsets, edit_val, i, &req.id) {
+        match resolve_edit_with_offsets(
+            &source,
+            &line_offsets,
+            edit_val,
+            i,
+            &req.id,
+            Some(path.as_path()),
+        ) {
             Ok(item_edits) => resolved.extend(item_edits),
             Err(resp) => return resp,
         }
@@ -378,7 +385,7 @@ fn resolve_edit(
     req_id: &str,
 ) -> Result<Vec<ResolvedEdit>, Response> {
     let line_offsets = edit::LineOffsets::new(source);
-    resolve_edit_with_offsets(source, &line_offsets, edit_val, index, req_id)
+    resolve_edit_with_offsets(source, &line_offsets, edit_val, index, req_id, None)
 }
 
 /// Resolve one edit, reusing line starts computed once for the whole batch.
@@ -388,6 +395,7 @@ fn resolve_edit_with_offsets(
     edit_val: &serde_json::Value,
     index: usize,
     req_id: &str,
+    path: Option<&Path>,
 ) -> Result<Vec<ResolvedEdit>, Response> {
     // Detect edit type: match-replace or line-range
     // Accept both "match"/"replacement" and "oldString"/"newString" (backward compat)
@@ -478,6 +486,7 @@ fn resolve_edit_with_offsets(
                     m,
                     match_str,
                     replacement,
+                    path,
                 )
                 .map_err(|error| {
                     Response::error(
@@ -1184,7 +1193,8 @@ mod audit11_regressions {
         let offsets = edit::LineOffsets::new(source);
         let edit = serde_json::json!({"line_start": 2, "line_end": 2, "content": "new"});
         for _ in 0..100 {
-            let resolved = resolve_edit_with_offsets(source, &offsets, &edit, 0, "test").unwrap();
+            let resolved =
+                resolve_edit_with_offsets(source, &offsets, &edit, 0, "test", None).unwrap();
             assert_eq!((resolved[0].byte_start, resolved[0].byte_end), (10, 14));
             let content =
                 edit::replace_byte_range(source, 10, 14, &resolved[0].replacement).unwrap();

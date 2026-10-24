@@ -1407,16 +1407,19 @@ fn fuzzy_replacement_restores_newline(
 /// match's indentation shift (see [`crate::fuzzy_match::reindent_replacement`]),
 /// with line separators adjusted so the match boundary neither loses nor
 /// doubles a newline. Fails with `ambiguous_indentation` when the shift cannot
-/// be determined without guessing.
+/// be determined without guessing. `path` is the edited file, whose language
+/// decides which lines are inside multi-line strings; `None` for text without
+/// string literals, such as a GitHub comment.
 pub(crate) fn push_fuzzy_replacement(
     output: &mut String,
     source: &str,
     matched: &crate::fuzzy_match::FuzzyMatch,
     needle: &str,
     replacement: &str,
+    path: Option<&Path>,
 ) -> Result<(), crate::error::AftError> {
     let replacement =
-        &*crate::fuzzy_match::reindent_replacement(source, needle, matched, replacement)?;
+        &*crate::fuzzy_match::reindent_replacement(source, needle, matched, replacement, path)?;
     let end = matched.byte_start + matched.byte_len;
     // When the match leaves the source line separator outside its span, a
     // replacement ending in a newline must not introduce a second separator.
@@ -1443,6 +1446,7 @@ pub(crate) fn apply_sorted_non_overlapping_fuzzy_matches(
     matches: &[crate::fuzzy_match::FuzzyMatch],
     needle: &str,
     replacement: &str,
+    path: Option<&Path>,
 ) -> Result<String, crate::error::AftError> {
     let mut removed_bytes = 0usize;
     let mut replacement_bytes = 0usize;
@@ -1466,7 +1470,7 @@ pub(crate) fn apply_sorted_non_overlapping_fuzzy_matches(
     let mut copied_through = 0usize;
     for matched in matches {
         result.push_str(&source[copied_through..matched.byte_start]);
-        push_fuzzy_replacement(&mut result, source, matched, needle, replacement)?;
+        push_fuzzy_replacement(&mut result, source, matched, needle, replacement, path)?;
         copied_through = matched.byte_start + matched.byte_len;
     }
     result.push_str(&source[copied_through..]);
@@ -1649,6 +1653,7 @@ fn handle_single_file_edit_match(
             &fuzzy_matches,
             match_str,
             replacement,
+            Some(path.as_path()),
         ) {
             Ok(updated) => updated,
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
@@ -1664,6 +1669,7 @@ fn handle_single_file_edit_match(
             matched,
             match_str,
             replacement,
+            Some(path.as_path()),
         ) {
             return Response::error(&req.id, e.code(), e.to_string());
         }
@@ -1884,9 +1890,14 @@ mod replace_all_tests {
                 "fixture must exercise replace_all: {needle:?}"
             );
             let expected = frozen_reverse_apply(source, &matches, replacement);
-            let actual =
-                apply_sorted_non_overlapping_fuzzy_matches(source, &matches, needle, replacement)
-                    .expect("one-pass replacement");
+            let actual = apply_sorted_non_overlapping_fuzzy_matches(
+                source,
+                &matches,
+                needle,
+                replacement,
+                None,
+            )
+            .expect("one-pass replacement");
             assert_eq!(actual.as_bytes(), expected.as_bytes(), "needle={needle:?}");
         }
     }
@@ -1898,7 +1909,7 @@ mod replace_all_tests {
         assert_eq!(matches.len(), 1_024);
 
         let (result, allocations) = crate::test_allocations::count(|| {
-            apply_sorted_non_overlapping_fuzzy_matches(&source, &matches, "old", "new")
+            apply_sorted_non_overlapping_fuzzy_matches(&source, &matches, "old", "new", None)
                 .expect("one-pass replacement")
         });
 
@@ -2188,14 +2199,17 @@ mod audit_regressions {
                 source,
                 &matches,
                 "a\nb\n",
-                "x\r\ny\r\n"
+                "x\r\ny\r\n",
+                None,
             )
             .unwrap(),
             "x\r\ny\r\nc\r\n"
         );
         assert_eq!(
-            super::apply_sorted_non_overlapping_fuzzy_matches(source, &matches, "a\nb\n", "x\ny\n")
-                .unwrap(),
+            super::apply_sorted_non_overlapping_fuzzy_matches(
+                source, &matches, "a\nb\n", "x\ny\n", None
+            )
+            .unwrap(),
             "x\ny\r\nc\r\n"
         );
     }

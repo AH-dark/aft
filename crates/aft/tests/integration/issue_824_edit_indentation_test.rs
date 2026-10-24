@@ -449,3 +449,81 @@ fn issue_824_python_validation_has_no_false_rejections_on_corpus() {
     assert!(checked > 0, "corpus list named no readable files");
     assert!(rejected.is_empty(), "false rejections: {rejected:?}");
 }
+
+/// Re-indenting a loose match must not change the value of a multi-line
+/// string literal that `newString` opens: the lines inside it keep exactly
+/// the text the agent wrote, while code lines around it are shifted. Covers
+/// Python triple-quoted strings, TypeScript template literals, Rust raw
+/// strings and bash heredocs.
+#[test]
+fn issue_824_reindent_leaves_multiline_string_contents_alone() {
+    let cases = [
+        (
+            "python triple-quoted string",
+            "t.py",
+            "def f():\n    a = 1\n    b = 2\n    return b\n",
+            "a = 1\nb = 2",
+            "a = \"\"\"\nhello\n\"\"\"\nb = 2",
+            "def f():\n    a = \"\"\"\nhello\n\"\"\"\n    b = 2\n    return b\n",
+        ),
+        (
+            "typescript template literal",
+            "t.ts",
+            "function f() {\n  const a = 1;\n  return a;\n}\n",
+            "const a = 1;\nreturn a;",
+            "const a = `x\ny`;\nreturn a;",
+            "function f() {\n  const a = `x\ny`;\n  return a;\n}\n",
+        ),
+        (
+            "rust raw string",
+            "t.rs",
+            "fn f() -> &'static str {\n    let a = \"\";\n    a\n}\n",
+            "let a = \"\";\na",
+            "let a = r#\"x\ny\"#;\na",
+            "fn f() -> &'static str {\n    let a = r#\"x\ny\"#;\n    a\n}\n",
+        ),
+        (
+            "bash heredoc",
+            "t.sh",
+            "f() {\n  echo a\n  echo b\n}\n",
+            "echo a\necho b",
+            "cat <<EOF\nhi\nEOF\necho b",
+            "f() {\n  cat <<EOF\nhi\nEOF\n  echo b\n}\n",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for shape in SHAPES {
+        for (label, name, before, old, new, expected) in cases {
+            let run = run_edit(shape, name, before, old, new);
+            if run.after != expected || run.reply["success"] != true {
+                failures.push(format!(
+                    "{shape:?} {label}: expected {expected:?}, got {:?}; reply: {:?}",
+                    run.after,
+                    reply_text(&run.reply)
+                ));
+            }
+        }
+    }
+    assert_no_failures(failures);
+}
+
+/// A loose match that falls inside a multi-line string the file already
+/// has gives no way to tell whether the agent meant the string's text as
+/// written or at the file's depth, so the edit is refused instead of
+/// changing the string either way.
+#[test]
+fn issue_824_loose_match_inside_existing_multiline_string_is_refused() {
+    let before = "def f():\n    s = \"\"\"\n        one\n        two\n    \"\"\"\n    return s\n";
+    let mut failures = Vec::new();
+    for shape in SHAPES {
+        let run = run_edit(shape, "t.py", before, "one\ntwo", "one\ntwo\nthree");
+        if run.reply["code"] != "ambiguous_indentation" || run.after != before {
+            failures.push(format!(
+                "{shape:?}: expected an ambiguous_indentation refusal, got {:?}; file {:?}",
+                reply_text(&run.reply),
+                run.after
+            ));
+        }
+    }
+    assert_no_failures(failures);
+}
