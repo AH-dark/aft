@@ -3,27 +3,36 @@ use super::*;
 use crate::db::remote_exec::{self as store, PolicyKey};
 
 pub(super) fn key(identity: &RouteIdentity, preset: Option<&str>) -> Option<PolicyKey> {
+    policy_key(identity, preset).ok()
+}
+
+fn policy_key(identity: &RouteIdentity, preset: Option<&str>) -> Result<PolicyKey, &'static str> {
     // A codemode call is confined exactly as its head agent's route is.
     let identity = identity
         .run_owner
         .as_ref()
         .map_or(identity, |owner| &owner.head);
-    let scope = identity.scope.as_ref()?;
     if preset != Some("worker") {
-        return None;
+        return Err("missing:preset");
     }
     let principal = match &identity.spawn_principal {
         AuthenticatedPrincipal::RouteBind {
             principal_id: Some(principal),
             ..
-        } => principal.clone(),
-        _ => return None,
+        } => Some(principal),
+        _ => None,
     };
-    Some(PolicyKey {
+    let (scope, principal) = match (identity.scope.as_ref(), principal) {
+        (Some(scope), Some(principal)) => (scope, principal),
+        (None, Some(_)) => return Err("missing:scope"),
+        (Some(_), None) => return Err("missing:principal"),
+        (None, None) => return Err("missing:scope,principal"),
+    };
+    Ok(PolicyKey {
         project_root: identity.project_root.display().to_string(),
         harness: identity.harness.clone(),
         session: identity.session.clone(),
-        principal,
+        principal: principal.clone(),
         owner: serde_json::to_string(&scope.owner).expect("scope owner serializes"),
         scope_ref: scope.scope_ref.clone(),
         epoch: scope.scope_epoch,
@@ -181,31 +190,110 @@ pub(super) fn catalog(
     // Render from the policy available to this session, including on a
     // paramless refetch after its worker plan has already been persisted.
     // Head sessions use the user setting; worker sessions cannot borrow it.
-    let offered = cfg!(unix)
-        && ctx.config().bash.runon_enabled
-        && !ctx.config().remote_exec.project_off
-        && matches!(identity.trust, BindTrust::FirstParty)
-        && lookup(ctx, &source(identity, Some(&preset))).is_some_and(|launch| {
-            launch
-                .params
-                .remote_exec
-                .as_ref()
-                .is_some_and(|policy| policy.enabled)
-        });
-    let render = if confined(ctx, identity)? {
+    let runon_enabled = ctx.config().bash.runon_enabled;
+    let project_off = ctx.config().remote_exec.project_off;
+    let runon = catalog_runon_policy(ctx, identity, &preset, runon_enabled, project_off);
+    let is_confined = confined(ctx, identity)?;
+    let render = if is_confined {
         tool_provider::catalog_for_confined_request
     } else {
         tool_provider::catalog_for_request
     };
-    render(
+    let answer = render(
         request,
         catalog_preset,
         &identity.disabled_tools,
         powershell,
-        offered,
+        runon.is_ok(),
         ctx.config().revision_reads,
         worker_wait_max_ms,
-    )
+    )?;
+    // Digest-only replies have no tools array. For those, use the renderer's
+    // tool selection and its confinement filter to describe the full catalog.
+    let bash_in_catalog = answer
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| tools.iter().any(|tool| tool["name"] == "bash"))
+        .unwrap_or_else(|| {
+            !is_confined
+                && tool_provider::tools_for_session(
+                    catalog_preset,
+                    &identity.disabled_tools,
+                    powershell,
+                    runon.is_ok(),
+                    ctx.config().revision_reads,
+                )
+                .iter()
+                .any(|tool| tool.name == "bash")
+        });
+    let served_runon = runon.and_then(|()| {
+        if catalog_preset == tool_provider::CatalogPreset::Reader {
+            Err("preset")
+        } else if !bash_in_catalog {
+            Err("bash_in_catalog")
+        } else {
+            Ok(())
+        }
+    });
+    let remote_exec_param = match original.get("remote_exec") {
+        None => "absent",
+        Some(value) if value.get("enabled") == Some(&Value::Bool(true)) => "enabled",
+        Some(_) => "disabled",
+    };
+    crate::log_ctx::with_session(Some(identity.session.clone()), || {
+        crate::slog_info!(
+            "catalog runon: session={:?} preset={} remote_exec_param={} key={} bind={} runon_enabled={} project_off={} bash_in_catalog={} offered={} first_failed={}",
+            identity.session,
+            catalog_preset.name(),
+            remote_exec_param,
+            policy_key(identity, Some(&preset)).err().unwrap_or("complete"),
+            if matches!(identity.trust, BindTrust::FirstParty) { "first_party" } else { "other" },
+            runon_enabled,
+            project_off,
+            bash_in_catalog,
+            served_runon.is_ok(),
+            served_runon.err().unwrap_or("none"),
+        );
+    });
+    Ok(answer)
+}
+
+// Keep the policy gates in their original short-circuit order. Both schema
+// selection and the diagnostic consume this result; request params alone do
+// not describe a saved worker policy or a head's user-config policy.
+fn catalog_runon_policy(
+    ctx: &AppContext,
+    identity: &RouteIdentity,
+    preset: &str,
+    runon_enabled: bool,
+    project_off: bool,
+) -> Result<(), &'static str> {
+    if !cfg!(unix) {
+        return Err("platform");
+    }
+    if !runon_enabled {
+        return Err("runon_enabled");
+    }
+    if project_off {
+        return Err("project_off");
+    }
+    if !matches!(identity.trust, BindTrust::FirstParty) {
+        return Err("bind");
+    }
+    let source = source(identity, Some(preset));
+    if matches!(source, RemoteSource::Worker(None)) {
+        return Err("key");
+    }
+    if !lookup(ctx, &source).is_some_and(|launch| {
+        launch
+            .params
+            .remote_exec
+            .as_ref()
+            .is_some_and(|policy| policy.enabled)
+    }) {
+        return Err("remote_exec");
+    }
+    Ok(())
 }
 
 pub(super) fn confined_tool(name: &str) -> bool {

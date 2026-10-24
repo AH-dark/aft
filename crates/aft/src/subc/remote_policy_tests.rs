@@ -932,6 +932,336 @@ fn fetch(plan: &Value) -> Value {
     json!({"op":"tool.catalog","preset":"worker","params":plan["tool_items"][0]["params"],"composition":plan["composition"]})
 }
 
+#[cfg(unix)]
+mod catalog_runon_log_tests {
+    use super::*;
+
+    struct Case {
+        _root: tempfile::TempDir,
+        _storage: tempfile::TempDir,
+        ctx: AppContext,
+        route: RouteIdentity,
+        request: Value,
+    }
+
+    impl Case {
+        fn worker(params: Value) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let ctx = context(root.path(), storage.path(), None);
+            let route = identity(root.path(), "catalog-diagnostic", 7, true);
+            let request = json!({"preset":"worker", "params":params});
+            catalog(request.clone(), &route, &ctx).unwrap();
+            Self {
+                _root: root,
+                _storage: storage,
+                ctx,
+                route,
+                request,
+            }
+        }
+
+        fn enabled() -> Self {
+            Self::worker(json!({"remote_exec":{"enabled":true}}))
+        }
+
+        fn before_diagnostics(&self) -> Value {
+            let preset = self.request["preset"].as_str().unwrap_or("head");
+            // Preserve the pre-diagnostic predicate as an independent snapshot
+            // oracle: logging must not change tools, descriptions or digests.
+            let offered = cfg!(unix)
+                && self.ctx.config().bash.runon_enabled
+                && !self.ctx.config().remote_exec.project_off
+                && matches!(self.route.trust, BindTrust::FirstParty)
+                && lookup(&self.ctx, &source(&self.route, Some(preset))).is_some_and(|launch| {
+                    launch
+                        .params
+                        .remote_exec
+                        .as_ref()
+                        .is_some_and(|policy| policy.enabled)
+                });
+            let mut request = self.request.clone();
+            if let Some(params) = request.get_mut("params").and_then(Value::as_object_mut) {
+                params.remove("remote_exec");
+                params.remove("confine");
+            }
+            let (request, preset) = tool_provider::validate_catalog_request(request).unwrap();
+            let render = if confined(&self.ctx, &self.route).unwrap() {
+                tool_provider::catalog_for_confined_request
+            } else {
+                tool_provider::catalog_for_request
+            };
+            render(
+                request,
+                preset,
+                &self.route.disabled_tools,
+                crate::bash_background::powershell_available(),
+                offered,
+                self.ctx.config().revision_reads,
+                self.ctx.config().bash.worker_wait_max_ms,
+            )
+            .unwrap()
+        }
+
+        fn check(
+            &self,
+            first_failed: &str,
+            remote_exec_param: &str,
+            key_status: &str,
+            offered: bool,
+        ) -> String {
+            let before = self.before_diagnostics();
+            let (answer, lines) = crate::logging::capture_log_lines(|| {
+                catalog(self.request.clone(), &self.route, &self.ctx).unwrap()
+            });
+            assert_eq!(
+                serde_json::to_vec(&answer["tools"]).unwrap(),
+                serde_json::to_vec(&before["tools"]).unwrap(),
+                "catalog tools changed after adding diagnostics"
+            );
+            assert_eq!(answer, before, "agent-visible catalog changed");
+            let diagnostics: Vec<_> = lines
+                .iter()
+                .filter(|line| line.contains("catalog runon:"))
+                .collect();
+            assert_eq!(diagnostics.len(), 1, "captured logs: {lines:?}");
+            let line = diagnostics[0];
+            assert!(line.starts_with("INFO "), "{line}");
+            for field in [
+                "session=\"catalog-diagnostic\"".to_owned(),
+                format!(
+                    "preset={}",
+                    self.request["preset"].as_str().unwrap_or("head")
+                ),
+                format!("first_failed={first_failed}"),
+                format!("remote_exec_param={remote_exec_param}"),
+                format!("key={key_status}"),
+                format!("offered={offered}"),
+                format!("runon_enabled={}", self.ctx.config().bash.runon_enabled),
+                format!("project_off={}", self.ctx.config().remote_exec.project_off),
+                format!(
+                    "bind={}",
+                    if matches!(self.route.trust, BindTrust::FirstParty) {
+                        "first_party"
+                    } else {
+                        "other"
+                    }
+                ),
+            ] {
+                assert!(
+                    line.split_whitespace().any(|word| word == field),
+                    "missing {field}: {line}"
+                );
+            }
+            assert!(
+                !line.contains(&self.route.project_root.display().to_string()),
+                "{line}"
+            );
+            if let Some(tools) = answer["tools"].as_array() {
+                let bash = tools.iter().find(|tool| tool["name"] == "bash");
+                assert!(
+                    line.contains(&format!("bash_in_catalog={}", bash.is_some())),
+                    "{line}"
+                );
+                assert_eq!(
+                    bash.is_some_and(|bash| bash["input_schema"]["properties"]
+                        .get("runon")
+                        .is_some()),
+                    offered,
+                    "logged offer disagrees with served schema: {line}"
+                );
+            }
+            line.to_string()
+        }
+    }
+
+    #[test]
+    fn preset_gate() {
+        let mut case = Case::enabled();
+        case.request = json!({"preset":"reader"});
+        case.ctx
+            .update_config(|config| config.remote_exec.enabled = true);
+        case.check("preset", "absent", "missing:preset", false);
+    }
+
+    #[test]
+    fn absent_remote_exec_gate() {
+        Case::worker(json!({})).check("remote_exec", "absent", "complete", false);
+    }
+
+    #[test]
+    fn disabled_remote_exec_gate() {
+        Case::worker(json!({"remote_exec":{"enabled":false}})).check(
+            "remote_exec",
+            "disabled",
+            "complete",
+            false,
+        );
+    }
+
+    #[test]
+    fn missing_scope_key_gate() {
+        let mut case = Case::enabled();
+        Arc::get_mut(&mut case.route.0).unwrap().scope = None;
+        case.check("key", "enabled", "missing:scope", false);
+    }
+
+    #[test]
+    fn missing_principal_key_gate() {
+        let mut case = Case::enabled();
+        let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+            &mut Arc::get_mut(&mut case.route.0).unwrap().spawn_principal
+        else {
+            panic!("route bind")
+        };
+        *principal_id = None;
+        case.check("key", "enabled", "missing:principal", false);
+    }
+
+    #[test]
+    fn missing_scope_and_principal_key_gate() {
+        let mut case = Case::enabled();
+        let route = Arc::get_mut(&mut case.route.0).unwrap();
+        route.scope = None;
+        let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut route.spawn_principal
+        else {
+            panic!("route bind")
+        };
+        *principal_id = None;
+        case.check("key", "enabled", "missing:scope,principal", false);
+    }
+
+    #[test]
+    fn bind_gate() {
+        let mut case = Case::enabled();
+        Arc::get_mut(&mut case.route.0).unwrap().trust = BindTrust::Untrusted;
+        case.check("bind", "enabled", "complete", false);
+    }
+
+    #[test]
+    fn runon_enabled_gate() {
+        let case = Case::enabled();
+        case.ctx
+            .update_config(|config| config.bash.runon_enabled = false);
+        case.check("runon_enabled", "enabled", "complete", false);
+    }
+
+    #[test]
+    fn project_off_gate() {
+        let case = Case::enabled();
+        case.ctx
+            .update_config(|config| config.remote_exec.project_off = true);
+        case.check("project_off", "enabled", "complete", false);
+    }
+
+    #[test]
+    fn bash_disabled_gate() {
+        let mut case = Case::enabled();
+        Arc::get_mut(&mut case.route.0).unwrap().disabled_tools = Arc::new(vec!["bash".into()]);
+        case.check("bash_in_catalog", "enabled", "complete", false);
+    }
+
+    #[test]
+    fn bash_confined_gate() {
+        Case::worker(json!({"remote_exec":{"enabled":true}, "confine":"root"})).check(
+            "bash_in_catalog",
+            "enabled",
+            "complete",
+            false,
+        );
+    }
+
+    #[test]
+    fn enabled_worker_and_paramless_refetch() {
+        let mut case = Case::enabled();
+        case.check("none", "enabled", "complete", true);
+        case.request = json!({"preset":"worker"});
+        case.check("none", "absent", "complete", true);
+    }
+
+    #[test]
+    fn head_uses_user_policy_not_worker_key_or_params() {
+        let mut case = Case::enabled();
+        Arc::get_mut(&mut case.route.0).unwrap().scope = None;
+        case.request = json!({});
+        case.ctx
+            .update_config(|config| config.remote_exec.enabled = true);
+        case.check("none", "absent", "missing:preset", true);
+    }
+
+    #[test]
+    fn digest_only_answer_logs_once() {
+        let mut case = Case::enabled();
+        case.request["digest_only"] = json!(true);
+        let line = case.check("none", "enabled", "complete", true);
+        assert!(line.contains("bash_in_catalog=true"), "{line}");
+    }
+
+    #[test]
+    fn digest_only_confined_answer_has_no_bash() {
+        let mut case = Case::worker(json!({"remote_exec":{"enabled":true}, "confine":"root"}));
+        case.request["digest_only"] = json!(true);
+        let line = case.check("bash_in_catalog", "enabled", "complete", false);
+        assert!(line.contains("bash_in_catalog=false"), "{line}");
+    }
+
+    #[test]
+    fn digest_only_disabled_bash_answer_has_no_bash() {
+        let mut case = Case::enabled();
+        case.request["digest_only"] = json!(true);
+        Arc::get_mut(&mut case.route.0).unwrap().disabled_tools = Arc::new(vec!["bash".into()]);
+        let line = case.check("bash_in_catalog", "enabled", "complete", false);
+        assert!(line.contains("bash_in_catalog=false"), "{line}");
+    }
+
+    #[test]
+    fn disabled_head_user_policy_gate() {
+        let mut case = Case::enabled();
+        case.request = json!({"preset":"head"});
+        case.check("remote_exec", "absent", "missing:preset", false);
+    }
+}
+
+#[cfg(not(unix))]
+#[test]
+fn catalog_runon_log_platform_gate() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let route = identity(root.path(), "catalog-diagnostic", 7, true);
+    let (request, preset) =
+        tool_provider::validate_catalog_request(json!({"preset":"worker"})).unwrap();
+    let before = tool_provider::catalog_for_request(
+        request,
+        preset,
+        &route.disabled_tools,
+        crate::bash_background::powershell_available(),
+        false,
+        ctx.config().revision_reads,
+        ctx.config().bash.worker_wait_max_ms,
+    )
+    .unwrap();
+    let (answer, lines) = crate::logging::capture_log_lines(|| {
+        catalog(
+            json!({"preset":"worker","params":{"remote_exec":{"enabled":true}}}),
+            &route,
+            &ctx,
+        )
+        .unwrap()
+    });
+    assert_eq!(answer, before, "agent-visible catalog changed");
+    let lines: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("catalog runon:"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("INFO "), "{lines:?}");
+    assert!(
+        lines[0].contains("offered=false first_failed=platform"),
+        "{lines:?}"
+    );
+}
+
 #[test]
 fn worker_reply_deadlines_track_resolved_config_only() {
     let root = tempfile::tempdir().unwrap();
