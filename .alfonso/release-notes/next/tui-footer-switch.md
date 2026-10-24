@@ -1,0 +1,1 @@
+- The AFT health line in the OpenCode prompt footer can be turned off with `"footer": false` in the `aft` entry of tui-preferences.jsonc.
