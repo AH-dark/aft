@@ -71,7 +71,7 @@ fn organize_python_trailing_comment_does_not_split_stdlib_group() {
         &mut aft,
         "org-py-noqa",
         "import",
-        json!({ "op": "organize", "filePath": "case.py" }),
+        json!({ "op": "organize", "path": "case.py" }),
     );
     assert_eq!(resp["success"], true, "organize should succeed: {resp:?}");
     let content = fs::read_to_string(root.join("case.py")).unwrap();
@@ -118,7 +118,7 @@ fn organize_python_sorts_group_by_module_not_raw_text() {
         &mut aft,
         "org-py-sort",
         "import",
-        json!({ "op": "organize", "filePath": "sorting.py" }),
+        json!({ "op": "organize", "path": "sorting.py" }),
     );
     assert_eq!(resp["success"], true, "organize should succeed: {resp:?}");
     let content = fs::read_to_string(root.join("sorting.py")).unwrap();
@@ -146,7 +146,7 @@ fn organize_ts_leading_comment_stays_with_its_import() {
         &mut aft,
         "org-ts-comment",
         "import",
-        json!({ "op": "organize", "filePath": "case.ts" }),
+        json!({ "op": "organize", "path": "case.ts" }),
     );
     assert_eq!(resp["success"], true, "organize should succeed: {resp:?}");
     let content = fs::read_to_string(root.join("case.ts")).unwrap();
@@ -183,7 +183,7 @@ fn remove_takes_the_trailing_same_line_comment_with_the_import() {
         &mut aft,
         "rm-ts",
         "import",
-        json!({ "op": "remove", "filePath": "case.ts", "module": "./y" }),
+        json!({ "op": "remove", "path": "case.ts", "module": "./y" }),
     );
     assert_eq!(resp["success"], true, "remove should succeed: {resp:?}");
     let content = fs::read_to_string(root.join("case.ts")).unwrap();
@@ -200,7 +200,7 @@ fn remove_takes_the_trailing_same_line_comment_with_the_import() {
         &mut aft,
         "rm-py",
         "import",
-        json!({ "op": "remove", "filePath": "case.py", "module": "os" }),
+        json!({ "op": "remove", "path": "case.py", "module": "os" }),
     );
     assert_eq!(resp["success"], true, "remove should succeed: {resp:?}");
     let content = fs::read_to_string(root.join("case.py")).unwrap();
@@ -221,7 +221,7 @@ fn organize_file(name: &str, source: &str) -> (Value, String) {
         &mut aft,
         "organize",
         "import",
-        json!({ "op": "organize", "filePath": name }),
+        json!({ "op": "organize", "path": name }),
     );
     assert_eq!(resp["success"], true, "organize should succeed: {resp:?}");
     let content = fs::read_to_string(root.join(name)).unwrap();
@@ -377,7 +377,7 @@ fn remove_from_file(name: &str, source: &str, module: &str) -> (Value, String) {
         &mut aft,
         "remove",
         "import",
-        json!({ "op": "remove", "filePath": name, "module": module }),
+        json!({ "op": "remove", "path": name, "module": module }),
     );
     let content = fs::read_to_string(root.join(name)).unwrap();
     aft.shutdown();
