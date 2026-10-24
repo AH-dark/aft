@@ -11737,7 +11737,6 @@ impl BgTaskRegistry {
             project_key: &project_key,
             tool: "bash",
             task_id: Some(&metadata.task_id),
-            command: Some(&metadata.command),
             compressor: if metadata.compressed {
                 "registry"
             } else {
