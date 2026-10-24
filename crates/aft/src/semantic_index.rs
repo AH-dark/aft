@@ -2115,7 +2115,6 @@ fn validate_embedding_batch(
             "{context} returned no vectors for {expected_count} inputs"
         ));
     }
-
     if vectors.len() != expected_count {
         return Err(format!(
             "{context} returned {} vectors for {} inputs",
@@ -2123,7 +2122,6 @@ fn validate_embedding_batch(
             expected_count
         ));
     }
-
     let Some(first_vector) = vectors.first() else {
         return Ok(());
     };
@@ -2131,6 +2129,8 @@ fn validate_embedding_batch(
     validate_embedding_dimension(expected_dimension)
         .map_err(|error| format!("{context} returned {error}"))?;
     for (index, vector) in vectors.iter().enumerate() {
+        validate_finite_embedding(vector)
+            .map_err(|error| format!("{context} vector {index}: {error}"))?;
         if vector.len() != expected_dimension {
             return Err(format!(
                 "{context} returned inconsistent embedding dimensions: vector 0 has length {expected_dimension}, vector {index} has length {}",
@@ -2139,6 +2139,13 @@ fn validate_embedding_batch(
         }
     }
 
+    Ok(())
+}
+
+fn validate_finite_embedding(vector: &[f32]) -> Result<(), String> {
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err("embedding contains non-finite components".to_string());
+    }
     Ok(())
 }
 
@@ -4571,6 +4578,7 @@ where
 
         validate_embedding_dimension(vector.len())
             .map_err(|error| format!("embedding backend returned {error}"))?;
+        validate_finite_embedding(&vector)?;
         match expected_dimension {
             None => expected_dimension = Some(vector.len()),
             Some(expected) if expected != vector.len() => {
@@ -7648,6 +7656,9 @@ impl SemanticIndex {
     where
         F: Fn(&Path) -> bool,
     {
+        if validate_finite_embedding(query_vector).is_err() {
+            return Vec::new();
+        }
         // `true` marks a path relative to the root (base and shared view
         // runs); `false` an absolute own-entry path.
         let entries = self
@@ -9513,9 +9524,9 @@ impl SemanticIndex {
                 || version == SEMANTIC_INDEX_VERSION_V6
                 || version == SEMANTIC_INDEX_VERSION_V7
             {
-                read_u64_stream(&mut reader)?
+                Some(read_u64_stream(&mut reader)?)
             } else {
-                0
+                None
             };
             let content_hash =
                 if version == SEMANTIC_INDEX_VERSION_V6 || version == SEMANTIC_INDEX_VERSION_V7 {
@@ -9562,7 +9573,9 @@ impl SemanticIndex {
                     PathBuf::from(path)
                 };
             file_mtimes.insert(path.clone(), mtime);
-            file_sizes.insert(path.clone(), size);
+            if let Some(size) = size {
+                file_sizes.insert(path.clone(), size);
+            }
             file_hashes.insert(path, content_hash);
         }
 
@@ -9599,7 +9612,7 @@ impl SemanticIndex {
                 None
             };
 
-            let kind = u8_to_symbol_kind(read_u8_stream(&mut reader, "unexpected end of data")?);
+            let kind = u8_to_symbol_kind(read_u8_stream(&mut reader, "unexpected end of data")?)?;
 
             let start_line = read_u32_stream(&mut reader)?;
             let end_line = read_u32_stream(&mut reader)?;
@@ -9622,6 +9635,7 @@ impl SemanticIndex {
                 .chunks_exact(F32_BYTES)
                 .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect::<Arc<[f32]>>();
+            validate_finite_embedding(&vector)?;
 
             entries.push(EmbeddingEntry::new(
                 SemanticChunk {
@@ -10632,7 +10646,7 @@ impl SemanticVectors {
         for _ in 0..count {
             let name = take_view_string(payload, &mut cursor)?;
             let qualified_name = take_view_string(payload, &mut cursor)?;
-            let kind = u8_to_symbol_kind(take_view_slice(payload, &mut cursor, 1)?[0]);
+            let kind = u8_to_symbol_kind(take_view_slice(payload, &mut cursor, 1)?[0])?;
             let start_line = take_view_u32(payload, &mut cursor)?;
             let end_line = take_view_u32(payload, &mut cursor)?;
             let exported = take_view_slice(payload, &mut cursor, 1)?[0] != 0;
@@ -10651,6 +10665,8 @@ impl SemanticVectors {
                 .chunks_exact(4)
                 .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
                 .collect::<Arc<[f32]>>();
+            validate_embedding_dimension(vector.len())?;
+            validate_finite_embedding(&vector)?;
             match dimension {
                 None => dimension = Some(vector.len()),
                 Some(expected) if expected != vector.len() => {
@@ -10939,9 +10955,23 @@ impl SemanticIndex {
 }
 
 fn semantic_score_order(a: &(f32, usize), b: &(f32, usize)) -> std::cmp::Ordering {
-    b.0.partial_cmp(&a.0)
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| a.1.cmp(&b.1))
+    // Preserve equal-score ties, including signed zero, while giving corrupt
+    // scores a consistent position after finite similarities.
+    let score_a = if a.0.is_finite() {
+        a.0
+    } else {
+        f32::NEG_INFINITY
+    };
+    let score_b = if b.0.is_finite() {
+        b.0
+    } else {
+        f32::NEG_INFINITY
+    };
+    if score_a == score_b {
+        a.1.cmp(&b.1)
+    } else {
+        score_b.total_cmp(&score_a)
+    }
 }
 
 /// Compute an embedding's L2 norm for its in-memory search cache.
@@ -10995,8 +11025,8 @@ fn symbol_kind_to_u8(kind: &SymbolKind) -> u8 {
     }
 }
 
-fn u8_to_symbol_kind(v: u8) -> SymbolKind {
-    match v {
+fn u8_to_symbol_kind(v: u8) -> Result<SymbolKind, String> {
+    Ok(match v {
         0 => SymbolKind::Function,
         1 => SymbolKind::Class,
         2 => SymbolKind::Method,
@@ -11008,8 +11038,8 @@ fn u8_to_symbol_kind(v: u8) -> SymbolKind {
         8 => SymbolKind::Heading,
         9 => SymbolKind::FileSummary,
         10 => SymbolKind::Kernel,
-        _ => SymbolKind::Heading,
-    }
+        _ => return Err(format!("invalid semantic symbol kind: {v}")),
+    })
 }
 
 #[cfg(test)]
@@ -15473,7 +15503,7 @@ Connection: close
 
         for (kind, encoded) in cases {
             assert_eq!(symbol_kind_to_u8(&kind), encoded);
-            assert_eq!(u8_to_symbol_kind(encoded), kind);
+            assert_eq!(u8_to_symbol_kind(encoded).unwrap(), kind);
         }
     }
 
@@ -18366,6 +18396,182 @@ public class Greeter {
 #[cfg(test)]
 mod embedding_backend_retry_status_tests {
     use super::*;
+
+    fn audit10_vector_index(vectors: Vec<Vec<f32>>) -> SemanticIndex {
+        let root = std::env::current_dir().unwrap();
+        let file = root.join("vectors.rs");
+        let mut index = SemanticIndex::new(root, 2);
+        index
+            .file_mtimes
+            .insert(file.clone(), SystemTime::UNIX_EPOCH);
+        index.file_sizes.insert(file.clone(), 0);
+        for (i, vector) in vectors.into_iter().enumerate() {
+            index.entries.push(EmbeddingEntry::new(
+                SemanticChunk {
+                    file: file.clone(),
+                    name: format!("audit_vector_{i}"),
+                    qualified_name: None,
+                    kind: SymbolKind::Function,
+                    start_line: i as u32 + 1,
+                    end_line: i as u32 + 1,
+                    exported: false,
+                    snippet: String::new(),
+                    embed_text: String::new(),
+                },
+                vector,
+            ));
+        }
+        index
+    }
+
+    #[test]
+    fn audit10_embedding_rejects_nonfinite_batch() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(validate_embedding_batch(&[vec![value, 1.0]], 1, "test").is_err());
+        }
+        assert!(validate_embedding_batch(&[vec![1.0, 0.0]], 1, "test").is_ok());
+    }
+
+    #[test]
+    fn audit10_embedding_rejects_nonfinite_build_rows() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                execute_build_embedding_batch(vec!["input".to_string()], &mut |_| {
+                    Ok(vec![vec![value, 1.0]])
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn audit10_semantic_cache_rejects_nonfinite_vectors() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let index = audit10_vector_index(vec![vec![value, 1.0]]);
+            let error =
+                SemanticIndex::from_bytes(&index.to_bytes(), &index.project_root).unwrap_err();
+            assert!(error.contains("non-finite"), "{error}");
+        }
+    }
+
+    #[test]
+    fn audit10_semantic_view_rejects_nonfinite_vectors() {
+        let producer = ViewPayloadProducer {
+            chunker_version: "1",
+            template_version: "1",
+            model_fingerprint: "test",
+        };
+        let run = SemanticVectors {
+            entries: audit10_vector_index(vec![vec![f32::NAN, 1.0]]).entries,
+        };
+        let bytes = run.encode_view_payload(&producer);
+        assert!(
+            SemanticVectors::decode_view_payload(&bytes, Path::new("vectors.rs"), &producer)
+                .is_err()
+        );
+        let valid = SemanticVectors {
+            entries: audit10_vector_index(vec![vec![1.0, 0.0]]).entries,
+        };
+        let bytes = valid.encode_view_payload(&producer);
+        let decoded =
+            SemanticVectors::decode_view_payload(&bytes, Path::new("vectors.rs"), &producer)
+                .unwrap();
+        assert_eq!(decoded.encode_view_payload(&producer), bytes);
+    }
+
+    #[test]
+    fn audit10_semantic_view_rejects_unknown_kind() {
+        let producer = ViewPayloadProducer {
+            chunker_version: "1",
+            template_version: "1",
+            model_fingerprint: "test",
+        };
+        let run = SemanticVectors {
+            entries: audit10_vector_index(vec![vec![1.0, 0.0]]).entries,
+        };
+        let mut bytes = run.encode_view_payload(&producer);
+        let name = b"audit_vector_0";
+        let offset = bytes.windows(name.len()).position(|w| w == name).unwrap();
+        bytes[offset + name.len() + 4] = 255;
+        assert!(
+            SemanticVectors::decode_view_payload(&bytes, Path::new("vectors.rs"), &producer)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn audit10_semantic_query_rejects_nonfinite_vectors() {
+        let index = audit10_vector_index(vec![vec![1.0, 0.0]]);
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(index.search(&[value, 1.0], 10).is_empty());
+        }
+        assert!(index.search(&[1.0], 10).is_empty());
+        assert_eq!(index.search(&[1.0, 0.0], 10).len(), 1);
+    }
+
+    #[test]
+    fn audit10_score_order_handles_corrupt_scores() {
+        let mut scores = [(f32::NAN, 0), (0.5, 1), (-0.5, 2), (f32::INFINITY, 3)];
+        scores.sort_by(semantic_score_order);
+        assert_eq!(
+            scores.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
+            vec![1, 2, 0, 3]
+        );
+        let mut valid = [(0.0, 0), (-0.0, 1), (0.5, 2), (-0.5, 3), (0.5, 4)];
+        valid.sort_by(semantic_score_order);
+        assert_eq!(
+            valid.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
+            vec![2, 4, 0, 1, 3]
+        );
+    }
+
+    #[test]
+    fn audit10_valid_input_order_and_cache_bytes_unchanged() {
+        let index = audit10_vector_index(vec![vec![0.0, 1.0], vec![1.0, 0.0], vec![-1.0, 0.0]]);
+        let bytes = index.to_bytes();
+        let restored = SemanticIndex::from_bytes(&bytes, &index.project_root).unwrap();
+        assert_eq!(restored.to_bytes(), bytes);
+        let results = restored.search(&[1.0, 0.0], 3);
+        assert_eq!(
+            results.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["audit_vector_1", "audit_vector_0", "audit_vector_2"]
+        );
+        assert_eq!(
+            results.iter().map(|r| r.score).collect::<Vec<_>>(),
+            vec![1.0, 0.0, -1.0]
+        );
+    }
+
+    #[test]
+    fn audit10_semantic_cache_rejects_unknown_kind() {
+        let index = audit10_vector_index(vec![vec![1.0, 0.0]]);
+        let mut bytes = index.to_bytes();
+        let name = b"audit_vector_0";
+        let offset = bytes.windows(name.len()).position(|w| w == name).unwrap();
+        let kind_offset = offset + name.len() + 4;
+        assert_eq!(bytes[kind_offset], symbol_kind_to_u8(&SymbolKind::Function));
+        bytes[kind_offset] = 255;
+        let error = SemanticIndex::from_bytes(&bytes, &index.project_root).unwrap_err();
+        assert!(error.contains("invalid semantic symbol kind"), "{error}");
+        assert_eq!(u8_to_symbol_kind(8).unwrap(), SymbolKind::Heading);
+    }
+
+    #[test]
+    fn audit10_legacy_decoder_marks_missing_sizes() {
+        let root = std::env::current_dir().unwrap();
+        let file = root.join("legacy.rs");
+        let path = file.to_str().unwrap().as_bytes();
+        let mut bytes = vec![SEMANTIC_INDEX_VERSION_V1];
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(path);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let restored = SemanticIndex::from_bytes(&bytes, &root).unwrap();
+        assert!(restored.any_missing_sizes);
+        assert!(!restored.file_sizes.contains_key(&file));
+    }
 
     fn unique_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("aft-backend-status-{name}-{}", std::process::id()))
