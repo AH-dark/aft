@@ -1813,6 +1813,21 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
         if refresh_metrics_bytes(metrics) <= HEALTH_METRICS_BUDGET_BYTES {
             return;
         }
+        // Historical sweep detail must yield before current root diagnostics,
+        // including standing health. The snapshot is newest first.
+        if metrics
+            .get_mut("v2_family_sweeps")
+            .and_then(Value::as_array_mut)
+            .is_some_and(|sweeps| sweeps.pop().is_some())
+        {
+            let omitted = metrics
+                .get("v2_family_sweeps_omitted")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(1);
+            metrics.insert("v2_family_sweeps_omitted".into(), json!(omitted));
+            continue;
+        }
         if metrics
             .get_mut("roots")
             .and_then(Value::as_array_mut)
@@ -3554,23 +3569,25 @@ pub(super) fn build_health_report(
     dispatch_path_metrics: &DispatchPathMetrics,
     shared_app: &App,
 ) -> HealthReport {
-    build_health_report_with_indexing(
+    build_health_report_with_snapshots(
         cache,
         executor,
         pending_binds,
         dispatch_path_metrics,
         shared_app,
         crate::cold_build_limiter::progress::snapshot,
+        crate::gc::family::sweep_stats(),
     )
 }
 
-fn build_health_report_with_indexing(
+fn build_health_report_with_snapshots(
     cache: &HealthRollupCache,
     executor: &Executor,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     dispatch_path_metrics: &DispatchPathMetrics,
     shared_app: &App,
     indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
+    sweep_snapshot: crate::gc::family::SweepStatsSnapshot,
 ) -> HealthReport {
     // The diagnostic payload is fixed-size and cached. Only probe-purpose
     // liveness signals are read fresh, using atomics or non-blocking snapshots.
@@ -3685,8 +3702,17 @@ fn build_health_report_with_indexing(
     metrics.insert("views_work".to_string(), crate::views::io::work_snapshot());
     metrics.insert(
         "v2_family_sweeps".to_string(),
-        crate::gc::family::sweep_stats(),
+        json!(sweep_snapshot.details),
     );
+    metrics.insert(
+        "v2_family_sweep_details_evicted_total".into(),
+        json!(sweep_snapshot.evicted_total),
+    );
+    metrics.insert(
+        "v2_family_sweep_details_retired_total".into(),
+        json!(sweep_snapshot.retired_total),
+    );
+    metrics.insert("v2_family_sweeps_omitted".into(), json!(0));
     metrics.insert(
         "filesystem_helpers".to_string(),
         crate::bounded_io::helper_health(),
@@ -4065,6 +4091,100 @@ mod tests {
             serde_json::to_vec(&expected).unwrap()
         );
         assert_eq!(cached["roots"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn long_running_daemon_sweeps_preserve_root_and_standing_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::gc::family::SweepStatsStore::default();
+        for family in 0..96 {
+            let family_dir = dir
+                .path()
+                .join(format!("family-{family:03}-{}", "p".repeat(120)));
+            std::fs::create_dir(&family_dir).unwrap();
+            // Thirty days of ten-minute passes reuse each family's counters.
+            for _ in 0..4320 {
+                store.record_stale_rows(&family_dir.join("semantic.db"), "family", 1);
+            }
+        }
+        let sweeps = store.snapshot();
+        assert_eq!(sweeps.details.len(), 64);
+        assert_eq!(sweeps.evicted_total, 32);
+        assert_eq!(sweeps.retired_total, 0);
+        assert!(
+            serde_json::to_vec(&sweeps.details).unwrap().len() > super::HEALTH_METRICS_BUDGET_BYTES
+        );
+        let cache = HealthRollupCache::new();
+        let mut rollup = HealthDiagnosticRollup::unavailable();
+        rollup.metrics = json!({
+            "root_count": 170,
+            "root_details_omitted": 168,
+            "roots": [{"root":"active-root"}, {"root":"standing-root", "standing_health":{"status":"ready"}}],
+        });
+        cache.publish(Some(rollup));
+        let executor = Executor::new();
+        let app = App::default_shared();
+        let report = super::build_health_report_with_snapshots(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+            crate::cold_build_limiter::progress::snapshot,
+            sweeps,
+        );
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["roots"].as_array().unwrap().len(), 2);
+        assert_eq!(metrics["roots"][1]["standing_health"]["status"], "ready");
+        assert_eq!(metrics["root_details_omitted"], 168);
+        assert_eq!(metrics["v2_family_sweep_details_evicted_total"], 32);
+        assert_eq!(metrics["v2_family_sweep_details_retired_total"], 0);
+        let kept = metrics["v2_family_sweeps"].as_array().unwrap();
+        assert!(kept.len() < 64);
+        assert_eq!(metrics["v2_family_sweeps_omitted"], 64 - kept.len());
+        assert!(kept.iter().all(|entry| entry["stale_rows_touched"] == 4320));
+        assert!(metrics["v2_family_sweeps_omitted"].as_u64().unwrap() > 0);
+        assert!(
+            metrics["metrics_bytes"].as_u64().unwrap() <= super::HEALTH_METRICS_BUDGET_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn health_budget_trims_every_sweep_before_root_detail() {
+        let roots = json!([{"root":"standing", "standing_health":{"status":"ready"}, "detail":"r".repeat(13000)}]);
+        let mut metrics = json!({
+            "roots": roots,
+            "root_details_omitted": 0,
+            "v2_family_sweeps": [{"family":"one"}, {"family":"two"}],
+            "v2_family_sweeps_omitted": 3,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        super::budget_health_metrics(&mut metrics);
+        assert_eq!(metrics["v2_family_sweeps"], json!([]));
+        assert_eq!(metrics["v2_family_sweeps_omitted"], 5);
+        assert_eq!(metrics["root_details_omitted"], 1);
+        assert_eq!(metrics["roots"], json!([]));
+    }
+
+    #[test]
+    fn health_fixture_ignores_process_global_sweep_telemetry() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::gc::family::record_stale_rows(&dir.path().join("semantic.db"), "foreign-family", 1);
+        let executor = Executor::new();
+        let app = App::default_shared();
+        let report = test_health_report(
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["v2_family_sweeps"], json!([]));
+        assert_eq!(metrics["v2_family_sweep_details_evicted_total"], 0);
+        assert_eq!(metrics["v2_family_sweep_details_retired_total"], 0);
+        assert_eq!(metrics["v2_family_sweeps_omitted"], 0);
     }
 
     #[test]
@@ -4483,6 +4603,44 @@ mod tests {
         );
     }
     use serde_json::json;
+
+    // Health fixtures own their roots, not sweep observations made by other
+    // tests in the process. Production still supplies the live store snapshot.
+    fn build_health_report(
+        cache: &HealthRollupCache,
+        executor: &Executor,
+        pending_binds: &HashMap<RouteChannel, PendingBind>,
+        metrics: &DispatchPathMetrics,
+        app: &App,
+    ) -> HealthReport {
+        build_health_report_with_indexing(
+            cache,
+            executor,
+            pending_binds,
+            metrics,
+            app,
+            crate::cold_build_limiter::progress::snapshot,
+        )
+    }
+
+    fn build_health_report_with_indexing(
+        cache: &HealthRollupCache,
+        executor: &Executor,
+        pending_binds: &HashMap<RouteChannel, PendingBind>,
+        metrics: &DispatchPathMetrics,
+        app: &App,
+        indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
+    ) -> HealthReport {
+        super::build_health_report_with_snapshots(
+            cache,
+            executor,
+            pending_binds,
+            metrics,
+            app,
+            indexing_snapshot,
+            crate::gc::family::SweepStatsSnapshot::default(),
+        )
+    }
 
     fn test_health_report(
         executor: &Executor,

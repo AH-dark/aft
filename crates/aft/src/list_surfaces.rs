@@ -449,8 +449,14 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
         file: "subc/health.rs",
         enclosing_item: "budget_health_metrics",
-        location_or_primitive: "storage_retention map removal under HEALTH_METRICS_BUDGET_BYTES",
-        reason: "management health detail, not an agent result list; omitted retention reports are counted exactly and aggregate retention counters remain present",
+        location_or_primitive: "storage_retention map removal and v2_family_sweeps pop under HEALTH_METRICS_BUDGET_BYTES",
+        reason: "management health detail, not an agent result list; sweep rows yield before root diagnostics, omitted sweep and retention rows are counted exactly and aggregate counters remain present",
+    },
+    ExclusionEntry {
+        file: "gc/family.rs",
+        enclosing_item: "SweepStatsStore::update",
+        location_or_primitive: "SWEEP_STATS_FAMILY_LIMIT / pop_front",
+        reason: "observational health telemetry retains the latest 64 family details, not a paginated result list; cap evictions and retired-family removals are disclosed separately",
     },
     ExclusionEntry {
         file: "status_push.rs",
