@@ -54,7 +54,8 @@ pub(crate) use location::acquire_cache_cleanup_lease;
 pub use location::{
     acquire_daemon_storage_lease, cache_root, cache_unavailable, clean_old_caches,
     prepare_cache_root, reclaim_configured_inactive_caches, CacheLease, CleanupCandidate,
-    CleanupReport, ProcessStorageLease, StoragePaths, CACHE_DIR_BUSY, CACHE_DIR_UNAVAILABLE,
+    CleanupReport, ProcessStorageLease, StoragePaths, CACHE_DIR_BUSY, CACHE_DIR_BUSY_MESSAGE,
+    CACHE_DIR_UNAVAILABLE,
 };
 pub(crate) use location::{
     cache_deletion_protections, cache_status_code, check_cache_access, durable_route,

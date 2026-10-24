@@ -14186,6 +14186,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn configure_cache_coordination_busy_bind_retries_once_while_bound() {
+        let _storage_override = crate::test_env::without_storage_override();
         fn inject_busy(
             _: std::os::fd::RawFd,
             name: &std::ffi::OsStr,

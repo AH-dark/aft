@@ -1188,6 +1188,9 @@ fn hold_use_lock_exclusively(root: &Path) -> File {
 fn cache_location_concurrent_coordination_create_keeps_cache_available() {
     use std::os::unix::fs::MetadataExt;
 
+    // A process-wide storage override outranks the explicit fixture path.
+    // Preparation and the injected sibling must use this same temporary root.
+    let _storage_override = crate::test_env::without_storage_override();
     let temp = tempfile::tempdir().unwrap();
     let storage = temp.path().join("storage");
     let sibling = Arc::new(Mutex::new(None));

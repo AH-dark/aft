@@ -4661,8 +4661,8 @@ impl std::fmt::Display for CoordinationCreateContended {
         write!(
             formatter,
             "{}: {}",
-            crate::cache_location::CACHE_DIR_BUSY,
-            crate::cache_location::CACHE_DIR_BUSY_MESSAGE
+            crate::root_cache::CACHE_DIR_BUSY,
+            crate::root_cache::CACHE_DIR_BUSY_MESSAGE
         )
     }
 }
@@ -4706,16 +4706,17 @@ fn openat_file(
             result => return result,
         }
     }
-    let path = parent.join(name);
+    let contention = CoordinationCreateContended {
+        path: parent.join(name),
+        attempts,
+    };
     // The agent-facing text names no path; the operator log keeps it.
     log::warn!(
-        "cache coordination create stayed contended: path={} attempts={attempts}",
-        path.display()
+        "cache coordination create stayed contended: path={} attempts={}",
+        contention.path.display(),
+        contention.attempts
     );
-    Err(io::Error::new(
-        io::ErrorKind::WouldBlock,
-        CoordinationCreateContended { path, attempts },
-    ))
+    Err(io::Error::new(io::ErrorKind::WouldBlock, contention))
 }
 
 #[cfg(unix)]
