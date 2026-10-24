@@ -422,9 +422,16 @@ fn boundary_match(source: &str, needle: &str, start: usize, end: usize, pass: u8
 }
 
 /// Describe fuzzy replacements only when the bytes being replaced contain
-/// non-whitespace content different from the requested text.
+/// non-whitespace content different from the requested text. `notice` is the
+/// reply line that tells the agent the match was loose (see
+/// [`loose_match_notice`]); `reindented` says whether any replacement was
+/// shifted to the file's indentation.
 pub fn replacement_detail(source: &str, needle: &str, matches: &[FuzzyMatch]) -> serde_json::Value {
     let pass = matches.first().map(|m| m.pass).unwrap_or(1);
+    // A refusal never reaches here: the replacement was already built.
+    let reindented = matches.iter().any(|m| {
+        indentation_shift(source, needle, m).is_ok_and(|shift| shift != IndentShift::None)
+    });
     let actual: Vec<String> = matches
         .iter()
         .filter_map(|m| {
@@ -441,7 +448,34 @@ pub fn replacement_detail(source: &str, needle: &str, matches: &[FuzzyMatch]) ->
             })
         })
         .collect();
-    serde_json::json!({"pass": pass, "replaced_text": actual})
+    let mut detail = serde_json::json!({
+        "pass": pass,
+        "replaced_text": actual,
+        "reindented": reindented,
+    });
+    if let Some(notice) = loose_match_notice(pass, reindented) {
+        detail["notice"] = serde_json::json!(notice);
+    }
+    detail
+}
+
+/// The one-line reply notice for an edit whose `oldString` was found only by
+/// a loose pass: what the match ignored, and whether `newString` was shifted
+/// to the file's indentation. This is the only place the wording lives; the
+/// reply formatters render the `notice` field as given.
+pub(crate) fn loose_match_notice(pass: u8, reindented: bool) -> Option<String> {
+    let ignored = match pass {
+        2 => "trailing whitespace",
+        3 => "indentation and trailing whitespace",
+        4 => "indentation, trailing whitespace and Unicode punctuation (curly quotes, dashes, ellipses, non-breaking spaces)",
+        5 => "line breaks and spacing",
+        _ => return None,
+    };
+    Some(if reindented {
+        format!("oldString matched only after ignoring {ignored}; newString was re-indented to match the file.")
+    } else {
+        format!("oldString matched only after ignoring {ignored}.")
+    })
 }
 
 /// How a loose match's replacement has to move to sit at the file's
@@ -1315,6 +1349,39 @@ mod edit_not_found_detail_tests {
 #[cfg(test)]
 mod indentation_shift_tests {
     use super::*;
+
+    /// Pins every notice the reply can show, word for word.
+    #[test]
+    fn loose_match_notice_full_strings() {
+        let expected = [
+            (2, false, "oldString matched only after ignoring trailing whitespace."),
+            (3, false, "oldString matched only after ignoring indentation and trailing whitespace."),
+            (3, true, "oldString matched only after ignoring indentation and trailing whitespace; newString was re-indented to match the file."),
+            (4, false, "oldString matched only after ignoring indentation, trailing whitespace and Unicode punctuation (curly quotes, dashes, ellipses, non-breaking spaces)."),
+            (4, true, "oldString matched only after ignoring indentation, trailing whitespace and Unicode punctuation (curly quotes, dashes, ellipses, non-breaking spaces); newString was re-indented to match the file."),
+            (5, false, "oldString matched only after ignoring line breaks and spacing."),
+        ];
+        for (pass, reindented, notice) in expected {
+            assert_eq!(
+                loose_match_notice(pass, reindented).as_deref(),
+                Some(notice),
+                "pass {pass}, reindented {reindented}"
+            );
+        }
+        assert_eq!(loose_match_notice(1, false), None);
+    }
+
+    #[test]
+    fn replacement_detail_carries_the_notice_and_shift() {
+        let needle = "if x:\n    a = 1\n    b = 2";
+        let matches = find_all_fuzzy(PY, needle);
+        let detail = replacement_detail(PY, needle, &matches);
+        assert_eq!(detail["reindented"], true);
+        assert_eq!(
+            detail["notice"],
+            "oldString matched only after ignoring indentation and trailing whitespace; newString was re-indented to match the file."
+        );
+    }
 
     /// Re-indent `replacement` for the only match of `needle` in `source`,
     /// asserting the match came from `pass`.

@@ -256,12 +256,13 @@ fn issue_824_exact_misindented_python_edit_is_rolled_back() {
 }
 
 /// When a whitespace-insensitive pass was needed to find `oldString`, the
-/// agent-facing reply must say so. Today the response carries a
-/// `fuzzy_match`/`fuzzy_matches` field, but the reply text the plugins show
-/// the agent (rendered by `subc_format::format_edit_summary`) drops it.
+/// agent-facing reply says so in one line, and says the replacement was
+/// re-indented. The reply text is what the plugins show the agent (rendered
+/// by `subc_format::format_edit_summary`); it used to drop the structured
+/// `fuzzy_match`/`fuzzy_matches` field.
 #[test]
-#[ignore = "issue #824 repro: fails until the edit reply text reports a fuzzy match"]
 fn issue_824_fuzzy_edit_reply_text_reports_fuzzy_match() {
+    const REINDENTED_NOTICE: &str = "oldString matched only after ignoring indentation and trailing whitespace; newString was re-indented to match the file.";
     let mut failures = Vec::new();
     for shape in SHAPES {
         for (name, before, old, new) in [
@@ -274,17 +275,16 @@ fn issue_824_fuzzy_edit_reply_text_reports_fuzzy_match() {
             } else {
                 &run.reply["fuzzy_match"]
             };
-            // The structured field is there today; only the text drops it.
             assert_eq!(
                 structured["pass"], 3,
                 "{shape:?} {name}: the trimmed-line pass should be the one that matched: {:?}",
                 run.reply
             );
             let text = reply_text(&run.reply);
-            let lower = text.to_lowercase();
-            if !lower.contains("fuzzy") && !lower.contains("indentation") {
+            let expected = format!("Edited (+2/-2).\n{REINDENTED_NOTICE}");
+            if text != expected {
                 failures.push(format!(
-                    "{shape:?} {name}: reply text gives no sign a fuzzy pass was used: {text:?}; structured field: {structured}"
+                    "{shape:?} {name}: expected reply {expected:?}, got {text:?}; structured field: {structured}"
                 ));
             }
         }

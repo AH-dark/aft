@@ -1540,6 +1540,31 @@ mod edit_diagnostics_tests {
     }
 
     #[test]
+    fn edit_summary_renders_each_loose_match_notice_once() {
+        let notice = "oldString matched only after ignoring indentation and trailing whitespace; newString was re-indented to match the file.";
+        let data = serde_json::json!({
+            "edits_applied": 1,
+            "diff": {"additions": 2, "deletions": 2},
+            "fuzzy_matches": [
+                {"pass": 3, "replaced_text": [], "notice": notice},
+                {"pass": 3, "replaced_text": [], "notice": notice},
+                {"pass": 4, "replaced_text": ["title = “a”"], "notice": "four"},
+            ],
+        });
+        assert_eq!(
+            super::format_edit_summary(&data),
+            format!("Edited (+2/-2).\n{notice}\nfour\nReplaced text 1: title = “a”")
+        );
+        // An exact match carries no fuzzy field and no notice.
+        assert_eq!(
+            super::format_edit_summary(
+                &serde_json::json!({"diff": {"additions": 1, "deletions": 1}})
+            ),
+            "Edited (+1/-1)."
+        );
+    }
+
+    #[test]
     fn frozen_lsp_edit_rendering_reports_diagnostics_unknown() {
         let data = serde_json::json!({
             "replacements": 1, "lsp_complete": false, "lsp_diagnostics": [],
@@ -1622,7 +1647,39 @@ fn format_edit_summary(data: &Value) -> String {
     if is_truthy_formatted(data) {
         s.push_str(&format_auto_formatted_suffix(data));
     }
+    append_loose_match_notices(&mut s, data);
     s
+}
+
+/// One line per loose (fuzzy) match: the producer's `notice`, followed by
+/// any file text that differed from `oldString` in more than whitespace. A
+/// notice identical to the previous one is not repeated, so a replace-all
+/// over many identical matches shows it once. Mirrors the fuzzy block of
+/// packages/aft-bridge/src/edit-summary.ts formatEditSummary.
+fn append_loose_match_notices(s: &mut String, data: &Value) {
+    let entries: Vec<&Value> = match data.get("fuzzy_matches").and_then(Value::as_array) {
+        Some(entries) => entries.iter().collect(),
+        None => data.get("fuzzy_match").into_iter().collect(),
+    };
+    let mut previous_notice: Option<&str> = None;
+    for entry in entries {
+        let notice = entry.get("notice").and_then(Value::as_str);
+        if let Some(notice) = notice.filter(|notice| previous_notice != Some(*notice)) {
+            s.push('\n');
+            s.push_str(notice);
+        }
+        previous_notice = notice.or(previous_notice);
+        for (index, text) in entry
+            .get("replaced_text")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .enumerate()
+        {
+            s.push_str(&format!("\nReplaced text {}: {text}", index + 1));
+        }
+    }
 }
 
 fn is_truthy_formatted(data: &Value) -> bool {
