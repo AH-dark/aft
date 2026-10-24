@@ -429,13 +429,19 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Write, format, validate ---
     let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
-    let mut write_result =
-        match edit::write_format_validate(&path, &new_source, &ctx.config(), &req.params) {
-            Ok(r) => r,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
+    let mut write_result = match edit::write_format_validate(
+        tool_policy,
+        &path,
+        &new_source,
+        &ctx.config(),
+        &req.params,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
     // Honesty: write_format_validate reverts the file when the inline produced
     // invalid syntax (e.g. inlining into expression context, or losing let/var).

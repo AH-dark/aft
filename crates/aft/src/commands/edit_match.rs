@@ -350,7 +350,9 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     // format_skipped_reason: None` and bypassed the formatter entirely.
     // Agents that appended messy lines kept them messy with no signal.
     let config = ctx.config();
-    let (formatted, format_skipped_reason) = format::auto_format(path.as_path(), &config);
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
+    let (formatted, format_skipped_reason) =
+        format::auto_format(tool_policy, path.as_path(), &config);
     drop(config);
 
     // Re-read final content AFTER formatting so the LSP sees the formatted
@@ -385,7 +387,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     } else {
         final_content
             .as_deref()
-            .map(|content| edit::check_created_file_syntax(path.as_path(), content))
+            .map(|content| edit::check_created_file_syntax(tool_policy, path.as_path(), content))
     };
     let syntax_valid = match created_syntax {
         Some(check) => check.valid,
@@ -818,6 +820,8 @@ fn handle_glob_edit_match(
         return edit::no_change_response(&req.id);
     }
     pending.retain(|edit| edit.original_source != edit.new_source);
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
+
     let _mutation = crate::runtime_drain::record_file_mutation(
         ctx,
         pending.iter().map(|edit| edit.path.as_path()),
@@ -926,7 +930,8 @@ fn handle_glob_edit_match(
     let mut format_skip_reasons = std::collections::BTreeSet::new();
     for edit in &pending {
         let file_str = edit.path.display().to_string();
-        let (formatted, format_skipped_reason) = format::auto_format(&edit.path, &config);
+        let (formatted, format_skipped_reason) =
+            format::auto_format(tool_policy, &edit.path, &config);
         if let Some(reason) = &format_skipped_reason {
             format_skipped_count += 1;
             format_skip_reasons.insert(reason.clone());
@@ -1710,7 +1715,9 @@ fn handle_single_file_edit_match(
     };
 
     // Write, format, and validate via shared pipeline
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
     let mut write_result = match edit::write_format_validate_observed(
+        tool_policy,
         path.as_path(),
         &new_source,
         &ctx.config(),

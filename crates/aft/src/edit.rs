@@ -1955,6 +1955,7 @@ pub(crate) fn full_validation_requested(config: &Config, params: &serde_json::Va
 /// Validate the completed multi-file operation, never its intermediate writes.
 /// Call only after all writes succeeded and rollback is no longer needed.
 pub(crate) fn validate_written_files(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     paths: &[std::path::PathBuf],
     config: &Config,
     params: &serde_json::Value,
@@ -1964,7 +1965,7 @@ pub(crate) fn validate_written_files(
     }
     notify_full_validation_start();
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Validate);
-    Some(format::validate_full_batch(paths, config))
+    Some(format::validate_full_batch(tool_policy, paths, config))
 }
 
 /// Write content to disk, auto-format, then validate syntax.
@@ -1980,16 +1981,27 @@ pub(crate) fn validate_written_files(
 /// the project's type checker is invoked after syntax validation and the
 /// results are included in `WriteResult`.
 pub fn write_format_validate(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     path: &Path,
     content: &str,
     config: &Config,
     params: &serde_json::Value,
 ) -> Result<WriteResult, AftError> {
-    write_format_validate_impl(path, content, config, params, false, None, false)
+    write_format_validate_impl(
+        tool_policy,
+        path,
+        content,
+        config,
+        params,
+        false,
+        None,
+        false,
+    )
 }
 
 /// Reuse the captured original only while its strong file identity still matches.
 pub(crate) fn write_format_validate_observed(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     path: &Path,
     content: &str,
     config: &Config,
@@ -2003,18 +2015,37 @@ pub(crate) fn write_format_validate_observed(
         .and(observation.version)
         .filter(|version| Some(*version) == crate::backup::DiskFileVersion::of_path(path))
         .map(|_| original);
-    write_format_validate_impl(path, content, config, params, false, pre, false)
+    write_format_validate_impl(
+        tool_policy,
+        path,
+        content,
+        config,
+        params,
+        false,
+        pre,
+        false,
+    )
 }
 
 /// Write, format and syntax-check now; the caller checks the completed project
 /// with `validate_written_files` after every file has been written successfully.
 pub(crate) fn write_format_validate_deferred(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     path: &Path,
     content: &str,
     config: &Config,
     params: &serde_json::Value,
 ) -> Result<WriteResult, AftError> {
-    write_format_validate_impl(path, content, config, params, true, None, false)
+    write_format_validate_impl(
+        tool_policy,
+        path,
+        content,
+        config,
+        params,
+        true,
+        None,
+        false,
+    )
 }
 
 /// Write and format a file that did not exist before the caller's
@@ -2024,18 +2055,20 @@ pub(crate) fn write_format_validate_deferred(
 /// checks the file's final content once with [`check_created_file_syntax`]
 /// after its last step. `syntax_valid` and `syntax_error_line` are `None`.
 pub(crate) fn write_format_deferred_created(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     path: &Path,
     content: &str,
     config: &Config,
     params: &serde_json::Value,
 ) -> Result<WriteResult, AftError> {
-    write_format_validate_impl(path, content, config, params, true, None, true)
+    write_format_validate_impl(tool_policy, path, content, config, params, true, None, true)
 }
 
 mod bash;
 mod swift;
 
 fn write_format_validate_impl(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     path: &Path,
     content: &str,
     config: &Config,
@@ -2078,7 +2111,7 @@ fn write_format_validate_impl(
 
     // Step 2: Format (before validate so we validate the formatted content)
     let format_phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Format);
-    let (formatted, format_skipped_reason) = format::auto_format(path, config);
+    let (formatted, format_skipped_reason) = format::auto_format(tool_policy, path, config);
     drop(format_phase);
 
     // Step 3: Validate syntax
@@ -2093,7 +2126,7 @@ fn write_format_validate_impl(
         .filter(|_| !syntax_checked_by_caller)
         .and_then(|source| {
             if !existed {
-                let check = check_created_file_syntax(path, source);
+                let check = check_created_file_syntax(tool_policy, path, source);
                 syntax_error_line = check.first_error_line;
                 syntax_skipped_reason = check.skipped_reason;
                 return check.valid;
@@ -2101,6 +2134,7 @@ fn write_format_validate_impl(
             let syntax_valid = validate_captured_syntax(path, source);
             if bash::applies(path) {
                 bash::confirm_if_needed(
+                    tool_policy,
                     source,
                     pre_write_content.as_deref(),
                     &mut was_syntax_valid,
@@ -2108,6 +2142,7 @@ fn write_format_validate_impl(
                 )
             } else {
                 swift::confirm_if_needed(
+                    tool_policy,
                     path,
                     source,
                     pre_write_content.as_deref(),
@@ -2143,7 +2178,7 @@ fn write_format_validate_impl(
     let (validation_errors, validate_skipped_reason) = if validate_requested {
         notify_full_validation_start();
         let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Validate);
-        format::validate_full(path, config)
+        format::validate_full(tool_policy, path, config)
     } else {
         (Vec::new(), None)
     };
@@ -2217,7 +2252,11 @@ pub(crate) struct CreatedFileSyntax {
 /// shell verdict is unknown and carries a reason instead of an error line;
 /// for bash that includes a missing shell, since tree-sitter-bash alone
 /// rejects some valid scripts.
-pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFileSyntax {
+pub(crate) fn check_created_file_syntax(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    path: &Path,
+    source: &str,
+) -> CreatedFileSyntax {
     let Some(tree) = parse_captured_syntax(path, source) else {
         return CreatedFileSyntax {
             valid: None,
@@ -2230,7 +2269,7 @@ pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFil
     // The line bash itself named for a syntax error it confirmed.
     let mut shell_error_line = None;
     let (valid, skipped_reason) = if tree_valid == Some(false) && bash::applies(path) {
-        match bash::confirm_created(source) {
+        match bash::confirm_created(tool_policy, source) {
             Ok(bash::ShellVerdict::Valid) => (Some(true), None),
             Ok(bash::ShellVerdict::Broken(line)) => {
                 shell_error_line = line;
@@ -2239,7 +2278,7 @@ pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFil
             Err(reason) => (None, Some(reason)),
         }
     } else {
-        match swift::confirm_created(path, source, tree_valid) {
+        match swift::confirm_created(tool_policy, path, source, tree_valid) {
             Ok(valid) => (valid, None),
             Err(reason) => (None, Some(reason)),
         }
@@ -2319,8 +2358,14 @@ mod tests {
                 format_on_edit: false,
                 ..Config::default()
             };
-            let mut result =
-                write_format_validate(&path, updated, &config, &serde_json::json!({})).unwrap();
+            let mut result = write_format_validate(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &path,
+                updated,
+                &config,
+                &serde_json::json!({}),
+            )
+            .unwrap();
             assert!(!result.rolled_back);
             assert_eq!(result.syntax_valid, Some(true));
             assert_eq!(result.final_content(&path), Some(updated));
@@ -2407,19 +2452,32 @@ mod tests {
         let path = Path::new("new.ts");
         // ERROR node on line 3 (later lines are broken too).
         let check = check_created_file_syntax(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
             path,
             "const a = 1;\nconst b = 2;\nfunction broken( {{\nconst c = ;\n",
         );
         assert_eq!(check.valid, Some(false));
         assert_eq!(check.first_error_line, Some(3));
         // A MISSING node (unclosed call) also counts.
-        let missing = check_created_file_syntax(path, "const a = 1;\nfoo(1\n");
+        let missing = check_created_file_syntax(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            path,
+            "const a = 1;\nfoo(1\n",
+        );
         assert_eq!(missing.valid, Some(false));
         assert!(missing.first_error_line.is_some_and(|line| line >= 2));
-        let valid = check_created_file_syntax(path, "const a = 1;\n");
+        let valid = check_created_file_syntax(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            path,
+            "const a = 1;\n",
+        );
         assert_eq!(valid.valid, Some(true));
         assert_eq!(valid.first_error_line, None);
-        let unsupported = check_created_file_syntax(Path::new("notes.unknownext"), "{{");
+        let unsupported = check_created_file_syntax(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            Path::new("notes.unknownext"),
+            "{{",
+        );
         assert_eq!(unsupported.valid, None);
         assert_eq!(unsupported.first_error_line, None);
     }
@@ -2433,7 +2491,14 @@ mod tests {
         };
         let path = temp.path().join("new.ts");
         let broken = "const a = 1;\n\nfunction {\n";
-        let result = write_format_validate(&path, broken, &config, &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            broken,
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert!(!result.rolled_back);
         assert_eq!(result.syntax_valid, Some(false));
         assert_eq!(result.syntax_error_line, Some(3));
@@ -2443,8 +2508,14 @@ mod tests {
         // carries no created-file line.
         let existing = temp.path().join("existing.ts");
         std::fs::write(&existing, "const a = 1;\n").unwrap();
-        let result =
-            write_format_validate(&existing, broken, &config, &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &existing,
+            broken,
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert!(result.rolled_back);
         assert_eq!(result.syntax_error_line, None);
     }
@@ -2613,6 +2684,7 @@ mod tests {
         std::fs::write(&path, "const value = 1;\n").unwrap();
         let (source, observation) = read_edit_source(&path).unwrap();
         let mut result = write_format_validate_observed(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
             &path,
             "function {",
             &Config::default(),
@@ -2630,6 +2702,7 @@ mod tests {
         // A stale valid source must not cause rollback against a now-invalid file.
         std::fs::write(&path, "function { external-invalid").unwrap();
         let mut result = write_format_validate_observed(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
             &path,
             "function { new-invalid",
             &Config::default(),
@@ -2678,6 +2751,7 @@ mod tests {
             A03_SYNTAX_PARSES.with(|count| count.set(0));
             let params = serde_json::json!({"validate": if full {"full"} else {"syntax"}, "include_diff_content": true});
             let mut result = write_format_validate_observed(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                 &path,
                 "const value = 2;\n",
                 &config,
@@ -2767,8 +2841,14 @@ mod tests {
         };
         WRITE_PIPELINE_READS.with(|count| count.set(0));
         crate::parser::work_counters::TREE_SOURCE_READS.with(|count| count.set(0));
-        let result =
-            write_format_validate(&path, &updated, &config, &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            &updated,
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(result.syntax_valid, Some(true));
         assert!(!result.rolled_back);
         assert!(result.reformatted_excerpt.is_none());
@@ -2776,8 +2856,14 @@ mod tests {
         let reads = WRITE_PIPELINE_READS.with(|count| count.get())
             + crate::parser::work_counters::TREE_SOURCE_READS.with(|count| count.get());
         assert_eq!(reads, 2, "shared write pipeline content reads");
-        let invalid =
-            write_format_validate(&path, "function {", &config, &serde_json::json!({})).unwrap();
+        let invalid = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "function {",
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(invalid.syntax_valid, Some(false));
         assert!(invalid.rolled_back);
         assert!(invalid.reformatted_excerpt.is_none());
@@ -2806,8 +2892,14 @@ func decode(data: Data) throws {
             ..Config::default()
         };
 
-        let result =
-            write_format_validate(&path, updated, &config, &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            updated,
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
 
         assert_eq!(result.syntax_valid, Some(true));
         assert!(!result.rolled_back);
@@ -2832,8 +2924,14 @@ func decode(data: Data) throws {
             ..Config::default()
         };
 
-        let result =
-            write_format_validate(&path, updated, &config, &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            updated,
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
 
         assert_eq!(result.syntax_valid, Some(true));
         assert!(!result.rolled_back);
@@ -3063,8 +3161,14 @@ mod audit11_regressions {
             ..Default::default()
         };
         let updated = "\u{feff}let x = 2;\r\n";
-        let result =
-            write_format_validate(&path, updated, &config, &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            updated,
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert!(!result.rolled_back);
         assert_eq!(std::fs::read(&path).unwrap(), updated.as_bytes());
         assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
@@ -3074,8 +3178,14 @@ mod audit11_regressions {
         );
         let held_updated = std::fs::File::open(&path).unwrap();
         let inode = held_updated.metadata().unwrap().ino();
-        let result =
-            write_format_validate(&path, "function {", &config, &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "function {",
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert!(result.rolled_back);
         assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
         assert_eq!(std::fs::read(&path).unwrap(), updated.as_bytes());
@@ -3152,7 +3262,14 @@ mod source_write_access_tests {
         };
         let before = acl_of(&path).expect("ACL stored");
 
-        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(acl_of(&path).as_ref(), Some(&before));
         assert_eq!(
@@ -3209,7 +3326,14 @@ mod source_write_access_tests {
                 .any(|entry| entry.starts_with("user:") && entry.ends_with(":deny:read")),
             "{before:?}"
         );
-        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(acl_of(&path), before);
     }
@@ -3242,7 +3366,14 @@ mod source_write_access_tests {
         );
         assert_eq!(acl_of(&path), None);
 
-        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(acl_of(&path), None);
         let mode = atomic_write_source(&path, b"third\n").unwrap().mode;
@@ -3315,7 +3446,14 @@ mod source_write_access_tests {
         );
         assert_eq!(acl_of(&path), None);
 
-        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(acl_of(&path), None);
         assert_eq!(
@@ -3340,7 +3478,14 @@ mod source_write_access_tests {
         std::fs::write(&path, "old\n").unwrap();
         std::fs::hard_link(&path, &other_name).unwrap();
         let inode = std::fs::metadata(&path).unwrap().ino();
-        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(std::fs::read(&other_name).unwrap(), b"new\n");
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
@@ -3376,7 +3521,14 @@ mod source_write_access_tests {
         std::fs::write(&path, "old\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         std::os::unix::fs::chown(&path, None, Some(group)).unwrap();
-        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         let metadata = std::fs::metadata(&path).unwrap();
         assert_eq!(metadata.gid(), group);
@@ -3514,8 +3666,14 @@ mod in_place_write_tests {
             .path()
             .join(format!(".aft-source-{}-notes.txt.orig", "0".repeat(32)));
         std::fs::write(&leftover, "saved\n").unwrap();
-        let result =
-            write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(
             result.write_warnings.len(),
@@ -3547,9 +3705,14 @@ mod in_place_write_tests {
             return;
         }
         std::fs::hard_link(&path, &other_name).unwrap();
-        let result =
-            write_format_validate(&path, "echo new\n", &plain_config(), &serde_json::json!({}))
-                .unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "echo new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&other_name).unwrap(), b"echo new\n");
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
@@ -3607,7 +3770,14 @@ mod in_place_write_tests {
             before.contains("Backup Operators") || before.contains("S-1-5-32-551"),
             "{before}"
         );
-        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(icacls(&path), before);
         let outcome = atomic_write_source(&path, b"third\n").unwrap();

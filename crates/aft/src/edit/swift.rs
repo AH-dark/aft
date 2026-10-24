@@ -58,6 +58,7 @@ enum LookupOutcome {
 }
 
 pub(super) fn confirm_if_needed(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     path: &Path,
     source: &str,
     original: Option<&str>,
@@ -73,12 +74,14 @@ pub(super) fn confirm_if_needed(
     // new content applies whatever the original was, so an edit that repairs a
     // broken file into valid Swift tree-sitter misreads is reported valid.
     if *was_valid == Some(false)
-        && original.is_some_and(|source| matches!(parse(source), ParseOutcome::Exited(Some(0))))
+        && original.is_some_and(|source| {
+            matches!(parse(tool_policy, source), ParseOutcome::Exited(Some(0)))
+        })
     {
         *was_valid = Some(true);
     }
 
-    confirm_with_compiler(path, source, is_valid)
+    confirm_with_compiler(tool_policy, path, source, is_valid)
 }
 
 /// Confirm a tree-sitter error in a Swift file that the current call created.
@@ -88,6 +91,7 @@ pub(super) fn confirm_if_needed(
 /// remains the authority. An unfinished confirmation is unknown, not evidence
 /// that the new file contains a syntax error.
 pub(super) fn confirm_created(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     path: &Path,
     source: &str,
     is_valid: Option<bool>,
@@ -95,17 +99,28 @@ pub(super) fn confirm_created(
     if path.extension().and_then(|ext| ext.to_str()) != Some("swift") || is_valid != Some(false) {
         return Ok(is_valid);
     }
-    compiler_verdict(path, source).map(|verdict| verdict.or(is_valid))
+    compiler_verdict(tool_policy, path, source).map(|verdict| verdict.or(is_valid))
 }
 
-fn confirm_with_compiler(path: &Path, source: &str, is_valid: Option<bool>) -> Option<bool> {
+fn confirm_with_compiler(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    path: &Path,
+    source: &str,
+    is_valid: Option<bool>,
+) -> Option<bool> {
     // Existing files keep the conservative rollback policy when confirmation
     // cannot finish; newly created files have no original content to protect.
-    compiler_verdict(path, source).unwrap_or(None).or(is_valid)
+    compiler_verdict(tool_policy, path, source)
+        .unwrap_or(None)
+        .or(is_valid)
 }
 
-fn compiler_verdict(path: &Path, source: &str) -> Result<Option<bool>, &'static str> {
-    let outcome = parse(source);
+fn compiler_verdict(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    path: &Path,
+    source: &str,
+) -> Result<Option<bool>, &'static str> {
+    let outcome = parse(tool_policy, source);
     log::debug!(
         "Swift syntax confirmation for {}: {outcome:?}",
         path.display()
@@ -156,6 +171,8 @@ fn discover_swiftc() -> LookupOutcome {
     }
     #[cfg(target_os = "macos")]
     {
+        // Discovery is operator-only and cached across sessions, unlike each
+        // source parse. Do not attach one session's launch policy to this probe.
         let mut command = Command::new("xcrun");
         command.args(["--find", "swiftc"]);
         xcrun_lookup_outcome(run_command(
@@ -207,7 +224,10 @@ pub(super) fn available() -> bool {
             return false;
         }
         // Warm up the compiler under the same generous guard as the native tests.
-        let outcome = parse("");
+        let outcome = parse(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            "",
+        );
         assert!(
             matches!(outcome, ParseOutcome::Exited(Some(0))),
             "discovered swiftc failed to parse empty input: {outcome:?}"
@@ -227,14 +247,16 @@ pub(super) fn with_native_swiftc<T>(f: impl FnOnce() -> T) -> Option<T> {
     })
 }
 
-fn parse(source: &str) -> ParseOutcome {
+fn parse(tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy, source: &str) -> ParseOutcome {
     #[cfg(test)]
     if let Some(outcome) =
         RUNNER.with(|runner| runner.borrow_mut().as_mut().map(|runner| runner(source)))
     {
         return outcome;
     }
-    parse_with_lookup(source, find_swiftc, run_swiftc)
+    parse_with_lookup(source, find_swiftc, |path, source| {
+        run_swiftc(tool_policy, path, source)
+    })
 }
 
 fn parse_with_lookup(
@@ -251,10 +273,17 @@ fn parse_with_lookup(
     }
 }
 
-fn run_swiftc(path: &Path, source: &str) -> ParseOutcome {
-    let mut command = Command::new(path);
+fn run_swiftc(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    path: &Path,
+    source: &str,
+) -> ParseOutcome {
     // Parsing stdin avoids temporary files. -parse performs no type checking or imports.
-    command.args(["-parse", "-"]);
+    let args = ["-parse", "-"].map(std::ffi::OsString::from);
+    let command = match tool_policy.command(path.as_os_str(), &args) {
+        Ok(command) => command,
+        Err(reason) => return ParseOutcome::Unavailable(reason),
+    };
     parse_outcome(run_command(
         command,
         "swiftc",
@@ -273,8 +302,9 @@ fn parse_outcome(result: Result<SubprocessOutcome, FormatError>) -> ParseOutcome
     }
 }
 
-/// Run a syntax-only checker that reads `source` on stdin, killing its
-/// process tree at `deadline`. Shared by the Swift and bash confirmations.
+/// Run a prepared tool command that reads `source` on stdin, killing its
+/// process tree at `deadline`. Syntax-confirmation callers supply commands
+/// prepared under the request policy; operator-only compiler discovery does not.
 ///
 /// With `may_stop_reading`, a checker that exits before reading all of its
 /// input (bash stops at the first syntax error) is judged by its exit status;
@@ -361,6 +391,49 @@ mod tests {
     const TUPLE: &str = "_ = (Int, Result<String, Error>).self\n";
     const BROKEN: &str = "_ = (Int, Result<String, Error>.self\n";
 
+    #[cfg(unix)]
+    #[test]
+    fn swiftc_parse_cannot_bypass_the_supplied_tool_policy() {
+        use crate::sandbox_spawn::{SpawnPlan, ToolLaunchPolicy};
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("parsed");
+        let compiler = root.path().join("swiftc");
+        crate::executable_cache::write_executable(
+            &compiler,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --warm-up ]; then exit 0; fi\n: > '{}'\ncat >/dev/null\n",
+                marker.display()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(Command::new(&compiler)
+            .arg("--warm-up")
+            .status()
+            .unwrap()
+            .success());
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let policy = crate::sandbox_spawn::with_spawn_plan_for_test(
+            SpawnPlan::refused_for_test("sandbox_unavailable"),
+            || ToolLaunchPolicy::resolve(&ctx),
+        );
+        let outcome = run_swiftc(&policy, &compiler, TUPLE);
+        assert!(
+            matches!(&outcome, ParseOutcome::Unavailable(reason) if reason.starts_with("sandbox_unavailable")),
+            "{outcome:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a refused syntax checker must not run on the host"
+        );
+    }
+
     fn write_case(source: &str, outcome: ParseOutcome) -> (WriteResult, String) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("tuple.swift");
@@ -375,6 +448,7 @@ mod tests {
             }),
             || {
                 write_format_validate(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                     &path,
                     source,
                     &Config {
@@ -423,15 +497,27 @@ mod tests {
                 assert_eq!(validate_syntax_str(TUPLE, &path), Some(false));
                 assert_eq!(validate_syntax_str(BROKEN, &path), Some(false));
 
-                let first =
-                    write_format_validate(&path, TUPLE, &config, &serde_json::json!({})).unwrap();
+                let first = write_format_validate(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                    &path,
+                    TUPLE,
+                    &config,
+                    &serde_json::json!({}),
+                )
+                .unwrap();
                 assert!(!first.rolled_back);
                 assert_eq!(first.syntax_valid, Some(true));
                 assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
                 assert_eq!(*calls.borrow(), [TUPLE]);
 
-                let mut second =
-                    write_format_validate(&path, BROKEN, &config, &serde_json::json!({})).unwrap();
+                let mut second = write_format_validate(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                    &path,
+                    BROKEN,
+                    &config,
+                    &serde_json::json!({}),
+                )
+                .unwrap();
                 assert!(second.rolled_back);
                 assert_eq!(second.syntax_valid, Some(false));
                 assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
@@ -478,6 +564,7 @@ mod tests {
                     let path = temp.path().join("broken.swift");
                     std::fs::write(&path, BROKEN).unwrap();
                     let result = write_format_validate(
+                        &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                         &path,
                         &updated,
                         &Config {
@@ -518,6 +605,7 @@ mod tests {
             }),
             || {
                 write_format_validate(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                     &path,
                     TUPLE,
                     &Config {
@@ -569,6 +657,7 @@ mod tests {
                     let path = temp.path().join("tuple.swift");
                     std::fs::write(&path, TUPLE).unwrap();
                     let result = write_format_validate(
+                        &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                         &path,
                         &updated,
                         &Config {
@@ -611,6 +700,7 @@ mod tests {
                     let path = temp.path().join("new.swift");
                     assert_eq!(validate_syntax_str(TUPLE, &path), Some(false));
                     let result = write_format_validate(
+                        &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                         &path,
                         TUPLE,
                         &Config {
@@ -981,6 +1071,7 @@ mod tests {
                 let updated = "let value = 2\n";
                 assert_eq!(validate_syntax_str(updated, &path), Some(true));
                 let result = write_format_validate(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                     &path,
                     updated,
                     &Config {
@@ -1042,6 +1133,7 @@ mod tests {
                 let path = temp.path().join("bad.ts");
                 std::fs::write(&path, "const value = 1;\n").unwrap();
                 let result = write_format_validate(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                     &path,
                     "function {",
                     &Config {
@@ -1079,6 +1171,7 @@ mod tests {
                     let mut original_valid = was_valid;
                     assert_eq!(
                         confirm_if_needed(
+                            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                             Path::new("test.swift"),
                             TUPLE,
                             Some(TUPLE),
@@ -1113,6 +1206,7 @@ mod tests {
                 let mut original_valid = None;
                 assert_eq!(
                     confirm_if_needed(
+                        &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                         Path::new("test.swift"),
                         TUPLE,
                         Some(TUPLE),
@@ -1138,13 +1232,25 @@ mod tests {
                 format_on_edit: false,
                 ..Config::default()
             };
-            let first =
-                write_format_validate(&path, TUPLE, &config, &serde_json::json!({})).unwrap();
+            let first = write_format_validate(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &path,
+                TUPLE,
+                &config,
+                &serde_json::json!({}),
+            )
+            .unwrap();
             assert!(!first.rolled_back);
             assert_eq!(first.syntax_valid, Some(true));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
-            let second =
-                write_format_validate(&path, BROKEN, &config, &serde_json::json!({})).unwrap();
+            let second = write_format_validate(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &path,
+                BROKEN,
+                &config,
+                &serde_json::json!({}),
+            )
+            .unwrap();
             assert!(second.rolled_back);
             assert_eq!(second.syntax_valid, Some(false));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
@@ -1158,7 +1264,11 @@ mod tests {
     #[test]
     fn swift_parser_native_created_file_is_valid() {
         let Some(()) = with_native_swiftc(|| {
-            let check = crate::edit::check_created_file_syntax(Path::new("new.swift"), TUPLE);
+            let check = crate::edit::check_created_file_syntax(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                Path::new("new.swift"),
+                TUPLE,
+            );
             assert_eq!(check.valid, Some(true), "{check:?}");
             assert_eq!(check.first_error_line, None);
             assert_eq!(check.skipped_reason, None);
@@ -1179,6 +1289,7 @@ mod tests {
         let path = temp.path().join("tuple.swift");
         std::fs::write(&path, ORIGINAL).unwrap();
         let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
             &path,
             TUPLE,
             &Config {
@@ -1200,6 +1311,7 @@ mod tests {
             let path = temp.path().join("broken.swift");
             std::fs::write(&path, ORIGINAL).unwrap();
             let result = write_format_validate(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                 &path,
                 BROKEN,
                 &Config {
@@ -1223,7 +1335,10 @@ mod tests {
     fn swift_parser_does_not_typecheck_or_load_imports() {
         let Some(()) = with_native_swiftc(|| {
             assert!(matches!(
-                parse("import AFTModuleThatDoesNotExist\n_ = undefinedName\n"),
+                parse(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                    "import AFTModuleThatDoesNotExist\n_ = undefinedName\n"
+                ),
                 ParseOutcome::Exited(Some(0))
             ));
         }) else {
@@ -1338,6 +1453,7 @@ mod tests {
             }),
             || {
                 write_format_validate(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                     &path,
                     &TUPLE.repeat(4_096),
                     &Config {

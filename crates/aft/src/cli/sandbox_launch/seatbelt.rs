@@ -520,6 +520,77 @@ fn escape_path(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    // Seatbelt rendering is macOS-only in production, and this fixture builds
+    // the /var -> /private/var alias with a Unix symlink.
+    #[cfg(unix)]
+    #[test]
+    fn scoped_var_folder_grants_render_canonical_write_and_read_allows() {
+        use aft::access_policy::{AccessGrant, AccessOperation, AccessPolicy, GrantKind};
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let real = root.join("private/var/folders");
+        let project = real.join("project");
+        let data = real.join("private-data");
+        let write = data.join("write");
+        let read = data.join("read");
+        let home = root.join("home");
+        let temp = root.join("temp");
+        for path in [&project, &write, &read, &home, &temp] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::os::unix::fs::symlink(root.join("private/var"), root.join("var")).unwrap();
+        let alias = root.join("var/folders");
+        let alias_write = alias.join("private-data/write");
+        let alias_read = alias.join("private-data/read");
+        let mut policy = AccessPolicy::from_config(
+            &aft::config::Config::default(),
+            &root.join("store"),
+            vec![alias.join("project")],
+            &home,
+        );
+        policy.grants = vec![
+            AccessGrant {
+                path: alias_write.clone(),
+                operation: AccessOperation::Write,
+                kind: GrantKind::Subtree,
+            },
+            AccessGrant {
+                path: alias_read.clone(),
+                operation: AccessOperation::Read,
+                kind: GrantKind::Subtree,
+            },
+        ];
+        let mut profile = policy.compile_shell(temp, Vec::new(), Vec::new()).unwrap();
+        // Seatbelt reads are default-allowed. A data-store deny makes the held
+        // read capability observable as a narrow exception to that deny.
+        profile.data_policy.deny.push(alias.join("private-data"));
+        let profile: SandboxProfile =
+            serde_json::from_slice(&serde_json::to_vec(&profile).unwrap()).unwrap();
+        let profile = profile.canonicalize_for_launch().unwrap();
+        assert!(profile.writable_roots.contains(&write));
+        assert!(profile.data_policy.read_allow.contains(&read));
+        let source = render_profile(&profile).unwrap();
+        let write = escape_path(&write).unwrap();
+        let read = escape_path(&read).unwrap();
+        let data = escape_path(&data).unwrap();
+        assert!(
+            source.contains(&format!("(allow file-write* (subpath \"{write}\"))")),
+            "{source}"
+        );
+        assert!(source.contains(&format!(
+            "(deny file-write* (require-all (subpath \"{data}\") (require-not (subpath \"{write}\"))))"
+        )), "{source}");
+        assert!(source.contains(&format!(
+            "(deny file-read* (require-all (subpath \"{data}\") (require-not (subpath \"{read}\")) (require-not (subpath \"{write}\"))))"
+        )), "{source}");
+        for alias_path in [&alias_write, &alias_read] {
+            assert!(
+                !source.contains(&format!("\"{}\"", escape_path(alias_path).unwrap())),
+                "{source}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

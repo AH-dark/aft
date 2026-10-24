@@ -319,7 +319,9 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // Write, format, and validate via shared pipeline
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
     let mut write_result = match edit::write_format_validate_observed(
+        tool_policy,
         &path,
         &new_source,
         &ctx.config(),

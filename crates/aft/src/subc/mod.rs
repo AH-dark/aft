@@ -9014,15 +9014,29 @@ impl PlainToolRun {
                         &bare_name,
                         arguments,
                         |arguments| {
-                            run_tool_call(
-                                &bare_name,
-                                arguments,
-                                &format_context,
-                                &tool_call_context,
-                                ctx,
-                                &dispatch,
-                                Some(&finalizer),
-                                Some(&mut phase_trace),
+                            let tool_policy = (!tool_call_context.preview
+                                && manifest::tool_call_is_mutating(&bare_name, &arguments))
+                            .then(|| {
+                                crate::sandbox_spawn::ToolLaunchPolicy::for_session(
+                                    ctx,
+                                    identity_for_run.spawn_principal.clone(),
+                                    access_grants::alfonso_worker(&identity_for_run),
+                                )
+                            });
+                            crate::sandbox_spawn::ToolLaunchPolicy::with_current(
+                                tool_policy,
+                                || {
+                                    run_tool_call(
+                                        &bare_name,
+                                        arguments,
+                                        &format_context,
+                                        &tool_call_context,
+                                        ctx,
+                                        &dispatch,
+                                        Some(&finalizer),
+                                        Some(&mut phase_trace),
+                                    )
+                                },
                             )
                         },
                     )

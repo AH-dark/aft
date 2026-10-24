@@ -162,7 +162,9 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Phase 6: Write, format, and validate via shared pipeline
     let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
     let mut write_result = match edit::write_format_validate_observed(
+        tool_policy,
         &path,
         &content,
         &ctx.config(),
@@ -1176,7 +1178,14 @@ mod audit11_regressions {
                 format_on_edit: false,
                 ..Default::default()
             };
-            edit::write_format_validate(&path, &content, &config, &serde_json::json!({})).unwrap();
+            edit::write_format_validate(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &path,
+                &content,
+                &config,
+                &serde_json::json!({}),
+            )
+            .unwrap();
             assert_eq!(
                 std::fs::read(path).unwrap(),
                 "\u{feff}first\r\nnew\nthree\rfour\r\ntail".as_bytes()
