@@ -5088,6 +5088,7 @@ impl Clone for SemanticIndex {
 
 #[cfg(test)]
 thread_local! {
+    static SHARED_PATH_JOINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PERSIST_DIRTY_SNAPSHOT_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -5641,6 +5642,14 @@ impl SemanticIndex {
         })
     }
 
+    /// Absolute path of a root-relative base or view-run chunk path. Tests
+    /// count the calls to prove refresh joins only the paths it needs.
+    fn join_shared_path(&self, file: &Path) -> PathBuf {
+        #[cfg(test)]
+        SHARED_PATH_JOINS.with(|count| count.set(count.get() + 1));
+        self.project_root.join(file)
+    }
+
     // Base paths are relative; delta paths are absolute. Iteration preserves the
     // old retain-then-append order, including the score comparator's index ties.
     // A view overlay's shared replacement runs read between the two, where its
@@ -5653,7 +5662,7 @@ impl SemanticIndex {
             .chain(self.view_run_entries())
             .map(|entry| {
                 (
-                    std::borrow::Cow::Owned(self.project_root.join(&entry.chunk.file)),
+                    std::borrow::Cow::Owned(self.join_shared_path(&entry.chunk.file)),
                     entry,
                 )
             })
@@ -6098,13 +6107,50 @@ impl SemanticIndex {
         let requested: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
         let mut reuse_map: ChunkReuseMap = HashMap::new();
 
-        for (path, entry) in self.live_entries() {
-            #[cfg(test)]
-            crate::search_hot_path_measurements::record(|counts| counts.refresh_entry_visits += 1);
-            if !requested.contains(path.as_ref()) {
-                continue;
-            }
-
+        // Base and view-run chunks carry root-relative paths. Match them
+        // against the requested files in that relative form, so only the
+        // chunks actually reused pay for an absolute path allocation. The
+        // visit order and visit count are the same as `live_entries`.
+        let requested_relative: HashSet<&Path> = files
+            .iter()
+            .filter_map(|path| path.strip_prefix(&self.project_root).ok())
+            .collect();
+        let shared_entries = self
+            .shared_base
+            .iter()
+            .flat_map(|base| base.entries())
+            .filter(|entry| !self.tombstones.contains(&entry.chunk.file))
+            .chain(self.view_run_entries())
+            .inspect(|_| {
+                #[cfg(test)]
+                crate::search_hot_path_measurements::record(|counts| {
+                    counts.refresh_entry_visits += 1
+                });
+            })
+            .filter(|entry| requested_relative.contains(entry.chunk.file.as_path()))
+            .map(|entry| {
+                (
+                    std::borrow::Cow::Owned(self.join_shared_path(&entry.chunk.file)),
+                    entry,
+                )
+            });
+        let local_entries = self
+            .entries
+            .iter()
+            .inspect(|_| {
+                #[cfg(test)]
+                crate::search_hot_path_measurements::record(|counts| {
+                    counts.refresh_entry_visits += 1
+                });
+            })
+            .filter(|entry| requested.contains(entry.chunk.file.as_path()))
+            .map(|entry| {
+                (
+                    std::borrow::Cow::Borrowed(entry.chunk.file.as_path()),
+                    entry,
+                )
+            });
+        for (path, entry) in shared_entries.chain(local_entries) {
             // `embed_text` is already persisted in the current on-disk format,
             // so refresh-time reuse can hash it in memory and confirm the exact
             // string without bumping `SEMANTIC_INDEX_VERSION` and forcing every
@@ -18560,6 +18606,37 @@ mod embedding_backend_retry_status_tests {
         let project = tempfile::tempdir().unwrap();
         let lock = SemanticIndexLock::acquire(storage.path(), "poison", project.path()).unwrap();
         assert!(lock._guard.is_some());
+    }
+
+    #[test]
+    fn audit10_reuse_map_joins_only_requested_shared_paths() {
+        let mut index = audit10_vector_index(vec![vec![1.0, 0.0]; 64]);
+        for (i, entry) in index.entries.iter_mut().enumerate() {
+            entry.chunk.file = index.project_root.join(format!("file_{i}.rs"));
+            index
+                .file_mtimes
+                .insert(entry.chunk.file.clone(), SystemTime::UNIX_EPOCH);
+            index.file_sizes.insert(entry.chunk.file.clone(), 0);
+        }
+        let requested = index.entries[0].chunk.file.clone();
+        let mut worker = index.fork_for_refresh();
+        assert!(worker.shared_base.is_some());
+        SHARED_PATH_JOINS.with(|count| count.set(0));
+        let reuse = worker.build_chunk_reuse_map(std::slice::from_ref(&requested));
+        assert_eq!(reuse.len(), 1);
+        let rows = reuse[&requested].values().next().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(&*rows[0].vector, &[1.0, 0.0]);
+        SHARED_PATH_JOINS.with(|count| assert_eq!(count.get(), 1));
+        worker.tombstones.insert(
+            requested
+                .strip_prefix(&worker.project_root)
+                .unwrap()
+                .to_path_buf(),
+        );
+        SHARED_PATH_JOINS.with(|count| count.set(0));
+        assert!(worker.build_chunk_reuse_map(&[requested]).is_empty());
+        SHARED_PATH_JOINS.with(|count| assert_eq!(count.get(), 0));
     }
 
     fn audit10_vector_index(vectors: Vec<Vec<f32>>) -> SemanticIndex {
