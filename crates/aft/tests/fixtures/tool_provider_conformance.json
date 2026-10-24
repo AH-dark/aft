@@ -2,19 +2,19 @@
   "registry_artifacts": [
     {
       "name": "cortexkit-role-tool-provider",
-      "version": "0.10.4",
+      "version": "0.13.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "ca097348ffbd27d40a327528b078140bcbc3fa06ac096c13f84a7c7dc908ccc4",
+      "checksum": "fbe60bbeae8cefacb56ae174d7fdce081efc149c60b52a7c3ea184c38089a9d0",
       "dependency_kind": "normal",
-      "release_tag": "cortexkit-role-tool-provider-v0.10.4"
+      "release_tag": "cortexkit-role-tool-provider-v0.13.0"
     },
     {
       "name": "cortexkit-role-tool-provider-conformance",
-      "version": "0.10.1",
+      "version": "0.13.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "4d917b2b6ae9797a09da083670a8039c2905bf988dbd89c1dbab5c718b5c352d",
+      "checksum": "5165507004302a8c8140e4b4ea934b575d372549d63e11856bfadc3fbefccd1c",
       "dependency_kind": "dev",
-      "release_tag": "cortexkit-role-tool-provider-conformance-v0.10.1"
+      "release_tag": "cortexkit-role-tool-provider-conformance-v0.13.0"
     },
     {
       "name": "cortexkit-role-harness",
@@ -78,7 +78,11 @@
       "late_results_incarnation_change_refused",
       "crash_after_prepared_not_started",
       "crash_after_authorized_not_started",
-      "tool_result_content_v1_valid"
+      "tool_result_v1_valid",
+      "system_text_preset_optional_served"
+    ],
+    "inapplicable_cases": [
+      "system_text_default_served"
     ],
     "capabilities": [
       "disable_tool",
@@ -158,7 +162,11 @@
             "user_commands_flow_refused",
             "user_commands_accepted_late",
             "tool_result_held_reply_route_gating",
-            "tool_result_content_v1_valid"
+            "tool_result_v1_valid",
+            "system_text_preset_optional_served"
+          ],
+          "inapplicable_cases": [
+            "system_text_default_served"
           ],
           "capabilities": [
             "disable_tool",
@@ -221,7 +229,11 @@
             "late_results_ack",
             "crash_after_prepared_not_started",
             "crash_after_authorized_not_started",
-            "tool_result_content_v1_valid"
+            "tool_result_v1_valid",
+            "system_text_preset_optional_served"
+          ],
+          "inapplicable_cases": [
+            "system_text_default_served"
           ],
           "capabilities": [
             "disable_tool",
@@ -285,7 +297,11 @@
             "user_commands_flow_refused",
             "user_commands_accepted_late",
             "tool_result_held_reply_route_gating",
-            "tool_result_content_v1_valid"
+            "tool_result_v1_valid",
+            "system_text_preset_optional_served"
+          ],
+          "inapplicable_cases": [
+            "system_text_default_served"
           ],
           "capabilities": [
             "disable_tool",
@@ -348,7 +364,11 @@
             "late_results_ack",
             "crash_after_prepared_not_started",
             "crash_after_authorized_not_started",
-            "tool_result_content_v1_valid"
+            "tool_result_v1_valid",
+            "system_text_preset_optional_served"
+          ],
+          "inapplicable_cases": [
+            "system_text_default_served"
           ],
           "capabilities": [
             "disable_tool",
@@ -412,7 +432,11 @@
             "crash_after_prepared_not_started",
             "crash_after_authorized_not_started",
             "call_mode_matches_catalog",
-            "tool_result_content_v1_valid"
+            "tool_result_v1_valid",
+            "system_text_preset_optional_served"
+          ],
+          "inapplicable_cases": [
+            "system_text_default_served"
           ],
           "capabilities": [
             "disable_tool",
@@ -469,7 +493,11 @@
             "crash_after_prepared_not_started",
             "crash_after_authorized_not_started",
             "call_mode_matches_catalog",
-            "tool_result_content_v1_valid"
+            "tool_result_v1_valid",
+            "system_text_preset_optional_served"
+          ],
+          "inapplicable_cases": [
+            "system_text_default_served"
           ],
           "capabilities": [
             "disable_tool",
