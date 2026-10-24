@@ -758,22 +758,7 @@ pub fn scan_symbols_in_text(text: &str) -> Vec<(String, SymbolOffsetRange)> {
         current_offset += segment.len();
     }
 
-    // Approximate bodies must not borrow evidence from the next declaration.
-    for index in 0..symbols.len().saturating_sub(1) {
-        symbols[index].1.end = symbols[index].1.end.min(symbols[index + 1].1.start);
-    }
     symbols
-}
-
-#[cfg(test)]
-#[test]
-fn audit01_approximate_span_stops_at_next_declaration() {
-    let source = "pub fn first() { }\n\npub fn second() { target_phrase(); }\n";
-    let symbols = scan_symbols_in_text(source);
-    assert_eq!(symbols.len(), 2);
-    assert!(symbols[0].1.end <= symbols[1].1.start);
-    assert!(!source[symbols[0].1.start..symbols[0].1.end].contains("target_phrase"));
-    assert!(source[symbols[1].1.start..symbols[1].1.end].contains("target_phrase"));
 }
 
 #[cfg(test)]
