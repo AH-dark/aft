@@ -19792,14 +19792,18 @@ mod tests {
             &ctx, true, false
         )));
         let completion = search_index_completion(&ctx);
-        // A slow disk may delay publication, but requesting a cold slot is a
-        // bypass violation regardless of how quickly the machine runs.
+        // A slow disk may delay publication, but a warm load must not request
+        // a slot from the saturated cold-build limiter. The 30s deadline only
+        // bounds a stalled worker; the refusal event detects incorrect admission.
         crossbeam_channel::select! {
             recv(cold_refusal) -> refusal => {
                 panic!("warm search load requested a saturated cold-build slot: {refusal:?}");
             }
             recv(completion) -> index => {
                 install_search_index_completion(&ctx, index.expect("warm search load disconnected"));
+            }
+            default(Duration::from_secs(30)) => {
+                panic!("timed out waiting for warm search publication or cold-build refusal");
             }
         }
     }
@@ -20185,6 +20189,9 @@ mod tests {
                 let _ = index.expect("cold search load disconnected while waiting for permit");
                 panic!("cold search load published before permit release");
             }
+            default(Duration::from_secs(30)) => {
+                panic!("timed out waiting for cold-build refusal before permit release");
+            }
         }
         crate::runtime_drain::drain_build_completions(&ctx);
         assert!(
@@ -20204,8 +20211,8 @@ mod tests {
 
         drop(held_permits.pop());
         let index = completion
-            .recv()
-            .expect("cold search load disconnected after permit release");
+            .recv_timeout(Duration::from_secs(30))
+            .expect("cold search publication did not arrive within 30s after permit release");
         install_search_index_completion(&ctx, index);
     }
 
