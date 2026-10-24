@@ -3486,6 +3486,12 @@ pub fn drain_on_demand_callgraph_build(ctx: &Arc<AppContext>) {
 }
 
 pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
+    if ctx.view_full_verification_due() && !crate::executor::view_publication::running_for(ctx) {
+        // A quiet root still needs verification after ten minutes or restart.
+        // The full request remains sticky through retries and later events.
+        state.view_publication_full = true;
+        state.view_publication_due = Some(Instant::now());
+    }
     if !ctx.config().views.enabled
         || !matches!(state.phase, WatcherDrainPhase::Collect)
         || state
@@ -3645,12 +3651,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
 
     {
         let rx_ref = ctx.watcher_rx().lock();
-        let Some(rx) = rx_ref.as_ref() else {
-            ctx.tick_tier2_refresh_scheduler(0);
-            return outcome;
-        };
-
-        loop {
+        // Idle verification must also run when no watcher receiver is installed.
+        while let Some(rx) = rx_ref.as_ref() {
             match rx.try_recv() {
                 Ok(
                     event @ (WatcherDispatchEvent::Paths(_)

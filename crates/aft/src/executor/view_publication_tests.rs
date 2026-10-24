@@ -1368,15 +1368,23 @@ fn publication_does_not_reuse_a_deleted_unchanged_member() {
 fn publication_rescan_then_event_still_reads_the_whole_checkout() {
     use crate::watcher_filter::{RescanReason, WatcherDispatchEvent};
     let fixture = Fixture::new();
-    let before = fixture
-        .view
-        .load_manifest(&fixture.initial)
+    std::fs::write(fixture.job_root().join("later.rs"), "pub fn before() {}\n").unwrap();
+    commit(&fixture.job_root());
+    let generation = fixture
+        .ctx
+        .publish_view_paths(BTreeSet::new(), true)
         .unwrap()
-        .to_json_bytes()
+        .generation
         .unwrap();
+    let before = fixture.view.load_manifest(&generation).unwrap();
     std::fs::write(
         fixture.job_root().join("tracked.rs"),
         "pub fn missed_by_watcher() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.job_root().join("later.rs"),
+        "pub fn reported() {}\n",
     )
     .unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -1404,14 +1412,11 @@ fn publication_rescan_then_event_still_reads_the_whole_checkout() {
     state.view_publication_due = Some(Instant::now());
     crate::runtime_drain::publish_view_if_quiet(&fixture.ctx, &mut state);
     let generation = fixture.view.current_generation().unwrap().unwrap();
+    let after = fixture.view.load_manifest(&generation).unwrap();
+    let missed = crate::views::RelPath::new(b"tracked.rs".to_vec()).unwrap();
     assert_ne!(
-        before,
-        fixture
-            .view
-            .load_manifest(&generation)
-            .unwrap()
-            .to_json_bytes()
-            .unwrap(),
+        before.get(&missed),
+        after.get(&missed),
         "the scheduled publication must read the edit omitted by the dropped events"
     );
     assert!(state.view_publication_due.is_none());
@@ -1464,6 +1469,47 @@ fn publication_unrepresentable_watcher_path_preserves_full_read() {
             after.get(&path),
             "unrepresentable event was silently discarded: root_event={root_event}"
         );
+    }
+}
+
+#[test]
+fn publication_idle_full_verification_runs_without_a_watcher_event() {
+    for with_receiver in [false, true] {
+        let fixture = Fixture::new();
+        let _sender = if with_receiver {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            *fixture.ctx.watcher_rx().lock() = Some(rx);
+            Some(tx)
+        } else {
+            None
+        };
+        let before = fixture.view.load_manifest(&fixture.initial).unwrap();
+        std::fs::write(
+            fixture.job_root().join("tracked.rs"),
+            "pub fn missed_during_silence() {}\n",
+        )
+        .unwrap();
+        crate::views::assembly::expire_verification_for_test(fixture.view.view_dir());
+        assert!(
+            fixture.ctx.watcher_drain_has_work(),
+            "the maintenance pump must wake an idle root at its verification deadline"
+        );
+        crate::runtime_drain::drain_watcher_to_completion_for_test(&fixture.ctx, usize::MAX);
+        let generation = fixture.view.current_generation().unwrap().unwrap();
+        let after = fixture.view.load_manifest(&generation).unwrap();
+        assert_ne!(
+        before, after,
+        "no new watcher event is needed to discover the missed edit: with_receiver={with_receiver}"
+    );
+        assert!(!fixture.ctx.view_full_verification_due());
+        assert!(fixture
+            .ctx
+            .watcher_drain_slice()
+            .lock()
+            .as_ref()
+            .unwrap()
+            .view_publication_due
+            .is_none());
     }
 }
 

@@ -34,6 +34,9 @@ struct RootCache {
     previous: Option<CachedManifest>,
     head: Option<(String, IndexStamp, Arc<Vec<crate::alias::TrackedPath>>)>,
     publications: u64,
+    last_full: Option<Instant>,
+    mismatch_pending: bool,
+    active_preparations: usize,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -79,13 +82,15 @@ pub(super) fn previous(view: &ViewStore, generation: Option<&str>) -> Option<Cac
         .cloned()
 }
 
-pub(super) fn remember(view: &ViewStore, cached: CachedManifest) {
-    caches()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(view.view_dir().to_path_buf())
-        .or_default()
-        .previous = Some(cached);
+pub(super) fn remember(view: &ViewStore, cached: CachedManifest, full_verified: bool) {
+    let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
+    let cache = caches.entry(view.view_dir().to_path_buf()).or_default();
+    cache.previous = Some(cached);
+    if full_verified {
+        cache.publications = 0;
+        cache.last_full = Some(Instant::now());
+        cache.mismatch_pending = false;
+    }
 }
 
 /// Rescans also refresh attributes: check-attr reads the index, whose attributes
@@ -136,11 +141,71 @@ pub(super) fn head(
     Ok((tree, entries, false))
 }
 
-pub(super) fn verification_due(view: &ViewStore) -> bool {
+pub(super) struct PreparationVerification {
+    view_dir: PathBuf,
+    pub due: bool,
+}
+
+impl Drop for PreparationVerification {
+    fn drop(&mut self) {
+        if let Some(cache) = caches()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&self.view_dir)
+        {
+            cache.active_preparations = cache.active_preparations.saturating_sub(1);
+        }
+    }
+}
+
+pub(super) fn begin_preparation(view: &ViewStore) -> PreparationVerification {
     let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
     let cache = caches.entry(view.view_dir().to_path_buf()).or_default();
-    cache.publications = cache.publications.wrapping_add(1);
-    cache.publications.is_multiple_of(64)
+    cache.publications = cache.publications.saturating_add(1);
+    cache.active_preparations += 1;
+    PreparationVerification {
+        view_dir: view.view_dir().to_path_buf(),
+        due: full_verification_required(cache, Instant::now()),
+    }
+}
+
+const FULL_VERIFICATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+// Failed preparations leave both the count and deadline due. Only remembering
+// a successfully served full result (including an identical no-op) renews them.
+fn full_verification_required(cache: &RootCache, now: Instant) -> bool {
+    cache.publications >= 64
+        || cache
+            .last_full
+            .is_none_or(|last| now.saturating_duration_since(last) >= FULL_VERIFICATION_INTERVAL)
+}
+
+pub(super) fn full_verification_due(view_dir: &Path) -> bool {
+    let caches = match caches().try_lock() {
+        Ok(caches) => caches,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return true,
+    };
+    caches.get(view_dir).is_none_or(|cache| {
+        cache.active_preparations == 0 && full_verification_required(cache, Instant::now())
+    })
+}
+
+pub(super) fn note_mismatch(view: &ViewStore) -> Option<u64> {
+    let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
+    let cache = caches.entry(view.view_dir().to_path_buf()).or_default();
+    if cache.mismatch_pending {
+        return None;
+    }
+    cache.mismatch_pending = true;
+    Some(VERIFICATION_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1)
+}
+
+#[cfg(test)]
+pub(super) fn expire_verification_for_test(view_dir: &Path) {
+    let mut caches = caches().lock().unwrap();
+    let cache = caches.entry(view_dir.to_path_buf()).or_default();
+    cache.last_full = Some(Instant::now() - FULL_VERIFICATION_INTERVAL);
 }
 
 pub(super) static VERIFICATION_MISMATCHES: std::sync::atomic::AtomicU64 =
@@ -473,6 +538,113 @@ mod tests {
         assert!(VERIFICATION_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed) > before);
         request.changed_paths.clear();
         assert_eq!(incremental, publish(&request).to_json_bytes().unwrap());
+    }
+
+    #[test]
+    fn views_periodic_verification_survives_nonincremental_and_failed_preparations() {
+        for fail_after_compare in [false, true] {
+            let (project, storage, mut request) = fixture();
+            let view = ViewStore::open(storage.path(), &request.scope).unwrap();
+            caches()
+                .lock()
+                .unwrap()
+                .get_mut(view.view_dir())
+                .unwrap()
+                .publications = 63;
+            let before = VERIFICATION_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed);
+            fs::write(project.path().join("f1.rs"), "pub fn missed() {}\n").unwrap();
+            fs::write(project.path().join("f0.rs"), "pub fn notified() {}\n").unwrap();
+            request.changed_paths.insert(b"f0.rs".to_vec());
+            if fail_after_compare {
+                let failure = prepare_checkout_deferring(&request, true, &mut |phase| {
+                    if phase == "cas" {
+                        Err(ViewError::InvalidManifest(
+                            "injected pre-commit failure".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                });
+                assert!(failure.is_err());
+            } else {
+                let generation = view.current_generation().unwrap().unwrap();
+                let manifest = view.load_manifest(&generation).unwrap();
+                let key = manifest_entry_callgraph_key(
+                    manifest
+                        .get(&RelPath::new(b"f7.rs".to_vec()).unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+                let store =
+                    BlobStore::open(storage.path(), &request.family, BlobPlane::Callgraph).unwrap();
+                let path = store.path().to_path_buf();
+                drop(store);
+                Connection::open(path)
+                    .unwrap()
+                    .execute(
+                        "DELETE FROM blob_payloads WHERE full_key = ?1",
+                        [decode_hex(key).unwrap()],
+                    )
+                    .unwrap();
+            }
+            let actual = publish(&request).to_json_bytes().unwrap();
+            assert_eq!(
+                actual,
+                rebuild_manifest(&request).to_json_bytes().unwrap(),
+                "fail_after_compare={fail_after_compare}"
+            );
+            assert_eq!(
+                VERIFICATION_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed) - before,
+                1,
+                "one mismatch incident must log once, including across a failed preparation"
+            );
+        }
+    }
+
+    #[test]
+    fn views_full_verification_deadline_and_restart_are_bounded() {
+        let (project, storage, mut request) = fixture();
+        let view = ViewStore::open(storage.path(), &request.scope).unwrap();
+        {
+            let mut caches = caches().lock().unwrap();
+            let cache = caches.get_mut(view.view_dir()).unwrap();
+            let verified = cache.last_full.unwrap();
+            assert!(!full_verification_required(
+                cache,
+                verified + std::time::Duration::from_secs(599)
+            ));
+            assert!(full_verification_required(
+                cache,
+                verified + std::time::Duration::from_secs(600)
+            ));
+        }
+        expire_verification_for_test(view.view_dir());
+        assert!(full_verification_due(view.view_dir()));
+        fs::write(
+            project.path().join("f1.rs"),
+            "pub fn missed_at_deadline() {}\n",
+        )
+        .unwrap();
+        fs::write(project.path().join("f0.rs"), "pub fn notified() {}\n").unwrap();
+        request.changed_paths.insert(b"f0.rs".to_vec());
+        assert_eq!(
+            publish(&request).to_json_bytes().unwrap(),
+            rebuild_manifest(&request).to_json_bytes().unwrap()
+        );
+        assert!(!full_verification_due(view.view_dir()));
+        // A new process has no remembered deadline or manifest proof.
+        caches().lock().unwrap().remove(view.view_dir());
+        assert!(full_verification_due(view.view_dir()));
+        fs::write(
+            project.path().join("f1.rs"),
+            "pub fn missed_while_stopped() {}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            publish(&request).to_json_bytes().unwrap(),
+            rebuild_manifest(&request).to_json_bytes().unwrap()
+        );
+        assert!(!full_verification_due(view.view_dir()));
     }
 
     #[test]

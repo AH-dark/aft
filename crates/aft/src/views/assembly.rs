@@ -27,6 +27,15 @@ mod manifest_incremental;
 #[path = "manifest_publication_bench.rs"]
 mod manifest_publication_bench;
 
+pub(crate) fn full_verification_due(view_dir: &Path) -> bool {
+    manifest_incremental::full_verification_due(view_dir)
+}
+
+#[cfg(test)]
+pub(crate) fn expire_verification_for_test(view_dir: &Path) {
+    manifest_incremental::expire_verification_for_test(view_dir);
+}
+
 #[derive(Clone, Debug)]
 pub struct AssemblyRequest {
     pub storage: PathBuf,
@@ -145,7 +154,8 @@ pub struct PreparedAssembly {
     settlement: Option<StatusSettlement>,
     /// Status changes the commit accepted, waiting for `settle_status`.
     committed_settlement: Option<StatusSettlement>,
-    manifest_cache: Option<(ViewStore, manifest_incremental::CachedManifest)>,
+    manifest_cache: Option<(ViewStore, manifest_incremental::CachedManifest, bool)>,
+    _verification: manifest_incremental::PreparationVerification,
 }
 
 /// The path-status changes a complete assembly computed: pending rows to
@@ -404,8 +414,8 @@ impl PreparedAssembly {
             match outcome? {
                 PublishOutcome::Published => {
                     self.report.published = true;
-                    if let Some((view, cached)) = self.manifest_cache.take() {
-                        manifest_incremental::remember(&view, cached);
+                    if let Some((view, cached, verified)) = self.manifest_cache.take() {
+                        manifest_incremental::remember(&view, cached, verified);
                     }
                     // Only moved aside here: the commit runs under the root's
                     // write gate and the process-wide job table, and the
@@ -599,6 +609,8 @@ pub fn prepare_checkout_deferring(
     let mut profile = PublicationProfile::new(&request.project_root);
     profile.enter(0, phase)?;
     let view = ViewStore::open(&request.storage, &request.scope)?;
+    let verification = manifest_incremental::begin_preparation(&view);
+    let verification_due = verification.due;
     let current_generation = view.current_generation()?;
     let base_pin = current_generation
         .as_deref()
@@ -721,7 +733,7 @@ pub fn prepare_checkout_deferring(
         && head
             .iter()
             .any(|entry| request.changed_paths.contains(&entry.rel_path));
-    let verify = manifest_incremental::verification_due(&view) && incremental;
+    let verify = verification_due && previous.is_some();
     let assembly_started = Instant::now();
     let mut blocking_paths = BTreeSet::new();
     let mut semantic_pending_paths = BTreeSet::new();
@@ -917,10 +929,9 @@ pub fn prepare_checkout_deferring(
             )
         };
         if entries(&candidates)?.to_json_bytes()? != entries(&full)?.to_json_bytes()? {
-            let count = manifest_incremental::VERIFICATION_MISMATCHES
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1;
-            log::warn!("view incremental manifest verification mismatch root={} count={count}; using full rebuild", request.project_root.display());
+            if let Some(count) = manifest_incremental::note_mismatch(&view) {
+                log::warn!("view incremental manifest verification mismatch root={} count={count}; using full rebuild", request.project_root.display());
+            }
         }
         // Even equal entries can have required payload repairs. Use the full
         // candidates, including those payloads, on every verification pass.
@@ -1089,6 +1100,7 @@ pub fn prepare_checkout_deferring(
         settlement: None,
         committed_settlement: None,
         manifest_cache: None,
+        _verification: verification,
     };
     prepared.profile.enter(1, phase)?;
     timing.phase("assembly_pin");
@@ -1269,6 +1281,7 @@ pub fn prepare_checkout_deferring(
                 metadata: std::sync::Arc::new(member_metadata),
                 admission,
             },
+            verification_due,
         );
         prepared.profile.outcome = "no_op";
         prepared.profile.seed_source = if base_ready { "own" } else { "deferred" };
@@ -1580,6 +1593,7 @@ pub fn prepare_checkout_deferring(
             metadata: std::sync::Arc::new(member_metadata),
             admission,
         },
+        verification_due,
     ));
     prepared.report = AssemblyReport {
         generation: Some(next_generation),

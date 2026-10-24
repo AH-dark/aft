@@ -6602,6 +6602,7 @@ impl AppContext {
             .is_none_or(|slot| slot.as_ref().is_some_and(|rx| !rx.is_empty()));
         cleanup_pending
             || receiver_pending
+            || self.view_full_verification_due()
             || self.watcher_drain_slice.try_lock().is_none_or(|slot| {
                 slot.as_ref().is_some_and(|state| {
                     state.has_pending_work()
@@ -6616,6 +6617,31 @@ impl AppContext {
                             .is_some_and(|due| Instant::now() >= due)
                 })
             })
+    }
+
+    /// The idle maintenance pump also enforces the view's full-read deadline.
+    /// Use nonblocking probes because this runs on the dispatch frame loop.
+    pub(crate) fn view_full_verification_due(&self) -> bool {
+        if !self.config().views.enabled {
+            return false;
+        }
+        let runtime = match self.view_runtime.try_read() {
+            Ok(runtime) => runtime,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return true,
+        };
+        let Some(state) = runtime
+            .as_ref()
+            .filter(|state| state.snapshot.generation.is_some())
+        else {
+            return false;
+        };
+        if !crate::views::assembly::full_verification_due(&state.snapshot.view_dir) {
+            return false;
+        }
+        self.view_publication_retry
+            .try_lock()
+            .is_none_or(|retry| retry.due().is_none_or(|due| Instant::now() >= due))
     }
 
     pub fn lsp_drain_has_work(&self) -> bool {
