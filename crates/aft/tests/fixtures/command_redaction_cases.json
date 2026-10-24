@@ -415,6 +415,58 @@
   {
    "input": "mysql\u000b-phunter2 db",
    "expected": "mysql\u000b-p<REDACTED_SECRET> db"
+  },
+  {
+   "input": "curl $(printf '%s' -s) -u admin:hunter2 https://h",
+   "expected": "curl $(printf '%s' -s) -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "mysql $(printf '%s' --batch) -phunter2 db",
+   "expected": "mysql $(printf '%s' --batch) -p<REDACTED_SECRET> db"
+  },
+  {
+   "input": "curl `printf '%s' -s` -u admin:hunter2 https://h",
+   "expected": "curl `printf '%s' -s` -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "curl \"$(printf '%s' -s)\" -u admin:hunter2 https://h",
+   "expected": "curl \"$(printf '%s' -s)\" -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "curl $(echo $(printf '%s' -s)) -u admin:hunter2 https://h",
+   "expected": "curl $(echo $(printf '%s' -s)) -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "curl \"`printf -- -s`\" -u admin:hunter2 https://h",
+   "expected": "curl \"`printf -- -s`\" -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "curl -d @<(printf x) -u admin:hunter2 https://h",
+   "expected": "curl -d @<(printf x) -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "curl -u $(cat user):hunter2 https://h",
+   "expected": "curl -u $(cat user):<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "x=$(curl $(printf '%s' -s) -u admin:hunter2 https://h)",
+   "expected": "x=$(curl $(printf '%s' -s) -u admin:<REDACTED_SECRET> https://h)"
+  },
+  {
+   "input": "mysql -u root $(printf -- --batch) -phunter2 db && curl $(printf x) -u admin:pw2 h",
+   "expected": "mysql -u root $(printf -- --batch) -p<REDACTED_SECRET> db && curl $(printf x) -u admin:<REDACTED_SECRET> h"
+  },
+  {
+   "input": "sshpass -p hunter2 ssh h \"$(printf x)\"",
+   "expected": "sshpass -p <REDACTED_SECRET> ssh h \"$(printf x)\""
+  },
+  {
+   "input": "echo \"$(mysql $(printf '%s' -B) -phunter2 db)\"",
+   "expected": "echo \"$(mysql $(printf '%s' -B) -p<REDACTED_SECRET> db)\""
+  },
+  {
+   "input": "curl $(printf '%s' \"-s)\") -u admin:hunter2 https://h",
+   "expected": "curl $(printf '%s' \"-s)\") -u admin:<REDACTED_SECRET> https://h"
   }
  ],
  "untouched": [

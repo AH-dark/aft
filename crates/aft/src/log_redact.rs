@@ -162,9 +162,10 @@ static COMMAND_SECRET_FLAG: LazyLock<Regex> = LazyLock::new(|| {
         ")"
     ))
 });
-/// How deep [`mask_tool_passwords`] looks into quoted strings that hold a
-/// command of their own (`bash -c "curl -u admin:pw ..."`).
-const QUOTED_COMMAND_DEPTH: usize = 4;
+/// How deep [`mask_tool_passwords`] looks into quoted strings and
+/// substitutions that hold a command of their own (`bash -c "curl ..."`,
+/// `$(curl ...)`). A quoted substitution (`"$(...)"`) takes two levels.
+const QUOTED_COMMAND_DEPTH: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ShellTokenKind {
@@ -180,13 +181,6 @@ struct ShellToken {
     range: std::ops::Range<usize>,
 }
 
-/// Split `text` into simple commands of words and redirections, reading it
-/// as the shell would: quotes and backslashes keep operators inside a word;
-/// an unquoted `;`, `&`, `|`, newline, `(`, `)` or backtick ends a command
-/// (so subshells, `$( ... )` and backtick substitutions are commands of
-/// their own); a backslash-newline continues the line; redirections may be
-/// attached to a word or spaced from it. Also returns the inside of every
-/// quoted run, which may hold a command for another shell.
 /// Bytes that separate words without ending the command: every ASCII
 /// whitespace byte except the newline (space, tab, carriage return, vertical
 /// tab, form feed; `u8::is_ascii_whitespace` leaves out the vertical tab).
@@ -199,13 +193,81 @@ fn is_shell_blank(byte: u8) -> bool {
 /// Bytes that end a word: blanks, plus the bytes that start an operator or
 /// end a command. The command loop has an arm for each of them.
 fn ends_shell_word(byte: u8) -> bool {
-    is_shell_blank(byte)
-        || matches!(
-            byte,
-            b'\n' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' | b'`'
-        )
+    is_shell_blank(byte) || matches!(byte, b'\n' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')')
 }
 
+/// Whether a process substitution (`<(` or `>(`) starts at `at`.
+fn starts_process_substitution(bytes: &[u8], at: usize) -> bool {
+    matches!(bytes.get(at), Some(b'<' | b'>')) && bytes.get(at + 1) == Some(&b'(')
+}
+
+/// The index of the `)` that closes a substitution whose body starts at
+/// `from`, or the end of `text` when it never closes. Quotes, backticks and
+/// escapes inside are skipped; nested parentheses are counted.
+fn substitution_end(text: &str, from: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 1;
+    let mut at = from;
+    while at < bytes.len() {
+        note_shell_scan_steps(1);
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'\'' => at = skip_single_quoted(text, at),
+            b'"' => at = skip_double_quoted(bytes, at),
+            b'`' => at = backtick_end(bytes, at + 1) + 1,
+            b'(' => {
+                depth += 1;
+                at += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return at;
+                }
+                at += 1;
+            }
+            _ => at += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// The index just past the single-quoted run opening at `at`.
+fn skip_single_quoted(text: &str, at: usize) -> usize {
+    text[at + 1..]
+        .find('\'')
+        .map_or(text.len(), |offset| at + 1 + offset + 1)
+}
+
+/// The index just past the double-quoted run opening at `at`.
+fn skip_double_quoted(bytes: &[u8], at: usize) -> usize {
+    let mut close = at + 1;
+    while close < bytes.len() && bytes[close] != b'"' {
+        close += if bytes[close] == b'\\' { 2 } else { 1 };
+    }
+    (close + 1).min(bytes.len())
+}
+
+/// The index of the backtick that closes a substitution whose body starts
+/// at `from`, or the end of the text.
+fn backtick_end(bytes: &[u8], from: usize) -> usize {
+    let mut at = from;
+    while at < bytes.len() && bytes[at] != b'`' {
+        at += if bytes[at] == b'\\' { 2 } else { 1 };
+    }
+    at.min(bytes.len())
+}
+
+/// Split `text` into simple commands of words and redirections, reading it
+/// as the shell would: quotes and backslashes keep operators inside a word;
+/// a command substitution (`$( ... )`, backticks) or process substitution
+/// (`<( ... )`, `>( ... )`) is part of the word it appears in, so the
+/// command around it carries on after it closes; an unquoted `;`, `&`, `|`,
+/// newline, `(` or `)` ends a command (a subshell is a command of its own);
+/// a backslash-newline continues the line; redirections may be attached to
+/// a word or spaced from it. Also returns the inside of every quoted run and
+/// substitution, which [`collect_tool_password_masks`] scans as a command of
+/// its own one level down.
 fn split_shell_commands(text: &str) -> (Vec<Vec<ShellToken>>, Vec<std::ops::Range<usize>>) {
     let bytes = text.as_bytes();
     let mut commands = vec![Vec::new()];
@@ -222,7 +284,7 @@ fn split_shell_commands(text: &str) -> (Vec<Vec<ShellToken>>, Vec<std::ops::Rang
         match bytes[at] {
             byte if is_shell_blank(byte) => at += 1,
             b'\\' if bytes.get(at + 1) == Some(&b'\n') => at += 2,
-            b'\n' | b';' | b'(' | b')' | b'`' => {
+            b'\n' | b';' | b'(' | b')' => {
                 end_command(&mut commands);
                 at += 1;
             }
@@ -234,7 +296,7 @@ fn split_shell_commands(text: &str) -> (Vec<Vec<ShellToken>>, Vec<std::ops::Rang
                 end_command(&mut commands);
                 at += 1 + usize::from(bytes.get(at + 1) == Some(&b'&'));
             }
-            b'&' | b'<' | b'>' => {
+            b'&' | b'<' | b'>' if !starts_process_substitution(bytes, at) => {
                 let (token, next) = scan_redirect(text, at, &mut quoted);
                 commands.last_mut().unwrap().push(token);
                 at = next;
@@ -259,7 +321,9 @@ fn split_shell_commands(text: &str) -> (Vec<Vec<ShellToken>>, Vec<std::ops::Rang
             }
         }
         // Every arm above consumes at least one byte: the word arm is only
-        // reached on a byte that does not end a word. Should a future change
+        // reached on a byte that does not end a word, or on the `<(` / `>(`
+        // that opens a process substitution, which the word scan consumes
+        // whole. Should a future change
         // break that, step over one character rather than loop forever on
         // a spawn path.
         if at <= before {
@@ -295,6 +359,23 @@ fn scan_shell_word(text: &str, start: usize, quoted: &mut Vec<std::ops::Range<us
                 at = (close + 1).min(bytes.len());
             }
             b'\\' => at = (at + 2).min(bytes.len()),
+            // A substitution belongs to the word around it; its body is
+            // scanned as a command one level down.
+            b'$' if bytes.get(at + 1) == Some(&b'(') => {
+                let close = substitution_end(text, at + 2);
+                quoted.push(at + 2..close);
+                at = (close + 1).min(bytes.len());
+            }
+            b'<' | b'>' if starts_process_substitution(bytes, at) => {
+                let close = substitution_end(text, at + 2);
+                quoted.push(at + 2..close);
+                at = (close + 1).min(bytes.len());
+            }
+            b'`' => {
+                let close = backtick_end(bytes, at + 1);
+                quoted.push(at + 1..close);
+                at = (close + 1).min(bytes.len());
+            }
             byte if ends_shell_word(byte) => break,
             _ => at += 1,
         }
@@ -1468,7 +1549,7 @@ mod tests {
             "../tests/fixtures/command_redaction_cases.json"
         ))
         .expect("command redaction fixture parses");
-        assert_eq!(fixture.masked.len(), 104);
+        assert_eq!(fixture.masked.len(), 117);
         assert!(fixture.untouched.len() > 800);
         for case in &fixture.masked {
             let masked = redact_command(&case.input);
@@ -1783,6 +1864,10 @@ mod tests {
             format!("curl {}", repeat("<<<")),
             format!("curl \"{}\"", repeat("'\\\"`$( curl -u a:b ) ")),
             format!("\"'\"'\"'{}", repeat("curl -u a:b ")),
+            // Substitutions that never close, each nested in the last.
+            format!("curl {}", repeat("$(echo -u a:b ")),
+            format!("curl {}", repeat("\"$(curl `mysql -ppw ")),
+            repeat("curl $(printf x) -u a:b "),
         ];
         for input in &inputs {
             let bound = 3 * (QUOTED_COMMAND_DEPTH + 1) * input.len();
