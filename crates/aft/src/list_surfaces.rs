@@ -495,6 +495,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "supplemental execution note names at most ten filtered environment variables and explicitly counts the rest with +N more; the complete executor report remains in persisted task metadata, not a paginated tool-result list",
     },
     ExclusionEntry {
+        file: "subc/bind_log.rs",
+        location_or_primitive: "consumer_capabilities preview (eight-entry slice cap)",
+        reason: "Bounds RouteBind INFO logging only; does not cut a product result list.",
+        enclosing_item: "consumer_capabilities",
+    },
+    ExclusionEntry {
         file: "url_fetch.rs",
         enclosing_item: "hash_url",
         location_or_primitive: "URL cache hash prefix",
