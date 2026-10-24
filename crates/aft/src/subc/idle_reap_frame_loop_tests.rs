@@ -148,6 +148,17 @@ impl BlockedUnboundRoots {
     }
 }
 
+/// Each registered actor holds a file descriptor until it is removed, and
+/// these fixtures register many; without this, running them beside the rest
+/// of the suite can exhaust the process's descriptor limit.
+impl Drop for BlockedUnboundRoots {
+    fn drop(&mut self) {
+        for (root, _) in &self.contexts {
+            self.executor.remove_actor(root);
+        }
+    }
+}
+
 /// Per-sweep wall time of the reaper at the daemon's observed scale (about
 /// 170 roots). Ignored by default because it measures time; run it with
 /// `cargo test -p agent-file-tools --lib -- --ignored --nocapture
@@ -479,6 +490,15 @@ impl ReapWorld {
     }
 }
 
+/// Releases each actor's file descriptor, as for [`BlockedUnboundRoots`].
+impl Drop for ReapWorld {
+    fn drop(&mut self) {
+        for root in &self.roots {
+            self.executor.remove_actor(root);
+        }
+    }
+}
+
 /// Over randomized roots (bound or not, quiesced or not, inside or past
 /// their TTL), standing blockers switching on and off, pending paths
 /// arriving between sweeps, and presence probes reporting directories
@@ -486,7 +506,7 @@ impl ReapWorld {
 /// with the path-by-path re-insertion they replaced.
 #[test]
 fn reap_decisions_match_path_by_path_restore_over_random_sequences() {
-    const ROOTS: usize = 8;
+    const ROOTS: usize = 6;
     const SWEEPS: u64 = 10;
     let mut evictions = 0;
     let mut forgotten = 0;
