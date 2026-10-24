@@ -97,6 +97,8 @@ export interface HarnessAdapter {
   tuiPluginEntryApplies?(): boolean;
 
   getPluginCacheInfo(): PluginCacheInfo;
+  /** Registered source used to retain exact pins even before installation. */
+  getConfiguredPluginEntry?(): string | undefined;
   getStorageDir(): string;
   getLogFile(): string;
 

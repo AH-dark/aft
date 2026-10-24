@@ -23,6 +23,7 @@ import {
   terminateNpmProcessTree,
 } from "@cortexkit/aft-bridge";
 
+import { getAllAdapters } from "../adapters/index.js";
 import { OpenCodeAdapter } from "../adapters/opencode.js";
 import type { HarnessAdapter } from "../adapters/types.js";
 import {
@@ -774,10 +775,15 @@ export interface BinaryCacheClearResult {
   keptVersion: string | null;
 }
 
-export function clearOldBinaries(): BinaryCacheClearResult {
-  // Keep the version that matches the running CLI. Different release
-  // tags share a `v` prefix; binaries on disk follow the same shape.
-  const cliVersion = getSelfVersion();
+export function clearOldBinaries(
+  cliVersion = getSelfVersion(),
+  plugins: Pick<
+    HarnessAdapter,
+    "getPluginCacheInfo" | "pluginPackageName" | "getConfiguredPluginEntry"
+  >[] = getAllAdapters(),
+): BinaryCacheClearResult {
+  // Retain both the CLI binary and versions installed or pinned by a harness.
+  const knownVersion = /^(?:v)?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
   const keepTag = `v${cliVersion.replace(/^v/, "")}`;
   const info = getBinaryCacheInfo(cliVersion);
   const result: BinaryCacheClearResult = {
@@ -792,7 +798,29 @@ export function clearOldBinaries(): BinaryCacheClearResult {
     return result;
   }
 
-  const stale = info.versions.filter((v) => v !== keepTag);
+  if (!knownVersion.test(cliVersion)) {
+    result.keptVersion = null;
+    return result;
+  }
+  const retained = new Set([keepTag]);
+  for (const plugin of plugins) {
+    try {
+      const info = plugin.getPluginCacheInfo();
+      const entry = (info.configuredEntry ?? plugin.getConfiguredPluginEntry?.())?.replace(
+        /^npm:/,
+        "",
+      );
+      const prefix = `${plugin.pluginPackageName}@`;
+      const pinned = entry?.startsWith(prefix) ? entry.slice(prefix.length) : undefined;
+      for (const version of [info.cached, pinned]) {
+        if (version && knownVersion.test(version)) retained.add(`v${version.replace(/^v/, "")}`);
+      }
+    } catch {
+      // Unreadable registration is not evidence that its binary is unused.
+      return result;
+    }
+  }
+  const stale = info.versions.filter((v) => !retained.has(v));
 
   if (stale.length === 0) {
     log.info(

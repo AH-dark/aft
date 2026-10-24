@@ -311,6 +311,7 @@ export {
   type MigrationNoticeOptions,
   migrationNoticeStorePath,
 } from "./migration-notices.js";
+export { lspNpmInstallInvocation, lspPublicationCutoff } from "./lsp-npm-policy.js";
 // --- npm resolution (PATH-stripped GUI launch fallback) ---
 export type { NpmInvocation, ResolvedNpm } from "./npm-resolver.js";
 export {
