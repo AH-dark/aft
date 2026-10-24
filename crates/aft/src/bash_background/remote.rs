@@ -3039,6 +3039,12 @@ impl BgTaskRegistry {
                 return Err(error);
             }
             state.metadata.memory_policy = Some(monitor.policy.clone());
+            // Persist the chosen enforcer before the gated fallback command can run.
+            if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
+                drop(child.stdin.take());
+                let _ = child.wait();
+                return Err(error.to_string());
+            }
             self.inner
                 .memory_monitors
                 .lock()

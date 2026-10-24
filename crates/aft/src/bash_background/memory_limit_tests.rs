@@ -4,6 +4,9 @@ const ALLOCATOR: &str =
     "bash_background::registry::memory_limit_tests::memory_limit_allocator_child";
 
 #[cfg(unix)]
+pub(super) const MEMORY_PRESSURE_COMMAND: &str = "python3 -c 'import time; allocation = bytearray(b\"x\" * (192 * 1024 * 1024)); time.sleep(20)'";
+
+#[cfg(unix)]
 pub(super) fn memory_request_context(
     project: &Path,
     storage: &Path,
@@ -26,10 +29,21 @@ pub(super) fn spawn_memory_request(
     request_id: &str,
     remote: Option<super::super::RemoteLaunch>,
 ) -> crate::protocol::Response {
+    spawn_memory_command(ctx, request_id, "exit 0", false, remote)
+}
+
+#[cfg(unix)]
+pub(super) fn spawn_memory_command(
+    ctx: &crate::context::AppContext,
+    request_id: &str,
+    command: &str,
+    pty: bool,
+    remote: Option<super::super::RemoteLaunch>,
+) -> crate::protocol::Response {
     super::super::spawn(
         request_id,
         "session",
-        "exit 0",
+        command,
         super::super::BashShell::Bash,
         PathBuf::from("/bin/sh"),
         None,
@@ -39,7 +53,7 @@ pub(super) fn spawn_memory_request(
         false,
         false,
         false,
-        false,
+        pty,
         24,
         80,
         Vec::new(),
@@ -121,9 +135,26 @@ fn memory_limit_allocator_child() {
     std::hint::black_box(&allocation);
 }
 
-fn allocate_past_cap(pty: bool, foreground: bool, aggregate: bool, require_kernel: bool) {
+fn allocate_past_cap(
+    pty: bool,
+    foreground: bool,
+    aggregate: bool,
+    require_kernel: bool,
+    attach_error: Option<i32>,
+) {
     let temp = tempfile::tempdir().unwrap();
+    #[cfg(target_os = "linux")]
+    let attach_fault = attach_error.map(|errno| {
+        super::super::memory_limit::AttachFaultGuard::for_thread(
+            temp.path().join("denied-cgroup"),
+            errno,
+        )
+    });
+    #[cfg(not(target_os = "linux"))]
+    let _ = attach_error;
     let registry = BgTaskRegistry::default();
+    #[cfg(target_os = "linux")]
+    let sampler_available = super::super::memory_limit::sampling_available_for_test();
     let executable = std::env::current_exe().unwrap();
     #[cfg(unix)]
     let command = format!("'{}' --exact {ALLOCATOR} --nocapture", executable.display());
@@ -202,6 +233,23 @@ fn allocate_past_cap(pty: bool, foreground: bool, aggregate: bool, require_kerne
             )
             .unwrap()
     };
+    #[cfg(target_os = "linux")]
+    if let Some(fault) = &attach_fault {
+        assert_eq!(
+            fault.attempts(),
+            1,
+            "the injected cgroup attach was not attempted"
+        );
+        let task = registry.task_for_test(&id).unwrap();
+        let state = task.lock_state().unwrap();
+        let policy = state.metadata.memory_policy.as_ref().unwrap();
+        assert_eq!(policy.mib, 64);
+        assert_eq!(
+            policy.kind,
+            "Linux process-group RSS watcher; kernel memory controller unavailable"
+        );
+        assert!(policy.cgroup.is_none());
+    }
     if require_kernel {
         let kernel = registry
             .task_for_test(&id)
@@ -216,8 +264,34 @@ fn allocate_past_cap(pty: bool, foreground: bool, aggregate: bool, require_kerne
             .is_some();
         if !kernel {
             let _ = registry.kill(&id, "memory-test");
-            panic!("no delegated cgroup v2 memory controller or systemd user scope available");
+            report_memory_runtime_skip(
+                "memory_limit_linux_kernel_stops_group",
+                "runtime launch downgraded to the RSS watcher",
+            );
+            return;
         }
+    }
+    #[cfg(target_os = "linux")]
+    if !sampler_available
+        && registry
+            .task_for_test(&id)
+            .unwrap()
+            .lock_state()
+            .unwrap()
+            .metadata
+            .memory_policy
+            .as_ref()
+            .unwrap()
+            .cgroup
+            .is_none()
+    {
+        let _ = registry.kill(&id, "memory-test");
+        let thread = std::thread::current();
+        report_memory_runtime_skip(
+            thread.name().unwrap_or("memory_limit_allocate_past_cap"),
+            "neither a kernel controller nor RSS sampling is available",
+        );
+        return;
     }
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -226,7 +300,7 @@ fn allocate_past_cap(pty: bool, foreground: bool, aggregate: bool, require_kerne
             .unwrap();
         if snapshot.info.status.is_terminal() {
             assert_eq!(snapshot.info.status, BgTaskStatus::Failed, "{snapshot:?}");
-            let reason = snapshot.info.status_reason.unwrap_or_default();
+            let reason = snapshot.info.status_reason.clone().unwrap_or_default();
             assert!(reason.contains("64 MiB memory cap"), "{reason}");
             assert!(!reason.contains("timeout"), "{reason}");
             let task = registry.task_for_test(&id).unwrap();
@@ -234,6 +308,23 @@ fn allocate_past_cap(pty: bool, foreground: bool, aggregate: bool, require_kerne
             let policy = state.metadata.memory_policy.as_ref().unwrap();
             assert!(reason.contains(&policy.kind), "{reason}");
             println!("enforcement: {}; result: {reason}", policy.kind);
+            #[cfg(target_os = "linux")]
+            if attach_fault.is_some() {
+                assert!(
+                    snapshot.output_preview.contains(
+                        "Linux process-group RSS watcher; kernel memory controller unavailable"
+                    ),
+                    "{snapshot:?}"
+                );
+                assert!(
+                    !temp.path().join("denied-cgroup").exists(),
+                    "failed cgroup was not removed"
+                );
+                let persisted = super::super::persistence::read_task(&task.paths.json).unwrap();
+                let saved_policy = persisted.memory_policy.unwrap();
+                assert!(saved_policy.cgroup.is_none());
+                assert_eq!(saved_policy.kind, policy.kind);
+            }
             drop(state);
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
@@ -267,30 +358,88 @@ fn allocate_past_cap(pty: bool, foreground: bool, aggregate: bool, require_kerne
 
 #[test]
 fn memory_limit_stops_background_command() {
-    allocate_past_cap(false, false, false, false);
+    allocate_past_cap(false, false, false, false, None);
 }
 
 #[test]
 fn memory_limit_stops_foreground_command() {
-    allocate_past_cap(false, true, false, false);
+    allocate_past_cap(false, true, false, false, None);
 }
 
 #[test]
 fn memory_limit_stops_pty_command() {
-    allocate_past_cap(true, false, false, false);
+    allocate_past_cap(true, false, false, false, None);
 }
 
 #[cfg(unix)]
 #[test]
 fn memory_limit_counts_children_as_one_group() {
-    allocate_past_cap(false, false, true, false);
+    allocate_past_cap(false, false, true, false, None);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires a delegated cgroup v2 memory controller or a systemd user manager"]
 fn memory_limit_linux_kernel_stops_group() {
-    allocate_past_cap(false, false, true, true);
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let mut probe =
+        super::super::memory_limit::Monitor::prepare(512, &format!("probe-{}", random_slug()))
+            .unwrap();
+    let mut child = Command::new("/bin/sh")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .args(["-c", "read -r ready"])
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    probe.attach(child.id()).unwrap();
+    let kernel_available = probe.policy.cgroup.is_some();
+    drop(child.stdin.take());
+    let _ = child.wait();
+    drop(probe);
+    if !kernel_available {
+        report_memory_runtime_skip(
+            "memory_limit_linux_kernel_stops_group",
+            "create-and-attach probe has no usable delegated cgroup or systemd scope",
+        );
+        return;
+    }
+    allocate_past_cap(false, false, true, true, None);
+}
+
+pub(super) fn report_memory_runtime_skip(name: &str, reason: &str) {
+    use std::io::Write;
+    // Bypass libtest's passing-test capture so capability skips remain visible in CI.
+    writeln!(std::io::stderr().lock(), "SKIP {name}: {reason}").unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_limit_attach_eperm_foreground_enforces_watcher_cap() {
+    allocate_past_cap(false, true, false, false, Some(libc::EPERM));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_limit_attach_eperm_background_enforces_watcher_cap() {
+    allocate_past_cap(false, false, false, false, Some(libc::EPERM));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_limit_attach_eperm_pty_enforces_watcher_cap() {
+    allocate_past_cap(true, false, false, false, Some(libc::EPERM));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_limit_other_attach_errors_enforce_watcher_cap() {
+    for errno in [libc::EACCES, libc::EROFS, libc::ENOENT, libc::EBUSY] {
+        allocate_past_cap(false, true, false, false, Some(errno));
+    }
 }
 
 #[test]

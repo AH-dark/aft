@@ -6,8 +6,164 @@ use serde::{Deserialize, Serialize};
 
 /// Matches the existing watchdog tick: two samples per second, only for capped tasks.
 pub(super) const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+const LINUX_WATCHER_KIND: &str =
+    "Linux process-group RSS watcher; kernel memory controller unavailable";
 #[cfg(unix)]
 const PID_BUDGET: usize = 4096;
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone)]
+struct AttachFault {
+    path: std::path::PathBuf,
+    errno: i32,
+    attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static THREAD_ATTACH_FAULT: std::cell::RefCell<Option<AttachFault>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn task_attach_faults() -> &'static std::sync::Mutex<std::collections::HashMap<String, AttachFault>>
+{
+    static FAULTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, AttachFault>>,
+    > = std::sync::OnceLock::new();
+    FAULTS.get_or_init(Default::default)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) struct AttachFaultGuard {
+    task: Option<String>,
+    previous: Option<AttachFault>,
+    attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl AttachFaultGuard {
+    pub(super) fn for_thread(path: std::path::PathBuf, errno: i32) -> Self {
+        std::fs::create_dir(&path).unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fault = AttachFault {
+            path,
+            errno,
+            attempts: attempts.clone(),
+        };
+        let previous = THREAD_ATTACH_FAULT.with(|slot| slot.replace(Some(fault)));
+        Self {
+            task: None,
+            previous,
+            attempts,
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+
+    pub(super) fn for_task(task: String, path: std::path::PathBuf, errno: i32) -> Self {
+        std::fs::create_dir(&path).unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fault = AttachFault {
+            path,
+            errno,
+            attempts: attempts.clone(),
+        };
+        assert!(task_attach_faults()
+            .lock()
+            .unwrap()
+            .insert(task.clone(), fault)
+            .is_none());
+        Self {
+            task: Some(task),
+            previous: None,
+            attempts,
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+
+    pub(super) fn attempts(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for AttachFaultGuard {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task_attach_faults().lock().unwrap().remove(task);
+        } else {
+            THREAD_ATTACH_FAULT.with(|slot| *slot.borrow_mut() = self.previous.take());
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn attach_fault_candidate(task: &str) -> Option<std::path::PathBuf> {
+    task_attach_faults()
+        .lock()
+        .unwrap()
+        .get(task)
+        .cloned()
+        .or_else(|| THREAD_ATTACH_FAULT.with(|slot| slot.borrow().clone()))
+        .map(|fault| fault.path)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn attach_fault_error(path: &std::path::Path) -> Option<std::io::Error> {
+    task_attach_faults()
+        .lock()
+        .unwrap()
+        .values()
+        .find(|fault| fault.path == path)
+        .cloned()
+        .or_else(|| {
+            THREAD_ATTACH_FAULT.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .filter(|fault| fault.path == path)
+                    .cloned()
+            })
+        })
+        .map(|fault| {
+            fault
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::io::Error::from_raw_os_error(fault.errno)
+        })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn sampling_available_for_test() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let Ok(mut child) = Command::new("/bin/sh")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .args(["-c", "read -r ready"])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let available = loop {
+            if group_bytes(child.id() as i32).is_some_and(|bytes| bytes > 0) {
+                break true;
+            }
+            if Instant::now() >= deadline || child.try_wait().ok().flatten().is_some() {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        linux::stop_bootstrap(child);
+        available
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryPolicy {
@@ -44,6 +200,8 @@ pub(crate) struct Monitor {
     accounting_failed: bool,
     #[cfg(target_os = "linux")]
     bootstrap: Option<std::process::Child>,
+    #[cfg(target_os = "linux")]
+    retired_cgroup: Option<std::path::PathBuf>,
     #[cfg(windows)]
     job: windows::Job,
 }
@@ -59,7 +217,7 @@ impl Monitor {
         let kind = if cgroup.is_some() {
             "Linux cgroup v2 memory.max"
         } else if cfg!(target_os = "linux") {
-            "Linux process-group RSS watcher; kernel memory controller unavailable"
+            LINUX_WATCHER_KIND
         } else if cfg!(target_os = "macos") {
             "macOS process-group physical-footprint watcher"
         } else {
@@ -77,6 +235,8 @@ impl Monitor {
             accounting_failed: false,
             #[cfg(target_os = "linux")]
             bootstrap,
+            #[cfg(target_os = "linux")]
+            retired_cgroup: None,
             #[cfg(windows)]
             job,
         })
@@ -85,18 +245,33 @@ impl Monitor {
     pub fn attach(&mut self, pid: u32) -> Result<(), String> {
         #[cfg(target_os = "linux")]
         if let Some(path) = &self.policy.cgroup {
-            std::fs::write(path.join("cgroup.procs"), pid.to_string())
-                .map_err(|error| format!("memory cap attachment failed: {error}"))?;
+            if linux::attach(path, pid).is_err() {
+                self.use_watcher_fallback();
+            }
         }
         #[cfg(target_os = "linux")]
-        if let Some(mut helper) = self.bootstrap.take() {
-            drop(helper.stdin.take());
-            let _ = helper.wait();
+        if let Some(helper) = self.bootstrap.take() {
+            linux::stop_bootstrap(helper);
         }
         #[cfg(windows)]
         self.job.attach(pid)?;
         let _ = pid;
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn use_watcher_fallback(&mut self) {
+        let failed = self.policy.cgroup.take();
+        self.policy.kind = LINUX_WATCHER_KIND.into();
+        if let Some(helper) = self.bootstrap.take() {
+            linux::stop_bootstrap(helper);
+        }
+        if let Some(path) = failed {
+            if std::fs::remove_dir(&path).is_err() {
+                // If immediate removal fails, retry it when this monitor is dropped.
+                self.retired_cgroup = Some(path);
+            }
+        }
     }
 
     pub fn recover(policy: MemoryPolicy, task_id: &str) -> Result<Self, String> {
@@ -110,6 +285,8 @@ impl Monitor {
             accounting_failed: false,
             #[cfg(target_os = "linux")]
             bootstrap: None,
+            #[cfg(target_os = "linux")]
+            retired_cgroup: None,
             #[cfg(windows)]
             job,
         })
@@ -159,7 +336,7 @@ impl Monitor {
     pub fn terminate(&self) {
         #[cfg(target_os = "linux")]
         if let Some(path) = &self.policy.cgroup {
-            let _ = std::fs::write(path.join("cgroup.kill"), "1");
+            let _ = linux::write_control(&path.join("cgroup.kill"), "1");
         }
         #[cfg(windows)]
         self.job.terminate();
@@ -191,12 +368,15 @@ impl Monitor {
 impl Drop for Monitor {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
-        if let Some(mut helper) = self.bootstrap.take() {
-            let _ = helper.kill();
-            let _ = helper.wait();
+        if let Some(helper) = self.bootstrap.take() {
+            linux::stop_bootstrap(helper);
         }
         #[cfg(target_os = "linux")]
         if let Some(path) = &self.policy.cgroup {
+            let _ = std::fs::remove_dir(path);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(path) = &self.retired_cgroup {
             let _ = std::fs::remove_dir(path);
         }
     }
@@ -205,6 +385,15 @@ impl Drop for Monitor {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::path::{Path, PathBuf};
+
+    pub(super) fn write_control(path: &Path, value: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        // Controller files must already exist; an ordinary directory is not a cgroup.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .write_all(value.as_bytes())
+    }
 
     fn helper_command(executable: &Path) -> std::process::Command {
         let mut command = std::process::Command::new(executable);
@@ -247,10 +436,10 @@ mod linux {
         let path = parent.join(format!("aft-memory-{task_id}"));
         std::fs::create_dir(&path).ok()?;
         let result = (|| {
-            std::fs::write(path.join("memory.max"), (mib * 1024 * 1024).to_string()).ok()?;
-            std::fs::write(path.join("memory.oom.group"), "1").ok()?;
+            write_control(&path.join("memory.max"), &(mib * 1024 * 1024).to_string()).ok()?;
+            write_control(&path.join("memory.oom.group"), "1").ok()?;
             // Swap must not turn the physical-memory ceiling into an unbounded allocation budget.
-            std::fs::write(path.join("memory.swap.max"), "0").ok()?;
+            write_control(&path.join("memory.swap.max"), "0").ok()?;
             Some(path.clone())
         })();
         if result.is_none() {
@@ -263,6 +452,10 @@ mod linux {
         mib: u64,
         task_id: &str,
     ) -> (Option<PathBuf>, Option<std::process::Child>) {
+        #[cfg(test)]
+        if let Some(path) = super::attach_fault_candidate(task_id) {
+            return (Some(path), None);
+        }
         let Some(parent) = current(std::process::id()) else {
             return (None, None);
         };
@@ -303,8 +496,8 @@ mod linux {
                 .filter(|scope| scope != &parent)
                 .or_else(|| child_pid.and_then(current).filter(|scope| scope != &parent));
             if let Some(scope) = scope {
-                if std::fs::write(scope.join("memory.oom.group"), "1").is_ok()
-                    && std::fs::write(scope.join("memory.swap.max"), "0").is_ok()
+                if write_control(&scope.join("memory.oom.group"), "1").is_ok()
+                    && write_control(&scope.join("memory.swap.max"), "0").is_ok()
                 {
                     result = Some(scope);
                 }
@@ -320,9 +513,25 @@ mod linux {
         if result.is_some() {
             return (result, Some(helper));
         }
+        stop_bootstrap(helper);
+        (None, None)
+    }
+
+    pub(super) fn stop_bootstrap(mut helper: std::process::Child) {
+        // Close stdin before waiting, so the shell blocked on read can exit normally.
+        drop(helper.stdin.take());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            match helper.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(None) => break,
+            }
+        }
         let _ = helper.kill();
         let _ = helper.wait();
-        (None, None)
     }
 
     pub(super) fn oom(path: &Path) -> bool {
@@ -336,11 +545,63 @@ mod linux {
         })
     }
 
+    pub(super) fn attach(path: &Path, pid: u32) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(error) = super::attach_fault_error(path) {
+            return Err(error);
+        }
+        write_control(&path.join("cgroup.procs"), &pid.to_string())
+    }
+
     #[cfg(test)]
     mod helper_env_tests {
         use super::*;
 
         const DRIVER: &str = "bash_background::memory_limit::linux::helper_env_tests::memory_limit_helper_environment_probe";
+
+        #[test]
+        fn memory_limit_delegation_setup_requires_existing_controller_files() {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(delegated(dir.path(), 64, "missing-controller").is_none());
+            assert!(!dir.path().join("aft-memory-missing-controller").exists());
+        }
+
+        #[test]
+        fn memory_limit_attach_failure_closes_and_reaps_bootstrap() {
+            use std::process::{Command, Stdio};
+            let dir = tempfile::tempdir().unwrap();
+            let failed = dir.path().join("denied-cgroup");
+            let fault = super::super::AttachFaultGuard::for_thread(failed.clone(), libc::EPERM);
+            let mut monitor = super::super::Monitor::prepare(64, "cleanup-probe").unwrap();
+            assert_eq!(monitor.policy.cgroup.as_ref(), Some(&failed));
+            let marker = dir.path().join("bootstrap-released");
+            let helper = Command::new("/bin/sh")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .args([
+                    "-c",
+                    &format!("read -r ready; printf released > '{}'", marker.display()),
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let helper_pid = helper.id();
+            monitor.bootstrap = Some(helper);
+            monitor.attach(12345).unwrap();
+            assert_eq!(fault.attempts(), 1);
+            assert!(monitor.bootstrap.is_none());
+            assert!(monitor.policy.cgroup.is_none());
+            assert_eq!(monitor.policy.mib, 64);
+            assert_eq!(std::fs::read_to_string(marker).unwrap(), "released");
+            assert!(!failed.exists());
+            assert_eq!(unsafe { libc::kill(helper_pid as i32, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
 
         #[test]
         fn memory_limit_helper_binary_uses_fixed_system_paths() {

@@ -113,6 +113,7 @@ pub(crate) fn spawn_pty_for_command(
     io_handles: &mut TaskIoHandles,
     spawned_pgid: &mut Option<i32>,
     memory_monitor: &mut Option<super::memory_limit::Monitor>,
+    publish_memory_policy: &mut dyn FnMut(&super::memory_limit::MemoryPolicy) -> Result<(), String>,
 ) -> Result<PtyRuntime, String> {
     #[cfg(unix)]
     {
@@ -153,6 +154,7 @@ pub(crate) fn spawn_pty_for_command(
             io_handles,
             spawned_pgid,
             memory_monitor,
+            publish_memory_policy,
         )
     }
     #[cfg(windows)]
@@ -209,6 +211,7 @@ pub(crate) fn spawn_pty_for_command(
                 io_handles,
                 spawned_pgid,
                 memory_monitor,
+                publish_memory_policy,
                 shell.uses_memory_file_gate(),
             )
             .map_err(crate::windows_shell::PtyAttemptError::Spawn)
@@ -258,6 +261,7 @@ fn try_spawn_pty(
     io_handles: &mut TaskIoHandles,
     spawned_pgid: &mut Option<i32>,
     memory_monitor: &mut Option<super::memory_limit::Monitor>,
+    publish_memory_policy: &mut dyn FnMut(&super::memory_limit::MemoryPolicy) -> Result<(), String>,
     #[cfg(windows)] memory_file_gate: bool,
 ) -> Result<PtyRuntime, String> {
     let (command, profile_handle) = crate::sandbox_spawn::pty_command_for_plan(
@@ -324,6 +328,7 @@ fn try_spawn_pty(
     *spawned_pgid = child_pid.map(|pid| pid as i32);
     if let Some(monitor) = memory_monitor.as_mut() {
         monitor.attach(child_pid.ok_or("memory cap launch PID missing")?)?;
+        publish_memory_policy(&monitor.policy)?;
     }
     let killer = child.child.as_ref().unwrap().clone_killer();
     #[cfg(test)]
@@ -913,6 +918,7 @@ fn lifecycle_pty_setup_failure_terminates_and_reaps_child() {
         &mut handles,
         &mut spawned_pgid,
         &mut None,
+        &mut |_| Ok(()),
     );
     let pid = pid.load(Ordering::SeqCst);
     assert_ne!(pid, 0);
@@ -953,6 +959,7 @@ fn approved_pty_worker_admission_failure(worker: super::worker_thread::Worker) {
                 &mut handles,
                 &mut spawned_pgid,
                 &mut None,
+                &mut |_| Ok(()),
             )
         })
     }));

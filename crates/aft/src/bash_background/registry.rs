@@ -4816,23 +4816,33 @@ impl BgTaskRegistry {
         self.dual_write_task(&paths, &metadata);
 
         let mut spawned_pgid = None;
-        let runtime = match spawn_pty_for_command(
-            &spawn_plan,
-            &task_id,
-            &session_id,
-            command,
-            shell,
-            &shell_path,
-            &paths,
-            &workdir,
-            &env,
-            rows,
-            cols,
-            self.inner.wake_tx.clone(),
-            &mut io_handles,
-            &mut spawned_pgid,
-            &mut memory_monitor,
-        ) {
+        let spawned = {
+            // Attach may choose sampling; publish that policy before opening the gate.
+            let mut publish_memory_policy = |policy: &super::memory_limit::MemoryPolicy| {
+                metadata.memory_policy = Some(policy.clone());
+                self.persist_task(&paths, &metadata)
+                    .map_err(|error| error.to_string())
+            };
+            spawn_pty_for_command(
+                &spawn_plan,
+                &task_id,
+                &session_id,
+                command,
+                shell,
+                &shell_path,
+                &paths,
+                &workdir,
+                &env,
+                rows,
+                cols,
+                self.inner.wake_tx.clone(),
+                &mut io_handles,
+                &mut spawned_pgid,
+                &mut memory_monitor,
+                &mut publish_memory_policy,
+            )
+        };
+        let runtime = match spawned {
             Ok(runtime) => runtime,
             Err(error) => {
                 crate::slog_warn!("failed to spawn PTY background bash task {task_id}: {error}");

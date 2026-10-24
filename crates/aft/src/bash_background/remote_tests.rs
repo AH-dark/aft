@@ -697,6 +697,26 @@ async fn exec_remote_bash_refusal_runs_local_with_disclosure() {
 
 #[tokio::test]
 async fn memory_limit_delayed_fallback_keeps_submitted_cap_after_reload() {
+    assert_delayed_fallback_cap(None).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn memory_limit_attach_eperm_delayed_fallback_after_reload_enforces_watcher() {
+    assert_delayed_fallback_cap(Some(libc::EPERM)).await;
+}
+
+async fn assert_delayed_fallback_cap(attach_error: Option<i32>) {
+    #[cfg(target_os = "linux")]
+    if attach_error.is_some()
+        && !crate::bash_background::memory_limit::sampling_available_for_test()
+    {
+        super::super::memory_limit_tests::report_memory_runtime_skip(
+            "memory_limit_attach_eperm_delayed_fallback_after_reload_enforces_watcher",
+            "RSS sampling is unavailable for the forced fallback",
+        );
+        return;
+    }
     let daemon = daemon(Script::GatedAcceptanceThenRefused, "exec-remote/v1").await;
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
@@ -708,14 +728,28 @@ async fn memory_limit_delayed_fallback_keeps_submitted_cap_after_reload() {
     );
     let submitted = {
         let _pin = ctx.pin_config();
-        super::super::memory_limit_tests::spawn_memory_request(
+        super::super::memory_limit_tests::spawn_memory_command(
             &ctx,
             "memory-fallback-a",
+            if attach_error.is_some() {
+                super::super::memory_limit_tests::MEMORY_PRESSURE_COMMAND
+            } else {
+                "exit 0"
+            },
+            false,
             Some(launch(daemon.connection.clone())),
         )
     };
     assert!(submitted.success, "{submitted:?}");
     let task_id = submitted.data["task_id"].as_str().unwrap().to_owned();
+    #[cfg(target_os = "linux")]
+    let attach_fault = attach_error.map(|errno| {
+        crate::bash_background::memory_limit::AttachFaultGuard::for_task(
+            task_id.clone(),
+            storage.path().join("denied-cgroup"),
+            errno,
+        )
+    });
     let (saved_layout, saved_digest) = {
         let task = ctx.bash_background().task(&task_id).unwrap();
         let digest = task
@@ -745,7 +779,29 @@ async fn memory_limit_delayed_fallback_keeps_submitted_cap_after_reload() {
     assert!(newer.success, "{newer:?}");
     daemon.acceptance_gate.notify_one();
     let done = terminal(ctx.bash_background(), &task_id).await;
-    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    if attach_error.is_some() {
+        assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+        assert!(
+            done.info
+                .status_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("64 MiB memory cap"),
+            "{done:?}"
+        );
+        assert!(
+            done.output_preview
+                .contains("Linux process-group RSS watcher; kernel memory controller unavailable"),
+            "{done:?}"
+        );
+    } else {
+        assert_eq!(done.exit_code, Some(0), "{done:?}");
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(fault) = &attach_fault {
+        assert_eq!(fault.attempts(), 1);
+        assert!(!storage.path().join("denied-cgroup").exists());
+    }
     let task = ctx.bash_background().task(&task_id).unwrap();
     let state = task.state.lock().unwrap();
     assert!(state.metadata.local_fallback_started);
@@ -770,19 +826,73 @@ async fn memory_limit_delayed_fallback_keeps_submitted_cap_after_reload() {
 
 #[tokio::test]
 async fn memory_limit_replayed_fallback_keeps_saved_cap() {
+    assert_replayed_fallback_cap(None).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn memory_limit_attach_eperm_replayed_fallback_enforces_watcher() {
+    assert_replayed_fallback_cap(Some(libc::EPERM)).await;
+}
+
+async fn assert_replayed_fallback_cap(attach_error: Option<i32>) {
+    #[cfg(target_os = "linux")]
+    if attach_error.is_some()
+        && !crate::bash_background::memory_limit::sampling_available_for_test()
+    {
+        super::super::memory_limit_tests::report_memory_runtime_skip(
+            "memory_limit_attach_eperm_replayed_fallback_enforces_watcher",
+            "RSS sampling is unavailable for the forced fallback",
+        );
+        return;
+    }
     let daemon = daemon(Script::AttachRefused, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let (original, task_id, paths) = persist_accepted_with_snapshot_cap(
         dir.path(),
         daemon.connection.clone(),
-        "exit 0",
+        if attach_error.is_some() {
+            super::super::memory_limit_tests::MEMORY_PRESSURE_COMMAND
+        } else {
+            "exit 0"
+        },
         Some(64),
     );
     drop(original);
+    #[cfg(target_os = "linux")]
+    let attach_fault = attach_error.map(|errno| {
+        crate::bash_background::memory_limit::AttachFaultGuard::for_task(
+            task_id.clone(),
+            dir.path().join("denied-cgroup"),
+            errno,
+        )
+    });
     let restarted = registry();
     restarted.replay_session(dir.path(), "session").unwrap();
     let done = terminal(&restarted, &task_id).await;
-    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    if attach_error.is_some() {
+        assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+        assert!(
+            done.info
+                .status_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("64 MiB memory cap"),
+            "{done:?}"
+        );
+        assert!(
+            done.output_preview
+                .contains("Linux process-group RSS watcher; kernel memory controller unavailable"),
+            "{done:?}"
+        );
+    } else {
+        assert_eq!(done.exit_code, Some(0), "{done:?}");
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(fault) = &attach_fault {
+        assert_eq!(fault.attempts(), 1);
+        assert!(!dir.path().join("denied-cgroup").exists());
+    }
     let metadata = read_task(&paths.json).unwrap();
     assert!(metadata.local_fallback_started);
     assert_eq!(
