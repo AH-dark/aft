@@ -11,6 +11,22 @@ pub(crate) fn id() -> Uuid {
     "0192a64a-1234-7000-8000-000000000001".parse().unwrap()
 }
 
+pub(crate) fn cancel_exit_status_unknown_terminal() -> TerminalRecord {
+    // The captured tree hash is redacted; its value supplies no process-liveness proof.
+    serde_json::from_value(json!({
+        "job_id": "01a16b6f-5136-775f-a4f9-0ff89d117615",
+        "outcome": {"type": "outcome_unknown"},
+        "killed": "cancel",
+        "wall_ms": 61620,
+        "queue_wait_ms": 27,
+        "bundle_bytes": 487115,
+        "ran": "remote",
+        "tree_hash": "f6be28c…",
+        "workspace_changes": []
+    }))
+    .unwrap()
+}
+
 /// The terminal record of a published `crate-local-server-reports-*` vector
 /// (see `fixtures/SOURCE.md`), after checking its bytes against the published
 /// SHA-256. Its job ID is [`id`].
@@ -95,6 +111,11 @@ pub(crate) enum Script {
     Refused,
     Restart,
     Cancel,
+    /// Hold the run stream open until cancellation; attach returns this terminal.
+    CancelTerminal {
+        terminal: fn() -> TerminalRecord,
+        stderr: &'static str,
+    },
     CancelRefused,
     MissingTerminal,
     KnownRefused,
@@ -377,7 +398,7 @@ pub(crate) async fn daemon_with_capabilities(
                                     Script::Windows { code: None, .. } => Outcome::OutcomeUnknown,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
-                            if matches!(script, Script::Cancel | Script::CancelRefused | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
+                            if matches!(script, Script::Cancel | Script::CancelTerminal { .. } | Script::CancelRefused | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
                             else if attaching && matches!(script, Script::GappedAttach | Script::GappedCancel) { /* output is sent below; completion waits for the test's release */ }
                             else {
                                 if matches!(script, Script::Restart) {
@@ -437,6 +458,12 @@ pub(crate) async fn daemon_with_capabilities(
                                         }
                                     }
                                     if cancelled && !matches!(script, Script::PersistentTerminalGap | Script::TransientTerminalGap | Script::TerminalGapOnce) { terminal = terminal.with_killed(Killed::Cancel); }
+                                    if let (true, true, Script::CancelTerminal { terminal: record, stderr }) = (attaching, cancelled, script) {
+                                        terminal = record();
+                                        if !stderr.is_empty() {
+                                            replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(0, OutputStream::Stderr, BytePayload(stderr.as_bytes().to_vec())))).unwrap()));
+                                        }
+                                    }
                                     if matches!(script, Script::Deadline) { terminal = terminal.with_killed(Killed::Deadline); }
                                     if matches!(script, Script::Reported) { terminal = report_vector("all"); }
                                     if matches!(script, Script::Utf8) {

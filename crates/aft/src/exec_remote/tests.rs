@@ -74,6 +74,50 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
 }
 
 #[test]
+fn cancel_before_start_has_a_confirmed_verdict() {
+    let mut terminal = TerminalRecord::new(job_id(), Outcome::Cancelled, 1, 0, 0);
+    terminal.ran = Some(Ran::None);
+    assert_eq!(grade(&terminal), Verdict::Cancelled);
+}
+
+#[test]
+fn cancelled_running_exit_has_a_confirmed_verdict() {
+    for code in [143, 137] {
+        let mut terminal = TerminalRecord::new(job_id(), Outcome::Exit { code }, 1, 0, 0)
+            .with_killed(Killed::Cancel);
+        terminal.ran = Some(Ran::Remote);
+        assert_eq!(grade(&terminal), Verdict::CancelKilled, "exit {code}");
+    }
+}
+
+#[test]
+fn cancelled_running_signal_has_a_confirmed_verdict() {
+    for signal in [15, 9] {
+        let mut terminal = TerminalRecord::new(job_id(), Outcome::Signal { signal }, 1, 0, 0)
+            .with_killed(Killed::Cancel);
+        terminal.ran = Some(Ran::Remote);
+        assert_eq!(grade(&terminal), Verdict::CancelKilled, "signal {signal}");
+    }
+}
+
+#[test]
+fn cancel_with_unknown_exit_and_no_liveness_proof_stays_unknown() {
+    let terminal = wire_tests::cancel_exit_status_unknown_terminal();
+    assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
+}
+
+#[test]
+#[ignore = "requires a typed execution-ended proof in the shared terminal wire type"]
+fn cancel_with_typed_execution_ended_proof_is_killed() {
+    // cortexkit_exec_remote_types::TerminalRecord 0.2.7 cannot represent typed
+    // process-ended proof for OutcomeUnknown. Keep this test ignored until
+    // TerminalRecord gains that proof, then set it before grading and enable
+    // the test. A cancel acknowledgement or runner stderr cannot substitute.
+    let terminal = wire_tests::cancel_exit_status_unknown_terminal();
+    assert_eq!(grade(&terminal), Verdict::CancelKilled);
+}
+
+#[test]
 fn published_outcomes_have_explicit_grades() {
     let cases = vector_cases("outcomes");
     assert_eq!(cases.len(), 26);
