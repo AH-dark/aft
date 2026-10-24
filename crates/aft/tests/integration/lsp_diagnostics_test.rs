@@ -3428,7 +3428,7 @@ fn watcher_drain_forwards_nothing_to_a_server_without_watched_file_support() {
 }
 
 #[test]
-fn watcher_drain_forwards_config_files_to_a_server_without_registered_globs() {
+fn watcher_drain_ignores_echoed_client_capabilities_without_registration() {
     let (_temp_dir, root, file, ctx, watcher_tx) =
         fake_rust_server_with_watcher(|_| env_pair("AFT_FAKE_LSP_STATIC_WATCHED_FILES_ONLY", "1"));
     fs::write(root.join("Cargo.lock"), "version = 4\n").expect("write lockfile");
@@ -3443,11 +3443,9 @@ fn watcher_drain_forwards_config_files_to_a_server_without_registered_globs() {
     drain_watcher_events(&ctx);
 
     let (watched, _) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
-    assert_eq!(watched.len(), 1, "{watched:?}");
-    assert_eq!(
-        forwarded_changes(&root, &watched[0]),
-        vec![("Cargo.lock".to_string(), 2), ("Cargo.toml".to_string(), 2)],
-        "without globs, only project configuration files are forwarded"
+    assert!(
+        watched.is_empty(),
+        "an echoed client capability is not a subscription: {watched:?}"
     );
 }
 

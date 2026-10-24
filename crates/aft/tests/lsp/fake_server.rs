@@ -234,7 +234,9 @@ fn write_flycheck_progress(writer: &mut impl Write, kind: &str) -> io::Result<()
     if kind == "begin" {
         value["title"] = json!("cargo check");
     } else if kind == "end" {
-        if let Ok(message) = std::env::var("AFT_FAKE_LSP_CHECK_END_MESSAGE") { value["message"] = json!(message); }
+        if let Ok(message) = std::env::var("AFT_FAKE_LSP_CHECK_END_MESSAGE") {
+            value["message"] = json!(message);
+        }
     }
     write_notification(
         writer,
@@ -481,7 +483,8 @@ pub(crate) fn main() -> io::Result<()> {
         // directly so persistence tests fingerprint the real analyzer version.
         if std::env::args_os().any(|arg| arg == "--version") {
             let status = std::process::Command::new(program)
-                .args(std::env::args_os().skip(1)).status()?;
+                .args(std::env::args_os().skip(1))
+                .status()?;
             std::process::exit(status.code().unwrap_or(1));
         }
         return run_proxy(program);
@@ -540,7 +543,8 @@ pub(crate) fn main() -> io::Result<()> {
         let freeze_release = std::env::var_os("AFT_FAKE_LSP_FREEZE_AFTER_OPEN");
         loop {
             let message = read_message(&mut reader);
-            let freeze = freeze_release.is_some() && matches!(&message,
+            let freeze = freeze_release.is_some()
+                && matches!(&message,
                 Ok(Some(ServerMessage::Notification { method, .. })) if method == "textDocument/didOpen");
             let last = !matches!(message, Ok(Some(_)));
             if message_tx.send(message).is_err() || last {
@@ -849,9 +853,8 @@ pub(crate) fn main() -> io::Result<()> {
                     }
 
                     if !no_watched_files {
-                        // Default: advertise didChangeWatchedFiles so the capability gate
-                        // in notify_files_watched_changed (#32) allows notifications
-                        // to reach the fake server during integration tests.
+                        // Echo the client capability to exercise defensive
+                        // parsing; the registration below is the subscription.
                         capabilities["workspace"] = json!({
                             "didChangeWatchedFiles": {
                                 "dynamicRegistration": true
@@ -860,8 +863,8 @@ pub(crate) fn main() -> io::Result<()> {
                         // AFT_FAKE_LSP_STATIC_WATCHED_FILES_ONLY=1 still
                         // advertises `workspace.didChangeWatchedFiles` in the
                         // initialize result but never sends
-                        // client/registerCapability, so the client may send
-                        // watched-file events yet knows no globs for them.
+                        // client/registerCapability. The echoed field alone
+                        // must not enable watched-file notifications.
                         should_register_watched_files =
                             std::env::var("AFT_FAKE_LSP_STATIC_WATCHED_FILES_ONLY")
                                 .ok()
@@ -1217,14 +1220,21 @@ pub(crate) fn main() -> io::Result<()> {
                                 }
                             }),
                         )?;
-                    } else if std::env::var("AFT_FAKE_LSP_PULL_WAIT_FOR_CHECK").ok().as_deref() == Some("1")
+                    } else if std::env::var("AFT_FAKE_LSP_PULL_WAIT_FOR_CHECK")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
                         && !check_completed
                     {
                         // A successful native pull can describe the old
                         // workspace before a watched-file change is applied.
-                        write_response(&mut writer, id, json!({
-                            "kind": "full", "resultId": "old-native", "items": []
-                        }))?;
+                        write_response(
+                            &mut writer,
+                            id,
+                            json!({
+                                "kind": "full", "resultId": "old-native", "items": []
+                            }),
+                        )?;
                     } else if force_unchanged {
                         write_response(
                             &mut writer,
@@ -1659,10 +1669,7 @@ pub(crate) fn main() -> io::Result<()> {
                     // The release file lets a test resume the same process without
                     // relying on platform-specific signals or leaving a stopped child.
                     if let Some(release) = std::env::var_os("AFT_FAKE_LSP_FREEZE_AFTER_OPEN") {
-                        write_notification(
-                            &mut writer,
-                            &Notification::new("custom/frozen", None),
-                        )?;
+                        write_notification(&mut writer, &Notification::new("custom/frozen", None))?;
                         while !std::path::Path::new(&release).exists() {
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
