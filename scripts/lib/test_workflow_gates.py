@@ -11,6 +11,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 
 
 MODULE_PATH = Path(__file__).with_name("workflow-gates.py")
@@ -554,9 +555,110 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
         gate = next(step for step in shard["steps"] if "./scripts/rust-test-gate.sh" in step.get("run", ""))
         self.assertEqual(gate["env"]["AFT_GATE_PHASES"], "lib-shard")
         self.assertEqual(gate["env"]["AFT_UNIT_TEST_RUNNER"], "nextest")
-        self.assertEqual(gate["env"]["AFT_NEXTEST_PARTITION"], "hash:${{ matrix.shard }}/3")
+        self.assertEqual(gate["env"]["AFT_NEXTEST_PARTITION"], "hash:${{ matrix.shard }}/6")
         self.assertEqual(gate["env"]["AFT_NEXTEST_ARCHIVE_FILE"], "${{ runner.temp }}/windows-nextest.tar.zst")
         self.assertEqual(shard["needs"], "unit-windows-nextest-archive")
+
+
+class UnitShardPartitionCountTests(unittest.TestCase):
+    """Each inventory proof must partition lib/bin tests the way its shards do.
+
+    The shard matrix size, the nextest partition spec and the proof's
+    AFT_UNIT_PARTITION_COUNT are written separately in the workflow. If they
+    disagree, shards may skip tests or the proof may check a split that no
+    shard runs. The shard job's displayed name must also show the matrix size.
+    """
+
+    # (libtest shard job, job whose step runs the inventory proof)
+    LANES = (
+        ("unit-linux-libtest-shard", "unit-linux-nextest-archive"),
+        ("unit-macos-libtest-shard", "unit-macos-inventory-proof"),
+        ("unit-windows-libtest-shard", "unit-windows-nextest-archive"),
+    )
+
+    def setUp(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        self.jobs = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))["jobs"]
+
+    def test_proof_partition_count_matches_each_shard_matrix(self) -> None:
+        for shard_job, proof_job in self.LANES:
+            with self.subTest(shard_job=shard_job):
+                job = self.jobs[shard_job]
+                shards = job["strategy"]["matrix"]["shard"]
+                count = len(shards)
+                self.assertEqual(shards, [str(index) for index in range(1, count + 1)])
+                self.assertEqual(job["strategy"]["max-parallel"], str(count))
+                self.assertTrue(
+                    job["name"].startswith(f"Cargo libtest shard ${{{{ matrix.shard }}}}/{count} ("),
+                    job["name"],
+                )
+                gate = next(step for step in job["steps"] if "./scripts/rust-test-gate.sh" in step.get("run", ""))
+                self.assertEqual(gate["env"]["AFT_NEXTEST_PARTITION"], f"hash:${{{{ matrix.shard }}}}/{count}")
+                proof = next(
+                    step for step in self.jobs[proof_job]["steps"]
+                    if "scripts/rust-test-inventory-proof.py" in step.get("run", "")
+                )
+                self.assertEqual(proof["env"].get("AFT_UNIT_PARTITION_COUNT"), str(count))
+
+    def _proof_partition_functions(self, list_calls: list[list[str]]) -> dict:
+        """Load the proof's partition helpers with cargo replaced by a recorder."""
+        import ast
+
+        tree = ast.parse(PROOF_TEXT)
+        wanted = {"INTEGRATION_PARTITION_COUNT", "unit_partition_count", "partition_nextest_entries"}
+        nodes = [
+            node for node in tree.body
+            if (isinstance(node, ast.FunctionDef) and node.name in wanted)
+            or (isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id in wanted for target in node.targets
+            ))
+        ]
+        self.assertEqual(len(nodes), 3)
+        namespace = {
+            "os": os,
+            "sys": __import__("sys"),
+            "NextestEntry": object,
+            "run_command": lambda command, merge_stderr=True: list_calls.append(command) or "",
+            "parse_nextest_list": lambda output, kinds=None, matching_tests_only=False: [],
+        }
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "rust-test-inventory-proof.py", "exec"), namespace)
+        return namespace
+
+    def test_proof_lists_one_partition_per_configured_shard(self) -> None:
+        for env_value, expected in ((None, 3), ("5", 5), ("6", 6)):
+            with self.subTest(env_value=env_value):
+                calls: list[list[str]] = []
+                proof = self._proof_partition_functions(calls)
+                env = {key: value for key, value in os.environ.items() if key != "AFT_UNIT_PARTITION_COUNT"}
+                if env_value is not None:
+                    env["AFT_UNIT_PARTITION_COUNT"] = env_value
+                with unittest.mock.patch.dict(os.environ, env, clear=True):
+                    count = proof["unit_partition_count"]()
+                self.assertEqual(count, expected)
+                partitions = proof["partition_nextest_entries"](["cargo", "nextest", "list", "--", "--skip", "x"], None, count)
+                self.assertEqual(len(partitions), expected)
+                self.assertEqual(
+                    [call[call.index("--partition") + 1] for call in calls],
+                    [f"hash:{shard}/{expected}" for shard in range(1, expected + 1)],
+                )
+                # The partition flag must stay ahead of the libtest `--` arguments.
+                self.assertTrue(all(call.index("--partition") < call.index("--") for call in calls))
+
+    def test_proof_integration_partitions_match_the_integration_shard_action(self) -> None:
+        calls: list[list[str]] = []
+        proof = self._proof_partition_functions(calls)
+        self.assertEqual(proof["INTEGRATION_PARTITION_COUNT"], 3)
+        proof["partition_nextest_entries"](["cargo", "nextest", "list"])
+        self.assertEqual([call[-1] for call in calls], ["hash:1/3", "hash:2/3", "hash:3/3"])
+
+    def test_proof_rejects_a_non_positive_partition_count(self) -> None:
+        proof = self._proof_partition_functions([])
+        for value in ("0", "-2", "three"):
+            with self.subTest(value=value):
+                with unittest.mock.patch.dict(os.environ, {"AFT_UNIT_PARTITION_COUNT": value}):
+                    with self.assertRaises(SystemExit) as raised:
+                        proof["unit_partition_count"]()
+                self.assertEqual(raised.exception.code, 2)
 
 
 class MacOSUnitWorkflowTests(unittest.TestCase):
@@ -662,10 +764,10 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn("unit-macos-bin-archive", libtest)
         self.assertIn("macos-libtest-archive", libtest)
         self.assertIn("macos-bin-archive", libtest)
-        self.assertIn("max-parallel: 3", libtest)
+        self.assertIn("max-parallel: 5", libtest)
         self.assertIn("AFT_NEXTEST_ARCHIVE_BIN_FILE", libtest)
         self.assertIn("AFT_GATE_PHASES: ${{ matrix.shard == 1 && 'lib,lib-shard' || 'lib-shard' }}", libtest)
-        self.assertIn("AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3", libtest)
+        self.assertIn("AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/5", libtest)
         self.assertIn("AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}", libtest)
 
         integration = workflow_job("unit-macos-nextest")
@@ -794,8 +896,8 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn("AFT_NEXTEST_ARCHIVE_BIN_FILE", inventory)
         self.assertIn('"lib": partition_coverage_errors(lib_entries, [lib_archive_entries])', PROOF_TEXT)
         self.assertIn('"bin": partition_coverage_errors(bin_entries, [bin_archive_entries])', PROOF_TEXT)
-        self.assertIn('lib_partitions = partition_nextest_entries(lib_command, {"lib"})', PROOF_TEXT)
-        self.assertIn('bin_partitions = partition_nextest_entries(bin_command, {"bin"})', PROOF_TEXT)
+        self.assertIn("lib_partitions = partition_nextest_entries(\n        lib_command, {\"lib\"}, unit_partitions_total\n    )", PROOF_TEXT)
+        self.assertIn("bin_partitions = partition_nextest_entries(\n        bin_command, {\"bin\"}, unit_partitions_total\n    )", PROOF_TEXT)
         self.assertIn("any(unexpected_archives.values())", PROOF_TEXT)
         self.assertIn("or any(source_archive_errors)", PROOF_TEXT)
         self.assertIn("any(partition_errors)", PROOF_TEXT)
