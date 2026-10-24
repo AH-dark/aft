@@ -9093,6 +9093,24 @@ mod run_tests {
     use super::*;
 
     async fn run(command: &str, timeout: u64, deadline: Option<Instant>) -> Value {
+        run_with_scope(
+            command,
+            timeout,
+            super::super::run_scope::RunScope::for_test(deadline),
+            1,
+            super::grant_path_tests::running_bash_stub,
+        )
+        .await
+        .data
+    }
+
+    async fn run_with_scope(
+        command: &str,
+        timeout: u64,
+        scope: Arc<super::super::run_scope::RunScope>,
+        expected_tasks: usize,
+        dispatch: DispatchFn,
+    ) -> Response {
         let (_dir, root) = super::super::test_support::test_root("run-bash-lifetime");
         let ctx = super::super::test_support::test_ctx();
         ctx.update_config(|config| config.foreground_wait_window_ms = 10);
@@ -9106,7 +9124,7 @@ mod run_tests {
             &completion_tx,
             &touch_tx,
             &metrics,
-            super::grant_path_tests::running_bash_stub,
+            dispatch,
             root.clone(),
             root.as_path().into(),
             "run-session".into(),
@@ -9121,7 +9139,7 @@ mod run_tests {
             json!({"command":command,"timeout":timeout}),
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
-                run_scope: Some(super::super::run_scope::RunScope::for_test(deadline)),
+                run_scope: Some(scope),
                 scope: None,
                 late_results: false,
                 ledger_carrier: None,
@@ -9149,12 +9167,13 @@ mod run_tests {
         let response = done.response_for_test();
         let ctx = executor.actor_context(&root).unwrap();
         let tasks = ctx.bash_background().list(0);
-        assert_eq!(tasks.len(), 1);
-        assert!(
-            tasks[0].info.status.is_terminal(),
-            "no background promotion: {:?}",
-            tasks[0]
-        );
+        assert_eq!(tasks.len(), expected_tasks, "{response:?}");
+        for task in &tasks {
+            assert!(
+                task.info.status.is_terminal(),
+                "no background promotion: {task:?}"
+            );
+        }
         if let Some(task) = response.data.get("task_id").and_then(Value::as_str) {
             if let Some(path) = ctx.bash_background().task_json_path(task, "run-session") {
                 let persisted: Value =
@@ -9165,7 +9184,7 @@ mod run_tests {
                 );
             }
         }
-        response.data.clone()
+        copy_response(response)
     }
 
     #[tokio::test]
@@ -9185,13 +9204,42 @@ mod run_tests {
 
     #[tokio::test]
     async fn run_available_budget_reaches_spawn_and_kills_at_deadline() {
-        // Inject a local deadline to verify that spawn receives a clamped
-        // timeout and the child returns exit 124 instead of being promoted.
-        // subc-protocol 0.30 cannot supply that deadline in scope.describe.
+        // Keep 200 ms available when the executor constrains the command,
+        // regardless of queue time. The real child must receive that timeout
+        // and return exit 124 instead of being promoted or running for 5 s.
         let started = Instant::now();
-        let response = run("sleep 30", 5000, Some(started + Duration::from_millis(200))).await;
-        assert!(started.elapsed() < Duration::from_secs(3));
-        assert_eq!(response["status"], "timed_out", "{response:?}");
-        assert_eq!(response["exit_code"], 124);
+        let scope = super::super::run_scope::RunScope::for_test_with_clock(
+            Some(started + Duration::from_millis(200)),
+            Some(started),
+        );
+        let response = run_with_scope("sleep 30", 5000, scope, 1, budgeted_bash_stub).await;
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "timed_out", "{response:?}");
+        assert_eq!(response.data["exit_code"], 124);
+    }
+
+    #[tokio::test]
+    async fn run_budget_expired_before_spawn_refuses_without_a_task() {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let scope =
+            super::super::run_scope::RunScope::for_test_with_clock(Some(deadline), Some(deadline));
+        let response = run_with_scope("sleep 30", 5000, scope, 0, budgeted_bash_stub).await;
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "run_deadline_expired");
+        assert_eq!(
+            response.data["message"],
+            "the codemode run's time budget has expired"
+        );
+        assert!(response.data.get("status").is_none(), "{response:?}");
+        assert!(response.data.get("exit_code").is_none(), "{response:?}");
+    }
+
+    fn budgeted_bash_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        let params = req.params.get("params").unwrap_or(&req.params);
+        assert_eq!(
+            params["timeout"], 200,
+            "spawn must receive the available run budget"
+        );
+        super::grant_path_tests::running_bash_stub(req, ctx)
     }
 }
