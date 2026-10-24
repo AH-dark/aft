@@ -1,6 +1,75 @@
 use super::*;
 use std::sync::{Arc, Mutex, OnceLock};
 
+#[cfg(test)]
+thread_local! {
+    static PATH_COMPARISONS: std::cell::Cell<(usize, Option<usize>)> = const { std::cell::Cell::new((0, None)) };
+}
+
+#[inline]
+fn record_path_comparison() {
+    #[cfg(test)]
+    PATH_COMPARISONS.with(|stats| {
+        let (count, limit) = stats.get();
+        let count = count + 1;
+        stats.set((count, limit));
+        assert!(
+            limit.is_none_or(|limit| count <= limit),
+            "watcher delta comparison budget exceeded: {count}"
+        );
+    });
+}
+
+fn compare_paths(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    record_path_comparison();
+    left.cmp(right)
+}
+
+#[derive(Default)]
+/// Byte-sorted sets shared with the HEAD listing. Each changed path needs at
+/// most two logarithmic lookups, even for a checkout-wide watcher batch.
+pub(super) struct HeadPaths {
+    members: Vec<Vec<u8>>,
+    directories: Vec<Vec<u8>>,
+}
+
+impl HeadPaths {
+    fn new(head: &[crate::alias::TrackedPath]) -> Self {
+        let mut paths = Self::default();
+        for entry in head {
+            paths.members.push(entry.rel_path.clone());
+            for (index, byte) in entry.rel_path.iter().enumerate() {
+                if *byte == b'/' {
+                    paths.directories.push(entry.rel_path[..index].to_vec());
+                }
+            }
+        }
+        for values in [&mut paths.members, &mut paths.directories] {
+            values.sort_unstable_by(|left, right| compare_paths(left, right));
+            values.dedup_by(|left, right| compare_paths(left, right).is_eq());
+            values.shrink_to_fit();
+        }
+        paths
+    }
+
+    fn contains(values: &[Vec<u8>], path: &[u8]) -> bool {
+        values
+            .binary_search_by(|value| compare_paths(value, path))
+            .is_ok()
+    }
+}
+
+pub(super) fn delta_requires_full_read(
+    head: &[crate::alias::TrackedPath],
+    paths: &OnceLock<HeadPaths>,
+    changed: &BTreeSet<Vec<u8>>,
+) -> bool {
+    let paths = paths.get_or_init(|| HeadPaths::new(head));
+    changed.iter().any(|path| {
+        HeadPaths::contains(&paths.directories, path) || !HeadPaths::contains(&paths.members, path)
+    })
+}
+
 type RemovalStamp = (Vec<u8>, i64);
 
 #[derive(Clone, PartialEq, Eq)]
@@ -35,6 +104,7 @@ pub(super) struct HeadSnapshot {
     tree: String,
     index: IndexStamp,
     entries: Arc<Vec<crate::alias::TrackedPath>>,
+    paths: Arc<OnceLock<HeadPaths>>,
 }
 
 pub(super) struct HeadRead {
@@ -42,6 +112,7 @@ pub(super) struct HeadRead {
     pub entries: Arc<Vec<crate::alias::TrackedPath>>,
     pub cached: bool,
     pub snapshot: Option<HeadSnapshot>,
+    pub paths: Arc<OnceLock<HeadPaths>>,
 }
 
 #[derive(Default)]
@@ -140,6 +211,7 @@ pub(super) fn head(request: &AssemblyRequest, view: &ViewStore) -> Result<HeadRe
                 return Ok(HeadRead {
                     tree,
                     entries: snapshot.entries.clone(),
+                    paths: snapshot.paths.clone(),
                     cached: true,
                     snapshot: Some(snapshot),
                 });
@@ -150,18 +222,21 @@ pub(super) fn head(request: &AssemblyRequest, view: &ViewStore) -> Result<HeadRe
         head_tree_entries(&request.project_root)
             .map_err(|error| ViewError::InvalidManifest(error.to_string()))?,
     );
+    let paths = Arc::new(OnceLock::new());
     // This listing is only a candidate. A failed or cancelled preparation must
     // leave the served manifest's index invalidation pending for the retry.
     let snapshot = index.map(|index| HeadSnapshot {
         tree: tree.clone(),
         index,
         entries: entries.clone(),
+        paths: paths.clone(),
     });
     Ok(HeadRead {
         tree,
         entries,
         cached: false,
         snapshot,
+        paths,
     })
 }
 
@@ -392,6 +467,79 @@ impl PublicationClosure for StoreClosure<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn views_large_watcher_delta_has_bounded_path_comparisons() {
+        let oid = crate::alias::GitOid::from_bytes(&[0; 20]).unwrap();
+        let head = (0..60_000)
+            .map(|index| crate::alias::TrackedPath {
+                rel_path: format!("src/p{:04}/f{index:05}.rs", index / 100).into_bytes(),
+                mode: GitMode::Regular { executable: false },
+                git_oid: oid,
+                filtered: false,
+                present_in_previous_generation: true,
+                tracked: true,
+            })
+            .collect::<Vec<_>>();
+        let changed = head
+            .iter()
+            .skip(head.len() - 4096)
+            .map(|entry| entry.rel_path.clone())
+            .collect::<BTreeSet<_>>();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                PATH_COMPARISONS.with(|stats| stats.set((0, None)));
+            }
+        }
+        let _reset = Reset;
+        PATH_COMPARISONS.with(|stats| stats.set((0, Some(4_000_000))));
+        let paths = OnceLock::new();
+        assert!(!delta_requires_full_read(&head, &paths, &changed));
+        let comparisons = PATH_COMPARISONS.with(|stats| stats.get().0);
+        assert!(
+            comparisons > changed.len(),
+            "the counter must observe actual path comparisons"
+        );
+        println!(
+            "watcher_delta head={} changed={} comparisons={comparisons}",
+            head.len(),
+            changed.len()
+        );
+        PATH_COMPARISONS.with(|stats| stats.set((0, Some(200_000))));
+        assert!(!delta_requires_full_read(&head, &paths, &changed));
+        println!(
+            "watcher_delta warm_comparisons={}",
+            PATH_COMPARISONS.with(|stats| stats.get().0)
+        );
+    }
+
+    #[test]
+    fn views_full_rebuild_skips_delta_comparison_index() {
+        let (_project, storage, request) = fixture();
+        let view = ViewStore::open(storage.path(), &request.scope).unwrap();
+        assert!(caches()
+            .lock()
+            .unwrap()
+            .get(view.view_dir())
+            .unwrap()
+            .head
+            .as_ref()
+            .unwrap()
+            .paths
+            .get()
+            .is_none());
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                PATH_COMPARISONS.with(|stats| stats.set((0, None)));
+            }
+        }
+        let _reset = Reset;
+        PATH_COMPARISONS.with(|stats| stats.set((0, Some(0))));
+        publish(&request);
+        assert_eq!(PATH_COMPARISONS.with(|stats| stats.get().0), 0);
+    }
 
     fn git(root: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")

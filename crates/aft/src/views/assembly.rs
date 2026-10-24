@@ -686,6 +686,7 @@ pub fn prepare_checkout_deferring(
         entries: head,
         cached: head_cached,
         snapshot: mut head_snapshot,
+        paths: head_paths,
     } = manifest_incremental::head(request, &view)?;
     profile.head_ms = head_started.elapsed().as_millis();
     timing.phase("head_tree");
@@ -711,33 +712,23 @@ pub fn prepare_checkout_deferring(
     // Directory notifications may be the only evidence for changed, removed,
     // or renamed children. Read their whole HEAD subtree rather than treating
     // its cached members as individually observed unchanged files.
-    let subtree_changed = head.iter().any(|entry| {
-        request.changed_paths.iter().any(|path| {
-            entry
-                .rel_path
-                .strip_prefix(path.as_slice())
-                .is_some_and(|suffix| suffix.starts_with(b"/"))
-        })
-    });
     let rebuild_all = request.changed_paths.is_empty()
-        || subtree_changed
-        // Case and Unicode spellings can differ on insensitive filesystems.
-        // An unmatched notification cannot safely identify an unchanged entry.
-        || request.changed_paths.iter().any(|path| !head.iter().any(|entry| &entry.rel_path == path))
         || !head_cached
         || cached
             .as_ref()
-            .is_none_or(|cached| cached.tree != head_tree);
+            .is_none_or(|cached| cached.tree != head_tree)
+        || manifest_incremental::delta_requires_full_read(
+            &head,
+            &head_paths,
+            &request.changed_paths,
+        );
     // A batch naming no HEAD member is not evidence that the checkout was
     // observed completely; preserve the full metadata/probe path in that case.
     let incremental = !rebuild_all
         && trusted.is_some()
         && cached
             .as_ref()
-            .is_some_and(|cached| cached.admission == admission)
-        && head
-            .iter()
-            .any(|entry| request.changed_paths.contains(&entry.rel_path));
+            .is_some_and(|cached| cached.admission == admission);
     let verify = verification_due && previous.is_some();
     let assembly_started = Instant::now();
     let mut blocking_paths = BTreeSet::new();
