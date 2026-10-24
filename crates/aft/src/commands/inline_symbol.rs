@@ -370,6 +370,15 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // --- Substitute params in body ---
     let substituted_body = substitute_params(&body_text, &param_to_arg, lang);
     let substitution_count = param_to_arg.len();
+    // A body node that starts its own line (a Python block) begins at its
+    // first statement, so the text's first line has lost the indentation
+    // every later line keeps. Restore it, or the common-indent strip in
+    // `build_inline_replacement` keeps the later lines one level too deep
+    // (`total = x + y` then `        result = total`: an IndentationError).
+    let substituted_body = match body_first_line_indent(&fn_node, &source) {
+        Some(indent) => format!("{indent}{substituted_body}"),
+        None => substituted_body,
+    };
 
     // --- Build replacement text ---
     //
@@ -1457,6 +1466,34 @@ fn get_line_indent(source: &str, line: usize) -> String {
         .unwrap_or_default()
 }
 
+/// The whitespace before the function body on its first line, when the body
+/// starts its own line (a Python block after `def f():`). `None` when
+/// anything else precedes it on that line, as for `{` bodies and same-line
+/// suites like `def f(): return 1`.
+fn body_first_line_indent<'s>(fn_node: &tree_sitter::Node, source: &'s str) -> Option<&'s str> {
+    let body = fn_node.child_by_field_name("body")?;
+    let line_start = source[..body.start_byte()]
+        .rfind('\n')
+        .map_or(0, |at| at + 1);
+    let lead = &source[line_start..body.start_byte()];
+    (!lead.is_empty() && lead.trim().is_empty()).then_some(lead)
+}
+
+/// Drop the body's leading blank lines and trailing whitespace, but keep the
+/// first statement's indentation: trimming it would leave the first line
+/// shallower than the rest, and the common-indent strip would then keep every
+/// later line one level too deep.
+fn trim_body_keeping_indent(body: &str) -> &str {
+    let mut start = 0;
+    for line in body.split_inclusive('\n') {
+        if !line.trim().is_empty() {
+            break;
+        }
+        start += line.len();
+    }
+    body[start..].trim_end()
+}
+
 /// Build the replacement text for the inlined function body.
 ///
 /// Handles three call contexts:
@@ -1470,7 +1507,7 @@ fn build_inline_replacement(
     lang: LangId,
     assignment_var: Option<&str>,
 ) -> String {
-    let body_trimmed = body.trim();
+    let body_trimmed = trim_body_keeping_indent(body);
     let lines: Vec<&str> = body_trimmed.lines().collect();
 
     match call_context {

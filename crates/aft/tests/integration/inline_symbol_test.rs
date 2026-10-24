@@ -200,12 +200,53 @@ fn inline_symbol_python() {
     );
     assert_eq!(resp["symbol"], "add");
 
-    // Verify call was replaced
+    // Verify call was replaced, at the call site's indentation: the body's
+    // second line must not keep the function body's own indentation on top
+    // of the call site's (`        result = total` is an IndentationError).
     let content = std::fs::read_to_string(&file).expect("read file");
     assert!(
         !content.contains("add(x, y)"),
         "call should be replaced:\n{}",
         content
+    );
+    assert!(
+        content.contains("def main():\n    x = 10\n    y = 20\n    total = x + y\n    result = total\n    print(result)\n"),
+        "inlined body should sit at the call site's indentation:\n{}",
+        content
+    );
+
+    aft.shutdown();
+}
+
+/// A Python body with a nested block keeps its relative nesting when it is
+/// inlined into a call site that is itself nested.
+#[test]
+fn inline_symbol_python_nested_body_keeps_relative_indentation() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let file = tmp.path().join("nested.py");
+    std::fs::write(
+        &file,
+        "def pick(a):\n    if a > 1:\n        print(a)\n    return a\n\ndef main():\n    v = 5\n    if v:\n        r = pick(v)\n        print(r)\n",
+    )
+    .expect("write test file");
+    let root = tmp.path().display().to_string();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"pick","call_site_line":9}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "nested python inline should succeed: {resp:?}"
+    );
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        content.contains(
+            "    if v:\n        if v > 1:\n            print(v)\n        r = v\n        print(r)\n"
+        ),
+        "inlined body should keep its nesting at the call site's depth:\n{content}"
     );
 
     aft.shutdown();
