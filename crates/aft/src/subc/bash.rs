@@ -2623,7 +2623,10 @@ pub(super) fn submit_deferred_bash(
                     _ = async {
                         #[cfg(test)]
                         if let Some(timing) = &timing_for_test {
-                            return timing.reply.wait().await;
+                            timing.reply.wait().await;
+                            if !timing.reply_uses_clock {
+                                return;
+                            }
                         }
                         wait_for_bash_reply_deadline(reply_deadline).await;
                     } => {
@@ -3844,6 +3847,7 @@ struct BashTimingForTest {
     startup: BashTestDeadline,
     inline_settle: BashTestDeadline,
     reply: BashTestDeadline,
+    reply_uses_clock: bool,
     committed: tokio::sync::Notify,
     task_id: std::sync::Mutex<Option<String>>,
     admission: (std::sync::Mutex<bool>, std::sync::Condvar),
@@ -4910,37 +4914,112 @@ mod grant_path_tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn blocking_bash_hands_back_before_client_deadline() {
-        for mode in ["wait", "block_to_completion"] {
-            let (_dir, root) = super::super::test_support::test_root("bash-client-deadline");
-            let ctx = super::super::test_support::test_ctx();
-            let executor = Arc::new(Executor::new());
-            executor.register_actor(root.clone(), ctx.clone());
-            let started = Instant::now();
-            let budget = crate::commands::blocking_wait::ReplyBudget::new(
-                started,
-                Some(started + Duration::from_secs(3)),
-            );
-            let mut args = json!({"command":"sleep 10","timeout":10000});
-            args[mode] = json!(true);
-            let mut rx =
-                deadline_test_call_owned(&executor, &root, running_bash_stub, args, budget, false);
-            let done = tokio::time::timeout(Duration::from_secs(4), rx.recv())
-                .await
-                .expect("blocking bash must hand back before transport expiry")
-                .unwrap();
-            let response = done.response_for_test();
-            let task = response.data["task_id"].as_str().expect("running task id");
-            let _ = ctx.bash_background().kill(task, "deadline-session");
-            assert!(response.success, "{response:?}");
-            assert_eq!(response.data["status"], "running", "{response:?}");
-            assert!(
-                started.elapsed() < Duration::from_millis(2500),
-                "{mode}: reply arrived after safety cutoff: {:?}",
-                started.elapsed()
-            );
+    #[test]
+    fn blocking_bash_hands_back_before_client_deadline() {
+        fn held_running_stub(req: RawRequest, ctx: &AppContext) -> Response {
+            let response = gated_running_stub(req, ctx);
+            let timing = BASH_TIMING_FOR_TEST.with(|slot| slot.borrow().clone().unwrap());
+            BashTimingForTest::wait(&timing.result, "spawn result");
+            response
         }
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                for mode in ["wait", "block_to_completion"] {
+                    let (_dir, root) =
+                        super::super::test_support::test_root("bash-client-deadline");
+                    let ctx = super::super::test_support::test_ctx();
+                    let executor = Arc::new(Executor::new());
+                    executor.register_actor(root.clone(), ctx.clone());
+                    let started = tokio::time::Instant::now();
+                    let mut timing = BashTimingForTest::new(started.into_std());
+                    Arc::get_mut(&mut timing).unwrap().reply_uses_clock = true;
+                    BashTimingForTest::release(&timing.admission);
+                    let budget = crate::commands::blocking_wait::ReplyBudget::new(
+                        started.into_std(),
+                        Some((started + Duration::from_secs(3)).into_std()),
+                    );
+                    let mut args = json!({"command":"sleep 10","timeout":10000});
+                    args[mode] = json!(true);
+                    let mut rx = with_bash_timing_for_test(Some(timing.clone()), || {
+                        deadline_test_call_owned(
+                            &executor,
+                            &root,
+                            held_running_stub,
+                            args,
+                            budget,
+                            false,
+                        )
+                    });
+                    tokio::select! {
+                        biased;
+                        done = rx.recv() => panic!("{mode}: answered before registration: {:?}", done.map(|done| copy_response(done.response_for_test()))),
+                        _ = timing.committed.notified() => {},
+                    }
+
+                    // Keep ordinary task observation off the blocking pool so only the
+                    // Tokio reply-deadline timer can hand back the still-running task.
+                    // Prevent polling the child before the blocker below holds
+                    // the only pool thread: held_running_stub delays returning
+                    // the task id until timing.result is released.
+                    let (occupied_tx, occupied_rx) = std::sync::mpsc::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                    let blocker = tokio::task::spawn_blocking(move || {
+                        occupied_tx.send(()).unwrap();
+                        let _ = release_rx.recv();
+                    });
+                    occupied_rx.recv().unwrap();
+                    BashTimingForTest::release(&timing.result);
+                    tokio::select! {
+                        biased;
+                        done = rx.recv() => panic!("{mode}: answered before reply watchdog: {:?}", done.map(|done| copy_response(done.response_for_test()))),
+                        _ = timing.reply.armed.notified() => {},
+                    }
+                    timing.reply.fire.notify_one();
+                    tokio::time::advance(Duration::from_millis(1499)).await;
+                    assert!(matches!(
+                        rx.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+
+                    let cutoff = started + Duration::from_millis(2500);
+                    // A running blocking job inhibits Tokio's automatic clock
+                    // advancement, so drive the clock while it holds the pool.
+                    let done = loop {
+                        if let Ok(done) = rx.try_recv() {
+                            break done;
+                        }
+                        assert!(
+                            tokio::time::Instant::now() < cutoff,
+                            "{mode}: blocking bash must hand back before transport expiry"
+                        );
+                        tokio::time::advance(Duration::from_millis(1)).await;
+                        tokio::task::yield_now().await;
+                    };
+                    let replied_at = tokio::time::Instant::now();
+                    drop(release_tx);
+                    blocker.await.unwrap();
+                    let response = done.response_for_test();
+                    let task = response.data["task_id"].as_str().expect("running task id");
+
+                    // Cleanup can outlive the client's deadline without making a timely
+                    // reply late. Measure receipt, not synchronous process termination.
+                    tokio::time::advance(Duration::from_secs(3)).await;
+                    let _ = ctx.bash_background().kill(task, "deadline-session");
+                    assert!(response.success, "{response:?}");
+                    assert_eq!(response.data["status"], "running", "{response:?}");
+                    assert!(
+                        replied_at < cutoff,
+                        "{mode}: reply arrived after safety cutoff: {:?}",
+                        replied_at - started
+                    );
+                }
+            });
     }
 
     #[tokio::test]
@@ -8291,6 +8370,7 @@ mod grant_path_tests {
                 startup: BashTestDeadline::default(),
                 inline_settle: BashTestDeadline::default(),
                 reply: BashTestDeadline::default(),
+                reply_uses_clock: false,
                 committed: tokio::sync::Notify::new(),
                 task_id: Default::default(),
                 admission: Default::default(),
@@ -9029,6 +9109,24 @@ mod run_tests {
     use super::*;
 
     async fn run(command: &str, timeout: u64, deadline: Option<Instant>) -> Value {
+        run_with_scope(
+            command,
+            timeout,
+            super::super::run_scope::RunScope::for_test(deadline),
+            1,
+            super::grant_path_tests::running_bash_stub,
+        )
+        .await
+        .data
+    }
+
+    async fn run_with_scope(
+        command: &str,
+        timeout: u64,
+        scope: Arc<super::super::run_scope::RunScope>,
+        expected_tasks: usize,
+        dispatch: DispatchFn,
+    ) -> Response {
         let (_dir, root) = super::super::test_support::test_root("run-bash-lifetime");
         let ctx = super::super::test_support::test_ctx();
         ctx.update_config(|config| config.foreground_wait_window_ms = 10);
@@ -9042,7 +9140,7 @@ mod run_tests {
             &completion_tx,
             &touch_tx,
             &metrics,
-            super::grant_path_tests::running_bash_stub,
+            dispatch,
             root.clone(),
             root.as_path().into(),
             "run-session".into(),
@@ -9057,7 +9155,7 @@ mod run_tests {
             json!({"command":command,"timeout":timeout}),
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
-                run_scope: Some(super::super::run_scope::RunScope::for_test(deadline)),
+                run_scope: Some(scope),
                 scope: None,
                 late_results: false,
                 ledger_carrier: None,
@@ -9085,12 +9183,13 @@ mod run_tests {
         let response = done.response_for_test();
         let ctx = executor.actor_context(&root).unwrap();
         let tasks = ctx.bash_background().list(0);
-        assert_eq!(tasks.len(), 1);
-        assert!(
-            tasks[0].info.status.is_terminal(),
-            "no background promotion: {:?}",
-            tasks[0]
-        );
+        assert_eq!(tasks.len(), expected_tasks, "{response:?}");
+        for task in &tasks {
+            assert!(
+                task.info.status.is_terminal(),
+                "no background promotion: {task:?}"
+            );
+        }
         if let Some(task) = response.data.get("task_id").and_then(Value::as_str) {
             if let Some(path) = ctx.bash_background().task_json_path(task, "run-session") {
                 let persisted: Value =
@@ -9101,7 +9200,7 @@ mod run_tests {
                 );
             }
         }
-        response.data.clone()
+        copy_response(response)
     }
 
     #[tokio::test]
@@ -9121,13 +9220,42 @@ mod run_tests {
 
     #[tokio::test]
     async fn run_available_budget_reaches_spawn_and_kills_at_deadline() {
-        // Inject a local deadline to verify that spawn receives a clamped
-        // timeout and the child returns exit 124 instead of being promoted.
-        // subc-protocol 0.30 cannot supply that deadline in scope.describe.
+        // Keep 200 ms available when the executor constrains the command,
+        // regardless of queue time. The real child must receive that timeout
+        // and return exit 124 instead of being promoted or running for 5 s.
         let started = Instant::now();
-        let response = run("sleep 30", 5000, Some(started + Duration::from_millis(200))).await;
-        assert!(started.elapsed() < Duration::from_secs(3));
-        assert_eq!(response["status"], "timed_out", "{response:?}");
-        assert_eq!(response["exit_code"], 124);
+        let scope = super::super::run_scope::RunScope::for_test_with_clock(
+            Some(started + Duration::from_millis(200)),
+            Some(started),
+        );
+        let response = run_with_scope("sleep 30", 5000, scope, 1, budgeted_bash_stub).await;
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "timed_out", "{response:?}");
+        assert_eq!(response.data["exit_code"], 124);
+    }
+
+    #[tokio::test]
+    async fn run_budget_expired_before_spawn_refuses_without_a_task() {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let scope =
+            super::super::run_scope::RunScope::for_test_with_clock(Some(deadline), Some(deadline));
+        let response = run_with_scope("sleep 30", 5000, scope, 0, budgeted_bash_stub).await;
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "run_deadline_expired");
+        assert_eq!(
+            response.data["message"],
+            "the codemode run's time budget has expired"
+        );
+        assert!(response.data.get("status").is_none(), "{response:?}");
+        assert!(response.data.get("exit_code").is_none(), "{response:?}");
+    }
+
+    fn budgeted_bash_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        let params = req.params.get("params").unwrap_or(&req.params);
+        assert_eq!(
+            params["timeout"], 200,
+            "spawn must receive the available run budget"
+        );
+        super::grant_path_tests::running_bash_stub(req, ctx)
     }
 }
