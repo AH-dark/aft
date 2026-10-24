@@ -20,10 +20,11 @@ pub(super) fn write(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let key = columns[0];
     if incremental {
-        connection.execute(
-            "INSERT OR IGNORE INTO emitted_view_rows(table_name, row_key) VALUES (?1, ?2)",
-            rusqlite::params![table, values[0]],
-        )?;
+        connection
+            .prepare_cached(
+                "INSERT OR IGNORE INTO emitted_view_rows(table_name, row_key) VALUES (?1, ?2)",
+            )?
+            .execute(rusqlite::params![table, values[0]])?;
         let old = connection
             .prepare_cached(&format!(
                 "SELECT {} FROM {table} WHERE {key} = ?1",
