@@ -211,13 +211,50 @@ fn bench_health_rollup_steps() {
             .is_some_and(|view| view.pending_paths == 1 && view.failed_paths == 1)
     }));
     let actors = executor.actor_entries();
+    if let Some(view_dir) = churn_view_dirs.first() {
+        let mut phases = [0u64; 3];
+        let elapsed = std::time::Instant::now();
+        for _ in 0..200 {
+            let started = cpu_ns();
+            let status = crate::path_status::PathStatusStore::open(view_dir).unwrap();
+            let opened = cpu_ns();
+            std::hint::black_box(status.summary().unwrap());
+            let counted = cpu_ns();
+            drop(status);
+            phases[0] += opened - started;
+            phases[1] += counted - opened;
+            phases[2] += cpu_ns() - counted;
+        }
+        println!(
+            "open/count/close microbench: runs=200 CPU us/op={:?} wall_us/combined={:.2}",
+            phases.map(|ns| ns as f64 / 200_000.),
+            elapsed.elapsed().as_secs_f64() * 1_000_000. / 200.
+        );
+    }
+    let wal_sizes = || {
+        let mut sizes = BTreeMap::<u64, usize>::new();
+        for view_dir in &churn_view_dirs {
+            // stat does not open another handle to SQLite's files.
+            let bytes = std::fs::metadata(view_dir.join("derived.sqlite-wal"))
+                .map_or(0, |metadata| metadata.len());
+            *sizes.entry(bytes).or_default() += 1;
+        }
+        sizes
+    };
+    println!(
+        "active WAL bytes at tick 0 (bytes: stores): {:?}",
+        wal_sizes()
+    );
     let mut snapshot_cpu = 0;
     let mut snapshot_elapsed = std::time::Duration::ZERO;
     let reads_before = crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
+    let opens_before = crate::path_status::STORE_OPENS.with(std::cell::Cell::get);
+    let mut writer_opens = 0;
     for _ in 0..TICKS {
         if churn {
             for view_dir in &churn_view_dirs {
                 let mut status = crate::path_status::PathStatusStore::open(view_dir).unwrap();
+                writer_opens += 1;
                 status.mark_pending(b"src/a.rs", "bench", 1).unwrap();
                 status.clear_many([&b"src/gone.rs"[..]]).unwrap();
             }
@@ -236,20 +273,26 @@ fn bench_health_rollup_steps() {
         snapshot_elapsed.as_secs_f64() * 1000. / TICKS as f64,
     );
     println!(
-        "snapshot phase SQLite reopens={}",
-        crate::path_status::HEALTH_READS.with(std::cell::Cell::get) - reads_before
+        "snapshot phase recounts/tick={} SQLite opens/tick={}",
+        (crate::path_status::HEALTH_READS.with(std::cell::Cell::get) - reads_before) / TICKS,
+        (crate::path_status::STORE_OPENS.with(std::cell::Cell::get) - opens_before - writer_opens)
+            / TICKS
     );
     STEPS.with(|steps| *steps.borrow_mut() = Some(BTreeMap::new()));
     let census_builds_before = cache.census_builds_for_test();
     let mut total = 0u64;
     let mut elapsed_steps = BTreeMap::<String, f64>::new();
     let mut elapsed_total = 0.0;
+    let opens_before = crate::path_status::STORE_OPENS.with(std::cell::Cell::get);
+    let reads_before = crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
+    let mut writer_opens = 0;
     for tick in 1..=TICKS {
         if churn {
             // What publishing views, reads and an occasional edit do between
             // two ticks; kept out of the measured time.
             for view_dir in &churn_view_dirs {
                 let mut status = crate::path_status::PathStatusStore::open(view_dir).unwrap();
+                writer_opens += 1;
                 status
                     .mark_pending_many([(&b"src/a.rs"[..], "bench")], 1)
                     .unwrap();
@@ -280,9 +323,9 @@ fn bench_health_rollup_steps() {
             &app,
             executor.actor_entries(),
         );
-        let tick = &built.tick;
-        elapsed_total += tick["elapsed_ms"].as_f64().unwrap();
-        for (step, value) in tick["steps"].as_object().unwrap() {
+        let tick_metrics = &built.tick;
+        elapsed_total += tick_metrics["elapsed_ms"].as_f64().unwrap();
+        for (step, value) in tick_metrics["steps"].as_object().unwrap() {
             *elapsed_steps.entry(step.clone()).or_default() +=
                 value["elapsed_ms"].as_f64().unwrap();
         }
@@ -292,6 +335,12 @@ fn bench_health_rollup_steps() {
         total += cpu_ns() - started;
         if census_reads {
             std::hint::black_box(cache.memory_census());
+        }
+        if [1, 5, 10, 20].contains(&tick) {
+            println!(
+                "active WAL bytes at tick {tick} (bytes: stores): {:?}",
+                wal_sizes()
+            );
         }
     }
     let steps = STEPS.with(|steps| steps.borrow_mut().take().unwrap());
@@ -312,6 +361,12 @@ fn bench_health_rollup_steps() {
     println!(
         "BUILD TOTAL: elapsed_ms/tick={:.3}",
         elapsed_total / TICKS as f64
+    );
+    println!(
+        "rollup phase recounts/tick={} SQLite opens/tick={}",
+        (crate::path_status::HEALTH_READS.with(std::cell::Cell::get) - reads_before) / TICKS,
+        (crate::path_status::STORE_OPENS.with(std::cell::Cell::get) - opens_before - writer_opens)
+            / TICKS
     );
     println!(
         "TOTAL: us/tick={:.2} us/second={:.2}",

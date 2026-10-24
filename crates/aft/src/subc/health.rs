@@ -5054,7 +5054,7 @@ mod tests {
         let cache = HealthRollupCache::new();
         assert_eq!(rolled_up_view(&cache, &executor, &app)["pending_paths"], 1);
         // First make a local write and refresh health. The later child-process
-        // signature change must still trigger a SQLite reopen.
+        // signature change must still trigger a fresh SQLite read.
         {
             let mut status = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
             status.mark_pending(b"b.rs", "local", 1).unwrap();
@@ -5084,7 +5084,7 @@ mod tests {
         assert_eq!(
             crate::path_status::HEALTH_READS.with(std::cell::Cell::get),
             before + 1,
-            "external signature changes must reopen SQLite"
+            "external signature changes must refresh the summary"
         );
     }
 
@@ -5104,6 +5104,25 @@ mod tests {
         assert_eq!(rolled_up_view(&cache, &executor, &app)["generation"], 2);
         ctx.clear_view_runtime();
         assert!(rolled_up_view(&cache, &executor, &app).is_null());
+    }
+
+    #[test]
+    fn view_health_runtime_drop_closes_reader_even_with_live_writer() {
+        let (_dir, executor, ctx, view_dir) = view_health_fixture();
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["pending_paths"], 1);
+        let writer = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
+        let path = writer.path().to_path_buf();
+        assert_eq!(crate::db::file_identity::open_connections(&path), 2);
+        ctx.clear_view_runtime();
+        assert_eq!(
+            crate::db::file_identity::open_connections(&path),
+            1,
+            "a writer must not retain the retired runtime's health connection"
+        );
+        drop(writer);
+        assert_eq!(crate::db::file_identity::open_connections(&path), 0);
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub(crate) mod health;
 #[cfg(test)]
 thread_local! {
     pub(crate) static HEALTH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static STORE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static HEALTH_SUMMARY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -391,7 +392,7 @@ impl From<rusqlite::Error> for PathStatusError {
 pub struct PathStatusStore {
     path: PathBuf,
     connection: crate::db::file_identity::IdentityConnection,
-    health: std::sync::Arc<health::Health>,
+    health: std::sync::Weak<health::Health>,
 }
 
 impl PathStatusStore {
@@ -410,6 +411,8 @@ impl PathStatusStore {
             path,
             "path_status::PathStatusStore::open_at",
         )?;
+        #[cfg(test)]
+        STORE_OPENS.with(|opens| opens.set(opens.get() + 1));
         // A last-close checkpoint changes the health signature without a
         // ledger write. Leave checkpointing to the normal WAL threshold so
         // cached local projections never need to guess who changed the files.
@@ -433,7 +436,7 @@ impl PathStatusStore {
         let mut store = Self {
             path: path.to_path_buf(),
             connection,
-            health: health::Health::for_path(path),
+            health: std::sync::Arc::downgrade(&health::Health::for_path(path)),
         };
         add_mark_column(&mut store.connection)?;
         Ok(store)
@@ -777,10 +780,14 @@ impl PathStatusStore {
     }
 
     fn invalidate_health(&self) {
-        // Without a context observing this ledger, the first health read can
-        // build its projection lazily. Writers must not pay for unused health.
-        if std::sync::Arc::strong_count(&self.health) > 1 {
-            self.health.committed();
+        // Writers must not keep a retired runtime's health reader alive.
+        // Without an observer, the next runtime builds its projection lazily.
+        if let Some(health) = self
+            .health
+            .upgrade()
+            .or_else(|| health::Health::existing(&self.path))
+        {
+            health.committed();
         }
     }
 

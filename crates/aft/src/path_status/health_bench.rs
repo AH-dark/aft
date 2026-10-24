@@ -45,7 +45,8 @@ fn bench_large_ledger_writer_and_tick() {
         let mut tick_elapsed = Duration::ZERO;
         let mut writer_scans = 0;
         let mut tick_scans = 0;
-        let reopens_before = super::super::HEALTH_READS.with(std::cell::Cell::get);
+        let reads_before = super::super::HEALTH_READS.with(std::cell::Cell::get);
+        let opens_before = super::super::STORE_OPENS.with(std::cell::Cell::get);
         for tick in 0..TICKS {
             for batch in 0..batches_per_tick {
                 let scans = super::super::HEALTH_SUMMARY_READS.with(std::cell::Cell::get);
@@ -86,13 +87,14 @@ fn bench_large_ledger_writer_and_tick() {
         }
         let batches = TICKS * batches_per_tick;
         println!(
-            "large ledger: status_rows=50000 skip_rows=50000 ticks={TICKS} batches_per_tick={batches_per_tick} writer_cpu_us/batch={:.2} writer_elapsed_us/batch={:.2} tick_cpu_us/tick={:.2} tick_elapsed_us/tick={:.2} total_cpu_us/tick={:.2} writer_summary_scans={writer_scans} tick_summary_scans={tick_scans} tick_sqlite_reopens={}",
+            "large ledger: status_rows=50000 skip_rows=50000 ticks={TICKS} batches_per_tick={batches_per_tick} writer_cpu_us/batch={:.2} writer_elapsed_us/batch={:.2} tick_cpu_us/tick={:.2} tick_elapsed_us/tick={:.2} total_cpu_us/tick={:.2} writer_summary_scans={writer_scans} tick_summary_scans={tick_scans} tick_recounts={} tick_sqlite_opens={}",
             writer_cpu as f64 / batches as f64 / 1000.,
             writer_elapsed.as_secs_f64() * 1_000_000. / batches as f64,
             tick_cpu as f64 / TICKS as f64 / 1000.,
             tick_elapsed.as_secs_f64() * 1_000_000. / TICKS as f64,
             (writer_cpu + tick_cpu) as f64 / TICKS as f64 / 1000.,
-            super::super::HEALTH_READS.with(std::cell::Cell::get) - reopens_before,
+            super::super::HEALTH_READS.with(std::cell::Cell::get) - reads_before,
+            super::super::STORE_OPENS.with(std::cell::Cell::get) - opens_before,
         );
     }
 }
