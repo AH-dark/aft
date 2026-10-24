@@ -1967,10 +1967,14 @@ struct LocalEmbeddingEngine {
 impl LocalEmbeddingEngine {
     fn new(
         model: Box<dyn LocalEmbeddingProvider>,
+        query_model: Option<Box<dyn LocalEmbeddingProvider>>,
         query_cache: Arc<Mutex<QueryEmbeddingCache>>,
     ) -> Result<Self, String> {
         let model = Arc::new(Mutex::new(model));
-        let query_worker = LocalQueryEmbedWorker::start(Arc::clone(&model), query_cache)?;
+        let query_model = query_model
+            .map(|provider| Arc::new(Mutex::new(provider)))
+            .unwrap_or_else(|| Arc::clone(&model));
+        let query_worker = LocalQueryEmbedWorker::start(query_model, query_cache)?;
         Ok(Self {
             model,
             query_worker,
@@ -2926,18 +2930,19 @@ fn query_embedding_text(query: &str, instruction: Option<&str>) -> String {
 
 impl SemanticEmbeddingModel {
     pub fn from_config(config: &SemanticBackendConfig) -> Result<Self, String> {
-        Self::from_config_with_timeout_ms(config, configured_embedding_timeout_ms(config))
+        Self::from_config_with_timeout_ms(config, configured_embedding_timeout_ms(config), false)
     }
 
     pub fn from_config_for_query(config: &SemanticBackendConfig) -> Result<Self, String> {
-        // The model may later be reused by a background build, so retain the build
-        // client's timeout. QueryBudget overrides each interactive HTTP request.
-        Self::from_config(config)
+        // Keep the configured timeout for build requests; QueryBudget overrides
+        // each interactive request. Local queries select only the warm query session.
+        Self::from_config_with_timeout_ms(config, configured_embedding_timeout_ms(config), true)
     }
 
     fn from_config_with_timeout_ms(
         config: &SemanticBackendConfig,
         timeout_ms: u64,
+        local_query_only: bool,
     ) -> Result<Self, String> {
         let max_batch_size = if config.max_batch_size == 0 {
             DEFAULT_MAX_BATCH_SIZE
@@ -2952,11 +2957,17 @@ impl SemanticEmbeddingModel {
 
         let engine = match config.backend {
             SemanticBackend::Fastembed => {
+                let cache_dir = config.local_cache_dir.as_deref();
+                let local = if local_query_only {
+                    LocalEmbedder::with_query_cache_dir(&model, cache_dir)?
+                } else {
+                    LocalEmbedder::with_cache_dir(&model, cache_dir)?
+                };
                 SemanticEmbeddingEngine::Local(LocalEmbeddingEngine::new(
-                    Box::new(LocalEmbedder::with_cache_dir(
-                        &model,
-                        config.local_cache_dir.as_deref(),
-                    )?),
+                    Box::new(local),
+                    Some(Box::new(LocalEmbedder::with_query_cache_dir(
+                        &model, cache_dir,
+                    )?)),
                     Arc::clone(&query_embedding_cache),
                 )?)
             }
@@ -3028,7 +3039,7 @@ impl SemanticEmbeddingModel {
     ) -> Self {
         let query_embedding_cache = Arc::new(Mutex::new(QueryEmbeddingCache::default()));
         let engine = SemanticEmbeddingEngine::Local(
-            LocalEmbeddingEngine::new(provider, Arc::clone(&query_embedding_cache))
+            LocalEmbeddingEngine::new(provider, None, Arc::clone(&query_embedding_cache))
                 .expect("start test local query embed worker"),
         );
         Self {

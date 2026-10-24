@@ -4350,7 +4350,8 @@ pub struct AppContext {
     semantic_worker_bytes: Arc<AtomicU64>,
     semantic_refresh_retry_attempts: parking_lot::Mutex<BTreeMap<PathBuf, usize>>,
     semantic_refresh_circuit: Arc<SemanticRefreshCircuit>,
-    semantic_embedding_model: parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>>,
+    semantic_embedding_model:
+        Arc<parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>>>,
     watcher_runtime_lock: parking_lot::Mutex<()>,
     watcher: parking_lot::Mutex<Option<RecommendedWatcher>>,
     watcher_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
@@ -5157,7 +5158,7 @@ impl AppContext {
             semantic_worker_bytes: Arc::default(),
             semantic_refresh_retry_attempts: parking_lot::Mutex::new(BTreeMap::new()),
             semantic_refresh_circuit: Arc::new(SemanticRefreshCircuit::default()),
-            semantic_embedding_model: parking_lot::Mutex::new(None),
+            semantic_embedding_model: Arc::new(parking_lot::Mutex::new(None)),
             watcher_runtime_lock: parking_lot::Mutex::new(()),
             watcher: parking_lot::Mutex::new(None),
             watcher_rx: parking_lot::Mutex::new(None),
@@ -11699,6 +11700,8 @@ impl AppContext {
         self.retire_semantic_index_rx("the root was unbound");
         let semantic_refresh_cancelled = self.semantic_refresh_event_rx.lock().is_some();
         self.clear_semantic_refresh_worker();
+        *self.semantic_embedding_model.lock() = None;
+        let _ = self.try_release_idle_semantic_lane();
         self.reset_semantic_cold_seed_gate_for_configure();
         let _ = self.inspect_manager.discard_completions();
         let _ = self.take_new_reuse_completions();
@@ -12971,6 +12974,12 @@ impl AppContext {
         &self.semantic_embedding_model
     }
 
+    pub(crate) fn semantic_embedding_model_slot(
+        &self,
+    ) -> Arc<parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>>> {
+        Arc::clone(&self.semantic_embedding_model)
+    }
+
     /// Access the file watcher handle (kept alive to continue watching).
     pub fn watcher(&self) -> &parking_lot::Mutex<Option<RecommendedWatcher>> {
         &self.watcher
@@ -13376,6 +13385,8 @@ impl AppContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         self.borrowed_index_cache.lock().clear();
+        self.clear_semantic_refresh_worker();
+        *self.semantic_embedding_model.lock() = None;
         // A contended lane is left loaded: this eviction does not wait for it.
         let _ = self.try_release_idle_semantic_lane();
         self.inspect_manager.evict_idle_caches();
@@ -13536,6 +13547,18 @@ impl AppContext {
         let Some(mut backup) = self.backup.try_lock() else {
             return false;
         };
+        let Some(mut embedding_model) = self.semantic_embedding_model.try_lock() else {
+            return false;
+        };
+        let Some(mut refresh_events) = self.semantic_refresh_event_rx.try_lock() else {
+            return false;
+        };
+        let Some(mut refresh_requests) = self.semantic_refresh_tx.try_lock() else {
+            return false;
+        };
+        let Some(mut refresh_worker) = self.semantic_refresh_worker.try_lock() else {
+            return false;
+        };
         // Last, so a contended lane leaves every other handle in place too.
         if !self.try_release_idle_semantic_lane() {
             return false;
@@ -13545,6 +13568,26 @@ impl AppContext {
         semantic_index.take();
         borrowed_index_cache.clear();
         backup.release_memory();
+        let released = (
+            embedding_model.take(),
+            refresh_events.take(),
+            refresh_requests.take(),
+            refresh_worker.take(),
+        );
+        self.semantic_refresh_epoch.fetch_add(1, Ordering::SeqCst);
+        self.semantic_refresh_build_epoch.store(0, Ordering::SeqCst);
+        self.invalidate_semantic_refresh_probe();
+        drop((
+            embedding_model,
+            refresh_events,
+            refresh_requests,
+            refresh_worker,
+        ));
+        // Native session destruction can wait for ORT. Keep it, and worker
+        // channel teardown, off the daemon's frame loop.
+        let _ = std::thread::Builder::new()
+            .name("aft-embedding-release".into())
+            .spawn(move || drop(released));
         drop((
             callgraph_store,
             search_index,

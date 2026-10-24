@@ -312,6 +312,32 @@ fn artifact_load_root_key(root: &Path) -> PathBuf {
     std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
+#[cfg(test)]
+type ReadOnlyQueryWarmupHook =
+    Box<dyn FnOnce() -> Result<crate::semantic_index::EmbeddingModel, String> + Send>;
+
+#[cfg(test)]
+static READ_ONLY_QUERY_WARMUP_HOOKS: Mutex<Option<HashMap<PathBuf, ReadOnlyQueryWarmupHook>>> =
+    Mutex::new(None);
+
+fn warm_read_only_query_model(
+    _root: &Path,
+    config: &SemanticBackendConfig,
+) -> Result<crate::semantic_index::EmbeddingModel, String> {
+    #[cfg(test)]
+    {
+        let hook = READ_ONLY_QUERY_WARMUP_HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|hooks| hooks.remove(&artifact_load_root_key(_root)));
+        if let Some(hook) = hook {
+            return hook();
+        }
+    }
+    crate::semantic_index::EmbeddingModel::from_config_for_query(config)
+}
+
 fn note_configure_artifact_load_attempt(root: &Path) {
     CONFIGURE_ARTIFACT_LOAD_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
     let mut by_root = CONFIGURE_ARTIFACT_LOAD_ATTEMPTS_BY_ROOT
@@ -5750,6 +5776,8 @@ fn schedule_artifact_loads_admitted(
         let semantic_load_generation = configure_generation;
         let semantic_load_generation_flag = ctx.configure_generation_flag();
         let semantic_load_lifecycle = subc_lifecycle.clone();
+        let semantic_query_slot = ctx.semantic_embedding_model_slot();
+        let semantic_query_config = semantic_config.clone();
         let session_id = log_ctx::current_session();
         thread::spawn(move || {
             let _terminal_guard = semantic_rx_terminal_guard;
@@ -5828,6 +5856,56 @@ fn schedule_artifact_loads_admitted(
                         semantic_rx_epoch,
                         bytes,
                     );
+                }
+                // A saved index is usable with a parent-supplied vector even
+                // when no local model is cached. Publish it before optional
+                // warmup, which may download weights or fail independently.
+                if published == Some(true)
+                    && finished_bytes.is_some()
+                    && semantic_query_config.backend == crate::config::SemanticBackend::Fastembed
+                {
+                    let warmup_session = log_ctx::current_session();
+                    let spawned = thread::Builder::new()
+                        .name("aft-readonly-query-warmup".into())
+                        .spawn(move || {
+                            log_ctx::with_session(warmup_session, || {
+                                if !semantic_load_lifecycle.is_current(
+                                    semantic_load_generation_flag.as_ref(),
+                                    semantic_load_generation,
+                                ) {
+                                    return;
+                                }
+                                let model = match warm_read_only_query_model(
+                                    &semantic_root,
+                                    &semantic_query_config,
+                                ) {
+                                    Ok(model) => model,
+                                    Err(error) => {
+                                        slog_warn!(
+                                            "read-only semantic query model warmup failed: {}",
+                                            error
+                                        );
+                                        return;
+                                    }
+                                };
+                                // Model loading cannot hold the lifecycle gate. A
+                                // reconfigure or unbind during it discards the result.
+                                let _ = semantic_load_lifecycle.run_if_current(
+                                    semantic_load_generation_flag.as_ref(),
+                                    semantic_load_generation,
+                                    || {
+                                        if let Some(mut slot) = semantic_query_slot.try_lock() {
+                                            if slot.is_none() {
+                                                *slot = Some(model);
+                                            }
+                                        }
+                                    },
+                                );
+                            })
+                        });
+                    if let Err(error) = spawned {
+                        slog_warn!("read-only semantic query warmup could not start: {}", error);
+                    }
                 }
             });
         });
@@ -16318,6 +16396,141 @@ mod tests {
             },
         );
         assert!(!ctx.config().indexes.trigram);
+    }
+
+    #[test]
+    fn read_only_semantic_ready_and_supplied_vector_search_do_not_wait_for_query_warmup() {
+        let _storage_env = crate::test_env::without_storage_override();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let owner = temp.path().join("owner");
+        init_git_fixture(&owner);
+        let worktree = temp.path().join("worktree");
+        assert!(git_command(&owner)
+            .args(["worktree", "add", "--detach", "--quiet"])
+            .arg(&worktree)
+            .arg("HEAD")
+            .status()
+            .unwrap()
+            .success());
+        let owner = std::fs::canonicalize(owner).unwrap();
+        let root = std::fs::canonicalize(worktree).unwrap();
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let key = crate::search_index::artifact_cache_key(&owner);
+        assert_eq!(crate::search_index::artifact_cache_key(&root), key);
+        crate::root_cache::configure_artifact_access(&owner, &key, false);
+        let mut embed =
+            |texts: Vec<String>| Ok::<_, String>(vec![vec![1.0, 0.0, 0.0]; texts.len()]);
+        let mut index =
+            SemanticIndex::build(&owner, &[owner.join("tracked.rs")], &mut embed, 8).unwrap();
+        index.set_fingerprint(crate::semantic_index::SemanticIndexFingerprint {
+            backend: "fastembed".into(),
+            model: "all-MiniLM-L6-v2".into(),
+            base_url: "none".into(),
+            dimension: 3,
+            chunking_version: 2,
+            ..Default::default()
+        });
+        assert!(index.write_to_disk(&storage, &key));
+
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.project_root = Some(root.clone());
+            config.storage_dir = Some(storage.clone());
+            config.indexes.semantic = true;
+            config.indexes.trigram = true;
+            config.views.enabled = false;
+            config.semantic = SemanticBackendConfig::default();
+        });
+        ctx.set_canonical_cache_root(root.clone());
+        ctx.set_cache_role(true, Some(owner.join(".git")));
+        crate::root_cache::configure_artifact_access(&root, &key, true);
+        *ctx.search_index().write().unwrap() = Some(SearchIndex::build(&root));
+
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (finished_tx, finished_rx) = crossbeam_channel::bounded(1);
+        struct ReleaseWarmup {
+            root: PathBuf,
+            release: crossbeam_channel::Sender<()>,
+        }
+        impl Drop for ReleaseWarmup {
+            fn drop(&mut self) {
+                let _ = self.release.try_send(());
+                if let Some(hooks) = super::READ_ONLY_QUERY_WARMUP_HOOKS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                {
+                    hooks.remove(&self.root);
+                }
+            }
+        }
+        let _release = ReleaseWarmup {
+            root: root.clone(),
+            release: release_tx.clone(),
+        };
+        super::READ_ONLY_QUERY_WARMUP_HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(
+                root.clone(),
+                Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    let _ = finished_tx.send(());
+                    Err("held query warmup failed without loading a model".into())
+                }),
+            );
+
+        let starts = super::schedule_artifact_loads(&ctx, false, true);
+        assert!(
+            starts.1.is_some(),
+            "read-only semantic loader was not scheduled"
+        );
+        assert!(super::start_artifact_loads(starts));
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("query warmup did not enter its gate");
+        // Keep warmup blocked while the real completion drain installs Ready.
+        // The timeout is only a deadlock backstop, not a latency assertion.
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(5));
+        assert!(ctx.semantic_embedding_model().lock().is_none());
+        let query = "where are cached semantic readiness markers handled";
+        let request: RawRequest = serde_json::from_value(json!({
+            "id": "readonly-parent-vector", "command": "semantic_search", "query": query,
+            "hint": "semantic", "top_k": 5,
+        }))
+        .unwrap();
+        let search = || {
+            crate::commands::semantic_search::with_precomputed_query_vector(
+                query,
+                vec![1.0, 0.0, 0.0],
+                || crate::commands::semantic_search::handle_semantic_search(&request, &ctx),
+            )
+        };
+        let response = search();
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], true, "{:?}", response.data);
+        assert!(
+            response.data["results"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["name"] == "tracked")),
+            "{:?}",
+            response.data
+        );
+
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let response = search();
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], true, "{:?}", response.data);
+        assert!(
+            ctx.semantic_embedding_model().lock().is_none(),
+            "failed warmup populated the query model cache"
+        );
     }
 
     #[test]
