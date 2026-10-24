@@ -16130,3 +16130,6 @@ mod scope_revocation_test;
 
 #[path = "confine_admission_test.rs"]
 mod confine_admission_test;
+
+#[path = "page_collect_test.rs"]
+mod page_collect_test;

@@ -146,6 +146,7 @@ pub mod ndjson_text;
 pub mod ort_lifecycle;
 pub mod ort_pin;
 pub(crate) mod os_metadata;
+pub(crate) mod page_collect;
 pub mod parser;
 pub mod patch;
 pub mod path_identity;

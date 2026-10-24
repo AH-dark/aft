@@ -478,6 +478,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 cortexkit_role_tool_provider::PROVIDES.to_string(),
                 cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
+                crate::page_collect::CAPABILITY.to_string(),
             ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
@@ -582,6 +583,25 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                     // runs here to change memory, disk and database together.
                     ManagementOperation {
                         name: crate::backup::purge::BACKUPS_PURGE_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
+                    // Core's page-bundle operations (`page-collect/v1`): read an
+                    // HTML page and the files it names under one agent
+                    // session's read policy into a private snapshot, read the
+                    // snapshot back, and release it.
+                    ManagementOperation {
+                        name: crate::page_collect::COLLECT_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: crate::page_collect::READ_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: crate::page_collect::RELEASE_OPERATION.to_string(),
                         kind: ManagementOperationKind::Mutate,
                         description: None,
                     },
@@ -813,6 +833,7 @@ mod tests {
                 "tool-provider/v1".to_string(),
                 "call-modes/v1".to_string(),
                 "scope-workdir/v1".to_string(),
+                "page-collect/v1".to_string(),
             ]
         );
         assert!(capabilities.requires.is_empty());
@@ -822,7 +843,8 @@ mod tests {
             Some(&serde_json::json!([
                 "tool-provider/v1",
                 "call-modes/v1",
-                "scope-workdir/v1"
+                "scope-workdir/v1",
+                "page-collect/v1"
             ]))
         );
     }
@@ -887,6 +909,18 @@ mod tests {
                 ),
                 (
                     crate::backup::purge::BACKUPS_PURGE_OPERATION,
+                    &ManagementOperationKind::Mutate,
+                ),
+                (
+                    crate::page_collect::COLLECT_OPERATION,
+                    &ManagementOperationKind::Mutate,
+                ),
+                (
+                    crate::page_collect::READ_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    crate::page_collect::RELEASE_OPERATION,
                     &ManagementOperationKind::Mutate,
                 ),
             ]
@@ -1102,7 +1136,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["tool-provider/v1", "call-modes/v1", "scope-workdir/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["tool-provider/v1", "call-modes/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );
@@ -1116,8 +1150,9 @@ mod tests {
             management.insert("concurrency".to_string(), json!("module_managed")),
             None
         );
-        // The snapshot predates the gh shim relay operations and the backup
-        // purge, so they are appended to its management operation list here.
+        // The snapshot predates the gh shim relay operations, the backup purge
+        // and the page-bundle operations, so they are appended to its
+        // management operation list here.
         // It also predates `bash.kill_scope`, which the manifest lists first.
         let operations = management
             .get_mut("operations")
@@ -1133,6 +1168,9 @@ mod tests {
             json!({"name": crate::gh_shim_relay::SESSION_CONTEXT_OPERATION, "kind": "query"}),
             json!({"name": crate::gh_shim_relay::READ_REQUEST_OPERATION, "kind": "query"}),
             json!({"name": crate::backup::purge::BACKUPS_PURGE_OPERATION, "kind": "mutate"}),
+            json!({"name": crate::page_collect::COLLECT_OPERATION, "kind": "mutate"}),
+            json!({"name": crate::page_collect::READ_OPERATION, "kind": "query"}),
+            json!({"name": crate::page_collect::RELEASE_OPERATION, "kind": "mutate"}),
         ]);
         // AFT registers not-ready and flips itself ready after warm-up (see
         // `subc::readiness`); this is the only field readiness adds.
