@@ -1,0 +1,1 @@
+- Language-server diagnostics keep pull-report versions and related files, recover from malformed message bodies, and keep watched-file delivery and document state consistent when a server fails.
