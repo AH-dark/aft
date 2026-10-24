@@ -174,11 +174,17 @@ static COMMAND_MYSQL_PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
 /// `sshpass -p <value>`.
 static COMMAND_SSHPASS_PASSWORD: LazyLock<Regex> =
     LazyLock::new(|| compile(concat!(r"\b(sshpass[ \t]+-p[ \t]*)(", shell_word!(), ")")));
-/// `curl -u user:password` (or `--user`): the whole credential word, whose
-/// password half (after the first `:`) is masked by [`mask_curl_password`].
-static COMMAND_CURL_USER_PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
+/// One `curl` command, up to the next shell operator or newline. A command
+/// can carry several `-u` options (one per URL, across `--next`), so each is
+/// found inside this span by [`COMMAND_CURL_USER_OPTION`].
+static COMMAND_CURL_SEGMENT: LazyLock<Regex> = LazyLock::new(|| compile(r"\bcurl\b[^;&|\n]*"));
+/// A `-u user:password` option inside a curl command, in any of curl's
+/// spellings (`-u value`, `-uvalue`, `--user value`, `--user=value`): the
+/// whole credential word, whose password half (after the first `:`) is
+/// masked by [`mask_curl_password`].
+static COMMAND_CURL_USER_OPTION: LazyLock<Regex> = LazyLock::new(|| {
     compile(concat!(
-        r"\b(curl\b[^;&|\n]*?\s(?:-u|--user)[ \t]+)(",
+        r"(^|\s)(-u[ \t]*|--user(?:=|[ \t]+))(",
         shell_word!(),
         ")"
     ))
@@ -249,13 +255,21 @@ pub fn redact_command(command: &str) -> Cow<'_, str> {
         });
     }
     if command.contains("curl") {
+        // Check every user option in the command: a username-only `-u`
+        // before a later `-u admin:password` must not end the search.
         out = replace_in(
             out,
             None,
-            &COMMAND_CURL_USER_PASSWORD,
-            |caps: &Captures<'_>| match mask_curl_password(&caps[2]) {
-                Some(masked) => format!("{}{masked}", &caps[1]),
-                None => caps[0].to_string(),
+            &COMMAND_CURL_SEGMENT,
+            |segment: &Captures<'_>| {
+                COMMAND_CURL_USER_OPTION
+                    .replace_all(&segment[0], |caps: &Captures<'_>| match mask_curl_password(
+                        &caps[3],
+                    ) {
+                        Some(masked) => format!("{}{}{masked}", &caps[1], &caps[2]),
+                        None => caps[0].to_string(),
+                    })
+                    .into_owned()
             },
         );
     }
@@ -1058,7 +1072,7 @@ mod tests {
             "../tests/fixtures/command_redaction_cases.json"
         ))
         .expect("command redaction fixture parses");
-        assert_eq!(fixture.masked.len(), 35);
+        assert_eq!(fixture.masked.len(), 39);
         assert!(fixture.untouched.len() > 800);
         for case in &fixture.masked {
             let masked = redact_command(&case.input);

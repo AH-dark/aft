@@ -139,6 +139,22 @@
   {
    "input": "NPM_TOKEN='a'\"b\"c npm publish",
    "expected": "NPM_TOKEN=<REDACTED_SECRET> npm publish"
+  },
+  {
+   "input": "curl -u alice https://one --next -u admin:hunter2 https://two",
+   "expected": "curl -u alice https://one --next -u admin:<REDACTED_SECRET> https://two"
+  },
+  {
+   "input": "curl -u admin:pw1 https://one --next --user root:pw2 https://two",
+   "expected": "curl -u admin:<REDACTED_SECRET> https://one --next --user root:<REDACTED_SECRET> https://two"
+  },
+  {
+   "input": "curl --user=admin:pw https://host",
+   "expected": "curl --user=admin:<REDACTED_SECRET> https://host"
+  },
+  {
+   "input": "curl -uadmin:pw https://host",
+   "expected": "curl -uadmin:<REDACTED_SECRET> https://host"
   }
  ],
  "untouched": [
@@ -944,6 +960,8 @@
   "bun test src/__tests__",
   "bun test src/__tests__ --path-ignore-patterns 'src/__tests__/e2e/**'",
   "bun build src/index.ts --outdir dist --target node --format esm --external @earendil-works/pi-coding-agent --external @earendil-works/pi-ai --external @earendil-works/pi-tui --external @oh-my-pi/pi-coding-agent/internal-urls --external typebox --external diff && tsc --emitDeclarationOnly",
-  "bun test src/__tests__/"
+  "bun test src/__tests__/",
+  "curl -u alice https://host",
+  "curl -u alice: https://host --next -u bob https://two"
  ]
 }
