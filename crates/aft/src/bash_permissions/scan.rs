@@ -1277,6 +1277,7 @@ fn push_unknown_base_path(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<Stri
             kind: PermissionKind::ExternalDirectory,
             patterns: vec![text],
             always: Vec::new(),
+            targets: Vec::new(),
         },
     );
 }

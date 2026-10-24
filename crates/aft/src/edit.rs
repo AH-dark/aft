@@ -2126,7 +2126,7 @@ fn write_format_validate_impl(
         .filter(|_| !syntax_checked_by_caller)
         .and_then(|source| {
             if !existed {
-                let check = check_created_file_syntax(path, source);
+                let check = check_created_file_syntax(tool_policy, path, source);
                 syntax_error_line = check.first_error_line;
                 syntax_skipped_reason = check.skipped_reason;
                 return check.valid;
@@ -2134,6 +2134,7 @@ fn write_format_validate_impl(
             let syntax_valid = validate_captured_syntax(path, source);
             if bash::applies(path) {
                 bash::confirm_if_needed(
+                    tool_policy,
                     source,
                     pre_write_content.as_deref(),
                     &mut was_syntax_valid,
@@ -2141,6 +2142,7 @@ fn write_format_validate_impl(
                 )
             } else {
                 swift::confirm_if_needed(
+                    tool_policy,
                     path,
                     source,
                     pre_write_content.as_deref(),
@@ -2250,7 +2252,11 @@ pub(crate) struct CreatedFileSyntax {
 /// shell verdict is unknown and carries a reason instead of an error line;
 /// for bash that includes a missing shell, since tree-sitter-bash alone
 /// rejects some valid scripts.
-pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFileSyntax {
+pub(crate) fn check_created_file_syntax(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    path: &Path,
+    source: &str,
+) -> CreatedFileSyntax {
     let Some(tree) = parse_captured_syntax(path, source) else {
         return CreatedFileSyntax {
             valid: None,
@@ -2263,7 +2269,7 @@ pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFil
     // The line bash itself named for a syntax error it confirmed.
     let mut shell_error_line = None;
     let (valid, skipped_reason) = if tree_valid == Some(false) && bash::applies(path) {
-        match bash::confirm_created(source) {
+        match bash::confirm_created(tool_policy, source) {
             Ok(bash::ShellVerdict::Valid) => (Some(true), None),
             Ok(bash::ShellVerdict::Broken(line)) => {
                 shell_error_line = line;
@@ -2272,7 +2278,7 @@ pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFil
             Err(reason) => (None, Some(reason)),
         }
     } else {
-        match swift::confirm_created(path, source, tree_valid) {
+        match swift::confirm_created(tool_policy, path, source, tree_valid) {
             Ok(valid) => (valid, None),
             Err(reason) => (None, Some(reason)),
         }
@@ -2446,19 +2452,32 @@ mod tests {
         let path = Path::new("new.ts");
         // ERROR node on line 3 (later lines are broken too).
         let check = check_created_file_syntax(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
             path,
             "const a = 1;\nconst b = 2;\nfunction broken( {{\nconst c = ;\n",
         );
         assert_eq!(check.valid, Some(false));
         assert_eq!(check.first_error_line, Some(3));
         // A MISSING node (unclosed call) also counts.
-        let missing = check_created_file_syntax(path, "const a = 1;\nfoo(1\n");
+        let missing = check_created_file_syntax(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            path,
+            "const a = 1;\nfoo(1\n",
+        );
         assert_eq!(missing.valid, Some(false));
         assert!(missing.first_error_line.is_some_and(|line| line >= 2));
-        let valid = check_created_file_syntax(path, "const a = 1;\n");
+        let valid = check_created_file_syntax(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            path,
+            "const a = 1;\n",
+        );
         assert_eq!(valid.valid, Some(true));
         assert_eq!(valid.first_error_line, None);
-        let unsupported = check_created_file_syntax(Path::new("notes.unknownext"), "{{");
+        let unsupported = check_created_file_syntax(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            Path::new("notes.unknownext"),
+            "{{",
+        );
         assert_eq!(unsupported.valid, None);
         assert_eq!(unsupported.first_error_line, None);
     }

@@ -387,7 +387,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     } else {
         final_content
             .as_deref()
-            .map(|content| edit::check_created_file_syntax(path.as_path(), content))
+            .map(|content| edit::check_created_file_syntax(tool_policy, path.as_path(), content))
     };
     let syntax_valid = match created_syntax {
         Some(check) => check.valid,

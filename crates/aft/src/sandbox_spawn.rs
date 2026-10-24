@@ -5994,6 +5994,25 @@ impl ToolLaunchPolicy {
     }
 
     pub(crate) fn command(&self, program: &OsStr, args: &[OsString]) -> Result<Command, String> {
+        self.command_with_base_environment(program, args, false)
+    }
+
+    /// Bash syntax checks must not read daemon-provided shell startup hooks.
+    /// Clear inherited state before installing any policy-required environment.
+    pub(crate) fn command_with_clean_environment(
+        &self,
+        program: &OsStr,
+        args: &[OsString],
+    ) -> Result<Command, String> {
+        self.command_with_base_environment(program, args, true)
+    }
+
+    fn command_with_base_environment(
+        &self,
+        program: &OsStr,
+        args: &[OsString],
+        clean: bool,
+    ) -> Result<Command, String> {
         // Host grants bind one approved shell command, never an edit's tools.
         if matches!(self.plan.policy(), SpawnPlan::Host { .. }) {
             return Err(
@@ -6020,6 +6039,12 @@ impl ToolLaunchPolicy {
             command.args(args);
             command
         };
+        if clean {
+            command.env_clear();
+            if let Some(path) = std::env::var_os("PATH") {
+                command.env("PATH", path);
+            }
+        }
         apply_sandbox_environment(&self.plan, &mut command, &self.environment);
         #[cfg(unix)]
         if !matches!(self.plan.policy(), SpawnPlan::Unsandboxed) {

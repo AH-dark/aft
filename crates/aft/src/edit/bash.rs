@@ -8,6 +8,7 @@
 //! verdict on a new file, the result is unknown rather than broken.
 
 use std::path::{Path, PathBuf};
+#[cfg(all(test, unix))]
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,7 @@ pub(super) fn applies(path: &Path) -> bool {
 /// tree-sitter's verdict stands, which keeps the conservative rollback for a
 /// file that was valid before.
 pub(super) fn confirm_if_needed(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     source: &str,
     original: Option<&str>,
     was_valid: &mut Option<bool>,
@@ -60,11 +62,11 @@ pub(super) fn confirm_if_needed(
         return is_valid;
     }
     if *was_valid == Some(false)
-        && original.is_some_and(|source| verdict(source) == Ok(ShellVerdict::Valid))
+        && original.is_some_and(|source| verdict(tool_policy, source) == Ok(ShellVerdict::Valid))
     {
         *was_valid = Some(true);
     }
-    match verdict(source) {
+    match verdict(tool_policy, source) {
         Ok(ShellVerdict::Valid) => Some(true),
         Ok(ShellVerdict::Broken(_)) => Some(false),
         Err(_) => is_valid,
@@ -75,12 +77,18 @@ pub(super) fn confirm_if_needed(
 /// error is a reason token for an unknown verdict: `bash_unavailable` (no
 /// usable bash, which is always the case on Windows), `bash_timeout`, or
 /// `bash_failed` (bash ended without a syntax verdict).
-pub(super) fn confirm_created(source: &str) -> Result<ShellVerdict, &'static str> {
-    verdict(source)
+pub(super) fn confirm_created(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    source: &str,
+) -> Result<ShellVerdict, &'static str> {
+    verdict(tool_policy, source)
 }
 
-fn verdict(source: &str) -> Result<ShellVerdict, &'static str> {
-    let outcome = check(source);
+fn verdict(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    source: &str,
+) -> Result<ShellVerdict, &'static str> {
+    let outcome = check(tool_policy, source);
     log::debug!("bash syntax confirmation: {outcome:?}");
     match outcome {
         CheckOutcome::Exited { code: Some(0), .. } => Ok(ShellVerdict::Valid),
@@ -110,7 +118,7 @@ fn reported_line(stderr: &str) -> Option<usize> {
     })
 }
 
-fn check(source: &str) -> CheckOutcome {
+fn check(tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy, source: &str) -> CheckOutcome {
     #[cfg(test)]
     if let Some(outcome) =
         RUNNER.with(|runner| runner.borrow_mut().as_mut().map(|runner| runner(source)))
@@ -118,7 +126,7 @@ fn check(source: &str) -> CheckOutcome {
         return outcome;
     }
     match find_bash() {
-        Ok(Some(bash)) => run_bash(&bash, source, Instant::now() + CHECK_TIMEOUT),
+        Ok(Some(bash)) => run_bash(tool_policy, &bash, source, Instant::now() + CHECK_TIMEOUT),
         Ok(None) => CheckOutcome::Missing,
         Err(reason) => CheckOutcome::Unavailable(reason),
     }
@@ -140,14 +148,19 @@ fn find_bash() -> Result<Option<PathBuf>, String> {
 }
 
 /// Run `bash -n` over `source` on stdin. The file path is never passed, and
-/// the environment holds only `PATH`, so no `BASH_ENV` or `ENV` startup file
-/// is read; `--norc --noprofile` rules out the others.
-fn run_bash(bash: &Path, source: &str, deadline: Instant) -> CheckOutcome {
-    let mut command = Command::new(bash);
-    command.args(["--norc", "--noprofile", "-n"]).env_clear();
-    if let Some(path) = std::env::var_os("PATH") {
-        command.env("PATH", path);
-    }
+/// inherited startup hooks are cleared before the request's policy environment
+/// is installed; `--norc --noprofile` rules out user startup files too.
+fn run_bash(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    bash: &Path,
+    source: &str,
+    deadline: Instant,
+) -> CheckOutcome {
+    let args = ["--norc", "--noprofile", "-n"].map(std::ffi::OsString::from);
+    let command = match tool_policy.command_with_clean_environment(bash.as_os_str(), &args) {
+        Ok(command) => command,
+        Err(reason) => return CheckOutcome::Unavailable(reason),
+    };
     check_outcome(super::swift::run_command(
         command, "bash", source, deadline, true,
     ))
@@ -218,6 +231,124 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bash_syntax_confirmation_launches_under_session_tool_policy() {
+        use crate::sandbox_spawn::{SpawnPlan, ToolLaunchPolicy};
+        require_bash();
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let temp = root.path().join("private-temp");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&temp).unwrap();
+        let argv_log = root.path().join("argv");
+        let env_log = root.path().join("environment");
+        let launcher = root.path().join("launcher");
+        crate::executable_cache::write_executable(&launcher, format!(
+            "#!/bin/sh\nif [ \"$1\" = --warm-up ]; then exit 0; fi\nprintf '%s\\n' \"$@\" > '{}'\nenv > '{}'\nshift 4\nexec \"$@\"\n",
+            argv_log.display(), env_log.display()
+        ).as_bytes()).unwrap();
+        assert!(Command::new(&launcher)
+            .arg("--warm-up")
+            .env_clear()
+            .env("PATH", crate::effective_path::effective_path())
+            .status()
+            .unwrap()
+            .success());
+        let profile = crate::sandbox_profile::SandboxProfile::build(
+            vec![project.clone()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            temp.clone(),
+        )
+        .unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.clone()),
+                storage_dir: Some(root.path().join("store")),
+                ..config()
+            },
+        );
+        let policy = std::rc::Rc::new(crate::sandbox_spawn::with_spawn_plan_for_test(
+            SpawnPlan::launcher_for_test(profile.clone(), launcher),
+            || ToolLaunchPolicy::resolve(&ctx),
+        ));
+        let path = project.join("script.sh");
+        std::fs::write(&path, "echo old\n").unwrap();
+        assert_eq!(validate_syntax_str(GRAMMAR_GAP, &path), Some(false));
+        let request = serde_json::from_value(serde_json::json!({"id":"syntax-policy", "command":"write", "file":path, "content":GRAMMAR_GAP})).unwrap();
+        let response = crate::log_ctx::with_session(Some("syntax-policy".into()), || {
+            ToolLaunchPolicy::with_current(Some(policy), || {
+                crate::commands::write::handle_write(&request, &ctx)
+            })
+        });
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["syntax_valid"], true, "{response:?}");
+        let args =
+            std::fs::read_to_string(argv_log).expect("bash -n must use the session's launcher");
+        let args = args.lines().collect::<Vec<_>>();
+        assert_eq!(&args[..2], &["sandbox-launch", "--profile-json"]);
+        let launched: crate::sandbox_profile::SandboxProfile =
+            serde_json::from_str(args[2]).unwrap();
+        assert_eq!(launched, profile);
+        assert_eq!(args[3], "--");
+        assert_eq!(args[4], find_bash().unwrap().unwrap().to_str().unwrap());
+        assert_eq!(&args[5..], &["--norc", "--noprofile", "-n"]);
+        let environment = std::fs::read_to_string(env_log).unwrap();
+        assert!(
+            environment
+                .lines()
+                .any(|line| line == format!("TMPDIR={}", temp.canonicalize().unwrap().display())),
+            "{environment}"
+        );
+        assert!(
+            !environment
+                .lines()
+                .any(|line| line.starts_with("CARGO_MANIFEST_DIR=")),
+            "{environment}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_syntax_confirmation_never_falls_back_after_session_policy_refusal() {
+        use crate::sandbox_spawn::{SpawnPlan, ToolLaunchPolicy};
+        require_bash();
+        let root = tempfile::tempdir().unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..config()
+            },
+        );
+        let policy = std::rc::Rc::new(crate::sandbox_spawn::with_spawn_plan_for_test(
+            SpawnPlan::refused_for_test("sandbox_unavailable"),
+            || ToolLaunchPolicy::resolve(&ctx),
+        ));
+        let path = root.path().join("new.sh");
+        assert_eq!(validate_syntax_str(GRAMMAR_GAP, &path), Some(false));
+        let request = serde_json::from_value(serde_json::json!({"id":"syntax-refused", "command":"write", "file":path, "content":GRAMMAR_GAP})).unwrap();
+        let response = ToolLaunchPolicy::with_current(Some(policy), || {
+            crate::commands::write::handle_write(&request, &ctx)
+        });
+        assert!(response.success, "{response:?}");
+        assert!(response.data.get("syntax_valid").is_none(), "{response:?}");
+        assert_eq!(
+            response.data["syntax_skipped_reason"], "bash_unavailable",
+            "{response:?}"
+        );
+        assert!(
+            response.data.get("syntax_error_line").is_none(),
+            "{response:?}"
+        );
+    }
+
     #[test]
     fn reported_line_reads_the_first_bash_line_number() {
         assert_eq!(
@@ -243,20 +374,32 @@ mod tests {
         let path = Path::new("new.sh");
         for source in [FIXTURE, GRAMMAR_GAP] {
             assert_eq!(validate_syntax_str(source, path), Some(false));
-            let check = check_created_file_syntax(path, source);
+            let check = check_created_file_syntax(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                path,
+                source,
+            );
             assert_eq!(check.valid, Some(true), "{source}");
             assert_eq!(check.first_error_line, None);
             assert_eq!(check.skipped_reason, None);
         }
 
-        let check = check_created_file_syntax(path, BROKEN_CASE);
+        let check = check_created_file_syntax(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            path,
+            BROKEN_CASE,
+        );
         assert_eq!(check.valid, Some(false));
         assert_eq!(check.first_error_line, Some(5));
         assert_eq!(check.skipped_reason, None);
 
         // tree-sitter stops at the grammar gap on line 1; bash names the stray
         // `fi` on line 3, and its line wins.
-        let check = check_created_file_syntax(path, GAP_THEN_BROKEN);
+        let check = check_created_file_syntax(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            path,
+            GAP_THEN_BROKEN,
+        );
         assert_eq!(check.valid, Some(false));
         assert_eq!(check.first_error_line, Some(3));
     }
@@ -364,7 +507,12 @@ mod tests {
                 env_dump.display()
             ),
         );
-        let outcome = run_bash(&bash, "echo hi\n", Instant::now() + CHECK_TIMEOUT);
+        let outcome = run_bash(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &bash,
+            "echo hi\n",
+            Instant::now() + CHECK_TIMEOUT,
+        );
         assert_eq!(
             outcome,
             CheckOutcome::Exited {
@@ -400,6 +548,7 @@ mod tests {
         let bash = fake_bash(temp.path(), "exec sleep 30\n");
         let started = Instant::now();
         let outcome = run_bash(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
             &bash,
             "echo hi\n",
             Instant::now() + Duration::from_millis(150),
@@ -416,7 +565,12 @@ mod tests {
         // pipe buffer, as bash does at the first error.
         let bash = fake_bash(temp.path(), "exit 2\n");
         let source = "echo hi\n".repeat(64 * 1024);
-        let outcome = run_bash(&bash, &source, Instant::now() + CHECK_TIMEOUT);
+        let outcome = run_bash(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &bash,
+            &source,
+            Instant::now() + CHECK_TIMEOUT,
+        );
         assert!(
             matches!(outcome, CheckOutcome::Exited { code: Some(2), .. }),
             "{outcome:?}"
@@ -434,8 +588,14 @@ mod tests {
 
         // Valid bash that tree-sitter rejects is kept, not rolled back.
         std::fs::write(&path, original).unwrap();
-        let result =
-            write_format_validate(&path, GRAMMAR_GAP, &config(), &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            GRAMMAR_GAP,
+            &config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert!(!result.rolled_back);
         assert_eq!(result.syntax_valid, Some(true));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), GRAMMAR_GAP);
@@ -443,15 +603,27 @@ mod tests {
         // An edit to a valid script tree-sitter misreads is also judged by bash.
         std::fs::write(&path, FIXTURE).unwrap();
         let edited = FIXTURE.replace("WINDOW DONE", "WINDOW FINISHED");
-        let result =
-            write_format_validate(&path, &edited, &config(), &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            &edited,
+            &config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert!(!result.rolled_back);
         assert_eq!(result.syntax_valid, Some(true));
 
         // A real syntax error is still rolled back.
         std::fs::write(&path, original).unwrap();
-        let result =
-            write_format_validate(&path, BROKEN_CASE, &config(), &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            BROKEN_CASE,
+            &config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert!(result.rolled_back);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
@@ -481,6 +653,7 @@ mod tests {
             }),
             || {
                 crate::edit::write_format_validate(
+                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                     &path,
                     FIXTURE,
                     &config(),
@@ -503,8 +676,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("script.sh");
         std::fs::write(&path, BROKEN_CASE).unwrap();
-        let result =
-            write_format_validate(&path, GRAMMAR_GAP, &config(), &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            GRAMMAR_GAP,
+            &config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert!(!result.rolled_back);
         assert_eq!(result.syntax_valid, Some(true));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), GRAMMAR_GAP);
@@ -513,8 +692,14 @@ mod tests {
         // and reported invalid.
         std::fs::write(&path, BROKEN_CASE).unwrap();
         let still_broken = format!("{BROKEN_CASE}{BROKEN_CASE}");
-        let result =
-            write_format_validate(&path, &still_broken, &config(), &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            &still_broken,
+            &config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert!(!result.rolled_back);
         assert_eq!(result.syntax_valid, Some(false));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), still_broken);
@@ -524,7 +709,11 @@ mod tests {
     #[test]
     fn windows_never_runs_bash_and_reports_unknown() {
         assert_eq!(find_bash(), Ok(None));
-        let check = check_created_file_syntax(Path::new("new.sh"), BROKEN_CASE);
+        let check = check_created_file_syntax(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            Path::new("new.sh"),
+            BROKEN_CASE,
+        );
         assert_eq!(check.valid, None);
         assert_eq!(check.skipped_reason, Some("bash_unavailable"));
         assert_eq!(check.first_error_line, None);

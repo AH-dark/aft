@@ -605,13 +605,14 @@ fn add_failure(failures: &mut Vec<Value>, path: &str, error: String) {
 /// The check runs once per file after all hunks, because a later hunk in the
 /// same patch can fix, break, move or delete a file an earlier hunk created.
 fn created_file_syntax_checks(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     created: &HashMap<PathBuf, usize>,
 ) -> HashMap<PathBuf, edit::CreatedFileSyntax> {
     created
         .keys()
         .filter_map(|path| {
             let content = fs::read_to_string(path).ok()?;
-            let check = edit::check_created_file_syntax(path, &content);
+            let check = edit::check_created_file_syntax(tool_policy, path, &content);
             Some((path.clone(), check))
         })
         .collect()
@@ -1210,7 +1211,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
         }
     }
 
-    let created_checks = created_file_syntax_checks(&created);
+    let created_checks = created_file_syntax_checks(tool_policy, &created);
     insert_created_syntax_notices(&mut output_lines, &created, &created_checks);
 
     if !failures.is_empty() {
