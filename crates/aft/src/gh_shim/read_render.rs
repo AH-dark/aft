@@ -1476,7 +1476,10 @@ fn run_logs(
     };
     for job in &jobs {
         if plan.flag("log-failed")
-            && !matches!(job["conclusion"].as_str(), Some("failure" | "timed_out"))
+            && !matches!(
+                job["conclusion"].as_str(),
+                Some("failure" | "timed_out" | "action_required" | "startup_failure")
+            )
         {
             continue;
         }
@@ -1485,7 +1488,6 @@ fn run_logs(
             .ok_or_else(|| failed("job response has no id"))?;
         let mut formatter = LogFormatter {
             job,
-            failed_only: plan.flag("log-failed"),
             pending: Vec::new(),
             output,
         };
@@ -1510,53 +1512,24 @@ fn run_logs(
 
 struct LogFormatter<'a, W> {
     job: &'a Value,
-    failed_only: bool,
     pending: Vec<u8>,
     output: &'a mut W,
 }
 
-// GitHub's log and step times are UTC. Compare whole seconds and decimal
-// fractions separately so differing fractional widths preserve full precision.
-fn log_timestamp(value: &str) -> Option<(&str, &str)> {
-    let value = value.strip_suffix('Z')?;
-    let (seconds, fraction) = value.split_once('.').unwrap_or((value, ""));
-    if seconds.len() != 19
-        || !seconds
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| match index {
-                4 | 7 => byte == b'-',
-                10 => byte == b'T',
-                13 | 16 => byte == b':',
-                _ => byte.is_ascii_digit(),
-            })
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    Some((seconds, fraction.trim_end_matches('0')))
-}
-
 impl<W: Write> LogFormatter<'_, W> {
     fn line(&mut self, line: &[u8]) -> io::Result<()> {
-        let timestamp = line.split(|byte| *byte == b' ').next().unwrap_or_default();
-        let timestamp = std::str::from_utf8(timestamp).unwrap_or("");
-        let step = log_timestamp(timestamp).and_then(|timestamp| {
-            self.job["steps"].as_array()?.iter().find(|step| {
-                let start = step["started_at"].as_str().and_then(log_timestamp);
-                let end = step["completed_at"].as_str().and_then(log_timestamp);
-                matches!((start, end), (Some(start), Some(end)) if start <= timestamp && timestamp < end)
-            })
-        });
-        if self.failed_only && !step.is_some_and(|step| step["conclusion"] == "failure") {
-            return Ok(());
-        }
+        // Plexus supplies whole-job display text, not gh's numbered step-log
+        // files. Mirror cli/cli v2.92.0 pkg/cmd/run/view/view.go:556-590:
+        // retain every line and label it UNKNOWN STEP rather
+        // than guessing from timestamps shared by several steps. Display text
+        // has already lost ANSI codes and may differ from native gh's archive.
         let name = self.job["name"].as_str().unwrap_or("job");
-        let step = step
-            .and_then(|step| step["name"].as_str())
-            .unwrap_or("UNKNOWN STEP");
-        write!(self.output, "{name}\t{step}\t")?;
-        self.output.write_all(line)
+        write!(self.output, "{name}\tUNKNOWN STEP\t")?;
+        // gh's line scanner removes CRLF and terminates even the final line.
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        self.output.write_all(line)?;
+        self.output.write_all(b"\n")
     }
     fn finish(&mut self) -> Result<(), ReadError> {
         if !self.pending.is_empty() {

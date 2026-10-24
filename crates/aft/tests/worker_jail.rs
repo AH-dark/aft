@@ -3412,6 +3412,61 @@ echo TWO_READS_OK
 }
 
 #[tokio::test]
+async fn worker_gh_read_log_failed_whole_job_fallback_through_sandboxed_gh() {
+    assert!(native_available(), "native worker sandbox is required");
+    let mut jail = gh_read_jail().await;
+    let log = include_str!("fixtures/gh_shim/run-40083893167-job-display.txt");
+    jail.read_holder.lock().unwrap().results.extend([
+        json!({"status":200,"body":{"jobs":[
+            {"id":1,"name":"successful job","conclusion":"success"},
+            {"id":120842790454_u64,"name":"Landing policy","conclusion":"failure","steps":[
+                {"name":"checkout","started_at":"2026-10-24T09:57:11Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"success"},
+                {"name":"Original PR commit identity and agent attribution","started_at":"2026-10-24T09:57:22Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"failure"},
+                {"name":"cleanup","started_at":"2026-10-24T09:57:22Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"success"}
+            ]}
+        ]},"next_page":null}),
+        json!({"body":log,"offset":0,"length":log.len()+9,"total_bytes":log.len()+9}),
+    ]);
+    let response = jail
+        .tool_reply(
+            "bash",
+            json!({
+                "command":"gh run view 40083893167 --repo cortexkit/aft --log-failed",
+                "timeout":300_000
+            }),
+        )
+        .await;
+    let text = response.to_string();
+    assert_eq!(response["structuredContent"]["exit_code"], 0, "{text}");
+    let output = response["structuredContent"]["output"]
+        .as_str()
+        .expect(&text);
+    let expected = log
+        .lines()
+        .map(|line| format!("Landing policy\tUNKNOWN STEP\t{line}\n"))
+        .collect::<String>();
+    let (command_output, trailer) = output.rsplit_once('\n').expect("bash task trailer line");
+    assert!(
+        regex::Regex::new(r"^\[task bash-[0-9a-f]{16}\]$")
+            .unwrap()
+            .is_match(trailer),
+        "unexpected bash task trailer: {trailer:?}"
+    );
+    assert_eq!(format!("{command_output}\n"), expected);
+    let calls = jail.read_holder.lock().unwrap().calls.clone();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(
+        calls[1]["request"]["arguments"]["action"],
+        "github.actions.job_log"
+    );
+    assert_eq!(
+        calls[1]["request"]["arguments"]["args"]["job_id"],
+        120842790454_u64
+    );
+    assert!(!jail.worktree.join("native-gh.log").exists());
+}
+
+#[tokio::test]
 async fn worker_gh_read_t8_live_scope_rebind_refuses_before_upstream() {
     if !native_available() {
         return;
