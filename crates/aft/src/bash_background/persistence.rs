@@ -3925,7 +3925,9 @@ pub fn read_exit_marker(paths: &TaskPaths) -> io::Result<Option<ExitMarker>> {
 /// the task exits, so for a running task every full read (pinning the session,
 /// task and I/O directories, reading and parsing the task metadata, then
 /// opening and reading the marker) finds nothing. One `lstat` of the marker
-/// path is enough to tell that the file is still that same empty file.
+/// path compares it with the empty file seen last time: by device and inode
+/// on Unix, by creation and modification time on Windows, which has no stable
+/// file ID in `std`. Either way, a marker with any content is never skipped.
 #[derive(Debug, Default)]
 pub(crate) struct ExitMarkerProbe {
     /// Identity of the marker file when a full read last found it empty.
@@ -3969,9 +3971,11 @@ impl EmptyMarkerIdentity {
 ///
 /// - A missing marker returns `None` after one `lstat`, which is what the
 ///   full read returns for a missing marker or task layout.
-/// - A marker that appears, gains bytes, or is replaced by another file no
-///   longer matches the remembered identity, so the next poll does the full
-///   read and sees it.
+/// - A marker that appears or gains bytes no longer matches the remembered
+///   empty file, so the next poll does the full read and sees it. A file
+///   renamed over the marker with content is seen the same way; one renamed
+///   over it empty is told apart by inode on Unix, but may look unchanged on
+///   Windows, where it would read as `None` anyway.
 /// - Anything other than an unchanged empty regular file (content, a symlink,
 ///   a stat error) goes through the full read, whose path validation and
 ///   errors are unchanged.
