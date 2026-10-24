@@ -49,6 +49,46 @@ pub fn is_project_trusted(storage_dir: Option<&Path>, project_root: &Path) -> bo
         .contains(&canonical.display().to_string())
 }
 
+/// Returns true when the project root, or the main checkout of the linked
+/// worktree it is, is in the trusted set.
+///
+/// Bash environment values use this rule: a linked worktree of a trusted
+/// checkout inherits its trust, because workers run their builds in exactly
+/// those checkouts and the deny list, not trust, is what protects AFT's
+/// controls. Compression filters deliberately keep the exact-root rule
+/// (`is_project_trusted`) and do not inherit.
+pub fn is_project_env_trusted(storage_dir: Option<&Path>, project_root: &Path) -> bool {
+    if is_project_trusted(storage_dir, project_root) {
+        return true;
+    }
+    match main_checkout_of(project_root) {
+        Some(main) => is_project_trusted(storage_dir, &main),
+        None => false,
+    }
+}
+
+/// The main checkout of a linked worktree, or `None` for a main checkout, a
+/// non-repository, or any failure. A linked worktree's `.git` is a file
+/// holding `gitdir: <common-dir>/worktrees/<name>`; the main checkout is two
+/// levels above that common directory. This reads the file rather than running
+/// git, so it costs one small read per bash call.
+fn main_checkout_of(project_root: &Path) -> Option<PathBuf> {
+    let marker = project_root.join(".git");
+    let pointer = fs::read_to_string(&marker).ok()?;
+    let git_dir = pointer.trim().strip_prefix("gitdir:")?.trim();
+    let git_dir = if Path::new(git_dir).is_absolute() {
+        PathBuf::from(git_dir)
+    } else {
+        project_root.join(git_dir)
+    };
+    let worktrees = git_dir.parent()?;
+    if worktrees.file_name()? != "worktrees" {
+        return None;
+    }
+    let main = worktrees.parent()?.parent()?;
+    main.canonicalize().ok()
+}
+
 /// Add a project to the trusted set. Returns Ok if the file was updated (or
 /// already trusted).
 pub fn trust_project(storage_dir: &Path, project_root: &Path) -> Result<(), String> {
@@ -221,6 +261,50 @@ mod tests {
         let listed = list_trusted(storage.path());
         assert!(listed.contains(&p1_canonical), "listed: {listed:?}");
         assert!(listed.contains(&p2_canonical), "listed: {listed:?}");
+    }
+
+    /// Lay out a main checkout with a linked worktree the way git does, so the
+    /// worktree-inherits-trust rule is exercised without running git.
+    fn linked_worktree(main: &Path, worktree: &Path) -> PathBuf {
+        let common = main.join(".git");
+        let git_dir = common.join("worktrees").join("linked");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::create_dir_all(worktree).unwrap();
+        fs::write(worktree.join(".git"), format!("gitdir: {}\n", git_dir.display())).unwrap();
+        git_dir
+    }
+
+    #[test]
+    fn linked_worktree_inherits_trust_from_its_main_checkout() {
+        let storage = tempdir().unwrap();
+        let main = tempdir().unwrap();
+        let worktree = tempdir().unwrap();
+        linked_worktree(main.path(), worktree.path());
+
+        // The exact-root filter rule does not inherit.
+        assert!(!is_project_trusted(Some(storage.path()), worktree.path()));
+        assert!(!is_project_env_trusted(Some(storage.path()), worktree.path()));
+
+        trust_project(storage.path(), main.path()).unwrap();
+        assert!(is_project_env_trusted(Some(storage.path()), worktree.path()));
+    }
+
+    #[test]
+    fn linked_worktree_of_an_untrusted_checkout_stays_untrusted() {
+        let storage = tempdir().unwrap();
+        let main = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        let worktree = tempdir().unwrap();
+        linked_worktree(main.path(), worktree.path());
+        trust_project(storage.path(), other.path()).unwrap();
+        assert!(!is_project_env_trusted(Some(storage.path()), worktree.path()));
+    }
+
+    #[test]
+    fn main_checkout_has_no_parent_checkout_to_inherit_from() {
+        let main = tempdir().unwrap();
+        fs::create_dir_all(main.path().join(".git")).unwrap();
+        assert!(main_checkout_of(main.path()).is_none());
     }
 
     #[test]

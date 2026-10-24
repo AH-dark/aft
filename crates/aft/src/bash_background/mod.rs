@@ -583,6 +583,11 @@ pub(crate) struct RemoteLaunch {
     pub session: String,
     pub requested_vcpus: Option<u32>,
     pub requested_network: bool,
+    /// Configured `bash.env` names carried in the launch environment, with the
+    /// map they came from. The remote request drops those names from the shell
+    /// environment before it is sent, so only `bash.runon_env` can send a user
+    /// value; see `commands::bash_remote_env`.
+    pub configured_env_names: Vec<String>,
 }
 
 /// Decide where a bash call that set `runon` runs, before anything is spawned.

@@ -1083,6 +1083,8 @@ fn classification_is_exhaustive(config: &Config) {
         disclaim_privacy: _,
         powershell_tool: _,
         env: _,
+        project_env: _,
+        runon_env: _,
     } = bash;
     let crate::config::SandboxConfig {
         profile: _,

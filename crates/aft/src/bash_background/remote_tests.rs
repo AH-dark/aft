@@ -219,6 +219,7 @@ pub(crate) fn launch(connection: PathBuf) -> crate::bash_background::RemoteLaunc
         requested_platform: None,
         requested_vcpus: None,
         requested_network: false,
+        configured_env_names: Vec::new(),
         params: exec::FrozenParams {
             remote_exec: Some(exec::policy::RemoteExecPolicy {
                 enabled: true,

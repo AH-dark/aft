@@ -478,13 +478,14 @@ pub fn build_bash_outcome(
                 .remove("_bash_duplicate_warning")
                 .and_then(|value| value.as_str().map(str::to_owned));
             let keys = data.remove("_bash_env_keys").and_then(|value| {
-                value.as_array().map(|items| {
-                    items
+                let lines = value.get("lines")?.as_array()?;
+                Some(
+                    lines
                         .iter()
                         .filter_map(Value::as_str)
                         .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                })
+                        .collect::<Vec<_>>(),
+                )
             });
             (warning, keys)
         })
@@ -1239,11 +1240,10 @@ fn append_bash_reply_notices(
     if let Some(warning) = duplicate_warning {
         notices.push(warning.to_string());
     }
-    if let Some(keys) = env_keys.filter(|keys| !keys.is_empty()) {
-        notices.push(format!(
-            "Configured bash.env keys applied (values not shown): {}.",
-            keys.join(", ")
-        ));
+    if let Some(lines) = env_keys.filter(|lines| !lines.is_empty()) {
+        // Each configured-environment line already reads as a sentence and
+        // never contains a value.
+        notices.extend(lines.iter().cloned());
     }
     if notices.is_empty() {
         return;
@@ -1477,7 +1477,9 @@ mod tests {
                     "status": "failed",
                     "mode": if pty { "pty" } else { "pipes" },
                     "_bash_duplicate_warning": "Duplicate running command: earlier-task",
-                    "_bash_env_keys": ["BUILD_LABEL"],
+                    "_bash_env_keys": {"lines": [
+                        "Configured bash.env keys applied (values not shown): BUILD_LABEL (user)."
+                    ]},
                 }),
             );
             let response = match build_bash_outcome(&request, &ctx, spawn) {
@@ -1501,7 +1503,7 @@ mod tests {
             );
             assert!(
                 output
-                    .contains("Configured bash.env keys applied (values not shown): BUILD_LABEL."),
+                    .contains("Configured bash.env keys applied (values not shown): BUILD_LABEL (user)."),
                 "{output}"
             );
             assert!(response.data.get("_bash_duplicate_warning").is_none());
@@ -2012,7 +2014,7 @@ mod tests {
             output,
             format!(
                 "line 1\nline 2\nSame command as the previous call.\n\
-                 Configured bash.env keys applied (values not shown): API_KEY.\n\
+                 Configured bash.env keys applied (values not shown): API_KEY (user).\n\
                  [task bash-test]\n{trailer}"
             )
         );

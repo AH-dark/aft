@@ -1955,10 +1955,25 @@ impl BgTaskRegistry {
         let linux_scope = env
             .remove("AFT_INTERNAL_LINUX_SCOPE")
             .is_some_and(|v| v == "1");
+        // Configured `bash.env` values apply to local commands only. Whatever
+        // the caller let through (`bash.runon_env`) is already unlisted, so
+        // every configured name is dropped here, with per-call `env` leaving
+        // through the child environment as before. `commands::bash_remote_env`
+        // owns the disclosure of what a job does not receive.
+        let configured_env_names = launch.configured_env_names.clone();
         let shell_environment: crate::sandbox_spawn::ChildEnvironment =
             if !plan.is_native_launcher() && plan.host_shell_path().is_none() {
                 std::env::vars_os()
-                    .chain(env.clone().into_iter().map(|(k, v)| (k.into(), v.into())))
+                    .chain(
+                        env.clone()
+                            .into_iter()
+                            .filter(|(key, _)| {
+                                !configured_env_names
+                                    .iter()
+                                    .any(|name| name == key)
+                            })
+                            .map(|(k, v)| (k.into(), v.into())),
+                    )
                     .collect()
             } else {
                 crate::sandbox_spawn::approved_environment_for_plan(&plan, &env)
