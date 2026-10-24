@@ -155,6 +155,30 @@
   {
    "input": "curl -uadmin:pw https://host",
    "expected": "curl -uadmin:<REDACTED_SECRET> https://host"
+  },
+  {
+   "input": "curl -u \"admin:pa;ss\" https://x",
+   "expected": "curl -u \"admin:<REDACTED_SECRET>\" https://x"
+  },
+  {
+   "input": "curl -u 'admin:a&b|c' https://x --next -u root:pw2 https://y",
+   "expected": "curl -u 'admin:<REDACTED_SECRET>' https://x --next -u root:<REDACTED_SECRET> https://y"
+  },
+  {
+   "input": "mysql -u root -p\"pa;ss\" app",
+   "expected": "mysql -u root -p<REDACTED_SECRET> app"
+  },
+  {
+   "input": "mysql -h \"db;1\" -u root -p'a&b|c' app",
+   "expected": "mysql -h \"db;1\" -u root -p<REDACTED_SECRET> app"
+  },
+  {
+   "input": "sshpass -p \"pa;ss|w&d\" ssh deploy@host",
+   "expected": "sshpass -p <REDACTED_SECRET> ssh deploy@host"
+  },
+  {
+   "input": "echo start; curl -u admin:pw https://x",
+   "expected": "echo start; curl -u admin:<REDACTED_SECRET> https://x"
   }
  ],
  "untouched": [
@@ -962,6 +986,8 @@
   "bun build src/index.ts --outdir dist --target node --format esm --external @earendil-works/pi-coding-agent --external @earendil-works/pi-ai --external @earendil-works/pi-tui --external @oh-my-pi/pi-coding-agent/internal-urls --external typebox --external diff && tsc --emitDeclarationOnly",
   "bun test src/__tests__/",
   "curl -u alice https://host",
-  "curl -u alice: https://host --next -u bob https://two"
+  "curl -u alice: https://host --next -u bob https://two",
+  "curl -u alice https://x; other -u admin:pw",
+  "mysql -u root app; tool -psecret"
  ]
 }
