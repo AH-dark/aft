@@ -120,6 +120,149 @@ struct RootCache {
     head: Option<HeadSnapshot>,
     verification: Arc<Mutex<VerificationState>>,
     last_used: Instant,
+    domain: CacheDomain,
+}
+
+#[cfg(not(test))]
+#[derive(Clone, Debug, Default)]
+struct CacheDomain;
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+// New test roots use their creating thread's domain, stored in the root's
+// verification state for later publications on workers. Non-test builds share
+// one publication-cache domain and enforce MAX_ROOT_CACHES across all roots.
+struct CacheDomain(Arc<TestCacheDomain>);
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestCacheDomain {
+    active: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+struct TestCacheScope {
+    domain: CacheDomain,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CACHE_SCOPE: TestCacheScope = TestCacheScope {
+        domain: CacheDomain(Arc::new(TestCacheDomain { active: std::sync::atomic::AtomicBool::new(true) })),
+    };
+}
+
+#[cfg(test)]
+impl Default for CacheDomain {
+    fn default() -> Self {
+        TEST_CACHE_SCOPE.with(|scope| scope.domain.clone())
+    }
+}
+
+impl CacheDomain {
+    fn same(&self, other: &Self) -> bool {
+        #[cfg(test)]
+        {
+            Arc::ptr_eq(&self.0, &other.0)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = other;
+            true
+        }
+    }
+
+    fn active(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.0.active.load(std::sync::atomic::Ordering::Acquire)
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestCacheScope {
+    fn drop(&mut self) {
+        self.domain
+            .0
+            .active
+            .store(false, std::sync::atomic::Ordering::Release);
+        let retired = {
+            let mut caches = caches().lock().unwrap_or_else(|error| error.into_inner());
+            let keys = caches
+                .iter()
+                .filter(|(_, cache)| cache.domain.same(&self.domain))
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| caches.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        drop(retired);
+    }
+}
+
+fn domain_size(caches: &BTreeMap<PathBuf, RootCache>, domain: &CacheDomain) -> usize {
+    #[cfg(test)]
+    {
+        caches
+            .values()
+            .filter(|cache| cache.domain.same(domain))
+            .count()
+    }
+    #[cfg(not(test))]
+    {
+        let _ = domain;
+        caches.len()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ADMISSION_OVERRIDES: std::cell::RefCell<BTreeMap<PathBuf, crate::db::file_identity::AdmissionSnapshot>> = const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+pub(super) fn admission_snapshot(storage: &Path) -> crate::db::file_identity::AdmissionSnapshot {
+    #[cfg(test)]
+    if let Some(snapshot) =
+        ADMISSION_OVERRIDES.with(|overrides| overrides.borrow().get(storage).cloned())
+    {
+        return snapshot;
+    }
+    crate::db::file_identity::admission_snapshot(storage)
+}
+
+#[cfg(all(test, unix))]
+struct AdmissionOverride {
+    storage: PathBuf,
+}
+
+#[cfg(all(test, unix))]
+impl AdmissionOverride {
+    fn pin(storage: &Path, snapshot: crate::db::file_identity::AdmissionSnapshot) -> Self {
+        ADMISSION_OVERRIDES.with(|overrides| {
+            assert!(overrides
+                .borrow_mut()
+                .insert(storage.to_path_buf(), snapshot)
+                .is_none());
+        });
+        Self {
+            storage: storage.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for AdmissionOverride {
+    fn drop(&mut self) {
+        ADMISSION_OVERRIDES.with(|overrides| {
+            overrides.borrow_mut().remove(&self.storage);
+        });
+    }
 }
 
 #[derive(Debug, Default)]
@@ -130,6 +273,9 @@ struct VerificationState {
     active_preparations: usize,
     owners: usize,
     epoch: u64,
+    domain: CacheDomain,
+    #[cfg(test)]
+    mismatch_count: u64,
 }
 
 const MAX_ROOT_CACHES: usize = 16;
@@ -301,6 +447,22 @@ pub(super) fn cache_contains_for_test(view_dir: &Path) -> bool {
 }
 
 #[cfg(test)]
+fn cache_domain_size_for_test() -> usize {
+    domain_size(
+        &caches().lock().unwrap_or_else(|error| error.into_inner()),
+        &CacheDomain::default(),
+    )
+}
+
+#[cfg(test)]
+fn mismatch_count_for_test(view_dir: &Path) -> u64 {
+    state_for(view_dir)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .mismatch_count
+}
+
+#[cfg(test)]
 #[derive(Debug)]
 pub(super) struct CacheMemoryEstimate {
     pub payload_bytes: usize,
@@ -409,9 +571,10 @@ pub(super) fn remember(
 ) {
     let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
     let mut state = preparation.state.lock().unwrap_or_else(|e| e.into_inner());
-    if state.epoch != preparation.epoch {
+    if state.epoch != preparation.epoch || !state.domain.active() {
         return;
     }
+    let domain = state.domain.clone();
     let previous = caches.insert(
         view.view_dir().to_path_buf(),
         RootCache {
@@ -419,6 +582,7 @@ pub(super) fn remember(
             previous: Some(cached),
             verification: preparation.state.clone(),
             last_used: Instant::now(),
+            domain: domain.clone(),
         },
     );
     if full_verified {
@@ -428,9 +592,10 @@ pub(super) fn remember(
     }
     drop(state);
     let mut retired = Vec::new();
-    while caches.len() > MAX_ROOT_CACHES {
+    while domain_size(&caches, &domain) > MAX_ROOT_CACHES {
         let oldest = caches
             .iter()
+            .filter(|(_, cache)| cache.domain.same(&domain))
             .min_by_key(|(_, cache)| cache.last_used)
             .map(|(key, _)| key.clone())
             .unwrap();
@@ -554,7 +719,9 @@ pub(super) fn full_verification_due(view_dir: &Path) -> bool {
         Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return true,
     };
-    state.active_preparations == 0 && full_verification_required(&state, Instant::now())
+    state.domain.active()
+        && state.active_preparations == 0
+        && full_verification_required(&state, Instant::now())
 }
 
 pub(super) fn note_mismatch(view: &ViewStore) -> Option<u64> {
@@ -564,6 +731,10 @@ pub(super) fn note_mismatch(view: &ViewStore) -> Option<u64> {
         return None;
     }
     cache.mismatch_pending = true;
+    #[cfg(test)]
+    {
+        cache.mismatch_count += 1;
+    }
     Some(VERIFICATION_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1)
 }
 
@@ -736,6 +907,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn views_cache_domains_isolate_parallel_root_pressure() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            let (_project, storage, request) = fixture();
+            let view = ViewStore::open(storage.path(), &request.scope).unwrap();
+            ready_tx.send(()).unwrap();
+            done_rx.recv().unwrap();
+            assert!(
+                cache_contains_for_test(view.view_dir()),
+                "a sibling test's roots evicted this test's warm entry"
+            );
+        });
+        ready_rx.recv().unwrap();
+        let mut roots = Vec::new();
+        for _ in 0..32 {
+            roots.push(fixture());
+        }
+        assert!(cache_domain_size_for_test() <= 16);
+        done_tx.send(()).unwrap();
+        other.join().unwrap();
+    }
+
+    #[test]
     fn views_large_watcher_delta_has_bounded_path_comparisons() {
         let oid = crate::alias::GitOid::from_bytes(&[0; 20]).unwrap();
         let head = (0..60_000)
@@ -820,21 +1015,17 @@ mod tests {
         let second = view(1);
         let weak = {
             let caches = caches().lock().unwrap();
-            Arc::downgrade(
-                &caches
-                    .get(second.view_dir())
-                    .unwrap()
-                    .previous
-                    .as_ref()
-                    .unwrap()
-                    .metadata,
-            )
-        };
+            caches
+                .get(second.view_dir())
+                .and_then(|cache| cache.previous.as_ref())
+                .map(|previous| Arc::downgrade(&previous.metadata))
+        }
+        .expect("the second root must remain in this test's cache domain");
         let generation = first.current_generation().unwrap().unwrap();
         drop(previous(&first, Some(&generation)).unwrap());
         roots.push(fixture());
         assert!(
-            caches().lock().unwrap().len() <= 16,
+            cache_domain_size_for_test() <= 16,
             "heavy root cache must remain bounded"
         );
         assert!(
@@ -849,7 +1040,7 @@ mod tests {
         for _ in 0..48 {
             roots.push(fixture());
         }
-        assert!(caches().lock().unwrap().len() <= 16);
+        assert!(cache_domain_size_for_test() <= 16);
     }
 
     #[test]
@@ -944,9 +1135,43 @@ mod tests {
     }
 
     fn fixture() -> (tempfile::TempDir, tempfile::TempDir, AssemblyRequest) {
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
+        // Case-only renames exercise ordinary checkout reads, not the stricter
+        // task_temp_reads admission rules for operating-system scratch files.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".cortexkit/scratch/view-publication-fixtures");
+        fs::create_dir_all(&root).unwrap();
+        fixture_at(Some(&root.canonicalize().unwrap()))
+    }
+
+    fn fixture_at(
+        parent: Option<&Path>,
+    ) -> (tempfile::TempDir, tempfile::TempDir, AssemblyRequest) {
+        let tempdir = || {
+            parent
+                .map_or_else(tempfile::tempdir, tempfile::tempdir_in)
+                .unwrap()
+        };
+        let project = tempdir();
+        let storage = tempdir();
         git(project.path(), &["init", "--quiet"]);
+        assert!(project.path().join(".git").is_dir());
+        let output = std::process::Command::new("git")
+            .current_dir(project.path())
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let bytes = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
+        let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+        assert_eq!(
+            path_from_bytes(bytes).canonicalize().unwrap(),
+            project.path().canonicalize().unwrap(),
+            "fixture must not discover its enclosing checkout"
+        );
         for i in 0..8 {
             fs::write(
                 project.path().join(format!("f{i}.rs")),
@@ -1021,7 +1246,40 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn views_incremental_reuses_manifest_and_head_without_decoding() {
-        let (project, _storage, mut request) = fixture();
+        assert_warm_reuse(fixture());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn views_fixture_owns_git_state_inside_another_checkout() {
+        let parent = tempfile::tempdir().unwrap();
+        git(parent.path(), &["init", "--quiet"]);
+        fs::write(parent.path().join("parent.rs"), "pub fn parent() {}\n").unwrap();
+        git(parent.path(), &["add", "."]);
+        git(parent.path(), &["commit", "--quiet", "-m", "parent"]);
+        assert_warm_reuse(fixture_at(Some(parent.path())));
+    }
+
+    #[cfg(unix)]
+    fn assert_warm_reuse(
+        (project, _storage, mut request): (tempfile::TempDir, tempfile::TempDir, AssemblyRequest),
+    ) {
+        let view = ViewStore::open(&request.storage, &request.scope).unwrap();
+        let generation = view.current_generation().unwrap().unwrap();
+        let cached = previous(&view, Some(&generation)).unwrap();
+        // Pin the cached AdmissionSnapshot so unrelated SQLite opens/closes in
+        // parallel tests cannot legitimately force fresh metadata reads here.
+        // Alias-invalidation tests exercise the real registry without an override.
+        let _admission = AdmissionOverride::pin(&request.storage, cached.admission.clone());
+        drop(cached);
+        // Force ambient registry churn so accidentally using the process-wide
+        // snapshot cannot silently make this isolation check pass.
+        let external = tempfile::tempdir().unwrap();
+        let _external_db = crate::db::file_identity::IdentityConnection::open(
+            external.path().join("external.sqlite"),
+            "publication reuse fixture",
+        )
+        .unwrap();
         crate::views::take_manifest_decodes();
         CLOSURE_PROBE_STATS.with(|stats| stats.set(Default::default()));
         let heads = crate::alias::head_tree_entry_calls_for_test();
@@ -1153,12 +1411,12 @@ mod tests {
         let (project, storage, mut request) = fixture();
         let view = ViewStore::open(storage.path(), &request.scope).unwrap();
         state_for(view.view_dir()).lock().unwrap().publications = 63;
-        let before = VERIFICATION_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed);
+        let before = mismatch_count_for_test(view.view_dir());
         fs::write(project.path().join("f1.rs"), "pub fn missed() {}\n").unwrap();
         fs::write(project.path().join("f0.rs"), "pub fn notified() {}\n").unwrap();
         request.changed_paths.insert(b"f0.rs".to_vec());
         let incremental = publish(&request).to_json_bytes().unwrap();
-        assert!(VERIFICATION_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed) > before);
+        assert!(mismatch_count_for_test(view.view_dir()) > before);
         request.changed_paths.clear();
         assert_eq!(incremental, publish(&request).to_json_bytes().unwrap());
     }
@@ -1169,7 +1427,7 @@ mod tests {
             let (project, storage, mut request) = fixture();
             let view = ViewStore::open(storage.path(), &request.scope).unwrap();
             state_for(view.view_dir()).lock().unwrap().publications = 63;
-            let before = VERIFICATION_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed);
+            let before = mismatch_count_for_test(view.view_dir());
             fs::write(project.path().join("f1.rs"), "pub fn missed() {}\n").unwrap();
             fs::write(project.path().join("f0.rs"), "pub fn notified() {}\n").unwrap();
             request.changed_paths.insert(b"f0.rs".to_vec());
@@ -1212,7 +1470,7 @@ mod tests {
                 "fail_after_compare={fail_after_compare}"
             );
             assert_eq!(
-                VERIFICATION_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed) - before,
+                mismatch_count_for_test(view.view_dir()) - before,
                 1,
                 "one mismatch incident must log once, including across a failed preparation"
             );

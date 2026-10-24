@@ -727,7 +727,7 @@ pub fn prepare_checkout_deferring(
 
     timing.phase("store_opens");
     let stamps = manifest_incremental::StoreStamps::read(&callgraph, &semantic)?;
-    let admission = crate::db::file_identity::admission_snapshot(&request.storage);
+    let admission = manifest_incremental::admission_snapshot(&request.storage);
     let trusted = cached.as_ref().filter(|cached| cached.stamps == stamps);
     // Directory notifications may be the only evidence for changed, removed,
     // or renamed children. Read their whole HEAD subtree rather than treating
