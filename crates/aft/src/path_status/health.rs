@@ -317,6 +317,81 @@ mod tests {
         assert_eq!(health.snapshot().1.unwrap().pending_count, 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cached_reader_refreshes_after_store_file_identity_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = dir.path().join("view");
+        let replacement = dir.path().join("replacement");
+        let health = Health::for_view(&view);
+        let mut writer = PathStatusStore::open(&view).unwrap();
+        writer.mark_pending(b"old", "waiting", 1).unwrap();
+        let path = writer.path().to_path_buf();
+        assert_eq!(health.snapshot().1.unwrap().pending_count, 1);
+        drop(writer);
+        assert_eq!(crate::db::file_identity::open_connections(&path), 1);
+        let old_identity = crate::db::file_identity::identity_of(&path).unwrap();
+        let old_files = files(&path);
+
+        let mut replacement_writer = PathStatusStore::open(&replacement).unwrap();
+        replacement_writer
+            .mark_failed(b"new-a", "failed", 2)
+            .unwrap();
+        replacement_writer
+            .mark_failed(b"new-b", "failed", 2)
+            .unwrap();
+        let replacement_path = replacement_writer.path().to_path_buf();
+        drop(replacement_writer);
+        // Move the complete closed replacement store, including its committed
+        // WAL. The cached reader remains attached to the old, unlinked files.
+        for extension in ["sqlite", "sqlite-wal", "sqlite-shm"] {
+            std::fs::rename(
+                replacement_path.with_extension(extension),
+                path.with_extension(extension),
+            )
+            .unwrap();
+        }
+        assert_ne!(
+            crate::db::file_identity::identity_of(&path),
+            Some(old_identity)
+        );
+        assert_ne!(
+            files(&path),
+            old_files,
+            "replacement must invalidate the stat signature"
+        );
+        let next = health.snapshot().1.unwrap();
+        assert_eq!(next.pending_count, 0, "cached reader served the old inode");
+        assert_eq!(next.failed_count, 2);
+        assert_eq!(crate::db::file_identity::open_connections(&path), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_reader_discards_summary_after_store_files_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let health = Health::for_view(dir.path());
+        let mut writer = PathStatusStore::open(dir.path()).unwrap();
+        writer.mark_pending(b"old", "waiting", 1).unwrap();
+        let path = writer.path().to_path_buf();
+        assert_eq!(health.snapshot().1.unwrap().pending_count, 1);
+        drop(writer);
+        assert_eq!(crate::db::file_identity::open_connections(&path), 1);
+        // Model an unavailable identity so only the missing-file guard can
+        // retire the cached reader, rather than an identity mismatch.
+        health.reader.lock().as_mut().unwrap().identity = None;
+        for extension in ["sqlite", "sqlite-wal", "sqlite-shm"] {
+            std::fs::remove_file(path.with_extension(extension)).unwrap();
+        }
+        assert!(files(&path)[0].is_none());
+        // Opening an absent ledger bootstraps an empty store; its previous
+        // annotations must not survive through the old connection or cache.
+        let next = health.snapshot().1.unwrap();
+        assert_eq!(next.pending_count, 0);
+        assert_eq!(next.failed_count, 0);
+        assert_eq!(crate::db::file_identity::open_connections(&path), 1);
+    }
+
     #[test]
     fn local_batches_defer_summary_until_next_snapshot() {
         let dir = tempfile::tempdir().unwrap();
