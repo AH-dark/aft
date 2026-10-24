@@ -2864,7 +2864,8 @@ fn server_request_response(
         "window/showDocument" => json!({ "success": false }),
         "client/registerCapability"
         | "client/unregisterCapability"
-        | "window/workDoneProgress/create" => Value::Null,
+        | "window/workDoneProgress/create"
+        | "workspace/diagnostic/refresh" => Value::Null,
         _ => {
             return json!({ "jsonrpc": "2.0", "id": id,
             "error": { "code": -32601, "message": "Method not found" } })
@@ -3079,6 +3080,7 @@ mod tests {
             "client/registerCapability",
             "client/unregisterCapability",
             "window/workDoneProgress/create",
+            "workspace/diagnostic/refresh",
         ] {
             let response = response(method);
             assert_eq!(response["result"], Value::Null);
