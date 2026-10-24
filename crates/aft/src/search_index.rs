@@ -4075,7 +4075,9 @@ impl SearchIndexSnapshot {
         }
 
         let mut and_trigrams = query.and_trigrams.clone();
-        and_trigrams.sort_unstable_by_key(|trigram| self.posting_count(*trigram));
+        // Each count may read the base lookup table, so compute it once per
+        // trigram rather than once per comparison.
+        and_trigrams.sort_by_cached_key(|trigram| self.posting_count(*trigram));
 
         let mut current: Option<Vec<u32>> = None;
 
@@ -4129,6 +4131,8 @@ impl SearchIndexSnapshot {
     }
 
     fn posting_count(&self, trigram: u32) -> usize {
+        #[cfg(test)]
+        POSTING_COUNT_CALLS.with(|calls| calls.set(calls.get() + 1));
         let base_count = self
             .base
             .as_ref()
@@ -4145,6 +4149,8 @@ impl SearchIndexSnapshot {
     }
 
     fn is_active_file(&self, file_id: u32) -> bool {
+        #[cfg(test)]
+        SUPERSEDED_LOOKUPS.with(|count| count.set(count.get() + 1));
         if self.delta.superseded.contains(&file_id) {
             return false;
         }
@@ -4167,12 +4173,19 @@ impl SearchIndexSnapshot {
         {
             if let Some(base) = &self.base {
                 matches.reserve(base_entry.count as usize);
+                let mut posting_index = 0usize;
                 let _ = base.for_each_posting(base_entry, |file_id, next_mask, loc_mask| {
-                    if crate::executor::current_job_cancelled() {
-                        return false;
-                    }
-                    if self.delta.superseded.contains(&file_id) {
-                        return true;
+                    // Check cancellation on the same 64-record cadence as the
+                    // delta loop below. Superseded files are dropped by
+                    // `is_active_file`, so no separate lookup is needed here.
+                    let checkpoint = posting_index % BORROWED_INDEX_CHECKPOINT_INTERVAL == 0;
+                    posting_index += 1;
+                    if checkpoint {
+                        #[cfg(test)]
+                        BASE_CANCELLATION_CHECKS.with(|count| count.set(count.get() + 1));
+                        if crate::executor::current_job_cancelled() {
+                            return false;
+                        }
                     }
                     let posting = Posting {
                         file_id,
@@ -10591,6 +10604,9 @@ fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
 
 #[cfg(test)]
 thread_local! {
+    static POSTING_COUNT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SUPERSEDED_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BASE_CANCELLATION_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Called on every `line_details_bytes` call on this thread, so tests can
     /// count line-detail work or act at a chosen point inside a scan.
     static LINE_DETAILS_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
@@ -12214,6 +12230,70 @@ mod tests {
         let cache_dir = storage.path().join("index").join("poison");
         let lock = super::CacheLock::acquire(&cache_dir, project.path()).unwrap();
         assert!(lock._guard.is_some());
+    }
+
+    #[test]
+    fn audit10_candidate_sort_counts_each_trigram_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = super::SearchIndex::new();
+        let path = dir.path().join("empty-postings.bin");
+        std::fs::write(&path, []).unwrap();
+        index.base = Some(std::sync::Arc::new(super::BasePostings {
+            file: std::sync::Arc::new(std::fs::File::open(path).unwrap()),
+            postings_blob_start: 0,
+            postings_blob_len: 0,
+            lookup: std::sync::Arc::new(
+                (0..32)
+                    .map(|trigram| super::LookupEntry {
+                        trigram,
+                        offset: 0,
+                        count: 0,
+                    })
+                    .collect(),
+            ),
+        }));
+        let query = super::RegexQuery {
+            and_trigrams: (0..32).rev().collect(),
+            and_filters: std::collections::HashMap::new(),
+            or_groups: Vec::new(),
+            or_filters: Vec::new(),
+        };
+        super::POSTING_COUNT_CALLS.with(|calls| calls.set(0));
+        assert!(index.snapshot().candidates(&query).is_empty());
+        super::POSTING_COUNT_CALLS.with(|calls| assert_eq!(calls.get(), 32));
+    }
+
+    #[test]
+    fn audit10_base_postings_use_bounded_cancellation_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = super::SearchIndex::new();
+        let mut bytes = Vec::new();
+        for i in 0..200u32 {
+            index.index_file(&dir.path().join(format!("file_{i}.rs")), b"needle");
+            bytes.extend_from_slice(&i.to_le_bytes());
+            bytes.extend_from_slice(&[255, 255]);
+        }
+        let path = dir.path().join("postings.bin");
+        std::fs::write(&path, &bytes).unwrap();
+        index.base = Some(std::sync::Arc::new(super::BasePostings {
+            file: std::sync::Arc::new(std::fs::File::open(path).unwrap()),
+            postings_blob_start: 0,
+            postings_blob_len: bytes.len() as u64,
+            lookup: std::sync::Arc::new(vec![super::LookupEntry {
+                trigram: 7,
+                offset: 0,
+                count: 200,
+            }]),
+        }));
+        index.delta = std::sync::Arc::new(super::DeltaState::default());
+        super::BASE_CANCELLATION_CHECKS.with(|count| count.set(0));
+        super::SUPERSEDED_LOOKUPS.with(|count| count.set(0));
+        assert_eq!(
+            index.snapshot().postings_for_trigram(7, None),
+            (0..200).collect::<Vec<_>>()
+        );
+        super::BASE_CANCELLATION_CHECKS.with(|count| assert_eq!(count.get(), 4));
+        super::SUPERSEDED_LOOKUPS.with(|count| assert_eq!(count.get(), 200));
     }
 
     #[test]
