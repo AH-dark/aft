@@ -9,6 +9,21 @@ fn key(root: &Path) -> ServerKey {
     }
 }
 
+fn workspace_reply(
+    manager: &LspManager,
+    key: &ServerKey,
+    reply: serde_json::Value,
+) -> WorkspacePullReply {
+    WorkspacePullReply {
+        reply: Ok(reply),
+        previous_result_ids: manager
+            .diagnostics
+            .result_ids_for_server(key)
+            .into_iter()
+            .collect(),
+    }
+}
+
 fn seed_instance_state(manager: &mut LspManager, key: &ServerKey, file: &Path) {
     manager
         .documents
@@ -146,24 +161,28 @@ fn workspace_pull_preserves_versions_and_refreshes_unchanged_reports() {
     manager
         .finish_workspace_pull(
             &key,
-            Ok(json!({"items": [{
-                "uri": uri, "version": 7, "kind": "full", "resultId": "v1", "items": []
-            }]})),
+            workspace_reply(
+                &manager,
+                &key,
+                json!({"items": [{
+                    "uri": uri, "version": 7, "kind": "full", "resultId": "v1", "items": []
+                }]}),
+            ),
         )
         .unwrap();
     assert_eq!(
         manager.diagnostics.entries_for_file(&file)[0].1.version,
         Some(7)
     );
+    let reply = workspace_reply(
+        &manager,
+        &key,
+        json!({"items": [{
+            "uri": uri, "version": 8, "kind": "unchanged", "resultId": "v1"
+        }]}),
+    );
     manager.diagnostics.mark_stale_for_file(&file);
-    let result = manager
-        .finish_workspace_pull(
-            &key,
-            Ok(json!({"items": [{
-                "uri": uri, "version": 8, "kind": "unchanged", "resultId": "v1"
-            }]})),
-        )
-        .unwrap();
+    let result = manager.finish_workspace_pull(&key, reply).unwrap();
     assert_eq!(result.files_reported, vec![file.clone()]);
     assert!(manager
         .diagnostics
@@ -175,9 +194,13 @@ fn workspace_pull_preserves_versions_and_refreshes_unchanged_reports() {
     manager
         .finish_workspace_pull(
             &key,
-            Ok(json!({"items": [{
-                "uri": uri_for_path(&file).unwrap(), "version": 9, "kind": "full", "items": []
-            }]})),
+            workspace_reply(
+                &manager,
+                &key,
+                json!({"items": [{
+                    "uri": uri_for_path(&file).unwrap(), "version": 9, "kind": "full", "items": []
+                }]}),
+            ),
         )
         .unwrap();
     assert!(
@@ -237,21 +260,26 @@ fn workspace_pull_from_warming_server_remains_provisional() {
     manager
         .clients
         .insert(key.clone(), sleeping_rust_client(&manager, tmp.path()));
-    manager.finish_workspace_pull(&key, Ok(json!({"items": [{
+    manager.finish_workspace_pull(&key, workspace_reply(&manager, &key, json!({"items": [{
         "uri": uri_for_path(&file).unwrap(), "version": 7, "kind": "full", "resultId": "v1", "items": []
     }]}))).unwrap();
     assert!(manager.diagnostics.entries_for_file(&file)[0].1.provisional);
+    let reply = workspace_reply(
+        &manager,
+        &key,
+        json!({"items": [{
+            "uri": uri_for_path(&file).unwrap(), "version": 7, "kind": "unchanged", "resultId": "v1"
+        }]}),
+    );
     manager.diagnostics.mark_stale_for_file(&file);
-    manager.finish_workspace_pull(&key, Ok(json!({"items": [{
-        "uri": uri_for_path(&file).unwrap(), "version": 7, "kind": "unchanged", "resultId": "v1"
-    }]}))).unwrap();
+    manager.finish_workspace_pull(&key, reply).unwrap();
     assert!(manager.diagnostics.entries_for_file(&file)[0].1.provisional);
     manager
         .clients
         .get_mut(&key)
         .unwrap()
         .set_rust_analyzer_quiescent(true);
-    manager.finish_workspace_pull(&key, Ok(json!({"items": [{
+    manager.finish_workspace_pull(&key, workspace_reply(&manager, &key, json!({"items": [{
         "uri": uri_for_path(&file).unwrap(), "version": 7, "kind": "unchanged", "resultId": "v1"
     }]}))).unwrap();
     assert!(!manager.diagnostics.entries_for_file(&file)[0].1.provisional);

@@ -3486,6 +3486,118 @@ fn watcher_overflow_sends_no_per_file_flood() {
 }
 
 #[test]
+fn workspace_unchanged_reply_does_not_relabel_an_interleaved_report() {
+    for replacement_id in [None, Some(None), Some(Some("B"))] {
+        let (_temp, root, files) = rust_workspace_with_files(&["main.rs"]);
+        let config = Config {
+            project_root: Some(root),
+            ..Config::default()
+        };
+        let mut manager = LspManager::new();
+        manager.override_binary(ServerKind::Rust, fake_server_path());
+        for name in [
+            "AFT_FAKE_LSP_PULL",
+            "AFT_FAKE_LSP_WORKSPACE",
+            "AFT_FAKE_LSP_WS_UNCHANGED",
+        ] {
+            manager.set_extra_env(name, "1");
+        }
+        let keys = manager.ensure_server_for_file(&files[0], &config);
+        assert_eq!(keys.len(), 1, "workspace producer must start");
+        let key = &keys[0];
+        let file = key.root.join("src/main.rs");
+        let diagnostics = |message| {
+            aft::lsp::diagnostics::from_lsp_diagnostics(
+                file.clone(),
+                vec![serde_json::from_value(serde_json::json!({
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                "message": message, "severity": 1
+            })).unwrap()],
+                &key.kind,
+            )
+        };
+        manager
+            .diagnostics_store_mut_for_test()
+            .publish_full_with_provisional(
+                key.clone(),
+                file.clone(),
+                diagnostics("A"),
+                Some("A".into()),
+                Some(1),
+                false,
+            );
+        let manager = parking_lot::Mutex::new(manager);
+        let locks = std::cell::Cell::new(0);
+        let result = aft::lsp::manager::pull_workspace_diagnostics_unlocked(
+            || {
+                let mut manager = manager.lock();
+                locks.set(locks.get() + 1);
+                if locks.get() == 2 {
+                    // The second lock is the completion hook, after the request
+                    // has been sent and awaited without owning the manager.
+                    if let Some(result_id) = replacement_id {
+                        manager
+                            .diagnostics_store_mut_for_test()
+                            .publish_full_with_provisional(
+                                key.clone(),
+                                file.clone(),
+                                diagnostics("B"),
+                                result_id.map(str::to_owned),
+                                Some(2),
+                                false,
+                            );
+                    }
+                }
+                manager
+            },
+            key,
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert_eq!(
+            locks.get(),
+            2,
+            "the interleaving hook must run after request submission"
+        );
+        let current = manager
+            .lock()
+            .diagnostics_store_for_test()
+            .entries_for_file(&file)
+            .into_iter()
+            .find(|(server, _)| **server == *key)
+            .map(|(_, entry)| entry.clone())
+            .expect("the cached report must remain present");
+        if let Some(result_id) = replacement_id {
+            assert_eq!(current.diagnostics[0].message, "B");
+            assert_eq!(
+                current.result_id.as_deref(),
+                result_id,
+                "an unchanged verdict for A must not relabel the replacement report B"
+            );
+            assert_eq!(
+                current.version,
+                Some(2),
+                "the replacement's version must remain intact"
+            );
+            assert!(
+                !result.complete,
+                "a rejected unchanged item is not a complete workspace report"
+            );
+            assert!(!result.files_reported.contains(&file));
+        } else {
+            assert_eq!(current.diagnostics[0].message, "A");
+            assert_eq!(current.result_id.as_deref(), Some("next-A"));
+            assert_eq!(current.version, Some(99));
+            assert!(
+                result.complete,
+                "a matching unchanged reply must remain usable"
+            );
+            assert_eq!(result.files_reported, vec![file]);
+        }
+    }
+}
+
+#[test]
 fn overflowing_document_backlog_leaves_disjoint_unchanged_documents_unsent() {
     let (_temp, root, files) = rust_workspace_with_files(&["main.rs", "probe.rs"]);
     fs::write(root.join("pyproject.toml"), "[project]\nname = \"demo\"\n").unwrap();

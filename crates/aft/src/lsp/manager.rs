@@ -870,11 +870,9 @@ pub struct PullFileResult {
 #[derive(Debug, Clone)]
 pub struct PullWorkspaceResult {
     pub server_key: ServerKey,
-    /// Files for which a Full report was received and cached. Files that came
-    /// back as `Unchanged` are NOT listed here because their cached entry was
-    /// already authoritative.
+    /// Files whose full or unchanged reports were accepted into the cache.
     pub files_reported: Vec<PathBuf>,
-    /// True if the server returned a full response within the timeout.
+    /// True if a full response arrived and every report could be applied.
     pub complete: bool,
     /// True if we cancelled (request timed out before the server responded).
     pub cancelled: bool,
@@ -882,6 +880,28 @@ pub struct PullWorkspaceResult {
     /// other fields are empty and the caller should fall back to file-mode
     /// pull or to push semantics.
     pub supports_workspace: bool,
+}
+
+/// A workspace request keeps the exact result IDs sent to the server because
+/// another push or pull can replace the live cache while the lock is released.
+pub(crate) struct PendingWorkspacePull {
+    request: crate::lsp::client::PendingLspRequest,
+    previous_result_ids: HashMap<PathBuf, String>,
+}
+
+/// The reply retains its request's cache identities through the unlocked wait.
+pub(crate) struct WorkspacePullReply {
+    reply: Result<serde_json::Value, LspError>,
+    previous_result_ids: HashMap<PathBuf, String>,
+}
+
+impl PendingWorkspacePull {
+    fn wait(self, timeout: Duration) -> WorkspacePullReply {
+        WorkspacePullReply {
+            reply: self.request.wait(timeout),
+            previous_result_ids: self.previous_result_ids,
+        }
+    }
 }
 
 pub struct DrainedLspEvents {
@@ -4739,7 +4759,7 @@ impl LspManager {
     pub(crate) fn begin_workspace_pull(
         &mut self,
         server_key: &ServerKey,
-    ) -> Result<Option<crate::lsp::client::PendingLspRequest>, LspError> {
+    ) -> Result<Option<PendingWorkspacePull>, LspError> {
         let supports_workspace = self
             .clients
             .get(server_key)
@@ -4758,7 +4778,7 @@ impl LspManager {
         // Report the result ids of current reports so the server can answer
         // "unchanged" for those files instead of resending every report;
         // an unchanged item leaves the stored report as it is.
-        let previous_result_ids = self
+        let previous_result_ids: Vec<_> = self
             .diagnostics
             .result_ids_for_server(server_key)
             .into_iter()
@@ -4768,6 +4788,10 @@ impl LspManager {
                     value,
                 })
             })
+            .collect();
+        let sent_result_ids = previous_result_ids
+            .iter()
+            .filter_map(|previous| Some((uri_to_path(&previous.uri)?, previous.value.clone())))
             .collect();
         let params = AftWorkspaceDiagnosticParams {
             identifier,
@@ -4780,15 +4804,24 @@ impl LspManager {
             .get_mut(server_key)
             .ok_or_else(|| LspError::ServerNotReady("server not found".into()))?
             .start_request::<AftWorkspaceDiagnosticRequest>(params)
-            .map(Some)
+            .map(|request| {
+                Some(PendingWorkspacePull {
+                    request,
+                    previous_result_ids: sent_result_ids,
+                })
+            })
     }
 
     /// Store the reply to a request sent by [`Self::begin_workspace_pull`].
     pub(crate) fn finish_workspace_pull(
         &mut self,
         server_key: &ServerKey,
-        reply: Result<serde_json::Value, LspError>,
+        reply: WorkspacePullReply,
     ) -> Result<PullWorkspaceResult, LspError> {
+        let WorkspacePullReply {
+            reply,
+            previous_result_ids,
+        } = reply;
         let result = match reply.and_then(|value| {
             serde_json::from_value::<lsp_types::WorkspaceDiagnosticReportResult>(value)
                 .map_err(Into::into)
@@ -4816,7 +4849,7 @@ impl LspManager {
         // Extract the items list. Partial responses are not a complete
         // workspace view, but the partial payload can still contain useful
         // document reports; ingest those while surfacing complete=false.
-        let (items, complete) = match result {
+        let (items, mut complete) = match result {
             lsp_types::WorkspaceDiagnosticReportResult::Report(report) => (report.items, true),
             lsp_types::WorkspaceDiagnosticReportResult::Partial(partial) => (partial.items, false),
         };
@@ -4848,6 +4881,17 @@ impl LspManager {
                     .into_iter()
                     .find(|(stored, _)| **stored == *server_key)
                     .map(|(_, entry)| entry.clone());
+                if matches!(
+                    &report,
+                    lsp_types::DocumentDiagnosticReportKind::Unchanged(_)
+                ) && !previous_result_ids.get(&file).is_some_and(|sent| {
+                    previous.as_ref().and_then(|entry| entry.result_id.as_ref()) == Some(sent)
+                }) {
+                    // An unchanged verdict concerns the report sent with the
+                    // request, not a replacement published while it was in flight.
+                    complete = false;
+                    continue;
+                }
                 self.ingest_document_report_kind(
                     server_key,
                     &file,

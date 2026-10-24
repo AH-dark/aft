@@ -1306,10 +1306,13 @@ pub(crate) fn main() -> io::Result<()> {
                     // a synthetic URI. Test variants:
                     //   AFT_FAKE_LSP_WS_TIMEOUT=1 → never reply (server hangs)
                     //   AFT_FAKE_LSP_WS_PARTIAL=1 → reply with empty items
+                    //   AFT_FAKE_LSP_WS_UNCHANGED=1 → unchanged reports with fresh result IDs
                     let force_timeout =
                         std::env::var("AFT_FAKE_LSP_WS_TIMEOUT").ok().as_deref() == Some("1");
                     let force_partial =
                         std::env::var("AFT_FAKE_LSP_WS_PARTIAL").ok().as_deref() == Some("1");
+                    let force_unchanged =
+                        std::env::var("AFT_FAKE_LSP_WS_UNCHANGED").ok().as_deref() == Some("1");
 
                     if force_timeout {
                         // Never respond — emulates a server still analyzing.
@@ -1319,6 +1322,17 @@ pub(crate) fn main() -> io::Result<()> {
 
                     let items = if force_partial {
                         json!([])
+                    } else if force_unchanged {
+                        let previous = params
+                            .as_ref()
+                            .and_then(|value| value.get("previousResultIds"))
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        Value::Array(previous.into_iter().map(|previous| json!({
+                            "kind": "unchanged", "uri": previous["uri"],
+                            "resultId": format!("next-{}", previous["value"].as_str().unwrap_or_default()), "version": 99
+                        })).collect())
                     } else {
                         json!([{
                             "kind": "full",
