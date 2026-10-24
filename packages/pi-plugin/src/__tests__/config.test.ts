@@ -1234,26 +1234,26 @@ describe("loadAftConfig", () => {
     expect(result.stderr).not.toContain("Ignoring");
   });
 
-  test("bash.env is user-only and blocked values are refused at load", () => {
+  test("bash.env keeps the user map, carries the project map, and refuses blocked names", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
-      JSON.stringify({ bash: { env: { TZ: "UTC", AFT_PI_ENV_TEST: "user-value" } } }),
+      JSON.stringify({ bash: { env: { TZ: "UTC", PI_ENV_TEST: "user-value" } } }),
     );
     writeFileSync(
       fixture.projectConfigPath,
-      JSON.stringify({ bash: { env: { TZ: "Mars", AFT_PI_PROJECT_ENV_TEST: "project-value" } } }),
+      JSON.stringify({ bash: { env: { TZ: "Mars", PI_PROJECT_ENV_TEST: "project-value" } } }),
     );
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
-    expect(JSON.parse(result.stdout).bash.env).toEqual({
-      TZ: "UTC",
-      AFT_PI_ENV_TEST: "user-value",
-    });
-    expect(result.stderr).toContain("bash.env");
+    // A project's values are applied by the engine only while the project is
+    // trusted, so the loader keeps them in `project_env`.
+    const bash = JSON.parse(result.stdout).bash;
+    expect(bash.env).toEqual({ TZ: "UTC", PI_ENV_TEST: "user-value" });
+    expect(bash.project_env).toEqual({ TZ: "Mars", PI_PROJECT_ENV_TEST: "project-value" });
 
     const candidate = { bash: { env: { PYTHONPATH: "/tmp/injected" } } };
     writeFileSync(fixture.userConfigPath, JSON.stringify(candidate));

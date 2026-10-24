@@ -2001,7 +2001,9 @@ mod tests {
         task.output_preview = format!("line 1\nline 2\n{trailer}");
         task.bash_output_list_envelope = Some(envelope);
         let mut response = foreground_result_response("req", task);
-        let keys = ["API_KEY".to_string()];
+        let keys = [
+            "Configured bash.env keys applied (values not shown): API_KEY (user).".to_string(),
+        ];
 
         append_bash_reply_notices(
             &mut response,

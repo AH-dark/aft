@@ -997,12 +997,51 @@ const CASES: ParityCase[] = [
   { name: "bash_db_schema_hints_user_off", user: { bash: { db_schema_hints: false } } },
   {
     name: "bash_env_user_only",
-    user: { bash: { env: { TZ: "UTC", AFT_PARITY_USER_ENV: "user-value" } } },
-    project: { bash: { env: { TZ: "Mars", AFT_PARITY_PROJECT_ENV: "project-value" } } },
+    user: { bash: { env: { TZ: "UTC", PARITY_USER_ENV: "user-value" } } },
+    project: { bash: { env: { TZ: "Mars", PARITY_PROJECT_ENV: "project-value" } } },
   },
   {
-    name: "bash_env_project_only_dropped",
-    project: { bash: { env: { AFT_PARITY_PROJECT_ENV: "project-value" } } },
+    // A project's `bash.env` is carried separately from the user map; the
+    // engine applies it only while the project is trusted.
+    name: "bash_env_project_tier",
+    project: { bash: { env: { PARITY_PROJECT_ENV: "project-value" } } },
+  },
+  {
+    // A harness block merges its `bash.env` names into the base map instead of
+    // replacing it.
+    name: "bash_env_harness_merges_names",
+    harness: "opencode",
+    user: {
+      bash: { env: { PARITY_BASE_ENV: "base" } },
+      harnesses: { opencode: { bash: { env: { PARITY_HARNESS_ENV: "harness" } } } },
+    },
+  },
+  {
+    // Credentials may be set from user config and are refused from project
+    // config.
+    name: "bash_env_project_credential_refused",
+    user: { bash: { env: { PARITY_USER_ENV: "user-value" } } },
+    project: { bash: { env: { PARITY_API_KEY: "project-value" } } },
+  },
+  {
+    name: "bash_env_project_credential_refused_in_harness",
+    harness: "pi",
+    project: { harnesses: { pi: { bash: { env: { PARITY_GITHUB_TOKEN: "x" } } } } },
+  },
+  {
+    name: "bash_env_project_refused_control_name",
+    project: { bash: { env: { AFT_INTERNAL_LINUX_SCOPE: "1" } } },
+  },
+  {
+    // A refused name rejects the candidate at either tier, whether or not the
+    // project is trusted.
+    name: "bash_env_user_refused_lookup_root",
+    user: { bash: { env: { XDG_CONFIG_HOME: "/tmp/elsewhere" } } },
+  },
+  {
+    name: "bash_env_runon_env_user_only",
+    user: { bash: { env: { TZ: "UTC" }, runon_env: ["TZ"] } },
+    project: { bash: { env: { PARITY_PROJECT_ENV: "v" }, runon_env: ["PARITY_PROJECT_ENV"] } },
   },
   {
     name: "idle_user_tier",

@@ -517,7 +517,13 @@ function buildSchema(): Record<string, unknown> {
                 type: "object",
                 additionalProperties: { type: "string" },
                 description:
-                  "Fixed shell environment variables from user config only. Project config cannot set this map; per-call env values override it. Loader, shell/interpreter startup hooks, PATH, and other protected keys are rejected.",
+                  "Fixed environment variables for local shell commands, at either tier. A project's names apply only while the project is trusted (aft doctor filters trust; a linked worktree inherits its main checkout); a user value wins when both tiers set the same name, and the first bash reply in a session names each applied variable with its tier, never its value. Per-call env values and the command's own export both override these. Names that hijack startup, redirect lookup roots, inject into interpreters or Git, or drive AFT, the sandbox, or a build worker are rejected at every tier; credentials, identity, proxy, and TLS-trust names are rejected at the project tier. These values never reach a runon build-server job unless a user name is listed in bash.runon_env.",
+              },
+              runon_env: {
+                type: "array",
+                items: { type: "string", minLength: 1 },
+                description:
+                  "User-only list of bash.env names that are also sent to a runon build-server job. Every other bash.env value applies to local commands only; a project's values are never sent, even when their name is listed. Unlisted names appear in the job's \"does not receive\" disclosure.",
               },
             },
             additionalProperties: false,

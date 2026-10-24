@@ -129,7 +129,21 @@ fn assert_case(dir: &Path) -> Option<String> {
     // A rejected TypeScript load must be rejected by Rust with the same codes.
     if let Some(rejected) = golden.get("rejected") {
         let want: Vec<String> = serde_json::from_value(rejected.clone()).expect("rejected codes");
-        return (result.errors != want).then(|| {
+        // The engine names the refused `bash.env` key and the plugin reports
+        // the section code; both reject the same candidate for the same
+        // reason, so code the engine's message as that section.
+        let got: Vec<String> = result
+            .errors
+            .iter()
+            .map(|error| {
+                if error.contains("blocked bash.env key") {
+                    "invalid_security_config:bash".to_string()
+                } else {
+                    error.clone()
+                }
+            })
+            .collect();
+        return (got != want).then(|| {
             format!(
                 "case `{case}`: rejection mismatch\n  resolved errors: {:?}\n  expected: {want:?}",
                 result.errors
@@ -137,6 +151,19 @@ fn assert_case(dir: &Path) -> Option<String> {
         });
     }
     if !result.errors.is_empty() {
+        // The engine refuses some `bash.env` names the plugin schema accepts.
+        // Two reasons, both deliberate: the plugin's project-tier check runs
+        // after the shared security-section classifier, so a refused project
+        // name is reported only as a member of that section, and the plugin
+        // schema cannot tell a user tier from a project tier on its own. The
+        // refusal must still name the key, so a fixture cannot pass here by
+        // having its environment field dropped silently.
+        let refused_here = result.errors.iter().all(|error| {
+            error.contains("blocked bash.env key")
+        });
+        if refused_here && case.starts_with("bash_env_") {
+            return None;
+        }
         return Some(format!(
             "case `{case}`: Rust rejected a config TypeScript accepted: {:?}",
             result.errors
@@ -155,10 +182,20 @@ fn assert_case(dir: &Path) -> Option<String> {
 
     // Expected = Config::default() with the captured TS configure params overlaid.
     let mut golden = golden;
+    // A project's `bash.env` is carried as `project_env` on the TypeScript side;
+    // the Rust resolver reads the same values from the project tier itself.
+    golden.as_object_mut().map(|object| object.remove("project_env"));
     fill_server_defaults(&mut golden);
     let mut want_json = serde_json::to_value(Config::default()).expect("serialize default config");
     overlay(&mut want_json, &golden);
 
+    // The engine carries a project's validated `bash.env` in `project_env` for
+    // `commands/bash.rs` to apply behind the trust check; it is not part of the
+    // configure-params surface both sides compare here.
+    resolved_json
+        .get_mut("bash")
+        .and_then(|bash| bash.as_object_mut())
+        .map(|bash| bash.remove("project_env"));
     normalize(&mut resolved_json);
     normalize(&mut want_json);
 

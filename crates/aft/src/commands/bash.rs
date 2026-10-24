@@ -588,8 +588,20 @@ fn project_env_trusted(ctx: &AppContext) -> bool {
     let Some(root) = ctx.config().project_root.clone() else {
         return false;
     };
-    let storage = crate::bash_background::task_storage_dir(ctx);
-    crate::compress::trust::is_project_env_trusted(Some(&storage), &root)
+    // `aft doctor filters trust` writes the trust file under the configured
+    // storage directory; a routed session's task storage sits one segment
+    // deeper, so both are checked and the user's decision is found either way.
+    let staged = crate::bash_background::task_storage_dir(ctx);
+    if crate::compress::trust::is_project_env_trusted(Some(&staged), &root) {
+        return true;
+    }
+    ctx.config()
+        .storage_dir
+        .as_ref()
+        .filter(|configured| **configured != staged)
+        .is_some_and(|configured| {
+            crate::compress::trust::is_project_env_trusted(Some(configured), &root)
+        })
 }
 
 fn blocked_env_var(env: &HashMap<String, String>) -> Option<&str> {
@@ -1835,14 +1847,19 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let ctx = spawn_test_context(&project, storage.path());
 
+        // A per-call test-thread value cannot defeat the budget: the names are
+        // refused before the launch, so the worker still gets its budget.
         let mut explicit = worker_thread_output_request("budget-explicit");
         explicit.params["params"]["env"] = json!({
             "NEXTEST_TEST_THREADS": "13",
             "RUST_TEST_THREADS": "17"
         });
+        let refused = crate::bash_background::with_worker_preset(true, || handle(&explicit, &ctx));
+        assert!(!refused.success, "{:?}", refused.data);
+        assert_eq!(refused.data["code"], "blocked_env_var");
         assert_eq!(
-            bash_output_for_test(&ctx, &project, &explicit, true),
-            "13|17"
+            bash_output_for_test(&ctx, &project, &worker_thread_output_request("budget"), true),
+            "8|8"
         );
 
         let mut head = worker_thread_output_request("budget-head");
@@ -1864,10 +1881,6 @@ mod tests {
             "19|23"
         );
         assert_eq!(bash_output_for_test(&ctx, &project, &head, false), "19|23");
-        assert_eq!(
-            bash_output_for_test(&ctx, &project, &explicit, true),
-            "13|17"
-        );
     }
 
     #[cfg(unix)]
@@ -2624,8 +2637,8 @@ mod tests {
         let launcher = PathBuf::from("/bin/sh");
         crate::executable_cache::write_executable_with_mode(
             &launcher_script,
-            br#"printf '%s\n' "$0" "$@" > "$AFT_TEST_LAUNCH_ARGS.tmp"
-mv -f "$AFT_TEST_LAUNCH_ARGS.tmp" "$AFT_TEST_LAUNCH_ARGS"
+            br#"printf '%s\n' "$0" "$@" > "$BASHENV_TEST_LAUNCH_ARGS.tmp"
+mv -f "$BASHENV_TEST_LAUNCH_ARGS.tmp" "$BASHENV_TEST_LAUNCH_ARGS"
 [ "$1" = "--profile-json" ] || exit 92
 [ -n "$2" ] || exit 93
 [ "$3" = "--failure-fd" ] || exit 95
@@ -2657,7 +2670,7 @@ exec "$@"
             "params": {
                 "command": "printf launcher-wrapped",
                 "compressed": false,
-                "env": { "AFT_TEST_LAUNCH_ARGS": args_log.to_string_lossy() },
+                "env": { "BASHENV_TEST_LAUNCH_ARGS": args_log.to_string_lossy() },
             },
         }))
         .unwrap();

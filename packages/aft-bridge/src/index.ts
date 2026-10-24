@@ -9,6 +9,17 @@
 
 // --- logger contract ---
 export { setActiveLogger } from "./active-logger.js";
+// --- bash.env deny list (shared by both plugin hosts and the engine) ---
+export {
+  BLOCKED_BASH_ENV_NAMES,
+  BLOCKED_BASH_ENV_PREFIXES,
+  isBlockedBashEnvKey,
+  isProjectBlockedBashEnvKey,
+  PROJECT_ONLY_BLOCKED_BASH_ENV_NAMES,
+  PROJECT_ONLY_BLOCKED_BASH_ENV_PREFIXES,
+  PROJECT_ONLY_BLOCKED_BASH_ENV_SUBSTRINGS,
+  PROJECT_ONLY_NETWORK_BLOCKED_BASH_ENV_NAMES,
+} from "./bash-env.js";
 // --- bash output hints (shared by both plugin hosts) ---
 export {
   formatForegroundResult,

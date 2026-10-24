@@ -207,7 +207,7 @@ mod tests {
         let disclosure = Disclosure::build(&applied, &[], false, &RemoteEnvPlan::default());
         let text = disclosure.lines.join("\n");
         assert!(
-            text.contains("TZ (user), IBToolNeverDeque (project)"),
+            text.contains("IBToolNeverDeque (project), TZ (user)"),
             "{text}"
         );
         assert!(!text.contains("UTC"), "{text}");

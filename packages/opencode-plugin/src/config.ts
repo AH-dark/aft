@@ -8,6 +8,8 @@ import {
   DEFAULT_DISABLED_TOOLS,
   DEFAULT_WORKER_WAIT_MAX_MS,
   deliverMigrationNoticeOnce,
+  isBlockedBashEnvKey,
+  isProjectBlockedBashEnvKey,
   legacyConfigNoticeMessage,
   legacyProjectConfigLocationNotice,
   MIN_WORKER_WAIT_MAX_MS,
@@ -304,47 +306,41 @@ const ExperimentalConfigSchema = z.object({
  *   - `bash: false`    → runtime gate off: bash operations report `bash_disabled`
  *   - `bash: { ... }`  → partial override; missing sub-keys default to true
  */
-const BLOCKED_BASH_ENV_NAMES = new Set([
-  "LD_PRELOAD",
-  "LD_LIBRARY_PATH",
-  "LD_AUDIT",
-  "DYLD_INSERT_LIBRARIES",
-  "DYLD_LIBRARY_PATH",
-  "DYLD_FALLBACK_LIBRARY_PATH",
-  "BASH_ENV",
-  "ENV",
-  "IFS",
-  "PATH",
-  "SHELLOPTS",
-  "BASHOPTS",
-  "PROMPT_COMMAND",
-  "PS4",
-  "PYTHONSTARTUP",
-  "PYTHONPATH",
-  "PYTHONHOME",
-  "PERL5OPT",
-  "PERL5LIB",
-  "PERLLIB",
-  "PERL5DB",
-  "RUBYOPT",
-  "RUBYLIB",
-  "NODE_OPTIONS",
-  "GCONV_PATH",
-  "LOCPATH",
-  "NLSPATH",
-  "HOSTALIASES",
-  "RESOLV_HOST_CONF",
-]);
-
-function isBlockedBashEnvKey(key: string): boolean {
-  const normalized = process.platform === "win32" ? key.toUpperCase() : key;
-  return (
-    BLOCKED_BASH_ENV_NAMES.has(normalized) ||
-    normalized.startsWith("LD_") ||
-    normalized.startsWith("DYLD_") ||
-    normalized.startsWith("BASH_FUNC_")
-  );
-}
+/**
+ * The `bash.env` map. A name is refused at the tier it was written at: the
+ * user's own file may set credentials and proxy settings, while a project may
+ * not (and neither tier may set the names that hijack startup, redirect a
+ * lookup root, corrupt Git, or drive AFT and its sandbox). Refusal rejects the
+ * candidate instead of dropping a variable silently.
+ */
+const BashEnvSchema = z.record(z.string(), z.string()).superRefine((env, context) => {
+  const names = Object.keys(env);
+  for (const key of names) {
+    if (isBlockedBashEnvKey(key)) {
+      context.addIssue({
+        code: "custom",
+        path: [key],
+        message: `bash.env key ${key} is blocked because it can alter startup or protected process state`,
+      });
+    }
+  }
+  // Two names that differ only by case collapse into one on Windows, so the
+  // file would mean different things on different machines.
+  const seen = new Map<string, string>();
+  for (const key of names) {
+    const folded = key.toUpperCase();
+    const first = seen.get(folded);
+    if (first !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: [key],
+        message: `bash.env keys ${first} and ${key} differ only by case; on Windows they would be the same variable`,
+      });
+    } else {
+      seen.set(folded, key);
+    }
+  }
+});
 
 const BashFeaturesSchema = z.object({
   /** Runtime gate for every bash-execution operation. Default: true. */
@@ -406,21 +402,14 @@ const BashFeaturesSchema = z.object({
   // Pi-only registration fallback. OpenCode accepts this shared config key but
   // never registers a PowerShell tool.
   powershell_tool: z.boolean().optional(),
-  /** Fixed extra variables passed to each bash request; user tier only. */
-  env: z
-    .record(z.string(), z.string())
-    .superRefine((env, context) => {
-      for (const key of Object.keys(env)) {
-        if (isBlockedBashEnvKey(key)) {
-          context.addIssue({
-            code: "custom",
-            path: [key],
-            message: `bash.env key ${key} is blocked because it can alter startup or protected process state`,
-          });
-        }
-      }
-    })
-    .optional(),
+  /**
+   * Fixed extra variables for each local bash command. User and project
+   * tiers both set it; a project's names apply only while the project is
+   * trusted, and a user value wins for the same name.
+   */
+  env: BashEnvSchema.optional(),
+  /** User-only names whose `bash.env` value is also sent to a `runon` job. */
+  runon_env: z.array(z.string().min(1)).optional(),
 });
 
 const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
@@ -824,6 +813,13 @@ function applyActiveHarnessOverride(config: AftConfig, trusted: boolean): AftCon
   const merged = { ...base, ...override } as AftConfigFields;
   if (base.storage) merged.storage = base.storage;
   else delete merged.storage;
+=
+  // A harness block's `bash.env` merges names into the file's base map
+  // instead of replacing it, so adding one name under `harnesses.<name>`
+  // cannot silently drop every base name.
+  if (override.bash !== undefined) {
+    merged.bash = mergeBashConfig(base.bash, override.bash);
+  }
   const disabled = unionDisabledTools(base.disabled_tools, override.disabled_tools);
   if (disabled === undefined) delete merged.disabled_tools;
   else merged.disabled_tools = disabled;
@@ -998,7 +994,8 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
       config.bash.memory_limit_mib !== undefined ||
       config.bash.disclaim_privacy !== undefined ||
       config.bash.powershell_tool !== undefined ||
-      config.bash.env !== undefined)
+      config.bash.env !== undefined ||
+      config.bash.runon_env !== undefined)
   ) {
     overrides.bash = {
       ...(config.bash.disclaim_privacy !== undefined
@@ -1033,6 +1030,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
         ? { powershell_tool: config.bash.powershell_tool }
         : {}),
       ...(config.bash.env !== undefined ? { env: config.bash.env } : {}),
+      ...(config.bash.runon_env !== undefined ? { runon_env: config.bash.runon_env } : {}),
     };
   }
   Object.assign(overrides, resolveLspConfigForConfigure(config));
@@ -1479,6 +1477,19 @@ function unknownCacheConfigKey(config: Record<string, unknown>): string | undefi
   return undefined;
 }
 
+=
+/**
+ * Throw when a project tier sets a `bash.env` name it may not set: credentials,
+ * identity, network/TLS trust, or any name refused at every tier.
+ */
+function rejectProjectRefusedBashEnv(config: AftConfig, configPath: string): void {
+  const bash = config.bash;
+  if (typeof bash !== "object" || bash === null) return;
+  const refused = Object.keys(bash.env ?? {}).filter((name) => isProjectBlockedBashEnvKey(name));
+  if (refused.length === 0) return;
+  throw new ConfigRejectedError(["invalid_security_config:bash"], configPath);
+}
+
 function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftConfig | null {
   let cleanConfig: Record<string, unknown>;
   try {
@@ -1571,7 +1582,13 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
     // harness block and the project tier are merged.
     parsed = { ...parsed, disabled_tools: [...DEFAULT_DISABLED_TOOLS] };
   }
-  return applyActiveHarnessOverride(parsed, tier === "user");
+  const merged = applyActiveHarnessOverride(parsed, tier === "user");
+  // A project's `bash.env` must pass the project strength of the deny list
+  // even though its values only apply while the project is trusted: a refused
+  // name rejects the candidate at the tier it was written at, base block or
+  // active harness block alike.
+  if (tier === "project") rejectProjectRefusedBashEnv(merged, configPath);
+  return merged;
 }
 
 // ---------------------------------------------------------------------------
@@ -1800,11 +1817,39 @@ function mergeBashConfig(
 
   const base = expand(baseBash);
   const override = expand(overrideBash);
-  const merged = { ...base, ...override };
+  const merged: Record<string, unknown> = { ...base, ...override };
   if (typeof base.memory_limit_mib === "number" && typeof override.memory_limit_mib === "number") {
     merged.memory_limit_mib = Math.min(base.memory_limit_mib, override.memory_limit_mib);
   }
+  // `bash.env` maps merge by name: an overriding block adds or replaces single
+  // names and never removes a base name, the way `disabled_tools` only adds.
+  // Two names that differ only by case are one variable on Windows, so the
+  // overriding spelling replaces the base spelling from the comparable set.
+  const env = mergeBashEnvMaps(base.env, override.env);
+  if (env !== undefined) merged.env = env;
+  else delete merged.env;
   return merged;
+}
+
+/**
+ * Merge two `bash.env` maps by name. The override adds or replaces names and
+ * never removes a base name; a name differing only by case from a base name
+ * replaces it, because on Windows the two spellings are one variable.
+ */
+function mergeBashEnvMaps(base: unknown, override: unknown): Record<string, string> | undefined {
+  const entriesOf = (value: unknown): [string, string][] =>
+    isConfigRecord(value)
+      ? Object.entries(value).filter(
+          (entry): entry is [string, string] => typeof entry[1] === "string",
+        )
+      : [];
+  const baseEntries = entriesOf(base);
+  const overrideEntries = entriesOf(override);
+  if (baseEntries.length === 0 && overrideEntries.length === 0) return undefined;
+  const merged = new Map<string, [string, string]>();
+  for (const [name, value] of baseEntries) merged.set(name.toLowerCase(), [name, value]);
+  for (const [name, value] of overrideEntries) merged.set(name.toLowerCase(), [name, value]);
+  return Object.fromEntries(merged.values());
 }
 
 function mergeExperimentalConfig(
@@ -1952,8 +1997,8 @@ function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[]
   }
   if (typeof override.bash === "object" && override.bash.disclaim_privacy === false)
     stripped.push("bash.disclaim_privacy");
-  if (typeof override.bash === "object" && override.bash.env !== undefined)
-    stripped.push("bash.env");
+  if (typeof override.bash === "object" && override.bash.runon_env !== undefined)
+    stripped.push("bash.runon_env");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
   if (override.pi?.external_access_ask === false) stripped.push("pi.external_access_ask");
@@ -2018,13 +2063,28 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const projectBash = typeof override.bash === "object" ? { ...override.bash } : override.bash;
   if (typeof projectBash === "object" && projectBash.disclaim_privacy !== true)
     delete projectBash.disclaim_privacy;
+  // A project's `bash.env` is carried as `project_env`, never merged into the
+  // user map: the engine applies it only while the project is trusted, and a
+  // user value wins for the same name. `bash.runon_env` is user-only.
+  const projectEnv =
+    typeof projectBash === "object" && isConfigRecord(projectBash.env)
+      ? Object.fromEntries(
+          Object.entries(projectBash.env).filter(
+            (entry): entry is [string, string] => typeof entry[1] === "string",
+          ),
+        )
+      : undefined;
   // Strip only the weakening direction before the usual field-wise merge.
   if (typeof projectBash === "object") {
     if (projectBash.changed_files !== "off") delete projectBash.changed_files;
     delete projectBash.runon_enabled;
+    delete projectBash.runon_env;
     delete projectBash.env;
   }
   const bash = mergeBashConfig(base.bash, projectBash);
+  if (projectEnv !== undefined && Object.keys(projectEnv).length > 0 && bash !== undefined) {
+    (bash as Record<string, unknown>).project_env = projectEnv;
+  }
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
   const worktree = mergeWorktreeConfig(base.worktree, override.worktree);
   const sandbox = mergeSandboxConfig(base.sandbox, override.sandbox);
