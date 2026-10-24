@@ -13765,6 +13765,7 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         init_git_fixture(project.path());
         let canonical_root = project.path().canonicalize().unwrap();
+        let fills = crate::views::semantic_runtime::FillObserver::new(canonical_root.clone());
         let source = canonical_root.join("tracked.rs");
         let ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
@@ -13838,26 +13839,35 @@ mod tests {
         }
 
         server.release_responses();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut polls = 0u32;
-        while !ctx.checkout_semantic_runtime().is_some_and(|runtime| {
+        // A held request may time out before release. Observe the worker's
+        // completion after its normal retry/backoff, not an embedding latency budget.
+        ctx.checkout_semantic().wake();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut events = Vec::new();
+        loop {
+            let event = fills.next_until(deadline).unwrap_or_else(|error| {
+                panic!(
+                    "semantic fill completion missing after response release ({error:?}); \
+                     events={events:?}; lane={}",
+                    ctx.checkout_semantic().describe()
+                )
+            });
+            events.push(event);
+            if event == "settled" {
+                break;
+            }
+        }
+        let complete = ctx.checkout_semantic_runtime().map(|runtime| {
             runtime
                 .search(&[1.0, 0.0, 0.0], 10, &|_| true)
-                .is_ok_and(|answer| answer.complete())
-        }) {
-            assert!(
-                Instant::now() < deadline,
-                "the semantic view never finished after the held fill was released"
-            );
-            // A fill that timed out while held waits for the next wake; wake
-            // it now and then, never so often that its quiet window restarts
-            // before it ends.
-            polls += 1;
-            if polls % 20 == 0 {
-                ctx.checkout_semantic().wake();
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+                .map(|answer| answer.complete())
+        });
+        assert!(
+            matches!(complete, Some(Ok(true))),
+            "semantic fill settled without a complete view; events={events:?}; \
+             lane={}; search={complete:?}",
+            ctx.checkout_semantic().describe()
+        );
     }
 
     #[test]
