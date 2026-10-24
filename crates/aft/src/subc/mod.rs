@@ -12474,6 +12474,7 @@ pub(crate) mod test_support {
                 crate::bash_background::HardKill::After(Duration::from_secs(
                     if case == "hard-timeout" { 2 } else { 60 },
                 )),
+                None,
                 crate::bash_background::task_storage_dir(&ctx),
                 1,
                 false,
@@ -15846,6 +15847,7 @@ mod tests {
                 storage.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                None,
                 storage.path().to_path_buf(),
                 8,
                 true,

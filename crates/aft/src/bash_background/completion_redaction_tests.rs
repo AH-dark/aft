@@ -454,6 +454,7 @@ fn bash_background_completion_masks_per_call_env_values() {
             fixture.path().into(),
             HashMap::from([("DEPLOY_tOkEn".into(), value.into())]),
             super::super::HardKill::After(Duration::from_secs(30)),
+            None,
             fixture.path().into(),
             super::super::TaskSlot::Background { max: 10 },
             true,
@@ -690,6 +691,7 @@ fn bash_background_completion_redaction_preserves_pipeline_failure_warning() {
                 fixture.path().into(),
                 HashMap::new(),
                 super::super::HardKill::After(Duration::from_secs(30)),
+                None,
                 fixture.path().into(),
                 super::super::TaskSlot::Background { max: 10 },
                 true,
@@ -750,6 +752,7 @@ fn bash_background_completion_redaction_preserves_short_recovery_trailers() {
             stderr_path: cache.stderr_path.clone(),
             include_stderr_path: false,
             artifact_access: cache.artifact_access.clone(),
+            failed_exit: false,
         });
         recovery.byte_truncated = true;
         recovery.had_inner_drop = true;

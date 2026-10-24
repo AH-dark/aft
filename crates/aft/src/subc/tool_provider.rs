@@ -498,6 +498,22 @@ pub(super) fn validate_catalog_request(
 ) -> Result<(CatalogRequest, CatalogPreset), ErrorBody> {
     let request: CatalogRequest = serde_json::from_value(body)
         .map_err(|e| errors::invalid_request("arguments", e.to_string()))?;
+    // The tool-provider contract reads a system-text item's preset as
+    // optional, where a missing preset asks for the provider's default text.
+    // AFT does not offer default text (its manifest does not declare
+    // system-text-default/v1), so it keeps refusing such an item with the
+    // error the contract's decoder gave while the preset was required. That
+    // decoder refused it before any other check ran, so this check runs first.
+    if request
+        .system_text
+        .as_ref()
+        .is_some_and(|item| item.preset.is_none())
+    {
+        return Err(errors::invalid_request(
+            "arguments",
+            "missing field `preset`",
+        ));
+    }
     let preset = CatalogPreset::parse("preset", request.preset.as_deref())?;
     if let Some((key, _)) = request.params.iter().next() {
         return Err(errors::invalid_request(
@@ -506,7 +522,9 @@ pub(super) fn validate_catalog_request(
         ));
     }
     if let Some(item) = &request.system_text {
-        if item.preset != "broca" && item.preset != preset.name() {
+        // Checked above: a system-text item without a preset never gets here.
+        let text_preset = item.preset.as_deref().unwrap_or_default();
+        if text_preset != "broca" && text_preset != preset.name() {
             return Err(errors::invalid_request(
                 "system_text.preset",
                 format!(
@@ -516,7 +534,7 @@ pub(super) fn validate_catalog_request(
             ));
         }
         for (key, value) in &item.params {
-            if key != "worker" || !value.is_boolean() || item.preset != "broca" {
+            if key != "worker" || !value.is_boolean() || text_preset != "broca" {
                 return Err(errors::invalid_request(
                     &format!("system_text.params.{key}"),
                     "unsupported system-text parameter",
@@ -3709,6 +3727,30 @@ mod tests {
                     &catalog(json!({"system_text": {"preset": preset}}), &[], true).unwrap_err()
                 ),
                 Some("system_text.preset")
+            );
+        }
+    }
+
+    /// AFT offers no default system text, so a system-text item without a
+    /// preset is refused, byte for byte as it was while the contract's decoder
+    /// still required the preset.
+    #[test]
+    fn system_text_without_a_preset_is_refused_as_before() {
+        for body in [
+            json!({"system_text": {"params": {}}}),
+            json!({"preset": "worker", "system_text": {"params": {"worker": true}}}),
+            // The old decoder refused the missing preset before the unknown
+            // catalog preset was ever looked at.
+            json!({"preset": "bogus", "system_text": {"params": {}}}),
+        ] {
+            let error = catalog(body, &[], true).unwrap_err();
+            assert_eq!(
+                serde_json::to_value(&error).unwrap(),
+                serde_json::to_value(errors::invalid_request(
+                    "arguments",
+                    "missing field `preset`"
+                ))
+                .unwrap()
             );
         }
     }

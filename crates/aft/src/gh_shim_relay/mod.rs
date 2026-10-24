@@ -483,6 +483,7 @@ pub(crate) async fn read_validated_request<T: RelayTransport>(
         schema_pin: None,
         origin: None,
         preset: None,
+        output_refs: None,
     })
     .expect("a read tool call serializes to JSON");
     let reply = match transport
@@ -637,6 +638,7 @@ fn github_call(arguments: Value) -> Value {
         schema_pin: None,
         origin: None,
         preset: None,
+        output_refs: None,
     })
     .expect("a tool call serializes to JSON")
 }

@@ -28,6 +28,12 @@ The list covers a time window, so changes made by other processes in that window
 
 On Linux, user config may set `bash.linux_scope: true` to launch non-PTY tool shells through `systemd-run --user --scope --collect --quiet`. The default is `false`. AFT uses the scope only when `systemd-run` exists and the user manager is reachable; otherwise it falls back to the normal process-group-isolated spawn and writes one informational log line. Native-sandbox launches also use the normal spawn because their launcher cannot contact the user manager. Project config cannot enable or disable this host-level containment option.
 
+`bash.memory_limit_mib` optionally caps aggregate memory for each local command, including foreground, background, and PTY commands. It is off by default; set a positive integer in MiB (for example, `4096` for 4 GiB; maximum `4294967295`) in user config. Projects may tighten the cap, never raise or remove it. Changes affect future commands; there is no per-call override. Remote `runon` jobs use the build server's own limits and are not covered.
+
+- **Linux:** cgroup v2 `memory.max` (using a delegated transient systemd user scope when needed); if unavailable, the result explicitly names the process-group RSS watcher fallback.
+- **Windows:** a job-object aggregate memory limit refuses allocations; AFT stops the job when a limit notification or peak accounting confirms the cap was hit.
+- **macOS:** a physical-footprint process-group watcher samples every 500 ms. Fast allocations can overshoot for a fraction of a second, and processes that leave the group are not counted. The Linux watcher has the same limits. Watcher scans are bounded to 4096 processes and stop the command explicitly if accounting cannot complete.
+
 On macOS, `bash.disclaim_privacy: true` makes agent shells (including background, PTY, and governed `gh` commands) responsible for their own privacy permissions instead of inheriting the supervisor's grants. It defaults to `false`; user config controls it and project config may only turn it on. It is live-reloadable for future commands, not already-running children, and accepted but inert on other platforms. Disclaimed shells cannot rely on inherited access to protected folders such as `~/Downloads`; agents should use AFT's in-process `read` tool for those files (`grep` and `glob` are also unaffected). If macOS cannot apply the responsibility attribute, AFT refuses the command with `privacy disclaim unavailable` rather than running it with inherited grants. Effective per-root settings appear in health, and the first disclaimed command logs an informational message per session.
 
 Background-task completion and pattern-watch notices are delivered only to the session that started the task; other sessions bound to the same project may still inspect or stop the task by ID.
@@ -652,6 +658,18 @@ The removed `opencode.server_url` and `opencode.server_password_env` settings no
 With `subc.connection_file` set, background shell completions and pattern matches wake their owning OpenCode 2 session through a session-scoped subscription. Notifications remain unacknowledged until the host admits the wake.
 
 After a Location reload or host restart, AFT restores subscriptions in the background for up to 20 of that Location directory's newest sessions whose last update was within 24 hours. Recovery is sequential and does not delay Location startup or inspect another workspace's sessions. Sessions outside that window or cap recover on their next tool call or prompt.
+
+## OpenCode TUI preferences
+
+The AFT sidebar and the OpenCode 2 prompt footer read their display settings from the `aft` entry of OpenCode's shared `tui-preferences.jsonc`, not from `aft.jsonc`. The file is `$OPENCODE_CONFIG_DIR/tui-preferences.jsonc` when that variable is set, otherwise `$XDG_CONFIG_HOME/opencode/tui-preferences.jsonc` (default `~/.config/opencode/tui-preferences.jsonc`); `OPENCODE_TUI_PREFERENCES_FILE` names a different file. Edits take effect while OpenCode is running, without a restart.
+
+`footer` (default `true`) controls the AFT health line in the OpenCode 2 prompt footer (`AFT E0 W0 | D0 U0 C1 | T0`). Set it to `false` to remove the line; the sidebar and `/aft-status` are unaffected. A value other than `true` or `false` is ignored and the line stays on. OpenCode 1 has no AFT footer line, so the key has no effect there.
+
+```jsonc
+{
+  "aft": { "footer": false }
+}
+```
 
 ## Git co-authorship
 

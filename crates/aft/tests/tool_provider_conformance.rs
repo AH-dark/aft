@@ -3092,15 +3092,22 @@ async fn conformance_inventory(subject: Subject) {
     let inventory = &fixtures["slice_b"]["presets"][subject.preset.unwrap_or("head")][build];
     let expected =
         |field: &str| serde_json::from_value::<BTreeSet<String>>(inventory[field].clone()).unwrap();
-    let (expected_enabled, expected_skipped) =
-        (expected("enabled_cases"), expected("skipped_cases"));
+    let (expected_enabled, expected_skipped, expected_inapplicable) = (
+        expected("enabled_cases"),
+        expected("skipped_cases"),
+        expected("inapplicable_cases"),
+    );
     // Case IDs are pinned from the conformance crate: the inventory names
     // every case the crate runs, each exactly once.
     let every: BTreeSet<String> = CASES.iter().map(|case| case.name.to_string()).collect();
     assert!(expected_enabled.is_disjoint(&expected_skipped));
+    assert!(expected_enabled.is_disjoint(&expected_inapplicable));
+    assert!(expected_skipped.is_disjoint(&expected_inapplicable));
     assert_eq!(
         expected_enabled
-            .union(&expected_skipped)
+            .iter()
+            .chain(&expected_skipped)
+            .chain(&expected_inapplicable)
             .cloned()
             .collect::<BTreeSet<_>>(),
         every
@@ -3118,11 +3125,17 @@ async fn conformance_inventory(subject: Subject) {
             .unwrap();
     let mut enabled = BTreeSet::new();
     let mut skipped = BTreeSet::new();
+    let mut inapplicable = BTreeSet::new();
     let mut failed = BTreeSet::new();
     for case in &report.cases {
         match &case.outcome {
             CaseOutcome::Skipped { .. } => {
                 skipped.insert(case.case.to_string());
+            }
+            // An optional promise AFT does not make, such as a manifest
+            // capability it does not declare.
+            CaseOutcome::Inapplicable { .. } => {
+                inapplicable.insert(case.case.to_string());
             }
             CaseOutcome::Passed => {
                 enabled.insert(case.case.to_string());
@@ -3140,6 +3153,7 @@ async fn conformance_inventory(subject: Subject) {
     }
     assert_eq!(enabled, expected_enabled);
     assert_eq!(skipped, expected_skipped);
+    assert_eq!(inapplicable, expected_inapplicable);
     // Every route is bound with role_versions {"tool-provider": "v1"}, so the
     // real module admits these calls under the v1 grammar. Every enabled case
     // must pass; the provider conforms for the capabilities it declares and
@@ -3151,10 +3165,11 @@ async fn conformance_inventory(subject: Subject) {
         "the live preset list must enable and pass the served-presets case"
     );
     eprintln!(
-        "v1 binds ({build}): {} passed, {} failed, {} capability skips, {} kills",
+        "v1 binds ({build}): {} passed, {} failed, {} capability skips, {} not applicable, {} kills",
         enabled.len() - failed.len(),
         failed.len(),
         skipped.len(),
+        inapplicable.len(),
         report.kills.len()
     );
     assert!(
