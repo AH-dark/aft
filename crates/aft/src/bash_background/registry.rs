@@ -216,6 +216,27 @@ pub(crate) mod remote;
 #[cfg(target_os = "linux")]
 pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 
+#[cfg(test)]
+thread_local! {
+    static MEMORY_PREPARE_GATE_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn with_memory_prepare_gate_for_test<R>(
+    gate: impl FnOnce() + 'static,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<Box<dyn FnOnce()>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MEMORY_PREPARE_GATE_FOR_TEST.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore =
+        Restore(MEMORY_PREPARE_GATE_FOR_TEST.with(|slot| slot.replace(Some(Box::new(gate)))));
+    run()
+}
+
 /// How long a reader that must answer with a settled status (`bash_status`,
 /// a second kill) waits for a kill already in flight on the same task: the
 /// SIGTERM grace period plus a margin for the SIGKILL, the reap and the
@@ -1066,6 +1087,7 @@ struct ProjectReplayDiskBatch {
 }
 
 pub(crate) struct RegistryInner {
+    memory_monitors: Mutex<HashMap<String, super::memory_limit::Monitor>>,
     #[cfg(unix)]
     db_hint_jobs:
         Mutex<HashMap<String, (std::sync::Weak<BgTask>, Arc<crate::bash_db_hints::HintJob>)>>,
@@ -1681,6 +1703,7 @@ impl BgTaskRegistry {
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
         Self {
             inner: Arc::new(RegistryInner {
+                memory_monitors: Mutex::new(HashMap::new()),
                 #[cfg(unix)]
                 db_hint_jobs: Mutex::new(HashMap::new()),
                 #[cfg(unix)]
@@ -2704,6 +2727,7 @@ impl BgTaskRegistry {
     }
 
     fn post_terminal_transition(&self, task: &Arc<BgTask>, emit_frame: bool) -> Result<(), String> {
+        self.settle_memory_accounting(task)?;
         #[cfg(test)]
         {
             let gate = TERMINAL_PUBLICATION_GATES
@@ -3984,6 +4008,120 @@ impl BgTaskRegistry {
             .store(interval_ms, Ordering::SeqCst);
     }
 
+    fn prepare_memory_limit(
+        memory_limit_mib: Option<u64>,
+        task_id: &str,
+    ) -> Result<Option<super::memory_limit::Monitor>, String> {
+        #[cfg(test)]
+        if let Some(gate) = MEMORY_PREPARE_GATE_FOR_TEST.with(|slot| slot.borrow_mut().take()) {
+            gate();
+        }
+        let mib = memory_limit_mib.unwrap_or(0);
+        if mib == 0 {
+            return Ok(None);
+        }
+        super::memory_limit::Monitor::prepare(mib, task_id).map(Some)
+    }
+
+    fn fail_memory_spawn(&self, metadata: &mut PersistedTask, paths: &TaskPaths, error: &str) {
+        metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.into()));
+        let _ = self.persist_task(paths, metadata);
+        let _ = self.insert_rehydrated_task(metadata.clone(), paths.clone(), true);
+        self.record_live_delivery_session(&metadata.session_id);
+        self.enqueue_completion_if_needed(metadata, Some(paths), true);
+    }
+
+    pub(crate) fn memory_limit_exceeded(&self, task: &Arc<BgTask>) -> Option<String> {
+        let state = task.lock_state().ok()?;
+        if (state.metadata.remote.is_some() && !state.metadata.local_fallback_started)
+            || state.metadata.is_terminal()
+        {
+            return None;
+        }
+        let pgid = state
+            .metadata
+            .pgid
+            .or(state.metadata.child_pid.map(|pid| pid as i32))?;
+        let mut monitors = self.inner.memory_monitors.lock().ok()?;
+        if !monitors.contains_key(&task.task_id) {
+            let policy = state.metadata.memory_policy.clone()?;
+            match super::memory_limit::Monitor::recover(policy, &task.task_id) {
+                Ok(monitor) => {
+                    monitors.insert(task.task_id.clone(), monitor);
+                }
+                Err(error) => return Some(error),
+            }
+        }
+        let monitor = monitors.get_mut(&task.task_id)?;
+        monitor.exceeded(pgid).then(|| monitor.reason())
+    }
+
+    pub(crate) fn kill_for_memory(&self, task: &Arc<BgTask>, reason: String) {
+        if let Ok(monitors) = self.inner.memory_monitors.lock() {
+            if let Some(monitor) = monitors.get(&task.task_id) {
+                monitor.terminate();
+            }
+        }
+        let _ = self.kill_with_status_reason(
+            &task.task_id,
+            &task.session_id,
+            BgTaskStatus::Failed,
+            Some(reason),
+        );
+    }
+
+    fn settle_memory_accounting(&self, task: &Arc<BgTask>) -> Result<(), String> {
+        let mut db = DeferredDbWrites::new(self, task);
+        let mut state = task.lock_state().map_err(|error| error.to_string())?;
+        if !state.metadata.is_terminal() || state.kill_in_flight {
+            return Ok(());
+        }
+        let mut monitors = self
+            .inner
+            .memory_monitors
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let Some(monitor) = monitors.get_mut(&task.task_id) else {
+            return Ok(());
+        };
+        let pgid = state
+            .metadata
+            .pgid
+            .or(state.metadata.child_pid.map(|pid| pid as i32))
+            .unwrap_or(0);
+        let mut updated = false;
+        if monitor.exceeded(pgid) {
+            monitor.terminate();
+            state
+                .metadata
+                .mark_terminal(BgTaskStatus::Failed, Some(137), Some(monitor.reason()));
+            state.terminal_output_cache = None;
+            updated = true;
+        }
+        #[cfg(windows)]
+        if let Some(note) = monitor
+            .outcome_note()
+            .filter(|_| state.metadata.exit_code != Some(0))
+        {
+            state.metadata.execution_note = Some(note.into());
+            updated = true;
+        }
+        if updated {
+            // Accounting refines an observed exit; failed storage must not skip
+            // the shared survivor check and completion publication.
+            task.terminal_persist_dirty.store(true, Ordering::SeqCst);
+            if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
+                crate::slog_warn!(
+                    "failed to persist terminal state for {}: {error}",
+                    task.task_id
+                );
+            } else {
+                task.terminal_persist_dirty.store(false, Ordering::SeqCst);
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
@@ -3994,6 +4132,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -4009,6 +4148,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -4031,6 +4171,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -4046,6 +4187,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             super::TaskSlot::Background { max: max_running },
             notify_on_completion,
@@ -4065,6 +4207,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         slot: super::TaskSlot,
         notify_on_completion: bool,
@@ -4080,6 +4223,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             slot,
             notify_on_completion,
@@ -4100,6 +4244,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -4117,6 +4262,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -4142,6 +4288,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))] mut env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         slot: super::TaskSlot,
         notify_on_completion: bool,
@@ -4260,6 +4407,10 @@ impl BgTaskRegistry {
         metadata.completion_ticket_digest = completion_secrets.ticket_digest.clone();
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
+        let mut memory_monitor = Self::prepare_memory_limit(memory_limit_mib, &task_id)?;
+        metadata.memory_policy = memory_monitor
+            .as_ref()
+            .map(|monitor| monitor.policy.clone());
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
             return Err(format!("failed to persist background task metadata: {error}").into());
@@ -4288,6 +4439,7 @@ impl BgTaskRegistry {
             &env,
             &mut io_handles,
             capture_pipeline_status,
+            memory_monitor.is_some(),
             linux_scope,
             LocalIdentityGate::Required,
         ) {
@@ -4309,6 +4461,20 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
+        if let Some(mut monitor) = memory_monitor.take() {
+            if let Err(error) = monitor.attach(child_pid) {
+                super::process::terminate_pgid(child_pid as i32, None);
+                let _ = child.wait();
+                self.fail_memory_spawn(&mut metadata, &paths, &error);
+                return Err(error.into());
+            }
+            metadata.memory_policy = Some(monitor.policy.clone());
+            self.inner
+                .memory_monitors
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(task_id.clone(), monitor);
+        }
         // The wrapper cannot execute the command until its identity is durable.
         // Keep Starting here so a failed later Running write still leaves a
         // recoverable PID checkpoint in the existing record format.
@@ -4507,6 +4673,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -4525,6 +4692,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -4546,6 +4714,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -4630,6 +4799,10 @@ impl BgTaskRegistry {
         metadata.pty_rows = Some(rows);
         metadata.pty_cols = Some(cols);
         super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
+        let mut memory_monitor = Self::prepare_memory_limit(memory_limit_mib, &task_id)?;
+        metadata.memory_policy = memory_monitor
+            .as_ref()
+            .map(|monitor| monitor.policy.clone());
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
             return Err(format!("failed to persist background task metadata: {error}").into());
@@ -4647,22 +4820,33 @@ impl BgTaskRegistry {
         self.dual_write_task(&paths, &metadata);
 
         let mut spawned_pgid = None;
-        let runtime = match spawn_pty_for_command(
-            &spawn_plan,
-            &task_id,
-            &session_id,
-            command,
-            shell,
-            &shell_path,
-            &paths,
-            &workdir,
-            &env,
-            rows,
-            cols,
-            self.inner.wake_tx.clone(),
-            &mut io_handles,
-            &mut spawned_pgid,
-        ) {
+        let spawned = {
+            // Attach may choose sampling; publish that policy before opening the gate.
+            let mut publish_memory_policy = |policy: &super::memory_limit::MemoryPolicy| {
+                metadata.memory_policy = Some(policy.clone());
+                self.persist_task(&paths, &metadata)
+                    .map_err(|error| error.to_string())
+            };
+            spawn_pty_for_command(
+                &spawn_plan,
+                &task_id,
+                &session_id,
+                command,
+                shell,
+                &shell_path,
+                &paths,
+                &workdir,
+                &env,
+                rows,
+                cols,
+                self.inner.wake_tx.clone(),
+                &mut io_handles,
+                &mut spawned_pgid,
+                &mut memory_monitor,
+                &mut publish_memory_policy,
+            )
+        };
+        let runtime = match spawned {
             Ok(runtime) => runtime,
             Err(error) => {
                 crate::slog_warn!("failed to spawn PTY background bash task {task_id}: {error}");
@@ -4681,6 +4865,14 @@ impl BgTaskRegistry {
             }
         };
 
+        if let Some(monitor) = memory_monitor {
+            metadata.memory_policy = Some(monitor.policy.clone());
+            self.inner
+                .memory_monitors
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(task_id.clone(), monitor);
+        }
         if let Some(child_pid) = runtime.child_pid {
             log_bash_spawn(&task_id, child_pid, &session_id, &spawn_log_root, command);
             metadata.mark_running(child_pid, child_pid as i32);
@@ -4791,6 +4983,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -4806,6 +4999,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -4828,6 +5022,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -4843,6 +5038,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             super::TaskSlot::Background { max: max_running },
             notify_on_completion,
@@ -4865,6 +5061,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         slot: super::TaskSlot,
         notify_on_completion: bool,
@@ -4902,6 +5099,10 @@ impl BgTaskRegistry {
             Some(completion_secrets.has_non_ticket_secrets);
         metadata.completion_ticket_digest = completion_secrets.ticket_digest.clone();
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
+        let mut memory_monitor = Self::prepare_memory_limit(memory_limit_mib, &task_id)?;
+        metadata.memory_policy = memory_monitor
+            .as_ref()
+            .map(|monitor| monitor.policy.clone());
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
             return Err(format!("failed to persist background task metadata: {error}").into());
@@ -4918,7 +5119,7 @@ impl BgTaskRegistry {
         layout_cleanup.disarm();
         self.dual_write_task(&paths, &metadata);
 
-        let child = match spawn_detached_child(
+        let mut child = match spawn_detached_child(
             &spawn_plan,
             command,
             shell,
@@ -4928,6 +5129,7 @@ impl BgTaskRegistry {
             &env,
             &mut io_handles,
             false,
+            memory_monitor.is_some(),
             false,
         ) {
             Ok(child) => child,
@@ -4947,6 +5149,35 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
+        if let Some(mut monitor) = memory_monitor.take() {
+            if let Err(error) = monitor.attach(child_pid) {
+                let _ = child.kill();
+                let _ = child.wait();
+                self.fail_memory_spawn(&mut metadata, &paths, &error);
+                return Err(error.into());
+            }
+            use std::io::Write;
+            let released = if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(b"aft-memory-ready\n")
+                    .map_err(|error| error.to_string())
+            } else {
+                crate::windows_shell::release_memory_file_gate(&paths.exit)
+            };
+            if let Err(error) = released {
+                monitor.terminate();
+                let _ = child.kill();
+                let _ = child.wait();
+                self.fail_memory_spawn(&mut metadata, &paths, &error);
+                return Err(error.into());
+            }
+            metadata.memory_policy = Some(monitor.policy.clone());
+            self.inner
+                .memory_monitors
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(task_id.clone(), monitor);
+        }
         log_bash_spawn(&task_id, child_pid, &session_id, &spawn_log_root, command);
         metadata.status = BgTaskStatus::Running;
         metadata.child_pid = Some(child_pid);
@@ -8799,6 +9030,11 @@ impl BgTaskRegistry {
     }
 
     fn remove_cleanup_task(&self, task: &BgTask) {
+        self.inner
+            .memory_monitors
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&task.task_id);
         if let Ok(mut tasks) = self.inner.tasks.lock() {
             tasks.remove(&task.task_id);
         }
@@ -9338,7 +9574,14 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn poll_task(&self, task: &Arc<BgTask>) -> Result<(), String> {
-        if task.lock_state().is_ok_and(|s| s.metadata.remote.is_some()) {
+        if let Some(reason) = self.memory_limit_exceeded(task) {
+            super::watchdog::schedule_memory_kill(self, task, reason);
+            return Ok(());
+        }
+        if task
+            .lock_state()
+            .is_ok_and(|s| s.metadata.remote.is_some() && !s.metadata.local_fallback_started)
+        {
             return Ok(());
         }
         if let Ok(state) = task.lock_state() {
@@ -10922,7 +11165,10 @@ impl BgTaskRegistry {
                         unreachable!()
                     }
                 } else {
-                    let terminal_reason = if marker == ExitMarker::Killed {
+                    let memory_kill = terminal_status == BgTaskStatus::Failed
+                        && state.metadata.memory_policy.is_some()
+                        && reason.is_some();
+                    let terminal_reason = if marker == ExitMarker::Killed || memory_kill {
                         reason.clone()
                     } else {
                         None
@@ -10932,6 +11178,13 @@ impl BgTaskRegistry {
                         marker,
                         terminal_reason,
                     );
+                    if memory_kill {
+                        state.metadata.mark_terminal(
+                            BgTaskStatus::Failed,
+                            Some(137),
+                            reason.clone(),
+                        );
+                    }
 
                     state.pending_terminal_override = None;
                     task.mark_terminal_now();
@@ -10979,9 +11232,12 @@ impl BgTaskRegistry {
                 state.metadata = killing;
                 if !was_already_killing
                     && state.metadata.mode == BgMode::Pty
-                    && terminal_status == BgTaskStatus::TimedOut
+                    && matches!(
+                        terminal_status,
+                        BgTaskStatus::TimedOut | BgTaskStatus::Failed
+                    )
                 {
-                    state.pending_terminal_override = Some(BgTaskStatus::TimedOut);
+                    state.pending_terminal_override = Some(terminal_status.clone());
                 }
 
                 let pgid = state.metadata.pgid;
@@ -14400,6 +14656,7 @@ fn detached_shell_command_for(
     exit_path: &Path,
     paths: &TaskPaths,
     creation_flags: u32,
+    memory_gated: bool,
 ) -> Result<Command, String> {
     use crate::windows_shell::WindowsShell;
     // Write the wrapper to a temp file alongside the other task files,
@@ -14414,7 +14671,11 @@ fn detached_shell_command_for(
     // body's internal quotes never reach the shell command line — the
     // shell reads them from disk by file syntax rules, not command-line
     // parser rules.
-    let wrapper_body = shell.wrapper_script_bytes(command, exit_path);
+    let wrapper_body = if memory_gated {
+        shell.memory_gated_wrapper_bytes(command, exit_path)
+    } else {
+        shell.wrapper_script_bytes(command, exit_path)
+    };
     let wrapper_ext = match shell {
         WindowsShell::Pwsh | WindowsShell::Powershell => "ps1",
         WindowsShell::Cmd => "bat",
@@ -14547,13 +14808,14 @@ fn spawn_detached_child(
     env: &HashMap<String, String>,
     io_handles: &mut TaskIoHandles,
     capture_pipeline_status: bool,
+    memory_gated: bool,
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] linux_scope: bool,
     #[cfg(unix)] identity_gate: LocalIdentityGate,
 ) -> Result<Child, String> {
     #[cfg(windows)]
     let _ = capture_pipeline_status;
     #[cfg(not(windows))]
-    let _ = (command, shell);
+    let _ = (command, shell, memory_gated);
     #[cfg(not(windows))]
     {
         use std::os::fd::AsRawFd;
@@ -14600,7 +14862,7 @@ fn spawn_detached_child(
             }),
         ];
         #[cfg(target_os = "linux")]
-        let (executable, args) = if linux_scope {
+        let (executable, args) = if linux_scope && !memory_gated {
             if spawn_plan.is_native_launcher() {
                 crate::slog_info!(
                     "bash.linux_scope requested but native sandbox launch cannot reach the user manager; spawning without a systemd scope"
@@ -14715,11 +14977,21 @@ fn spawn_detached_child(
                 let stderr = io_handles.clone_file(TaskArtifact::Stderr).map_err(|e| {
                     PipedAttemptError::Setup(format!("failed to clone stderr capture handle: {e}"))
                 })?;
-                let mut cmd =
-                    detached_shell_command_for(shell.clone(), command, &paths.exit, paths, flags)
-                        .map_err(PipedAttemptError::Setup)?;
+                let mut cmd = detached_shell_command_for(
+                    shell.clone(),
+                    command,
+                    &paths.exit,
+                    paths,
+                    flags,
+                    memory_gated,
+                )
+                .map_err(PipedAttemptError::Setup)?;
                 cmd.current_dir(workdir)
-                    .stdin(Stdio::null())
+                    .stdin(if memory_gated && !shell.uses_memory_file_gate() {
+                        Stdio::piped()
+                    } else {
+                        Stdio::null()
+                    })
                     .stdout(Stdio::from(stdout))
                     .stderr(Stdio::from(stderr));
                 crate::agent_child_env::apply_to_command(&mut cmd, env);
@@ -14840,7 +15112,7 @@ fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
         (None, Some(note)) => Some(note.to_owned()),
         (None, None) => None,
     };
-    if metadata.status == BgTaskStatus::Killed
+    let note = if metadata.status == BgTaskStatus::Killed
         && metadata.status_reason.as_deref() == Some(OWNER_PAUSED_REASON)
     {
         let cancellation = "[killed (cancelled by owner); expected stop, not a command failure]";
@@ -14850,6 +15122,11 @@ fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
         })
     } else {
         note
+    };
+    match (metadata.memory_policy.as_ref(), note) {
+        (Some(policy), Some(note)) => Some(format!("{}\n{note}", policy.note())),
+        (Some(policy), None) => Some(policy.note()),
+        (None, note) => note,
     }
 }
 
@@ -14875,6 +15152,10 @@ pub(crate) mod default_kill_tests;
 #[cfg(all(test, unix))]
 #[path = "completion_replay_ordering_tests.rs"]
 mod completion_replay_ordering_tests;
+
+#[cfg(test)]
+#[path = "memory_limit_tests.rs"]
+mod memory_limit_tests;
 
 #[cfg(test)]
 mod tests {
@@ -15126,6 +15407,7 @@ mod tests {
                 missing_workdir.clone(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -15784,6 +16066,7 @@ mod tests {
                                 storage.clone(),
                                 HashMap::new(),
                                 crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                                None,
                                 storage.clone(),
                                 1,
                                 true,
@@ -16063,6 +16346,7 @@ mod tests {
                 storage.clone(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(300)),
+                None,
                 storage.clone(),
                 10,
                 true,
@@ -16333,15 +16617,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let release = dir.path().join("release");
         let original = BgTaskRegistry::default();
-        let task_id = original.spawn_with_shell(
-            SpawnPlan::Unsandboxed,
-            &format!("sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; printf \"381 tests run: 381 passed\\n\" >&2; exit 1' | true", release.display()),
-            crate::bash_background::BashShell::Bash, PathBuf::from("/bin/bash"),
-            "session".into(),
-            dir.path().into(), HashMap::new(),
-            crate::bash_background::HardKill::After(Duration::from_secs(30)), dir.path().into(), 10, true, false,
-            Some(dir.path().into()),
-        ).unwrap();
+        let task_id = original.spawn_with_shell(SpawnPlan::Unsandboxed, &format!("sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; printf \"381 tests run: 381 passed\\n\" >&2; exit 1' | true", release.display()), crate::bash_background::BashShell::Bash, PathBuf::from("/bin/bash"), "session".into(), dir.path().into(), HashMap::new(), crate::bash_background::HardKill::After(Duration::from_secs(30)), None, dir.path().into(), 10, true, false, Some(dir.path().into())).unwrap();
         let paths = original.task(&task_id).unwrap().paths.clone();
         original.detach();
         drop(original);
@@ -16851,6 +17127,7 @@ mod tests {
                     dir.path().to_path_buf(),
                     HashMap::new(),
                     crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    None,
                     dir.path().to_path_buf(),
                     10,
                     true,
@@ -17156,6 +17433,7 @@ mod tests {
                 other_dir.path().into(),
                 HashMap::new(),
                 super::super::HardKill::After(Duration::from_millis(100)),
+                None,
                 other_dir.path().into(),
                 1,
                 true,
@@ -17927,6 +18205,7 @@ mod tests {
                 project.clone(),
                 HashMap::new(),
                 super::super::HardKill::After(Duration::from_secs(30)),
+                None,
                 project.clone(),
                 1,
                 false,
@@ -17962,6 +18241,7 @@ mod tests {
                 dir.path().into(),
                 HashMap::new(),
                 super::super::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().into(),
                 1,
                 false,
@@ -18004,6 +18284,7 @@ mod tests {
                 root.path().to_path_buf(),
                 HashMap::new(),
                 super::super::HardKill::After(Duration::from_secs(30)),
+                None,
                 root.path().to_path_buf(),
                 1,
                 false,
@@ -18225,6 +18506,7 @@ mod tests {
                 missing_workdir.clone(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 crate::bash_background::TaskSlot::Background { max: 1 },
                 true,
@@ -19153,6 +19435,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -19248,6 +19531,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -19304,6 +19588,7 @@ mod tests {
                 root.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -19396,6 +19681,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -19440,6 +19726,7 @@ mod tests {
                 root.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -19544,6 +19831,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -19610,6 +19898,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -20097,6 +20386,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -20167,6 +20457,7 @@ mod tests {
                     project.path().to_path_buf(),
                     HashMap::new(),
                     crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    None,
                     storage.path().to_path_buf(),
                     10,
                     false,
@@ -20279,6 +20570,7 @@ mod tests {
                     project.path().to_path_buf(),
                     HashMap::new(),
                     crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    None,
                     storage.path().to_path_buf(),
                     QUICK_TASKS * 2,
                     false,
@@ -20300,6 +20592,7 @@ mod tests {
                 project.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 QUICK_TASKS * 2,
                 false,
@@ -20486,6 +20779,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -20649,6 +20943,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -20751,6 +21046,7 @@ mod tests {
                 storage.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -20840,6 +21136,7 @@ mod tests {
                 storage.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -20890,6 +21187,7 @@ mod tests {
                     storage.path().to_path_buf(),
                     HashMap::new(),
                     crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    None,
                     storage.path().to_path_buf(),
                     10,
                     true,
@@ -20961,6 +21259,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -21043,6 +21342,7 @@ mod tests {
                 storage.to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(120)),
+                None,
                 storage.to_path_buf(),
                 10,
                 true,
@@ -21238,6 +21538,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -21268,6 +21569,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -21324,6 +21626,7 @@ mod tests {
                 dir.to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.to_path_buf(),
                 10,
                 true,
@@ -21596,6 +21899,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -21657,6 +21961,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -22074,6 +22379,7 @@ mod tests {
                 project.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -22177,6 +22483,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 environment,
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 dir.path().to_path_buf(),
                 10,
                 false,
@@ -22391,6 +22698,7 @@ mod tests {
                 project.to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                None,
                 storage.to_path_buf(),
                 10,
                 true,
@@ -22418,6 +22726,7 @@ mod tests {
                     root.clone(),
                     HashMap::new(),
                     super::super::HardKill::After(Duration::from_secs(60)),
+                    None,
                     storage.path().to_path_buf(),
                     10,
                     true,
@@ -22832,6 +23141,7 @@ mod tests {
                     project.path().to_path_buf(),
                     HashMap::new(),
                     crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                    None,
                     storage.path().to_path_buf(),
                     10,
                     false,
@@ -22923,6 +23233,7 @@ mod tests {
                 project.path().to_path_buf(),
                 env,
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -23342,6 +23653,7 @@ mod tests {
                 project.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -23365,6 +23677,7 @@ mod tests {
                 project.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -23843,6 +24156,7 @@ mod tests {
                 storage.to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.to_path_buf(),
                 10,
                 true,
@@ -23913,6 +24227,7 @@ mod tests {
                 storage.into(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.into(),
                 10,
                 true,
@@ -23996,6 +24311,7 @@ mod tests {
                     storage.to_path_buf(),
                     HashMap::new(),
                     crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    None,
                     storage.to_path_buf(),
                     10,
                     true,
@@ -24073,6 +24389,7 @@ mod tests {
                 storage.to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.to_path_buf(),
                 10,
                 true,
@@ -24109,6 +24426,7 @@ mod tests {
                 storage.to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.to_path_buf(),
                 10,
                 true,
@@ -24176,6 +24494,7 @@ mod tests {
                 storage.to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
                 storage.to_path_buf(),
                 10,
                 true,
