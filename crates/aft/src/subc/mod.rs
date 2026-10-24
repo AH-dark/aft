@@ -199,6 +199,9 @@ type LossyPushEnvelope = (u64, ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>;
 mod access_grants;
 mod bash;
+mod bind_log;
+#[cfg(test)]
+mod content_v1_tests;
 // The grant tests run real shell commands, which need a POSIX shell.
 #[cfg(all(test, unix))]
 mod bash_grant_tests;
@@ -7475,6 +7478,11 @@ async fn handle_control_request(
             call_mode,
         } => {
             let route_id = route_key(route_channel, epoch);
+            bind_log::consumer_capabilities(
+                &principal,
+                &identity.harness,
+                consumer_capabilities.as_deref().unwrap_or_default(),
+            );
             // Whether the daemon stamped this bind with a scope decides what a
             // tool call without a preset gets (refused when scoped, the
             // unscoped default otherwise), so every bind says which it was.
