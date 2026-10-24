@@ -5119,9 +5119,32 @@ impl SemanticCollectPhaseTimings {
     }
 }
 
+#[derive(Debug)]
+enum SemanticCollectError {
+    UnsupportedExtension,
+    Io(std::io::Error),
+    Parse(String),
+}
+
+impl SemanticCollectError {
+    fn is_expected_non_code(&self) -> bool {
+        matches!(self, Self::UnsupportedExtension)
+    }
+}
+
+impl std::fmt::Display for SemanticCollectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedExtension => formatter.write_str("unsupported file extension"),
+            Self::Io(error) => std::fmt::Display::fmt(error, formatter),
+            Self::Parse(message) => formatter.write_str(message),
+        }
+    }
+}
+
 type CollectedSemanticFile = (
     PathBuf,
-    Result<(IndexedFileMetadata, Vec<SemanticChunk>), String>,
+    Result<(IndexedFileMetadata, Vec<SemanticChunk>), SemanticCollectError>,
     SemanticCollectPhaseTimings,
 );
 
@@ -6045,12 +6068,10 @@ impl SemanticIndex {
                     chunks.extend(file_chunks);
                 }
                 Err(error) => {
-                    // "unsupported file extension" is expected for non-code files
-                    // (json, xml, .gitignore, etc.) that get included in the
-                    // project walk. Pre-fix this was swallowed by .unwrap_or_default();
-                    // we now skip silently to keep the log clean. Only real read/parse
-                    // errors are worth surfacing.
-                    if error == "unsupported file extension" {
+                    // Project walks include non-code files. Only the typed
+                    // extension exclusion is expected; read/parse failures
+                    // must still be surfaced even if their wording is similar.
+                    if error.is_expected_non_code() {
                         continue;
                     }
                     slog_warn!(
@@ -10268,7 +10289,7 @@ fn collect_semantic_file(
     file: &Path,
     embed_text_caps: EmbedTextCaps,
     phases: &mut SemanticCollectPhaseTimings,
-) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), String> {
+) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), SemanticCollectError> {
     if let Some(job) = prepared_pause_job() {
         let key = FileCheckpointKey {
             root: project_root.to_path_buf(),
@@ -10299,20 +10320,22 @@ fn collect_semantic_file_uncached(
     file: &Path,
     embed_text_caps: EmbedTextCaps,
     phases: &mut SemanticCollectPhaseTimings,
-) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), String> {
+) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), SemanticCollectError> {
     let read_hash_started = Instant::now();
     let read_result = (|| {
-        let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
+        let metadata = fs::metadata(file).map_err(SemanticCollectError::Io)?;
         if !metadata.is_file() {
-            return Err("not a regular file".to_string());
+            return Err(SemanticCollectError::Parse(
+                "not a regular file".to_string(),
+            ));
         }
-        let mtime = metadata.modified().map_err(|error| error.to_string())?;
+        let mtime = metadata.modified().map_err(SemanticCollectError::Io)?;
         let size = metadata.len();
 
         if !is_semantic_indexed_extension(file) {
-            return Err("unsupported file extension".to_string());
+            return Err(SemanticCollectError::UnsupportedExtension);
         }
-        let lang = detect_language(file).ok_or_else(|| "unsupported file extension".to_string())?;
+        let lang = detect_language(file).ok_or(SemanticCollectError::UnsupportedExtension)?;
 
         let mut indexed_metadata = IndexedFileMetadata {
             mtime,
@@ -10329,7 +10352,7 @@ fn collect_semantic_file_uncached(
         #[cfg(test)]
         crate::search_hot_path_measurements::record_file_read();
         let source =
-            crate::project_content::read_to_string(file).map_err(|error| error.to_string())?;
+            crate::project_content::read_to_string(file).map_err(SemanticCollectError::Io)?;
         indexed_metadata.content_hash = if size <= cache_freshness::CONTENT_HASH_SIZE_CAP {
             cache_freshness::hash_bytes(source.as_bytes())
         } else {
@@ -10350,7 +10373,8 @@ fn collect_semantic_file_uncached(
         &source,
         embed_text_caps,
         phases,
-    )?;
+    )
+    .map_err(SemanticCollectError::Parse)?;
     Ok((indexed_metadata, chunks))
 }
 
@@ -13928,6 +13952,16 @@ Connection: close
         let bytes = fs::read(storage.path().join("semantic/fresh/semantic.bin")).unwrap();
         let restored = SemanticIndex::from_bytes(&bytes, project.path()).unwrap();
         assert_eq!(restored.file_mtimes.get(&file), Some(&mtime));
+    }
+
+    #[test]
+    fn audit10_47_collection_category_not_error_words_controls_skipping() {
+        assert!(SemanticCollectError::UnsupportedExtension.is_expected_non_code());
+        let parse = SemanticCollectError::Parse("unsupported file extension".to_string());
+        let io = SemanticCollectError::Io(std::io::Error::other("unsupported file extension"));
+        assert_eq!(parse.to_string(), "unsupported file extension");
+        assert!(!parse.is_expected_non_code());
+        assert!(!io.is_expected_non_code());
     }
 
     #[test]
