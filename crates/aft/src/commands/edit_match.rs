@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::backup::CapturedRegularFile;
 use crate::context::AppContext;
-use crate::edit::{self, validate_syntax};
+use crate::edit::{self, validate_edited_file_syntax};
 use crate::format;
 
 use crate::protocol::{RawRequest, Response};
@@ -936,7 +936,7 @@ fn handle_glob_edit_match(
             format_skipped_count += 1;
             format_skip_reasons.insert(reason.clone());
         }
-        let syntax_valid = match validate_syntax(&edit.path) {
+        let syntax_valid = match validate_edited_file_syntax(&edit.path) {
             Ok(valid) => valid,
             Err(e) => {
                 if let Some(name) = &checkpoint_name {

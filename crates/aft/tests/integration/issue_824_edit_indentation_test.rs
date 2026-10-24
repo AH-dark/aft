@@ -1,19 +1,15 @@
-//! Reproductions for issue #824: an `edit` can leave a Python file with an
-//! IndentationError while reporting success.
+//! Regression tests for issue #824: an `edit` could leave a Python file with
+//! an IndentationError while reporting success.
 //!
-//! The four `issue_824_*` tests that are not probes drive the real agent path
-//! (`tool_call` with the `edit` tool, the same request the OpenCode and Pi
-//! plugins send). They are ignored because they fail on the current code. Each
-//! one asserts the behaviour the issue asks for, so removing `#[ignore]` turns
-//! it into the regression test for the fix. Run them with
+//! The `issue_824_*` edit tests drive the real agent path (`tool_call` with
+//! the `edit` tool, the same request the OpenCode and Pi plugins send),
+//! through both argument shapes that reach find/replace.
+//!
+//! Two diagnostics stay ignored. One prints the tree-sitter-python trees for
+//! the broken results, to show why tree-sitter's `has_error()` alone accepts
+//! them. The other runs edit syntax validation over an external list of valid
+//! Python files to measure false rejections. Run them with
 //! `cargo test -p agent-file-tools --test integration issue_824 -- --ignored`.
-//!
-//! The three `probe` tests are diagnostics, not reproductions, and are ignored
-//! because they only print evidence or need an external file list. One prints
-//! the tree-sitter-python trees for the broken results, to show why syntax
-//! validation accepts them. Another checks a candidate block-indentation rule
-//! against the broken and valid fixtures in this file. The third runs that rule
-//! over a list of valid Python files to look for false rejections.
 
 use std::fs;
 use std::path::Path;
@@ -40,6 +36,9 @@ const CASE2_OLD: &str = "return 2";
 const CASE2_NEW: &str = "return 2\n            y = 5\n        z = 6";
 const CASE2_BROKEN: &str =
     "def g():\n    if True:\n        return 2\n            y = 5\n        z = 6\n    return 3\n";
+/// The same edit adding a tab-indented line to a space-indented block.
+const CASE2_TAB_NEW: &str = "return 2\n\ty = 5";
+const CASE2_TAB_BROKEN: &str = "def g():\n    if True:\n        return 2\n\ty = 5\n    return 3\n";
 
 /// TypeScript: `oldString` and `newString` written with no indentation.
 const CASE3_BEFORE: &str = "export function f(x: number) {\n  if (x) {\n    const a = 1;\n    const b = 2;\n  }\n  return x;\n}\n";
@@ -127,7 +126,6 @@ fn assert_no_failures(failures: Vec<String>) {
 /// re-indented to the file's level, or the edit is refused or rolled back and
 /// the file is unchanged.
 #[test]
-#[ignore = "issue #824 repro: fails until fuzzy matches re-indent the replacement"]
 fn issue_824_fuzzy_shallow_python_edit_never_leaves_invalid_file() {
     let mut failures = Vec::new();
     for shape in SHAPES {
@@ -150,25 +148,30 @@ fn issue_824_fuzzy_shallow_python_edit_never_leaves_invalid_file() {
 
 /// An exact edit that inserts an over-indented line produces a file Python
 /// rejects with "unexpected indent". Syntax validation must roll it back, the
-/// same way it rolls back other invalid edits.
+/// same way it rolls back other invalid edits. A line indented with a tab
+/// where its block uses spaces (CPython's TabError) must roll back too.
 #[test]
-#[ignore = "issue #824 repro: fails until Python syntax validation checks block indentation"]
 fn issue_824_exact_misindented_python_edit_is_rolled_back() {
     let mut failures = Vec::new();
     for shape in SHAPES {
-        let run = run_edit(shape, "t.py", CASE2_BEFORE, CASE2_OLD, CASE2_NEW);
-        if run.after == CASE2_BROKEN {
-            failures.push(format!(
-                "{shape:?}: the file was left with an IndentationError; syntax_valid={} rolled_back={}; reply: {:?}",
-                run.reply["syntax_valid"],
-                run.reply["rolled_back"],
-                reply_text(&run.reply)
-            ));
-        } else if run.after != CASE2_BEFORE || run.reply["rolled_back"] != true {
-            failures.push(format!(
-                "{shape:?}: expected a rollback, got {:?}; reply: {:?}",
-                run.after, run.reply
-            ));
+        for (label, new, broken) in [
+            ("unexpected indent", CASE2_NEW, CASE2_BROKEN),
+            ("tab error", CASE2_TAB_NEW, CASE2_TAB_BROKEN),
+        ] {
+            let run = run_edit(shape, "t.py", CASE2_BEFORE, CASE2_OLD, new);
+            if run.after == broken {
+                failures.push(format!(
+                    "{shape:?} {label}: the file was left invalid; syntax_valid={} rolled_back={}; reply: {:?}",
+                    run.reply["syntax_valid"],
+                    run.reply["rolled_back"],
+                    reply_text(&run.reply)
+                ));
+            } else if run.after != CASE2_BEFORE || run.reply["rolled_back"] != true {
+                failures.push(format!(
+                    "{shape:?} {label}: expected a rollback, got {:?}; reply: {:?}",
+                    run.after, run.reply
+                ));
+            }
         }
     }
     assert_no_failures(failures);
@@ -262,9 +265,10 @@ fn contains_missing(node: tree_sitter::Node<'_>) -> bool {
 }
 
 /// Prints the tree-sitter-python trees for the two broken results, and pins
-/// why syntax validation accepts them: neither tree holds an ERROR or a
-/// MISSING node, so `has_error()` (which counts both) is false. Inputs that
-/// recover with MISSING nodes show `has_error()` already rejects those.
+/// why tree-sitter alone accepts them: neither tree holds an ERROR or a
+/// MISSING node, so `has_error()` (which counts both) is false and edit
+/// validation needs its own Python indentation check. Inputs that recover with
+/// MISSING nodes show `has_error()` already rejects those.
 #[test]
 #[ignore = "issue #824 probe: prints parse trees"]
 fn issue_824_probe_python_trees_for_broken_results() {
@@ -338,193 +342,33 @@ fn issue_824_probe_python_trees_for_broken_results() {
     }
 }
 
-/// Leading-whitespace widths the way CPython's tokenizer measures them: the
-/// column with tab stops every 8, and with every tab counted as 1. Two lines
-/// are at the same level only when both agree; a form feed resets the column.
-fn cpython_indent(prefix: &str) -> Option<(usize, usize)> {
-    let mut col8 = 0;
-    let mut col1 = 0;
-    for ch in prefix.chars() {
-        match ch {
-            ' ' => {
-                col8 += 1;
-                col1 += 1;
-            }
-            '\t' => {
-                col8 = (col8 / 8 + 1) * 8;
-                col1 += 1;
-            }
-            '\x0c' => {
-                col8 = 0;
-                col1 = 0;
-            }
-            _ => return None,
-        }
-    }
-    Some((col8, col1))
-}
-
-/// The indentation of the line `byte` is on, when `byte` is the first
-/// non-whitespace character of that line and the line is not a backslash
-/// continuation of the previous one. `None` otherwise.
-fn statement_indent(source: &str, byte: usize) -> Option<(usize, usize)> {
-    let line_start = source[..byte].rfind('\n').map_or(0, |at| at + 1);
-    let indent = cpython_indent(&source[line_start..byte])?;
-    if line_start > 0 {
-        let previous = source[..line_start - 1].trim_end_matches('\r');
-        if previous.ends_with('\\') {
-            return None;
-        }
-    }
-    Some(indent)
-}
-
-/// A candidate check for the indentation errors tree-sitter-python accepts,
-/// not product code. It reports:
-/// - a `block` with no statements (tree-sitter accepts `if x:` followed by
-///   a dedent as an empty block; Python requires at least one statement);
-/// - statements of one `block` (or of the module) that start lines at
-///   different indentation;
-/// - a module-level statement that starts indented;
-/// - a block whose statements are not deeper than the line of its header.
-fn python_indentation_problems(tree: &tree_sitter::Tree, source: &str) -> Vec<String> {
-    let mut problems = Vec::new();
-    let mut cursor = tree.root_node().walk();
-    loop {
-        let node = cursor.node();
-        if matches!(node.kind(), "block" | "module") {
-            let mut walker = node.walk();
-            let statements: Vec<_> = node
-                .named_children(&mut walker)
-                .filter(|child| child.kind() != "comment")
-                .collect();
-            let row = node.start_position().row + 1;
-            if node.kind() == "block" && statements.is_empty() {
-                problems.push(format!("line {row}: block with no statements"));
-            }
-            let mut level = (node.kind() == "module").then_some((0, 0));
-            for statement in &statements {
-                let Some(indent) = statement_indent(source, statement.start_byte()) else {
-                    continue;
-                };
-                match level {
-                    None => level = Some(indent),
-                    Some(expected) if expected != indent => problems.push(format!(
-                        "line {}: statement indentation {indent:?} differs from its block's {expected:?}",
-                        statement.start_position().row + 1
-                    )),
-                    Some(_) => {}
-                }
-            }
-            if let (Some(level), Some(parent)) = (level, node.parent()) {
-                if node.kind() == "block" && node.start_position().row > parent.start_position().row
-                {
-                    if let Some(header) = statement_indent(source, parent.start_byte()) {
-                        if level.0 <= header.0 || level.1 <= header.1 {
-                            problems.push(format!(
-                                "line {row}: block indentation {level:?} is not deeper than its header's {header:?}"
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        if cursor.goto_first_child() {
-            continue;
-        }
-        loop {
-            if cursor.goto_next_sibling() {
-                break;
-            }
-            if !cursor.goto_parent() {
-                return problems;
-            }
-        }
-    }
-}
-
-/// The candidate rule flags each broken result above and accepts the valid
-/// fixtures: the files before each edit, the correctly re-indented case 1
-/// result, and a few layouts Python allows (same-line suites, comments at any
-/// column, backslash continuations, tabs).
+/// Runs edit syntax validation over every file named in the
+/// newline-separated list at `AFT_ISSUE_824_CORPUS`. The list should hold only
+/// files that CPython's own parser accepts, so any file validation rejects is
+/// a false rejection that would roll back a good edit. The always-on, bounded
+/// form of this check (every Python file in this repository) is the
+/// `python_indent` unit test `accepts_every_python_file_in_the_repository`.
 #[test]
-#[ignore = "issue #824 probe: candidate indentation rule"]
-fn issue_824_probe_candidate_rule_flags_broken_results() {
-    for (label, source) in [
-        ("case1", CASE1_BROKEN),
-        ("case2", CASE2_BROKEN),
-        (
-            "dedent_between_levels",
-            "def h():\n    if x:\n        a = 1\n      b = 2\n",
-        ),
-        (
-            "comment_only_body",
-            "def k():\n    if x:\n        # todo\n    return 1\n",
-        ),
-    ] {
-        let problems = python_indentation_problems(&parse_python(source), source);
-        println!("{label}: {problems:?}");
-        assert!(!problems.is_empty(), "{label} was not flagged");
-    }
-    for (label, source) in [
-        ("case1_before", CASE1_BEFORE),
-        ("case1_reindented", CASE1_REINDENTED),
-        ("case2_before", CASE2_BEFORE),
-        ("same_line_suite", "if x: a = 1; b = 2\nelse: pass\n"),
-        (
-            "comment_at_any_column",
-            "def f():\n    a = 1\n# note\n        # note\n    return a\n",
-        ),
-        (
-            "backslash_continuation",
-            "def f():\n    a = 1 + \\\n        2\n    return a\n",
-        ),
-        ("tabs", "def f():\n\tif x:\n\t\treturn 1\n\treturn 2\n"),
-    ] {
-        let problems = python_indentation_problems(&parse_python(source), source);
-        assert!(problems.is_empty(), "{label} falsely flagged: {problems:?}");
-    }
-}
-
-/// Runs the candidate rule over every file named in the newline-separated
-/// list at `AFT_ISSUE_824_CORPUS`. The list should hold only files that
-/// Python's own parser accepts, so any file flagged here is a false
-/// rejection. Files tree-sitter already rejects are counted separately: the
-/// current validator gives those up already.
-#[test]
-#[ignore = "issue #824 probe: needs AFT_ISSUE_824_CORPUS"]
-fn issue_824_probe_candidate_rule_has_no_false_rejections_on_corpus() {
+#[ignore = "corpus measurement: needs AFT_ISSUE_824_CORPUS"]
+fn issue_824_python_validation_has_no_false_rejections_on_corpus() {
     let list = std::env::var("AFT_ISSUE_824_CORPUS").expect("set AFT_ISSUE_824_CORPUS");
     let list = fs::read_to_string(list).unwrap();
     let mut checked = 0usize;
-    let mut tree_sitter_rejected = Vec::new();
-    let mut flagged = Vec::new();
+    let mut rejected = Vec::new();
     for path in list.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(source) = fs::read_to_string(Path::new(path)) else {
+        let path = Path::new(path);
+        let Ok(source) = fs::read_to_string(path) else {
             continue;
         };
         checked += 1;
-        let tree = parse_python(&source);
-        if tree.root_node().has_error() {
-            tree_sitter_rejected.push(path.to_string());
-            continue;
-        }
-        let problems = python_indentation_problems(&tree, &source);
-        if !problems.is_empty() {
-            flagged.push(format!("{path}: {problems:?}"));
+        if aft::edit::validate_syntax_str(&source, path) != Some(true) {
+            rejected.push(path.display().to_string());
         }
     }
     println!(
-        "checked {checked} files; tree-sitter already rejects {}; candidate rule flags {}",
-        tree_sitter_rejected.len(),
-        flagged.len()
+        "checked {checked} files; validation rejects {}",
+        rejected.len()
     );
-    for path in tree_sitter_rejected.iter().take(20) {
-        println!("tree-sitter rejects: {path}");
-    }
-    for entry in flagged.iter().take(20) {
-        println!("flagged: {entry}");
-    }
     assert!(checked > 0, "corpus list named no readable files");
-    assert!(flagged.is_empty(), "{} false rejections", flagged.len());
+    assert!(rejected.is_empty(), "false rejections: {rejected:?}");
 }
