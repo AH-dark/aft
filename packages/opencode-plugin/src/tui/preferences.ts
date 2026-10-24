@@ -205,17 +205,44 @@ export function queueTuiPreferenceUpdate(
 
 const WATCH_DEBOUNCE_MS = 150;
 
+/**
+ * What the watcher last saw where the preferences file should be: its text,
+ * or FILE_ABSENT once a read has confirmed the file does not exist. A symbol
+ * can never equal any file text, so deleting the file always counts as a
+ * change, even from an empty file.
+ */
+const FILE_ABSENT: unique symbol = Symbol("tui-preferences file absent");
+type WatchedState = string | typeof FILE_ABSENT;
+
+/**
+ * Read the file for the watcher. Returns FILE_ABSENT only for ENOENT; any
+ * other failure (a permission error, a directory at the path) returns null,
+ * meaning "unknown", so a file that is present but momentarily unreadable
+ * never makes callers fall back to defaults.
+ */
+async function readWatchedState(file: string): Promise<WatchedState | null> {
+  try {
+    return await readFile(file, "utf8");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? FILE_ABSENT : null;
+  }
+}
+
+/**
+ * Calls `onChange` after the preferences file's content changes, including
+ * when the file is deleted (callers then read defaults) and when it is
+ * created again.
+ */
 export function watchTuiPreferences(onChange: () => void): () => void {
   const file = getTuiPreferencesFile();
   const name = basename(file);
   let timer: ReturnType<typeof setTimeout> | null = null;
-  let lastSeen: string | null = null;
+  // null until a read has succeeded or confirmed the file is missing.
+  let lastSeen: WatchedState | null = null;
   let stopped = false;
-  void readFile(file, "utf8")
-    .then((text) => {
-      if (lastSeen === null) lastSeen = text;
-    })
-    .catch(() => {});
+  void readWatchedState(file).then((state) => {
+    if (lastSeen === null && state !== null) lastSeen = state;
+  });
   try {
     const watcher = watch(dirname(file), (_event, filename) => {
       const isOurs =
@@ -224,14 +251,12 @@ export function watchTuiPreferences(onChange: () => void): () => void {
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
         timer = null;
-        void readFile(file, "utf8")
-          .catch(() => null)
-          .then((text) => {
-            if (stopped || text === null) return;
-            if (text === lastSeen) return;
-            lastSeen = text;
-            onChange();
-          });
+        void readWatchedState(file).then((state) => {
+          if (stopped || state === null) return;
+          if (state === lastSeen) return;
+          lastSeen = state;
+          onChange();
+        });
       }, WATCH_DEBOUNCE_MS);
     });
     const stop = () => {

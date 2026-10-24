@@ -31,7 +31,12 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
-async function renderFrames(update?: string): Promise<string[][]> {
+/**
+ * Renders the footer, then applies each step to the preferences file in order
+ * (a string is written as its text, null deletes it), returning the first
+ * frame followed by one frame per step.
+ */
+async function renderFrames(...steps: Array<string | null>): Promise<string[][]> {
   const child = spawn(
     process.execPath,
     ["--preload", "@opentui/solid/preload", join(__dirname, "fixtures", "render-v2-footer.tsx")],
@@ -40,7 +45,7 @@ async function renderFrames(update?: string): Promise<string[][]> {
       env: {
         ...process.env,
         OPENCODE_TUI_PREFERENCES_FILE: prefsFile,
-        ...(update === undefined ? {} : { AFT_FOOTER_PREFS_UPDATE: update }),
+        AFT_FOOTER_STEPS: JSON.stringify(steps),
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
@@ -149,6 +154,32 @@ describe("the OpenCode 2 prompt footer switch", () => {
       const [before, after] = await renderFrames(`{ "aft": { "footer": true } }\n`);
       expect(footerLines(before!, true)).toEqual([]);
       expect(footerLines(after!)).toEqual([HEALTH_LINE]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "deleting the preferences file while the line is off brings it back without a remount",
+    async () => {
+      await writeFile(prefsFile, `{ "aft": { "footer": false } }\n`, "utf8");
+      const [before, after] = await renderFrames(null);
+      expect(footerLines(before!, true)).toEqual([]);
+      expect(footerLines(after!)).toEqual([HEALTH_LINE]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "recreating the deleted file with the line off hides it again",
+    async () => {
+      await writeFile(prefsFile, `{ "aft": { "footer": false } }\n`, "utf8");
+      const [before, deleted, recreated] = await renderFrames(
+        null,
+        `{ "aft": { "footer": false } }\n`,
+      );
+      expect(footerLines(before!, true)).toEqual([]);
+      expect(footerLines(deleted!)).toEqual([HEALTH_LINE]);
+      expect(footerLines(recreated!, true)).toEqual([]);
     },
     TEST_TIMEOUT_MS,
   );

@@ -10,12 +10,14 @@
 // from one that renders an empty line.
 //
 // Input (environment): OPENCODE_TUI_PREFERENCES_FILE is the preferences file
-// the footer reads. When AFT_FOOTER_PREFS_UPDATE is set, its text is written
-// to that file after the first frame and a second frame is printed once the
-// footer has reacted (or a deadline passes). Frames are separated by a line
-// holding FRAME_SEPARATOR.
+// the footer reads. AFT_FOOTER_STEPS, when set, is a JSON array of edits
+// applied one at a time after the first frame: a string is written as the
+// file's text, and null deletes the file. After each edit another frame is
+// printed once the footer has reacted (or a deadline passes). Frames are
+// separated by a line holding FRAME_SEPARATOR. The footer stays mounted the
+// whole time, so every change it shows came from the live file watch.
 
-import { writeFile } from "node:fs/promises";
+import { rm, writeFile } from "node:fs/promises";
 import { testRender } from "@opentui/solid";
 import { setupV2Tui } from "../../tui/v2.tsx";
 
@@ -26,7 +28,7 @@ const POLL_MS = 25;
 
 const prefsFile = process.env.OPENCODE_TUI_PREFERENCES_FILE;
 if (!prefsFile) throw new Error("OPENCODE_TUI_PREFERENCES_FILE must name the preferences file");
-const update = process.env.AFT_FOOTER_PREFS_UPDATE;
+const steps = JSON.parse(process.env.AFT_FOOTER_STEPS ?? "[]") as Array<string | null>;
 
 const status = {
   success: true,
@@ -96,24 +98,26 @@ try {
   // The preferences read and the status fetch are both asynchronous; give
   // them time to land before the first frame.
   await sleep(SETTLE_MS);
-  const first = await frame();
-  process.stdout.write(first);
+  let previous = await frame();
+  process.stdout.write(previous);
 
-  if (update !== undefined) {
-    await writeFile(prefsFile, update, "utf8");
+  for (const step of steps) {
+    if (step === null) await rm(prefsFile, { force: true });
+    else await writeFile(prefsFile, step, "utf8");
     // The file watch debounces, so poll until the frame changes. A footer
     // that ignores the edit leaves the frame as it was and the deadline ends
     // the wait; the caller's assertion is what reports that.
     const deadline = Date.now() + UPDATE_DEADLINE_MS;
     let next = await frame();
-    while (next === first && Date.now() < deadline) {
+    while (next === previous && Date.now() < deadline) {
       await sleep(POLL_MS);
       next = await frame();
     }
     // A footer that has just been shown fetches its status asynchronously.
     await sleep(SETTLE_MS);
+    previous = await frame();
     process.stdout.write(`\n${FRAME_SEPARATOR}\n`);
-    process.stdout.write(await frame());
+    process.stdout.write(previous);
   }
 } finally {
   cleanup();
