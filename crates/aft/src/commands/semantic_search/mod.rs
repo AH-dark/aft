@@ -946,6 +946,7 @@ fn handle_semantic_search_with_disk_fallback(
             format!("cache_dir_unavailable: {reason}"),
             "cache_dir_unavailable; bounded lexical walk only",
             false,
+            false,
             vec![],
             external_root.as_deref().unwrap_or(&project_root),
             params.top_k,
