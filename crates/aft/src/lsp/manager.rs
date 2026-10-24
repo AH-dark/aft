@@ -2756,7 +2756,7 @@ impl LspManager {
                 let snapshot = DiskSnapshot::read(path);
                 self.documents
                     .values()
-                    .any(|store| store.is_stale_against(path, &snapshot))
+                    .any(|store| store.is_open(path) && store.is_stale_against(path, &snapshot))
             })
             .collect::<Vec<_>>();
         let mut resynced = 0;

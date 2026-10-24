@@ -3486,6 +3486,126 @@ fn watcher_overflow_sends_no_per_file_flood() {
 }
 
 #[test]
+fn overflowing_document_backlog_leaves_disjoint_unchanged_documents_unsent() {
+    let (_temp, root, files) = rust_workspace_with_files(&["main.rs", "probe.rs"]);
+    fs::write(root.join("pyproject.toml"), "[project]\nname = \"demo\"\n").unwrap();
+    let python = root.join("main.py");
+    fs::write(&python, "pass\n").unwrap();
+    let log = root.join("did-change.jsonl");
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        }),
+    )
+    .with_test_checkpoint_store();
+    {
+        let mut manager = ctx.lsp();
+        manager.override_binary(ServerKind::Rust, fake_server_path());
+        manager.override_binary(ServerKind::Python, fake_server_path());
+        manager.set_extra_env("AFT_FAKE_LSP_DID_CHANGE_LOG", log.to_str().unwrap());
+    }
+    let documents = [
+        (files[0].clone(), "fn main() {}\n", ServerKind::Rust),
+        (python, "pass\n", ServerKind::Python),
+    ];
+    let config = ctx.config();
+    let mut before = Vec::new();
+    for (file, content, kind) in &documents {
+        let versions = ctx
+            .lsp()
+            .notify_file_changed_versioned(file, content, &config)
+            .unwrap();
+        assert_eq!(versions.len(), 1, "one producer must own {file:?}");
+        assert_eq!(&versions[0].0.kind, kind);
+        wait_for_publish(&mut ctx.lsp());
+        let snapshot = ctx.lsp().snapshot_pre_edit_state(file);
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "each file must be open in only one store"
+        );
+        assert_eq!(
+            snapshot
+                .get(&versions[0].0)
+                .expect("owning store must be captured")
+                .document_version_at_capture,
+            Some(0)
+        );
+        before.push(snapshot);
+    }
+    assert_ne!(before[0].keys().next(), before[1].keys().next());
+    let probe = &files[1];
+    ctx.lsp()
+        .notify_file_changed_versioned(probe, "fn main() {}\n", &config)
+        .unwrap();
+    wait_for_publish(&mut ctx.lsp());
+    fs::write(probe, "fn main() { 1; }\n").unwrap();
+    {
+        let _held = ctx.lsp();
+        // The helper may take one full batch before blocking on this lock.
+        // A second full batch plus one path guarantees that a batch overflows.
+        for index in 0..=2 * aft::lsp::pending_changes::PENDING_LSP_DOCUMENTS_CAP {
+            ctx.lsp_notify_file_changed(&root.join(format!("noise-{index}.rs")), "ignored");
+        }
+        assert!(
+            ctx.lsp_pending_changes_for_test(),
+            "the held manager must retain the overflowing backlog"
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while ctx.lsp_pending_changes_for_test() {
+        assert!(Instant::now() < deadline, "overflow backlog did not drain");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let probe_state = ctx.lsp().snapshot_pre_edit_state(probe);
+    assert_eq!(
+        probe_state
+            .values()
+            .next()
+            .expect("probe must remain open")
+            .document_version_at_capture,
+        Some(1),
+        "the unqueued disk change must prove an overflow resync ran"
+    );
+    for ((file, _, _), previous) in documents.iter().zip(&before) {
+        let current = ctx.lsp().snapshot_pre_edit_state(file);
+        assert_eq!(
+            current.len(),
+            1,
+            "only the owning store must contain {file:?}"
+        );
+        for (key, snapshot) in previous {
+            assert_eq!(
+                current
+                    .get(key)
+                    .expect("owning producer must remain open")
+                    .document_version_at_capture,
+                snapshot.document_version_at_capture,
+                "overflow must not send didChange for unchanged {file:?} absent from another store"
+            );
+        }
+    }
+    let probe_ack = collect_event(&mut ctx.lsp(), |event| {
+        matches!(event,
+        LspEvent::Notification { method, .. } if method == "custom/documentChanged")
+    });
+    assert!(probe_ack.is_some(), "overflow probe must reach its server");
+    // The probe acknowledgement is consumed. FIFO acknowledgements for these
+    // barriers account for exactly two additional changes in the log.
+    for (file, content, _) in &documents {
+        server_reports_before_barrier(&ctx, file, content);
+    }
+    let changes = fs::read_to_string(&log).expect("barrier changes must be logged");
+    assert_eq!(
+        changes.lines().count(),
+        3,
+        "only the drifted probe and two barriers may send didChange: {changes}"
+    );
+}
+
+#[test]
 fn watcher_overflow_under_manager_contention_sends_one_config_notification() {
     let (_temp_dir, root, file, ctx, watcher_tx) = fake_rust_server_with_watcher(|_| Vec::new());
     let mut paths: Vec<_> = (0..WATCHED_FILE_FORWARD_CAP + 10)
