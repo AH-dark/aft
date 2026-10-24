@@ -1,0 +1,1 @@
+- Tool calls no longer stall behind idle-project housekeeping when many idle projects hold unsaved file-change records; that work now costs the same at any size.

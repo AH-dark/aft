@@ -2302,6 +2302,75 @@ pub(crate) struct PendingReconciliationState {
     corpus_refresh: bool,
 }
 
+/// Put one taken pending-path set back into the context's live set.
+///
+/// The idle reaper takes and restores these sets on every sweep for each
+/// unbound root an artifact blocker keeps resident, on the subc frame loop.
+/// Usually nothing was recorded while the set was out, so the taken set moves
+/// back whole without comparing a single path. Re-inserting path by path cost
+/// a full-path comparison per tree level for every pending path, every sweep.
+/// When the watcher did record paths meanwhile, the two sorted sets are merged
+/// in one linear pass.
+fn restore_pending_paths(pending: &mut BTreeSet<PathBuf>, mut taken: BTreeSet<PathBuf>) {
+    #[cfg(test)]
+    if pending_restore_work::legacy_enabled() {
+        // The path-by-path re-insertion this function replaced, kept so tests
+        // can compare reap decisions and work against it.
+        pending_restore_work::note_merged(taken.len());
+        pending.extend(taken);
+        return;
+    }
+    if taken.is_empty() {
+        return;
+    }
+    if pending.is_empty() {
+        *pending = taken;
+        return;
+    }
+    #[cfg(test)]
+    pending_restore_work::note_merged(pending.len() + taken.len());
+    pending.append(&mut taken);
+}
+
+/// Counts the pending paths [`restore_pending_paths`] had to merge one by one
+/// on the calling thread, so tests can assert that a reap sweep's restore
+/// work does not grow with the number of roots or pending paths.
+#[cfg(test)]
+pub(crate) mod pending_restore_work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MERGED: Cell<usize> = const { Cell::new(0) };
+        static LEGACY: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn note_merged(paths: usize) {
+        MERGED.with(|merged| merged.set(merged.get() + paths));
+    }
+
+    /// Paths merged one by one on this thread since the last call.
+    pub(crate) fn take_merged() -> usize {
+        MERGED.with(|merged| merged.replace(0))
+    }
+
+    pub(super) fn legacy_enabled() -> bool {
+        LEGACY.with(Cell::get)
+    }
+
+    /// Run `f` with restores on this thread re-inserting every taken path
+    /// one by one, as they did before restores moved whole sets back.
+    pub(crate) fn with_legacy_restore<R>(f: impl FnOnce() -> R) -> R {
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                LEGACY.with(|legacy| legacy.set(self.0));
+            }
+        }
+        let _reset = Reset(LEGACY.with(|legacy| legacy.replace(true)));
+        f()
+    }
+}
+
 /// Why [`AppContext::artifact_eviction_blocker`] refused eviction. The idle
 /// reaper counts retained unbound roots per kind in its health census.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -11921,6 +11990,27 @@ impl AppContext {
         std::mem::take(&mut *self.pending_semantic_corpus_refresh.lock())
     }
 
+    /// Copies of the pending search, callgraph, Tier-2 and semantic path sets
+    /// and the corpus-refresh flag, unfiltered and left in place.
+    #[cfg(test)]
+    pub(crate) fn pending_reconciliation_snapshot_for_test(
+        &self,
+    ) -> (
+        BTreeSet<PathBuf>,
+        BTreeSet<PathBuf>,
+        BTreeSet<PathBuf>,
+        BTreeSet<PathBuf>,
+        bool,
+    ) {
+        (
+            self.pending_search_index_paths.lock().clone(),
+            self.pending_callgraph_store_paths.lock().clone(),
+            self.pending_tier2_paths.lock().clone(),
+            self.pending_semantic_index_paths.lock().clone(),
+            *self.pending_semantic_corpus_refresh.lock(),
+        )
+    }
+
     pub fn clear_pending_index_updates(&self) {
         self.clear_pending_index_updates_with_callgraph(true);
     }
@@ -11940,14 +12030,16 @@ impl AppContext {
     }
 
     pub(crate) fn restore_pending_reconciliation_state(&self, state: PendingReconciliationState) {
-        self.pending_search_index_paths.lock().extend(state.search);
-        self.pending_callgraph_store_paths
-            .lock()
-            .extend(state.callgraph);
-        self.pending_tier2_paths.lock().extend(state.tier2);
-        self.pending_semantic_index_paths
-            .lock()
-            .extend(state.semantic);
+        restore_pending_paths(&mut self.pending_search_index_paths.lock(), state.search);
+        restore_pending_paths(
+            &mut self.pending_callgraph_store_paths.lock(),
+            state.callgraph,
+        );
+        restore_pending_paths(&mut self.pending_tier2_paths.lock(), state.tier2);
+        restore_pending_paths(
+            &mut self.pending_semantic_index_paths.lock(),
+            state.semantic,
+        );
         if state.corpus_refresh {
             *self.pending_semantic_corpus_refresh.lock() = true;
         }
@@ -13818,10 +13910,10 @@ impl AppContext {
         })();
         match guards {
             Some((mut search, mut callgraph, mut tier2, mut semantic, mut corpus_refresh)) => {
-                search.extend(state.search);
-                callgraph.extend(state.callgraph);
-                tier2.extend(state.tier2);
-                semantic.extend(state.semantic);
+                restore_pending_paths(&mut search, state.search);
+                restore_pending_paths(&mut callgraph, state.callgraph);
+                restore_pending_paths(&mut tier2, state.tier2);
+                restore_pending_paths(&mut semantic, state.semantic);
                 if state.corpus_refresh {
                     *corpus_refresh = true;
                 }
