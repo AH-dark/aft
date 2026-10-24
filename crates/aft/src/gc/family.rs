@@ -42,7 +42,7 @@
 //! mark could miss a protected key; a deletion walk that reaches one simply
 //! stops, which only leaves garbage for the next sweep.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -878,10 +878,18 @@ fn metadata_cleanup_due(registry: &FamilyRegistry) -> bool {
 }
 
 fn metadata_cleanup_completed(registry: &FamilyRegistry) {
-    metadata_cleanups()
+    let mut cleanups = metadata_cleanups()
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(registry.path().to_path_buf(), Instant::now());
+        .unwrap_or_else(|error| error.into_inner());
+    forget_expired_cleanups(&mut cleanups, Instant::now());
+    cleanups.insert(registry.path().to_path_buf(), Instant::now());
+}
+
+/// An entry older than the interval answers "due" exactly like a missing one,
+/// so dropping it changes nothing. This keeps the map to families cleaned in
+/// the last hour instead of every family the process has ever swept.
+fn forget_expired_cleanups(cleanups: &mut BTreeMap<PathBuf, Instant>, now: Instant) {
+    cleanups.retain(|_, last| now.saturating_duration_since(*last) < METADATA_CLEANUP_INTERVAL);
 }
 
 /// Reclaims dead-owner pin and reader files without loading references. A
@@ -2290,5 +2298,24 @@ mod reader_marker_tests {
                 readers.len(), census.values().sum::<usize>(), census.values().max().copied().unwrap_or(0), elapsed.as_secs_f64() * 1000.0);
         }
         drop((readers, views));
+    }
+}
+
+#[cfg(test)]
+mod metadata_cleanup_clock_tests {
+    use super::*;
+
+    #[test]
+    fn expired_cleanup_entries_are_forgotten_and_recent_ones_kept() {
+        let swept = Instant::now();
+        let later = swept + METADATA_CLEANUP_INTERVAL + Duration::from_secs(1);
+        let mut cleanups = BTreeMap::new();
+        cleanups.insert(PathBuf::from("/families/gone"), swept);
+        cleanups.insert(PathBuf::from("/families/recent"), later);
+        forget_expired_cleanups(&mut cleanups, later);
+        assert_eq!(
+            cleanups.keys().collect::<Vec<_>>(),
+            vec![&PathBuf::from("/families/recent")]
+        );
     }
 }
