@@ -280,6 +280,37 @@ fn private_finish_syncs_the_owning_database_file() {
     );
 }
 
+#[test]
+fn private_finish_restores_journaling_and_full_synchronous_on_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("restored-policy.sqlite");
+    let connection =
+        crate::db::file_identity::IdentityConnection::open(&path, "private-finish-policy-test")
+            .unwrap();
+    configure_private_connection(&connection).unwrap();
+    connection
+        .execute_batch("CREATE TABLE t(v); INSERT INTO t VALUES(1);")
+        .unwrap();
+    let journal_mode = || {
+        connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap()
+    };
+    let synchronous = || {
+        connection
+            .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    assert_eq!(journal_mode(), "off");
+    assert_eq!(synchronous(), 0);
+
+    finish_private_database(&connection).unwrap();
+
+    // Finalization restores the owner's policy as well as syncing existing pages.
+    assert_eq!(journal_mode(), "delete");
+    assert_eq!(synchronous(), 2);
+}
+
 /// Logical content of a derived database: schema rows plus sorted, typed rows
 /// of every table. See [`parity`] for the definition.
 fn snapshot(path: &Path) -> parity::LogicalSnapshot {
