@@ -806,6 +806,8 @@ export function clearOldBinaries(
   for (const plugin of plugins) {
     try {
       const info = plugin.getPluginCacheInfo();
+      // Failed metadata reads cannot establish that a plugin's binary is unused.
+      if (info.readError !== undefined) return result;
       const entry = (info.configuredEntry ?? plugin.getConfiguredPluginEntry?.())?.replace(
         /^npm:/,
         "",

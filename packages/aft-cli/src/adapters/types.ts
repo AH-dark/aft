@@ -31,6 +31,8 @@ export interface HarnessConfigPaths {
 export interface PluginCacheInfo {
   path: string;
   cached?: string;
+  /** An installed manifest could not be read; its binary version may still be in use. */
+  readError?: string;
   latest?: string;
   exists: boolean;
   /**
