@@ -162,45 +162,399 @@ static COMMAND_SECRET_FLAG: LazyLock<Regex> = LazyLock::new(|| {
         ")"
     ))
 });
-/// The rest of a command after its program name: whole shell words separated
-/// by spaces or tabs, so a `;`, `&`, `|` or newline ends it only outside
-/// quotes. Redirections and parentheses do not end it.
-macro_rules! command_args {
-    () => {
-        concat!(r"(?:[ \t]+(?:", shell_word!(), r"|[<>()])+)*")
-    };
+/// How deep [`mask_tool_passwords`] looks into quoted strings that hold a
+/// command of their own (`bash -c "curl -u admin:pw ..."`).
+const QUOTED_COMMAND_DEPTH: usize = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShellTokenKind {
+    Word,
+    /// A redirection with its target (`<f`, `> f`, `2>&1`, `<<<word`). It is
+    /// neither an argument nor the value of the option before it.
+    Redirect,
 }
-/// The MySQL family's attached password, `-p<value>`. Other tools' `-p`
-/// (cargo's package, ssh's port, mkdir's parents) is never touched.
-static COMMAND_MYSQL_PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
-    compile(concat!(
-        r"\b((?:mysql|mariadb|mysqladmin|mysqldump)\b(?:[ \t]+(?:",
-        shell_word!(),
-        r"|[<>()])+)*?[ \t]+-p)(",
-        shell_word!(),
-        ")"
-    ))
-});
-/// `sshpass -p <value>`.
-static COMMAND_SSHPASS_PASSWORD: LazyLock<Regex> =
-    LazyLock::new(|| compile(concat!(r"\b(sshpass[ \t]+-p[ \t]*)(", shell_word!(), ")")));
-/// One `curl` command, up to the next shell operator or newline outside
-/// quotes (the `command_args!` span). A command
-/// can carry several `-u` options (one per URL, across `--next`), so each is
-/// found inside this span by [`COMMAND_CURL_USER_OPTION`].
-static COMMAND_CURL_SEGMENT: LazyLock<Regex> =
-    LazyLock::new(|| compile(concat!(r"\bcurl\b", command_args!())));
-/// A `-u user:password` option inside a curl command, in any of curl's
-/// spellings (`-u value`, `-uvalue`, `--user value`, `--user=value`): the
-/// whole credential word, whose password half (after the first `:`) is
-/// masked by [`mask_curl_password`].
-static COMMAND_CURL_USER_OPTION: LazyLock<Regex> = LazyLock::new(|| {
-    compile(concat!(
-        r"(^|\s)(-u[ \t]*|--user(?:=|[ \t]+))(",
-        shell_word!(),
-        ")"
-    ))
-});
+
+#[derive(Clone)]
+struct ShellToken {
+    kind: ShellTokenKind,
+    range: std::ops::Range<usize>,
+}
+
+/// Split `text` into simple commands of words and redirections, reading it
+/// as the shell would: quotes and backslashes keep operators inside a word;
+/// an unquoted `;`, `&`, `|`, newline, `(`, `)` or backtick ends a command
+/// (so subshells, `$( ... )` and backtick substitutions are commands of
+/// their own); a backslash-newline continues the line; redirections may be
+/// attached to a word or spaced from it. Also returns the inside of every
+/// quoted run, which may hold a command for another shell.
+fn split_shell_commands(text: &str) -> (Vec<Vec<ShellToken>>, Vec<std::ops::Range<usize>>) {
+    let bytes = text.as_bytes();
+    let mut commands = vec![Vec::new()];
+    let mut quoted = Vec::new();
+    let end_command = |commands: &mut Vec<Vec<ShellToken>>| {
+        if !commands.last().is_some_and(Vec::is_empty) {
+            commands.push(Vec::new());
+        }
+    };
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b' ' | b'\t' | b'\r' => at += 1,
+            b'\\' if bytes.get(at + 1) == Some(&b'\n') => at += 2,
+            b'\n' | b';' | b'(' | b')' | b'`' => {
+                end_command(&mut commands);
+                at += 1;
+            }
+            b'|' => {
+                end_command(&mut commands);
+                at += 1 + usize::from(matches!(bytes.get(at + 1), Some(b'|' | b'&')));
+            }
+            b'&' if bytes.get(at + 1) != Some(&b'>') => {
+                end_command(&mut commands);
+                at += 1 + usize::from(bytes.get(at + 1) == Some(&b'&'));
+            }
+            b'&' | b'<' | b'>' => {
+                let (token, next) = scan_redirect(text, at, &mut quoted);
+                commands.last_mut().unwrap().push(token);
+                at = next;
+            }
+            _ => {
+                let next = scan_shell_word(text, at, &mut quoted);
+                // A file-descriptor number attached to a redirection (`2>`).
+                if text[at..next].bytes().all(|byte| byte.is_ascii_digit())
+                    && matches!(bytes.get(next), Some(b'<' | b'>'))
+                {
+                    let (mut token, after) = scan_redirect(text, next, &mut quoted);
+                    token.range.start = at;
+                    commands.last_mut().unwrap().push(token);
+                    at = after;
+                } else {
+                    commands.last_mut().unwrap().push(ShellToken {
+                        kind: ShellTokenKind::Word,
+                        range: at..next,
+                    });
+                    at = next;
+                }
+            }
+        }
+    }
+    (commands, quoted)
+}
+
+/// The end of the shell word starting at `start`, recording the inside of
+/// each quoted run. An unclosed quote runs to the end of `text`.
+fn scan_shell_word(text: &str, start: usize, quoted: &mut Vec<std::ops::Range<usize>>) -> usize {
+    let bytes = text.as_bytes();
+    let mut at = start;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\'' => {
+                let close = text[at + 1..]
+                    .find('\'')
+                    .map_or(bytes.len(), |off| at + 1 + off);
+                quoted.push(at + 1..close);
+                at = (close + 1).min(bytes.len());
+            }
+            b'"' => {
+                let mut close = at + 1;
+                while close < bytes.len() && bytes[close] != b'"' {
+                    close += if bytes[close] == b'\\' { 2 } else { 1 };
+                }
+                let close = close.min(bytes.len());
+                quoted.push(at + 1..close);
+                at = (close + 1).min(bytes.len());
+            }
+            b'\\' => at = (at + 2).min(bytes.len()),
+            byte if byte.is_ascii_whitespace()
+                || matches!(byte, b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' | b'`') =>
+            {
+                break
+            }
+            _ => at += 1,
+        }
+    }
+    // Stay on a character boundary after a backslash before a multibyte char.
+    while !text.is_char_boundary(at) {
+        at += 1;
+    }
+    at
+}
+
+/// A redirection operator at `start` (`<`, `>>`, `<<<`, `>&`, `&>`, `>|`,
+/// `<<-`) and its target word, attached or after spaces, if one follows.
+fn scan_redirect(
+    text: &str,
+    start: usize,
+    quoted: &mut Vec<std::ops::Range<usize>>,
+) -> (ShellToken, usize) {
+    let bytes = text.as_bytes();
+    let mut at = start + usize::from(bytes[start] == b'&');
+    let mut arrows = 0;
+    while arrows < 3 && matches!(bytes.get(at), Some(b'<' | b'>')) {
+        at += 1;
+        arrows += 1;
+    }
+    if matches!(bytes.get(at), Some(b'&' | b'|' | b'-')) {
+        at += 1;
+    }
+    let mut target = at;
+    while matches!(bytes.get(target), Some(b' ' | b'\t')) {
+        target += 1;
+    }
+    let starts_word = bytes.get(target).is_some_and(|byte| {
+        !byte.is_ascii_whitespace()
+            && !matches!(byte, b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' | b'`')
+    });
+    if starts_word {
+        at = scan_shell_word(text, target, quoted);
+    }
+    (
+        ShellToken {
+            kind: ShellTokenKind::Redirect,
+            range: start..at,
+        },
+        at,
+    )
+}
+
+/// A shell word as the program sees it: quotes removed, escapes resolved.
+fn unquote_shell_word(word: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut chars = word.chars();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (None, '\'' | '"') => quote = Some(ch),
+            (Some(open), _) if ch == open => quote = None,
+            (Some('\''), _) => out.push(ch),
+            (_, '\\') => {
+                if let Some(next) = chars.next() {
+                    if next != '\n' {
+                        out.push(next);
+                    }
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Mask the passwords that curl (`-u`/`--user`), the MySQL family (`-p<pw>`)
+/// and sshpass (`-p pw`) take on the command line, wherever those programs
+/// run in `command`: after assignments or wrappers (`env`, `sudo`,
+/// `command`), inside subshells and substitutions, across continuation
+/// lines, and inside a quoted string handed to another shell.
+fn mask_tool_passwords(command: &str) -> Cow<'_, str> {
+    if !["curl", "mysql", "mariadb", "sshpass"]
+        .iter()
+        .any(|program| command.contains(program))
+    {
+        return Cow::Borrowed(command);
+    }
+    let mut masks = Vec::new();
+    collect_tool_password_masks(command, 0, 0, &mut masks);
+    if masks.is_empty() {
+        return Cow::Borrowed(command);
+    }
+    masks.sort_by_key(|(range, _): &(std::ops::Range<usize>, String)| range.start);
+    let mut out = String::with_capacity(command.len());
+    let mut copied = 0;
+    for (range, replacement) in masks {
+        if range.start < copied {
+            continue;
+        }
+        out.push_str(&command[copied..range.start]);
+        out.push_str(&replacement);
+        copied = range.end;
+    }
+    out.push_str(&command[copied..]);
+    if out == command {
+        Cow::Borrowed(command)
+    } else {
+        Cow::Owned(out)
+    }
+}
+
+fn collect_tool_password_masks(
+    text: &str,
+    base: usize,
+    depth: usize,
+    masks: &mut Vec<(std::ops::Range<usize>, String)>,
+) {
+    let (commands, quoted) = split_shell_commands(text);
+    let mut local = Vec::new();
+    for tokens in &commands {
+        for (index, token) in tokens.iter().enumerate() {
+            if token.kind != ShellTokenKind::Word {
+                continue;
+            }
+            let word = unquote_shell_word(&text[token.range.clone()]);
+            let program = word.rsplit('/').next().unwrap_or_default();
+            let program = program.strip_suffix(".exe").unwrap_or(program);
+            let args = &tokens[index + 1..];
+            match program {
+                "curl" => curl_password_masks(text, args, &mut local),
+                "mysql" | "mariadb" | "mysqladmin" | "mysqldump" => {
+                    mysql_password_masks(text, args, &mut local)
+                }
+                "sshpass" => sshpass_password_masks(text, args, &mut local),
+                _ => {}
+            }
+        }
+    }
+    masks.extend(
+        local
+            .into_iter()
+            .map(|(range, replacement)| (range.start + base..range.end + base, replacement)),
+    );
+    if depth < QUOTED_COMMAND_DEPTH {
+        for inner in quoted {
+            collect_tool_password_masks(&text[inner.clone()], base + inner.start, depth + 1, masks);
+        }
+    }
+}
+
+/// The value attached to an option word (`-uadmin:pw`, `--user=admin:pw`,
+/// `-ppw`) after `prefix`, as a range of `text`, or `None` when the word is
+/// not that option with an attached value. A quoted option word (`"-ppw"`)
+/// yields the whole word and the unquoted value to mask in its place.
+fn attached_option_value(
+    text: &str,
+    token: &ShellToken,
+    prefix: &str,
+) -> Option<(std::ops::Range<usize>, Option<String>)> {
+    let raw = &text[token.range.clone()];
+    if raw.len() > prefix.len() && raw.starts_with(prefix) {
+        return Some((token.range.start + prefix.len()..token.range.end, None));
+    }
+    let plain = unquote_shell_word(raw);
+    let value = plain
+        .strip_prefix(prefix)
+        .filter(|value| !value.is_empty())?;
+    Some((token.range.clone(), Some(value.to_string())))
+}
+
+/// The word right after an option, if the next token is a word (not a
+/// redirection, which would mean the option has no value here).
+fn next_word(args: &[ShellToken], index: usize) -> Option<&ShellToken> {
+    args.get(index + 1)
+        .filter(|token| token.kind == ShellTokenKind::Word)
+}
+
+/// Every `-u`/`--user` value in curl's arguments, across `--next`.
+fn curl_password_masks(
+    text: &str,
+    args: &[ShellToken],
+    masks: &mut Vec<(std::ops::Range<usize>, String)>,
+) {
+    for (index, token) in args.iter().enumerate() {
+        if token.kind != ShellTokenKind::Word {
+            continue;
+        }
+        let plain = unquote_shell_word(&text[token.range.clone()]);
+        if plain == "-u" || plain == "--user" {
+            if let Some(value) = next_word(args, index) {
+                if let Some(masked) = mask_curl_password(&text[value.range.clone()]) {
+                    masks.push((value.range.clone(), masked));
+                }
+            }
+            continue;
+        }
+        let prefix = if plain.starts_with("--user=") {
+            "--user="
+        } else if plain.starts_with("-u") && !plain.starts_with("--") {
+            "-u"
+        } else {
+            continue;
+        };
+        match attached_option_value(text, token, prefix) {
+            Some((range, None)) => {
+                if let Some(masked) = mask_curl_password(&text[range.clone()]) {
+                    masks.push((range, masked));
+                }
+            }
+            Some((range, Some(value))) => {
+                if let Some(masked) = mask_curl_password(&value) {
+                    masks.push((range, format!("{prefix}{masked}")));
+                }
+            }
+            None => {}
+        }
+    }
+}
+
+/// Push a placeholder over an attached option value unless it is a reference.
+fn mask_attached_password(
+    text: &str,
+    token: &ShellToken,
+    prefix: &str,
+    masks: &mut Vec<(std::ops::Range<usize>, String)>,
+) {
+    match attached_option_value(text, token, prefix) {
+        Some((range, None)) if !command_value_is_reference(&text[range.clone()]) => {
+            masks.push((range, SECRET_PLACEHOLDER.to_string()));
+        }
+        Some((range, Some(value))) if !command_value_is_reference(&value) => {
+            masks.push((range, format!("{prefix}{SECRET_PLACEHOLDER}")));
+        }
+        _ => {}
+    }
+}
+
+/// The MySQL family's attached password, `-p<value>`. A bare `-p` prompts,
+/// and other tools' `-p` (cargo's package, ssh's port) is never reached here.
+fn mysql_password_masks(
+    text: &str,
+    args: &[ShellToken],
+    masks: &mut Vec<(std::ops::Range<usize>, String)>,
+) {
+    for token in args {
+        if token.kind == ShellTokenKind::Word {
+            let plain = unquote_shell_word(&text[token.range.clone()]);
+            if plain.starts_with("-p") {
+                mask_attached_password(text, token, "-p", masks);
+            }
+        }
+    }
+}
+
+/// sshpass's `-p <value>` or `-p<value>`. Only sshpass's own options are
+/// read: they end at the wrapped command, whose `-p` (ssh's port) is not a
+/// password.
+fn sshpass_password_masks(
+    text: &str,
+    args: &[ShellToken],
+    masks: &mut Vec<(std::ops::Range<usize>, String)>,
+) {
+    let mut index = 0;
+    while index < args.len() {
+        let token = &args[index];
+        index += 1;
+        if token.kind != ShellTokenKind::Word {
+            continue;
+        }
+        let plain = unquote_shell_word(&text[token.range.clone()]);
+        match plain.as_str() {
+            "-p" => {
+                if let Some(value) = next_word(args, index - 1) {
+                    if !command_value_is_reference(&text[value.range.clone()]) {
+                        masks.push((value.range.clone(), SECRET_PLACEHOLDER.to_string()));
+                    }
+                }
+                return;
+            }
+            // Options that take a value of their own.
+            "-f" | "-d" | "-P" => index += 1,
+            _ if plain.starts_with("-p") => {
+                mask_attached_password(text, token, "-p", masks);
+                return;
+            }
+            _ if plain.starts_with('-') => {}
+            _ => return,
+        }
+    }
+}
 
 /// Mask what follows the first `:` of a `user:password` word, keeping the
 /// user and a quote pair that wraps the whole word (`"admin:<masked>"`).
@@ -237,7 +591,9 @@ fn command_value_is_reference(value: &str) -> bool {
 /// Mask the whole command before shortening it for a log line: a token cut
 /// short no longer matches its pattern.
 pub fn redact_command(command: &str) -> Cow<'_, str> {
-    let mut out = Cow::Borrowed(command);
+    // Runs first, on the command as typed: the shapes below write
+    // placeholders that read as redirections to the shell-word scan.
+    let mut out = mask_tool_passwords(command);
     if command.contains('=') {
         out = replace_in(
             out,
@@ -265,40 +621,6 @@ pub fn redact_command(command: &str) -> Cow<'_, str> {
                 format!("{}{}{SECRET_PLACEHOLDER}", &caps[1], &caps[2])
             }
         });
-    }
-    if command.contains("curl") {
-        // Check every user option in the command: a username-only `-u`
-        // before a later `-u admin:password` must not end the search.
-        out = replace_in(
-            out,
-            None,
-            &COMMAND_CURL_SEGMENT,
-            |segment: &Captures<'_>| {
-                COMMAND_CURL_USER_OPTION
-                    .replace_all(&segment[0], |caps: &Captures<'_>| match mask_curl_password(
-                        &caps[3],
-                    ) {
-                        Some(masked) => format!("{}{}{masked}", &caps[1], &caps[2]),
-                        None => caps[0].to_string(),
-                    })
-                    .into_owned()
-            },
-        );
-    }
-    for (needle, pattern) in [
-        ("mysql", &COMMAND_MYSQL_PASSWORD),
-        ("mariadb", &COMMAND_MYSQL_PASSWORD),
-        ("sshpass", &COMMAND_SSHPASS_PASSWORD),
-    ] {
-        if command.contains(needle) {
-            out = replace_in(out, None, pattern, |caps: &Captures<'_>| {
-                if command_value_is_reference(&caps[2]) {
-                    caps[0].to_string()
-                } else {
-                    format!("{}{SECRET_PLACEHOLDER}", &caps[1])
-                }
-            });
-        }
     }
     match aft_redactor(&out) {
         Cow::Borrowed(_) => out,
@@ -1084,7 +1406,7 @@ mod tests {
             "../tests/fixtures/command_redaction_cases.json"
         ))
         .expect("command redaction fixture parses");
-        assert_eq!(fixture.masked.len(), 45);
+        assert_eq!(fixture.masked.len(), 101);
         assert!(fixture.untouched.len() > 800);
         for case in &fixture.masked {
             let masked = redact_command(&case.input);
@@ -1101,6 +1423,102 @@ mod tests {
             .map(|command| format!("{command} -> {}", redact_command(command)))
             .collect();
         assert!(mangled.is_empty(), "{}", mangled.join("\n"));
+    }
+
+    /// The curl, MySQL and sshpass rules as they were before commands were
+    /// read as shell words: the span ran to the first `;`, `&`, `|` or
+    /// newline, quoted or not.
+    fn line_pattern_tool_passwords(command: &str) -> String {
+        static PATTERNS: LazyLock<[Regex; 4]> = LazyLock::new(|| {
+            [
+                compile(r"\bcurl\b[^;&|\n]*"),
+                compile(concat!(
+                    r"(^|\s)(-u[ \t]*|--user(?:=|[ \t]+))(",
+                    shell_word!(),
+                    ")"
+                )),
+                compile(concat!(
+                    r"\b((?:mysql|mariadb|mysqladmin|mysqldump)\b[^;&|\n]*?\s-p)(",
+                    shell_word!(),
+                    ")"
+                )),
+                compile(concat!(r"\b(sshpass[ \t]+-p[ \t]*)(", shell_word!(), ")")),
+            ]
+        });
+        let [segment, user_option, mysql, sshpass] = &*PATTERNS;
+        let out = segment.replace_all(command, |segment: &Captures<'_>| {
+            user_option
+                .replace_all(
+                    &segment[0],
+                    |caps: &Captures<'_>| match mask_curl_password(&caps[3]) {
+                        Some(masked) => format!("{}{}{masked}", &caps[1], &caps[2]),
+                        None => caps[0].to_string(),
+                    },
+                )
+                .into_owned()
+        });
+        let mut out = out.into_owned();
+        for pattern in [mysql, sshpass] {
+            out = pattern
+                .replace_all(&out, |caps: &Captures<'_>| {
+                    if command_value_is_reference(&caps[2]) {
+                        caps[0].to_string()
+                    } else {
+                        format!("{}{SECRET_PLACEHOLDER}", &caps[1])
+                    }
+                })
+                .into_owned();
+        }
+        out
+    }
+
+    /// Reading commands as shell words must not lose a password the earlier
+    /// line patterns caught: on every fixture command, each placeholder the
+    /// line patterns wrote is also written by the shell-word scan, at the
+    /// same place.
+    #[test]
+    fn shell_word_scan_masks_everything_the_line_patterns_did() {
+        let fixture: CommandFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/command_redaction_cases.json"
+        ))
+        .expect("command redaction fixture parses");
+        let mut compared = 0;
+        let mut lost = Vec::new();
+        for command in fixture
+            .masked
+            .iter()
+            .map(|case| &case.input)
+            .chain(&fixture.untouched)
+        {
+            let legacy = line_pattern_tool_passwords(command);
+            if legacy == *command {
+                continue;
+            }
+            compared += 1;
+            let scanned = mask_tool_passwords(command);
+            // Text before each legacy placeholder must match the scan's
+            // output up to a placeholder too.
+            let legacy_prefixes: Vec<_> = legacy
+                .match_indices(SECRET_PLACEHOLDER)
+                .map(|(at, _)| &legacy[..at])
+                .collect();
+            let scanned_prefixes: Vec<_> = scanned
+                .match_indices(SECRET_PLACEHOLDER)
+                .map(|(at, _)| &scanned[..at])
+                .collect();
+            for prefix in legacy_prefixes {
+                if !scanned_prefixes.iter().any(|scanned| {
+                    scanned.trim_end_matches(['"', '\'']) == prefix.trim_end_matches(['"', '\''])
+                }) {
+                    lost.push(format!(
+                        "{command:?}\n  line patterns: {legacy}\n  shell words:   {scanned}"
+                    ));
+                }
+            }
+        }
+        assert!(lost.is_empty(), "{}", lost.join("\n"));
+        eprintln!("{compared} fixture commands masked by the line patterns; none lost");
+        assert!(compared > 40, "{compared}");
     }
 
     fn fixture() -> Fixture {

@@ -179,6 +179,230 @@
   {
    "input": "echo start; curl -u admin:pw https://x",
    "expected": "echo start; curl -u admin:<REDACTED_SECRET> https://x"
+  },
+  {
+   "input": "curl</dev/null -u admin:pw1 https://h",
+   "expected": "curl</dev/null -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "curl < /dev/null -u admin:pw1 https://h",
+   "expected": "curl < /dev/null -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "curl -u admin:pw1 https://h >out.txt 2>&1",
+   "expected": "curl -u admin:<REDACTED_SECRET> https://h >out.txt 2>&1"
+  },
+  {
+   "input": "curl -u admin:pw1>out.txt https://h",
+   "expected": "curl -u admin:<REDACTED_SECRET>>out.txt https://h"
+  },
+  {
+   "input": "curl <<<data -u admin:pw1 https://h",
+   "expected": "curl <<<data -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "curl 2>/dev/null -u admin:pw1 https://h",
+   "expected": "curl 2>/dev/null -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "A=1 curl -u admin:pw1 https://h",
+   "expected": "A=1 curl -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "command curl -u admin:pw1 https://h",
+   "expected": "command curl -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "sudo -u deploy curl -u admin:pw1 https://h",
+   "expected": "sudo -u deploy curl -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "env A=1 curl -u admin:pw1 https://h",
+   "expected": "env A=1 curl -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "(curl -u admin:pw1 https://h)",
+   "expected": "(curl -u admin:<REDACTED_SECRET> https://h)"
+  },
+  {
+   "input": "out=$(curl -u admin:pw1 https://h)",
+   "expected": "out=$(curl -u admin:<REDACTED_SECRET> https://h)"
+  },
+  {
+   "input": "out=`curl -u admin:pw1 https://h`",
+   "expected": "out=`curl -u admin:<REDACTED_SECRET> https://h`"
+  },
+  {
+   "input": "curl \\\n  -u admin:pw1 \\\n  https://h",
+   "expected": "curl \\\n  -u admin:<REDACTED_SECRET> \\\n  https://h"
+  },
+  {
+   "input": "bash -c \"curl -u admin:pw1 https://h\"",
+   "expected": "bash -c \"curl -u admin:<REDACTED_SECRET> https://h\""
+  },
+  {
+   "input": "echo start && curl -u admin:pw1 https://h",
+   "expected": "echo start && curl -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "mysql</dev/null -u root -ppw1 db",
+   "expected": "mysql</dev/null -u root -p<REDACTED_SECRET> db"
+  },
+  {
+   "input": "mysql < /dev/null -u root -ppw1 db",
+   "expected": "mysql < /dev/null -u root -p<REDACTED_SECRET> db"
+  },
+  {
+   "input": "mysql -u root -ppw1 db >out.txt 2>&1",
+   "expected": "mysql -u root -p<REDACTED_SECRET> db >out.txt 2>&1"
+  },
+  {
+   "input": "mysql -u root -ppw1>out.txt db",
+   "expected": "mysql -u root -p<REDACTED_SECRET>>out.txt db"
+  },
+  {
+   "input": "mysql <<<data -u root -ppw1 db",
+   "expected": "mysql <<<data -u root -p<REDACTED_SECRET> db"
+  },
+  {
+   "input": "mysql 2>/dev/null -u root -ppw1 db",
+   "expected": "mysql 2>/dev/null -u root -p<REDACTED_SECRET> db"
+  },
+  {
+   "input": "A=1 mysql -u root -ppw1 db",
+   "expected": "A=1 mysql -u root -p<REDACTED_SECRET> db"
+  },
+  {
+   "input": "command mysql -u root -ppw1 db",
+   "expected": "command mysql -u root -p<REDACTED_SECRET> db"
+  },
+  {
+   "input": "sudo -u deploy mysql -u root -ppw1 db",
+   "expected": "sudo -u deploy mysql -u root -p<REDACTED_SECRET> db"
+  },
+  {
+   "input": "env A=1 mysql -u root -ppw1 db",
+   "expected": "env A=1 mysql -u root -p<REDACTED_SECRET> db"
+  },
+  {
+   "input": "(mysql -u root -ppw1 db)",
+   "expected": "(mysql -u root -p<REDACTED_SECRET> db)"
+  },
+  {
+   "input": "out=$(mysql -u root -ppw1 db)",
+   "expected": "out=$(mysql -u root -p<REDACTED_SECRET> db)"
+  },
+  {
+   "input": "out=`mysql -u root -ppw1 db`",
+   "expected": "out=`mysql -u root -p<REDACTED_SECRET> db`"
+  },
+  {
+   "input": "mysql \\\n  -u root -ppw1 \\\n  db",
+   "expected": "mysql \\\n  -u root -p<REDACTED_SECRET> \\\n  db"
+  },
+  {
+   "input": "bash -c \"mysql -u root -ppw1 db\"",
+   "expected": "bash -c \"mysql -u root -p<REDACTED_SECRET> db\""
+  },
+  {
+   "input": "echo start && mysql -u root -ppw1 db",
+   "expected": "echo start && mysql -u root -p<REDACTED_SECRET> db"
+  },
+  {
+   "input": "sshpass</dev/null -p pw1 ssh h",
+   "expected": "sshpass</dev/null -p <REDACTED_SECRET> ssh h"
+  },
+  {
+   "input": "sshpass < /dev/null -p pw1 ssh h",
+   "expected": "sshpass < /dev/null -p <REDACTED_SECRET> ssh h"
+  },
+  {
+   "input": "sshpass -p pw1 ssh h >out.txt 2>&1",
+   "expected": "sshpass -p <REDACTED_SECRET> ssh h >out.txt 2>&1"
+  },
+  {
+   "input": "sshpass -p pw1>out.txt ssh h",
+   "expected": "sshpass -p <REDACTED_SECRET>>out.txt ssh h"
+  },
+  {
+   "input": "sshpass <<<data -p pw1 ssh h",
+   "expected": "sshpass <<<data -p <REDACTED_SECRET> ssh h"
+  },
+  {
+   "input": "sshpass 2>/dev/null -p pw1 ssh h",
+   "expected": "sshpass 2>/dev/null -p <REDACTED_SECRET> ssh h"
+  },
+  {
+   "input": "A=1 sshpass -p pw1 ssh h",
+   "expected": "A=1 sshpass -p <REDACTED_SECRET> ssh h"
+  },
+  {
+   "input": "command sshpass -p pw1 ssh h",
+   "expected": "command sshpass -p <REDACTED_SECRET> ssh h"
+  },
+  {
+   "input": "sudo -u deploy sshpass -p pw1 ssh h",
+   "expected": "sudo -u deploy sshpass -p <REDACTED_SECRET> ssh h"
+  },
+  {
+   "input": "env A=1 sshpass -p pw1 ssh h",
+   "expected": "env A=1 sshpass -p <REDACTED_SECRET> ssh h"
+  },
+  {
+   "input": "(sshpass -p pw1 ssh h)",
+   "expected": "(sshpass -p <REDACTED_SECRET> ssh h)"
+  },
+  {
+   "input": "out=$(sshpass -p pw1 ssh h)",
+   "expected": "out=$(sshpass -p <REDACTED_SECRET> ssh h)"
+  },
+  {
+   "input": "out=`sshpass -p pw1 ssh h`",
+   "expected": "out=`sshpass -p <REDACTED_SECRET> ssh h`"
+  },
+  {
+   "input": "sshpass \\\n  -p pw1 \\\n  ssh h",
+   "expected": "sshpass \\\n  -p <REDACTED_SECRET> \\\n  ssh h"
+  },
+  {
+   "input": "bash -c \"sshpass -p pw1 ssh h\"",
+   "expected": "bash -c \"sshpass -p <REDACTED_SECRET> ssh h\""
+  },
+  {
+   "input": "echo start && sshpass -p pw1 ssh h",
+   "expected": "echo start && sshpass -p <REDACTED_SECRET> ssh h"
+  },
+  {
+   "input": "curl -u \"admin:a;b&c|d\" https://h",
+   "expected": "curl -u \"admin:<REDACTED_SECRET>\" https://h"
+  },
+  {
+   "input": "curl -u 'admin:a)b`c' https://h",
+   "expected": "curl -u 'admin:<REDACTED_SECRET>' https://h"
+  },
+  {
+   "input": "mysql -u root -p\"a;b&c|d\" db",
+   "expected": "mysql -u root -p<REDACTED_SECRET> db"
+  },
+  {
+   "input": "mysql -u root -p'a)b`c' db",
+   "expected": "mysql -u root -p<REDACTED_SECRET> db"
+  },
+  {
+   "input": "sshpass -p \"a;b&c|d\" ssh h",
+   "expected": "sshpass -p <REDACTED_SECRET> ssh h"
+  },
+  {
+   "input": "sshpass -p 'a)b`c' ssh h",
+   "expected": "sshpass -p <REDACTED_SECRET> ssh h"
+  },
+  {
+   "input": "curl -u alice https://one --next -u admin:pw1 https://two --next --user root:pw2 https://three",
+   "expected": "curl -u alice https://one --next -u admin:<REDACTED_SECRET> https://two --next --user root:<REDACTED_SECRET> https://three"
+  },
+  {
+   "input": "curl</dev/null -u admin:pw1 https://one --next -uroot:pw2 https://two",
+   "expected": "curl</dev/null -u admin:<REDACTED_SECRET> https://one --next -uroot:<REDACTED_SECRET> https://two"
   }
  ],
  "untouched": [
@@ -988,6 +1212,14 @@
   "curl -u alice https://host",
   "curl -u alice: https://host --next -u bob https://two",
   "curl -u alice https://x; other -u admin:pw",
-  "mysql -u root app; tool -psecret"
+  "mysql -u root app; tool -psecret",
+  "curl -u alice https://h; other -u admin:pw1",
+  "curl https://h && other -u admin:pw1",
+  "mysql -u root db; other -ppw1",
+  "mysql -u root db && other -ppw1",
+  "sshpass -f pwfile ssh h; other -p pw1",
+  "sshpass -f pwfile ssh -p 2222 h && other -p pw1",
+  "sshpass -e ssh -p 2222 deploy@host",
+  "curl -fsSL https://example.com/install.sh | sh -s -- -u admin:pw1"
  ]
 }
