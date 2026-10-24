@@ -806,7 +806,7 @@ mod tests {
         )
         .unwrap();
         let owner = registry
-            .register_view("shared-view", Path::new(&root))
+            .register_view_with_storage(registry.storage(), "shared-view", Path::new(&root))
             .unwrap();
         let name = GenerationName::for_manifest(&manifest()).unwrap();
         println!(
@@ -822,8 +822,12 @@ mod tests {
         let registry =
             super::super::registry::FamilyRegistry::open(storage.path(), "private-name-family")
                 .unwrap();
-        let first = registry.register_view("shared-view", root.path()).unwrap();
-        let second = registry.register_view("shared-view", root.path()).unwrap();
+        let first = registry
+            .register_view_with_storage(registry.storage(), "shared-view", root.path())
+            .unwrap();
+        let second = registry
+            .register_view_with_storage(registry.storage(), "shared-view", root.path())
+            .unwrap();
         assert_eq!(first.view_dir(), second.view_dir());
         let view = first.view_store().unwrap();
         let manifest = manifest();

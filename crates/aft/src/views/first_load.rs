@@ -1968,7 +1968,9 @@ mod callgraph_bridge_tests {
         .unwrap();
         let registry =
             super::super::registry::FamilyRegistry::open(storage.path(), "cleanup-family").unwrap();
-        let owner = registry.register_view("local", root.path()).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "local", root.path())
+            .unwrap();
         let bridge = Arc::new(CallgraphBridge::default());
         let driver = Arc::new(
             CheckoutDriver::new(

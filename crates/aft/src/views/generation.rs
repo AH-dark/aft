@@ -1206,7 +1206,7 @@ mod tests {
                 super::super::registry::FamilyRegistry::open(Path::new(&storage), "crash-family")
                     .unwrap();
             registry
-                .register_view("crash-cleanup", &root)
+                .register_view_with_storage(registry.storage(), "crash-cleanup", &root)
                 .unwrap()
                 .view_store()
                 .unwrap()
@@ -1335,7 +1335,11 @@ mod tests {
                 super::super::registry::FamilyRegistry::open(storage.path(), "crash-family")
                     .unwrap();
             registry
-                .register_view("crash-cleanup", &storage.path().join("project"))
+                .register_view_with_storage(
+                    registry.storage(),
+                    "crash-cleanup",
+                    &storage.path().join("project"),
+                )
                 .unwrap()
                 .view_store()
                 .unwrap()
