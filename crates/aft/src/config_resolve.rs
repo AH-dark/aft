@@ -1480,16 +1480,6 @@ pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option
     harness_refusal.or(base_refusal)
 }
 
-fn blocked_bash_env_key(raw: &RawAftConfig) -> Option<&str> {
-    let env = match raw.bash.as_ref() {
-        Some(RawBash::Features(features)) => features.env.as_ref(),
-        _ => None,
-    }?;
-    env.keys()
-        .find(|key| crate::bash_env::is_blocked_env_key(key))
-        .map(String::as_str)
-}
-
 /// The refusal for a `bash.env` name the tier may not set. The message names
 /// the key so the author can fix the file: this check runs for every tier and
 /// whether or not the project is trusted.
