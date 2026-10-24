@@ -826,10 +826,10 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
             target.task_id,
             if target.run_scoped { "remains governed by its run scope" } else { "keeps running in the background" }
         );
-        let frame = match (reason, routes.get(&route)) {
+        let frame: Option<WriterFrame> = match (reason, routes.get(&route)) {
             (_, None) => None,
-            (drain::BashLoopAnswer::Drain, Some(_)) if target.server_completion => {
-                Some(build_detached_frame(
+            (drain::BashLoopAnswer::Drain, Some(_)) if target.server_completion => Some(
+                build_detached_frame(
                     target.ver,
                     route.channel,
                     route.epoch,
@@ -837,8 +837,9 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                     target.flags,
                     &target.task_id,
                     target.late_results,
-                )?)
-            }
+                )?
+                .into(),
+            ),
             (drain::BashLoopAnswer::Drain, Some(identity)) => {
                 let cached = target.reply_cache.snapshot();
                 let response = Response::success(
@@ -888,7 +889,7 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                     corr,
                     target.flags,
                     &result,
-                    identity.trust,
+                    identity.reply_policy(),
                 )?)
             }
             (drain::BashLoopAnswer::Cancel, Some(_)) => Some(
@@ -905,7 +906,8 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                     )
                     .map_err(SubcError::Json)?,
                 )
-                .map_err(SubcError::FrameBuild)?,
+                .map_err(SubcError::FrameBuild)?
+                .into(),
             ),
         };
         detach_held_bash_in_background(target, matches!(reason, drain::BashLoopAnswer::Cancel));
@@ -3687,7 +3689,7 @@ pub(super) async fn handle_bash_deferred_completion(
                 done.corr,
                 done.flags,
                 &result,
-                identity.trust,
+                identity.reply_policy(),
             )?;
             send_reliable_writer_frame(tx, metrics, frame, "deferred bash response").await?;
         } else {

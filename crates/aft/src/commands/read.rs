@@ -276,6 +276,22 @@ fn handle_pdf_media(id: &str, raw_bytes: Vec<u8>) -> Response {
 
 fn image_attachment_response(id: &str, image: ProcessedImage) -> Response {
     let byte_size = image.bytes.len();
+    if crate::subc::result_body::active() {
+        // The base64 image travels in both content and structuredContent. Refuse
+        // before encoding rather than allocate a reply that cannot be delivered.
+        let wire_size = base64_len(byte_size)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(2)
+            .saturating_add(16 * 1024);
+        if wire_size >= crate::subc::result_body::MAX_RESULT_BYTES {
+            return crate::subc::result_body::too_large(
+                id,
+                wire_size,
+                "image read",
+                "a smaller image",
+            );
+        }
+    }
     let data = match encode_base64_checked(&image.bytes, |encoded_len| {
         format!(
             "image too large to inline after resize (base64 payload {} bytes > {} bytes)",
@@ -938,6 +954,26 @@ fn github_read_response(
     completion: GithubReadCompletion,
     start_line: usize,
 ) -> Response {
+    if crate::subc::result_body::active() && !completion.attachments.is_empty() {
+        let image_bytes = completion.attachments.iter().fold(0usize, |total, image| {
+            total.saturating_add(
+                base64_len(image.bytes.len())
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(2),
+            )
+        });
+        let wire_size = image_bytes
+            .saturating_add(completion.content.len().saturating_mul(3))
+            .saturating_add(16 * 1024);
+        if wire_size >= crate::subc::result_body::MAX_RESULT_BYTES {
+            return crate::subc::result_body::too_large(
+                &req.id,
+                wire_size,
+                "GitHub image read",
+                "a page with fewer or smaller images",
+            );
+        }
+    }
     let (start_line, lines_read, actual_end, truncated) = if let Some(page) = &completion.diff_page
     {
         (
@@ -1167,7 +1203,26 @@ pub fn build_read_outcome(req: RawRequest, ctx: &AppContext) -> DispatchOutcome 
 /// Returns for binary files:
 ///   `{ binary: true, byte_size }`
 pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
-    crate::bounded_io::command(req, ctx, handle_read_inner)
+    let mut response = crate::bounded_io::command(req, ctx, handle_read_inner);
+    if crate::subc::result_body::active() {
+        if let Some(attachments) = response
+            .data
+            .get_mut("attachments")
+            .and_then(Value::as_array_mut)
+        {
+            for attachment in attachments
+                .iter_mut()
+                .filter(|part| part["kind"] == "image")
+            {
+                attachment["alt"] = serde_json::json!(req
+                    .params
+                    .get("file")
+                    .and_then(Value::as_str)
+                    .unwrap_or("read image"));
+            }
+        }
+    }
+    response
 }
 
 fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -2397,6 +2452,43 @@ mod tests {
             decoded_attachment_bytes(attachment),
             vec![137, 80, 78, 71, 13, 10, 26, 10]
         );
+    }
+
+    #[test]
+    fn github_image_result_budget_refuses_before_base64_encoding() {
+        let request = RawRequest {
+            id: "github-budget".into(),
+            command: "read".into(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({"file":"issue://7"}),
+        };
+        let completion = || GithubReadCompletion {
+            content: "canonical text\n".into(),
+            total_lines: 1,
+            freshness: crate::github_read::GithubReadFreshness::Fetched,
+            attachments: vec![crate::github_read::GithubImageAttachment {
+                source_url: "https://github.com/user-attachments/files/7/image.png".into(),
+                mime: "image/png".into(),
+                bytes: vec![0; 2 * 1024 * 1024],
+            }],
+            document: None,
+            diff_page: None,
+        };
+        let legacy = github_read_response(&request, completion(), 1);
+        assert!(legacy.success);
+        assert!(
+            legacy.data["attachments"][0]["data"]
+                .as_str()
+                .unwrap()
+                .len()
+                > 2 * 1024 * 1024
+        );
+        let _budget = crate::subc::result_body::enter(true);
+        let bounded = github_read_response(&request, completion(), 1);
+        assert!(!bounded.success);
+        assert_eq!(bounded.data["code"], "response_too_large");
+        assert!(bounded.data.get("attachments").is_none());
     }
 
     #[test]

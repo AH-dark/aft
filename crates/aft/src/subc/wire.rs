@@ -132,8 +132,15 @@ enum WriterFrameBody {
 pub(super) struct WriterFrame {
     /// The route-specific header. Shared Push bodies remain outside this frame.
     pub(super) frame: Frame,
-    body: WriterFrameBody,
+    body_storage: WriterFrameBody,
     pub(super) tool_response_trace: Option<ToolResponseWriteTrace>,
+    result_projection: Option<(ToolResponsePolicy, usize, Option<ToolCallResult>)>,
+}
+
+impl From<Frame> for WriterFrame {
+    fn from(frame: Frame) -> Self {
+        Self::plain(frame)
+    }
 }
 
 impl std::ops::Deref for WriterFrame {
@@ -148,8 +155,9 @@ impl WriterFrame {
     pub(super) fn plain(frame: Frame) -> Self {
         Self {
             frame,
-            body: WriterFrameBody::Owned,
+            body_storage: WriterFrameBody::Owned,
             tool_response_trace: None,
+            result_projection: None,
         }
     }
 
@@ -157,17 +165,100 @@ impl WriterFrame {
         debug_assert_eq!(frame.header.len as usize, body.len());
         Self {
             frame,
-            body: WriterFrameBody::SharedPush(body),
+            body_storage: WriterFrameBody::SharedPush(body),
             tool_response_trace: None,
+            result_projection: None,
         }
     }
 
-    fn traced_tool_response(frame: Frame, trace: ToolResponseWriteTrace) -> Self {
-        Self {
-            frame,
-            body: WriterFrameBody::Owned,
-            tool_response_trace: Some(trace),
+    fn traced_tool_response(frame: impl Into<Self>, trace: ToolResponseWriteTrace) -> Self {
+        let mut outgoing = frame.into();
+        outgoing.tool_response_trace = Some(trace);
+        outgoing
+    }
+
+    pub(super) fn retained_tool_response(
+        frame: Frame,
+        policy: ToolResponsePolicy,
+        image_alt: Option<&str>,
+    ) -> Self {
+        let mut outgoing = Self::plain(frame);
+        if policy.tool_result_body {
+            let source = if outgoing.header.ty == FrameType::Response {
+                if outgoing.frame.body.len() >= super::result_body::MAX_RESULT_BYTES {
+                    let response = super::result_body::too_large(
+                        "retained-tool-reply",
+                        outgoing.frame.body.len(),
+                        "retained tool reply",
+                        "paths, pattern, or offset/limit",
+                    );
+                    Some(ToolCallResult {
+                        text: response.data["message"].as_str().unwrap().into(),
+                        response,
+                    })
+                } else {
+                    retained_tool_result(&outgoing.frame.body)
+                        .ok()
+                        .map(|mut result| {
+                            if let Some(parts) = result
+                                .response
+                                .data
+                                .get_mut("attachments")
+                                .and_then(Value::as_array_mut)
+                            {
+                                for part in parts.iter_mut().filter(|part| part["kind"] == "image")
+                                {
+                                    part["alt"] = serde_json::json!(
+                                        image_alt.unwrap_or("image from retained tool reply")
+                                    );
+                                }
+                            }
+                            result
+                        })
+                }
+            } else {
+                None
+            };
+            outgoing.result_projection = Some((policy, MAX_FRAME_BODY_LEN as usize, source));
         }
+        outgoing
+    }
+
+    /// The ledger proxy forwards legacy response bytes unchanged. The final
+    /// transport writer projects the reply after the ledger has persisted those bytes.
+    pub(super) fn project_tool_result(&mut self) -> Result<(), SubcError> {
+        let Some((policy, limit, source)) = self.result_projection.take() else {
+            return Ok(());
+        };
+        if self.frame.header.ty != FrameType::Response {
+            return Ok(());
+        }
+        let mut result = match source {
+            Some(result) => result,
+            None => retained_tool_result(&self.frame.body)?,
+        };
+        if let Err(reason) = complete_image_dimensions(&mut result) {
+            let text = format!("Attachment omitted: {reason}");
+            result = ToolCallResult {
+                response: Response::error(
+                    "image-reply",
+                    super::result_body::FALLBACK_ERROR_CODE,
+                    &text,
+                ),
+                text,
+            };
+        }
+        let header = &self.frame.header;
+        self.frame = build_result_body_frame(
+            header.ver,
+            super::route_key(header.channel, header.epoch),
+            header.corr,
+            header.flags,
+            &result,
+            policy.trust,
+            limit,
+        )?;
+        Ok(())
     }
 
     pub(super) fn frame(&self) -> &Frame {
@@ -175,7 +266,7 @@ impl WriterFrame {
     }
 
     pub(super) fn body(&self) -> &[u8] {
-        match &self.body {
+        match &self.body_storage {
             WriterFrameBody::Owned => &self.frame.body,
             WriterFrameBody::SharedPush(body) => body,
         }
@@ -183,7 +274,7 @@ impl WriterFrame {
 
     #[cfg(test)]
     pub(super) fn shared_push_body_strong_count(&self) -> Option<usize> {
-        match &self.body {
+        match &self.body_storage {
             WriterFrameBody::Owned => None,
             WriterFrameBody::SharedPush(body) => Some(Arc::strong_count(body)),
         }
@@ -338,16 +429,16 @@ async fn send_reliable_writer_item(
 pub(super) async fn send_reliable_writer_frame(
     tx: &WriterSender,
     metrics: &DispatchPathMetrics,
-    frame: Frame,
+    frame: impl Into<WriterFrame>,
     context: &'static str,
 ) -> Result<(), SubcError> {
-    send_reliable_writer_item(tx, metrics, WriterFrame::plain(frame), context).await
+    send_reliable_writer_item(tx, metrics, frame.into(), context).await
 }
 
 pub(super) async fn send_traced_tool_response_frame(
     tx: &WriterSender,
     metrics: &DispatchPathMetrics,
-    frame: Frame,
+    frame: impl Into<WriterFrame>,
     trace: ToolResponseWriteTrace,
 ) -> Result<(), SubcError> {
     send_reliable_writer_item(
@@ -539,7 +630,7 @@ fn serialize_tool_response_body(
     result: &ToolCallResult,
     include_structured: bool,
 ) -> Result<Vec<u8>, serde_json::Error> {
-    serialize_tool_response_body_with_text(result, include_structured, &result.text, false)
+    serialize_tool_response_body_with_text(result, include_structured, &result.text, false, false)
 }
 
 fn serialize_tool_response_body_with_text(
@@ -547,6 +638,7 @@ fn serialize_tool_response_body_with_text(
     include_structured: bool,
     rendered_text: &str,
     transport_truncated: bool,
+    tool_result_body: bool,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let data_capacity = result
         .response
@@ -580,12 +672,38 @@ fn serialize_tool_response_body_with_text(
     let encoded_text_start = body.len();
     serde_json::to_writer(&mut body, rendered_text)?;
     let encoded_text_end = body.len();
-    body.extend_from_slice(b"}],\"isError\":");
+    body.push(b'}');
+    if tool_result_body {
+        if let Some(attachments) = result.response.data["attachments"].as_array() {
+            for image in attachments.iter().filter(|part| part["kind"] == "image") {
+                body.extend_from_slice(b",{\"type\":\"image\",\"data\":");
+                serde_json::to_writer(&mut body, &image["data"])?;
+                body.extend_from_slice(b",\"mimeType\":");
+                serde_json::to_writer(&mut body, &image["mime"])?;
+                body.extend_from_slice(b",\"width\":");
+                serde_json::to_writer(&mut body, &image["width"])?;
+                body.extend_from_slice(b",\"height\":");
+                serde_json::to_writer(&mut body, &image["height"])?;
+                body.extend_from_slice(b",\"alt\":");
+                serde_json::to_writer(&mut body, &image["alt"])?;
+                body.push(b'}');
+            }
+        }
+    }
+    body.extend_from_slice(b"],\"isError\":");
     body.extend_from_slice(if result.response.success {
         b"false"
     } else {
         b"true"
     });
+
+    if tool_result_body && !result.response.success {
+        body.extend_from_slice(b",\"errorCode\":");
+        serde_json::to_writer(
+            &mut body,
+            &super::result_body::error_code(result.response.data["code"].as_str()),
+        )?;
+    }
 
     if include_structured {
         body.extend_from_slice(b",\"structuredContent\":{\"id\":");
@@ -703,26 +821,120 @@ fn response_too_large_frame(
     .expect("fixed response_too_large envelope must fit the protocol frame limit")
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ToolResponsePolicy {
+    pub(super) trust: BindTrust,
+    pub(super) tool_result_body: bool,
+}
+
+impl From<BindTrust> for ToolResponsePolicy {
+    fn from(trust: BindTrust) -> Self {
+        Self {
+            trust,
+            tool_result_body: false,
+        }
+    }
+}
+
+impl From<&super::RouteIdentity> for ToolResponsePolicy {
+    fn from(identity: &super::RouteIdentity) -> Self {
+        Self {
+            trust: identity.trust,
+            tool_result_body: identity.tool_result_body,
+        }
+    }
+}
+
 pub(super) fn build_tool_response_frame(
     ver: u8,
     route: RouteChannel,
     corr: u64,
     flags: Flags,
     result: &ToolCallResult,
-    trust: BindTrust,
-) -> Result<Frame, SubcError> {
+    policy: impl Into<ToolResponsePolicy>,
+) -> Result<WriterFrame, SubcError> {
     build_tool_response_frame_with_limit(
         ver,
         route,
         corr,
         flags,
         result,
-        trust,
+        policy,
         MAX_FRAME_BODY_LEN as usize,
     )
 }
 
 pub(super) fn build_tool_response_frame_with_limit(
+    ver: u8,
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+    result: &ToolCallResult,
+    policy: impl Into<ToolResponsePolicy>,
+    max_body_len: usize,
+) -> Result<WriterFrame, SubcError> {
+    let ToolResponsePolicy {
+        trust,
+        tool_result_body,
+    } = policy.into();
+    let policy = ToolResponsePolicy {
+        trust,
+        tool_result_body,
+    };
+    if !tool_result_body {
+        return build_legacy_tool_response_frame(
+            ver,
+            route,
+            corr,
+            flags,
+            result,
+            trust,
+            max_body_len,
+        )
+        .map(WriterFrame::plain);
+    }
+    let mut source = ToolCallResult {
+        text: result.text.clone(),
+        response: Response {
+            id: result.response.id.clone(),
+            success: result.response.success,
+            data: result.response.data.clone(),
+        },
+    };
+    // Image paths are send-only metadata, not a change to the legacy structured
+    // payload retained by the call ledger.
+    let alts: Vec<_> = source
+        .response
+        .data
+        .get_mut("attachments")
+        .and_then(Value::as_array_mut)
+        .map(|parts| {
+            parts
+                .iter_mut()
+                .map(|part| part.as_object_mut().and_then(|part| part.remove("alt")))
+                .collect()
+        })
+        .unwrap_or_default();
+    let frame =
+        build_legacy_tool_response_frame(ver, route, corr, flags, &source, trust, max_body_len)?;
+    if let Some(parts) = source
+        .response
+        .data
+        .get_mut("attachments")
+        .and_then(Value::as_array_mut)
+    {
+        for (part, alt) in parts.iter_mut().zip(alts) {
+            if let Some(alt) = alt {
+                part["alt"] = alt;
+            }
+        }
+    }
+    let mut outgoing = WriterFrame::plain(frame);
+    outgoing.result_projection = Some((policy, max_body_len, Some(source)));
+    Ok(outgoing)
+}
+
+fn build_legacy_tool_response_frame(
     ver: u8,
     route: RouteChannel,
     corr: u64,
@@ -756,6 +968,7 @@ pub(super) fn build_tool_response_frame_with_limit(
         include_structured,
         &rendered_text,
         transport_truncated,
+        false,
     )
     .map_err(SubcError::Json)?;
 
@@ -800,6 +1013,119 @@ pub(super) fn build_tool_response_frame_with_limit(
             include_structured,
         )),
     }
+}
+
+fn retained_tool_result(body: &[u8]) -> Result<ToolCallResult, SubcError> {
+    let mut envelope: Value = serde_json::from_slice(body).map_err(SubcError::Json)?;
+    let text = envelope["content"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let data = envelope
+        .as_object_mut()
+        .and_then(|body| body.remove("structuredContent"))
+        .filter(Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    Ok(ToolCallResult {
+        text,
+        response: Response {
+            id: data["id"].as_str().unwrap_or("retained-tool-reply").into(),
+            success: envelope["isError"] != true,
+            data,
+        },
+    })
+}
+
+fn complete_image_dimensions(result: &mut ToolCallResult) -> Result<(), String> {
+    use base64::Engine;
+    let Some(parts) = result
+        .response
+        .data
+        .get_mut("attachments")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for part in parts.iter_mut().filter(|part| part["kind"] == "image") {
+        if part["width"].as_u64().is_some_and(|value| value > 0)
+            && part["height"].as_u64().is_some_and(|value| value > 0)
+        {
+            continue;
+        }
+        // Older GitHub-read sidecars contain raw image data but no dimensions.
+        // Read the image header, without decoding or allocating a pixel buffer.
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(part["data"].as_str().unwrap_or(""))
+            .map_err(|error| error.to_string())?;
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|error| error.to_string())?
+            .into_dimensions()
+            .map_err(|error| error.to_string())?;
+        if width == 0 || height == 0 {
+            return Err("image has no pixels".into());
+        }
+        part["width"] = serde_json::json!(width);
+        part["height"] = serde_json::json!(height);
+    }
+    Ok(())
+}
+
+fn build_result_body_frame(
+    ver: u8,
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+    result: &ToolCallResult,
+    trust: BindTrust,
+    max_body_len: usize,
+) -> Result<Frame, SubcError> {
+    let include_structured = !matches!(trust, BindTrust::Untrusted);
+    let mut body = serialize_tool_response_body_with_text(
+        result,
+        include_structured,
+        &result.text,
+        false,
+        true,
+    )
+    .map_err(SubcError::Json)?;
+    // The result contract is strictly below 3 MiB, independently of the transport cap.
+    if body.len() >= super::result_body::MAX_RESULT_BYTES || body.len() > max_body_len {
+        let response = super::result_body::too_large(
+            "response_too_large",
+            body.len(),
+            "tool reply",
+            "paths, pattern, or offset/limit",
+        );
+        let fallback = ToolCallResult {
+            text: response.data["message"].as_str().unwrap().into(),
+            response,
+        };
+        body = serialize_tool_response_body_with_text(
+            &fallback,
+            include_structured,
+            &fallback.text,
+            false,
+            true,
+        )
+        .map_err(SubcError::Json)?;
+    }
+    Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        flags,
+        route.channel,
+        route.epoch,
+        corr,
+        body,
+    )
+    .map_err(SubcError::FrameBuild)
 }
 
 pub(super) fn build_error_frame(
@@ -1000,7 +1326,7 @@ impl SubcError {
 impl std::error::Error for SubcError {}
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::subc::route_key;
     use serde_json::json;
@@ -1102,7 +1428,10 @@ mod tests {
         );
     }
 
-    fn legacy_tool_response_body(result: &ToolCallResult, include_structured: bool) -> Vec<u8> {
+    pub(in crate::subc) fn legacy_tool_response_body(
+        result: &ToolCallResult,
+        include_structured: bool,
+    ) -> Vec<u8> {
         serde_json::to_vec(&ToolResponseEnvelope {
             result,
             include_structured,

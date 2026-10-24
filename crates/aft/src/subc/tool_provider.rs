@@ -931,6 +931,7 @@ fn render_catalog(
     // Last, once the served names are final: every description names the
     // tools of this catalog and no other.
     render_tool_references(&mut answer.tools);
+    declare_result_format(&mut answer.tools, super::result_body::DECLARE_RESULT_FORMAT);
     // Every preset can settle a keyed call after its reply (a held shell
     // call, or a scoped call whose end was never observed), so every catalog
     // declares the session capability that lets a custodian pull those
@@ -1007,6 +1008,14 @@ fn render_catalog(
         return Ok(json!({"generation": digest, "catalog_digest": digest}));
     }
     Ok(serde_json::to_value(answer).expect("catalog is JSON"))
+}
+
+pub(super) fn declare_result_format(tools: &mut [CatalogTool], enabled: bool) {
+    if enabled {
+        for tool in tools {
+            tool.result_format = Some(super::result_body::RESULT_FORMAT.to_string().into());
+        }
+    }
 }
 
 /// Admit a v1 `tool.call` before anything runs, and resolve the role it runs
@@ -1819,7 +1828,7 @@ impl LedgerEdge {
                     decoded.frame.header.corr,
                     decoded.frame.header.flags,
                     &result,
-                    identity.trust,
+                    identity.reply_policy(),
                 ) {
                     let _ = send_reliable_writer_frame(&writer, &metrics, frame, "ledger refusal")
                         .await;
@@ -2020,7 +2029,11 @@ impl LedgerEdge {
                                     let _ = send_reliable_writer_frame(
                                         &writer,
                                         &metrics,
-                                        frame,
+                                        WriterFrame::retained_tool_response(
+                                            frame,
+                                            identity.reply_policy(),
+                                            call.arguments.get("path").and_then(Value::as_str),
+                                        ),
                                         "attached ledger result",
                                     )
                                     .await;
@@ -2060,9 +2073,17 @@ impl LedgerEdge {
                         &response_key,
                         row.frame.as_ref(),
                     ) {
-                        let _ =
-                            send_reliable_writer_frame(&writer, &metrics, frame, "ledger replay")
-                                .await;
+                        let _ = send_reliable_writer_frame(
+                            &writer,
+                            &metrics,
+                            WriterFrame::retained_tool_response(
+                                frame,
+                                identity.reply_policy(),
+                                call.arguments.get("path").and_then(Value::as_str),
+                            ),
+                            "ledger replay",
+                        )
+                        .await;
                     }
                 }
                 Ok(Admission::Conflict) => {
@@ -2094,10 +2115,10 @@ impl LedgerEdge {
                         decoded.frame.header.corr,
                         decoded.frame.header.flags,
                         &result,
-                        identity.trust,
+                        identity.reply_policy(),
                     ) {
                         if edge.finish_waiting(&decoded.frame) {
-                            frame = Self::cancelled_frame(&decoded.frame).unwrap();
+                            frame = Self::cancelled_frame(&decoded.frame).unwrap().into();
                         }
                         let _ =
                             send_reliable_writer_frame(&writer, &metrics, frame, "ledger refusal")
@@ -4868,6 +4889,7 @@ mod route_tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::new(disabled),
             scope,
             run_scope: OnceLock::new(),
@@ -5334,6 +5356,7 @@ mod route_tests {
             trust: BindTrust::FirstParty,
             spawn_principal: runner_restore_principal(&project),
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::default(),
             scope: None,
             run_scope: OnceLock::new(),
@@ -5821,6 +5844,7 @@ mod route_tests {
                 principal_id: Some("reserved:broca".into()),
             },
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             scope: Some(stamp("worker")),
             run_scope: OnceLock::new(),

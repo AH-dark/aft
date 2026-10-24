@@ -487,6 +487,7 @@ fn effective_identity(
         // step as the head's direct call, which then refuses it because a run
         // route has nobody to answer.
         consumer_elicitation_capable: head.consumer_elicitation_capable,
+        tool_result_body: head.tool_result_body,
         disabled_tools: Arc::clone(&head.disabled_tools),
         scope: run.scope.clone(),
         call_mode: run.call_mode.clone(),

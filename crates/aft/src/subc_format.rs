@@ -2018,6 +2018,13 @@ fn format_ast_search(data: &Value) -> String {
     {
         output = append_ast_skipped_files(output, data.get("skipped_files"));
     }
+    if let Some(env) = data.get("matches_list_envelope").and_then(|value| {
+        serde_json::from_value::<crate::list_envelope::ListEnvelope>(value.clone()).ok()
+    }) {
+        if let Some(trailer) = render_envelope_trailer(&env) {
+            output.push_str(&format!("\n\n{trailer}"));
+        }
+    }
     output
 }
 

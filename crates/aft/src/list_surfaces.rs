@@ -13,6 +13,25 @@ pub mod search;
 pub mod trace_data;
 pub mod trace_to;
 
+pub fn ast_search_envelope(
+    shown: usize,
+    total: usize,
+    skipped: bool,
+) -> crate::list_envelope::ListEnvelope {
+    use crate::list_envelope::{ListEnvelope, Total};
+    ListEnvelope::new(
+        shown,
+        if skipped {
+            Total::AtLeast(total)
+        } else {
+            Total::Exact(total)
+        },
+        Unit::Results,
+        vec![Reason::Budget],
+        &["paths", "globs", "pattern"],
+    )
+}
+
 /// Classification of a reason: whether the traversal stopped (`Bounding`)
 /// or a selector chose which of an enumerated set to retain (`Selecting`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -201,6 +220,18 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
                 predicate_name: "HANDFUL_ROWS, HANDFUL_BYTES, COUNTED_ENTRIES_LISTED, grep_page_output, counted_entries, include_targets",
             },
         ],
+    },
+    SurfaceEntry {
+        command: "ast_search",
+        mode: "matches",
+        list_id: "payload.matches",
+        unit: Unit::Results,
+        narrow: &["paths", "globs", "pattern"],
+        reasons: &[ReasonEntry {
+            reason: Reason::Budget,
+            kind: ReasonKind::Selecting,
+            predicate_name: "MatchBudget",
+        }],
     },
     SurfaceEntry {
         command: "glob",

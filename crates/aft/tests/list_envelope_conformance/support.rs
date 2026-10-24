@@ -213,6 +213,17 @@ const OUTLINE_REASONS: &[ReasonSpec] = &[
 
 pub const SURFACE_SPECS: &[SurfaceSpec] = &[
     SurfaceSpec {
+        command: "ast_search",
+        mode: "matches",
+        list_id: "payload.matches",
+        unit: Unit::Results,
+        narrow: &["paths", "globs", "pattern"],
+        reasons: &[ReasonSpec {
+            reason: Reason::Budget,
+            kind: ReasonKind::Selecting,
+        }],
+    },
+    SurfaceSpec {
         command: "callgraph",
         mode: "impact",
         list_id: "payload.sites",
@@ -363,6 +374,9 @@ fn sorted_causes(causes: &[Reason]) -> Vec<Reason> {
 fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnvelope> {
     let has = |reason| fired.contains(&reason);
     match (surface.command, surface.mode) {
+        ("ast_search", "matches") => {
+            Some(aft::list_surfaces::ast_search_envelope(15, 24000, false))
+        }
         ("callgraph", "impact" | "callers" | "call_tree") => {
             let total = if has(Reason::Cap) { 21 } else { 15 };
             let truncated = usize::from(has(Reason::Depth));
@@ -465,6 +479,7 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
 fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
     let has = |reason| fired.contains(&reason);
     match (surface.command, surface.mode) {
+        ("ast_search", "matches") => Total::Exact(24000),
         ("callgraph", "impact" | "callers" | "call_tree") => {
             if has(Reason::Depth) {
                 Total::AtLeast(15)
@@ -1001,7 +1016,7 @@ pub fn capped_fixtures() -> Vec<FixtureRecord> {
 
     for case in kind_bound_cases()
         .into_iter()
-        .filter(|case| case.surface.command == "callgraph")
+        .filter(|case| matches!(case.surface.command, "callgraph" | "ast_search"))
     {
         let envelope = case.envelope.expect("callgraph case envelope");
         let wire_key = derive_wire_key(case.surface.list_id, false);
@@ -1669,6 +1684,21 @@ fn changed_files_fixture(mode: &str) -> Value {
 pub fn capped_parity_fixtures() -> Vec<CappedParityFixture> {
     vec![
         CappedParityFixture {
+            name: "ast_search/result_budget",
+            command: "ast_search",
+            mode: "matches",
+            list_id: "payload.matches",
+            reply: json!({
+                "matches": [{"file":"large.js", "line":1, "text":"console.log(1);"}],
+                "total_matches":24000, "files_searched":1, "files_with_matches":1,
+                "complete":false, "skipped_files":[],
+                "matches_list_envelope": {
+                    "shown":1, "total":{"kind":"exact","value":24000}, "unit":"results",
+                    "reason":"budget", "causes":["budget"], "narrow":["paths","globs","pattern"]
+                }
+            }),
+        },
+        CappedParityFixture {
             name: "bash/changed_files",
             command: "bash",
             mode: "changed_files",
@@ -1820,7 +1850,7 @@ pub fn render_transports(fixture: &CappedParityFixture) -> (String, String) {
             .unwrap_or("")
             .replace(&format!("\n\n{GLOB_TRUNCATED_MESSAGE}"), "")
             .replace(GLOB_TRUNCATED_MESSAGE, "")
-    } else if matches!(fixture.command, "callgraph" | "read") {
+    } else if matches!(fixture.command, "callgraph" | "read" | "ast_search") {
         let wire_key = derive_wire_key(fixture.list_id, false);
         let env: Option<ListEnvelope> = fixture
             .reply

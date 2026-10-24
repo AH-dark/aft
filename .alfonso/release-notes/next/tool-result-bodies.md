@@ -1,0 +1,1 @@
+- Heads and codemode programs that request the `tool-result/v1` format receive AFT tool replies as text, data and error codes.

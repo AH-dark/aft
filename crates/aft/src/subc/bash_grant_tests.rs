@@ -57,6 +57,7 @@ fn grant_test_route(
         trust,
         spawn_principal: AuthenticatedPrincipal::FirstParty,
         consumer_elicitation_capable: trust == BindTrust::Untrusted,
+        tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         run_owner: None,
         run_scope: OnceLock::new(),
