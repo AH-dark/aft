@@ -85,13 +85,19 @@ pub fn grade(terminal: &TerminalRecord) -> Verdict {
         None | Some(Ran::Remote) | Some(Ran::None) => {}
         Some(_) => return Verdict::OutcomeUnknown,
     }
-    // Refusals, lost jobs, and expired history are authoritative before kills.
+    // Refusals and expired history remain authoritative before kill reasons.
     match &terminal.outcome {
         Outcome::RefusedBeforeStart { reason } => {
             return Verdict::RunLocally {
                 reason: reason.clone(),
                 refusal_detail: terminal.refusal_detail().map(str::to_owned),
             };
+        }
+        Outcome::OutcomeUnknown
+            if terminal.killed == Some(Killed::Cancel) && terminal.execution_ended() =>
+        {
+            // The runner can prove no process remains without knowing its exit status.
+            return Verdict::CancelKilled;
         }
         Outcome::OutcomeUnknown | Outcome::Unknown { .. } => return Verdict::OutcomeUnknown,
         Outcome::HistoryExpired => return Verdict::HistoryExpired,

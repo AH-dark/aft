@@ -2477,6 +2477,30 @@ async fn exec_remote_cancel_unknown_exit_keeps_warning_despite_stderr() {
     }
 }
 
+#[tokio::test]
+async fn exec_remote_cancel_execution_ended_true_is_killed_without_unknown_warning() {
+    assert_cancel_terminal(
+        || cancel_unknown_terminal().with_execution_ended(),
+        "",
+        BgTaskStatus::Killed,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn exec_remote_cancel_execution_ended_false_keeps_unknown_warning() {
+    assert_cancel_terminal(
+        || {
+            let mut value = serde_json::to_value(cancel_unknown_terminal()).unwrap();
+            value["execution_ended"] = false.into();
+            serde_json::from_value(value).unwrap()
+        },
+        "",
+        BgTaskStatus::FateUnknown,
+    )
+    .await;
+}
+
 const TERMINAL_PENDING: &str =
     "remote cancellation requested; terminal pending; inspect bash_status (never rerun)";
 

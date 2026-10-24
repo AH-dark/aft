@@ -33,7 +33,7 @@ fn accepted_021_vector_and_single_locked_contract_are_pinned() {
         .filter(|p| p["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .collect();
     assert_eq!(packages.len(), 1);
-    assert_eq!(packages[0]["version"].as_str(), Some("0.2.7"));
+    assert_eq!(packages[0]["version"].as_str(), Some("0.2.13"));
 }
 
 fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
@@ -54,7 +54,7 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
         .filter(|package| package["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .map(|package| package["version"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(versions, ["0.2.7"], "exactly one caller contract version");
+    assert_eq!(versions, ["0.2.13"], "exactly one caller contract version");
     let vectors: serde_json::Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/exec-remote/published-v0.2.0.json"
     ))
@@ -107,14 +107,47 @@ fn cancel_with_unknown_exit_and_no_liveness_proof_stays_unknown() {
 }
 
 #[test]
-#[ignore = "requires a typed execution-ended proof in the shared terminal wire type"]
 fn cancel_with_typed_execution_ended_proof_is_killed() {
-    // cortexkit_exec_remote_types::TerminalRecord 0.2.7 cannot represent typed
-    // process-ended proof for OutcomeUnknown. Keep this test ignored until
-    // TerminalRecord gains that proof, then set it before grading and enable
-    // the test. A cancel acknowledgement or runner stderr cannot substitute.
-    let terminal = wire_tests::cancel_exit_status_unknown_terminal();
+    let terminal = wire_tests::cancel_exit_status_unknown_terminal().with_execution_ended();
+    assert!(terminal.execution_ended());
     assert_eq!(grade(&terminal), Verdict::CancelKilled);
+}
+
+#[test]
+fn cancel_with_execution_ended_false_or_absent_stays_unknown() {
+    for proof in [None, Some(false)] {
+        let mut value =
+            serde_json::to_value(wire_tests::cancel_exit_status_unknown_terminal()).unwrap();
+        if let Some(proof) = proof {
+            value["execution_ended"] = proof.into();
+        } else {
+            value.as_object_mut().unwrap().remove("execution_ended");
+        }
+        let terminal: TerminalRecord = serde_json::from_value(value).unwrap();
+        assert!(!terminal.execution_ended());
+        assert_eq!(grade(&terminal), Verdict::OutcomeUnknown, "proof {proof:?}");
+    }
+}
+
+#[test]
+fn execution_ended_proof_does_not_supply_an_exit_status_or_unknown_kind() {
+    for killed in [
+        None,
+        Some(Killed::Deadline),
+        Some(Killed::Unknown("future_kill".into())),
+    ] {
+        let mut terminal = wire_tests::cancel_exit_status_unknown_terminal().with_execution_ended();
+        terminal.killed = killed;
+        assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
+    }
+    let mut terminal = wire_tests::cancel_exit_status_unknown_terminal().with_execution_ended();
+    terminal.outcome = Outcome::Unknown {
+        kind: "future_outcome".into(),
+    };
+    assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
+    terminal.outcome = Outcome::OutcomeUnknown;
+    terminal.ran = Some(Ran::Unknown("future_ran".into()));
+    assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
 }
 
 #[test]
