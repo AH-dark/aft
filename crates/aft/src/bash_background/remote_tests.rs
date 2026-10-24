@@ -2336,6 +2336,147 @@ async fn exec_remote_bash_kill_sends_cancel_and_reports_terminal() {
         .any(|(_, b)| b["method"] == "exec.cancel"));
 }
 
+fn cancel_terminal(outcome: Outcome, killed: Option<Killed>, ran: Ran) -> TerminalRecord {
+    let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);
+    terminal.killed = killed;
+    terminal.ran = Some(ran);
+    terminal
+}
+
+fn cancel_unknown_terminal() -> TerminalRecord {
+    let mut terminal = crate::exec_remote::wire_tests::cancel_exit_status_unknown_terminal();
+    terminal.job_id = id();
+    terminal
+}
+
+async fn assert_cancel_terminal(
+    record: fn() -> TerminalRecord,
+    stderr: &'static str,
+    expected: BgTaskStatus,
+) {
+    let daemon = daemon(
+        Script::CancelTerminal {
+            terminal: record,
+            stderr,
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task = start(&registry, dir.path(), daemon.connection.clone());
+    wait_for("runner acceptance before cancel", || {
+        registry
+            .status(&task, "session", None, None, 0)
+            .unwrap()
+            .remote_job_id
+    })
+    .await;
+    let killing = registry.clone();
+    let kill_task = task.clone();
+    tokio::task::spawn_blocking(move || killing.kill(&kill_task, "session").unwrap())
+        .await
+        .unwrap();
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.info.status, expected, "{done:?}");
+    assert_eq!(done.exit_code, None);
+    if expected == BgTaskStatus::Killed {
+        assert_eq!(done.info.status_reason.as_deref(), Some("remote cancel"));
+        assert!(!done.output_preview.contains("may still be running"));
+    } else {
+        assert!(done
+            .info
+            .status_reason
+            .as_deref()
+            .unwrap()
+            .contains("may still be running"));
+        assert!(done.output_preview.contains("may still be running"));
+    }
+    if !stderr.is_empty() {
+        assert!(done.output_preview.contains(stderr), "{done:?}");
+    }
+    let saved = read_task(&registry.task(&task).unwrap().paths.json).unwrap();
+    assert_eq!(saved.remote.unwrap().terminal.as_ref(), Some(&record()));
+}
+
+#[tokio::test]
+async fn exec_remote_cancel_before_start_is_killed_without_unknown_warning() {
+    assert_cancel_terminal(
+        || cancel_terminal(Outcome::Cancelled, None, Ran::None),
+        "",
+        BgTaskStatus::Killed,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn exec_remote_cancelled_exit_is_killed_without_unknown_warning() {
+    for code in [143, 137] {
+        assert_cancel_terminal(
+            if code == 143 {
+                || {
+                    cancel_terminal(
+                        Outcome::Exit { code: 143 },
+                        Some(Killed::Cancel),
+                        Ran::Remote,
+                    )
+                }
+            } else {
+                || {
+                    cancel_terminal(
+                        Outcome::Exit { code: 137 },
+                        Some(Killed::Cancel),
+                        Ran::Remote,
+                    )
+                }
+            },
+            "",
+            BgTaskStatus::Killed,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn exec_remote_cancelled_signal_is_killed_without_unknown_warning() {
+    assert_cancel_terminal(
+        || {
+            cancel_terminal(
+                Outcome::Signal { signal: 15 },
+                Some(Killed::Cancel),
+                Ran::Remote,
+            )
+        },
+        "",
+        BgTaskStatus::Killed,
+    )
+    .await;
+    assert_cancel_terminal(
+        || {
+            cancel_terminal(
+                Outcome::Signal { signal: 9 },
+                Some(Killed::Cancel),
+                Ran::Remote,
+            )
+        },
+        "",
+        BgTaskStatus::Killed,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn exec_remote_cancel_unknown_exit_keeps_warning_despite_stderr() {
+    for stderr in [
+        "runner monitoring: outcome_unknown error=cancel recorded after unit exited",
+        "runner monitoring: outcome_unknown error=cancelled unit already exited",
+        "runner monitoring: outcome_unknown error=restart_execution_not_reattachable",
+        "",
+    ] {
+        assert_cancel_terminal(cancel_unknown_terminal, stderr, BgTaskStatus::FateUnknown).await;
+    }
+}
+
 const TERMINAL_PENDING: &str =
     "remote cancellation requested; terminal pending; inspect bash_status (never rerun)";
 
@@ -10510,6 +10651,18 @@ async fn bash_kill_scope_runon_cancel_failure_still_kills_local_task() {
     assert_bash_kill_scope_runon_cancel(Script::CancelRefused, "failed:").await;
 }
 
+#[tokio::test]
+async fn bash_kill_scope_cancel_ack_is_local_stop_not_remote_proof() {
+    assert_bash_kill_scope_runon_cancel(
+        Script::CancelTerminal {
+            terminal: cancel_unknown_terminal,
+            stderr: "runner monitoring: outcome_unknown error=cancelled unit already exited",
+        },
+        "sent",
+    )
+    .await;
+}
+
 async fn assert_bash_kill_scope_runon_cancel(script: Script, expected: &str) {
     let daemon = daemon(script, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
@@ -10580,6 +10733,10 @@ async fn assert_bash_kill_scope_runon_cancel(script: Script, expected: &str) {
     let done = registry.status(&task, "session", None, None, 0).unwrap();
     assert_eq!(done.info.status, BgTaskStatus::Killed);
     assert_eq!(done.info.status_reason.as_deref(), Some("paused_by_owner"));
+    // Owner pause stops the local task after the cancel acknowledgement; it
+    // does not assert that the runner supplied a terminal or proved process exit.
+    let saved = read_task(&registry.task(&task).unwrap().paths.json).unwrap();
+    assert!(saved.remote.unwrap().terminal.is_none());
 }
 
 /// The scope's owner calls `bash.kill_scope` while the worker of an accepted
