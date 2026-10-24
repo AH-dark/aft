@@ -560,11 +560,9 @@ fn synapse_request_timeout_does_not_reset_another_roots_inflight_request() {
         let result = impatient.embed_query("timeout", Duration::from_millis(100));
         daemon.release.send(true).unwrap();
         let (patient, answer) = answer.join().unwrap();
-        assert!(matches!(result, Err(SynapseEmbeddingError::CircuitOpen)));
-        assert_eq!(
-            impatient.state.consecutive_timeouts,
-            CIRCUIT_TIMEOUT_THRESHOLD
-        );
+        // One logical call shares one deadline, so it counts one timeout.
+        assert!(matches!(result, Err(SynapseEmbeddingError::Timeout(_))));
+        assert_eq!(impatient.state.consecutive_timeouts, 1);
         assert_eq!(patient.state.consecutive_timeouts, 0);
         assert!(patient.state.circuit_open_until.is_none());
         assert_eq!(answer.unwrap(), vec![1.0, 0.0]);
@@ -578,10 +576,9 @@ fn synapse_request_timeout_does_not_reset_another_roots_inflight_request() {
         );
         assert_eq!(daemon.counts.0.lock().unwrap().opens, 1);
         assert_eq!(daemon.counts.0.lock().unwrap().connections, 1);
-        assert_eq!(
-            daemon.counts.0.lock().unwrap().queries,
-            1 + CIRCUIT_TIMEOUT_THRESHOLD
-        );
+        // The impatient call's single attempt holds its whole deadline, so
+        // it sends one query instead of one per retry.
+        assert_eq!(daemon.counts.0.lock().unwrap().queries, 2);
     });
     drop(original);
     drop(impatient);

@@ -969,7 +969,7 @@ impl SynapseEmbeddingClient {
         );
         let mut vectors = HashMap::with_capacity(items.len());
         for page in pages {
-            match self.embed_batch_page(&page) {
+            match self.embed_batch_page(page) {
                 Ok(page_vectors) => vectors.extend(page_vectors),
                 Err(SynapseEmbeddingError::LanePaused(pause)) if !pause.retry_same_request() => {
                     shrink_page_rows(
@@ -1039,6 +1039,7 @@ impl SynapseEmbeddingClient {
             json!({ "items": wire_items, "request_key": request_key }),
         );
         let timeout = self.state.call_timeout;
+        let deadline = Instant::now() + timeout;
         let raw = self
             .runtime
             .block_on(self.state.call(BATCH_OPERATION, submit, timeout))?;
@@ -1050,7 +1051,6 @@ impl SynapseEmbeddingClient {
             return Ok(page.vectors);
         };
 
-        let deadline = Instant::now() + timeout;
         let mut vectors = HashMap::new();
         vectors.extend(page.vectors.drain());
         let mut next_chunk = page.next_chunk_id.clone();
@@ -1091,7 +1091,10 @@ impl SynapseEmbeddingClient {
                 if no_progress_polls >= MAX_NO_PROGRESS_POLLS {
                     return Err(SynapseEmbeddingError::NoProgress(job_id));
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(
+                    Duration::from_millis(100)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
             } else {
                 no_progress_polls = 0;
                 last_progress = progress;
@@ -1196,6 +1199,33 @@ impl SynapseState {
         params: Value,
         timeout: Duration,
     ) -> Result<Vec<u8>, SynapseEmbeddingError> {
+        // Routing, request retries and backoff share the caller's one budget.
+        // A per-attempt timeout alone would restart it after each failure.
+        let timeouts_before = self.consecutive_timeouts;
+        match tokio::time::timeout(timeout, self.call_with_retries(operation, params)).await {
+            Ok(result) => result,
+            Err(_) => {
+                // One logical call counts at most one timeout toward the
+                // circuit, even when an attempt inside it already saw the
+                // transport's own deadline. The shared route is not reset:
+                // other callers may still be multiplexed on it.
+                if self.consecutive_timeouts == timeouts_before {
+                    self.note_timeout();
+                }
+                if self.circuit_open_until.is_some() {
+                    Err(SynapseEmbeddingError::CircuitOpen)
+                } else {
+                    Err(SynapseEmbeddingError::Timeout(operation.to_string()))
+                }
+            }
+        }
+    }
+
+    async fn call_with_retries(
+        &mut self,
+        operation: &str,
+        params: Value,
+    ) -> Result<Vec<u8>, SynapseEmbeddingError> {
         if self
             .circuit_open_until
             .is_some_and(|until| Instant::now() < until)
@@ -1217,8 +1247,8 @@ impl SynapseState {
                         body.clone(),
                         CallOptions::default(),
                     );
-                    match tokio::time::timeout(timeout, request).await {
-                        Ok(Ok(response)) => {
+                    match request.await {
+                        Ok(response) => {
                             if response.len() > MAX_RESULT_PAGE_BYTES {
                                 return Err(SynapseEmbeddingError::InvalidEnvelope(format!(
                                     "{operation} response exceeded 512KiB page bound"
@@ -1246,7 +1276,7 @@ impl SynapseState {
                             }
                             return result;
                         }
-                        Ok(Err(error)) => {
+                        Err(error) => {
                             if matches!(error, CallError::Module(_)) {
                                 return Err(SynapseEmbeddingError::DaemonUnavailable(
                                     error.to_string(),
@@ -1261,13 +1291,6 @@ impl SynapseState {
                                     return Err(SynapseEmbeddingError::CircuitOpen);
                                 }
                                 last_error = format!("{operation} timed out");
-                            }
-                        }
-                        Err(_) => {
-                            last_error = format!("{operation} timed out");
-                            self.note_timeout();
-                            if self.circuit_open_until.is_some() {
-                                return Err(SynapseEmbeddingError::CircuitOpen);
                             }
                         }
                     }
@@ -1777,27 +1800,24 @@ fn batch_request_key(model: &str, identity: &SynapseIdentity, items: &[BatchItem
     hex_sha256(&encoded)
 }
 
-fn split_batch_pages<'a>(
-    items: &'a [BatchItem],
-    rows: usize,
-    token_budget: usize,
-) -> Vec<Vec<BatchItem>> {
+fn split_batch_pages(items: &[BatchItem], rows: usize, token_budget: usize) -> Vec<&[BatchItem]> {
     let mut pages = Vec::new();
-    let mut page = Vec::new();
+    let mut page_start = 0usize;
     let mut page_tokens = 0usize;
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
         let item_tokens = item.text.chars().count().div_ceil(4).max(1);
-        if !page.is_empty()
-            && (page.len() >= rows || page_tokens.saturating_add(item_tokens) > token_budget)
+        if index > page_start
+            && (index - page_start >= rows
+                || page_tokens.saturating_add(item_tokens) > token_budget)
         {
-            pages.push(std::mem::take(&mut page));
+            pages.push(&items[page_start..index]);
+            page_start = index;
             page_tokens = 0;
         }
-        page.push(item.clone());
         page_tokens = page_tokens.saturating_add(item_tokens);
     }
-    if !page.is_empty() {
-        pages.push(page);
+    if page_start < items.len() {
+        pages.push(&items[page_start..]);
     }
     pages
 }
@@ -2318,6 +2338,49 @@ mod tests {
                 },
             );
         });
+    }
+
+    #[test]
+    fn audit10_batch_pages_borrow_original_items() {
+        let items = vec![item("a", "first"), item("b", "second"), item("c", "third")];
+        let pages = super::split_batch_pages(&items, 2, usize::MAX);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].len(), 2);
+        assert_eq!(pages[1].len(), 1);
+        assert_eq!(pages[0].as_ptr(), items.as_ptr());
+        assert_eq!(pages[1].as_ptr(), items[2..].as_ptr());
+        let pages = super::split_batch_pages(&items, 10, 2);
+        assert_eq!(
+            pages.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+        assert!(super::split_batch_pages(&[], 10, 10).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn audit10_synapse_deadline_includes_route_and_retry_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = super::SynapseState {
+            connection_file: dir.path().join("absent.json"),
+            route_project_root: dir.path().to_path_buf(),
+            route_harness: "aft".to_string(),
+            model: "test".to_string(),
+            call_timeout: std::time::Duration::from_millis(1),
+            required_operations: &[],
+            connection: super::SynapseConnection::new().unwrap(),
+            consecutive_timeouts: 0,
+            circuit_open_until: None,
+        };
+        let error = state
+            .call("embed.query", serde_json::json!({}), state.call_timeout)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, super::SynapseEmbeddingError::Timeout(_)),
+            "{error}"
+        );
+        assert_eq!(state.consecutive_timeouts, 1);
+        assert!(state.connection.active.lock().await.is_none());
     }
 
     use super::*;
