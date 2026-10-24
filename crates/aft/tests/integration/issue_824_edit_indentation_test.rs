@@ -527,3 +527,23 @@ fn issue_824_loose_match_inside_existing_multiline_string_is_refused() {
     }
     assert_no_failures(failures);
 }
+
+/// Python never continues a comment onto the next line, even when the
+/// comment ends in a backslash, so an indented statement after such a
+/// comment is an "unexpected indent" and the edit must roll back.
+#[test]
+fn issue_824_comment_ending_in_backslash_does_not_hide_indentation_error() {
+    let before = "a = 1\nb = 2\n";
+    let mut failures = Vec::new();
+    for shape in SHAPES {
+        let run = run_edit(shape, "t.py", before, "a = 1", "a = 1  # note \\\n  x = 3");
+        if run.after != before || run.reply["rolled_back"] != true {
+            failures.push(format!(
+                "{shape:?}: expected a rollback, got {:?}; reply: {:?}",
+                run.after,
+                reply_text(&run.reply)
+            ));
+        }
+    }
+    assert_no_failures(failures);
+}

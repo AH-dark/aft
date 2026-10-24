@@ -56,18 +56,29 @@ fn measure(prefix: &str) -> Option<Indent> {
 }
 
 /// The indentation of the line holding `byte`, when `byte` is the first
-/// non-whitespace character of a line that does not continue a
-/// backslash-ended line. `None` otherwise: a statement after `;` or on its
-/// header's line, and a statement on a continuation line, have no indentation
-/// of their own to compare. Returning `None` only ever skips a comparison, so
-/// an unusual layout can hide an error but never invent one.
-fn line_start_indent(source: &str, byte: usize) -> Option<Indent> {
+/// non-whitespace character of a line that does not continue the previous
+/// line through a backslash. `None` otherwise: a statement after `;` or on
+/// its header's line, and a statement on a continuation line, have no
+/// indentation of their own to compare. Returning `None` only ever skips a
+/// comparison, so an unusual layout can hide an error but never invent one.
+///
+/// A backslash continues a line only as a `line_continuation` token in
+/// code. One that ends a comment is part of the comment (Python never
+/// continues comments), so the next line is still checked.
+fn line_start_indent(root: Node<'_>, source: &str, byte: usize) -> Option<Indent> {
     let line_start = source[..byte].rfind('\n').map_or(0, |at| at + 1);
     let indent = measure(&source[line_start..byte])?;
     if line_start > 0 {
         let previous = source[..line_start - 1].trim_end_matches('\r');
         if previous.ends_with('\\') {
-            return None;
+            let backslash = previous.len() - 1;
+            let mut node = root.descendant_for_byte_range(backslash, backslash + 1);
+            while let Some(current) = node {
+                if current.kind() == "line_continuation" {
+                    return None;
+                }
+                node = current.parent();
+            }
         }
     }
     Some(indent)
@@ -79,7 +90,7 @@ fn line_of(node: Node<'_>) -> usize {
 
 /// Check one `block` (or the `module`) and return the 1-based line of the
 /// first problem in it, if any. Nested blocks are checked separately.
-fn check_suite(node: Node<'_>, source: &str) -> Option<usize> {
+fn check_suite(node: Node<'_>, root: Node<'_>, source: &str) -> Option<usize> {
     let is_module = node.kind() == "module";
     let mut walker = node.walk();
     let mut first_problem: Option<usize> = None;
@@ -95,7 +106,7 @@ fn check_suite(node: Node<'_>, source: &str) -> Option<usize> {
         .filter(|child| child.kind() != "comment")
     {
         statements += 1;
-        let Some(indent) = line_start_indent(source, statement.start_byte()) else {
+        let Some(indent) = line_start_indent(root, source, statement.start_byte()) else {
             continue;
         };
         match level {
@@ -116,7 +127,7 @@ fn check_suite(node: Node<'_>, source: &str) -> Option<usize> {
     // the header's line.
     if let (Some(level), Some(header)) = (level, node.parent()) {
         if node.start_position().row > header.start_position().row {
-            if let Some(header_indent) = line_start_indent(source, header.start_byte()) {
+            if let Some(header_indent) = line_start_indent(root, source, header.start_byte()) {
                 if !level.deeper_than(header_indent) {
                     note(line_of(node));
                 }
@@ -138,7 +149,7 @@ pub(crate) fn first_indentation_error_line(tree: &Tree, source: &str) -> Option<
     loop {
         let node = cursor.node();
         if matches!(node.kind(), "block" | "module") {
-            if let Some(line) = check_suite(node, source) {
+            if let Some(line) = check_suite(node, tree.root_node(), source) {
                 first = Some(first.map_or(line, |seen| seen.min(line)));
             }
         }
@@ -204,6 +215,12 @@ mod tests {
                 2,
             ),
             ("indented_module_statement", "a = 1\n  b = 2\n", 2),
+            // Python never continues a comment, even one ending in `\`.
+            (
+                "comment_ending_in_backslash",
+                "a = 1  # note \\\n  x = 3\n",
+                2,
+            ),
             // Same tab8 column, different tab1 column: CPython's TabError.
             (
                 "inconsistent_tabs_and_spaces",
@@ -229,6 +246,12 @@ mod tests {
                 "def f():\n    a = 1 + \\\n        2\n    return a\n",
             ),
             ("tabs", "def f():\n\tif x:\n\t\treturn 1\n\treturn 2\n"),
+            // A real continuation joins the lines, so a statement that
+            // starts the continued line has no indentation of its own.
+            ("statement_after_continuation", "x = 1; \\\n  y = 2\n"),
+            // A comment ending in a backslash, followed by a correctly
+            // indented line.
+            ("comment_ending_in_backslash_valid", "a = 1  # note \\\nb = 2\n"),
             (
                 "bracket_continuation",
                 "def f():\n    a = [\n  1,\n            2,\n]\n    return a\n",
