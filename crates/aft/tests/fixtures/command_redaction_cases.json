@@ -467,6 +467,14 @@
   {
    "input": "curl $(printf '%s' \"-s)\") -u admin:hunter2 https://h",
    "expected": "curl $(printf '%s' \"-s)\") -u admin:<REDACTED_SECRET> https://h"
+  },
+  {
+   "input": "x=$(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(curl -u admin:hunter2 h)))))))))",
+   "expected": "x=$(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(<REDACTED_SECRET>)))))))))"
+  },
+  {
+   "input": "x=$(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(curl -u admin:hunter2 h))))))))))))))))))))))))))))))))))))))))))))))))))",
+   "expected": "x=$(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(<REDACTED_SECRET>)))))))))"
   }
  ],
  "untouched": [

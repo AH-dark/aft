@@ -167,6 +167,11 @@ static COMMAND_SECRET_FLAG: LazyLock<Regex> = LazyLock::new(|| {
 /// `$(curl ...)`). A quoted substitution (`"$(...)"`) takes two levels.
 const QUOTED_COMMAND_DEPTH: usize = 8;
 
+/// The longest command prefix [`mask_tool_passwords`] scans. Anything past
+/// it is masked whole rather than logged unscanned, which keeps the work on
+/// a huge command bounded without letting its tail through.
+const MAX_SCANNED_COMMAND_BYTES: usize = 1 << 20;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ShellTokenKind {
     Word,
@@ -459,7 +464,14 @@ fn mask_tool_passwords(command: &str) -> Cow<'_, str> {
         return Cow::Borrowed(command);
     }
     let mut masks = Vec::new();
-    collect_tool_password_masks(command, 0, 0, &mut masks);
+    let scanned = crate::compress::generic::floor_char_boundary(
+        command,
+        command.len().min(MAX_SCANNED_COMMAND_BYTES),
+    );
+    collect_tool_password_masks(&command[..scanned], 0, 0, &mut masks);
+    if scanned < command.len() {
+        masks.push((scanned..command.len(), SECRET_PLACEHOLDER.to_string()));
+    }
     if masks.is_empty() {
         return Cow::Borrowed(command);
     }
@@ -468,6 +480,9 @@ fn mask_tool_passwords(command: &str) -> Cow<'_, str> {
     let mut copied = 0;
     for (range, replacement) in masks {
         if range.start < copied {
+            // Overlaps a span already replaced: drop the rest of this span
+            // too, so no byte of either one is written out.
+            copied = copied.max(range.end);
             continue;
         }
         out.push_str(&command[copied..range.start]);
@@ -629,9 +644,16 @@ fn collect_tool_password_masks(
             .into_iter()
             .map(|(range, replacement)| (range.start + base..range.end + base, replacement)),
     );
-    if depth < QUOTED_COMMAND_DEPTH {
-        for inner in quoted {
+    for inner in quoted {
+        if depth < QUOTED_COMMAND_DEPTH {
             collect_tool_password_masks(&text[inner.clone()], base + inner.start, depth + 1, masks);
+        } else if !inner.is_empty() {
+            // Too deep to scan: mask the whole body instead of logging it
+            // unscanned, so a credential nested past the limit never leaks.
+            masks.push((
+                base + inner.start..base + inner.end,
+                SECRET_PLACEHOLDER.to_string(),
+            ));
         }
     }
 }
@@ -1549,7 +1571,7 @@ mod tests {
             "../tests/fixtures/command_redaction_cases.json"
         ))
         .expect("command redaction fixture parses");
-        assert_eq!(fixture.masked.len(), 117);
+        assert_eq!(fixture.masked.len(), 119);
         assert!(fixture.untouched.len() > 800);
         for case in &fixture.masked {
             let masked = redact_command(&case.input);
@@ -1639,20 +1661,15 @@ mod tests {
             }
             compared += 1;
             let scanned = mask_tool_passwords(command);
-            // Text before each legacy placeholder must match the scan's
-            // output up to a placeholder too.
-            let legacy_prefixes: Vec<_> = legacy
-                .match_indices(SECRET_PLACEHOLDER)
-                .map(|(at, _)| &legacy[..at])
-                .collect();
-            let scanned_prefixes: Vec<_> = scanned
-                .match_indices(SECRET_PLACEHOLDER)
-                .map(|(at, _)| &scanned[..at])
-                .collect();
-            for prefix in legacy_prefixes {
-                if !scanned_prefixes.iter().any(|scanned| {
-                    scanned.trim_end_matches(['"', '\'']) == prefix.trim_end_matches(['"', '\''])
-                }) {
+            // Every byte the line patterns masked must be masked by the scan
+            // too: each of their masked spans lies inside one of the scan's.
+            let legacy_spans = masked_ranges(command, &legacy).expect("line patterns only mask");
+            let scanned_spans = masked_ranges(command, &scanned).expect("scan only masks");
+            for span in legacy_spans {
+                if !scanned_spans
+                    .iter()
+                    .any(|scanned| scanned.start <= span.start && span.end <= scanned.end)
+                {
                     lost.push(format!(
                         "{command:?}\n  line patterns: {legacy}\n  shell words:   {scanned}"
                     ));
@@ -1667,6 +1684,13 @@ mod tests {
     /// Whether `output` is `input` with some spans replaced by placeholders
     /// and every other byte unchanged and in order.
     fn only_placeholders_changed(input: &str, output: &str) -> bool {
+        masked_ranges(input, output).is_some()
+    }
+
+    /// The spans of `input` that `output` replaced with placeholders, if
+    /// `output` is `input` with only such replacements (each other piece
+    /// matched at its earliest place).
+    fn masked_ranges(input: &str, output: &str) -> Option<Vec<std::ops::Range<usize>>> {
         // Split `output` at its placeholders. Each placeholder's next
         // occurrence is searched for only after the previous one is passed,
         // so splitting a megabyte output stays linear.
@@ -1698,27 +1722,30 @@ mod tests {
             }
         }
         if pieces.len() == 1 {
-            return input == output;
+            return (input == output).then(Vec::new);
         }
         let (first, last) = (pieces[0], pieces[pieces.len() - 1]);
         if first.len() + last.len() > input.len()
             || !input.starts_with(first)
             || !input.ends_with(last)
         {
-            return false;
+            return None;
         }
         let limit = input.len() - last.len();
         let mut cursor = first.len();
+        let mut ranges = Vec::new();
         for piece in &pieces[1..pieces.len() - 1] {
             if cursor > limit {
-                return false;
+                return None;
             }
-            match input[cursor..limit].find(piece) {
-                Some(at) => cursor += at + piece.len(),
-                None => return false,
-            }
+            let at = input[cursor..limit].find(piece)?;
+            ranges.push(cursor..cursor + at);
+            cursor += at + piece.len();
         }
-        cursor <= limit
+        (cursor <= limit).then(|| {
+            ranges.push(cursor..limit);
+            ranges
+        })
     }
 
     /// The command redactor runs on every spawned command, so it must never
@@ -1905,6 +1932,34 @@ mod tests {
         let masked = std::panic::catch_unwind(|| mask_tool_passwords(command).into_owned());
         SHELL_SCAN_BUDGET.with(|budget| budget.set(usize::MAX));
         masked.unwrap_or_else(|_| panic!("scan stalled or panicked on {command:?}"))
+    }
+
+    /// A command longer than the scanned prefix has its tail masked whole: a
+    /// credential after the cut-off, or one the cut-off splits, never
+    /// reaches the log unscanned.
+    #[test]
+    fn command_tail_past_the_scan_limit_is_masked_not_logged() {
+        let padding = "x".repeat(MAX_SCANNED_COMMAND_BYTES - 10);
+        let after = format!("echo {padding} && curl -u admin:hunter2 h");
+        let split = format!(
+            "curl {} -u admin:hunter2 h",
+            "y".repeat(MAX_SCANNED_COMMAND_BYTES - 18)
+        );
+        for command in [&after, &split] {
+            assert!(command.len() > MAX_SCANNED_COMMAND_BYTES);
+            for masked in [
+                mask_within_budget(command),
+                redact_command(command).into_owned(),
+            ] {
+                assert!(
+                    !masked.contains("hunter2"),
+                    "credential after the cut-off logged"
+                );
+                assert!(!masked.contains("hun"), "part of a split credential logged");
+                assert!(masked.ends_with(SECRET_PLACEHOLDER));
+                assert!(only_placeholders_changed(command, &masked));
+            }
+        }
     }
 
     /// A byte that ends a word must be consumed by the loop around the word,
