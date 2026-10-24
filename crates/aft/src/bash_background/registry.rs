@@ -1321,6 +1321,9 @@ pub(crate) struct BgTask {
     /// `bash.kill_scope` recovery registry to restore or register it. `None`
     /// for a task only one registry holds; that registry publishes its notices.
     notice_registry: Mutex<Option<std::sync::Weak<RegistryInner>>>,
+    /// Lets the watchdog's per-tick exit-marker check skip the full marker
+    /// read while the marker is still the empty file it found last time.
+    exit_marker_probe: Mutex<super::persistence::ExitMarkerProbe>,
     #[cfg(unix)]
     adopted_exit: Mutex<super::exit_observer::AdoptedExit>,
     pub(crate) state: Mutex<BgTaskState>,
@@ -4348,6 +4351,7 @@ impl BgTaskRegistry {
             terminal_at: Mutex::new(None),
             terminal_notification_routed: Mutex::new(false),
             notice_registry: Mutex::new(None),
+            exit_marker_probe: Mutex::new(Default::default()),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             terminal_persist_dirty: AtomicBool::new(false),
@@ -4711,6 +4715,7 @@ impl BgTaskRegistry {
             terminal_at: Mutex::new(None),
             terminal_notification_routed: Mutex::new(false),
             notice_registry: Mutex::new(None),
+            exit_marker_probe: Mutex::new(Default::default()),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             terminal_persist_dirty: AtomicBool::new(false),
@@ -4971,6 +4976,7 @@ impl BgTaskRegistry {
             terminal_at: Mutex::new(None),
             terminal_notification_routed: Mutex::new(false),
             notice_registry: Mutex::new(None),
+            exit_marker_probe: Mutex::new(Default::default()),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             terminal_persist_dirty: AtomicBool::new(false),
@@ -9377,7 +9383,11 @@ impl BgTaskRegistry {
                 _ => {}
             }
         }
-        let marker = match read_exit_marker(&task.paths) {
+        let polled = match task.exit_marker_probe.lock() {
+            Ok(mut probe) => super::persistence::poll_exit_marker(&task.paths, &mut probe),
+            Err(_) => read_exit_marker(&task.paths),
+        };
+        let marker = match polled {
             Ok(Some(marker)) => marker,
             Ok(None) => {
                 #[cfg(unix)]
@@ -10483,6 +10493,7 @@ impl BgTaskRegistry {
             terminal_at: Mutex::new(metadata.finished_at.map(started_instant_from_unix_millis)),
             terminal_notification_routed: Mutex::new(false),
             notice_registry: Mutex::new(None),
+            exit_marker_probe: Mutex::new(Default::default()),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             terminal_persist_dirty: AtomicBool::new(false),

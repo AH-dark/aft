@@ -3918,6 +3918,94 @@ pub fn read_exit_marker(paths: &TaskPaths) -> io::Result<Option<ExitMarker>> {
     Ok(content.parse::<i32>().ok().map(ExitMarker::Code))
 }
 
+/// Memory of the last full exit-marker read that found an empty marker file,
+/// so the watchdog can skip re-resolving a marker that has not changed.
+///
+/// The marker file is created empty when a task starts and stays empty until
+/// the task exits, so for a running task every full read (pinning the session,
+/// task and I/O directories, reading and parsing the task metadata, then
+/// opening and reading the marker) finds nothing. One `lstat` of the marker
+/// path compares it with the empty file seen last time: by device and inode
+/// on Unix, by creation and modification time on Windows, which has no stable
+/// file ID in `std`. Either way, a marker with any content is never skipped.
+#[derive(Debug, Default)]
+pub(crate) struct ExitMarkerProbe {
+    /// Identity of the marker file when a full read last found it empty.
+    empty: Option<EmptyMarkerIdentity>,
+}
+
+/// Identity of an empty, regular marker file. Only empty files are recorded:
+/// any byte written to the marker changes its size, which forces a full read,
+/// so a partially written marker is re-read on every poll exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EmptyMarkerIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(windows)]
+    created: u64,
+    modified: Option<SystemTime>,
+}
+
+impl EmptyMarkerIdentity {
+    fn of(metadata: &fs::Metadata) -> Option<Self> {
+        if !metadata.file_type().is_file() || metadata.len() != 0 {
+            return None;
+        }
+        Some(Self {
+            #[cfg(unix)]
+            dev: metadata.dev(),
+            #[cfg(unix)]
+            ino: metadata.ino(),
+            #[cfg(windows)]
+            created: metadata.creation_time(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+/// Watchdog form of [`read_exit_marker`]: the same result, without the full
+/// validated read while the marker is missing or is still the empty file a
+/// previous full read already found empty.
+///
+/// - A missing marker returns `None` after one `lstat`, which is what the
+///   full read returns for a missing marker or task layout.
+/// - A marker that appears or gains bytes no longer matches the remembered
+///   empty file, so the next poll does the full read and sees it. A file
+///   renamed over the marker with content is seen the same way; one renamed
+///   over it empty is told apart by inode on Unix, but may look unchanged on
+///   Windows, where it would read as `None` anyway.
+/// - Anything other than an unchanged empty regular file (content, a symlink,
+///   a stat error) goes through the full read, whose path validation and
+///   errors are unchanged.
+pub(crate) fn poll_exit_marker(
+    paths: &TaskPaths,
+    probe: &mut ExitMarkerProbe,
+) -> io::Result<Option<ExitMarker>> {
+    #[cfg(test)]
+    work_counts::record_stat();
+    let identity = match fs::symlink_metadata(&paths.exit) {
+        Ok(metadata) => EmptyMarkerIdentity::of(&metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            probe.empty = None;
+            return Ok(None);
+        }
+        Err(_) => None,
+    };
+    if identity.is_some() && identity == probe.empty {
+        return Ok(None);
+    }
+    probe.empty = None;
+    let marker = read_exit_marker(paths)?;
+    if marker.is_none() {
+        // `identity` was sampled before the read. If bytes landed after the
+        // sample, the size no longer matches it and the next poll reads again.
+        probe.empty = identity;
+    }
+    Ok(marker)
+}
+
 /// Publish a terminal marker through its validated I/O directory. When proof is
 /// unavailable, remove only an empty placeholder, never an existing result.
 pub(crate) fn record_terminal_artifact(

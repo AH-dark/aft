@@ -1132,3 +1132,197 @@ fn watchdog_cost_adopted_exit_with_refused_marker_still_settles() {
     );
     assert_eq!(registry.drain_completions().len(), 1);
 }
+
+/// Poll the marker the way the watchdog does, returning the result and how
+/// many full marker reads (the validated open-read-parse path) it took.
+fn probe_once(
+    paths: &TaskPaths,
+    probe: &mut super::super::persistence::ExitMarkerProbe,
+) -> (Option<super::super::persistence::ExitMarker>, usize) {
+    work_counts::reset();
+    let marker = super::super::persistence::poll_exit_marker(paths, probe).unwrap();
+    (marker, work_counts::get().marker_reads)
+}
+
+/// Replace the marker by renaming a new file over it, the way atomic writers
+/// publish it, so the path names a different file than the previous poll saw.
+fn replace_marker(paths: &TaskPaths, content: &[u8]) {
+    let staged = paths.io_dir.join("exit.staged");
+    fs::write(&staged, content).unwrap();
+    fs::rename(&staged, &paths.exit).unwrap();
+}
+
+#[test]
+fn watchdog_cost_exit_marker_poll_sees_marker_that_appears_between_ticks() {
+    use super::super::persistence::{ExitMarker, ExitMarkerProbe};
+    let storage = tempfile::tempdir().unwrap();
+    let (_, paths) = fixture(storage.path(), "session", false, 0);
+    let mut probe = ExitMarkerProbe::default();
+
+    // A running task's marker exists and is empty. The first poll does the
+    // full read; later polls of the unchanged empty file do not.
+    assert_eq!(probe_once(&paths, &mut probe), (None, 1));
+    assert_eq!(probe_once(&paths, &mut probe), (None, 0));
+    assert_eq!(probe_once(&paths, &mut probe), (None, 0));
+
+    // The shell writes the status into the same file in place: seen next tick.
+    fs::write(&paths.exit, b"0\n").unwrap();
+    assert_eq!(
+        probe_once(&paths, &mut probe),
+        (Some(ExitMarker::Code(0)), 1)
+    );
+
+    // A missing marker costs no full read and is seen as soon as it appears.
+    fs::remove_file(&paths.exit).unwrap();
+    assert_eq!(probe_once(&paths, &mut probe), (None, 0));
+    assert_eq!(probe_once(&paths, &mut probe), (None, 0));
+    fs::write(&paths.exit, b"7").unwrap();
+    assert_eq!(
+        probe_once(&paths, &mut probe),
+        (Some(ExitMarker::Code(7)), 1)
+    );
+}
+
+#[test]
+fn watchdog_cost_exit_marker_poll_retries_partial_marker() {
+    use super::super::persistence::{ExitMarker, ExitMarkerProbe};
+    let storage = tempfile::tempdir().unwrap();
+    let (_, paths) = fixture(storage.path(), "session", false, 0);
+    let mut probe = ExitMarkerProbe::default();
+    assert_eq!(probe_once(&paths, &mut probe), (None, 1));
+
+    // A marker caught mid-write is not a result, and is read again on every
+    // poll rather than remembered, until it is complete.
+    fs::write(&paths.exit, b"kil").unwrap();
+    assert_eq!(probe_once(&paths, &mut probe), (None, 1));
+    assert_eq!(probe_once(&paths, &mut probe), (None, 1));
+    fs::write(&paths.exit, b"killed\n").unwrap();
+    assert_eq!(
+        probe_once(&paths, &mut probe),
+        (Some(ExitMarker::Killed), 1)
+    );
+}
+
+#[test]
+fn watchdog_cost_exit_marker_poll_rereads_replaced_marker() {
+    use super::super::persistence::{ExitMarker, ExitMarkerProbe};
+    let storage = tempfile::tempdir().unwrap();
+    let (_, paths) = fixture(storage.path(), "session", false, 0);
+    let mut probe = ExitMarkerProbe::default();
+    assert_eq!(probe_once(&paths, &mut probe), (None, 1));
+    assert_eq!(probe_once(&paths, &mut probe), (None, 0));
+
+    // Another empty file renamed over the marker is a different file: the
+    // next poll validates it with a full read, then skips it again.
+    // Windows exposes no stable file identity through `std`, and NTFS may
+    // carry the old creation time over to a file renamed into the same name,
+    // so only Unix can tell two empty files apart. Either way an empty marker
+    // means no result.
+    replace_marker(&paths, b"");
+    let (marker, full_reads) = probe_once(&paths, &mut probe);
+    assert_eq!(marker, None);
+    #[cfg(unix)]
+    assert_eq!(full_reads, 1, "a replaced empty marker was not re-read");
+    #[cfg(not(unix))]
+    let _ = full_reads;
+    assert_eq!(probe_once(&paths, &mut probe), (None, 0));
+
+    // An atomically published result is seen on the next poll.
+    replace_marker(&paths, b"3\n");
+    assert_eq!(
+        probe_once(&paths, &mut probe),
+        (Some(ExitMarker::Code(3)), 1)
+    );
+}
+
+/// Per-tick cost of the watchdog's exit-marker check for N running tasks,
+/// before (one full `read_exit_marker` per task, as `poll_task` did) and after
+/// (`poll_task` with the probe). Prints read syscalls and bytes from
+/// `/proc/self/io`, thread CPU time, and the module's own open/read counters.
+/// Run with `--ignored --nocapture --test-threads=1` so no other test shares
+/// the process-wide `/proc/self/io` counters.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "measurement: prints per-tick exit-marker poll cost"]
+fn watchdog_cost_exit_marker_poll_measurement() {
+    fn proc_io() -> (u64, u64) {
+        let text = fs::read_to_string("/proc/self/io").unwrap();
+        let field = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap()
+        };
+        (field("syscr:"), field("rchar:"))
+    }
+    fn thread_cpu_micros() -> u64 {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) },
+            0
+        );
+        let micros = |time: libc::timeval| time.tv_sec as u64 * 1_000_000 + time.tv_usec as u64;
+        micros(usage.ru_utime) + micros(usage.ru_stime)
+    }
+    fn measure(ticks: usize, mut tick: impl FnMut()) -> String {
+        tick();
+        work_counts::reset();
+        let (syscalls, bytes) = proc_io();
+        let cpu = thread_cpu_micros();
+        for _ in 0..ticks {
+            tick();
+        }
+        let cpu = thread_cpu_micros() - cpu;
+        let (syscalls_after, bytes_after) = proc_io();
+        let counts = work_counts::get();
+        let per = |value: u64| value as f64 / ticks as f64;
+        format!(
+            "read syscalls/tick={:.0} bytes read/tick={:.0} cpu/tick={:.0}us opens/tick={:.0} metadata reads/tick={:.0} marker reads/tick={:.0} stats/tick={:.0}",
+            per(syscalls_after - syscalls),
+            per(bytes_after - bytes),
+            per(cpu),
+            per(counts.opens as u64),
+            per(counts.metadata_reads as u64),
+            per(counts.marker_reads as u64),
+            per(counts.stats as u64),
+        )
+    }
+    const TICKS: usize = 20;
+    for count in [10usize, 100, 500] {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let mut tasks = Vec::new();
+        for _ in 0..count {
+            // A PTY task restored after a restart has no runtime handle, so
+            // every tick reaches the marker check (as every task does on
+            // Windows). Its recorded child is this live test process.
+            let (mut metadata, paths) = fixture(storage.path(), "session", false, 0);
+            metadata.mode = BgMode::Pty;
+            metadata.mark_running(std::process::id(), std::process::id() as i32);
+            metadata.finished_at = None;
+            metadata.duration_ms = None;
+            write_task_at(
+                &resolve_task_layout(&paths.session_dir, &paths.task_id).unwrap(),
+                &metadata,
+            )
+            .unwrap();
+            registry
+                .insert_rehydrated_task(metadata, paths.clone(), true)
+                .unwrap();
+            tasks.push(registry.task(&paths.task_id).unwrap());
+        }
+        let before = measure(TICKS, || {
+            for task in &tasks {
+                assert_eq!(read_exit_marker(&task.paths).unwrap(), None);
+            }
+        });
+        let after = measure(TICKS, || {
+            for task in &tasks {
+                registry.poll_task(task).unwrap();
+            }
+        });
+        assert!(tasks.iter().all(|task| task.is_running()));
+        eprintln!("{count} running tasks, before: {before}");
+        eprintln!("{count} running tasks, after:  {after}");
+    }
+}
