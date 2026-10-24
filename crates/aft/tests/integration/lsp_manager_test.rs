@@ -1171,12 +1171,23 @@ fn watched_file_batch_continues_after_a_server_rejects_send() {
         "protocol fixture requires Python"
     );
     let temp = tempdir().unwrap();
+    let physical_roots = temp.path().join("physical-roots");
+    fs::create_dir_all(&physical_roots).unwrap();
+    // Exercise caller aliases on Linux as well as macOS's /var spelling.
+    #[cfg(unix)]
+    let caller_roots = {
+        let alias = temp.path().join("caller-roots");
+        std::os::unix::fs::symlink(&physical_roots, &alias).unwrap();
+        alias
+    };
+    #[cfg(not(unix))]
+    let caller_roots = physical_roots;
     let (_script_dir, script) = executable_protocol_server_script();
     let mut manager = LspManager::new();
     let mut config = Config::default();
-    let mut sources = HashMap::new();
+    let mut sources = Vec::new();
     for id in ["batch-a", "batch-b"] {
-        let root = temp.path().join(id);
+        let root = caller_roots.join(id);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("marker.txt"), "marker").unwrap();
         let source = root.join(format!("main.{id}"));
@@ -1192,10 +1203,23 @@ fn watched_file_batch_continues_after_a_server_rejects_send() {
             disabled: false,
         });
         manager.override_binary(ServerKind::Custom(Arc::from(id)), script.clone());
-        sources.insert(root, source);
+        sources.push(source);
     }
-    for source in sources.values() {
-        assert_eq!(manager.ensure_server_for_file(source, &config).len(), 1);
+    let mut sources_by_key = HashMap::new();
+    for source in sources {
+        let started = manager.ensure_server_for_file(&source, &config);
+        assert_eq!(started.len(), 1, "the fixture must start one producer");
+        let key = started
+            .into_iter()
+            .next()
+            .expect("one producer was started");
+        #[cfg(unix)]
+        assert_ne!(
+            key.root.as_path(),
+            source.parent().unwrap(),
+            "the caller alias must differ from the product's canonical identity"
+        );
+        sources_by_key.insert(key, source);
         collect_event(
             &mut manager,
             |event| {
@@ -1209,8 +1233,16 @@ fn watched_file_batch_continues_after_a_server_rejects_send() {
     // Use the manager's own iteration order so the rejected send precedes the
     // healthy recipient without depending on HashMap's randomized ordering.
     let keys = manager.active_server_keys();
-    let failed_source = &sources[&keys[0].root];
-    let healthy_source = &sources[&keys[1].root];
+    let [failed_key, healthy_key] = keys.as_slice() else {
+        panic!("expected two fixture producers, got {keys:?}");
+    };
+    let failed_source = sources_by_key
+        .get(failed_key)
+        .unwrap_or_else(|| panic!("failed producer key {failed_key:?} has no fixture source"));
+    assert!(
+        sources_by_key.contains_key(healthy_key),
+        "healthy producer key {healthy_key:?} has no fixture source"
+    );
     let failed = manager.client_for_file_mut(failed_source, &config).unwrap();
     failed.shutdown().unwrap();
     assert!(
@@ -1228,7 +1260,7 @@ fn watched_file_batch_continues_after_a_server_rejects_send() {
     assert_eq!(received["changes"].as_array().unwrap().len(), 1);
     assert_eq!(
         received["changes"][0]["uri"],
-        aft::lsp::position::uri_for_path(&healthy_source.parent().unwrap().join("config.json"))
+        aft::lsp::position::uri_for_path(&healthy_key.root.join("config.json"))
             .unwrap()
             .as_str()
     );
