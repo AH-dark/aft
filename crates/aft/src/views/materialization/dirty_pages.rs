@@ -40,6 +40,30 @@ fn platform() -> *mut ffi::sqlite3_vfs {
         as *mut ffi::sqlite3_vfs
 }
 
+const VFS_NAME: &str = "aft-derived-dirty-pages";
+
+pub(crate) fn open_probe_connection(
+    path: &Path,
+    flags: rusqlite::OpenFlags,
+) -> rusqlite::Result<Connection> {
+    let measured = CAPTURE.with(|capture| {
+        capture
+            .borrow()
+            .as_ref()
+            .is_some_and(|capture| capture.target == absolute_sqlite_path(path))
+    }) || publication::captures(path);
+    if measured {
+        Connection::open_with_flags_and_vfs(path, flags, VFS_NAME)
+    } else {
+        Connection::open_with_flags(path, flags)
+    }
+}
+
+fn ffi_result(body: impl FnOnce() -> c_int) -> c_int {
+    // A test assertion or poisoned observer must never unwind through SQLite.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(ffi::SQLITE_IOERR)
+}
+
 fn methods() -> &'static Mutex<BTreeMap<usize, usize>> {
     static METHODS: OnceLock<Mutex<BTreeMap<usize, usize>>> = OnceLock::new();
     METHODS.get_or_init(Default::default)
@@ -57,33 +81,38 @@ unsafe extern "C" fn open(
     flags: c_int,
     out: *mut c_int,
 ) -> c_int {
-    let base = platform();
-    let rc = unsafe { ((*base).xOpen.unwrap())(base, name, file, flags, out) };
-    if rc != ffi::SQLITE_OK || name.is_null() {
-        return rc;
-    }
-    let path = absolute_sqlite_path(Path::new(
-        unsafe { CStr::from_ptr(name) }.to_string_lossy().as_ref(),
-    ));
-    let wal = flags & ffi::SQLITE_OPEN_WAL != 0;
-    files().lock().unwrap().insert(file as usize, (path, wal));
-    let original = unsafe { (*file).pMethods };
-    if !original.is_null() {
-        let mut tables = methods().lock().unwrap();
-        let patched = tables
-            .iter()
-            .find(|(_, value)| **value == original as usize)
-            .map(|(key, _)| *key)
-            .unwrap_or_else(|| {
-                let mut copy = unsafe { *original };
-                copy.xWrite = Some(write);
-                let key = Box::into_raw(Box::new(copy)) as usize;
-                tables.insert(key, original as usize);
-                key
-            });
-        unsafe { (*file).pMethods = patched as *const ffi::sqlite3_io_methods };
-    }
-    rc
+    ffi_result(|| {
+        let base = platform();
+        let Some(open) = (unsafe { base.as_ref() }).and_then(|base| base.xOpen) else {
+            return ffi::SQLITE_CANTOPEN;
+        };
+        let rc = unsafe { open(base, name, file, flags, out) };
+        if rc != ffi::SQLITE_OK || name.is_null() {
+            return rc;
+        }
+        let path = absolute_sqlite_path(Path::new(
+            unsafe { CStr::from_ptr(name) }.to_string_lossy().as_ref(),
+        ));
+        let wal = flags & ffi::SQLITE_OPEN_WAL != 0;
+        files().lock().unwrap().insert(file as usize, (path, wal));
+        let original = unsafe { (*file).pMethods };
+        if !original.is_null() {
+            let mut tables = methods().lock().unwrap();
+            let patched = tables
+                .iter()
+                .find(|(_, value)| **value == original as usize)
+                .map(|(key, _)| *key)
+                .unwrap_or_else(|| {
+                    let mut copy = unsafe { *original };
+                    copy.xWrite = Some(write);
+                    let key = Box::into_raw(Box::new(copy)) as usize;
+                    tables.insert(key, original as usize);
+                    key
+                });
+            unsafe { (*file).pMethods = patched as *const ffi::sqlite3_io_methods };
+        }
+        rc
+    })
 }
 
 unsafe extern "C" fn write(
@@ -92,39 +121,53 @@ unsafe extern "C" fn write(
     amount: c_int,
     offset: i64,
 ) -> c_int {
-    let original = methods().lock().unwrap()[&(unsafe { (*file).pMethods } as usize)]
-        as *const ffi::sqlite3_io_methods;
-    let rc = unsafe { ((*original).xWrite.unwrap())(file, buffer, amount, offset) };
-    if rc != ffi::SQLITE_OK || amount <= 0 {
-        return rc;
-    }
-    if let Some((path, wal)) = files().lock().unwrap().get(&(file as usize)) {
-        publication::written(path, *wal, buffer, amount, offset);
-    }
-    CAPTURE.with(|capture| {
-        let mut capture = capture.borrow_mut();
-        let Some(capture) = capture.as_mut() else {
-            return;
+    ffi_result(|| {
+        let Some(file_ref) = (unsafe { file.as_ref() }) else {
+            return ffi::SQLITE_IOERR_WRITE;
         };
-        let opened = files().lock().unwrap();
-        let Some((path, wal)) = opened.get(&(file as usize)) else {
-            return;
+        let Ok(tables) = methods().lock() else {
+            return ffi::SQLITE_IOERR_WRITE;
         };
-        if !*wal && path == &capture.target {
-            capture.main_bytes += amount as u64;
-        } else if *wal && path == &PathBuf::from(format!("{}-wal", capture.target.display())) {
-            capture.wal_bytes += amount as u64;
-            // Bundled SQLite writes each frame header at a frame boundary.
-            // A missing/split header fails the frame-count reconciliation below.
-            if offset >= 32 && (offset - 32) % 4120 == 0 && amount >= 24 {
-                let bytes = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), 4) };
-                let page = u32::from_be_bytes(bytes.try_into().unwrap());
-                capture.pages.insert((offset - 32) / 4120, page);
-                capture.frame_writes.push(page);
-            }
+        let Some(original) = tables.get(&(file_ref.pMethods as usize)).copied() else {
+            return ffi::SQLITE_IOERR_WRITE;
+        };
+        drop(tables);
+        let original = original as *const ffi::sqlite3_io_methods;
+        let Some(write) = (unsafe { original.as_ref() }).and_then(|methods| methods.xWrite) else {
+            return ffi::SQLITE_IOERR_WRITE;
+        };
+        let rc = unsafe { write(file, buffer, amount, offset) };
+        if rc != ffi::SQLITE_OK || amount <= 0 {
+            return rc;
         }
-    });
-    rc
+        if let Some((path, wal)) = files().lock().unwrap().get(&(file as usize)) {
+            publication::written(path, *wal, buffer, amount, offset);
+        }
+        CAPTURE.with(|capture| {
+            let mut capture = capture.borrow_mut();
+            let Some(capture) = capture.as_mut() else {
+                return;
+            };
+            let opened = files().lock().unwrap();
+            let Some((path, wal)) = opened.get(&(file as usize)) else {
+                return;
+            };
+            if !*wal && path == &capture.target {
+                capture.main_bytes += amount as u64;
+            } else if *wal && path == &PathBuf::from(format!("{}-wal", capture.target.display())) {
+                capture.wal_bytes += amount as u64;
+                // Bundled SQLite writes each frame header at a frame boundary.
+                // A missing/split header fails the frame-count reconciliation below.
+                if offset >= 32 && (offset - 32) % 4120 == 0 && amount >= 24 {
+                    let bytes = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), 4) };
+                    let page = u32::from_be_bytes(bytes.try_into().unwrap());
+                    capture.pages.insert((offset - 32) / 4120, page);
+                    capture.frame_writes.push(page);
+                }
+            }
+        });
+        rc
+    })
 }
 
 struct Session;
@@ -140,7 +183,9 @@ impl Session {
             Box::into_raw(Box::new(shim)) as usize
         });
         assert_eq!(
-            unsafe { ffi::sqlite3_vfs_register(shim as *mut _, 1) },
+            // Other probes cache SQLite's default VFS. Never let them capture
+            // this wrapper and replace its per-file method table a second time.
+            unsafe { ffi::sqlite3_vfs_register(shim as *mut _, 0) },
             ffi::SQLITE_OK
         );
         Self
@@ -163,11 +208,177 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         CAPTURE.with(|capture| *capture.borrow_mut() = None);
-        assert_eq!(
-            unsafe { ffi::sqlite3_vfs_register(platform(), 1) },
-            ffi::SQLITE_OK
-        );
     }
+}
+
+#[test]
+fn missing_write_method_returns_sqlite_error() {
+    let mut file = ffi::sqlite3_file {
+        pMethods: std::ptr::null(),
+    };
+    assert_eq!(
+        unsafe { write(&mut file, std::ptr::null(), 0, 0) },
+        ffi::SQLITE_IOERR_WRITE
+    );
+}
+
+#[test]
+fn session_keeps_default_and_wal_probe_isolated() {
+    const CHILD: &str = "AFT_DIRTY_VFS_ISOLATION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // The WAL probe must first cache its base while the session is active.
+        // A fresh process makes that ordering independent of other lib tests.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "views::materialization::tests::dirty_pages::session_keeps_default_and_wal_probe_isolated", "--nocapture"])
+            .env(CHILD, "1")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "VFS child {:?}\n{}\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .contains("isolated-vfs measured=64 default=64 wal-credit=64"));
+        return;
+    }
+    fn counted(connection: &Connection) -> bool {
+        let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
+        let rc = unsafe {
+            ffi::sqlite3_file_control(
+                connection.handle(),
+                c"main".as_ptr(),
+                ffi::SQLITE_FCNTL_FILE_POINTER,
+                std::ptr::from_mut(&mut file).cast(),
+            )
+        };
+        assert_eq!(rc, ffi::SQLITE_OK);
+        assert!(!file.is_null());
+        methods()
+            .lock()
+            .unwrap()
+            .contains_key(&(unsafe { (*file).pMethods } as usize))
+    }
+    fn write_row(connection: &Connection) -> rusqlite::Result<()> {
+        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS probe(value INTEGER); INSERT INTO probe VALUES(1); PRAGMA wal_checkpoint(TRUNCATE)")
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let measured = root.join("measured.sqlite");
+    let default_before = unsafe { ffi::sqlite3_vfs_find(std::ptr::null()) } as usize;
+    let session = Session::start(&measured);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let other_barrier = barrier.clone();
+    let other_root = root.clone();
+    let other = std::thread::spawn(move || {
+        let mut errors = Vec::new();
+        let mut default_writes = 0;
+        let mut credit_writes = 0;
+        other_barrier.wait();
+        for _ in 0..64 {
+            let connection = Connection::open(other_root.join("default.sqlite")).unwrap();
+            if counted(&connection) {
+                errors.push("default connection was counted".to_string());
+            }
+            match write_row(&connection) {
+                Ok(()) => default_writes += 1,
+                Err(error) => errors.push(format!("default write: {error}")),
+            }
+            let credit = crate::db::wal_credit_probe::open_counted(
+                &other_root.join("credit.sqlite"),
+                rusqlite::OpenFlags::default(),
+            );
+            match write_row(&credit) {
+                Ok(()) => credit_writes += 1,
+                Err(error) => errors.push(format!("WAL credit write: {error}")),
+            }
+            if crate::db::wal_credit_probe::main_io_counts(&credit).0 == 0 {
+                errors.push("WAL credit probe missed its main-file writes".to_string());
+            }
+        }
+        (errors, default_writes, credit_writes)
+    });
+    let mut errors = Vec::new();
+    let mut measured_writes = 0;
+    barrier.wait();
+    for iteration in 0..64 {
+        let perform = |connection: &Connection| (counted(connection), write_row(connection));
+        let (is_counted, result) = match iteration % 5 {
+            0 => perform(
+                &crate::db::file_identity::IdentityConnection::open_with_flags(
+                    &measured,
+                    rusqlite::OpenFlags::default(),
+                    "views::materialization::materialize",
+                )
+                .unwrap(),
+            ),
+            1 => perform(
+                &crate::db::file_identity::IdentityConnection::open(
+                    &measured,
+                    "views::materialization::materialize",
+                )
+                .unwrap(),
+            ),
+            2 => perform(
+                &crate::db::lifecycle::TrackedConnection::open(
+                    &measured,
+                    crate::db::lifecycle::SqliteStore::BlobStore,
+                )
+                .unwrap(),
+            ),
+            3 => perform(
+                &crate::db::lifecycle::TrackedConnection::open_with_flags(
+                    measured.to_str().unwrap(),
+                    rusqlite::OpenFlags::default(),
+                    crate::db::lifecycle::SqliteStore::BlobStore,
+                )
+                .unwrap(),
+            ),
+            _ => perform(
+                &crate::db::lifecycle::TrackedConnection::open_path_with_flags(
+                    &measured,
+                    rusqlite::OpenFlags::default(),
+                    crate::db::lifecycle::SqliteStore::BlobStore,
+                )
+                .unwrap(),
+            ),
+        };
+        if !is_counted {
+            errors.push("measured connection bypassed counting VFS".to_string());
+        }
+        match result {
+            Ok(()) => measured_writes += 1,
+            Err(error) => errors.push(format!("measured write: {error}")),
+        }
+    }
+    let (other_errors, default_writes, credit_writes) = other.join().unwrap();
+    errors.extend(other_errors);
+    let default_during = unsafe { ffi::sqlite3_vfs_find(std::ptr::null()) } as usize;
+    let wal_bytes = CAPTURE.with(|capture| capture.borrow().as_ref().unwrap().wal_bytes);
+    drop(session);
+    assert!(errors.is_empty(), "VFS write failures: {errors:?}");
+    assert_eq!(
+        default_during, default_before,
+        "session changed the process default VFS"
+    );
+    assert_eq!(
+        unsafe { ffi::sqlite3_vfs_find(std::ptr::null()) } as usize,
+        default_before
+    );
+    assert!(wal_bytes > 0, "measured WAL writes must be observed");
+    assert_eq!(
+        (measured_writes, default_writes, credit_writes),
+        (64, 64, 64)
+    );
+    for name in ["measured.sqlite", "default.sqlite", "credit.sqlite"] {
+        let rows: i64 = Connection::open(root.join(name))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 64, "writes must survive closing {name}");
+    }
+    println!("isolated-vfs measured=64 default=64 wal-credit=64");
 }
 
 fn owners(connection: &Connection) -> BTreeMap<u32, String> {
@@ -186,15 +397,14 @@ unsafe extern "C" fn wal_hook(
     _: *const c_char,
     frames: c_int,
 ) -> c_int {
-    CAPTURE.with(|capture| {
-        capture
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .hook_frames
-            .push(frames)
-    });
-    ffi::SQLITE_OK
+    ffi_result(|| {
+        CAPTURE.with(|capture| {
+            if let Some(capture) = capture.borrow_mut().as_mut() {
+                capture.hook_frames.push(frames);
+            }
+        });
+        ffi::SQLITE_OK
+    })
 }
 
 pub(in crate::views::materialization) fn observe(

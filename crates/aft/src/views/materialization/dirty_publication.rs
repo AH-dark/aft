@@ -21,6 +21,14 @@ struct Publication {
 
 static PUBLICATION: Mutex<Option<Publication>> = Mutex::new(None);
 
+pub(super) fn captures(path: &Path) -> bool {
+    PUBLICATION.lock().is_ok_and(|publication| {
+        publication
+            .as_ref()
+            .is_some_and(|publication| absolute_sqlite_path(path).starts_with(&publication.root))
+    })
+}
+
 fn database_path(db: *mut ffi::sqlite3) -> PathBuf {
     let name = unsafe { ffi::sqlite3_db_filename(db, c"main".as_ptr()) };
     if name.is_null() {
@@ -32,36 +40,42 @@ fn database_path(db: *mut ffi::sqlite3) -> PathBuf {
 }
 
 pub(crate) unsafe fn probe_wal(db: *mut ffi::sqlite3, frames: i32) {
-    let mut publication = PUBLICATION.lock().unwrap();
-    let Some(publication) = publication.as_mut() else {
-        return;
-    };
-    let path = database_path(db);
-    if path.starts_with(&publication.root) {
-        publication
-            .databases
-            .entry(path)
-            .or_default()
-            .hooks
-            .push(frames);
-    }
+    let _ = ffi_result(|| {
+        let mut publication = PUBLICATION.lock().unwrap();
+        let Some(publication) = publication.as_mut() else {
+            return ffi::SQLITE_OK;
+        };
+        let path = database_path(db);
+        if path.starts_with(&publication.root) {
+            publication
+                .databases
+                .entry(path)
+                .or_default()
+                .hooks
+                .push(frames);
+        }
+        ffi::SQLITE_OK
+    });
 }
 
 pub(crate) unsafe fn probe_checkpoint(db: *mut ffi::sqlite3, busy: i64, log: i64, backfilled: i64) {
-    let mut publication = PUBLICATION.lock().unwrap();
-    let Some(publication) = publication.as_mut() else {
-        return;
-    };
-    let path = database_path(db);
-    if !path.starts_with(&publication.root) {
-        return;
-    }
-    let database = publication.databases.entry(path).or_default();
-    database.checkpoints.push((busy, log, backfilled));
-    // from_handle borrows the existing SQLite handle; it neither opens another
-    // database connection nor closes the handle when this wrapper is dropped.
-    let borrowed = unsafe { Connection::from_handle(db) }.unwrap();
-    database.owners.extend(owners(&borrowed));
+    let _ = ffi_result(|| {
+        let mut publication = PUBLICATION.lock().unwrap();
+        let Some(publication) = publication.as_mut() else {
+            return ffi::SQLITE_OK;
+        };
+        let path = database_path(db);
+        if !path.starts_with(&publication.root) {
+            return ffi::SQLITE_OK;
+        }
+        let database = publication.databases.entry(path).or_default();
+        database.checkpoints.push((busy, log, backfilled));
+        // from_handle borrows the existing SQLite handle; it neither opens another
+        // database connection nor closes the handle when this wrapper is dropped.
+        let borrowed = unsafe { Connection::from_handle(db) }.unwrap();
+        database.owners.extend(owners(&borrowed));
+        ffi::SQLITE_OK
+    });
 }
 
 unsafe extern "C" fn hook(
@@ -70,8 +84,10 @@ unsafe extern "C" fn hook(
     _: *const c_char,
     frames: c_int,
 ) -> c_int {
-    unsafe { probe_wal(db, frames) };
-    ffi::SQLITE_OK
+    ffi_result(|| {
+        unsafe { probe_wal(db, frames) };
+        ffi::SQLITE_OK
+    })
 }
 
 pub(crate) fn observe(connection: &Connection, _path: &Path) {

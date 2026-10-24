@@ -577,7 +577,14 @@ impl TrackedConnection {
         production_write_gate(path)?;
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(path, OpenFlags::default())?;
-        Self::from_connection_attributed(Connection::open(sqlite_open_path(path))?, store, root_id)
+        #[cfg(test)]
+        let connection = crate::views::materialization::open_probe_connection(
+            &sqlite_open_path(path),
+            OpenFlags::default(),
+        )?;
+        #[cfg(not(test))]
+        let connection = Connection::open(sqlite_open_path(path))?;
+        Self::from_connection_attributed(connection, store, root_id)
     }
 
     pub fn open_with_flags(
@@ -596,9 +603,21 @@ impl TrackedConnection {
         // store's `sqlite_readonly_uri`).
         let connection = if flags.contains(OpenFlags::SQLITE_OPEN_URI) && path.starts_with("file:")
         {
-            Connection::open_with_flags(path, flags)?
+            #[cfg(test)]
+            let connection =
+                crate::views::materialization::open_probe_connection(Path::new(path), flags)?;
+            #[cfg(not(test))]
+            let connection = Connection::open_with_flags(path, flags)?;
+            connection
         } else {
-            Connection::open_with_flags(sqlite_open_path(Path::new(path)), flags)?
+            #[cfg(test)]
+            let connection = crate::views::materialization::open_probe_connection(
+                &sqlite_open_path(Path::new(path)),
+                flags,
+            )?;
+            #[cfg(not(test))]
+            let connection = Connection::open_with_flags(sqlite_open_path(Path::new(path)), flags)?;
+            connection
         };
         Self::from_connection_attributed(connection, store, path.to_owned())
     }
@@ -613,11 +632,12 @@ impl TrackedConnection {
         }
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(path, flags)?;
-        Self::from_connection_attributed(
-            Connection::open_with_flags(sqlite_open_path(path), flags)?,
-            store,
-            path.display().to_string(),
-        )
+        #[cfg(test)]
+        let connection =
+            crate::views::materialization::open_probe_connection(&sqlite_open_path(path), flags)?;
+        #[cfg(not(test))]
+        let connection = Connection::open_with_flags(sqlite_open_path(path), flags)?;
+        Self::from_connection_attributed(connection, store, path.display().to_string())
     }
 
     pub fn open_in_memory(store: SqliteStore) -> rusqlite::Result<Self> {

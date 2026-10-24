@@ -1711,6 +1711,8 @@ fn finish_private_database(connection: &Connection) -> Result<()> {
 mod tests;
 
 #[cfg(test)]
+pub(crate) use tests::dirty_pages::open_probe_connection;
+#[cfg(test)]
 pub(crate) use tests::dirty_pages::publication::{probe_checkpoint, probe_connection, probe_wal};
 
 // The measurement harness reads process CPU time through getrusage.

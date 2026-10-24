@@ -382,7 +382,14 @@ impl IdentityConnection {
         super::lifecycle::production_write_gate(path.as_ref())?;
         let _guard = filesystem_guard();
         crate::private_storage::prepare_sqlite(path.as_ref(), rusqlite::OpenFlags::default())?;
-        Ok(Self::new(rusqlite::Connection::open(path)?, seam))
+        #[cfg(test)]
+        let connection = crate::views::materialization::open_probe_connection(
+            path.as_ref(),
+            rusqlite::OpenFlags::default(),
+        )?;
+        #[cfg(not(test))]
+        let connection = rusqlite::Connection::open(path)?;
+        Ok(Self::new(connection, seam))
     }
 
     pub(crate) fn open_with_flags(
@@ -395,10 +402,12 @@ impl IdentityConnection {
         }
         let _guard = filesystem_guard();
         crate::private_storage::prepare_sqlite(path.as_ref(), flags)?;
-        Ok(Self::new(
-            rusqlite::Connection::open_with_flags(path, flags)?,
-            seam,
-        ))
+        #[cfg(test)]
+        let connection =
+            crate::views::materialization::open_probe_connection(path.as_ref(), flags)?;
+        #[cfg(not(test))]
+        let connection = rusqlite::Connection::open_with_flags(path, flags)?;
+        Ok(Self::new(connection, seam))
     }
 
     pub(crate) fn new(connection: rusqlite::Connection, seam: &'static str) -> Self {
