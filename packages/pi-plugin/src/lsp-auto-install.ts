@@ -35,7 +35,8 @@ import {
   cachedFileSha256,
   cachedFileSha256Sync,
   isSafeVersion,
-  npmInvocation,
+  lspNpmInstallInvocation,
+  lspPublicationCutoff,
   npmSpawnEnv,
   resolveNpm,
   spawn,
@@ -279,6 +280,7 @@ function runInstall(
   version: string,
   cwd: string,
   installLock: InstallLockLease,
+  before: string | undefined,
   signal?: AbortSignal,
 ): Promise<boolean> {
   return new Promise((resolve) => {
@@ -295,7 +297,7 @@ function runInstall(
     // auto-resolve `.cmd`), and GUI/Desktop launches often have a stripped PATH
     // with no version-manager bin dir, so a bare `npm` spawn fails with ENOENT.
     // resolveNpm() handles discovery, npmSpawnEnv() makes npm's node sibling
-    // reachable, and npmInvocation() safely routes Windows shims through cmd.exe
+    // reachable, and the shared policy safely routes Windows shims through cmd.exe
     // without enabling shell parsing on other platforms.
     const npm = resolveNpm();
     if (!npm) {
@@ -304,15 +306,13 @@ function runInstall(
       return;
     }
 
+    const invocation = lspNpmInstallInvocation(npm, target, before);
+    if (!invocation) {
+      warn(`[lsp] npm cannot enforce the publication cutoff; cannot install ${target}`);
+      resolve(false);
+      return;
+    }
     ensureInstallAnchor(cwd);
-
-    const invocation = npmInvocation(npm, [
-      "install",
-      "--no-save",
-      "--ignore-scripts",
-      "--silent",
-      target,
-    ]);
     const child = spawn(invocation.command, invocation.args, {
       stdio: ["ignore", "pipe", "pipe"],
       cwd,
@@ -495,6 +495,7 @@ async function ensureServerInstalled(
       version,
       cachedPackageDir(spec.npm),
       installLock,
+      lspPublicationCutoff(config.graceDays, Boolean(config.versions[spec.npm])),
       signal,
     ).catch((err: unknown) => {
       error(`[lsp] background install ${spec.npm} crashed: ${err}`);
