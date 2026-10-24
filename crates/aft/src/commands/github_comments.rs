@@ -378,15 +378,15 @@ fn apply_comment_match(
     } else {
         let matched = &matches[occurrence.unwrap_or(0)];
         let mut effective = String::with_capacity(replacement.len().saturating_add(1));
-        super::edit_match::push_fuzzy_replacement(
-            &mut effective,
+        let plan = crate::fuzzy_match::ReindentPlan::new(
             source,
-            matched,
             match_text,
             replacement,
             None,
-        )
-        .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))?;
+            std::slice::from_ref(matched),
+        );
+        super::edit_match::push_fuzzy_replacement(&mut effective, &plan, 0)
+            .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))?;
         let updated = crate::edit::replace_byte_range(
             source,
             matched.byte_start,

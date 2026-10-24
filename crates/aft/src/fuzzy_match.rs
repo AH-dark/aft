@@ -625,92 +625,6 @@ fn region_has_error(root: tree_sitter::Node<'_>, start: usize, end: usize) -> bo
     false
 }
 
-/// For each line of `replacement` (as split by `split_inclusive('\n')`),
-/// whether it starts inside a multi-line string literal that `replacement`
-/// itself opens. Such a line is part of the string's value and must keep the
-/// exact text the agent wrote, so the shift skips it.
-///
-/// The answer comes from parsing the file with `replacement` inserted
-/// unshifted: moving lines that are outside strings never changes where a
-/// string starts or ends, so the unshifted parse is valid for the shifted
-/// result too. `path` is `None` for text with no string literals (GitHub
-/// comments), where nothing is skipped.
-///
-/// Refuses with `ambiguous_indentation` when a line continues a string that
-/// opened before the edit (the agent's intended text for that string is
-/// unknowable), and when it cannot tell: the parse is broken around the edit,
-/// or the language has no parser here, while string delimiters are present.
-fn lines_inside_new_strings(
-    source: &str,
-    matched: &FuzzyMatch,
-    replacement: &str,
-    path: Option<&std::path::Path>,
-) -> Result<Vec<bool>, crate::error::AftError> {
-    let pieces: Vec<&str> = replacement.split_inclusive('\n').collect();
-    let mut inside = vec![false; pieces.len()];
-    let Some(path) = path else {
-        return Ok(inside);
-    };
-    let end = matched.byte_start + matched.byte_len;
-    let matched_lines_start = source[..matched.byte_start]
-        .rfind('\n')
-        .map_or(0, |at| at + 1);
-    let matched_text = &source[matched_lines_start..end];
-    let Some(lang) = crate::parser::detect_language(path) else {
-        if has_multiline_string_marker(replacement) || has_multiline_string_marker(matched_text) {
-            return Err(ambiguous_indentation(
-                "this file type has no parser here and newString or the matched lines may hold a multi-line string, whose text must not move".to_string(),
-            ));
-        }
-        return Ok(inside);
-    };
-    let mut verbatim = String::with_capacity(source.len() + replacement.len() + 1);
-    verbatim.push_str(&source[..matched.byte_start]);
-    verbatim.push_str(replacement);
-    let replacement_end = verbatim.len();
-    if source[..end].ends_with('\n') && !replacement.is_empty() && !replacement.ends_with('\n') {
-        verbatim.push('\n');
-    }
-    verbatim.push_str(&source[end..]);
-    let unsure = || {
-        ambiguous_indentation(
-            "the code around the edit does not parse, so lines inside multi-line strings cannot be told apart from code".to_string(),
-        )
-    };
-    let delimiters = has_string_delimiter(replacement) || has_string_delimiter(matched_text);
-    let Ok(tree) = crate::parser::parse_source_with_cached_parser(path, &verbatim, lang) else {
-        return if delimiters {
-            Err(unsure())
-        } else {
-            Ok(inside)
-        };
-    };
-    let root = tree.root_node();
-    if delimiters && region_has_error(root, matched.byte_start, replacement_end) {
-        return Err(unsure());
-    }
-    let mut offset = matched.byte_start;
-    for (index, piece) in pieces.iter().enumerate() {
-        let line_start = offset;
-        offset += piece.len();
-        // Only lines that begin at a line start can be shifted.
-        let at_line_start = line_start == 0 || verbatim.as_bytes()[line_start - 1] == b'\n';
-        if !at_line_start || piece.trim().is_empty() {
-            continue;
-        }
-        if let Some(string) = string_literal_at_line_start(root, line_start) {
-            if string.start_byte() < matched.byte_start {
-                return Err(ambiguous_indentation(format!(
-                    "line {} of newString is inside a multi-line string that starts before the edit, and that string's intended text is unclear",
-                    index + 1
-                )));
-            }
-            inside[index] = true;
-        }
-    }
-    Ok(inside)
-}
-
 /// The string literal (see [`is_string_literal_kind`]) that the line
 /// beginning at byte `line_start` starts inside, if any. Such a line is part
 /// of the string's value: adding or removing its leading whitespace changes
@@ -774,76 +688,296 @@ thread_local! {
     pub(crate) static STRING_LINE_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The replacement for `matched`, with every line moved by the match's
-/// [`indentation_shift`]. A loose match keeps the file's indentation for the
-/// matched lines, so writing `newString` as given would leave every line
-/// after the first at `oldString`'s wrong indentation: in Python that is an
-/// IndentationError or code moved into another block. Lines inside a
-/// multi-line string literal are left exactly as written (see
-/// [`lines_inside_new_strings`]); `path` selects the language for that check.
+/// Re-indents the replacement for each match of one find/replace (see
+/// [`indentation_shift`]), sharing the work across matches. Finding which
+/// replacement lines sit inside multi-line string literals needs a parse of
+/// the edited file; a plan makes at most one such parse for all of its
+/// matches, and only when some match needs shifting and a string delimiter
+/// appears anywhere in the file, the matched lines or the replacement. A
+/// `replace_all` over thousands of matches would otherwise parse the whole
+/// file thousands of times.
+pub(crate) struct ReindentPlan<'a> {
+    source: &'a str,
+    needle: &'a str,
+    replacement: &'a str,
+    /// The edited file, whose language decides what a string literal is;
+    /// `None` for text without string literals (GitHub comments).
+    path: Option<&'a std::path::Path>,
+    /// The matches being replaced, ascending by start.
+    matches: &'a [FuzzyMatch],
+    source_has_delimiter: std::cell::OnceCell<bool>,
+    shared: std::cell::OnceCell<Option<StringParse>>,
+}
+
+/// The edited file with every planned replacement inserted unshifted, its
+/// parse, and where each replacement starts in that text. Moving lines that
+/// are outside strings never changes where a string starts or ends, so this
+/// parse holds for the shifted result too.
+struct StringParse {
+    text: String,
+    tree: tree_sitter::Tree,
+    replacement_starts: Vec<usize>,
+}
+
+impl<'a> ReindentPlan<'a> {
+    pub(crate) fn new(
+        source: &'a str,
+        needle: &'a str,
+        replacement: &'a str,
+        path: Option<&'a std::path::Path>,
+        matches: &'a [FuzzyMatch],
+    ) -> Self {
+        Self {
+            source,
+            needle,
+            replacement,
+            path,
+            matches,
+            source_has_delimiter: std::cell::OnceCell::new(),
+            shared: std::cell::OnceCell::new(),
+        }
+    }
+
+    pub(crate) fn source(&self) -> &'a str {
+        self.source
+    }
+
+    pub(crate) fn matched(&self, index: usize) -> &'a FuzzyMatch {
+        &self.matches[index]
+    }
+
+    /// The whole lines the match at `index` covers.
+    fn matched_text(&self, index: usize) -> &'a str {
+        let matched = &self.matches[index];
+        let start = self.source[..matched.byte_start]
+            .rfind('\n')
+            .map_or(0, |at| at + 1);
+        &self.source[start..matched.byte_start + matched.byte_len]
+    }
+
+    /// Insert the unshifted replacement at each listed match and parse once.
+    /// `None` when the parse fails.
+    fn parse_with_replacements(
+        &self,
+        lang: crate::parser::LangId,
+        indices: &[usize],
+    ) -> Option<StringParse> {
+        let path = self.path?;
+        let mut text =
+            String::with_capacity(self.source.len() + indices.len() * (self.replacement.len() + 1));
+        let mut replacement_starts = Vec::with_capacity(indices.len());
+        let mut copied_through = 0;
+        for &index in indices {
+            let matched = &self.matches[index];
+            let end = matched.byte_start + matched.byte_len;
+            text.push_str(&self.source[copied_through..matched.byte_start]);
+            replacement_starts.push(text.len());
+            text.push_str(self.replacement);
+            // The edit restores a line separator the match consumed.
+            if self.source[..end].ends_with('\n')
+                && !self.replacement.is_empty()
+                && !self.replacement.ends_with('\n')
+            {
+                text.push('\n');
+            }
+            copied_through = end;
+        }
+        text.push_str(&self.source[copied_through..]);
+        #[cfg(test)]
+        STRING_LINE_PARSES.with(|count| count.set(count.get() + 1));
+        let tree = crate::parser::parse_source_with_cached_parser(path, &text, lang).ok()?;
+        Some(StringParse {
+            text,
+            tree,
+            replacement_starts,
+        })
+    }
+
+    /// For each line of the replacement at match `index` (as split by
+    /// `split_inclusive('\n')`), whether it starts inside a multi-line string
+    /// literal that the replacement itself opens. Such a line is part of the
+    /// string's value and keeps the exact text the agent wrote.
+    ///
+    /// Refuses with `ambiguous_indentation` when a line continues a string
+    /// that opened before the edit (the agent's intended text for it is
+    /// unknowable), and when it cannot tell: the parse is broken around the
+    /// edit, or the language has no parser here, while string delimiters are
+    /// present.
+    fn lines_inside_new_strings(&self, index: usize) -> Result<Vec<bool>, crate::error::AftError> {
+        let pieces: Vec<&str> = self.replacement.split_inclusive('\n').collect();
+        let mut inside = vec![false; pieces.len()];
+        let Some(path) = self.path else {
+            return Ok(inside);
+        };
+        let matched_text = self.matched_text(index);
+        let Some(lang) = crate::parser::detect_language(path) else {
+            if has_multiline_string_marker(self.replacement)
+                || has_multiline_string_marker(matched_text)
+            {
+                return Err(ambiguous_indentation(
+                    "this file type has no parser here and newString or the matched lines may hold a multi-line string, whose text must not move".to_string(),
+                ));
+            }
+            return Ok(inside);
+        };
+        let local_delimiters =
+            has_string_delimiter(self.replacement) || has_string_delimiter(matched_text);
+        // A quote anywhere earlier in the file can open a string the match
+        // falls inside, so only a file with no delimiter at all is skipped.
+        let source_has_delimiter = *self
+            .source_has_delimiter
+            .get_or_init(|| has_string_delimiter(self.source));
+        if !local_delimiters && !source_has_delimiter {
+            return Ok(inside);
+        }
+        let unsure = || {
+            ambiguous_indentation(
+                "the code around the edit does not parse, so lines inside multi-line strings cannot be told apart from code".to_string(),
+            )
+        };
+        // Matches that overlap cannot all be inserted into one text; each is
+        // parsed alone (the edit is rejected for the overlap anyway).
+        let overlapping = self
+            .matches
+            .windows(2)
+            .any(|pair| pair[0].byte_start + pair[0].byte_len > pair[1].byte_start);
+        let single;
+        let (parse, slot) = if overlapping {
+            single = self.parse_with_replacements(lang, &[index]);
+            (single.as_ref(), 0)
+        } else {
+            let all: Vec<usize> = (0..self.matches.len()).collect();
+            let shared = self
+                .shared
+                .get_or_init(|| self.parse_with_replacements(lang, &all));
+            (shared.as_ref(), index)
+        };
+        let Some(parse) = parse else {
+            return if local_delimiters {
+                Err(unsure())
+            } else {
+                Ok(inside)
+            };
+        };
+        let replacement_start = parse.replacement_starts[slot];
+        let root = parse.tree.root_node();
+        if local_delimiters
+            && region_has_error(
+                root,
+                replacement_start,
+                replacement_start + self.replacement.len(),
+            )
+        {
+            return Err(unsure());
+        }
+        let mut offset = replacement_start;
+        for (line, piece) in pieces.iter().enumerate() {
+            let line_start = offset;
+            offset += piece.len();
+            // Only lines that begin at a line start can be shifted.
+            let at_line_start = line_start == 0 || parse.text.as_bytes()[line_start - 1] == b'\n';
+            if !at_line_start || piece.trim().is_empty() {
+                continue;
+            }
+            if let Some(string) = string_literal_at_line_start(root, line_start) {
+                if string.start_byte() < replacement_start {
+                    return Err(ambiguous_indentation(format!(
+                        "line {} of newString is inside a multi-line string that starts before the edit, and that string's intended text is unclear",
+                        line + 1
+                    )));
+                }
+                inside[line] = true;
+            }
+        }
+        Ok(inside)
+    }
+
+    /// The replacement for the match at `index`, with every line moved by
+    /// the match's [`indentation_shift`]. A loose match keeps the file's
+    /// indentation for the matched lines, so writing `newString` as given
+    /// would leave every line after the first at `oldString`'s wrong
+    /// indentation: in Python that is an IndentationError or code moved into
+    /// another block. Lines inside a multi-line string literal are left
+    /// exactly as written (see [`Self::lines_inside_new_strings`]).
+    pub(crate) fn replacement_for(
+        &self,
+        index: usize,
+    ) -> Result<std::borrow::Cow<'a, str>, crate::error::AftError> {
+        let matched = &self.matches[index];
+        let shift = indentation_shift(self.source, self.needle, matched)?;
+        if shift == IndentShift::None {
+            return Ok(std::borrow::Cow::Borrowed(self.replacement));
+        }
+        let in_string = self.lines_inside_new_strings(index)?;
+        let line_start = self.source[..matched.byte_start]
+            .rfind('\n')
+            .map_or(0, |at| at + 1);
+        let before_match = &self.source[line_start..matched.byte_start];
+        let mut shifted =
+            String::with_capacity(self.replacement.len() + self.replacement.len() / 4);
+        match shift {
+            IndentShift::None => unreachable!("handled above"),
+            IndentShift::Add(prefix) => {
+                // `boundary_match` trims the file's extra leading indentation
+                // from the match's start, leaving it in the file just before
+                // the match, so the first replacement line already follows it
+                // and only the later lines need it. That holds only when
+                // exactly the prefix precedes the match, which a blank first
+                // line can break.
+                if before_match != prefix {
+                    return Err(ambiguous_indentation(
+                        "its first line is blank, so the indentation of newString's first line is unclear"
+                            .to_string(),
+                    ));
+                }
+                for (line, piece) in self.replacement.split_inclusive('\n').enumerate() {
+                    if line > 0 && !piece.trim().is_empty() && !in_string[line] {
+                        shifted.push_str(&prefix);
+                    }
+                    shifted.push_str(piece);
+                }
+            }
+            IndentShift::Remove(prefix) => {
+                // A deeper oldString makes the match start at the beginning of
+                // its first line, so every replacement line loses the prefix.
+                if !before_match.is_empty() {
+                    return Err(ambiguous_indentation(
+                        "its first line is blank, so the indentation of newString's first line is unclear"
+                            .to_string(),
+                    ));
+                }
+                for (line, piece) in self.replacement.split_inclusive('\n').enumerate() {
+                    if piece.trim().is_empty() || in_string[line] {
+                        shifted.push_str(piece);
+                        continue;
+                    }
+                    let Some(rest) = piece.strip_prefix(prefix.as_str()) else {
+                        return Err(ambiguous_indentation(format!(
+                            "oldString is indented deeper than the file, and line {} of newString does not start with that extra indentation",
+                            line + 1
+                        )));
+                    };
+                    shifted.push_str(rest);
+                }
+            }
+        }
+        Ok(std::borrow::Cow::Owned(shifted))
+    }
+}
+
+/// [`ReindentPlan::replacement_for`] for a single match.
+#[cfg(test)]
 pub(crate) fn reindent_replacement<'r>(
-    source: &str,
-    needle: &str,
+    source: &'r str,
+    needle: &'r str,
     matched: &FuzzyMatch,
     replacement: &'r str,
-    path: Option<&std::path::Path>,
+    path: Option<&'r std::path::Path>,
 ) -> Result<std::borrow::Cow<'r, str>, crate::error::AftError> {
-    let shift = indentation_shift(source, needle, matched)?;
-    if shift == IndentShift::None {
-        return Ok(std::borrow::Cow::Borrowed(replacement));
-    }
-    let in_string = lines_inside_new_strings(source, matched, replacement, path)?;
-    let line_start = source[..matched.byte_start]
-        .rfind('\n')
-        .map_or(0, |at| at + 1);
-    let before_match = &source[line_start..matched.byte_start];
-    let mut shifted = String::with_capacity(replacement.len() + replacement.len() / 4);
-    match shift {
-        IndentShift::None => unreachable!("handled above"),
-        IndentShift::Add(prefix) => {
-            // `boundary_match` leaves the file's extra prefix on the first
-            // matched line outside the match, so the first replacement line
-            // already follows it and only the later lines need it. That holds
-            // only when exactly the prefix precedes the match, which a blank
-            // first line can break.
-            if before_match != prefix {
-                return Err(ambiguous_indentation(
-                    "its first line is blank, so the indentation of newString's first line is unclear"
-                        .to_string(),
-                ));
-            }
-            for (index, piece) in replacement.split_inclusive('\n').enumerate() {
-                if index > 0 && !piece.trim().is_empty() && !in_string[index] {
-                    shifted.push_str(&prefix);
-                }
-                shifted.push_str(piece);
-            }
-        }
-        IndentShift::Remove(prefix) => {
-            // A deeper oldString makes the match start at the beginning of
-            // its first line, so every replacement line loses the prefix.
-            if !before_match.is_empty() {
-                return Err(ambiguous_indentation(
-                    "its first line is blank, so the indentation of newString's first line is unclear"
-                        .to_string(),
-                ));
-            }
-            for (index, piece) in replacement.split_inclusive('\n').enumerate() {
-                if piece.trim().is_empty() || in_string[index] {
-                    shifted.push_str(piece);
-                    continue;
-                }
-                let Some(rest) = piece.strip_prefix(prefix.as_str()) else {
-                    return Err(ambiguous_indentation(format!(
-                        "oldString is indented deeper than the file, and line {} of newString does not start with that extra indentation",
-                        index + 1
-                    )));
-                };
-                shifted.push_str(rest);
-            }
-        }
-    }
-    Ok(std::borrow::Cow::Owned(shifted))
+    let matches = std::slice::from_ref(matched);
+    let plan = ReindentPlan::new(source, needle, replacement, path, matches);
+    plan.replacement_for(0)
+        .map(|text| std::borrow::Cow::Owned(text.into_owned()))
 }
 
 /// Final pass: windows of whole lines that hold the needle's text with line
