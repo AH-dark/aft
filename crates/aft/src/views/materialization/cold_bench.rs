@@ -29,6 +29,85 @@ fn disk_bytes(path: &Path) -> u64 {
         .sum()
 }
 
+struct StopSampler<'a>(&'a AtomicBool);
+
+impl Drop for StopSampler<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+fn sample_disk_during<T>(path: &Path, peak: &AtomicU64, build: impl FnOnce() -> T) -> T {
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        // Unwinding must stop sampling before the scope waits for its thread.
+        let _stop_on_drop = StopSampler(&stop);
+        scope.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                peak.fetch_max(disk_bytes(path), Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        build()
+    })
+}
+
+#[test]
+fn disk_sampler_panic_probe_child() {
+    let Some(root) = std::env::var_os("AFT_TEST_DISK_SAMPLER_PANIC") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let peak = AtomicU64::new(0);
+    let path = root.join("unpublished.sqlite");
+    let result = std::panic::catch_unwind(|| {
+        sample_disk_during(&path, &peak, || {
+            std::fs::write(root.join("materialization-started"), b"started").unwrap();
+            std::result::Result::<(), &str>::Err("injected materialization error").unwrap();
+        });
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn disk_sampler_stops_when_materialization_panics() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "views::materialization::tests::cold_bench::disk_sampler_panic_probe_child",
+            "--nocapture",
+        ])
+        .env("AFT_TEST_DISK_SAMPLER_PANIC", root.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            assert!(
+                root.path().join("materialization-started").exists(),
+                "probe never reached materialization"
+            );
+            panic!("disk sampler did not stop after the materialization panic");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(root.path().join("materialization-started").exists());
+}
+
 #[test]
 #[ignore = "offline 20k/60k cold-build I/O measurement, several GB of scratch storage"]
 fn measure_private_cold_build_io() {
@@ -69,18 +148,11 @@ fn measure_private_cold_build_io() {
             ("deferred_and_relaxed", (true, true)),
         ] {
             let path = dir.path().join(format!("{label}.sqlite"));
-            let stop = AtomicBool::new(false);
             let peak = AtomicU64::new(0);
             let before = written();
             let started = Instant::now();
             let mut materialize_ms = 0;
-            std::thread::scope(|scope| {
-                scope.spawn(|| {
-                    while !stop.load(Ordering::Relaxed) {
-                        peak.fetch_max(disk_bytes(&path), Ordering::Relaxed);
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                });
+            sample_disk_during(&path, &peak, || {
                 // WAL generations retain a schema-attached keeper through
                 // publication. Measure that latency separately from the
                 // eventual close/checkpoint.
@@ -105,7 +177,6 @@ fn measure_private_cold_build_io() {
                 materialize_ms = started.elapsed().as_millis();
                 drop(keeper);
                 peak.fetch_max(disk_bytes(&path), Ordering::Relaxed);
-                stop.store(true, Ordering::Relaxed);
             });
             let elapsed = started.elapsed();
             let after = written();
