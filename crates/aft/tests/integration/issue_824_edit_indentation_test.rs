@@ -146,7 +146,85 @@ fn issue_824_fuzzy_shallow_python_edit_never_leaves_invalid_file() {
     assert_no_failures(failures);
 }
 
-/// An exact edit that inserts an over-indented line produces a file Python
+/// The same edit lands at the file's indentation: every replacement line is
+/// shifted by the four spaces `oldString` was missing, not just the first.
+#[test]
+fn issue_824_fuzzy_shallow_python_edit_is_reindented() {
+    let mut failures = Vec::new();
+    for shape in SHAPES {
+        let run = run_edit(shape, "t.py", CASE1_BEFORE, CASE1_OLD, CASE1_NEW);
+        if run.after != CASE1_REINDENTED || run.reply["success"] != true {
+            failures.push(format!(
+                "{shape:?}: expected the re-indented file, got {:?}; reply: {:?}",
+                run.after, run.reply
+            ));
+        }
+    }
+    assert_no_failures(failures);
+}
+
+/// An `oldString` written one level too deep loses that level on every
+/// replacement line.
+#[test]
+fn issue_824_fuzzy_deep_python_edit_is_dedented() {
+    let before = "def f(x):\n    a = 1\n    return a\n";
+    let old = "        a = 1\n        return a";
+    let new = "        a = 1\n        if x:\n            a = 2\n        return a";
+    let expected = "def f(x):\n    a = 1\n    if x:\n        a = 2\n    return a\n";
+    let mut failures = Vec::new();
+    for shape in SHAPES {
+        let run = run_edit(shape, "t.py", before, old, new);
+        if run.after != expected {
+            failures.push(format!(
+                "{shape:?}: expected {expected:?}, got {:?}; reply: {:?}",
+                run.after, run.reply
+            ));
+        }
+    }
+    assert_no_failures(failures);
+}
+
+/// Indentation that differs in kind (tabs against spaces) or by different
+/// amounts on different lines has no single correct shift. The edit is
+/// refused with `ambiguous_indentation` and the file is left alone, in any
+/// language.
+#[test]
+fn issue_824_ambiguous_indentation_is_refused() {
+    let cases = [
+        (
+            "tabs against spaces",
+            "t.py",
+            "def f(x):\n\tif x:\n\t\ta = 1\n",
+            "if x:\n    a = 1",
+            "if x:\n    a = 2",
+        ),
+        (
+            "flattened block",
+            "t.ts",
+            CASE3_BEFORE,
+            "if (x) {\nconst a = 1;\nconst b = 2;\n}",
+            "if (x) {\nconst a = 10;\n}",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for shape in SHAPES {
+        for (label, name, before, old, new) in cases {
+            let run = run_edit(shape, name, before, old, new);
+            if run.reply["success"] != false
+                || run.reply["code"] != "ambiguous_indentation"
+                || run.after != before
+            {
+                failures.push(format!(
+                    "{shape:?} {label}: expected an ambiguous_indentation refusal, got {:?}; file {:?}",
+                    run.reply, run.after
+                ));
+            }
+        }
+    }
+    assert_no_failures(failures);
+}
+
+/// An exact edit that inserts an over-indented line produces a file CPython
 /// rejects with "unexpected indent". Syntax validation must roll it back, the
 /// same way it rolls back other invalid edits. A line indented with a tab
 /// where its block uses spaces (CPython's TabError) must roll back too.
@@ -214,11 +292,10 @@ fn issue_824_fuzzy_edit_reply_text_reports_fuzzy_match() {
     assert_no_failures(failures);
 }
 
-/// TypeScript stays valid at column 0, so this is a formatting complaint, not
-/// a broken file: the second replacement line lands at column 0. Re-indenting
-/// it is a behaviour change on a valid outcome.
+/// TypeScript stays valid at column 0, so this was a formatting complaint, not
+/// a broken file: the second replacement line landed at column 0. It now gets
+/// the file's indentation like every other shifted line.
 #[test]
-#[ignore = "issue #824 repro: fails until fuzzy matches re-indent the replacement"]
 fn issue_824_fuzzy_unindented_ts_edit_keeps_file_indentation() {
     let mut failures = Vec::new();
     for shape in SHAPES {

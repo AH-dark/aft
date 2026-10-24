@@ -444,6 +444,170 @@ pub fn replacement_detail(source: &str, needle: &str, matches: &[FuzzyMatch]) ->
     serde_json::json!({"pass": pass, "replaced_text": actual})
 }
 
+/// How a loose match's replacement has to move to sit at the file's
+/// indentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IndentShift {
+    /// The matched lines and `oldString` share their indentation.
+    None,
+    /// Every matched line carries this extra outer prefix that the
+    /// corresponding `oldString` line lacks (`oldString` was written too
+    /// shallow), so each replacement line gets it too.
+    Add(String),
+    /// Every `oldString` line carries this extra outer prefix that the
+    /// matched line lacks (`oldString` was written too deep), so each
+    /// replacement line loses it.
+    Remove(String),
+}
+
+fn leading_whitespace(line: &str) -> &str {
+    &line[..line.len() - line.trim_start().len()]
+}
+
+const COPY_EXACT_INDENTATION: &str =
+    "Nothing was changed; copy oldString with the file's exact indentation.";
+
+fn ambiguous_indentation(reason: String) -> crate::error::AftError {
+    crate::error::AftError::AmbiguousIndentation {
+        message: format!(
+            "oldString matched only after ignoring indentation, but {reason}, so newString cannot be re-indented without guessing. {COPY_EXACT_INDENTATION}"
+        ),
+    }
+}
+
+/// 1-based file line of the line that starts at `line_start`, plus `offset`.
+fn file_line(source: &str, line_start: usize, offset: usize) -> usize {
+    source[..line_start].matches('\n').count() + 1 + offset
+}
+
+/// The indentation shift for a match found by a pass that ignores leading
+/// whitespace (3: trimmed lines, 4: trimmed lines with Unicode punctuation
+/// normalised). Those passes pair each `oldString` line with one file line,
+/// so the difference in their leading whitespace is measurable. Other passes
+/// either keep leading whitespace exact (1, 2) or have no line pairing (5),
+/// and never shift.
+///
+/// Whitespace is compared as text, never converted between tabs and spaces:
+/// one leading-whitespace string must be the other plus an outer prefix, and
+/// that prefix must be the same on every non-blank line. Anything else is
+/// refused with `ambiguous_indentation`, because any shift would be a guess.
+pub(crate) fn indentation_shift(
+    source: &str,
+    needle: &str,
+    matched: &FuzzyMatch,
+) -> Result<IndentShift, crate::error::AftError> {
+    if !matches!(matched.pass, 3 | 4) {
+        return Ok(IndentShift::None);
+    }
+    let line_start = source[..matched.byte_start]
+        .rfind('\n')
+        .map_or(0, |at| at + 1);
+    let needle_lines: Vec<&str> = needle.lines().collect();
+    let source_lines = source[line_start..].lines().take(needle_lines.len());
+    let mut shift: Option<IndentShift> = None;
+    for (offset, (file_text, needle_text)) in source_lines.zip(&needle_lines).enumerate() {
+        // Lines matched after trimming are either both blank or both not.
+        if file_text.trim().is_empty() || needle_text.trim().is_empty() {
+            continue;
+        }
+        let (file_lead, needle_lead) = (
+            leading_whitespace(file_text),
+            leading_whitespace(needle_text),
+        );
+        let line_shift = if file_lead == needle_lead {
+            IndentShift::None
+        } else if let Some(prefix) = file_lead.strip_suffix(needle_lead) {
+            IndentShift::Add(prefix.to_string())
+        } else if let Some(prefix) = needle_lead.strip_suffix(file_lead) {
+            IndentShift::Remove(prefix.to_string())
+        } else {
+            return Err(ambiguous_indentation(format!(
+                "line {} of the file is indented with different whitespace (tabs versus spaces) than oldString",
+                file_line(source, line_start, offset)
+            )));
+        };
+        match &shift {
+            None => shift = Some(line_shift),
+            Some(expected) if *expected != line_shift => {
+                return Err(ambiguous_indentation(format!(
+                    "its indentation differs from the file's by different amounts on different lines (first at line {})",
+                    file_line(source, line_start, offset)
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(shift.unwrap_or(IndentShift::None))
+}
+
+/// The replacement for `matched`, with every line moved by the match's
+/// [`indentation_shift`]. A loose match keeps the file's indentation for the
+/// matched lines, so writing `newString` as given would leave every line
+/// after the first at `oldString`'s wrong indentation: in Python that is an
+/// IndentationError or code moved into another block.
+pub(crate) fn reindent_replacement<'r>(
+    source: &str,
+    needle: &str,
+    matched: &FuzzyMatch,
+    replacement: &'r str,
+) -> Result<std::borrow::Cow<'r, str>, crate::error::AftError> {
+    let shift = indentation_shift(source, needle, matched)?;
+    if shift == IndentShift::None {
+        return Ok(std::borrow::Cow::Borrowed(replacement));
+    }
+    let line_start = source[..matched.byte_start]
+        .rfind('\n')
+        .map_or(0, |at| at + 1);
+    let before_match = &source[line_start..matched.byte_start];
+    let mut shifted = String::with_capacity(replacement.len() + replacement.len() / 4);
+    match shift {
+        IndentShift::None => unreachable!("handled above"),
+        IndentShift::Add(prefix) => {
+            // `boundary_match` leaves the file's extra prefix on the first
+            // matched line outside the match, so the first replacement line
+            // already follows it and only the later lines need it. That holds
+            // only when exactly the prefix precedes the match, which a blank
+            // first line can break.
+            if before_match != prefix {
+                return Err(ambiguous_indentation(
+                    "its first line is blank, so the indentation of newString's first line is unclear"
+                        .to_string(),
+                ));
+            }
+            for (index, piece) in replacement.split_inclusive('\n').enumerate() {
+                if index > 0 && !piece.trim().is_empty() {
+                    shifted.push_str(&prefix);
+                }
+                shifted.push_str(piece);
+            }
+        }
+        IndentShift::Remove(prefix) => {
+            // A deeper oldString makes the match start at the beginning of
+            // its first line, so every replacement line loses the prefix.
+            if !before_match.is_empty() {
+                return Err(ambiguous_indentation(
+                    "its first line is blank, so the indentation of newString's first line is unclear"
+                        .to_string(),
+                ));
+            }
+            for (index, piece) in replacement.split_inclusive('\n').enumerate() {
+                if piece.trim().is_empty() {
+                    shifted.push_str(piece);
+                    continue;
+                }
+                let Some(rest) = piece.strip_prefix(prefix.as_str()) else {
+                    return Err(ambiguous_indentation(format!(
+                        "oldString is indented deeper than the file, and line {} of newString does not start with that extra indentation",
+                        index + 1
+                    )));
+                };
+                shifted.push_str(rest);
+            }
+        }
+    }
+    Ok(std::borrow::Cow::Owned(shifted))
+}
+
 /// Final pass: windows of whole lines that hold the needle's text with line
 /// breaks and spacing moved, as a formatter reflow does. A window matches
 /// when its text, with every whitespace run collapsed to one space and the
@@ -1145,5 +1309,131 @@ mod edit_not_found_detail_tests {
                 "unexpected hint for newString {new_string:?}: {detail}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod indentation_shift_tests {
+    use super::*;
+
+    /// Re-indent `replacement` for the only match of `needle` in `source`,
+    /// asserting the match came from `pass`.
+    fn reindent(source: &str, needle: &str, replacement: &str, pass: u8) -> Result<String, String> {
+        let matches = find_all_fuzzy(source, needle);
+        assert_eq!(matches.len(), 1, "{source:?} / {needle:?}");
+        assert_eq!(matches[0].pass, pass, "{source:?} / {needle:?}");
+        reindent_replacement(source, needle, &matches[0], replacement)
+            .map(|text| text.into_owned())
+            .map_err(|error| {
+                assert_eq!(error.code(), "ambiguous_indentation");
+                error.to_string()
+            })
+    }
+
+    const PY: &str = "def f(x):\n    if x:\n        a = 1\n        b = 2\n    return x\n";
+
+    #[test]
+    fn shallow_needle_shifts_every_later_replacement_line() {
+        // The first line already follows the file's prefix, which stays
+        // outside the match; every later non-blank line gets the prefix.
+        assert_eq!(
+            reindent(
+                PY,
+                "if x:\n    a = 1\n    b = 2",
+                "if x:\n    a = 10\n\n    b = 20",
+                3
+            )
+            .unwrap(),
+            "if x:\n        a = 10\n\n        b = 20"
+        );
+        // A one-line needle off by the same prefix shifts added lines too.
+        assert_eq!(
+            reindent(PY, "a = 1  ", "a = 1\nc = 3", 3).unwrap(),
+            "a = 1\n        c = 3"
+        );
+    }
+
+    #[test]
+    fn deep_needle_drops_the_extra_prefix_from_every_line() {
+        let source = "def f():\n    a = 1\n    b = 2\n";
+        assert_eq!(
+            reindent(
+                source,
+                "        a = 1\n        b = 2",
+                "        a = 10\n        if a:\n            b = 3\n",
+                3
+            )
+            .unwrap(),
+            "    a = 10\n    if a:\n        b = 3\n"
+        );
+    }
+
+    #[test]
+    fn tab_indented_file_shifts_by_tabs_and_keeps_crlf() {
+        let source = "def f(x):\r\n\tif x:\r\n\t\ta = 1\r\n";
+        assert_eq!(
+            reindent(source, "if x:\r\n\ta = 1", "if x:\r\n\ta = 2\r\n\tb = 3", 3).unwrap(),
+            "if x:\r\n\t\ta = 2\r\n\t\tb = 3"
+        );
+    }
+
+    #[test]
+    fn unicode_pass_shifts_like_the_trim_pass() {
+        let source = "    if x:\n        title = \u{201c}a\u{201d}\n";
+        assert_eq!(
+            reindent(
+                source,
+                "if x:\n    title = \"a\"",
+                "if x:\n    title = \"b\"",
+                4
+            )
+            .unwrap(),
+            "if x:\n        title = \"b\""
+        );
+    }
+
+    #[test]
+    fn passes_that_keep_or_lose_line_pairing_never_shift() {
+        // Pass 2 compares leading whitespace exactly.
+        assert_eq!(
+            reindent("    a = 1   \n", "    a = 1\t", "    a = 2\nb", 2).unwrap(),
+            "    a = 2\nb"
+        );
+        // Pass 5 has no line pairing to measure.
+        let reflow = "    call(a,\n         b)\n";
+        assert_eq!(
+            reindent(reflow, "call(a, b)", "call(a,\nb)", 5).unwrap(),
+            "call(a,\nb)"
+        );
+    }
+
+    #[test]
+    fn tabs_against_spaces_are_refused() {
+        let source = "\tif x:\n\t\ta = 1\n";
+        assert_eq!(
+            reindent(source, "if x:\n    a = 1", "if x:\n    a = 2", 3).unwrap_err(),
+            "oldString matched only after ignoring indentation, but line 2 of the file is indented with different whitespace (tabs versus spaces) than oldString, so newString cannot be re-indented without guessing. Nothing was changed; copy oldString with the file's exact indentation."
+        );
+    }
+
+    #[test]
+    fn different_offsets_on_different_lines_are_refused() {
+        // oldString was flattened: the file is 2 deeper on line 1 but 4
+        // deeper on line 2.
+        let source = "  if (x) {\n    a();\n  }\n";
+        assert_eq!(
+            reindent(source, "if (x) {\na();\n}", "if (x) {\nb();\n}", 3).unwrap_err(),
+            "oldString matched only after ignoring indentation, but its indentation differs from the file's by different amounts on different lines (first at line 2), so newString cannot be re-indented without guessing. Nothing was changed; copy oldString with the file's exact indentation."
+        );
+    }
+
+    #[test]
+    fn deep_needle_with_shallower_replacement_line_is_refused() {
+        let source = "def f():\n    a = 1\n";
+        let error = reindent(source, "        a = 1", "        a = 2\n  b = 3", 3).unwrap_err();
+        assert!(
+            error.contains("line 2 of newString does not start with that extra indentation"),
+            "{error}"
+        );
     }
 }

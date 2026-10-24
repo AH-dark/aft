@@ -469,11 +469,25 @@ fn resolve_edit_with_offsets(
 
         let fuzzy_matches = crate::fuzzy_match::find_all_fuzzy(source, match_str);
 
-        let effective_replacement = |m: &crate::fuzzy_match::FuzzyMatch| -> String {
-            let mut output = String::new();
-            super::edit_match::push_fuzzy_replacement(&mut output, source, m, replacement);
-            output
-        };
+        let effective_replacement =
+            |m: &crate::fuzzy_match::FuzzyMatch| -> Result<String, Response> {
+                let mut output = String::new();
+                super::edit_match::push_fuzzy_replacement(
+                    &mut output,
+                    source,
+                    m,
+                    match_str,
+                    replacement,
+                )
+                .map_err(|error| {
+                    Response::error(
+                        req_id,
+                        error.code(),
+                        format!("batch: edit[{}] {}", index, error),
+                    )
+                })?;
+                Ok(output)
+            };
 
         if fuzzy_matches.is_empty() {
             let message = format!(
@@ -495,21 +509,23 @@ fn resolve_edit_with_offsets(
         }
 
         if replace_all {
-            return Ok(fuzzy_matches
+            return fuzzy_matches
                 .iter()
-                .map(|m| ResolvedEdit {
-                    byte_start: m.byte_start,
-                    byte_end: m.byte_start + m.byte_len,
-                    replacement: effective_replacement(m),
-                    fuzzy_match: (m.pass > 1).then(|| {
-                        crate::fuzzy_match::replacement_detail(
-                            source,
-                            match_str,
-                            std::slice::from_ref(m),
-                        )
-                    }),
+                .map(|m| {
+                    Ok(ResolvedEdit {
+                        byte_start: m.byte_start,
+                        byte_end: m.byte_start + m.byte_len,
+                        replacement: effective_replacement(m)?,
+                        fuzzy_match: (m.pass > 1).then(|| {
+                            crate::fuzzy_match::replacement_detail(
+                                source,
+                                match_str,
+                                std::slice::from_ref(m),
+                            )
+                        }),
+                    })
                 })
-                .collect());
+                .collect();
         }
 
         if let Some(occ) = occurrence {
@@ -529,7 +545,7 @@ fn resolve_edit_with_offsets(
             return Ok(vec![ResolvedEdit {
                 byte_start: m.byte_start,
                 byte_end: m.byte_start + m.byte_len,
-                replacement: effective_replacement(m),
+                replacement: effective_replacement(m)?,
                 fuzzy_match: (m.pass > 1).then(|| {
                     crate::fuzzy_match::replacement_detail(
                         source,
@@ -577,7 +593,7 @@ fn resolve_edit_with_offsets(
         Ok(vec![ResolvedEdit {
             byte_start: m.byte_start,
             byte_end: m.byte_start + m.byte_len,
-            replacement: effective_replacement(m),
+            replacement: effective_replacement(m)?,
             fuzzy_match: (m.pass > 1).then(|| {
                 crate::fuzzy_match::replacement_detail(source, match_str, std::slice::from_ref(m))
             }),
