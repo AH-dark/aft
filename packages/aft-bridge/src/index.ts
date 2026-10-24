@@ -280,6 +280,7 @@ export {
   type GithubServerSpec,
   type Platform,
 } from "./lsp-github-table.js";
+export { lspNpmInstallInvocation, lspPublicationCutoff } from "./lsp-npm-policy.js";
 // --- which incoming messages interrupt a blocking bash wait ---
 export {
   BASH_WAIT_DETACH_MAGIC_KEYWORD,
@@ -311,7 +312,6 @@ export {
   type MigrationNoticeOptions,
   migrationNoticeStorePath,
 } from "./migration-notices.js";
-export { lspNpmInstallInvocation, lspPublicationCutoff } from "./lsp-npm-policy.js";
 // --- npm resolution (PATH-stripped GUI launch fallback) ---
 export type { NpmInvocation, ResolvedNpm } from "./npm-resolver.js";
 export {
