@@ -207,6 +207,9 @@ pub(crate) fn intra_thread_derivation() -> IntraThreadDerivation {
 /// not pay a model reload or wait behind a large indexing inference.
 pub struct LocalEmbedder {
     shared: Arc<Mutex<ResidentModel>>,
+    // Reload through the requesting root's connected cache, never an unrelated
+    // default directory after its shared build session has expired.
+    cache_dir: Option<PathBuf>,
     // A root's build/refresh handle keeps queries warm even after its idle
     // native build state unloads. Both sessions drop with their last lease.
     _query_keepalive: Option<Arc<Mutex<ResidentModel>>>,
@@ -261,11 +264,15 @@ impl ResidentModel {
 
 impl LocalEmbedder {
     pub fn new(model: &str) -> Result<Self, String> {
+        Self::with_cache_dir(model, None)
+    }
+
+    pub(crate) fn with_cache_dir(model: &str, cache_dir: Option<&Path>) -> Result<Self, String> {
         validate_model(model)?;
         // Initialize the query model before background work becomes available.
         // Its registry and inference lock never depend on the build session.
-        let query_keepalive = shared_model(model, InferenceRole::Query)?;
-        let shared = shared_model(model, InferenceRole::Build)?;
+        let query_keepalive = shared_model(model, InferenceRole::Query, cache_dir)?;
+        let shared = shared_model(model, InferenceRole::Build, cache_dir)?;
         MODEL_REAPER
             .get_or_init(|| {
                 std::thread::Builder::new()
@@ -296,14 +303,24 @@ impl LocalEmbedder {
             .map_err(Clone::clone)?;
         Ok(Self {
             shared,
+            cache_dir: cache_dir.map(Path::to_path_buf),
             _query_keepalive: Some(query_keepalive),
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn new_for_query(model: &str) -> Result<Self, String> {
+        Self::with_query_cache_dir(model, None)
+    }
+
+    pub(crate) fn with_query_cache_dir(
+        model: &str,
+        cache_dir: Option<&Path>,
+    ) -> Result<Self, String> {
         validate_model(model)?;
         Ok(Self {
-            shared: shared_model(model, InferenceRole::Query)?,
+            shared: shared_model(model, InferenceRole::Query, cache_dir)?,
+            cache_dir: cache_dir.map(Path::to_path_buf),
             _query_keepalive: None,
         })
     }
@@ -319,7 +336,11 @@ impl LocalEmbedder {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if resident.model.is_none() {
-            resident.model = Some(NativeEmbedder::new("all-MiniLM-L6-v2", resident.role)?);
+            resident.model = Some(NativeEmbedder::with_cache_dir(
+                "all-MiniLM-L6-v2",
+                resident.role,
+                self.cache_dir.as_deref(),
+            )?);
         }
         let result = resident.model.as_mut().unwrap().embed(texts);
         resident.last_used = Instant::now();
@@ -327,7 +348,11 @@ impl LocalEmbedder {
     }
 }
 
-fn shared_model(model: &str, role: InferenceRole) -> Result<Arc<Mutex<ResidentModel>>, String> {
+fn shared_model(
+    model: &str,
+    role: InferenceRole,
+    cache_dir: Option<&Path>,
+) -> Result<Arc<Mutex<ResidentModel>>, String> {
     let registry = match role {
         InferenceRole::Build => &BUILD_MODEL,
         InferenceRole::Query => &QUERY_MODEL,
@@ -339,7 +364,7 @@ fn shared_model(model: &str, role: InferenceRole) -> Result<Arc<Mutex<ResidentMo
         return Ok(shared);
     }
     let shared = Arc::new(Mutex::new(ResidentModel {
-        model: Some(NativeEmbedder::new(model, role)?),
+        model: Some(NativeEmbedder::with_cache_dir(model, role, cache_dir)?),
         last_used: Instant::now(),
         role,
     }));
@@ -365,16 +390,23 @@ struct NativeEmbedder {
     run_options: ManuallyDrop<RunOptions>,
     model_bytes: u64,
     role: InferenceRole,
+    #[cfg(test)]
+    model_path: PathBuf,
 }
 
 impl NativeEmbedder {
     /// Build the embedder for the named model. Only `all-MiniLM-L6-v2` is
     /// supported as the local backend (matches the prior fastembed surface).
+    #[cfg(test)]
     fn new(model: &str, role: InferenceRole) -> Result<Self, String> {
         Self::with_cache_dir(model, role, None)
     }
 
-    fn with_cache_dir(model: &str, role: InferenceRole, cache_dir: Option<&Path>) -> Result<Self, String> {
+    fn with_cache_dir(
+        model: &str,
+        role: InferenceRole,
+        cache_dir: Option<&Path>,
+    ) -> Result<Self, String> {
         validate_model(model)?;
 
         // Fail with an actionable message instead of letting ort panic deep
@@ -464,6 +496,8 @@ impl NativeEmbedder {
             run_options: ManuallyDrop::new(run_options),
             model_bytes,
             role,
+            #[cfg(test)]
+            model_path,
         })
     }
 
@@ -942,6 +976,88 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(super::session_memory().sessions, expected);
+    }
+
+    #[test]
+    #[ignore = "requires cached MiniLM and ONNX Runtime; exercises connected-cache reload and recovery"]
+    fn local_embedding_connected_cache_survives_idle_reload_and_volume_recovery() {
+        let _serial = native_test();
+        let (model, tokenizer) = super::resolve_model_files(None).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let volume = temp.path().join("cache-volume");
+        std::fs::create_dir(&volume).unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(temp.path().join("storage")),
+            cache_dir: Some(volume.clone()),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let models = config.semantic.local_cache_dir.clone().unwrap();
+        let snapshot = models.join("models--Qdrant--all-MiniLM-L6-v2-onnx/snapshots/fixture");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::copy(model, snapshot.join("model.onnx")).unwrap();
+        std::fs::copy(tokenizer, snapshot.join("tokenizer.json")).unwrap();
+
+        let mut query_model =
+            crate::semantic_index::SemanticEmbeddingModel::from_config_for_query(&config.semantic)
+                .unwrap();
+        let mut build_model =
+            crate::semantic_index::SemanticEmbeddingModel::from_config(&config.semantic).unwrap();
+        let build =
+            super::LocalEmbedder::with_cache_dir("all-MiniLM-L6-v2", Some(&models)).unwrap();
+        let query =
+            super::LocalEmbedder::with_query_cache_dir("all-MiniLM-L6-v2", Some(&models)).unwrap();
+        assert!(build
+            .shared
+            .lock()
+            .unwrap()
+            .model
+            .as_ref()
+            .unwrap()
+            .model_path
+            .starts_with(&models));
+        assert!(query
+            .shared
+            .lock()
+            .unwrap()
+            .model
+            .as_ref()
+            .unwrap()
+            .model_path
+            .starts_with(&models));
+        let corpus = vec!["connected cache model reload".to_string()];
+        let expected = bits(build_model.embed(corpus.clone()).unwrap());
+        assert_eq!(bits(query_model.embed(corpus.clone()).unwrap()), expected);
+        assert_eq!(super::session_memory().sessions, 2);
+        {
+            let mut resident = build.shared.lock().unwrap();
+            let expired = resident.last_used + super::MODEL_IDLE_TTL;
+            resident.release_if_idle(expired);
+        }
+        assert_eq!(super::session_memory().sessions, 1);
+        drop(config);
+        let disconnected = temp.path().join("disconnected-cache");
+        std::fs::rename(&volume, &disconnected).unwrap();
+        std::fs::create_dir(&volume).unwrap();
+
+        let error = build_model.embed(corpus.clone()).unwrap_err();
+        assert!(
+            error.contains(crate::root_cache::CACHE_DIR_UNAVAILABLE),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&volume).unwrap().count(),
+            0,
+            "reload wrote into the replacement volume"
+        );
+        assert_eq!(bits(query_model.embed(corpus.clone()).unwrap()), expected);
+
+        std::fs::remove_dir(&volume).unwrap();
+        std::fs::rename(&disconnected, &volume).unwrap();
+        assert_eq!(bits(build_model.embed(corpus).unwrap()), expected);
+        assert_eq!(super::session_memory().sessions, 2);
+        drop((query_model, build_model, query, build));
+        wait_for_sessions(0);
     }
 
     #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]

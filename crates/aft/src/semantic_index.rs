@@ -2965,7 +2965,9 @@ impl SemanticEmbeddingModel {
                 };
                 SemanticEmbeddingEngine::Local(LocalEmbeddingEngine::new(
                     Box::new(local),
-                    Some(Box::new(LocalEmbedder::with_query_cache_dir(&model, cache_dir)?)),
+                    Some(Box::new(LocalEmbedder::with_query_cache_dir(
+                        &model, cache_dir,
+                    )?)),
                     Arc::clone(&query_embedding_cache),
                 )?)
             }
