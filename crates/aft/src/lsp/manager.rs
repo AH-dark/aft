@@ -2599,9 +2599,10 @@ impl LspManager {
 
         for key in server_keys {
             // The server is about to hold text its pulled report may not
-            // describe. No push replaces a pulled report, so without this a
-            // scoped inspect would keep certifying it for a document that is
-            // open (see `sweep_scoped_files`).
+            // describe. A pull-only server publishes nothing after the
+            // change, so without this a scoped inspect would keep certifying
+            // the old report for a document that is open (see
+            // `sweep_scoped_files`).
             self.mark_pulled_report_stale(&key, &canonical_path);
             let current_version = self
                 .documents
