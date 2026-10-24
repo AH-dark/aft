@@ -66,7 +66,7 @@ fn measure_private_cold_build_io() {
             ("legacy", (false, false)),
             ("indexes_only", (false, true)),
             ("durability_only", (true, false)),
-            ("private", (true, true)),
+            ("deferred_and_relaxed", (true, true)),
         ] {
             let path = dir.path().join(format!("{label}.sqlite"));
             let stop = AtomicBool::new(false);

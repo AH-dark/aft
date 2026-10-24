@@ -1380,7 +1380,11 @@ impl FirstLoadDriver for CheckoutDriver {
                 .ok_or_else(|| SiblingLoader::error("publication committed twice"))?;
             store
                 .commit_v2(prepared, None)
-                .map(|_| ())
+                .map(|outcome| {
+                    if outcome == super::manifest_v2::PublishV2::Published {
+                        unpublished.complete();
+                    }
+                })
                 .map_err(|error| SiblingLoader::error(error.to_string()))
         };
         let fence = self

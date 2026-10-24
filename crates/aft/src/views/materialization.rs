@@ -290,9 +290,9 @@ fn materialize_reading(
     #[cfg(test)]
     let (relaxed, deferred_indexes) = tests::COLD_BUILD_MODE
         .get()
-        .unwrap_or((private_cold, private_cold));
+        .unwrap_or((private_cold, false));
     #[cfg(not(test))]
-    let (relaxed, deferred_indexes) = (private_cold, private_cold);
+    let relaxed = private_cold;
     let write_probe = profile::WriteProbe::start(database_path);
     let mut profile = profile::PhaseTimer::new(if base.is_some() {
         "incremental"
@@ -308,6 +308,27 @@ fn materialize_reading(
         },
         "views::materialization::materialize",
     )?;
+    // A private cold output may use DELETE mode. Do not change its header to
+    // WAL for an identical-manifest patch that promises to write nothing.
+    if let Some(base) = base.filter(|base| *base == manifest) {
+        let metadata = connection.query_row(
+            "SELECT (SELECT v FROM meta WHERE k = 'view_manifest_fingerprint'),
+                    (SELECT v FROM meta WHERE k = 'view_materialization_version')",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        );
+        if let Ok((Some(recorded), Some(version))) = metadata {
+            if recorded == fingerprint(base)? && version == MATERIALIZATION_VERSION {
+                profile.finish("load_bindings_select");
+                return Ok((MaterializeStats::default(), profile.into_timings()));
+            }
+        }
+    }
     if relaxed {
         configure_private_connection(&connection)?;
     } else {
@@ -321,6 +342,9 @@ fn materialize_reading(
     }
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Deferred index rebuilding increased physical disk writes in paired
+    // measurements. Production keeps indexes live; the benchmark compares both.
+    #[cfg(test)]
     if deferred_indexes {
         crate::callgraph_store::drop_cold_build_secondary_indexes(&transaction)?;
     }
@@ -1244,8 +1268,9 @@ fn materialize_reading(
         // A table with no emitted rows is still an observed zero, not a missing timer.
         profile.observe_empty(phase);
     }
-    // Rebuild cold indexes after the bulk graph load. Dispatch performs
-    // per-file ref and node lookups, so it needs those indexes already present.
+    // The offline deferred-index control rebuilds after the bulk graph load.
+    // Dispatch needs these indexes for its per-file ref and node lookups.
+    #[cfg(test)]
     if deferred_indexes {
         let phase = PhaseProbe::start(&transaction);
         crate::callgraph_store::create_cold_build_secondary_indexes(&transaction)?;

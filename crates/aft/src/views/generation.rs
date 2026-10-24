@@ -1018,10 +1018,17 @@ impl<'a> UnpublishedGenerations<'a> {
             self.names.push(generation.to_owned());
         }
     }
+
+    pub(super) fn complete(&mut self) {
+        self.names.clear();
+    }
 }
 
 impl Drop for UnpublishedGenerations<'_> {
     fn drop(&mut self) {
+        if self.names.is_empty() {
+            return;
+        }
         let cleanup = || -> Result<()> {
             let mut pointer = self.view.open_pointer_connection()?;
             let transaction =
@@ -1196,7 +1203,8 @@ mod tests {
             let root = PathBuf::from(&storage).join("project");
             fs::create_dir_all(&root).unwrap();
             let registry =
-                super::super::registry::FamilyRegistry::open(&storage, "crash-family").unwrap();
+                super::super::registry::FamilyRegistry::open(Path::new(&storage), "crash-family")
+                    .unwrap();
             registry
                 .register_view("crash-cleanup", &root)
                 .unwrap()
@@ -1236,8 +1244,75 @@ mod tests {
             b"interrupted journal",
         )
         .unwrap();
-        // Exit without running either SQLite or pin destructors.
-        std::process::exit(77);
+        let _relaxed_pin = crate::pins::AssemblyPin::create(
+            view.view_dir(),
+            "family",
+            "crash-cleanup",
+            "relaxed",
+            &[],
+        )
+        .unwrap();
+        let relaxed = view.derived_path("relaxed").unwrap();
+        let (manifest, payload) = crash_materialization_fixture();
+        crate::views::materialization::materialize_from_blob_reader(
+            &relaxed,
+            &manifest,
+            &CrashColdReader {
+                path: relaxed.clone(),
+                payload,
+                exit: true,
+            },
+        )
+        .unwrap();
+        panic!("the relaxed materializer did not reach the crash hook");
+    }
+
+    struct CrashColdReader {
+        path: PathBuf,
+        payload: Vec<u8>,
+        exit: bool,
+    }
+
+    impl crate::callgraph_store::join::ManifestBlobReader for CrashColdReader {
+        fn read_callgraph_blob(
+            &self,
+            _: &str,
+        ) -> std::result::Result<Option<Vec<u8>>, crate::callgraph_store::join::ManifestJoinError>
+        {
+            if self.exit {
+                assert!(fs::metadata(&self.path).unwrap().len() > 0);
+                assert_eq!(crate::db::file_identity::open_connections(&self.path), 1);
+                assert!(!PathBuf::from(format!("{}-wal", self.path.display())).exists());
+                // Kill the process inside the relaxed writer, without running
+                // SQLite, generation-owner or assembly-pin destructors.
+                std::process::exit(77);
+            }
+            Ok(Some(self.payload.clone()))
+        }
+    }
+
+    fn crash_materialization_fixture() -> (crate::views::Manifest, Vec<u8>) {
+        let payload = crate::callgraph_store::join::CallgraphBlob::extract(
+            "export function target() {}",
+            "typescript",
+            "fixture",
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+        let manifest = crate::views::Manifest::new([(
+            crate::views::RelPath::new(b"file.ts".to_vec()).unwrap(),
+            crate::views::ManifestEntry::Regular {
+                mode: 0o100644,
+                resolution_input: false,
+                planes: crate::views::RegularPlanes {
+                    semantic: None,
+                    callgraph: Some(blake3::hash(&payload).to_hex().to_string()),
+                },
+            },
+        )])
+        .unwrap();
+        (manifest, payload)
     }
 
     fn crash_restart(v2: bool) {
@@ -1260,7 +1335,7 @@ mod tests {
                 super::super::registry::FamilyRegistry::open(storage.path(), "crash-family")
                     .unwrap();
             registry
-                .register_view("crash-cleanup", storage.path().join("project"))
+                .register_view("crash-cleanup", &storage.path().join("project"))
                 .unwrap()
                 .view_store()
                 .unwrap()
@@ -1270,6 +1345,12 @@ mod tests {
         let path = view.derived_path("crashed").unwrap();
         assert_file_set_removed(&path);
         assert_file_set_removed(&view.derived_path("journal-only").unwrap());
+        let relaxed = view.derived_path("relaxed").unwrap();
+        assert_file_set_removed(&relaxed);
+        for generation in ["crashed", "relaxed"] {
+            let (metadata, keys) = crate::pins::pin_paths(view.view_dir(), generation);
+            assert!(!metadata.exists() && !keys.exists());
+        }
         let served = crate::db::file_identity::IdentityConnection::open(
             view.derived_path("served").unwrap(),
             "served-restart-test",
@@ -1282,6 +1363,19 @@ mod tests {
             42
         );
         drop(served);
+        let (manifest, payload) = crash_materialization_fixture();
+        crate::views::materialization::materialize_from_blob_reader(
+            &relaxed,
+            &manifest,
+            &CrashColdReader {
+                path: relaxed.clone(),
+                payload,
+                exit: false,
+            },
+        )
+        .unwrap();
+        assert!(relaxed.exists());
+        remove_unpublished_derived(&relaxed).unwrap();
         let connection =
             crate::db::file_identity::IdentityConnection::open(&path, "retry-test").unwrap();
         connection
