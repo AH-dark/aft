@@ -1571,7 +1571,27 @@ impl Drop for PublicationProfile {
             self.finish();
         }
         log_publication_profile(self);
+        #[cfg(test)]
+        PUBLICATION_OUTCOMES
+            .lock()
+            .entry(self.root.clone())
+            .or_default()
+            .push(self.outcome);
     }
+}
+
+#[cfg(test)]
+static PUBLICATION_OUTCOMES: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<PathBuf, Vec<&'static str>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+pub(crate) fn publication_outcomes_for_test(root: &Path) -> Vec<&'static str> {
+    PUBLICATION_OUTCOMES
+        .lock()
+        .get(root)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn log_publication_profile(profile: &PublicationProfile) {
