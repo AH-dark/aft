@@ -2598,6 +2598,12 @@ impl LspManager {
         let disk = DiskSnapshot::read(&canonical_path);
 
         for key in server_keys {
+            // The server is about to hold text its pulled report may not
+            // describe. A pull-only server publishes nothing after the
+            // change, so without this a scoped inspect would keep certifying
+            // the old report for a document that is open (see
+            // `sweep_scoped_files`).
+            self.mark_pulled_report_stale(&key, &canonical_path);
             let current_version = self
                 .documents
                 .get(&key)
@@ -2668,6 +2674,68 @@ impl LspManager {
         }
 
         Ok(versions)
+    }
+
+    /// Mark `key`'s stored report for `file` stale when it came from a
+    /// document pull. Pushed reports are left alone: their server publishes
+    /// again after the change and replaces them.
+    fn mark_pulled_report_stale(&mut self, key: &ServerKey, file: &Path) {
+        let pulled = self
+            .diagnostics
+            .entries_for_file(file)
+            .into_iter()
+            .any(|(stored_key, entry)| stored_key == key && entry.from_document_pull);
+        if pulled {
+            self.diagnostics.mark_stale_for_server_file(key, file);
+        }
+    }
+
+    /// Bring a document that is open in `server_keys` up to date with the file
+    /// on disk when it changed there since AFT last sent its text: a write by
+    /// another tool or a shell, which only the project watcher reports, and
+    /// nothing reports for a file outside the project. The current text goes
+    /// through the normal change notification, which also marks the
+    /// server's pulled report stale. Servers that do not have the document
+    /// open, or whose copy matches the disk, are left alone.
+    ///
+    /// On failure (the file cannot be read as text, or the server rejects
+    /// the change) the error is returned so the caller can report the file
+    /// as unknown; the drifted servers' reports are already marked stale.
+    pub(crate) fn resync_drifted_document(
+        &mut self,
+        file_path: &Path,
+        server_keys: &[ServerKey],
+    ) -> Result<(), LspError> {
+        let canonical_path = canonicalize_for_lsp(file_path)?;
+        let disk = DiskSnapshot::read(&canonical_path);
+        let drifted: Vec<ServerKey> = server_keys
+            .iter()
+            .filter(|key| {
+                self.clients.contains_key(*key)
+                    && self.documents.get(*key).is_some_and(|store| {
+                        store.is_open(&canonical_path)
+                            && store.is_stale_against(&canonical_path, &disk)
+                    })
+            })
+            .cloned()
+            .collect();
+        if drifted.is_empty() {
+            return Ok(());
+        }
+        // Every drifted server's report describes text the file no longer
+        // has, pushed or pulled, as when the project watcher sees the change
+        // (`mark_diagnostics_stale_for_file`). A push server publishes again
+        // after the change below; a pull server is asked again.
+        for key in &drifted {
+            self.diagnostics
+                .mark_stale_for_server_file(key, &canonical_path);
+        }
+        std::fs::read_to_string(&canonical_path)
+            .map_err(LspError::Io)
+            .and_then(|content| {
+                self.notify_file_changed_for_server_keys(canonical_path.clone(), &content, drifted)
+            })
+            .map(|_| ())
     }
 
     /// Send `didChange` for every open document whose file changed on disk
@@ -3204,9 +3272,12 @@ impl LspManager {
     /// Close documents a scoped inspect opened with
     /// [`Self::open_document_for_servers`]. The diagnostics collected while
     /// they were open stay in the store: they are the latest analysis of the
-    /// file, and a later external edit marks them stale through the watcher.
-    /// The server's reply to the close is ignored (see
-    /// `inspect_closed_documents`).
+    /// file. A later change makes them stale: an AFT edit marks a pulled
+    /// report stale when it sends the new text, the watcher marks every
+    /// report stale on an external edit inside the project, and the next
+    /// scoped inspect re-sends a document that changed on disk (see
+    /// [`Self::resync_drifted_document`]). The server's reply to the close is
+    /// ignored (see `inspect_closed_documents`).
     pub(crate) fn close_inspect_documents(
         &mut self,
         file_path: &Path,
@@ -5276,6 +5347,28 @@ impl LspManager {
         let normalized = normalize_lookup_path(file);
         self.diagnostics
             .has_fresh_report_for_server_file(server, &normalized)
+    }
+
+    /// True if this server/file pair has a current report that describes the
+    /// text the server now holds for the open document: a document pull
+    /// produced it, or a push carried the open document's version. An
+    /// unversioned push (a late clearing reply to an earlier close, for
+    /// example) proves neither.
+    pub(crate) fn has_report_for_open_document(&self, server: &ServerKey, file: &Path) -> bool {
+        let normalized = normalize_lookup_path(file);
+        let open_version = self
+            .documents
+            .get(server)
+            .and_then(|documents| documents.version(&normalized));
+        self.diagnostics
+            .entries_for_file(&normalized)
+            .into_iter()
+            .any(|(key, entry)| {
+                key == server
+                    && !entry.stale
+                    && (entry.from_document_pull
+                        || (entry.version.is_some() && entry.version == open_version))
+            })
     }
 
     /// True if any server has an authoritative report for this file: neither

@@ -6945,6 +6945,328 @@ fn scoped_typescript_sync_excluded_external_file_is_not_requested() {
         .all(|request| request["arguments"][1]["file"] == file_uri(&included)));
 }
 
+/// Serve TypeScript under `package_root` the way TypeScript 7 is served: a
+/// `node_modules/typescript` at version 7 selects the native compiler's own
+/// server (`tsc --lsp`), here the fake. That server only answers pull
+/// requests (it publishes nothing for an opened source file) and reports one
+/// error for each line of the text it was last sent that contains `BROKEN`.
+/// These tests disable the in-process file watcher, so no watcher event marks
+/// a stored report stale (outside the project none would arrive anyway).
+/// Call before `configured_context`, so the installation is seen.
+fn install_content_pull_native_typescript(package_root: &Path) -> ServerKind {
+    let package_dir = package_root.join("node_modules").join("typescript");
+    write_file(
+        &package_dir,
+        "package.json",
+        "{\"name\":\"typescript\",\"version\":\"7.0.0\"}\n",
+    );
+    ServerKind::TypeScriptNative(Arc::from(
+        crate::helpers::canonicalize_like_product(&package_dir).as_path(),
+    ))
+}
+
+fn configure_content_pull_typescript_lsp(ctx: &AppContext, native: ServerKind) {
+    ctx.lsp().override_binary(native, fake_server_path());
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_FROM_CONTENT", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_SERVER_NAME", "typescript-go");
+}
+
+const CONTENT_PULL_ERROR: &str = "BROKEN marker in synced text";
+
+/// `edit_match` dispatched as an OpenCode host's request is, so a file
+/// outside the project can be edited.
+fn edit_match_as_opencode(ctx: &AppContext, id: &str, file: &Path, from: &str, to: &str) {
+    let response = aft::access_policy::with_native_route(
+        request(json!({
+            "id": id, "command": "edit_match",
+            "file": file.display().to_string(), "match": from, "replacement": to,
+        })),
+        ctx,
+        |req, ctx| aft::commands::edit_match::handle_edit_match(&req, ctx),
+    );
+    assert!(response.success, "{response:?}");
+}
+
+/// Fail when `response` certifies diagnostics for `file` that do not describe
+/// its current text. A stale result marked incomplete is acceptable; one
+/// counted as authoritative is not.
+fn assert_not_certified_stale(response: &Value, file: &Path, expected_errors: u64) {
+    let messages = diagnostic_messages_for(response, &diagnostic_path(file));
+    let reported = messages
+        .iter()
+        .filter(|message| message.as_str() == CONTENT_PULL_ERROR)
+        .count() as u64;
+    if response["complete"] == false {
+        assert!(
+            uncovered_files(response)
+                .iter()
+                .any(|(gap, _)| gap == &diagnostic_path(file)),
+            "an incomplete result must name the file it could not certify: {response:#}"
+        );
+        return;
+    }
+    assert_eq!(
+        reported, expected_errors,
+        "diagnostics certified as authoritative must describe the file's current text: {response:#}"
+    );
+}
+
+/// A scoped inspect of a file outside the project pulled its
+/// diagnostics (and closed the document again); an AFT edit then fixed the
+/// error and reopened the document in the server. The pulled report stays in
+/// the store as current, and the next inspect reads an already-open document's
+/// stored report instead of asking again, so it certifies the fixed error as
+/// authoritative.
+#[test]
+fn scoped_inspect_outside_project_drops_an_error_fixed_by_an_aft_edit() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, file) = external_typescript_fixture();
+    fs::write(&file, "export const n: number = BROKEN;\n").unwrap();
+    let native = install_content_pull_native_typescript(&external_root);
+    let ctx = configured_context(&root);
+    configure_content_pull_typescript_lsp(&ctx, native.clone());
+
+    let before =
+        scoped_diagnostics_inspect_outside(&ctx, "fixed-outside-before", file.to_str().unwrap());
+    assert_eq!(before["complete"], true, "{before:#}");
+    assert_eq!(
+        diagnostic_messages_for(&before, &diagnostic_path(&file)),
+        vec![CONTENT_PULL_ERROR.to_string()],
+        "control: the first inspect reports the error: {before:#}"
+    );
+    assert!(
+        ctx.lsp()
+            .active_server_keys()
+            .iter()
+            .any(|key| key.kind == native),
+        "control: the native TypeScript server analyzed the file"
+    );
+
+    edit_match_as_opencode(&ctx, "fixed-outside-edit", &file, "BROKEN", "5");
+    let after =
+        scoped_diagnostics_inspect_outside(&ctx, "fixed-outside-after", file.to_str().unwrap());
+    assert_not_certified_stale(&after, &file, 0);
+}
+
+/// After the AFT edit left the document open, the file is changed again by a
+/// plain disk write (as a shell append would), which nothing reports to the
+/// server, so its analysis still describes the earlier text.
+#[test]
+fn scoped_inspect_outside_project_sees_a_disk_write_after_an_aft_edit() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, file) = external_typescript_fixture();
+    fs::write(&file, "export const n: number = 5;\n").unwrap();
+    let native = install_content_pull_native_typescript(&external_root);
+    let ctx = configured_context(&root);
+    configure_content_pull_typescript_lsp(&ctx, native.clone());
+
+    let before =
+        scoped_diagnostics_inspect_outside(&ctx, "append-outside-before", file.to_str().unwrap());
+    assert_eq!(before["complete"], true, "{before:#}");
+    assert!(
+        diagnostic_messages_for(&before, &diagnostic_path(&file)).is_empty(),
+        "control: the clean file is reported clean: {before:#}"
+    );
+    assert!(
+        ctx.lsp()
+            .active_server_keys()
+            .iter()
+            .any(|key| key.kind == native),
+        "control: the native TypeScript server analyzed the file"
+    );
+    edit_match_as_opencode(&ctx, "append-outside-edit", &file, "= 5", "= 6");
+    let edited =
+        scoped_diagnostics_inspect_outside(&ctx, "append-outside-edited", file.to_str().unwrap());
+    assert_not_certified_stale(&edited, &file, 0);
+
+    let mut appended = fs::read_to_string(&file).unwrap();
+    appended.push_str("export const m: number = BROKEN;\n");
+    fs::write(&file, appended).unwrap();
+    let after =
+        scoped_diagnostics_inspect_outside(&ctx, "append-outside-after", file.to_str().unwrap());
+    assert_not_certified_stale(&after, &file, 1);
+}
+
+/// The same sequence as the out-of-project edit, inside the project. In a
+/// running session the project watcher sees AFT's own write and marks the old
+/// analysis stale, which hides the defect; without that event (these tests run
+/// no watcher) the old analysis is certified exactly as outside the project.
+#[test]
+fn scoped_inspect_inside_project_drops_an_error_fixed_by_an_aft_edit_without_a_watcher_event() {
+    let (_temp, root, _broken) = external_typescript_fixture();
+    let file = crate::helpers::canonicalize_like_product(&write_file(
+        &root,
+        "a.ts",
+        "export const n: number = BROKEN;\n",
+    ));
+    let native = install_content_pull_native_typescript(&root);
+    let ctx = configured_context(&root);
+    configure_content_pull_typescript_lsp(&ctx, native.clone());
+
+    let before = scoped_diagnostics_inspect(&ctx, "fixed-inside-before", "a.ts");
+    assert_eq!(before["complete"], true, "{before:#}");
+    assert_eq!(
+        diagnostic_messages_for(&before, "a.ts"),
+        vec![CONTENT_PULL_ERROR.to_string()],
+        "control: the first inspect reports the error: {before:#}"
+    );
+    assert!(
+        ctx.lsp()
+            .active_server_keys()
+            .iter()
+            .any(|key| key.kind == native),
+        "control: the native TypeScript server analyzed the file"
+    );
+
+    let fix = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "fixed-inside-edit", "command": "edit_match",
+            "file": file.display().to_string(), "match": "BROKEN", "replacement": "5",
+        })),
+        &ctx,
+    );
+    assert!(fix.success, "{fix:?}");
+    let after = scoped_diagnostics_inspect(&ctx, "fixed-inside-after", "a.ts");
+    if after["complete"] == true {
+        assert!(
+            diagnostic_messages_for(&after, "a.ts").is_empty(),
+            "diagnostics certified as authoritative must describe the file's current text: {after:#}"
+        );
+    }
+}
+
+/// After an AFT edit left the document open, the file changed on disk to
+/// bytes that are not UTF-8 text, so AFT cannot send the server the current
+/// text. The server's analysis describes the older text, so the file must be
+/// reported unknown, with the reason, never certified.
+#[test]
+fn scoped_inspect_reports_a_file_unknown_when_its_changed_text_cannot_be_sent() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, file) = external_typescript_fixture();
+    fs::write(&file, "export const n: number = BROKEN;\n").unwrap();
+    let native = install_content_pull_native_typescript(&external_root);
+    let ctx = configured_context(&root);
+    configure_content_pull_typescript_lsp(&ctx, native.clone());
+
+    let before =
+        scoped_diagnostics_inspect_outside(&ctx, "unsendable-before", file.to_str().unwrap());
+    assert_eq!(
+        diagnostic_messages_for(&before, &diagnostic_path(&file)),
+        vec![CONTENT_PULL_ERROR.to_string()],
+        "control: the first inspect reports the error: {before:#}"
+    );
+    assert!(
+        ctx.lsp()
+            .active_server_keys()
+            .iter()
+            .any(|key| key.kind == native),
+        "control: the native TypeScript server analyzed the file"
+    );
+    edit_match_as_opencode(&ctx, "unsendable-edit", &file, "BROKEN", "5");
+    let edited =
+        scoped_diagnostics_inspect_outside(&ctx, "unsendable-edited", file.to_str().unwrap());
+    assert_eq!(edited["complete"], true, "control: {edited:#}");
+    assert!(
+        diagnostic_messages_for(&edited, &diagnostic_path(&file)).is_empty(),
+        "control: the fixed file is reported clean: {edited:#}"
+    );
+
+    fs::write(&file, b"export const n: number = BROKEN;\n// \xff\xfe\n").unwrap();
+    let after =
+        scoped_diagnostics_inspect_outside(&ctx, "unsendable-after", file.to_str().unwrap());
+    assert_eq!(after["complete"], false, "{after:#}");
+    let gaps = uncovered_files(&after);
+    // The full agent-visible reason, pinned word for word: the wording was
+    // approved as written, so any change to it must show up here.
+    assert!(
+        gaps.iter().any(|(gap, reason)| gap == &diagnostic_path(&file)
+            && reason
+                == "changed on disk since the server last analyzed it, and AFT could not send it the current text; retry aft_inspect"),
+        "the file must be named unknown with the reason: {after:#}"
+    );
+    assert!(
+        diagnostic_messages_for(&after, &diagnostic_path(&file)).is_empty(),
+        "no analysis of the older text may be reported: {after:#}"
+    );
+}
+
+/// A server that answers pulls and clears a closed document's diagnostics
+/// with an empty, unversioned `publishDiagnostics` sent the clear late: after
+/// an AFT edit had already reopened the document. That push says nothing
+/// about the open text (which still has the error), so a scoped inspect must
+/// ask the server again rather than certify the file clean from it.
+#[test]
+fn scoped_inspect_asks_a_pull_server_again_after_a_late_clearing_push() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, file) = external_typescript_fixture();
+    fs::write(
+        &file,
+        "export const n: number = BROKEN;\nexport const other = 1;\n",
+    )
+    .unwrap();
+    let native = install_content_pull_native_typescript(&external_root);
+    let ctx = configured_context(&root);
+    configure_content_pull_typescript_lsp(&ctx, native.clone());
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_CONTENT_CLEARS_ON_CLOSE", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_CLOSE_DELAY_MS", "500");
+
+    let before =
+        scoped_diagnostics_inspect_outside(&ctx, "late-clear-before", file.to_str().unwrap());
+    assert_eq!(
+        diagnostic_messages_for(&before, &diagnostic_path(&file)),
+        vec![CONTENT_PULL_ERROR.to_string()],
+        "control: the first inspect reports the error: {before:#}"
+    );
+    assert!(
+        ctx.lsp()
+            .active_server_keys()
+            .iter()
+            .any(|key| key.kind == native),
+        "control: the native TypeScript server analyzed the file"
+    );
+    // An edit that keeps the error reopens the document before the server's
+    // delayed reply to the inspect's close arrives.
+    edit_match_as_opencode(&ctx, "late-clear-edit", &file, "other = 1", "other = 2");
+
+    // Control: the late clearing push reached the store as a current,
+    // pushed (not pulled), empty report for the file.
+    let canonical = crate::helpers::canonicalize_like_product(&file);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut lsp = ctx.lsp();
+        lsp.drain_events();
+        let landed = lsp
+            .diagnostics_store_for_test()
+            .entries_for_file(&canonical)
+            .into_iter()
+            .any(|(key, entry)| {
+                key.kind == native
+                    && !entry.stale
+                    && !entry.from_document_pull
+                    && entry.diagnostics.is_empty()
+            });
+        drop(lsp);
+        if landed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "control: the late clearing push never reached the store"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let after =
+        scoped_diagnostics_inspect_outside(&ctx, "late-clear-after", file.to_str().unwrap());
+    assert_not_certified_stale(&after, &file, 1);
+}
+
 /// The reporter's scenario: the server reported on file Y only, so a scoped
 /// call for file X must return `complete: false` naming X — never an
 /// empty-clean result. The second half is the mutation control: forcing the

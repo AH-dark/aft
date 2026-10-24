@@ -606,6 +606,11 @@ pub(crate) fn main() -> io::Result<()> {
     let mut diagnostic_registered = false;
     let mut open_documents: std::collections::BTreeMap<String, (Value, Value)> =
         std::collections::BTreeMap::new();
+    // The text the client last synced for each open document, so
+    // AFT_FAKE_LSP_PULL_FROM_CONTENT=1 can answer a pull from what the server
+    // was actually told, as a real language server does.
+    let mut document_texts: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     // Files the last emulated check found a compiler error in. Like
     // rust-analyzer, every later report for such a file still carries the
     // error until a new check runs.
@@ -878,7 +883,11 @@ pub(crate) fn main() -> io::Result<()> {
                         json!({
                             "capabilities": capabilities,
                             "serverInfo": {
-                                "name": "fake-lsp-server",
+                                // AFT_FAKE_LSP_SERVER_NAME=<name>: report another
+                                // server name, such as the native TypeScript
+                                // server's `typescript-go`.
+                                "name": std::env::var("AFT_FAKE_LSP_SERVER_NAME")
+                                    .unwrap_or_else(|_| "fake-lsp-server".into()),
                                 "version": "0.1.0",
                             }
                         }),
@@ -1225,6 +1234,40 @@ pub(crate) fn main() -> io::Result<()> {
                                 "resultId": "fake-result-1"
                             }),
                         )?;
+                    } else if std::env::var("AFT_FAKE_LSP_PULL_FROM_CONTENT").ok().as_deref()
+                        == Some("1")
+                    {
+                        // AFT_FAKE_LSP_PULL_FROM_CONTENT=1: report one error
+                        // for every line of the synced text that contains
+                        // `BROKEN`, so a test can tell an analysis of the
+                        // current text from one of an older text.
+                        let text = document_uri(&params)
+                            .as_str()
+                            .and_then(|uri| document_texts.get(uri))
+                            .cloned()
+                            .unwrap_or_default();
+                        let items = text
+                            .lines()
+                            .enumerate()
+                            .filter(|(_, line)| line.contains("BROKEN"))
+                            .map(|(line, _)| {
+                                json!({
+                                    "range": {
+                                        "start": { "line": line, "character": 0 },
+                                        "end": { "line": line, "character": 6 }
+                                    },
+                                    "severity": 1,
+                                    "code": "E0TEXT",
+                                    "source": "fake-lsp",
+                                    "message": "BROKEN marker in synced text"
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        write_response(
+                            &mut writer,
+                            id,
+                            json!({ "kind": "full", "items": items }),
+                        )?;
                     } else {
                         write_response(
                             &mut writer,
@@ -1452,6 +1495,15 @@ pub(crate) fn main() -> io::Result<()> {
                 "textDocument/didOpen" => {
                     let uri = document_uri(&params);
                     let version = document_version(&params);
+                    if let (Some(uri), Some(text)) = (
+                        uri.as_str(),
+                        params
+                            .as_ref()
+                            .and_then(|p| p.pointer("/textDocument/text"))
+                            .and_then(Value::as_str),
+                    ) {
+                        document_texts.insert(uri.to_string(), text.to_string());
+                    }
                     if dynamic_pull {
                         if let Some(uri) = uri.as_str() { open_documents.insert(uri.to_string(), (opened_diagnostics(), version.clone())); }
                         record_pull_event(&format!("open {uri}"))?;
@@ -1551,7 +1603,11 @@ pub(crate) fn main() -> io::Result<()> {
                             diagnostics,
                             version.clone(),
                         )?;
-                    } else {
+                    } else if std::env::var("AFT_FAKE_LSP_PULL_FROM_CONTENT").ok().as_deref()
+                        != Some("1")
+                    {
+                        // A pull-only server (`tsc --lsp`) publishes nothing
+                        // for an opened source file; the content mode models it.
                         write_publish_diagnostics(&mut writer, uri.clone(), json!([]))?;
                     }
                     if matches!(
@@ -1617,6 +1673,18 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                 }
                 "textDocument/didChange" => {
+                    if let (Some(uri), Some(text)) = (
+                        document_uri(&params).as_str(),
+                        params
+                            .as_ref()
+                            .and_then(|p| p.get("contentChanges"))
+                            .and_then(Value::as_array)
+                            .and_then(|changes| changes.last())
+                            .and_then(|change| change.get("text"))
+                            .and_then(Value::as_str),
+                    ) {
+                        document_texts.insert(uri.to_string(), text.to_string());
+                    }
                     if dynamic_pull && client_dynamic_pull {
                         let uri = document_uri(&params);
                         if let Some(uri) = uri.as_str() { open_documents.insert(uri.into(), (changed_diagnostics(), document_version(&params))); }
@@ -1689,6 +1757,7 @@ pub(crate) fn main() -> io::Result<()> {
                     let uri = document_uri(&params);
                     if let Some(uri) = uri.as_str() {
                         open_documents.remove(uri);
+                        document_texts.remove(uri);
                     }
                     write_custom_notification(
                         &mut writer,
@@ -1705,6 +1774,19 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                     // AFT_FAKE_LSP_CLOSE_PUBLISHES=1: answer the close with real
                     // diagnostics instead of the usual clearing empty list.
+                    // A pull-only server (AFT_FAKE_LSP_PULL_FROM_CONTENT=1, as
+                    // `tsc --lsp`) publishes nothing for a closed source file,
+                    // unless AFT_FAKE_LSP_PULL_CONTENT_CLEARS_ON_CLOSE=1 makes
+                    // it send the usual clearing empty list.
+                    if std::env::var("AFT_FAKE_LSP_PULL_FROM_CONTENT").ok().as_deref()
+                        == Some("1")
+                        && std::env::var("AFT_FAKE_LSP_PULL_CONTENT_CLEARS_ON_CLOSE")
+                            .ok()
+                            .as_deref()
+                            != Some("1")
+                    {
+                        continue;
+                    }
                     let close_diagnostics = if std::env::var("AFT_FAKE_LSP_CLOSE_PUBLISHES")
                         .ok()
                         .as_deref()
