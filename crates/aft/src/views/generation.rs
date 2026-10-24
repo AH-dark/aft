@@ -1002,8 +1002,8 @@ impl<'a> UnpublishedGenerations<'a> {
     }
 
     pub(super) fn track_new(&mut self, generation: &str) {
-        // Hash-named first loads can encounter an existing completed output.
-        // A failed rename must not delete a file this attempt did not create.
+        // First-load names include an owner and sequence, not just a content hash.
+        // Also avoid claiming any artifact already present at the private path.
         if !self
             .view
             .view_dir()

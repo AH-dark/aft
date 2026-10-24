@@ -793,4 +793,92 @@ mod tests {
         assert!(a.same_content(&b));
         assert_eq!(GenerationName::parse(&a.to_string()), Some(a));
     }
+
+    #[test]
+    fn registered_builder_name_probe_child() {
+        let Some(storage) = std::env::var_os("AFT_TEST_PRIVATE_BUILDER_STORAGE") else {
+            return;
+        };
+        let root = std::env::var_os("AFT_TEST_PRIVATE_BUILDER_ROOT").unwrap();
+        let registry = super::super::registry::FamilyRegistry::open(
+            Path::new(&storage),
+            "private-name-family",
+        )
+        .unwrap();
+        let owner = registry
+            .register_view("shared-view", Path::new(&root))
+            .unwrap();
+        let name = GenerationName::for_manifest(&manifest()).unwrap();
+        println!(
+            "PRIVATE_BUILDER={}",
+            serde_json::to_string(&(name.to_string(), owner.view_dir())).unwrap()
+        );
+    }
+
+    #[test]
+    fn registered_builders_keep_equal_manifest_generation_paths_private() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "private-name-family")
+                .unwrap();
+        let first = registry.register_view("shared-view", root.path()).unwrap();
+        let second = registry.register_view("shared-view", root.path()).unwrap();
+        assert_eq!(first.view_dir(), second.view_dir());
+        let view = first.view_store().unwrap();
+        let manifest = manifest();
+        let a = GenerationName::for_manifest(&manifest).unwrap();
+        let b = GenerationName::for_manifest(&manifest).unwrap();
+        let a_path = view.derived_path(&a.to_string()).unwrap();
+        let b_path = view.derived_path(&b.to_string()).unwrap();
+        assert!(!a_path.exists() && !b_path.exists());
+        assert!(a.same_content(&b));
+        assert_ne!(
+            a_path, b_path,
+            "same-process builders must not share a destination"
+        );
+
+        let spawn = || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "views::manifest_v2::tests::registered_builder_name_probe_child",
+                    "--nocapture",
+                ])
+                .env("AFT_TEST_PRIVATE_BUILDER_STORAGE", storage.path())
+                .env("AFT_TEST_PRIVATE_BUILDER_ROOT", root.path())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let children = [spawn(), spawn()];
+        let mut names = BTreeSet::from([a.to_string(), b.to_string()]);
+        for child in children {
+            let pid = child.id();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let record = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("PRIVATE_BUILDER="))
+                .unwrap();
+            let (name, view_dir): (String, std::path::PathBuf) =
+                serde_json::from_str(record).unwrap();
+            assert_eq!(view_dir, first.view_dir());
+            let parsed = GenerationName::parse(&name).unwrap();
+            assert_eq!(parsed.pid, pid);
+            assert!(a.same_content(&parsed));
+            assert!(!view.derived_path(&name).unwrap().exists());
+            assert!(
+                names.insert(name),
+                "different processes must not share a destination"
+            );
+        }
+        assert_eq!(names.len(), 4);
+    }
 }
