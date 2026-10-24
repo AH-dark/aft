@@ -795,13 +795,16 @@ pub struct ViewStore {
 }
 
 impl ViewStore {
+    pub(super) fn cache_key(storage: &Path, project_scope_key: &str) -> Result<PathBuf> {
+        validate_scope_key(project_scope_key)?;
+        Ok(storage.join("views").join(project_scope_key))
+    }
     /// Opens `<storage>/views/<project_scope_key>` and initializes its singleton
     /// pointer row under `BEGIN IMMEDIATE` so concurrent first opens agree.
     pub fn open(storage: impl AsRef<Path>, project_scope_key: &str) -> Result<Self> {
         crate::production_storage::refuse_write(storage.as_ref())
             .map_err(|error| ViewError::io_at("opening writable view", storage.as_ref(), error))?;
-        validate_scope_key(project_scope_key)?;
-        let view_dir = storage.as_ref().join("views").join(project_scope_key);
+        let view_dir = Self::cache_key(storage.as_ref(), project_scope_key)?;
         crate::private_storage::open_dir(storage.as_ref(), &view_dir)
             .map_err(|error| ViewError::io_at("creating directory", &view_dir, error))?;
         let store = Self { view_dir };

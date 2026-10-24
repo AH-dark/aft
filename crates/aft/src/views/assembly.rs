@@ -23,6 +23,16 @@ use super::{
 #[path = "manifest_incremental.rs"]
 mod manifest_incremental;
 
+pub(crate) use manifest_incremental::CacheLease;
+
+pub(crate) fn release_manifest_cache(view_dir: &Path) {
+    manifest_incremental::release_cache(view_dir);
+}
+
+pub(crate) fn try_release_manifest_cache(view_dir: &Path) -> bool {
+    manifest_incremental::try_release_cache(view_dir)
+}
+
 #[cfg(test)]
 #[path = "manifest_publication_bench.rs"]
 mod manifest_publication_bench;
@@ -34,6 +44,11 @@ pub(crate) fn full_verification_due(view_dir: &Path) -> bool {
 #[cfg(test)]
 pub(crate) fn expire_verification_for_test(view_dir: &Path) {
     manifest_incremental::expire_verification_for_test(view_dir);
+}
+
+#[cfg(test)]
+pub(crate) fn cache_contains_for_test(view_dir: &Path) -> bool {
+    manifest_incremental::cache_contains_for_test(view_dir)
 }
 
 #[derive(Clone, Debug)]
@@ -471,7 +486,7 @@ impl PreparedAssembly {
             self.accept_settlement();
         }
         if let Some((view, cached, verified)) = self.manifest_cache.take() {
-            manifest_incremental::remember(&view, cached, verified);
+            manifest_incremental::remember(&view, cached, verified, &self._verification);
         }
         self.profile.finish();
         Ok(AssemblyReport {
@@ -598,6 +613,13 @@ pub fn prepare_checkout_deferring(
     defer_derived: bool,
     phase: &mut impl FnMut(&str) -> Result<()>,
 ) -> Result<PreparedAssembly> {
+    // Register before delays, callbacks or opening stores: lifecycle release
+    // must invalidate every preparation already admitted for this view.
+    let verification = manifest_incremental::begin_preparation(&ViewStore::cache_key(
+        &request.storage,
+        &request.scope,
+    )?);
+    let verification_due = verification.due;
     publication_delay_for_test();
     let readiness_deadline = Instant::now() + crate::db::STEADY_BUSY_TIMEOUT;
     let mut timing = super::profile::PublicationTiming::new(&request.project_root);
@@ -609,8 +631,6 @@ pub fn prepare_checkout_deferring(
     let mut profile = PublicationProfile::new(&request.project_root);
     profile.enter(0, phase)?;
     let view = ViewStore::open(&request.storage, &request.scope)?;
-    let verification = manifest_incremental::begin_preparation(&view);
-    let verification_due = verification.due;
     let current_generation = view.current_generation()?;
     let base_pin = current_generation
         .as_deref()

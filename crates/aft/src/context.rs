@@ -2355,11 +2355,13 @@ struct ViewRuntimeState {
     pin: Option<Arc<crate::pins::QueryPin>>,
     health: Arc<crate::path_status::health::Health>,
     health_cache: parking_lot::Mutex<Option<ViewHealthCache>>,
+    _manifest_cache: crate::views::assembly::CacheLease,
 }
 
 impl ViewRuntimeState {
     fn new(snapshot: ViewRuntimeSnapshot, pin: Option<Arc<crate::pins::QueryPin>>) -> Self {
         Self {
+            _manifest_cache: crate::views::assembly::CacheLease::new(&snapshot.view_dir),
             health: crate::path_status::health::Health::for_view(&snapshot.view_dir),
             snapshot,
             pin,
@@ -6359,6 +6361,7 @@ impl AppContext {
     pub(crate) fn mark_subc_unbound(&self) {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
+        self.release_view_publication_cache();
         crate::callgraph_store::retire_obsolete_callgraph_refresh_waiters();
         if let Some(root) = self.canonical_cache_root_opt() {
             crate::callgraph_store::close_refresh_connections(&root);
@@ -9232,11 +9235,20 @@ impl AppContext {
     ) {
         self.deleted_view_root_retired
             .store(false, Ordering::Release);
-        *self
+        let next_view_dir = snapshot.view_dir.clone();
+        let next = ViewRuntimeState::new(snapshot, pin.map(Arc::new));
+        let retired = self
             .view_runtime
             .write()
-            .unwrap_or_else(|error| error.into_inner()) =
-            Some(ViewRuntimeState::new(snapshot, pin.map(Arc::new)));
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(next);
+        if let Some(runtime) = retired
+            .as_ref()
+            .filter(|runtime| runtime.snapshot.view_dir != next_view_dir)
+        {
+            crate::views::assembly::release_manifest_cache(&runtime.snapshot.view_dir);
+        }
+        drop(retired);
     }
 
     /// A deleted checkout has no publication consumer. Retire once rather than
@@ -9270,6 +9282,7 @@ impl AppContext {
     }
 
     pub(crate) fn clear_view_runtime(&self) {
+        self.release_view_publication_cache();
         if let Some(root) = self.canonical_cache_root_opt() {
             crate::cold_build_limiter::progress::cancel_root(&root);
         }
@@ -9280,10 +9293,36 @@ impl AppContext {
             .checkout_query_runtime
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        *self
+        let retired = self
             .view_runtime
             .write()
-            .unwrap_or_else(|error| error.into_inner()) = None;
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        drop(retired);
+    }
+
+    fn release_view_publication_cache(&self) {
+        let view_dir = self
+            .view_runtime
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|runtime| runtime.snapshot.view_dir.clone());
+        if let Some(view_dir) = view_dir {
+            crate::views::assembly::release_manifest_cache(&view_dir);
+        }
+    }
+
+    fn try_release_view_publication_cache(&self) -> bool {
+        let Some(runtime) = try_read_unpoisoned(&self.view_runtime) else {
+            return false;
+        };
+        let view_dir = runtime
+            .as_ref()
+            .map(|runtime| runtime.snapshot.view_dir.clone());
+        drop(runtime);
+        view_dir
+            .is_none_or(|view_dir| crate::views::assembly::try_release_manifest_cache(&view_dir))
     }
 
     pub(crate) fn view_health_snapshot(&self) -> Option<ViewHealthSnapshot> {
@@ -13425,6 +13464,7 @@ impl AppContext {
         self.reset_symbol_cache();
         self.clear_tsconfig_membership_cache();
         self.backup.lock().release_memory();
+        self.release_view_publication_cache();
         true
     }
 
@@ -13591,6 +13631,11 @@ impl AppContext {
         let Some(mut refresh_worker) = self.semantic_refresh_worker.try_lock() else {
             return false;
         };
+        // Publication memoization can be discarded independently of resident
+        // artifact handles, including when the semantic lane remains busy.
+        if !self.try_release_view_publication_cache() {
+            return false;
+        }
         // Last, so a contended lane leaves every other handle in place too.
         if !self.try_release_idle_semantic_lane() {
             return false;

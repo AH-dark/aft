@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[cfg(test)]
 thread_local! {
@@ -115,14 +115,148 @@ pub(super) struct HeadRead {
     pub paths: Arc<OnceLock<HeadPaths>>,
 }
 
-#[derive(Default)]
 struct RootCache {
     previous: Option<CachedManifest>,
     head: Option<HeadSnapshot>,
+    verification: Arc<Mutex<VerificationState>>,
+    last_used: Instant,
+}
+
+#[derive(Debug, Default)]
+struct VerificationState {
     publications: u64,
     last_full: Option<Instant>,
     mismatch_pending: bool,
     active_preparations: usize,
+    owners: usize,
+    epoch: u64,
+}
+
+const MAX_ROOT_CACHES: usize = 16;
+
+fn verification_states() -> &'static Mutex<BTreeMap<PathBuf, Weak<Mutex<VerificationState>>>> {
+    static STATES: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Mutex<VerificationState>>>>> =
+        OnceLock::new();
+    STATES.get_or_init(Default::default)
+}
+
+fn state_for(view_dir: &Path) -> Arc<Mutex<VerificationState>> {
+    let mut states = verification_states()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    states.retain(|_, state| state.strong_count() > 0);
+    if let Some(state) = states.get(view_dir).and_then(Weak::upgrade) {
+        return state;
+    }
+    let state = Arc::new(Mutex::new(VerificationState::default()));
+    states.insert(view_dir.to_path_buf(), Arc::downgrade(&state));
+    state
+}
+
+/// The context owns lightweight verification deadlines independently of the
+/// bounded heavy cache, so LRU pressure cannot cause endless idle rebuilds.
+#[derive(Debug)]
+pub(crate) struct CacheLease {
+    view_dir: PathBuf,
+    state: Arc<Mutex<VerificationState>>,
+}
+
+impl CacheLease {
+    pub(crate) fn new(view_dir: &Path) -> Self {
+        let mut states = verification_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        states.retain(|_, state| state.strong_count() > 0);
+        let state = states
+            .get(view_dir)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let state = Arc::new(Mutex::new(VerificationState::default()));
+                states.insert(view_dir.to_path_buf(), Arc::downgrade(&state));
+                state
+            });
+        state.lock().unwrap_or_else(|e| e.into_inner()).owners += 1;
+        Self {
+            view_dir: view_dir.to_path_buf(),
+            state,
+        }
+    }
+}
+
+pub(super) fn release_cache(view_dir: &Path) {
+    let state = state_for(view_dir);
+    let retired = {
+        let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        state.epoch = state.epoch.wrapping_add(1);
+        caches.remove(view_dir)
+    };
+    drop(retired);
+}
+
+pub(super) fn try_release_cache(view_dir: &Path) -> bool {
+    let mut caches = match caches().try_lock() {
+        Ok(caches) => caches,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
+    let states = match verification_states().try_lock() {
+        Ok(states) => states,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
+    let state = states.get(view_dir).and_then(Weak::upgrade);
+    drop(states);
+    if let Some(state) = state {
+        let mut state = match state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        state.epoch = state.epoch.wrapping_add(1);
+    }
+    let retired = caches.remove(view_dir);
+    drop(caches);
+    drop(retired);
+    true
+}
+
+impl Drop for CacheLease {
+    fn drop(&mut self) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.owners = state.owners.saturating_sub(1);
+        }
+        let retired = {
+            let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.owners != 0 {
+                return;
+            }
+            state.epoch = state.epoch.wrapping_add(1);
+            if caches
+                .get(&self.view_dir)
+                .is_some_and(|cache| Arc::ptr_eq(&cache.verification, &self.state))
+            {
+                caches.remove(&self.view_dir)
+            } else {
+                None
+            }
+        };
+        drop(retired);
+        let mut states = verification_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.owners == 0
+            && state.active_preparations == 0
+            && states
+                .get(&self.view_dir)
+                .is_some_and(|weak| weak.ptr_eq(&Arc::downgrade(&self.state)))
+        {
+            states.remove(&self.view_dir);
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -157,27 +291,154 @@ fn caches() -> &'static Mutex<BTreeMap<PathBuf, RootCache>> {
     CACHES.get_or_init(Default::default)
 }
 
-pub(super) fn previous(view: &ViewStore, generation: Option<&str>) -> Option<CachedManifest> {
+#[cfg(test)]
+pub(super) fn cache_contains_for_test(view_dir: &Path) -> bool {
     caches()
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(view.view_dir())?
+        .unwrap()
+        .get(view_dir)
+        .is_some_and(|cache| cache.previous.is_some())
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct CacheMemoryEstimate {
+    pub payload_bytes: usize,
+    pub estimated_bytes: usize,
+    pub metadata_size: usize,
+    pub head_path_size: usize,
+    pub json_bytes: usize,
+    pub head_bytes: usize,
+    pub path_index_bytes: usize,
+}
+
+#[cfg(test)]
+pub(super) fn cache_memory_for_test(view_dir: &Path) -> CacheMemoryEstimate {
+    use std::mem::size_of;
+    let caches = caches().lock().unwrap();
+    let cache = &caches[view_dir];
+    let previous = cache.previous.as_ref().unwrap();
+    let mut manifest_dynamic = 0;
+    for (path, entry) in previous.manifest.entries() {
+        manifest_dynamic += path.0 .0.capacity();
+        manifest_dynamic += match entry {
+            ManifestEntry::Regular { planes, .. } => {
+                planes.semantic.as_ref().map_or(0, String::capacity)
+                    + planes.callgraph.as_ref().map_or(0, String::capacity)
+            }
+            ManifestEntry::Symlink { target_bytes } => target_bytes.0.capacity(),
+            ManifestEntry::Gitlink { oid } => oid.capacity(),
+            ManifestEntry::Synthetic { name, planes } => {
+                name.capacity() + planes.callgraph.capacity()
+            }
+        };
+    }
+    let json_bytes = previous
+        .manifest
+        .json
+        .get()
+        .map_or(0, |(_, bytes)| bytes.len());
+    let metadata_dynamic = previous.metadata.keys().map(Vec::capacity).sum::<usize>();
+    let manifest_inline =
+        previous.manifest.entries().count() * size_of::<(RelPath, ManifestEntry)>();
+    let metadata_inline = previous.metadata.len() * size_of::<(Vec<u8>, fs::Metadata)>();
+    let (head_bytes, path_index_bytes) = cache.head.as_ref().map_or((0, 0), |head| {
+        let head_bytes = head.entries.capacity() * size_of::<crate::alias::TrackedPath>()
+            + head
+                .entries
+                .iter()
+                .map(|entry| {
+                    entry.rel_path.capacity()
+                        + match &entry.mode {
+                            GitMode::Other(mode) => mode.capacity(),
+                            _ => 0,
+                        }
+                })
+                .sum::<usize>();
+        let index_bytes = head.paths.get().map_or(0, |paths| {
+            [&paths.members, &paths.directories]
+                .into_iter()
+                .map(|values| {
+                    values.capacity() * size_of::<Vec<u8>>()
+                        + values.iter().map(Vec::capacity).sum::<usize>()
+                })
+                .sum()
+        });
+        (head_bytes, index_bytes)
+    });
+    let payload_bytes = size_of::<RootCache>()
+        + manifest_dynamic
+        + manifest_inline
+        + metadata_dynamic
+        + metadata_inline
+        + json_bytes
+        + head_bytes
+        + path_index_bytes;
+    // Approximate B-tree spare slots at eight occupied keys per eleven-slot
+    // node, plus parent/child pointers. This is a retained-graph estimate, not RSS.
+    let estimated_bytes = payload_bytes
+        + (manifest_inline + metadata_inline) * 3 / 8
+        + (previous.manifest.entries().count() + previous.metadata.len()).div_ceil(8) * 112;
+    CacheMemoryEstimate {
+        payload_bytes,
+        estimated_bytes,
+        metadata_size: size_of::<fs::Metadata>(),
+        head_path_size: size_of::<crate::alias::TrackedPath>(),
+        json_bytes,
+        head_bytes,
+        path_index_bytes,
+    }
+}
+
+pub(super) fn previous(view: &ViewStore, generation: Option<&str>) -> Option<CachedManifest> {
+    let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
+    let cache = caches.get_mut(view.view_dir())?;
+    cache.last_used = Instant::now();
+    cache
         .previous
         .as_ref()
         .filter(|cached| Some(cached.generation.as_str()) == generation)
         .cloned()
 }
 
-pub(super) fn remember(view: &ViewStore, cached: CachedManifest, full_verified: bool) {
+pub(super) fn remember(
+    view: &ViewStore,
+    cached: CachedManifest,
+    full_verified: bool,
+    preparation: &PreparationVerification,
+) {
     let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
-    let cache = caches.entry(view.view_dir().to_path_buf()).or_default();
-    cache.head = cached.head.clone();
-    cache.previous = Some(cached);
-    if full_verified {
-        cache.publications = 0;
-        cache.last_full = Some(Instant::now());
-        cache.mismatch_pending = false;
+    let mut state = preparation.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.epoch != preparation.epoch {
+        return;
     }
+    let previous = caches.insert(
+        view.view_dir().to_path_buf(),
+        RootCache {
+            head: cached.head.clone(),
+            previous: Some(cached),
+            verification: preparation.state.clone(),
+            last_used: Instant::now(),
+        },
+    );
+    if full_verified {
+        state.publications = 0;
+        state.last_full = Some(Instant::now());
+        state.mismatch_pending = false;
+    }
+    drop(state);
+    let mut retired = Vec::new();
+    while caches.len() > MAX_ROOT_CACHES {
+        let oldest = caches
+            .iter()
+            .min_by_key(|(_, cache)| cache.last_used)
+            .map(|(key, _)| key.clone())
+            .unwrap();
+        retired.push(caches.remove(&oldest).unwrap());
+    }
+    drop(caches);
+    // Large maps and JSON buffers are destroyed outside the global cache lock.
+    drop((previous, retired));
 }
 
 /// Rescans also refresh attributes: check-attr reads the index, whose attributes
@@ -201,12 +462,14 @@ pub(super) fn head(request: &AssemblyRequest, view: &ViewStore) -> Result<HeadRe
             path.rsplit(|byte| *byte == b'/').next() == Some(b".gitattributes".as_slice())
         });
     if eligible {
-        if let Some(snapshot) = caches()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(view.view_dir())
-            .and_then(|cache| cache.head.clone())
-        {
+        let snapshot = {
+            let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
+            caches.get_mut(view.view_dir()).and_then(|cache| {
+                cache.last_used = Instant::now();
+                cache.head.clone()
+            })
+        };
+        if let Some(snapshot) = snapshot {
             if snapshot.tree == tree && Some(&snapshot.index) == index.as_ref() {
                 return Ok(HeadRead {
                     tree,
@@ -241,30 +504,27 @@ pub(super) fn head(request: &AssemblyRequest, view: &ViewStore) -> Result<HeadRe
 }
 
 pub(super) struct PreparationVerification {
-    view_dir: PathBuf,
+    state: Arc<Mutex<VerificationState>>,
+    epoch: u64,
     pub due: bool,
 }
 
 impl Drop for PreparationVerification {
     fn drop(&mut self) {
-        if let Some(cache) = caches()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(&self.view_dir)
-        {
-            cache.active_preparations = cache.active_preparations.saturating_sub(1);
-        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.active_preparations = state.active_preparations.saturating_sub(1);
     }
 }
 
-pub(super) fn begin_preparation(view: &ViewStore) -> PreparationVerification {
-    let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
-    let cache = caches.entry(view.view_dir().to_path_buf()).or_default();
-    cache.publications = cache.publications.saturating_add(1);
-    cache.active_preparations += 1;
+pub(super) fn begin_preparation(view_dir: &Path) -> PreparationVerification {
+    let state = state_for(view_dir);
+    let mut verification = state.lock().unwrap_or_else(|e| e.into_inner());
+    verification.publications = verification.publications.saturating_add(1);
+    verification.active_preparations += 1;
     PreparationVerification {
-        view_dir: view.view_dir().to_path_buf(),
-        due: full_verification_required(cache, Instant::now()),
+        state: state.clone(),
+        epoch: verification.epoch,
+        due: full_verification_required(&verification, Instant::now()),
     }
 }
 
@@ -272,7 +532,7 @@ const FULL_VERIFICATION_INTERVAL: std::time::Duration = std::time::Duration::fro
 
 // Failed preparations leave both the count and deadline due. Only remembering
 // a successfully served full result (including an identical no-op) renews them.
-fn full_verification_required(cache: &RootCache, now: Instant) -> bool {
+fn full_verification_required(cache: &VerificationState, now: Instant) -> bool {
     cache.publications >= 64
         || cache
             .last_full
@@ -280,19 +540,26 @@ fn full_verification_required(cache: &RootCache, now: Instant) -> bool {
 }
 
 pub(super) fn full_verification_due(view_dir: &Path) -> bool {
-    let caches = match caches().try_lock() {
-        Ok(caches) => caches,
+    let states = match verification_states().try_lock() {
+        Ok(states) => states,
         Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return true,
     };
-    caches.get(view_dir).is_none_or(|cache| {
-        cache.active_preparations == 0 && full_verification_required(cache, Instant::now())
-    })
+    let Some(state) = states.get(view_dir).and_then(Weak::upgrade) else {
+        return true;
+    };
+    drop(states);
+    let state = match state.try_lock() {
+        Ok(state) => state,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return true,
+    };
+    state.active_preparations == 0 && full_verification_required(&state, Instant::now())
 }
 
 pub(super) fn note_mismatch(view: &ViewStore) -> Option<u64> {
-    let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
-    let cache = caches.entry(view.view_dir().to_path_buf()).or_default();
+    let state = state_for(view.view_dir());
+    let mut cache = state.lock().unwrap_or_else(|e| e.into_inner());
     if cache.mismatch_pending {
         return None;
     }
@@ -302,8 +569,8 @@ pub(super) fn note_mismatch(view: &ViewStore) -> Option<u64> {
 
 #[cfg(test)]
 pub(super) fn expire_verification_for_test(view_dir: &Path) {
-    let mut caches = caches().lock().unwrap();
-    let cache = caches.entry(view_dir.to_path_buf()).or_default();
+    let state = state_for(view_dir);
+    let mut cache = state.lock().unwrap();
     cache.last_full = Some(Instant::now() - FULL_VERIFICATION_INTERVAL);
 }
 
@@ -541,6 +808,127 @@ mod tests {
         assert_eq!(PATH_COMPARISONS.with(|stats| stats.get().0), 0);
     }
 
+    #[test]
+    fn views_root_cache_cap_releases_lru_payloads() {
+        let mut roots = Vec::new();
+        for _ in 0..16 {
+            roots.push(fixture());
+        }
+        let view =
+            |index: usize| ViewStore::open(roots[index].1.path(), &roots[index].2.scope).unwrap();
+        let first = view(0);
+        let second = view(1);
+        let weak = {
+            let caches = caches().lock().unwrap();
+            Arc::downgrade(
+                &caches
+                    .get(second.view_dir())
+                    .unwrap()
+                    .previous
+                    .as_ref()
+                    .unwrap()
+                    .metadata,
+            )
+        };
+        let generation = first.current_generation().unwrap().unwrap();
+        drop(previous(&first, Some(&generation)).unwrap());
+        roots.push(fixture());
+        assert!(
+            caches().lock().unwrap().len() <= 16,
+            "heavy root cache must remain bounded"
+        );
+        assert!(
+            cache_contains_for_test(first.view_dir()),
+            "recently used entry must survive LRU pressure"
+        );
+        assert!(!cache_contains_for_test(second.view_dir()));
+        assert!(
+            weak.upgrade().is_none(),
+            "eviction must release metadata, not just hide its key"
+        );
+        for _ in 0..48 {
+            roots.push(fixture());
+        }
+        assert!(caches().lock().unwrap().len() <= 16);
+    }
+
+    #[test]
+    fn views_lru_keeps_live_context_deadlines_and_release_rejects_old_preparations() {
+        let (project, storage, mut request) = fixture();
+        let view = ViewStore::open(storage.path(), &request.scope).unwrap();
+        let lease = CacheLease::new(view.view_dir());
+        let mut roots = Vec::new();
+        for _ in 0..20 {
+            roots.push(fixture());
+        }
+        assert!(!cache_contains_for_test(view.view_dir()));
+        assert!(
+            !full_verification_due(view.view_dir()),
+            "LRU pressure must not reset a live context's idle deadline"
+        );
+        fs::write(project.path().join("f0.rs"), "pub fn changed() {}\n").unwrap();
+        request.changed_paths.insert(b"f0.rs".to_vec());
+        let mut prepared = prepare_checkout_deferring(&request, true, &mut |_| Ok(())).unwrap();
+        release_cache(view.view_dir());
+        assert!(prepared.commit().unwrap().published);
+        assert!(
+            !cache_contains_for_test(view.view_dir()),
+            "a pre-release preparation must not resurrect the cache"
+        );
+        drop(prepared);
+        drop(lease);
+        assert!(full_verification_due(view.view_dir()));
+    }
+
+    #[test]
+    fn views_last_runtime_lease_releases_its_cache() {
+        let (_project, storage, request) = fixture();
+        let view = ViewStore::open(storage.path(), &request.scope).unwrap();
+        let first = CacheLease::new(view.view_dir());
+        let second = CacheLease::new(view.view_dir());
+        let weak = {
+            let caches = caches().lock().unwrap();
+            Arc::downgrade(
+                &caches
+                    .get(view.view_dir())
+                    .unwrap()
+                    .previous
+                    .as_ref()
+                    .unwrap()
+                    .metadata,
+            )
+        };
+        drop(first);
+        assert!(
+            cache_contains_for_test(view.view_dir()),
+            "another installed runtime still owns the root"
+        );
+        drop(second);
+        assert!(!cache_contains_for_test(view.view_dir()));
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn views_release_before_view_open_rejects_the_preparation() {
+        let (project, storage, mut request) = fixture();
+        let view = ViewStore::open(storage.path(), &request.scope).unwrap();
+        let _lease = CacheLease::new(view.view_dir());
+        fs::write(project.path().join("f0.rs"), "pub fn changed() {}\n").unwrap();
+        request.changed_paths.insert(b"f0.rs".to_vec());
+        let mut released = false;
+        let mut prepared = prepare_checkout_deferring(&request, true, &mut |phase| {
+            if phase == "manifest" && !released {
+                released = true;
+                release_cache(view.view_dir());
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(released);
+        assert!(prepared.commit().unwrap().published);
+        assert!(!cache_contains_for_test(view.view_dir()), "a release during preparation admission must not be consumed before its token is captured");
+    }
+
     fn git(root: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
             .current_dir(root)
@@ -764,12 +1152,7 @@ mod tests {
     fn views_incremental_periodic_verification_repairs_missed_change() {
         let (project, storage, mut request) = fixture();
         let view = ViewStore::open(storage.path(), &request.scope).unwrap();
-        caches()
-            .lock()
-            .unwrap()
-            .get_mut(view.view_dir())
-            .unwrap()
-            .publications = 63;
+        state_for(view.view_dir()).lock().unwrap().publications = 63;
         let before = VERIFICATION_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed);
         fs::write(project.path().join("f1.rs"), "pub fn missed() {}\n").unwrap();
         fs::write(project.path().join("f0.rs"), "pub fn notified() {}\n").unwrap();
@@ -785,12 +1168,7 @@ mod tests {
         for fail_after_compare in [false, true] {
             let (project, storage, mut request) = fixture();
             let view = ViewStore::open(storage.path(), &request.scope).unwrap();
-            caches()
-                .lock()
-                .unwrap()
-                .get_mut(view.view_dir())
-                .unwrap()
-                .publications = 63;
+            state_for(view.view_dir()).lock().unwrap().publications = 63;
             let before = VERIFICATION_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed);
             fs::write(project.path().join("f1.rs"), "pub fn missed() {}\n").unwrap();
             fs::write(project.path().join("f0.rs"), "pub fn notified() {}\n").unwrap();
@@ -846,15 +1224,15 @@ mod tests {
         let (project, storage, mut request) = fixture();
         let view = ViewStore::open(storage.path(), &request.scope).unwrap();
         {
-            let mut caches = caches().lock().unwrap();
-            let cache = caches.get_mut(view.view_dir()).unwrap();
+            let state = state_for(view.view_dir());
+            let cache = state.lock().unwrap();
             let verified = cache.last_full.unwrap();
             assert!(!full_verification_required(
-                cache,
+                &cache,
                 verified + std::time::Duration::from_secs(599)
             ));
             assert!(full_verification_required(
-                cache,
+                &cache,
                 verified + std::time::Duration::from_secs(600)
             ));
         }

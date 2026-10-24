@@ -114,5 +114,8 @@ fn bench_views_one_file_publication() {
                 publication_profile_line(&prepared.profile)
             );
         }
+        let view = ViewStore::open(&request.storage, &request.scope).unwrap();
+        let memory = manifest_incremental::cache_memory_for_test(view.view_dir());
+        println!("manifest_cache_memory files={files} payload_bytes={} estimated_bytes={} metadata_size={} head_path_size={} json_bytes={} head_bytes={} path_index_bytes={}", memory.payload_bytes, memory.estimated_bytes, memory.metadata_size, memory.head_path_size, memory.json_bytes, memory.head_bytes, memory.path_index_bytes);
     }
 }

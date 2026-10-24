@@ -1514,6 +1514,37 @@ fn publication_idle_full_verification_runs_without_a_watcher_event() {
 }
 
 #[test]
+fn publication_cache_is_released_on_quiesce_eviction_and_clear() {
+    for action in ["quiesce", "evict", "try_evict", "clear", "replace"] {
+        let fixture = Fixture::new();
+        let view_dir = fixture.view.view_dir();
+        assert!(crate::views::assembly::cache_contains_for_test(view_dir));
+        match action {
+            "quiesce" => fixture.ctx.mark_subc_unbound(),
+            "evict" => assert!(fixture.ctx.evict_idle_artifacts()),
+            "try_evict" => assert!(fixture.ctx.try_evict_idle_artifacts()),
+            "clear" => fixture.ctx.clear_view_runtime(),
+            "replace" => {
+                let mut snapshot = fixture.ctx.view_runtime_snapshot().unwrap();
+                let replacement =
+                    crate::views::ViewStore::open(fixture._storage.path(), "replacement").unwrap();
+                snapshot.scope = "replacement".into();
+                snapshot.view_dir = replacement.view_dir().to_path_buf();
+                snapshot.generation = None;
+                snapshot.manifest = None;
+                snapshot.query_pin = None;
+                fixture.ctx.install_view_runtime(snapshot, None);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !crate::views::assembly::cache_contains_for_test(view_dir),
+            "cache survived {action}"
+        );
+    }
+}
+
+#[test]
 fn publication_io_error_names_operation_and_path() {
     let fixture = Fixture::new();
     let path = fixture.project.path().join("tracked.rs");
