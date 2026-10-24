@@ -48,17 +48,15 @@ struct ThreadRecord {
     /// Windows.
     id: u64,
     name: Option<String>,
-    /// How the thread started, read from its stack (macOS only; other
-    /// platforms do not let a process read another thread's registers).
+    /// How the thread started: its stack entry on macOS, or its Win32 start
+    /// address and containing module on Windows. Not available on Linux.
     start: Option<String>,
-    /// A macOS workqueue thread, including one the kernel created ahead of
-    /// demand that has not run yet. The kernel starts these for libdispatch
-    /// and system frameworks (FSEvents, CoreFoundation, Security), and parks
-    /// and retires them on its own schedule. Every thread AFT starts itself
-    /// comes from `pthread_create` (`std::thread`, rayon, tokio), and AFT's
-    /// FSEvents streams run on its own named run-loop threads, so a
-    /// workqueue thread that outlives a root's teardown holds nothing of
-    /// that root.
+    /// An OS-managed pool thread: a macOS workqueue entry or a Windows
+    /// thread whose Win32 start address belongs to ntdll.dll. The OS starts,
+    /// parks and retires these workers independently of root teardown.
+    /// AFT's own threads start through pthread_create on macOS and an
+    /// executable-resident Rust trampoline on Windows; neither is excluded.
+    /// An unreadable start address is always counted as potentially owned.
     os_workqueue: bool,
 }
 
@@ -88,7 +86,7 @@ fn thread_ids() -> std::collections::HashSet<u64> {
 }
 
 /// The threads started since `baseline` was taken that a root could own, and
-/// separately the macOS workqueue threads started since then, which it
+/// separately the OS workqueue threads started since then, which it
 /// cannot (see [`ThreadRecord::os_workqueue`]). Comparing thread IDs, not
 /// counts, keeps threads the system starts or retires on its own from
 /// passing for, or hiding, a thread a root kept.
@@ -105,31 +103,81 @@ fn threads_started_since(
 }
 
 /// Give detached teardown threads (watcher and LSP reapers) time to exit:
-/// polls every 100 ms and returns the threads started since `baseline` once
-/// at most `at_most` of them could belong to a root, the set has not changed
-/// for five samples, or 10 seconds have passed. A settling heuristic, not
-/// proof that teardown finished.
+/// polls every 100 ms until no root-owned candidates remain or the existing
+/// 10-second deadline passes. An unchanged set is not completion: detached
+/// watcher joins can remain blocked for longer than five samples.
 fn settled_threads_started_since(
     baseline: &std::collections::HashSet<u64>,
-    at_most: usize,
 ) -> (Vec<ThreadRecord>, Vec<ThreadRecord>) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let ids = |threads: &[ThreadRecord]| threads.iter().map(|t| t.id).collect::<Vec<_>>();
-    let mut previous = threads_started_since(baseline);
-    let mut stable_samples = 0;
+    settle_thread_inventory(
+        || threads_started_since(baseline),
+        || std::thread::sleep(Duration::from_millis(100)),
+    )
+}
+
+fn settle_thread_inventory(
+    mut sample: impl FnMut() -> (Vec<ThreadRecord>, Vec<ThreadRecord>),
+    mut wait: impl FnMut(),
+) -> (Vec<ThreadRecord>, Vec<ThreadRecord>) {
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(10);
+    let mut previous = sample();
+    let mut pending = HashMap::new();
+    let mut exit_times = Vec::new();
     loop {
-        if previous.0.len() <= at_most || stable_samples >= 5 || Instant::now() >= deadline {
+        let current_ids: std::collections::HashSet<_> = previous.0.iter().map(|t| t.id).collect();
+        for thread in &previous.0 {
+            pending.insert(thread.id, thread.to_string());
+        }
+        pending.retain(|id, description| {
+            if current_ids.contains(id) {
+                true
+            } else {
+                let elapsed = started.elapsed().as_millis();
+                println!("retention: exited after {elapsed} ms: {description}");
+                exit_times.push(elapsed);
+                false
+            }
+        });
+        if previous.0.is_empty() || Instant::now() >= deadline {
+            if !exit_times.is_empty() {
+                exit_times.sort_unstable();
+                println!(
+                    "retention: observed_exits={} median_exit_ms={} max_exit_ms={}",
+                    exit_times.len(),
+                    (exit_times[(exit_times.len() - 1) / 2] + exit_times[exit_times.len() / 2]) / 2,
+                    exit_times.last().unwrap(),
+                );
+            }
             return previous;
         }
-        std::thread::sleep(Duration::from_millis(100));
-        let current = threads_started_since(baseline);
-        stable_samples = if ids(&current.0) == ids(&previous.0) {
-            stable_samples + 1
-        } else {
-            0
-        };
-        previous = current;
+        wait();
+        previous = sample();
     }
+}
+
+#[test]
+fn stable_thread_samples_are_not_teardown_completion() {
+    let mut samples = 0;
+    let (kept, _) = settle_thread_inventory(
+        || {
+            samples += 1;
+            let threads = if samples <= 8 {
+                vec![ThreadRecord {
+                    id: 42,
+                    name: Some("stable-set-probe".to_string()),
+                    start: None,
+                    os_workqueue: false,
+                }]
+            } else {
+                Vec::new()
+            };
+            (threads, Vec::new())
+        },
+        || {},
+    );
+    assert!(kept.is_empty(), "a plateau was mistaken for completion");
+    assert_eq!(samples, 9, "the census must observe the thread's exit");
 }
 
 /// A failure message line per thread.
@@ -182,13 +230,126 @@ mod thread_inventory {
         ids()
             .into_iter()
             .filter(|id| !baseline.contains(id))
-            .map(|id| ThreadRecord {
-                id,
-                name: None,
-                start: None,
-                os_workqueue: false,
+            .map(|id| {
+                let (start, os_workqueue) = win::describe_start(id as u32);
+                ThreadRecord {
+                    id,
+                    name: win::thread_name(id as u32),
+                    start,
+                    os_workqueue,
+                }
             })
             .collect()
+    }
+
+    #[cfg(windows)]
+    mod win {
+        use std::ffi::c_void;
+        use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HMODULE};
+        use windows_sys::Win32::System::Threading::{
+            GetThreadDescription, OpenThread, THREAD_QUERY_INFORMATION,
+        };
+
+        const THREAD_QUERY_SET_WIN32_START_ADDRESS: i32 = 9;
+        const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x00000002;
+        const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x00000004;
+
+        #[link(name = "ntdll")]
+        extern "system" {
+            fn NtQueryInformationThread(
+                thread: HANDLE,
+                information_class: i32,
+                information: *mut c_void,
+                information_length: u32,
+                return_length: *mut u32,
+            ) -> i32;
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetModuleHandleExW(flags: u32, address: *const u16, module: *mut HMODULE) -> i32;
+            fn GetModuleFileNameW(module: HMODULE, filename: *mut u16, size: u32) -> u32;
+        }
+
+        pub(super) fn thread_name(id: u32) -> Option<String> {
+            // SAFETY: query a thread in this process and close the owned handle.
+            let thread = unsafe { OpenThread(THREAD_QUERY_INFORMATION, 0, id) };
+            if thread.is_null() {
+                return None;
+            }
+            let mut name = std::ptr::null_mut();
+            // SAFETY: name is writable; a successful call allocates a NUL-
+            // terminated UTF-16 description, released with LocalFree below.
+            let status = unsafe { GetThreadDescription(thread, &mut name) };
+            unsafe { CloseHandle(thread) };
+            if status < 0 || name.is_null() {
+                return None;
+            }
+            let mut length = 0;
+            // SAFETY: the successful call returned a NUL-terminated string.
+            while unsafe { *name.add(length) } != 0 {
+                length += 1;
+            }
+            let description =
+                unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(name, length)) };
+            // SAFETY: GetThreadDescription allocated this buffer with LocalAlloc.
+            unsafe { LocalFree(name.cast()) };
+            (!description.is_empty()).then_some(description)
+        }
+
+        pub(super) fn describe_start(id: u32) -> (Option<String>, bool) {
+            // SAFETY: query only a thread in this process; its handle is closed
+            // after the query even if the thread exited since the snapshot.
+            let thread = unsafe { OpenThread(THREAD_QUERY_INFORMATION, 0, id) };
+            if thread.is_null() {
+                return (None, false);
+            }
+            let mut start: *mut c_void = std::ptr::null_mut();
+            // SAFETY: this information class writes one pointer into start.
+            let status = unsafe {
+                NtQueryInformationThread(
+                    thread,
+                    THREAD_QUERY_SET_WIN32_START_ADDRESS,
+                    (&mut start as *mut *mut c_void).cast(),
+                    std::mem::size_of_val(&start) as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            // SAFETY: OpenThread returned this owned handle.
+            unsafe { CloseHandle(thread) };
+            if status < 0 || start.is_null() {
+                return (None, false);
+            }
+
+            let mut module: HMODULE = std::ptr::null_mut();
+            // SAFETY: FROM_ADDRESS interprets start as an address, not a UTF-16
+            // string. UNCHANGED_REFCOUNT borrows the already-loaded module.
+            let found = unsafe {
+                GetModuleHandleExW(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                        | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    start.cast(),
+                    &mut module,
+                )
+            };
+            if found == 0 {
+                return (Some(format!("{start:p} (module unknown)")), false);
+            }
+            let mut path = vec![0u16; 32768];
+            // SAFETY: path is writable for the supplied length; module is a
+            // loaded module handle returned by GetModuleHandleExW.
+            let length = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) }
+                as usize;
+            if length == 0 || length >= path.len() {
+                return (Some(format!("{start:p} (module path unreadable)")), false);
+            }
+            let path = String::from_utf16_lossy(&path[..length]);
+            let name = path.rsplit('\\').next().unwrap_or(&path);
+            let description = format!("{name}+{:#x} ({start:p})", start as usize - module as usize);
+            // Only the native OS pool entry module is excluded. Rust's Win32
+            // thread start lives in the test executable, not in ntdll.dll.
+            (Some(description), name.eq_ignore_ascii_case("ntdll.dll"))
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -582,8 +743,13 @@ mod thread_inventory {
 }
 
 /// The kernel ID of the calling thread, as the thread inventory reports it.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn current_thread_id() -> u64 {
+    #[cfg(windows)]
+    {
+        // SAFETY: GetCurrentThreadId has no preconditions.
+        unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() as u64 }
+    }
     #[cfg(target_os = "linux")]
     {
         // SAFETY: gettid has no preconditions.
@@ -599,10 +765,10 @@ fn current_thread_id() -> u64 {
 }
 
 /// The retention checks name the threads a root kept. A thread started
-/// after the baseline must be listed with its ID and, on macOS, with the
-/// function it was spawned to run, even when it has no name; and it must not
+/// after the baseline must be listed with its ID and, on macOS or Windows,
+/// its start routine or module, even when it has no name; and it must not
 /// be mistaken for a system workqueue thread, which the checks leave out.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
 fn thread_inventory_lists_a_new_unnamed_thread_with_its_start_routine() {
     let baseline = thread_ids();
@@ -629,6 +795,13 @@ fn thread_inventory_lists_a_new_unnamed_thread_with_its_start_routine() {
         });
     let line = record.to_string();
     assert!(line.contains(&probe_id.to_string()), "{line}");
+    #[cfg(windows)]
+    {
+        let executable = std::env::current_exe().unwrap();
+        let module = executable.file_name().unwrap().to_string_lossy();
+        let start = record.start.as_deref().unwrap_or_default();
+        assert!(start.starts_with(module.as_ref()), "{line}");
+    }
     #[cfg(target_os = "macos")]
     {
         assert_eq!(record.name, None, "{line}");
@@ -697,6 +870,64 @@ fn thread_inventory_recognises_a_libdispatch_worker() {
         });
     let start = worker.start.as_deref().unwrap_or_default();
     assert!(start.starts_with("start_wqthread"), "{worker}");
+}
+
+/// Windows owns and may park native pool workers after the operation that
+/// requested them has finished. A real pool callback must be classified by
+/// its start module, without excluding Rust threads in the executable.
+#[cfg(windows)]
+#[test]
+fn thread_inventory_recognises_a_windows_pool_worker() {
+    use windows_sys::Win32::System::Threading::{QueueUserWorkItem, WT_EXECUTEDEFAULT};
+
+    type Handoff = (std::sync::mpsc::Sender<u64>, std::sync::mpsc::Receiver<()>);
+    unsafe extern "system" fn hold_worker(context: *mut std::ffi::c_void) -> u32 {
+        // SAFETY: QueueUserWorkItem received ownership of this Box<Handoff>.
+        let (id_tx, stop_rx) = *unsafe { Box::from_raw(context.cast::<Handoff>()) };
+        id_tx.send(current_thread_id()).unwrap();
+        let _ = stop_rx.recv();
+        0
+    }
+
+    let (id_tx, id_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let handoff: Box<Handoff> = Box::new((id_tx, stop_rx));
+    let context = Box::into_raw(handoff);
+    // SAFETY: the callback owns context until it returns; stop_tx keeps it
+    // blocked while the inventory reads its thread's start address.
+    let queued = unsafe { QueueUserWorkItem(Some(hold_worker), context.cast(), WT_EXECUTEDEFAULT) };
+    if queued == 0 {
+        // SAFETY: a failed submission did not transfer ownership.
+        unsafe { drop(Box::from_raw(context)) };
+        panic!(
+            "QueueUserWorkItem failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let worker_id = id_rx.recv().unwrap();
+    // An existing worker is just as useful as one started for this callback.
+    let mut baseline = thread_ids();
+    baseline.remove(&worker_id);
+    let (owned, os_workqueue) = threads_started_since(&baseline);
+    stop_tx.send(()).unwrap();
+
+    assert!(
+        !owned.iter().any(|thread| thread.id == worker_id),
+        "the Windows pool worker {worker_id} was counted as a thread a root could own:{}",
+        describe_threads(&owned)
+    );
+    let worker = os_workqueue
+        .iter()
+        .find(|thread| thread.id == worker_id)
+        .unwrap_or_else(|| {
+            panic!("the Windows pool worker {worker_id} is missing from the listing")
+        });
+    let start = worker.start.as_deref().unwrap_or_default();
+    assert!(
+        start.to_ascii_lowercase().starts_with("ntdll.dll+"),
+        "{worker}"
+    );
+    println!("Windows pool callback: {worker}");
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -807,8 +1038,7 @@ fn evicted_idle_roots_release_their_per_context_threads() {
     );
     assert_eq!(outcome.evicted, ROOTS, "every idle root is evicted");
 
-    let (kept_threads, os_workqueue_threads) =
-        settled_threads_started_since(&baseline_thread_ids, 1);
+    let (kept_threads, os_workqueue_threads) = settled_threads_started_since(&baseline_thread_ids);
     let evicted_threads = thread_total();
     let evicted_heap = heap_in_use();
     let live_contexts = weak_contexts
@@ -827,7 +1057,7 @@ fn evicted_idle_roots_release_their_per_context_threads() {
     assert!(
         kept_threads.len() <= 1,
         "idle-evicted roots kept {} thread(s) started after the baseline for {ROOTS} roots:{}\n\
-         (not counted: {} macOS workqueue thread(s), which no root owns:{})",
+         (not counted: {} OS workqueue thread(s), which no root owns:{})",
         kept_threads.len(),
         describe_threads(&kept_threads),
         os_workqueue_threads.len(),
@@ -1125,8 +1355,7 @@ fn evicted_worked_roots_keep_only_bookkeeping() {
         assert_eq!(ctx.symbol_cache().read().unwrap().len(), 0);
         assert!(!ctx.watcher_runtime_active());
     }
-    let (kept_threads, os_workqueue_threads) =
-        settled_threads_started_since(&baseline_thread_ids, 1);
+    let (kept_threads, os_workqueue_threads) = settled_threads_started_since(&baseline_thread_ids);
     let evicted_heap = settled_heap();
 
     // Drop the evicted contexts: the heap that leaves with them is what each
@@ -1158,7 +1387,7 @@ fn evicted_worked_roots_keep_only_bookkeeping() {
     assert!(
         kept_threads.len() <= 1,
         "{WORKED_ROOTS} evicted roots kept {} thread(s) started after the baseline:{}\n\
-         (not counted: {} macOS workqueue thread(s), which no root owns:{})",
+         (not counted: {} OS workqueue thread(s), which no root owns:{})",
         kept_threads.len(),
         describe_threads(&kept_threads),
         os_workqueue_threads.len(),
