@@ -139,6 +139,12 @@ fn allocate_past_cap(pty: bool, foreground: bool, aggregate: bool, require_kerne
                 {
                     assert_eq!(completion.status, BgTaskStatus::Failed);
                     assert_eq!(completion.status_reason.as_deref(), Some(reason.as_str()));
+                    if !pty {
+                        assert!(
+                            task.lock_state().unwrap().descendant_sampling_started,
+                            "memory stop bypassed the shared survivor check"
+                        );
+                    }
                     break;
                 }
                 assert!(Instant::now() < deadline, "no memory-cap completion result");
@@ -193,4 +199,59 @@ fn memory_limit_report_is_not_a_timeout() {
         policy.exceeded_reason(),
         "Command stopped: exceeded the 64 MiB memory cap (test enforcement)."
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_limit_terminal_accounting_failure_still_samples_and_notifies() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (id, task) = tests::insert_terminal_piped_task(&registry, &temp, "allocate", "", "", false);
+    let policy = super::super::memory_limit::MemoryPolicy {
+        mib: 64,
+        kind: "test enforcement".into(),
+        cgroup: None,
+    };
+    {
+        let mut state = task.lock_state().unwrap();
+        state.metadata.memory_policy = Some(policy.clone());
+        state.metadata.completion_delivered = false;
+    }
+    let mut monitor = super::super::memory_limit::Monitor::recover(policy.clone(), &id).unwrap();
+    monitor.force_exceeded_for_test();
+    registry
+        .inner
+        .memory_monitors
+        .lock()
+        .unwrap()
+        .insert(id, monitor);
+    registry.inner.completions.lock().unwrap().clear();
+    *task.terminal_notification_routed.lock().unwrap() = false;
+
+    // An unwritable metadata destination must not suppress an observed terminal result.
+    let original_metadata = std::fs::read(&task.paths.json).unwrap();
+    std::fs::remove_file(&task.paths.json).unwrap();
+    std::fs::create_dir(&task.paths.json).unwrap();
+    let result = registry.post_terminal_transition(&task, false);
+    assert!(
+        result.is_ok(),
+        "memory settlement blocked publication: {result:?}"
+    );
+    assert!(task.terminal_persist_dirty.load(Ordering::SeqCst));
+    assert!(task.lock_state().unwrap().descendant_sampling_started);
+    let completions = registry.pending_completions_for_session("session");
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].status, BgTaskStatus::Failed);
+    assert_eq!(
+        completions[0].status_reason.as_deref(),
+        Some(policy.exceeded_reason().as_str())
+    );
+
+    std::fs::remove_dir(&task.paths.json).unwrap();
+    std::fs::write(&task.paths.json, original_metadata).unwrap();
+    registry.retry_terminal_persist(&task).unwrap();
+    assert!(!task.terminal_persist_dirty.load(Ordering::SeqCst));
+    let persisted = super::super::persistence::read_task(&task.paths.json).unwrap();
+    assert_eq!(persisted.status, BgTaskStatus::Failed);
+    assert_eq!(persisted.status_reason, Some(policy.exceeded_reason()));
 }

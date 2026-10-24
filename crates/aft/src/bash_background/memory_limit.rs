@@ -173,6 +173,11 @@ impl Monitor {
         }
     }
 
+    #[cfg(all(test, unix))]
+    pub(super) fn force_exceeded_for_test(&mut self) {
+        self.exceeded = true;
+    }
+
     #[cfg(windows)]
     pub fn outcome_note(&self) -> Option<&'static str> {
         if self.exceeded {
@@ -577,6 +582,7 @@ mod macos_tests {
     #[test]
     fn memory_limit_macos_decodes_exact_three_process_group_and_measures_cost() {
         let first = std::process::Command::new("/bin/sleep")
+            .env_clear()
             .arg("20")
             .process_group(0)
             .spawn()
@@ -586,6 +592,7 @@ mod macos_tests {
         for _ in 0..2 {
             group.0.push(
                 std::process::Command::new("/bin/sleep")
+                    .env_clear()
                     .arg("20")
                     .process_group(pgid)
                     .spawn()

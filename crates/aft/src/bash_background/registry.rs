@@ -4069,14 +4069,14 @@ impl BgTaskRegistry {
             .pgid
             .or(state.metadata.child_pid.map(|pid| pid as i32))
             .unwrap_or(0);
+        let mut updated = false;
         if monitor.exceeded(pgid) {
             monitor.terminate();
             state
                 .metadata
                 .mark_terminal(BgTaskStatus::Failed, Some(137), Some(monitor.reason()));
             state.terminal_output_cache = None;
-            self.persist_task_locked(task, &state.metadata, &mut db)
-                .map_err(|error| error.to_string())?;
+            updated = true;
         }
         #[cfg(windows)]
         if let Some(note) = monitor
@@ -4084,8 +4084,20 @@ impl BgTaskRegistry {
             .filter(|_| state.metadata.exit_code != Some(0))
         {
             state.metadata.execution_note = Some(note.into());
-            self.persist_task_locked(task, &state.metadata, &mut db)
-                .map_err(|error| error.to_string())?;
+            updated = true;
+        }
+        if updated {
+            // Accounting refines an observed exit; failed storage must not skip
+            // the shared survivor check and completion publication.
+            task.terminal_persist_dirty.store(true, Ordering::SeqCst);
+            if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
+                crate::slog_warn!(
+                    "failed to persist terminal state for {}: {error}",
+                    task.task_id
+                );
+            } else {
+                task.terminal_persist_dirty.store(false, Ordering::SeqCst);
+            }
         }
         Ok(())
     }
