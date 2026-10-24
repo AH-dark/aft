@@ -443,6 +443,13 @@ mod linux {
 
 #[cfg(target_os = "linux")]
 fn group_bytes(pgid: i32) -> Option<u64> {
+    if pgid == 0
+        || (pgid > 0
+            && unsafe { libc::kill(-pgid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+    {
+        return Some(0);
+    }
     let mut sum = 0_u64;
     // Bound all work, not just matching members. Reaching the budget fails closed.
     for (index, entry) in std::fs::read_dir("/proc").ok()?.enumerate() {
@@ -483,25 +490,40 @@ fn group_pids(pgid: i32) -> Option<Vec<u32>> {
     extern "C" {
         fn proc_listpgrppids(group: u32, buffer: *mut c_void, size: c_int) -> c_int;
     }
-    let estimate = unsafe { proc_listpgrppids(pgid as u32, std::ptr::null_mut(), 0) };
-    if estimate <= 0 {
-        return None;
+    if pgid == 0 {
+        return Some(Vec::new());
+    }
+    group_pids_with(|buffer| {
+        let (pointer, size) = match buffer {
+            Some(buffer) => (
+                buffer.as_mut_ptr().cast(),
+                std::mem::size_of_val(buffer) as c_int,
+            ),
+            None => (std::ptr::null_mut(), 0),
+        };
+        unsafe { proc_listpgrppids(pgid as u32, pointer, size) }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn group_pids_with(mut read: impl FnMut(Option<&mut [u32]>) -> i32) -> Option<Vec<u32>> {
+    let estimate = read(None);
+    if estimate == 0 {
+        return Some(Vec::new());
+    }
+    if estimate < 0 {
+        return missing_group_after_error();
     }
     let mut capacity = (estimate as usize).clamp(16, PID_BUDGET);
     for _ in 0..3 {
         let mut pids = vec![0_u32; capacity];
-        let count = unsafe {
-            proc_listpgrppids(
-                pgid as u32,
-                pids.as_mut_ptr().cast(),
-                std::mem::size_of_val(pids.as_slice()) as c_int,
-            )
-        };
+        let count = read(Some(&mut pids));
         if count < 0 {
-            return None;
+            return missing_group_after_error();
         }
         if (count as usize) < capacity {
             pids.resize(count as usize, 0);
+            pids.retain(|pid| *pid != 0);
             return Some(pids);
         }
         if capacity == PID_BUDGET {
@@ -510,6 +532,11 @@ fn group_pids(pgid: i32) -> Option<Vec<u32>> {
         capacity = capacity.saturating_mul(2).min(PID_BUDGET);
     }
     None
+}
+
+#[cfg(target_os = "macos")]
+fn missing_group_after_error() -> Option<Vec<u32>> {
+    (std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)).then(Vec::new)
 }
 
 #[cfg(target_os = "macos")]
@@ -568,6 +595,35 @@ mod agent_text_tests {
 mod macos_tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn memory_limit_empty_group_has_zero_footprint() {
+        assert_eq!(group_pids(0), Some(Vec::new()));
+        assert_eq!(group_bytes(0), Some(0));
+    }
+
+    #[test]
+    fn memory_limit_zero_sizing_query_is_an_empty_group() {
+        assert_eq!(group_pids_with(|_| 0), Some(Vec::new()));
+    }
+
+    #[test]
+    fn memory_limit_disappeared_group_is_empty_but_scan_errors_are_not() {
+        let missing = group_pids_with(|_| {
+            unsafe {
+                *libc::__error() = libc::ESRCH;
+            }
+            -1
+        });
+        assert_eq!(missing, Some(Vec::new()));
+        let denied = group_pids_with(|_| {
+            unsafe {
+                *libc::__error() = libc::EACCES;
+            }
+            -1
+        });
+        assert_eq!(denied, None);
+    }
 
     struct Group(Vec<std::process::Child>);
     impl Drop for Group {

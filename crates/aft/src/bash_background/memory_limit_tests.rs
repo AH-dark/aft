@@ -201,6 +201,142 @@ fn memory_limit_report_is_not_a_timeout() {
     );
 }
 
+#[test]
+fn memory_limit_quick_piped_success_keeps_exit_zero() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    registry.set_memory_limit(Some(512));
+    registry
+        .inner
+        .watchdog_started
+        .store(true, Ordering::SeqCst);
+    let mut env = HashMap::new();
+    for key in ["PATH", "SystemRoot", "WINDIR", "USERPROFILE", "TEMP", "TMP"] {
+        if let Ok(value) = std::env::var(key) {
+            env.insert(key.into(), value);
+        }
+    }
+    #[cfg(unix)]
+    let (shell, shell_path) = (super::super::BashShell::Bash, PathBuf::from("/bin/sh"));
+    #[cfg(windows)]
+    let (shell, shell_path) = (
+        super::super::BashShell::Powershell,
+        PathBuf::from("pwsh.exe"),
+    );
+    let id = registry
+        .spawn_with_shell(
+            SpawnPlan::Unsandboxed,
+            "exit 0",
+            shell,
+            shell_path,
+            "quick-success".into(),
+            temp.path().into(),
+            env,
+            super::super::HardKill::After(Duration::from_secs(5)),
+            temp.path().into(),
+            4,
+            true,
+            false,
+            None,
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let snapshot = registry
+            .status(&id, "quick-success", None, None, 4096)
+            .unwrap();
+        if snapshot.info.status.is_terminal() {
+            assert_eq!(
+                snapshot.info.status,
+                BgTaskStatus::Completed,
+                "{snapshot:?}"
+            );
+            assert_eq!(snapshot.exit_code, Some(0), "{snapshot:?}");
+            assert!(snapshot.info.status_reason.is_none(), "{snapshot:?}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "successful piped task did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn memory_limit_fast_successful_pty_keeps_exit_zero() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    registry.set_memory_limit(Some(64));
+    // Observe the completed child before the first memory scan, without a timer race.
+    registry
+        .inner
+        .watchdog_started
+        .store(true, Ordering::SeqCst);
+    let id = registry
+        .spawn_pty_with_shell(
+            SpawnPlan::Unsandboxed,
+            "exit 0",
+            super::super::BashShell::Bash,
+            PathBuf::from("/bin/sh"),
+            "quick-success".into(),
+            temp.path().into(),
+            HashMap::new(),
+            super::super::HardKill::After(Duration::from_secs(5)),
+            temp.path().into(),
+            4,
+            true,
+            false,
+            None,
+            24,
+            80,
+        )
+        .unwrap();
+    let task = registry.task_for_test(&id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let exited = task.lock_state().is_ok_and(|state| {
+            matches!(&state.runtime,
+            TaskRuntime::Pty(Some(pty)) if pty.exit_observed.load(Ordering::SeqCst))
+        });
+        if exited && task.terminal_reader_done.load(Ordering::SeqCst) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "successful PTY child did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Model a reaped PTY whose process identity was cleared before completion is consumed.
+    {
+        let mut state = task.lock_state().unwrap();
+        state.metadata.child_pid = None;
+        state.metadata.pgid = None;
+    }
+    loop {
+        let snapshot = registry
+            .status(&id, "quick-success", None, None, 4096)
+            .unwrap();
+        if snapshot.info.status.is_terminal() {
+            assert_eq!(
+                snapshot.info.status,
+                BgTaskStatus::Completed,
+                "{snapshot:?}"
+            );
+            assert_eq!(snapshot.exit_code, Some(0), "{snapshot:?}");
+            assert!(snapshot.info.status_reason.is_none(), "{snapshot:?}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "successful PTY task did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn memory_limit_terminal_accounting_failure_still_samples_and_notifies() {
