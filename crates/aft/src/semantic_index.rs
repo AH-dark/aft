@@ -5067,7 +5067,9 @@ impl Clone for SemanticIndex {
             shared_base: self.shared_base.clone(),
             tombstones: self.tombstones.clone(),
             view_runs: self.view_runs.clone(),
-            dirty_paths: Arc::clone(&self.dirty_paths),
+            // Cloned payloads can mutate independently. Sharing their dirty set
+            // lets one writer erase changes that only the other payload holds.
+            dirty_paths: Arc::new(Mutex::new(self.dirty_paths_snapshot())),
             persistence: Arc::clone(&self.persistence),
             last_append_read_bytes: Arc::clone(&self.last_append_read_bytes),
             skipped_rows: self.skipped_rows,
@@ -5082,6 +5084,12 @@ impl Clone for SemanticIndex {
         clone.materialize_view_runs();
         clone
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PERSIST_DIRTY_SNAPSHOT_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6955,6 +6963,7 @@ impl SemanticIndex {
         let indexed_paths: Vec<PathBuf> = indexed_paths.into_iter().collect();
         let mut checks: Vec<Option<IndexedFileCheck>> = Vec::with_capacity(indexed_paths.len());
         let mut strict_verify_inputs: Vec<(usize, PathBuf, FileFreshness)> = Vec::new();
+        let mut skipped_verify_inputs = Vec::new();
 
         for indexed_path in indexed_paths {
             let check_index = checks.len();
@@ -6975,7 +6984,16 @@ impl SemanticIndex {
                 _ => None,
             };
             if let Some(freshness) = cached {
-                strict_verify_inputs.push((check_index, indexed_path, freshness));
+                // Oversized semantic files have deliberately empty rows and a
+                // zero hash. Equal stat metadata keeps that exclusion valid;
+                // indexable zero-hash files still require strict verification.
+                if freshness.size > MAX_SEMANTIC_FILE_BYTES
+                    && freshness.content_hash == cache_freshness::zero_hash()
+                {
+                    skipped_verify_inputs.push((check_index, indexed_path, freshness));
+                } else {
+                    strict_verify_inputs.push((check_index, indexed_path, freshness));
+                }
                 checks.push(None);
             } else {
                 checks.push(Some(IndexedFileCheck::MissingMetadata(indexed_path)));
@@ -6994,6 +7012,12 @@ impl SemanticIndex {
         for (check_index, path, verdict) in verified {
             checks[check_index] = Some(IndexedFileCheck::Verified(path, verdict));
         }
+        for (check_index, path, verdict) in cache_freshness::verify_files_bounded(
+            skipped_verify_inputs,
+            cache_freshness::VerifyStrategy::StatFirst,
+        ) {
+            checks[check_index] = Some(IndexedFileCheck::Verified(path, verdict));
+        }
 
         for check in checks {
             match check.expect("freshness check should be populated") {
@@ -7008,7 +7032,8 @@ impl SemanticIndex {
                     },
                 ) => {
                     self.file_mtimes.insert(path.clone(), new_mtime);
-                    self.file_sizes.insert(path, new_size);
+                    self.file_sizes.insert(path.clone(), new_size);
+                    self.extend_dirty_paths(std::iter::once(path));
                 }
                 IndexedFileCheck::Verified(
                     path,
@@ -7770,7 +7795,14 @@ impl SemanticIndex {
         let Some(cached) = self.recorded_file_freshness(file) else {
             return true;
         };
-        match cache_freshness::verify_file_strict(file, &cached) {
+        let verdict = if cached.size > MAX_SEMANTIC_FILE_BYTES
+            && cached.content_hash == cache_freshness::zero_hash()
+        {
+            cache_freshness::verify_file(file, &cached)
+        } else {
+            cache_freshness::verify_file_strict(file, &cached)
+        };
+        match verdict {
             FreshnessVerdict::HotFresh => false,
             FreshnessVerdict::ContentFresh { .. } => false,
             FreshnessVerdict::Stale | FreshnessVerdict::Deleted => true,
@@ -8477,6 +8509,13 @@ impl SemanticIndex {
                 }
             };
 
+            #[cfg(test)]
+            PERSIST_DIRTY_SNAPSHOT_PROBE.with(|probe| {
+                let callback = probe.borrow_mut().take();
+                if let Some(callback) = callback {
+                    callback();
+                }
+            });
             self.last_append_read_bytes
                 .store(layout.bytes_read, Ordering::Relaxed);
             if layout.torn_tail {
@@ -13773,6 +13812,117 @@ Connection: close
 
     fn test_project_root() -> PathBuf {
         std::env::current_dir().unwrap()
+    }
+
+    #[test]
+    fn audit10_oversized_semantic_refresh_stays_clean() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let file = project.path().join("large.rs");
+        fs::File::create(&file)
+            .unwrap()
+            .set_len(MAX_SEMANTIC_FILE_BYTES + 1)
+            .unwrap();
+        let mut index = build_test_index(project.path(), std::slice::from_ref(&file));
+        assert_eq!(index.len(), 0);
+        assert!(index.write_to_disk(storage.path(), "large"));
+        let summary = index
+            .refresh_stale_files(
+                project.path(),
+                std::slice::from_ref(&file),
+                &mut |_| -> Result<Vec<Vec<f32>>, String> {
+                    panic!("excluded files must not embed")
+                },
+                8,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert!(summary.is_noop());
+        assert!(!index.is_file_stale(&file));
+        assert!(index.dirty_paths_snapshot().unwrap().is_empty());
+        fs::write(&file, "pub fn now_indexable() {}\n").unwrap();
+        assert!(index.is_file_stale(&file));
+        let small = cache_freshness::collect(&file).unwrap();
+        index.file_mtimes.insert(file.clone(), small.mtime);
+        index.file_sizes.insert(file.clone(), small.size);
+        index
+            .file_hashes
+            .insert(file.clone(), cache_freshness::zero_hash());
+        assert!(index.is_file_stale(&file));
+    }
+
+    #[test]
+    fn audit10_contentfresh_metadata_survives_persistence() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let file = project.path().join("fresh.rs");
+        fs::write(&file, "pub fn fresh() {}\n").unwrap();
+        let mut index = build_test_index(project.path(), std::slice::from_ref(&file));
+        assert!(index.write_to_disk(storage.path(), "fresh"));
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        let summary = index
+            .refresh_stale_files(
+                project.path(),
+                std::slice::from_ref(&file),
+                &mut |_| -> Result<Vec<Vec<f32>>, String> {
+                    panic!("unchanged content must be reused")
+                },
+                8,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(summary.changed, 0);
+        assert!(index.write_to_disk(storage.path(), "fresh"));
+        let bytes = fs::read(storage.path().join("semantic/fresh/semantic.bin")).unwrap();
+        let restored = SemanticIndex::from_bytes(&bytes, project.path()).unwrap();
+        assert_eq!(restored.file_mtimes.get(&file), Some(&mtime));
+    }
+
+    #[test]
+    fn audit10_plain_clone_dirty_updates_survive_another_writer() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let files = (0..64)
+            .map(|i| project.path().join(format!("file_{i}.rs")))
+            .collect::<Vec<_>>();
+        for file in &files {
+            fs::write(file, "pub fn symbol() {}\n").unwrap();
+        }
+        let mut first = build_test_index(project.path(), &files);
+        assert!(first.write_to_disk(storage.path(), "overlap"));
+        let second = std::rc::Rc::new(std::cell::RefCell::new(first.clone()));
+        first
+            .file_mtimes
+            .insert(files[0].clone(), SystemTime::UNIX_EPOCH);
+        first.extend_dirty_paths(std::iter::once(files[0].clone()));
+        let second_at_snapshot = second.clone();
+        let path = files[1].clone();
+        let updated_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(50);
+        PERSIST_DIRTY_SNAPSHOT_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move || {
+                let mut second = second_at_snapshot.borrow_mut();
+                second.file_mtimes.insert(path.clone(), updated_mtime);
+                second.extend_dirty_paths(std::iter::once(path));
+            }));
+        });
+        assert!(first.write_to_disk(storage.path(), "overlap"));
+        assert_eq!(
+            second.borrow().file_mtimes.get(&files[1]),
+            Some(&updated_mtime)
+        );
+        assert!(first.last_append_read_bytes.load(Ordering::Relaxed) > 0);
+        assert!(second.borrow().write_to_disk(storage.path(), "overlap"));
+        let bytes = fs::read(storage.path().join("semantic/overlap/semantic.bin")).unwrap();
+        let restored = SemanticIndex::from_bytes(&bytes, project.path()).unwrap();
+        assert_eq!(restored.file_mtimes.get(&files[1]), Some(&updated_mtime));
+        let fork = first.fork_for_refresh();
+        assert!(!Arc::ptr_eq(&fork.dirty_paths, &first.dirty_paths));
     }
 
     #[test]
