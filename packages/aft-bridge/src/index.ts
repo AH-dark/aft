@@ -372,6 +372,7 @@ export type {
   AftRequestEnvelope,
   AftResponse,
   AftSuccessResponse,
+  BashChangedFiles,
   BashCompletedFrame,
   BgCompletion,
   ConfigureWarningFrame,

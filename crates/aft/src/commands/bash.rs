@@ -377,6 +377,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // optimization, so skip it and let native bash (which honors cwd) run the
     // command verbatim when the workdir differs from the project root.
     if !params.shell.is_powershell()
+        && ctx.config().bash.changed_files == crate::config::BashChangedFiles::Off
         && host_escalation.is_none()
         && remote.is_none()
         && params.env.is_empty()

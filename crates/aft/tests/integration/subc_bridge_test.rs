@@ -773,6 +773,7 @@ fn emit_test_status_burst(ctx: &AppContext, marker: &str, count: u64) {
 
 fn bash_completed_push(task_id: &str, session_id: &str) -> PushFrame {
     PushFrame::BashCompleted(BashCompletedFrame {
+        changed_files: None,
         frame_type: "bash_completed",
         task_id: task_id.to_string(),
         session_id: session_id.to_string(),

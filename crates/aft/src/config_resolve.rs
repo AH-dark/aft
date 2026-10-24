@@ -434,6 +434,7 @@ impl<'de> Deserialize<'de> for RawBash {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct RawBashFeatures {
+    pub changed_files: Option<crate::config::BashChangedFiles>,
     /// Runtime gate for bash execution. Absent means on.
     pub enabled: Option<bool>,
     pub rewrite: Option<bool>,
@@ -2037,6 +2038,9 @@ fn project_safe_bash(project: Option<RawBash>) -> Option<RawBash> {
     project.map(|bash| match bash {
         RawBash::Bool(enabled) => RawBash::Bool(enabled),
         RawBash::Features(mut features) => {
+            features.changed_files = features
+                .changed_files
+                .filter(|mode| *mode == crate::config::BashChangedFiles::Off);
             features.linux_scope = None;
             features.runon_enabled = None;
             features.env = None;
@@ -2077,6 +2081,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
             let base = expand_bash_for_merge(&base);
             let override_features = expand_bash_for_merge(&override_bash);
             Some(RawBash::Features(RawBashFeatures {
+                changed_files: override_features.changed_files.or(base.changed_files),
                 enabled: override_features.enabled.or(base.enabled),
                 rewrite: override_features.rewrite.or(base.rewrite),
                 compress: override_features.compress.or(base.compress),
@@ -2119,6 +2124,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
         // A boolean expands to its sub-features only. The runtime gate is left
         // unset so a later object tier decides it, matching the TypeScript merge.
         RawBash::Bool(enabled) => RawBashFeatures {
+            changed_files: None,
             enabled: None,
             rewrite: Some(*enabled),
             compress: Some(*enabled),
@@ -2398,6 +2404,11 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
         if sandbox.write_allow.is_some() {
             push_drop(dropped, "sandbox.write_allow", tier, USER_ONLY_REASON);
         }
+    }
+    if raw.bash.as_ref().is_some_and(
+        |bash| matches!(bash, RawBash::Features(features) if features.changed_files.is_some_and(|mode| mode != crate::config::BashChangedFiles::Off)),
+    ) {
+        push_drop(dropped, "bash.changed_files", tier, "a project config may only turn changed-file reporting off");
     }
     if raw.bash.as_ref().is_some_and(
         |bash| matches!(bash, RawBash::Features(features) if features.linux_scope.is_some()),
@@ -3008,6 +3019,7 @@ fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedBashConfig {
+    changed_files: crate::config::BashChangedFiles,
     enabled: bool,
     rewrite: bool,
     compress: bool,
@@ -3034,6 +3046,7 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut V
     // and merge the same config.
     let _plugin_only = bash.subagent_background;
     config.bash.enabled = bash.enabled;
+    config.bash.changed_files = bash.changed_files;
     config.bash.host_fallback = bash.host_fallback;
     config.bash.runon_enabled = bash.runon_enabled;
     config.bash.detach_on_user_message = bash.detach_on_user_message;
@@ -3104,6 +3117,9 @@ fn resolve_bash_config(
         .max(FOREGROUND_WAIT_WINDOW_MIN_MS);
 
     let base = ResolvedBashConfig {
+        changed_files: top_features
+            .and_then(|features| features.changed_files)
+            .unwrap_or_default(),
         enabled: false,
         rewrite: false,
         compress: false,

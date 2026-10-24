@@ -55,6 +55,11 @@ pub struct PermissionAskFrame {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BashCompletedFrame {
+    #[serde(
+        rename = "_bash_changed_files",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub changed_files: Option<crate::bash_changed_files::Report>,
     #[serde(rename = "type")]
     pub frame_type: &'static str,
     pub task_id: String,
@@ -349,6 +354,7 @@ impl BashCompletedFrame {
     ) -> Self {
         Self {
             frame_type: "bash_completed",
+            changed_files: None,
             task_id: task_id.into(),
             session_id: session_id.into(),
             status,

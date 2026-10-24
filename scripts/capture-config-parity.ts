@@ -920,6 +920,13 @@ const CASES: ParityCase[] = [
   // present, github.read wins over the gh_read alias.
   { name: "gh_read_alias_rejected", user: { gh_read: { enabled: false }, github: { read: true } } },
   { name: "bash_true", user: { bash: true } },
+  { name: "bash_changed_files_off", user: { bash: { changed_files: "off" } } },
+  { name: "bash_changed_files_list", user: { bash: { changed_files: "list" } } },
+  { name: "bash_changed_files_diff", user: { bash: { changed_files: "diff" } } },
+  { name: "bash_changed_files_project_off", user: { bash: { changed_files: "diff" } }, project: { bash: { changed_files: "off" } } },
+  { name: "bash_changed_files_project_cannot_enable", project: { bash: { changed_files: "diff" } } },
+  { name: "bash_changed_files_project_cannot_upgrade", user: { bash: { changed_files: "list" } }, project: { bash: { changed_files: "diff" } } },
+  { name: "bash_changed_files_pi", harness: "pi", user: { bash: { changed_files: "diff" } } },
   { name: "bash_false", user: { bash: false } },
   { name: "bash_empty_obj", user: { bash: {} } },
   { name: "bash_partial", user: { bash: { compress: false } } },

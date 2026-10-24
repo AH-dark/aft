@@ -940,6 +940,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("bash.worker_wait_max_ms", bash.worker_wait_max_ms);
     later!("bash.detach_on_user_message", bash.detach_on_user_message);
     live!("bash.db_schema_hints", bash.db_schema_hints);
+    live!("bash.changed_files", bash.changed_files);
     live!("bash.env", bash.env);
     later!("bash.powershell_tool", bash.powershell_tool);
     live!(
@@ -1068,6 +1069,7 @@ fn classification_is_exhaustive(config: &Config) {
         callgraph: _,
     } = indexes;
     let crate::config::BashConfig {
+        changed_files: _,
         enabled: _,
         host_fallback: _,
         runon_enabled: _,

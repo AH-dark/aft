@@ -83,6 +83,7 @@ export type AftPushFrame =
   | StatusChangedFrame;
 
 export interface BashCompletedFrame {
+  _bash_changed_files?: BashChangedFiles;
   type: "bash_completed";
   task_id: string;
   status: string;
@@ -147,6 +148,7 @@ export interface StatusChangedFrame {
  * their own bg-notification machinery.
  */
 export interface BgCompletion {
+  _bash_changed_files?: BashChangedFiles;
   task_id: string;
   status: string;
   exit_code: number | null;
@@ -190,4 +192,11 @@ export function isTerminalBashStatus(status: unknown, compatibilityAliases = fal
     (TERMINAL_BASH_STATUSES.has(status) ||
       (compatibilityAliases && (status === "cancelled" || status === "timeout")))
   );
+}
+
+/** Watcher-observed project changes during one shell task. */
+export interface BashChangedFiles {
+  text: string;
+  files: Array<{ path: string; status: string; diff?: string; reason?: string }>;
+  incomplete: string[];
 }

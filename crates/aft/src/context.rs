@@ -251,7 +251,7 @@ thread_local! {
 /// component (the store falls back to the raw spelling for those, which
 /// `relative_path` keeps as an absolute out-of-root key), and `..` traversal
 /// through a non-directory (realpath ENOTDIR).
-fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
+pub(crate) fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
     use std::path::Component;
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return Some(canonical);
@@ -1513,6 +1513,8 @@ const WATCHER_RESCAN_RERUN: u8 = 2;
 
 #[derive(Debug, Default)]
 pub(crate) struct WatcherCounters {
+    pub(crate) bash_flush: Arc<crate::watcher_backend::flush::FlushControl>,
+    pub(crate) bash_changes: std::sync::OnceLock<Arc<crate::bash_changed_files::Journal>>,
     overflow_ignore_evidence: AtomicU8,
     fsevents_stream_creations_total: AtomicU64,
     raw_events_total: AtomicU64,
@@ -1654,6 +1656,9 @@ impl WatcherCounters {
         prefixes: Vec<WatcherOverflowPrefix>,
     ) -> bool {
         self.overflows_total.fetch_add(1, Ordering::Relaxed);
+        if let Some(journal) = self.bash_changes.get() {
+            journal.gap();
+        }
         *self
             .last_overflow_prefixes
             .write()

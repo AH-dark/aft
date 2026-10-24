@@ -534,6 +534,12 @@ impl SpawnPlan {
         }
         Vec::new()
     }
+    pub(crate) fn changed_files_read_profile(&self) -> Option<&SandboxProfile> {
+        match self.policy() {
+            Self::Launcher { profile, .. } => Some(profile),
+            _ => None,
+        }
+    }
 
     pub(crate) fn refusal_code(&self) -> Option<&'static str> {
         match self.policy() {

@@ -1791,6 +1791,39 @@ pub(super) fn submit_deferred_bash(
         startup_deadline,
         startup_started_at,
     ));
+    let changed_files_budget = (spawn_ctx.config().bash.changed_files
+        != crate::config::BashChangedFiles::Off
+        && (server_completion
+            || !["background", "pty"].iter().any(|key| {
+                raw_args
+                    .get(*key)
+                    .and_then(crate::subc_translate::model_boolean)
+                    == Some(true)
+            })))
+    .then(|| crate::bash_changed_files::BudgetGuard::new(reply_budget.deadline));
+    if let Some(budget) = &changed_files_budget {
+        receipt.bind_changed_files_deadline(budget.shared());
+    }
+    // Bind before dispatch so even a command that exits inside spawn sees the
+    // caller's deadline. Clear on the reply channel, including startup handoffs
+    // whose executor job can still be finishing after the caller has its task id.
+    let changed_files_completion_tx = changed_files_budget.map(|budget| {
+        let (tx, mut rx) = mpsc::channel::<BashDeferredCompletion>(1);
+        let forward = completion_tx.clone();
+        let budget_metrics = metrics.clone();
+        tokio::spawn(async move {
+            while let Some(done) = rx.recv().await {
+                decrement_counted_channel(&budget_metrics.bash_deferred_queued);
+                budget.clear();
+                let _ = send_counted_channel(&forward, &budget_metrics.bash_deferred_queued, done)
+                    .await;
+            }
+        });
+        tx
+    });
+    let completion_tx = changed_files_completion_tx
+        .as_ref()
+        .unwrap_or(completion_tx);
     let receipt_for_spawn = Arc::clone(&receipt);
     let admitted = Arc::new(AtomicBool::new(false));
     let admitted_for_spawn = Arc::clone(&admitted);
@@ -2141,6 +2174,7 @@ pub(super) fn submit_deferred_bash(
                     );
                     unanswered_metrics.set_bash_unanswered_deadline(route, corr, unanswered_deadline);
                     let deadline = reply_budget.cap(received_at + Duration::from_millis(wait_window_ms));
+                    receipt_for_spawn.limit_changed_files_deadline(deadline);
                     // Server-owned calls use the outer transport timer rather
                     // than this ordinary remote-job handback timer.
                     let remote_handback = ((settings.block_to_completion || settings.wait)
@@ -3853,6 +3887,69 @@ pub(super) async fn assert_deferred_wait_entrypoint_for_test(
 
 #[cfg(test)]
 mod grant_path_tests {
+    #[cfg(unix)]
+    static CHANGED_FILES_BUDGET_FOR_TEST: std::sync::Mutex<
+        Option<crate::bash_changed_files::SharedCallDeadline>,
+    > = std::sync::Mutex::new(None);
+
+    #[cfg(unix)]
+    fn changed_files_budget_running_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        let deadline = crate::bash_background::changed_files_deadline_for_spawn()
+            .expect("reply deadline bound before dispatch");
+        assert!(deadline.lock().unwrap().is_some());
+        *CHANGED_FILES_BUDGET_FOR_TEST.lock().unwrap() = Some(deadline);
+        slow_running_write_stub(req, ctx)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn changed_files_budget_clears_at_startup_handoff_before_spawn_finishes() {
+        let received_at = Instant::now();
+        let (dir, root) = super::super::test_support::test_root("bash-changed-files-budget");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.foreground_wait_window_ms = 500;
+            config.project_root = Some(root.as_path().into());
+            config.storage_dir = Some(dir.path().join("storage"));
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
+            config.experimental_bash_rewrite = false;
+            config.bash.changed_files = crate::config::BashChangedFiles::List;
+        });
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let mut timing = BashTimingForTest::new(received_at);
+        Arc::get_mut(&mut timing).unwrap().dispatch = Some(changed_files_budget_running_stub);
+        let rx = with_bash_timing_for_test(Some(timing.clone()), || {
+            deadline_test_call_owned(
+                &executor,
+                &root,
+                controlled_startup_dispatch,
+                json!({"command":"printf ran > started-command", "timeout":60000}),
+                received_at,
+                false,
+            )
+        });
+        let mut startup = ControlledStartup {
+            call: StartupCall { dir, ctx, rx },
+            timing,
+        };
+        let done = startup.reply_at_checkpoint().await;
+        assert!(
+            done.response_for_test().success,
+            "{:?}",
+            done.response_for_test()
+        );
+        let state = CHANGED_FILES_BUDGET_FOR_TEST
+            .lock()
+            .unwrap()
+            .take()
+            .expect("capture budget observed");
+        assert!(
+            state.lock().unwrap().is_none(),
+            "handoff releases the reply budget before the executor finishes"
+        );
+        startup.finish().await;
+    }
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 

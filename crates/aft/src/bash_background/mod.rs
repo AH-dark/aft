@@ -50,6 +50,7 @@ mod slot_limit_tests;
 /// end states are final, so a caller told "refused" can rely on the command
 /// never starting later, and a caller told "committed" gets the task id.
 pub(crate) struct SpawnReceipt {
+    changed_files_deadline: std::sync::OnceLock<crate::bash_changed_files::SharedCallDeadline>,
     state: std::sync::Mutex<SpawnReceiptState>,
     deadline: std::time::Instant,
     startup_steps: std::sync::Mutex<StartupSteps>,
@@ -235,6 +236,24 @@ pub(crate) enum StartupOutcome {
 }
 
 impl SpawnReceipt {
+    pub(crate) fn bind_changed_files_deadline(
+        &self,
+        deadline: crate::bash_changed_files::SharedCallDeadline,
+    ) {
+        let _ = self.changed_files_deadline.set(deadline);
+    }
+    pub(crate) fn limit_changed_files_deadline(&self, deadline: std::time::Instant) {
+        if let Some(shared) = self.changed_files_deadline.get() {
+            let mut bound = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // None means the foreground reply no longer needs this deadline;
+            // late spawn completion must not reactivate it.
+            if let Some(current) = bound.as_mut() {
+                *current = (*current).min(deadline);
+            }
+        }
+    }
     #[cfg(test)]
     pub(crate) fn new(deadline: std::time::Instant) -> Self {
         Self::new_with_start_time(deadline, std::time::Instant::now())
@@ -246,6 +265,7 @@ impl SpawnReceipt {
     ) -> Self {
         Self {
             state: std::sync::Mutex::new(SpawnReceiptState::Pending),
+            changed_files_deadline: std::sync::OnceLock::new(),
             deadline,
             startup_steps: std::sync::Mutex::new(StartupSteps::new(startup_started_at)),
             #[cfg(feature = "test-timing-hooks")]
@@ -399,6 +419,16 @@ pub(crate) fn with_spawn_receipt<T>(
     let previous = CURRENT_SPAWN_RECEIPT.with(|slot| slot.replace(Some(receipt)));
     let _restore = Restore(previous);
     run()
+}
+pub(crate) fn changed_files_deadline_for_spawn(
+) -> Option<crate::bash_changed_files::SharedCallDeadline> {
+    CURRENT_SPAWN_RECEIPT.with(|slot| {
+        slot.borrow()
+            .as_ref()?
+            .changed_files_deadline
+            .get()
+            .cloned()
+    })
 }
 
 pub(crate) fn enter_bash_startup_step(step: BashStartupStep) {
@@ -1213,6 +1243,9 @@ pub(crate) fn spawn(
     // handle, which reads the registry as it is. An idle-evicted root has
     // released its registry, so load it again before the task can finish.
     ctx.reload_released_filter_registry();
+    let _changed_files =
+        crate::bash_changed_files::Capture::start_for_spawn(ctx, request_id, &spawn_plan)
+            .map(|capture| crate::bash_changed_files::scope(Some(capture)));
     #[cfg(unix)]
     ctx.bash_background()
         .set_db_schema_hints(ctx.config().bash.db_schema_hints);

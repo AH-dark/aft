@@ -903,3 +903,220 @@ fn bash_timeout_terminates_shell_process_group_grandchild() {
 
     assert!(aft.shutdown().success());
 }
+
+#[cfg(unix)]
+#[test]
+fn bash_changed_files_foreground_and_background_completion_notice() {
+    // Verify actual diffs with an ample test budget, not a Git startup benchmark.
+    assert_changed_files_completion_with_git_budget("30000", false);
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn bash_changed_files_git_budget_exhaustion_reports_paths_without_diffs() {
+    assert_changed_files_completion_with_git_budget("0", true);
+}
+
+#[cfg(unix)]
+fn assert_changed_files_completion_with_git_budget(budget_ms: &str, exhausted: bool) {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "test@example.invalid"],
+        vec!["config", "user.name", "Test"],
+    ] {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(project.path())
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    std::fs::write(project.path().join("file.txt"), "old\n").unwrap();
+    std::fs::write(project.path().join(".gitignore"), "config.local.json\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-qm", "initial"]] {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(project.path())
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let mut aft = AftProcess::spawn_with_env(&[
+        (
+            "AFT_TEST_BASH_CHANGED_FILES_GIT_BUDGET_MS",
+            std::ffi::OsStr::new(budget_ms),
+        ),
+        ("AFT_TEST_DISABLE_FILE_WATCHER", std::ffi::OsStr::new("0")),
+        (
+            "AFT_TEST_SYNC_FILE_WATCHER_START",
+            std::ffi::OsStr::new("1"),
+        ),
+    ]);
+    let configured = aft.send(&serde_json::json!({
+        "id": "changed-files-config", "command": "configure", "harness": "opencode",
+        "project_root": project.path(), "storage_dir": storage.path(),
+        "config": user_config(serde_json::json!({"bash": {"changed_files": "diff", "rewrite": false}, "sandbox": {"profile": {"head": "off"}}}))
+    }).to_string());
+    assert_eq!(configured["success"], true, "{configured}");
+    // Establish native service readiness before testing command-exit delivery.
+    // The separate saturation regression deliberately starts without warming up.
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let probe = aft.send(&serde_json::json!({"id":"changed-files-ready", "method":"bash", "params":{"command":":", "notify_on_completion":false}}).to_string());
+        assert_eq!(probe["success"], true, "{probe}");
+        let probe = wait_for_terminal_status(&mut aft, probe["task_id"].as_str().unwrap());
+        if probe["_bash_changed_files"]["incomplete"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < ready_deadline,
+            "watcher did not become ready: {probe}"
+        );
+    }
+    for background in [false, true] {
+        let name = if background {
+            "background.txt"
+        } else {
+            "foreground.txt"
+        };
+        // Write as the last shell operation: no sleep gives the watcher a head
+        // start before the completion barrier.
+        let result = aft.send(&serde_json::json!({"id": name, "method": "bash", "params": {
+            "command": format!("printf ignored > config.local.json; printf changed > file.txt; printf done; printf 'hello\\n' > {name}"), "background": background, "wait": !background,
+            "compressed": false, "notify_on_completion": background
+        }}).to_string());
+        assert_eq!(result["success"], true, "{result}");
+        if background {
+            assert!(result.get("_bash_changed_files").is_none(), "{result}");
+            wait_for_terminal_status(&mut aft, result["task_id"].as_str().unwrap());
+            // Terminal status can be published before its completion notice is
+            // queued, so wait for delivery rather than assuming both happen together.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let completion = loop {
+                let completions = aft.send(
+                    &serde_json::json!({"id":"drain-changes", "command":"bash_drain_completions"})
+                        .to_string(),
+                );
+                if let Some(completion) = completions["bg_completions"]
+                    .as_array()
+                    .expect("completion array")
+                    .iter()
+                    .find(|item| item["task_id"] == result["task_id"])
+                {
+                    break completion.clone();
+                }
+                assert!(std::time::Instant::now() < deadline, "{completions}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            let files = completion["_bash_changed_files"]["files"]
+                .as_array()
+                .unwrap();
+            assert!(
+                files.iter().any(|file| file["path"] == "file.txt"),
+                "{completion}"
+            );
+            assert!(
+                !files.iter().any(|file| file["path"] == "config.local.json"),
+                "ignored file leaked: {completion}"
+            );
+            assert!(
+                completion["_bash_changed_files"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(name),
+                "{completion}"
+            );
+            assert_changed_file_image(&completion["_bash_changed_files"], name, exhausted);
+            assert_eq!(
+                completion["_bash_changed_files"]["incomplete"],
+                serde_json::json!([]),
+                "{completion}"
+            );
+            let ack = aft.send(&serde_json::json!({"id":"ack-changes", "command":"bash_ack_completions", "params":{"task_ids":[result["task_id"]]}}).to_string());
+            assert_eq!(ack["success"], true);
+            let drained = aft.send(&serde_json::json!({"id":"drain-changes-again", "command":"bash_drain_completions"}).to_string());
+            assert!(
+                drained["bg_completions"].as_array().unwrap().is_empty(),
+                "{drained}"
+            );
+        } else {
+            let result = wait_for_terminal_status(&mut aft, result["task_id"].as_str().unwrap());
+            let files = result["_bash_changed_files"]["files"].as_array().unwrap();
+            assert!(
+                files.iter().any(|file| file["path"] == "file.txt"),
+                "{result}"
+            );
+            assert!(
+                !files.iter().any(|file| file["path"] == "config.local.json"),
+                "ignored file leaked: {result}"
+            );
+            assert_eq!(
+                result["_bash_changed_files"]["incomplete"],
+                serde_json::json!([]),
+                "{result}"
+            );
+            assert!(
+                result["_bash_changed_files"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Files changed while the command ran"),
+                "{result}"
+            );
+            assert_changed_file_image(&result["_bash_changed_files"], name, exhausted);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_changed_file_image(report: &serde_json::Value, name: &str, exhausted: bool) {
+    let files = report["files"].as_array().unwrap();
+    if exhausted {
+        assert!(report["text"].as_str().unwrap().contains(
+            "No diffs: git before-images could not be captured within the time/output budget, so only paths are listed."
+        ), "{report}");
+        assert!(files.iter().any(|file| file["path"] == name), "{report}");
+        assert!(
+            files.iter().all(|file| file.get("diff").is_none()),
+            "{report}"
+        );
+    } else {
+        assert!(
+            files.iter().any(|file| file["path"] == name
+                && file["diff"]
+                    .as_str()
+                    .is_some_and(|diff| diff.contains("+hello"))),
+            "{report}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_changed_files_flush_timeout_reports_incomplete() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("AFT_TEST_DISABLE_FILE_WATCHER", std::ffi::OsStr::new("0")),
+        (
+            "AFT_TEST_SYNC_FILE_WATCHER_START",
+            std::ffi::OsStr::new("1"),
+        ),
+        (
+            "AFT_TEST_BASH_CHANGED_FILES_FLUSH_TIMEOUT",
+            std::ffi::OsStr::new("1"),
+        ),
+    ]);
+    let configured = aft.send(&serde_json::json!({"id":"flush-timeout-config", "command":"configure", "harness":"opencode", "project_root":project.path(), "storage_dir":storage.path(), "config":user_config(serde_json::json!({"bash":{"changed_files":"list","rewrite":false},"sandbox":{"profile":{"head":"off"}}}))}).to_string());
+    assert_eq!(configured["success"], true, "{configured}");
+    let result = aft.send(&serde_json::json!({"id":"flush-timeout-command", "method":"bash", "params":{"command":"printf last > late.txt", "notify_on_completion":false}}).to_string());
+    assert_eq!(result["success"], true, "{result}");
+    let result = wait_for_terminal_status(&mut aft, result["task_id"].as_str().unwrap());
+    assert_eq!(result["_bash_changed_files"]["incomplete"], serde_json::json!(["Incomplete: the file watcher had not caught up when the command ended, so some changes may be missing."]), "{result}");
+}

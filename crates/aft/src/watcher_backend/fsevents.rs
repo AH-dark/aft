@@ -5,7 +5,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fsevent_sys as fs;
 use fsevent_sys::core_foundation as cf;
@@ -21,6 +21,7 @@ use crate::watcher_filter::{
 
 const FSEVENTS_LATENCY_SECONDS: f64 = 0.03;
 const BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const FLUSH_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
 struct HandoffWriteForTest {
@@ -80,6 +81,7 @@ impl ProjectWatcher {
         // rather than on the backend thread after spawn.
         let generation = matcher_generation.load(Ordering::Acquire);
         let counters = crate::context::watcher_counters_for_root(&root);
+        let flush_rx = counters.bash_flush.register_native();
         let mut planning = crate::watcher_filter::WatcherExclusionRetry::default();
         let outcome = planning
             .attempt(&root, generation, &counters, || {
@@ -120,8 +122,21 @@ impl ProjectWatcher {
             .into_iter()
             .filter(|path| path.exists())
             .collect::<Vec<_>>();
-        let mut external_watcher = DirectoryWatcher::new(backend_tx, Arc::clone(&counters));
+        let mut external_watcher = DirectoryWatcher::new(backend_tx.clone(), Arc::clone(&counters));
         external_watcher.watch_paths(&extra_watch_paths)?;
+        let git_directory = root.join(".git");
+        // Auxiliary streams have independent callback ordering. The marker must
+        // share the recursive stream that observes the command's project writes.
+        let git_watched = !exclusion_state.paths().contains(&git_directory);
+        counters.bash_flush.set_marker_directory(
+            if git_watched
+                && std::fs::symlink_metadata(&git_directory).is_ok_and(|metadata| metadata.is_dir())
+            {
+                git_directory
+            } else {
+                root.clone()
+            },
+        );
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
@@ -134,8 +149,38 @@ impl ProjectWatcher {
                 let mut exclusion_state = exclusion_state;
                 let mut dropped_paths = watcher_exclusion_paths(&plan.dropped);
                 let mut observed_generation = observed_generation;
+                let mut active_flushes: Vec<super::flush::FlushRequest> = Vec::new();
+                let mut next_flush = Instant::now();
 
                 while !thread_shutdown.load(Ordering::Acquire) {
+                    for request in flush_rx.try_iter() {
+                        #[cfg(test)]
+                        if request.marker_id.is_none() && Instant::now() < request.deadline {
+                            unsafe {
+                                fs::FSEventStreamFlushSync(stream.stream as fs::FSEventStreamRef);
+                            }
+                            if let Some(flushed) = request.flushed {
+                                let _ = flushed.send(());
+                            }
+                            continue;
+                        }
+                        active_flushes.push(request);
+                    }
+                    active_flushes.retain(|request| {
+                        Instant::now() < request.deadline
+                            && request
+                                .marker_id
+                                .is_some_and(|id| counters.bash_flush.is_pending(id))
+                    });
+                    if !active_flushes.is_empty() && Instant::now() >= next_flush {
+                        // FlushSync only drains events already in the service pipeline.
+                        // Retry while the marker is pending, never treating a flush alone
+                        // as proof that the filesystem service delivered earlier writes.
+                        unsafe {
+                            fs::FSEventStreamFlushSync(stream.stream as fs::FSEventStreamRef);
+                        }
+                        next_flush = Instant::now() + FLUSH_RETRY_INTERVAL;
+                    }
                     let generation = matcher_generation.load(Ordering::Acquire);
                     let previous_paths = exclusion_state.paths();
                     if let Some(update) = planning.replacement(
@@ -195,7 +240,14 @@ impl ProjectWatcher {
                         }
                     }
 
-                    match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
+                    let wait = if active_flushes.is_empty() {
+                        BACKEND_POLL_INTERVAL
+                    } else {
+                        next_flush
+                            .saturating_duration_since(Instant::now())
+                            .min(BACKEND_POLL_INTERVAL)
+                    };
+                    match backend_rx.recv_timeout(wait) {
                         Ok(event) => {
                             if let Ok(event) = &event {
                                 if !exclusion_state.refresh_event(event).is_empty() {
@@ -346,6 +398,7 @@ impl DirectoryWatcher {
 }
 
 struct FsEventsStream {
+    stream: usize,
     run_loop: usize,
     join: Option<JoinHandle<()>>,
     sender: mpsc::Sender<notify::Result<Event>>,
@@ -489,6 +542,7 @@ impl FsEventsStream {
         }
 
         Ok(Self {
+            stream: stream_address,
             run_loop,
             join: Some(join),
             sender,

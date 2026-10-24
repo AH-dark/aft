@@ -16,6 +16,14 @@ OMP uses this same CortexKit user file; register its Pi-compatible plugin with `
 
 `bash.worker_wait_max_ms` bounds blocking `bash` calls in every session, including heads (`wait: true`, or foreground calls forced to block, such as when `bash.subagent_background` is false). It also bounds delegated (subagent) `bash_watch` calls, including an explicit timeout. Head watches still use `bash.watch_sync_max_ms`. At the limit the command is not killed: it keeps running in the background, and the caller gets its task id, elapsed time and latest output, so it can inspect it, wait again where `bash_watch` is available, or `bash_kill` it. Blocking calls and worker watches push the command's default 30-minute hard kill to at least this long after the wait; an explicit command `timeout` is never extended. The default is `1800000` (30 minutes); a value below `60000` is a config error that drops the `bash` block, not a silent clamp. User and project config may both set it, and harness blocks override it like the other `bash` keys. The key was originally worker-only; its name is retained so existing user and project configurations keep working when blocking head calls use it too.
 
+`bash.changed_files` lists the project files that changed while a shell command ran. Only user configuration can turn it on; a project can only set `"off"`.
+
+- `"off"` (default): nothing is recorded.
+- `"list"`: each changed path, marked added, modified or deleted.
+- `"diff"`: the list plus a short diff for clean tracked text files, against the version git had when the command started.
+
+The list covers a time window, so changes made by other processes in that window can appear. It comes from the file watcher, so paths the watcher excludes (`.git`, `target`, `node_modules`, ignore rules) are not listed. Before reporting, AFT confirms the watcher has caught up by creating and removing an empty marker file (in `.git/`, or the project root when `.git` is not a folder), waiting at most 300 ms; if it can't confirm, the result says the list may be incomplete. Background commands report in their completion notice, and `runon` commands report only changes seen in the local project. Limits: 40 files and 64 KiB per report, 200 lines and 32 KiB per file diff. Files over 256 KiB, binary files and files that already had uncommitted changes are listed without a diff.
+
 `bash.env` adds fixed variables to every shell command from user config only (for example, `"env": { "TZ": "UTC" }`). Project config cannot set environment values. Per-call `env` entries override these defaults, and user-config changes apply to future commands without a restart. Loader, shell/interpreter startup, `PATH`, and other protected variables are rejected while loading config. The first bash reply in each session lists the configured keys only, never their values. When a command starts while the same trimmed command is already running in the same project and canonical working directory, AFT adds a warning with its task ID, age, and whether it belongs to this session; the command still runs.
 
 On Linux, user config may set `bash.linux_scope: true` to launch non-PTY tool shells through `systemd-run --user --scope --collect --quiet`. The default is `false`. AFT uses the scope only when `systemd-run` exists and the user manager is reachable; otherwise it falls back to the normal process-group-isolated spawn and writes one informational log line. Native-sandbox launches also use the normal spawn because their launcher cannot contact the user manager. Project config cannot enable or disable this host-level containment option.
@@ -412,6 +420,7 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // background completions, independent of compression. Probe: same launch
     // sandbox, 1.5s timeout, 256 KiB output cap; trailer: 2 KiB with omissions.
     "db_schema_hints": true,
+    "changed_files": "off",
 
     // Maximum time a synchronous bash_watch call may wait. Defaults to 120000ms;
     // values outside 1000..=1800000 are clamped with a warning. Sync waits are

@@ -24,6 +24,7 @@ function hashReminder(text: string): string {
 }
 
 export interface BgCompletion {
+  _bash_changed_files?: import("@cortexkit/aft-bridge").BashChangedFiles;
   task_id: string;
   status: string;
   exit_code: number | null;
@@ -2446,7 +2447,15 @@ function formatCompletion(completion: BgCompletion): string {
   const captureWarning = completion.output_incomplete
     ? `    [${completion.status_reason || "PTY output may be incomplete"}]`
     : "";
-  return [header, captureWarning, previewBlock, descendantWarning].filter(Boolean).join("\n");
+  return [
+    header,
+    captureWarning,
+    previewBlock,
+    descendantWarning,
+    completion._bash_changed_files?.text,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function formatOutputPreview(completion: BgCompletion): string {

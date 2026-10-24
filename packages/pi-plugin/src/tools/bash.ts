@@ -460,6 +460,7 @@ const BashWriteParams = Type.Object({
 });
 
 interface BashDetails {
+  _bash_changed_files?: import("@cortexkit/aft-bridge").BashChangedFiles;
   exit_code?: number;
   duration_ms?: number;
   truncated?: boolean;
@@ -1011,6 +1012,7 @@ export function registerBashTool(
       }
 
       const details: BashDetails = {
+        _bash_changed_files: response._bash_changed_files as BashDetails["_bash_changed_files"],
         exit_code: response.exit_code as number | undefined,
         duration_ms: response.duration_ms as number | undefined,
         truncated: response.truncated as boolean | undefined,
@@ -1387,6 +1389,7 @@ function bashResult(
       output_path: details.output_path,
       task_id: details.task_id,
       bg_completions: details.bg_completions,
+      ...(details._bash_changed_files ? { _bash_changed_files: details._bash_changed_files } : {}),
     } as BashDetails,
   };
 }

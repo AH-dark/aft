@@ -569,6 +569,11 @@ pub fn build_bash_outcome(
     // A capped blocking wait detaches at its deadline instead of blocking on.
     let block_to_completion =
         (params.block_to_completion || params.wait) && worker_cap_ms.is_none();
+    let flush_budget = (ctx.config().bash.changed_files != crate::config::BashChangedFiles::Off)
+        .then(|| {
+            ctx.bash_background()
+                .changed_files_budget(&task_id, (!block_to_completion).then_some(deadline))
+        });
     let timeout = params.timeout;
     let storage_dir = crate::bash_background::task_storage_dir(ctx);
     let project_root = ctx.config().project_root.clone();
@@ -577,6 +582,7 @@ pub fn build_bash_outcome(
     let session_id_for_poll = session_id.clone();
 
     let mut poll: PendingResponsePoll = Box::new(move |ctx| {
+        let _keep_flush_budget = &flush_budget;
         // All blocking calls have a wait cap, but only delegated workers renew
         // the default hard kill. A primary session keeps its original limit.
         if worker_session && worker_cap_ms.is_some() {
@@ -1087,7 +1093,7 @@ pub(crate) fn with_runon_capture_state(
 /// will not reach, even when the runner never confirmed capture.
 pub(crate) fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Response {
     let task_line = foreground_task_line(&snapshot);
-    let (output, foreground_envelope) =
+    let (mut output, foreground_envelope) =
         if let Some(envelope) = snapshot.bash_output_list_envelope.as_ref() {
             let trailer = crate::list_surfaces::bash::envelope_trailer(envelope);
             let mut foreground_snapshot = snapshot.clone();
@@ -1113,6 +1119,9 @@ pub(crate) fn foreground_result_response(request_id: &str, snapshot: BgTaskSnaps
             push_line(&mut output, &task_line);
             (output, None)
         };
+    if let Some(report) = &snapshot.changed_files {
+        push_line(&mut output, &report.text);
+    }
     if let Some(refusal) = &snapshot.remote_refusal {
         return Response::error_with_data(
             request_id,
@@ -1163,6 +1172,9 @@ pub(crate) fn foreground_result_response(request_id: &str, snapshot: BgTaskSnaps
             .expect("foreground bash data is an object"),
         &foreground_envelope,
     );
+    if let Some(report) = &snapshot.changed_files {
+        data["_bash_changed_files"] = json!(report);
+    }
     if let Some(job_id) = &snapshot.remote_job_id {
         data["remote_job_id"] = json!(job_id);
     }
@@ -1512,6 +1524,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bash_changed_files_foreground_block_follows_output_and_is_namespaced() {
+        let mut task = snapshot(
+            "command output",
+            false,
+            None,
+            BgTaskStatus::Completed,
+            Some(0),
+        );
+        task.changed_files = Some(crate::bash_changed_files::Report {
+            text: "Files changed while the command ran (changes by other processes may be included):\n  added new.txt".into(),
+            files: vec![],
+            incomplete: vec![],
+            changed_files_list_envelope: crate::list_surfaces::bash::build_changed_files_envelope(1, 1, false, false),
+        });
+        let response = foreground_result_response("request", task);
+        let text = response.data["output"].as_str().unwrap();
+        assert!(text.starts_with("command output"));
+        assert!(text.ends_with("  added new.txt"));
+        assert_eq!(text.matches("Files changed while").count(), 1);
+        assert!(response.data["_bash_changed_files"].is_object());
+    }
+
     fn snapshot(
         output_preview: &str,
         output_truncated: bool,
@@ -1520,6 +1555,7 @@ mod tests {
         exit_code: Option<i64>,
     ) -> BgTaskSnapshot {
         BgTaskSnapshot {
+            changed_files: None,
             exit_marker_unavailable: None,
             info: BgTaskInfo {
                 task_id: "bash-test".to_string(),
