@@ -2547,13 +2547,17 @@ mod tests {
     fn created_python_file_reports_indentation_error_line() {
         let path = Path::new("new.py");
         let broken = "def g():\n    if True:\n        return 2\n            y = 5\n    return 3\n";
-        let check = check_created_file_syntax(path, broken);
+        let policy = crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test();
+        let check = check_created_file_syntax(&policy, path, broken);
         assert_eq!(check.valid, Some(false));
         assert_eq!(check.skipped_reason, None);
         assert_eq!(check.first_error_line, Some(4));
         assert_eq!(validate_syntax_str(broken, path), Some(false));
         let valid = "def g():\n    if True:\n        return 2\n    return 3\n";
-        assert_eq!(check_created_file_syntax(path, valid).valid, Some(true));
+        assert_eq!(
+            check_created_file_syntax(&policy, path, valid).valid,
+            Some(true)
+        );
     }
 
     #[test]
