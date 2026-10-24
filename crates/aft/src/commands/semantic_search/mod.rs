@@ -10638,15 +10638,20 @@ mod tests {
         ctx.install_search_index_rx(rx, ctx.configure_generation());
         // A zero budget makes the planning wait see the load in flight once and
         // give up. The loader publishes at the request's next wait, after the
-        // plan was made without the index.
-        let mut waits_seen = 0;
+        // plan was made without the index. `published_at_wait` records which
+        // wait published, so the test can check the hold really lasted.
+        let waits_seen = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let published_at_wait = std::rc::Rc::new(std::cell::Cell::new(None::<usize>));
         let mut pending = Some((tx, SearchIndex::build(project.path())));
+        let hook_waits = std::rc::Rc::clone(&waits_seen);
+        let hook_published = std::rc::Rc::clone(&published_at_wait);
         let response = with_search_index_load_wait_hook_for_test(
             move || {
-                waits_seen += 1;
-                if waits_seen >= 2 {
+                hook_waits.set(hook_waits.get() + 1);
+                if hook_waits.get() >= 2 {
                     if let Some((tx, index)) = pending.take() {
                         tx.send(index).unwrap();
+                        hook_published.set(Some(hook_waits.get()));
                     }
                 }
             },
@@ -10671,10 +10676,21 @@ mod tests {
                 .is_some_and(SearchIndex::is_ready),
             "the load must land during the request for this case: {response}"
         );
-        assert!(
-            response["results"].as_array().unwrap().len() < 47,
+        assert_eq!(
+            published_at_wait.get(),
+            Some(2),
+            "the index must be held back through the planning wait: {response}"
+        );
+        // The plan the reply records is the one made before publication. The
+        // number of results is not checked: the capped walk reads directories
+        // in file-system order, so which matches fit under its cap varies by
+        // machine.
+        let plan = &response["structuredContent"]["plan"];
+        assert_eq!(
+            plan["readiness"]["lexical_index"], false,
             "the plan must have been made before the index was loaded: {response}"
         );
+        assert_eq!(plan["exact_mode"], "fallback", "{response}");
         assert!(
             rendered.starts_with(&format!(
                 "{TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE}\nDegraded grep reached its 1000-file scan cap; additional files were not scanned.\n\n"
