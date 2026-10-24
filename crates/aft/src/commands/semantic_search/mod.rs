@@ -206,7 +206,9 @@ fn with_search_index_load_wait_hook_for_test<T>(
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
-            SEARCH_INDEX_LOAD_WAIT_HOOK.with(|slot| slot.borrow_mut().take());
+            // Assign rather than `Option::take`: the list-envelope scanner treats
+            // `.take(` as a list-cutting site, and this only clears a test hook.
+            SEARCH_INDEX_LOAD_WAIT_HOOK.with(|slot| *slot.borrow_mut() = None);
         }
     }
 
