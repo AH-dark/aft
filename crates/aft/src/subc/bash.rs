@@ -2623,7 +2623,10 @@ pub(super) fn submit_deferred_bash(
                     _ = async {
                         #[cfg(test)]
                         if let Some(timing) = &timing_for_test {
-                            return timing.reply.wait().await;
+                            timing.reply.wait().await;
+                            if !timing.reply_uses_clock {
+                                return;
+                            }
                         }
                         wait_for_bash_reply_deadline(reply_deadline).await;
                     } => {
@@ -3844,6 +3847,7 @@ struct BashTimingForTest {
     startup: BashTestDeadline,
     inline_settle: BashTestDeadline,
     reply: BashTestDeadline,
+    reply_uses_clock: bool,
     committed: tokio::sync::Notify,
     task_id: std::sync::Mutex<Option<String>>,
     admission: (std::sync::Mutex<bool>, std::sync::Condvar),
@@ -4910,37 +4914,96 @@ mod grant_path_tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn blocking_bash_hands_back_before_client_deadline() {
-        for mode in ["wait", "block_to_completion"] {
-            let (_dir, root) = super::super::test_support::test_root("bash-client-deadline");
-            let ctx = super::super::test_support::test_ctx();
-            let executor = Arc::new(Executor::new());
-            executor.register_actor(root.clone(), ctx.clone());
-            let started = Instant::now();
-            let budget = crate::commands::blocking_wait::ReplyBudget::new(
-                started,
-                Some(started + Duration::from_secs(3)),
-            );
-            let mut args = json!({"command":"sleep 10","timeout":10000});
-            args[mode] = json!(true);
-            let mut rx =
-                deadline_test_call_owned(&executor, &root, running_bash_stub, args, budget, false);
-            let done = tokio::time::timeout(Duration::from_secs(4), rx.recv())
-                .await
-                .expect("blocking bash must hand back before transport expiry")
-                .unwrap();
-            let response = done.response_for_test();
-            let task = response.data["task_id"].as_str().expect("running task id");
-            let _ = ctx.bash_background().kill(task, "deadline-session");
-            assert!(response.success, "{response:?}");
-            assert_eq!(response.data["status"], "running", "{response:?}");
-            assert!(
-                started.elapsed() < Duration::from_millis(2500),
-                "{mode}: reply arrived after safety cutoff: {:?}",
-                started.elapsed()
-            );
-        }
+    #[test]
+    fn blocking_bash_hands_back_before_client_deadline() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                for mode in ["wait", "block_to_completion"] {
+                    let (_dir, root) =
+                        super::super::test_support::test_root("bash-client-deadline");
+                    let ctx = super::super::test_support::test_ctx();
+                    let executor = Arc::new(Executor::new());
+                    executor.register_actor(root.clone(), ctx.clone());
+                    let started = tokio::time::Instant::now();
+                    let mut timing = BashTimingForTest::new(started.into_std());
+                    Arc::get_mut(&mut timing).unwrap().reply_uses_clock = true;
+                    BashTimingForTest::release(&timing.admission);
+                    let budget = crate::commands::blocking_wait::ReplyBudget::new(
+                        started.into_std(),
+                        Some((started + Duration::from_secs(3)).into_std()),
+                    );
+                    let mut args = json!({"command":"sleep 10","timeout":10000});
+                    args[mode] = json!(true);
+                    let mut rx = with_bash_timing_for_test(Some(timing.clone()), || {
+                        deadline_test_call_owned(
+                            &executor,
+                            &root,
+                            gated_running_stub,
+                            args,
+                            budget,
+                            false,
+                        )
+                    });
+                    tokio::select! {
+                        biased;
+                        done = rx.recv() => panic!("{mode}: answered before reply watchdog: {:?}", done.map(|done| copy_response(done.response_for_test()))),
+                        _ = timing.reply.armed.notified() => {},
+                    }
+
+                    // Keep ordinary task observation off the blocking pool so only the
+                    // Tokio reply-deadline timer can hand back the still-running task.
+                    let (occupied_tx, occupied_rx) = std::sync::mpsc::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                    let blocker = tokio::task::spawn_blocking(move || {
+                        occupied_tx.send(()).unwrap();
+                        let _ = release_rx.recv();
+                    });
+                    occupied_rx.recv().unwrap();
+                    timing.reply.fire.notify_one();
+                    tokio::time::advance(Duration::from_millis(1499)).await;
+                    assert!(matches!(
+                        rx.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+
+                    let cutoff = started + Duration::from_millis(2500);
+                    // A running blocking job inhibits Tokio's automatic clock
+                    // advancement, so drive the clock while it holds the pool.
+                    let done = loop {
+                        if let Ok(done) = rx.try_recv() {
+                            break done;
+                        }
+                        assert!(
+                            tokio::time::Instant::now() < cutoff,
+                            "{mode}: blocking bash must hand back before transport expiry"
+                        );
+                        tokio::time::advance(Duration::from_millis(1)).await;
+                        tokio::task::yield_now().await;
+                    };
+                    let replied_at = tokio::time::Instant::now();
+                    drop(release_tx);
+                    blocker.await.unwrap();
+                    let response = done.response_for_test();
+                    let task = response.data["task_id"].as_str().expect("running task id");
+
+                    // Cleanup can outlive the client's deadline without making a timely
+                    // reply late. Measure receipt, not synchronous process termination.
+                    tokio::time::advance(Duration::from_secs(3)).await;
+                    let _ = ctx.bash_background().kill(task, "deadline-session");
+                    assert!(response.success, "{response:?}");
+                    assert_eq!(response.data["status"], "running", "{response:?}");
+                    assert!(
+                        replied_at < cutoff,
+                        "{mode}: reply arrived after safety cutoff: {:?}",
+                        replied_at - started
+                    );
+                }
+            });
     }
 
     #[tokio::test]
@@ -8291,6 +8354,7 @@ mod grant_path_tests {
                 startup: BashTestDeadline::default(),
                 inline_settle: BashTestDeadline::default(),
                 reply: BashTestDeadline::default(),
+                reply_uses_clock: false,
                 committed: tokio::sync::Notify::new(),
                 task_id: Default::default(),
                 admission: Default::default(),
