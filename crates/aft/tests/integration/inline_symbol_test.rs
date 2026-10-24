@@ -252,6 +252,76 @@ fn inline_symbol_python_nested_body_keeps_relative_indentation() {
     aft.shutdown();
 }
 
+/// Inline `symbol` at 1-based `line` of a fresh file holding `source`, and
+/// return the response and the file afterwards.
+fn inline_in_fresh_file(
+    name: &str,
+    source: &str,
+    symbol: &str,
+    line: u32,
+) -> (serde_json::Value, String) {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let file = tmp.path().join(name);
+    std::fs::write(&file, source).expect("write test file");
+    let root = tmp.path().display().to_string();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"{}","call_site_line":{}}}"#,
+        crate::helpers::json_string(&file.display()),
+        symbol,
+        line
+    ));
+    let content = std::fs::read_to_string(&file).expect("read file");
+    aft.shutdown();
+    (resp, content)
+}
+
+/// Removing the body's indentation must not remove indentation inside a
+/// multi-line string: those spaces are part of the string's value, and the
+/// result would still parse, so no syntax check would catch the change.
+#[test]
+fn inline_symbol_keeps_multiline_string_values() {
+    let cases = [
+        (
+            "python triple-quoted string",
+            "f.py",
+            "def f():\n    return '''hello\n    world'''\n\nresult = f()\n",
+            5,
+            "result = '''hello\n    world'''\n",
+        ),
+        (
+            "typescript template literal",
+            "f.ts",
+            "function f(): string {\n  return `a\n  b`;\n}\n\nconst r = f();\n",
+            6,
+            "const r = `a\n  b`;\n",
+        ),
+        (
+            "python docstring in a nested body",
+            "g.py",
+            "def g():\n    \"\"\"Doc\n    more\n    \"\"\"\n    print(1)\n\ndef main():\n    if True:\n        g()\n",
+            9,
+            "    if True:\n        \"\"\"Doc\n    more\n    \"\"\"\n        print(1)\n",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, name, source, line, expected) in cases {
+        let (resp, content) = inline_in_fresh_file(
+            name,
+            source,
+            if name.starts_with('g') { "g" } else { "f" },
+            line,
+        );
+        if resp["success"] != true || !content.contains(expected) {
+            failures.push(format!(
+                "{label}: expected the file to contain {expected:?}; response {resp:?}; file {content:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
+}
+
 // ---------------------------------------------------------------------------
 // Error path tests
 // ---------------------------------------------------------------------------

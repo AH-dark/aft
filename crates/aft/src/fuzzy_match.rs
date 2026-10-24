@@ -698,29 +698,80 @@ fn lines_inside_new_strings(
         if !at_line_start || piece.trim().is_empty() {
             continue;
         }
-        let mut node = root.descendant_for_byte_range(line_start, line_start);
-        while let Some(current) = node {
-            // A heredoc body or terminator can begin exactly at the line
-            // start; every byte of it is still literal text.
-            let starts_before = current.start_byte() < line_start
-                || (current.start_byte() == line_start && current.kind().contains("heredoc"));
-            if is_string_literal_kind(current.kind())
-                && starts_before
-                && line_start < current.end_byte()
-            {
-                if current.start_byte() < matched.byte_start {
-                    return Err(ambiguous_indentation(format!(
-                        "line {} of newString is inside a multi-line string that starts before the edit, and that string's intended text is unclear",
-                        index + 1
-                    )));
-                }
-                inside[index] = true;
-                break;
+        if let Some(string) = string_literal_at_line_start(root, line_start) {
+            if string.start_byte() < matched.byte_start {
+                return Err(ambiguous_indentation(format!(
+                    "line {} of newString is inside a multi-line string that starts before the edit, and that string's intended text is unclear",
+                    index + 1
+                )));
             }
-            node = current.parent();
+            inside[index] = true;
         }
     }
     Ok(inside)
+}
+
+/// The string literal (see [`is_string_literal_kind`]) that the line
+/// beginning at byte `line_start` starts inside, if any. Such a line is part
+/// of the string's value: adding or removing its leading whitespace changes
+/// the string.
+pub(crate) fn string_literal_at_line_start(
+    root: tree_sitter::Node<'_>,
+    line_start: usize,
+) -> Option<tree_sitter::Node<'_>> {
+    let mut node = root.descendant_for_byte_range(line_start, line_start);
+    while let Some(current) = node {
+        // A heredoc body or terminator can begin exactly at the line start;
+        // every byte of it is still literal text.
+        let starts_before = current.start_byte() < line_start
+            || (current.start_byte() == line_start && current.kind().contains("heredoc"));
+        if is_string_literal_kind(current.kind())
+            && starts_before
+            && line_start < current.end_byte()
+        {
+            return Some(current);
+        }
+        node = current.parent();
+    }
+    None
+}
+
+/// For each line of `text` (as split by `str::lines`), whether it begins
+/// inside a multi-line string literal of `text`, parsed with `lang`. Code
+/// generators that re-indent a block (inlining a function body) use it to
+/// leave string contents alone. Text with no string delimiter is not parsed.
+/// `None` when the boundaries cannot be determined: the parse fails, or it
+/// has errors while string delimiters are present.
+pub(crate) fn text_lines_inside_strings(
+    text: &str,
+    path: &std::path::Path,
+    lang: crate::parser::LangId,
+) -> Option<Vec<bool>> {
+    let mut inside = vec![false; text.lines().count()];
+    if !has_string_delimiter(text) {
+        return Some(inside);
+    }
+    #[cfg(test)]
+    STRING_LINE_PARSES.with(|count| count.set(count.get() + 1));
+    let tree = crate::parser::parse_source_with_cached_parser(path, text, lang).ok()?;
+    let root = tree.root_node();
+    if region_has_error(root, 0, text.len()) {
+        return None;
+    }
+    let mut line_start = 0;
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        if index > 0 && string_literal_at_line_start(root, line_start).is_some() {
+            inside[index] = true;
+        }
+        line_start += line.len();
+    }
+    Some(inside)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Full parses made to find which lines are inside string literals.
+    pub(crate) static STRING_LINE_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The replacement for `matched`, with every line moved by the match's
@@ -1764,6 +1815,29 @@ mod indentation_shift_tests {
             )
             .unwrap(),
             "- a\n  ```\n  code\n  ```"
+        );
+    }
+
+    #[test]
+    fn text_lines_inside_strings_marks_string_interiors_only() {
+        let path = std::path::Path::new("t.py");
+        let lang = crate::parser::LangId::Python;
+        let body = "    \"\"\"Doc\n    more\n    \"\"\"\n    x = (\"a\"\n         \"b\")\n";
+        assert_eq!(
+            text_lines_inside_strings(body, path, lang),
+            Some(vec![false, true, true, false, false])
+        );
+        // Text without a string delimiter is answered without parsing.
+        STRING_LINE_PARSES.with(|count| count.set(0));
+        assert_eq!(
+            text_lines_inside_strings("a = 1\nb = 2\n", path, lang),
+            Some(vec![false, false])
+        );
+        assert_eq!(STRING_LINE_PARSES.with(|count| count.get()), 0);
+        // A broken parse with quotes present gives no answer.
+        assert_eq!(
+            text_lines_inside_strings("x = ('a'\ny = )\n", path, lang),
+            None
         );
     }
 }

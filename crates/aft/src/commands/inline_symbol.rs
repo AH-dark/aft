@@ -379,6 +379,20 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         Some(indent) => format!("{indent}{substituted_body}"),
         None => substituted_body,
     };
+    // Lines inside a multi-line string literal are part of the string's
+    // value, so re-indenting the body must leave them exactly as written.
+    let body_lines = trim_body_keeping_indent(&substituted_body);
+    let Some(in_string) = crate::fuzzy_match::text_lines_inside_strings(body_lines, &path, lang)
+    else {
+        return Response::error(
+            &req.id,
+            "ambiguous_indentation",
+            format!(
+                "inline_symbol: the body of '{}' does not parse cleanly, so its multi-line strings cannot be told apart from code and re-indenting it could change a string's value. Nothing was changed.",
+                symbol
+            ),
+        );
+    };
 
     // --- Build replacement text ---
     //
@@ -393,7 +407,8 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // before the replacement's `  const ...`.
     let replacement_indent = get_line_indent(&source, call_site_line as usize);
     let replacement_text = build_inline_replacement(
-        &substituted_body,
+        body_lines,
+        &in_string,
         &call_context,
         &replacement_indent,
         lang,
@@ -1067,39 +1082,27 @@ fn is_simple_identifier(value: &str) -> bool {
 mod unicode_tests {
     #[test]
     fn mixed_unicode_indent_is_stripped_on_character_boundaries() {
+        let body = super::strip_braces("{\n first();\n\u{3000}second();\n}");
+        let lines: Vec<&str> = body.lines().collect();
         assert_eq!(
-            super::strip_braces("{\n first();\n\u{3000}second();\n}"),
-            "first();\nsecond();"
+            super::strip_common_indent(&lines, &[false, false]),
+            ["first();", "second();"]
         );
     }
 }
 
-/// Strip outer braces and de-indent a statement block.
+/// Strip the outer braces of a statement block and the blank lines just
+/// inside them. The body keeps its indentation: `strip_common_indent` removes
+/// it later, skipping lines inside multi-line strings (a template literal's
+/// lines are part of its value).
 fn strip_braces(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.starts_with('{') && trimmed.ends_with('}') {
         let inner = &trimmed[1..trimmed.len() - 1];
-        // Remove leading/trailing newlines
-        let inner = inner.trim_start_matches('\n').trim_end_matches('\n');
-        // De-indent: find minimum indent and strip it
-        let min_indent = inner
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| l.chars().take_while(|ch| ch.is_whitespace()).count())
-            .min()
-            .unwrap_or(0);
-
         inner
-            .lines()
-            .map(|l| {
-                if l.trim().is_empty() {
-                    String::new()
-                } else {
-                    l.chars().skip(min_indent).collect::<String>()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .trim_start_matches('\n')
+            .trim_end_matches('\n')
+            .to_string()
     } else {
         text.to_string()
     }
@@ -1500,8 +1503,11 @@ fn trim_body_keeping_indent(body: &str) -> &str {
 /// - "assignment": `const x = fn()` → body statements + assign return value to x
 /// - "standalone": `fn()` → body statements (strip return)
 /// - "return": `return fn()` → body statements (keep return)
+/// `in_string[i]` says line `i` of the trimmed body starts inside a
+/// multi-line string literal; such lines are emitted exactly as written.
 fn build_inline_replacement(
     body: &str,
+    in_string: &[bool],
     call_context: &str,
     indent: &str,
     lang: LangId,
@@ -1531,18 +1537,18 @@ fn build_inline_replacement(
                 }
             } else {
                 // Multi-line: emit all non-return lines, then assign return expr
-                build_multiline_assignment(&lines, indent, lang, assignment_var)
+                build_multiline_assignment(&lines, in_string, indent, lang, assignment_var)
             }
         }
         "standalone" => {
             // Strip return statements, keep everything else
-            build_multiline_standalone(&lines, indent, lang)
+            build_multiline_standalone(&lines, in_string, indent, lang)
         }
         "return" => {
             // Keep return statements as-is
-            build_multiline_replacement(&lines, indent, lang)
+            build_multiline_replacement(&lines, in_string, indent, lang)
         }
-        _ => build_multiline_replacement(&lines, indent, lang),
+        _ => build_multiline_replacement(&lines, in_string, indent, lang),
     }
 }
 
@@ -1583,22 +1589,29 @@ fn build_assignment_line(var: &str, expr: &str, indent: &str, lang: LangId) -> S
 /// Non-return lines are kept; the return line becomes an assignment.
 fn build_multiline_assignment(
     lines: &[&str],
+    in_string: &[bool],
     indent: &str,
     lang: LangId,
     assignment_var: Option<&str>,
 ) -> String {
-    let normalized = strip_common_indent(lines);
+    let normalized = strip_common_indent(lines, in_string);
     let mut result = Vec::new();
-    for line in &normalized {
+    for (index, line) in normalized.iter().enumerate() {
         let trimmed_start = line.trim_start();
-        if trimmed_start.is_empty() {
+        if is_string_line(in_string, index) {
+            result.push(line.clone());
+        } else if trimmed_start.is_empty() {
             result.push(String::new());
         } else if let Some(Some(expr)) = parse_return_statement(trimmed_start) {
             // Convert return to assignment, preserving any relative nesting indent.
             if let Some(var) = assignment_var {
                 let line_indent = leading_whitespace(line);
                 let assignment_indent = format!("{}{}", indent, line_indent);
-                result.push(build_assignment_line(var, expr, &assignment_indent, lang));
+                if let Some(open) = return_continuing_into_string(trimmed_start, in_string, index) {
+                    result.push(build_assignment_open(var, open, &assignment_indent, lang));
+                } else {
+                    result.push(build_assignment_line(var, expr, &assignment_indent, lang));
+                }
             }
             // else: drop the return (void return in assignment context shouldn't happen)
         } else if parse_return_statement(trimmed_start).is_some() {
@@ -1611,19 +1624,30 @@ fn build_multiline_assignment(
 }
 
 /// Build multi-line replacement for standalone context.
-fn build_multiline_standalone(lines: &[&str], indent: &str, lang: LangId) -> String {
-    let normalized = strip_common_indent(lines);
+fn build_multiline_standalone(
+    lines: &[&str],
+    in_string: &[bool],
+    indent: &str,
+    lang: LangId,
+) -> String {
+    let normalized = strip_common_indent(lines, in_string);
     let mut result = Vec::new();
-    for line in &normalized {
+    for (index, line) in normalized.iter().enumerate() {
         let trimmed_start = line.trim_start();
-        if trimmed_start.is_empty() {
+        if is_string_line(in_string, index) {
+            result.push(line.clone());
+        } else if trimmed_start.is_empty() {
             result.push(String::new());
         } else if let Some(return_expr) = parse_return_statement(trimmed_start) {
             if let Some(expr) = return_expr {
                 let line_indent = leading_whitespace(line);
-                match lang {
-                    LangId::Python => result.push(format!("{}{}{}", indent, line_indent, expr)),
-                    _ => result.push(format!("{}{}{};", indent, line_indent, expr)),
+                if let Some(open) = return_continuing_into_string(trimmed_start, in_string, index) {
+                    result.push(format!("{}{}{}", indent, line_indent, open));
+                } else {
+                    match lang {
+                        LangId::Python => result.push(format!("{}{}{}", indent, line_indent, expr)),
+                        _ => result.push(format!("{}{}{};", indent, line_indent, expr)),
+                    }
                 }
             }
             // Bare `return;` has no side effects and is dropped.
@@ -1635,11 +1659,19 @@ fn build_multiline_standalone(lines: &[&str], indent: &str, lang: LangId) -> Str
 }
 
 /// Build multi-line replacement with proper indentation (preserving all lines).
-fn build_multiline_replacement(lines: &[&str], indent: &str, _lang: LangId) -> String {
-    strip_common_indent(lines)
+fn build_multiline_replacement(
+    lines: &[&str],
+    in_string: &[bool],
+    indent: &str,
+    _lang: LangId,
+) -> String {
+    strip_common_indent(lines, in_string)
         .iter()
-        .map(|line| {
-            if line.trim().is_empty() {
+        .enumerate()
+        .map(|(index, line)| {
+            if is_string_line(in_string, index) {
+                line.clone()
+            } else if line.trim().is_empty() {
                 String::new()
             } else {
                 format!("{}{}", indent, line)
@@ -1649,21 +1681,59 @@ fn build_multiline_replacement(lines: &[&str], indent: &str, _lang: LangId) -> S
         .join("\n")
 }
 
-fn strip_common_indent(lines: &[&str]) -> Vec<String> {
+fn is_string_line(in_string: &[bool], index: usize) -> bool {
+    in_string.get(index).copied().unwrap_or(false)
+}
+
+/// The returned expression exactly as written, when the `return` on line
+/// `index` continues into a multi-line string on the next line. The
+/// statement ends (and any `;` sits) on a later line, so this line is copied
+/// without trimming or appending a terminator: either would change the
+/// string's text.
+fn return_continuing_into_string<'l>(
+    trimmed_line: &'l str,
+    in_string: &[bool],
+    index: usize,
+) -> Option<&'l str> {
+    if !is_string_line(in_string, index + 1) {
+        return None;
+    }
+    trimmed_line.strip_prefix("return").map(str::trim_start)
+}
+
+/// The opening line of an assignment whose value continues on later lines
+/// (inside a multi-line string), so no terminator is appended.
+fn build_assignment_open(var: &str, value: &str, indent: &str, lang: LangId) -> String {
+    match lang {
+        LangId::Python => format!("{}{} = {}", indent, var, value),
+        _ => format!("{}const {} = {}", indent, var, value),
+    }
+}
+
+/// Remove the indentation common to the body's code lines. Lines inside a
+/// multi-line string literal (`in_string`) are part of the string's value:
+/// they neither count toward the common indentation nor lose any of it, and
+/// come back exactly as written. Indentation is counted in characters, so a
+/// mix of ASCII and Unicode whitespace is stripped on character boundaries.
+fn strip_common_indent(lines: &[&str], in_string: &[bool]) -> Vec<String> {
     let common_indent = lines
         .iter()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| leading_whitespace(line).len())
+        .enumerate()
+        .filter(|(index, line)| !is_string_line(in_string, *index) && !line.trim().is_empty())
+        .map(|(_, line)| leading_whitespace(line).chars().count())
         .min()
         .unwrap_or(0);
 
     lines
         .iter()
-        .map(|line| {
-            if line.trim().is_empty() {
+        .enumerate()
+        .map(|(index, line)| {
+            if is_string_line(in_string, index) {
+                line.to_string()
+            } else if line.trim().is_empty() {
                 String::new()
             } else {
-                line.get(common_indent..).unwrap_or(line).to_string()
+                line.chars().skip(common_indent).collect()
             }
         })
         .collect()
