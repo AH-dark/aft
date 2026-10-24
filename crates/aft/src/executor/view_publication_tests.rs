@@ -1365,6 +1365,186 @@ fn publication_does_not_reuse_a_deleted_unchanged_member() {
 }
 
 #[test]
+fn publication_rescan_then_event_still_reads_the_whole_checkout() {
+    use crate::watcher_filter::{RescanReason, WatcherDispatchEvent};
+    let fixture = Fixture::new();
+    std::fs::write(fixture.job_root().join("later.rs"), "pub fn before() {}\n").unwrap();
+    commit(&fixture.job_root());
+    let generation = fixture
+        .ctx
+        .publish_view_paths(BTreeSet::new(), true)
+        .unwrap()
+        .generation
+        .unwrap();
+    let before = fixture.view.load_manifest(&generation).unwrap();
+    std::fs::write(
+        fixture.job_root().join("tracked.rs"),
+        "pub fn missed_by_watcher() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.job_root().join("later.rs"),
+        "pub fn reported() {}\n",
+    )
+    .unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    *fixture.ctx.watcher_rx().lock() = Some(rx);
+    tx.send(WatcherDispatchEvent::RescanRequired(
+        RescanReason::KernelDropped,
+    ))
+    .unwrap();
+    // Complete the rescan before the later event arrives in the quiet window.
+    crate::runtime_drain::drain_watcher_to_completion_for_test(&fixture.ctx, usize::MAX);
+    assert!(fixture
+        .ctx
+        .watcher_drain_slice()
+        .lock()
+        .as_ref()
+        .unwrap()
+        .view_publication_due
+        .is_some());
+    tx.send(WatcherDispatchEvent::Paths(vec![fixture
+        .job_root()
+        .join("later.rs")]))
+        .unwrap();
+    crate::runtime_drain::drain_watcher_to_completion_for_test(&fixture.ctx, usize::MAX);
+    let mut state = fixture.ctx.watcher_drain_slice().lock().take().unwrap();
+    state.view_publication_due = Some(Instant::now());
+    crate::runtime_drain::publish_view_if_quiet(&fixture.ctx, &mut state);
+    let generation = fixture.view.current_generation().unwrap().unwrap();
+    let after = fixture.view.load_manifest(&generation).unwrap();
+    let missed = crate::views::RelPath::new(b"tracked.rs".to_vec()).unwrap();
+    assert_ne!(
+        before.get(&missed),
+        after.get(&missed),
+        "the scheduled publication must read the edit omitted by the dropped events"
+    );
+    assert!(state.view_publication_due.is_none());
+}
+
+#[test]
+fn publication_unrepresentable_watcher_path_preserves_full_read() {
+    for root_event in [false, true] {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.job_root().join("other.rs"), "pub fn before() {}\n").unwrap();
+        commit(&fixture.job_root());
+        fixture
+            .ctx
+            .publish_view_paths(BTreeSet::new(), true)
+            .unwrap();
+        let generation = fixture.view.current_generation().unwrap().unwrap();
+        let before = fixture.view.load_manifest(&generation).unwrap();
+        std::fs::write(
+            fixture.job_root().join("tracked.rs"),
+            "pub fn missed_spelling() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.job_root().join("other.rs"),
+            "pub fn reported() {}\n",
+        )
+        .unwrap();
+        let mut state = crate::context::WatcherDrainSliceState::new(
+            fixture.ctx.configure_generation(),
+            fixture.ctx.configure_content_generation(),
+        );
+        state
+            .view_publication_paths
+            .insert(fixture.job_root().join("other.rs"));
+        state.view_publication_paths.insert(if root_event {
+            fixture.job_root()
+        } else {
+            fixture
+                .job_root()
+                .with_file_name("different-root-spelling")
+                .join("tracked.rs")
+        });
+        state.view_publication_due = Some(Instant::now());
+        crate::runtime_drain::publish_view_if_quiet(&fixture.ctx, &mut state);
+        let generation = fixture.view.current_generation().unwrap().unwrap();
+        let after = fixture.view.load_manifest(&generation).unwrap();
+        let path = crate::views::RelPath::new(b"tracked.rs".to_vec()).unwrap();
+        assert_ne!(
+            before.get(&path),
+            after.get(&path),
+            "unrepresentable event was silently discarded: root_event={root_event}"
+        );
+    }
+}
+
+#[test]
+fn publication_idle_full_verification_runs_without_a_watcher_event() {
+    for with_receiver in [false, true] {
+        let fixture = Fixture::new();
+        let _sender = if with_receiver {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            *fixture.ctx.watcher_rx().lock() = Some(rx);
+            Some(tx)
+        } else {
+            None
+        };
+        let before = fixture.view.load_manifest(&fixture.initial).unwrap();
+        std::fs::write(
+            fixture.job_root().join("tracked.rs"),
+            "pub fn missed_during_silence() {}\n",
+        )
+        .unwrap();
+        crate::views::assembly::expire_verification_for_test(fixture.view.view_dir());
+        assert!(
+            fixture.ctx.watcher_drain_has_work(),
+            "the maintenance pump must wake an idle root at its verification deadline"
+        );
+        crate::runtime_drain::drain_watcher_to_completion_for_test(&fixture.ctx, usize::MAX);
+        let generation = fixture.view.current_generation().unwrap().unwrap();
+        let after = fixture.view.load_manifest(&generation).unwrap();
+        assert_ne!(
+        before, after,
+        "no new watcher event is needed to discover the missed edit: with_receiver={with_receiver}"
+    );
+        assert!(!fixture.ctx.view_full_verification_due());
+        assert!(fixture
+            .ctx
+            .watcher_drain_slice()
+            .lock()
+            .as_ref()
+            .unwrap()
+            .view_publication_due
+            .is_none());
+    }
+}
+
+#[test]
+fn publication_cache_is_released_on_quiesce_eviction_and_clear() {
+    for action in ["quiesce", "evict", "try_evict", "clear", "replace"] {
+        let fixture = Fixture::new();
+        let view_dir = fixture.view.view_dir();
+        assert!(crate::views::assembly::cache_contains_for_test(view_dir));
+        match action {
+            "quiesce" => fixture.ctx.mark_subc_unbound(),
+            "evict" => assert!(fixture.ctx.evict_idle_artifacts()),
+            "try_evict" => assert!(fixture.ctx.try_evict_idle_artifacts()),
+            "clear" => fixture.ctx.clear_view_runtime(),
+            "replace" => {
+                let mut snapshot = fixture.ctx.view_runtime_snapshot().unwrap();
+                let replacement =
+                    crate::views::ViewStore::open(fixture._storage.path(), "replacement").unwrap();
+                snapshot.scope = "replacement".into();
+                snapshot.view_dir = replacement.view_dir().to_path_buf();
+                snapshot.generation = None;
+                snapshot.manifest = None;
+                snapshot.query_pin = None;
+                fixture.ctx.install_view_runtime(snapshot, None);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !crate::views::assembly::cache_contains_for_test(view_dir),
+            "cache survived {action}"
+        );
+    }
+}
+
+#[test]
 fn publication_io_error_names_operation_and_path() {
     let fixture = Fixture::new();
     let path = fixture.project.path().join("tracked.rs");

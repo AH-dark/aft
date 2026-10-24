@@ -5,6 +5,7 @@ use std::time::Instant;
 
 #[cfg(test)]
 use rusqlite::Connection;
+#[cfg(test)]
 use rusqlite::OptionalExtension;
 
 use crate::alias::{head_tree_entries, AliasStore, GitMode};
@@ -18,6 +19,37 @@ use super::{
     PublicationClosure, PublicationRequest, PublishOutcome, RegularPlanes, RelPath, Result,
     ViewError, ViewStore,
 };
+
+#[path = "manifest_incremental.rs"]
+mod manifest_incremental;
+
+pub(crate) use manifest_incremental::CacheLease;
+
+pub(crate) fn release_manifest_cache(view_dir: &Path) {
+    manifest_incremental::release_cache(view_dir);
+}
+
+pub(crate) fn try_release_manifest_cache(view_dir: &Path) -> bool {
+    manifest_incremental::try_release_cache(view_dir)
+}
+
+#[cfg(test)]
+#[path = "manifest_publication_bench.rs"]
+mod manifest_publication_bench;
+
+pub(crate) fn full_verification_due(view_dir: &Path) -> bool {
+    manifest_incremental::full_verification_due(view_dir)
+}
+
+#[cfg(test)]
+pub(crate) fn expire_verification_for_test(view_dir: &Path) {
+    manifest_incremental::expire_verification_for_test(view_dir);
+}
+
+#[cfg(test)]
+pub(crate) fn cache_contains_for_test(view_dir: &Path) -> bool {
+    manifest_incremental::cache_contains_for_test(view_dir)
+}
 
 #[derive(Clone, Debug)]
 pub struct AssemblyRequest {
@@ -137,6 +169,8 @@ pub struct PreparedAssembly {
     settlement: Option<StatusSettlement>,
     /// Status changes the commit accepted, waiting for `settle_status`.
     committed_settlement: Option<StatusSettlement>,
+    manifest_cache: Option<(ViewStore, manifest_incremental::CachedManifest, bool)>,
+    _verification: manifest_incremental::PreparationVerification,
 }
 
 /// The path-status changes a complete assembly computed: pending rows to
@@ -451,6 +485,9 @@ impl PreparedAssembly {
             // generation being served and applies as is.
             self.accept_settlement();
         }
+        if let Some((view, cached, verified)) = self.manifest_cache.take() {
+            manifest_incremental::remember(&view, cached, verified, &self._verification);
+        }
         self.profile.finish();
         Ok(AssemblyReport {
             generation: self.report.generation.take(),
@@ -576,6 +613,13 @@ pub fn prepare_checkout_deferring(
     defer_derived: bool,
     phase: &mut impl FnMut(&str) -> Result<()>,
 ) -> Result<PreparedAssembly> {
+    // Register before delays, callbacks or opening stores: lifecycle release
+    // must invalidate every preparation already admitted for this view.
+    let verification = manifest_incremental::begin_preparation(&ViewStore::cache_key(
+        &request.storage,
+        &request.scope,
+    )?);
+    let verification_due = verification.due;
     publication_delay_for_test();
     let readiness_deadline = Instant::now() + crate::db::STEADY_BUSY_TIMEOUT;
     let mut timing = super::profile::PublicationTiming::new(&request.project_root);
@@ -593,10 +637,14 @@ pub fn prepare_checkout_deferring(
         .map(|generation| crate::pins::QueryPin::acquire(view.view_dir(), generation))
         .transpose()
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    let previous = current_generation
-        .as_deref()
-        .map(|generation| view.load_manifest(generation))
-        .transpose()?;
+    let cached = manifest_incremental::previous(&view, current_generation.as_deref());
+    let previous = match &cached {
+        Some(cached) => Some(cached.manifest.clone()),
+        None => current_generation
+            .as_deref()
+            .map(|generation| view.load_manifest(generation))
+            .transpose()?,
+    };
     // A generation published while its derived graph was deferred has no
     // derived file. That is no base at all, not a base that failed a check.
     let current_derived_built = current_generation
@@ -653,8 +701,13 @@ pub fn prepare_checkout_deferring(
     let marked_through = status
         .mark_epoch()
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    let head = head_tree_entries(&request.project_root)
-        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    let manifest_incremental::HeadRead {
+        tree: head_tree,
+        entries: head,
+        cached: head_cached,
+        snapshot: mut head_snapshot,
+        paths: head_paths,
+    } = manifest_incremental::head(request, &view)?;
     profile.head_ms = head_started.elapsed().as_millis();
     timing.phase("head_tree");
     let mut callgraph = BlobStore::open(
@@ -673,16 +726,30 @@ pub fn prepare_checkout_deferring(
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
 
     timing.phase("store_opens");
-    let previous_entries = previous
-        .as_ref()
-        .map(|manifest| {
-            manifest
-                .entries()
-                .map(|(path, entry)| (path.as_bytes().to_vec(), entry.clone()))
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
-    let rebuild_all = request.changed_paths.is_empty();
+    let stamps = manifest_incremental::StoreStamps::read(&callgraph, &semantic)?;
+    let admission = manifest_incremental::admission_snapshot(&request.storage);
+    let trusted = cached.as_ref().filter(|cached| cached.stamps == stamps);
+    // Directory notifications may be the only evidence for changed, removed,
+    // or renamed children. Read their whole HEAD subtree rather than treating
+    // its cached members as individually observed unchanged files.
+    let rebuild_all = request.changed_paths.is_empty()
+        || !head_cached
+        || cached
+            .as_ref()
+            .is_none_or(|cached| cached.tree != head_tree)
+        || manifest_incremental::delta_requires_full_read(
+            &head,
+            &head_paths,
+            &request.changed_paths,
+        );
+    // A batch naming no HEAD member is not evidence that the checkout was
+    // observed completely; preserve the full metadata/probe path in that case.
+    let incremental = !rebuild_all
+        && trusted.is_some()
+        && cached
+            .as_ref()
+            .is_some_and(|cached| cached.admission == admission);
+    let verify = verification_due && previous.is_some();
     let assembly_started = Instant::now();
     let mut blocking_paths = BTreeSet::new();
     let mut semantic_pending_paths = BTreeSet::new();
@@ -696,41 +763,72 @@ pub fn prepare_checkout_deferring(
     // from the bytes in hand so classifying it later needs no second read.
     let mut fresh_semantic_classes = std::collections::HashMap::new();
     let mut candidates = Vec::with_capacity(head.len());
+    let mut member_metadata = BTreeMap::new();
     let reader = CandidateReader {
         request,
-        previous_entries: &previous_entries,
+        previous: previous.as_ref(),
         callgraph: &callgraph,
     };
 
     #[cfg(test)]
-    let head = rewrite_head_for_test(head);
-    for tracked in head {
+    let head = std::sync::Arc::new(rewrite_head_for_test((*head).clone()));
+    for tracked in head.iter().cloned() {
         let rel_path = RelPath::new(tracked.rel_path.clone())?;
         let absolute = request
             .project_root
             .join(path_from_bytes(&tracked.rel_path));
         // Git membership includes database fixtures and internal storage. Omit
         // them before either opening bytes or reusing an older manifest entry.
-        if crate::project_content::is_excluded(&absolute) {
+        // A watcher-complete delta also permits reusing regular-file identity.
+        // Recheck live registrations against that identity: a source can become
+        // a database without its inode changing. Symlinks take fresh admission
+        // because their target can change independently of the link itself.
+        let cached_metadata = cached
+            .as_ref()
+            .and_then(|cached| cached.metadata.get(&tracked.rel_path))
+            .filter(|metadata| {
+                incremental
+                    && !request.changed_paths.contains(&tracked.rel_path)
+                    && metadata.is_file()
+            });
+        let excluded = match cached_metadata {
+            Some(metadata) => {
+                crate::project_content::is_excluded_event(&absolute)
+                    || crate::db::file_identity::is_live_sqlite_file_with_metadata(
+                        &absolute,
+                        Some(metadata),
+                    )
+            }
+            None => crate::project_content::is_excluded(&absolute),
+        };
+        if excluded {
             continue;
         }
-        // HEAD describes committed membership, not the checkout. Check absence
-        // before reusing an unchanged entry as well as when reading changed bytes.
+        // HEAD describes committed membership, not checkout existence. Fresh
+        // metadata checks absence; a complete delta can reuse its old evidence.
         // Do not follow symlinks: a dangling link is still a checkout member.
-        if matches!(tracked.mode, GitMode::Regular { .. } | GitMode::Symlink)
-            && working_tree_io(
-                fs::symlink_metadata(&absolute),
-                "reading metadata for",
-                &absolute,
-            )?
-            .is_none()
-        {
-            continue;
+        if matches!(tracked.mode, GitMode::Regular { .. } | GitMode::Symlink) {
+            let metadata = match cached_metadata {
+                Some(metadata) => Some(metadata.clone()),
+                None => working_tree_io(
+                    crate::db::file_identity::candidate_metadata(&absolute),
+                    "reading metadata for",
+                    &absolute,
+                )?,
+            };
+            let Some(metadata) = metadata else {
+                continue;
+            };
+            member_metadata.insert(tracked.rel_path.clone(), metadata);
         }
         if !rebuild_all && !request.changed_paths.contains(&tracked.rel_path) {
-            if let Some(entry) = previous_entries.get(&tracked.rel_path).filter(|entry| {
-                !(request.callgraph && lacks_callgraph_key(entry, &tracked.rel_path))
-            }) {
+            if let Some(entry) = previous
+                .as_ref()
+                .and_then(|manifest| manifest.get(&rel_path))
+                .filter(|entry| {
+                    !(request.callgraph && lacks_callgraph_key(entry, &tracked.rel_path))
+                })
+            {
                 candidates.push(Candidate {
                     path: rel_path,
                     entry: entry.clone(),
@@ -808,14 +906,67 @@ pub fn prepare_checkout_deferring(
         }
     }
 
-    let healed = heal_missing_payloads(
+    let mut healed = heal_missing_payloads(
         &reader,
         &semantic,
         &mut candidates,
         &mut fresh_skips,
         &mut fresh_reads,
+        if incremental { previous.as_ref() } else { None },
         phase,
     )?;
+    if verify {
+        let mut full_request = request.clone();
+        full_request.changed_paths.clear();
+        let full_head = manifest_incremental::head(&full_request, &view)?;
+        head_snapshot = full_head.snapshot;
+        let mut full_skips = Vec::new();
+        let mut full_reads = std::collections::HashSet::new();
+        let mut full = manifest_incremental::full_candidates(
+            &reader,
+            &full_head.entries,
+            &mut full_skips,
+            &mut full_reads,
+            phase,
+        )?;
+        let full_healed = heal_missing_payloads(
+            &reader,
+            &semantic,
+            &mut full,
+            &mut full_skips,
+            &mut full_reads,
+            None,
+            phase,
+        )?;
+        let entries = |candidates: &[Candidate]| {
+            Manifest::new(
+                candidates
+                    .iter()
+                    .map(|candidate| (candidate.path.clone(), candidate.entry.clone())),
+            )
+        };
+        if entries(&candidates)?.to_json_bytes()? != entries(&full)?.to_json_bytes()? {
+            if let Some(count) = manifest_incremental::note_mismatch(&view) {
+                log::warn!("view incremental manifest verification mismatch root={} count={count}; using full rebuild", request.project_root.display());
+            }
+        }
+        // Even equal entries can have required payload repairs. Use the full
+        // candidates, including those payloads, on every verification pass.
+        candidates = full;
+        healed = full_healed;
+        fresh_skips = full_skips;
+        fresh_reads = full_reads;
+        fresh_semantic_classes.clear();
+        member_metadata.clear();
+        for candidate in &candidates {
+            let path = request
+                .project_root
+                .join(path_from_bytes(candidate.path.as_bytes()));
+            if let Ok(metadata) = crate::db::file_identity::candidate_metadata(&path) {
+                member_metadata.insert(candidate.path.as_bytes().to_vec(), metadata);
+            }
+        }
+    }
     drop(reader);
 
     timing.phase("candidate_assembly");
@@ -965,6 +1116,8 @@ pub fn prepare_checkout_deferring(
         profile,
         settlement: None,
         committed_settlement: None,
+        manifest_cache: None,
+        _verification: verification,
     };
     prepared.profile.enter(1, phase)?;
     timing.phase("assembly_pin");
@@ -1135,6 +1288,19 @@ pub fn prepare_checkout_deferring(
         // still replaces one whose derived file fails the readiness check.
         && (base_ready || (defer_derived && !current_derived_built))
     {
+        prepared.manifest_cache = Some((
+            view.clone(),
+            manifest_incremental::CachedManifest {
+                generation: current_generation.clone().expect("no-op generation"),
+                manifest: manifest.clone(),
+                stamps: stamps.clone(),
+                tree: head_tree.clone(),
+                metadata: std::sync::Arc::new(member_metadata),
+                admission,
+                head: head_snapshot,
+            },
+            verification_due,
+        ));
         prepared.profile.outcome = "no_op";
         prepared.profile.seed_source = if base_ready { "own" } else { "deferred" };
         prepared.profile.cold_build_reason = "none";
@@ -1179,7 +1345,11 @@ pub fn prepare_checkout_deferring(
                 let base_path = view.derived_path(base)?;
                 if base_path.is_file() {
                     let owner = view.derived_owner(base)?;
-                    match view.load_manifest(&owner) {
+                    match if Some(owner.as_str()) == current_generation.as_deref() {
+                        Ok(previous.clone().expect("current manifest"))
+                    } else {
+                        view.load_manifest(&owner)
+                    } {
                         Ok(base_manifest) => Some((base_path, base_manifest)),
                         Err(ViewError::IoAt { source, .. })
                             if source.kind() == std::io::ErrorKind::NotFound =>
@@ -1392,11 +1562,15 @@ pub fn prepare_checkout_deferring(
         trigram_artifact: trigram.clone(),
         alias_database: aliases.path().to_path_buf(),
     };
-    let closure = SqliteClosure {
-        semantic: semantic.path().to_path_buf(),
-        callgraph: callgraph.path().to_path_buf(),
+    let closure = manifest_incremental::StoreClosure {
+        semantic: &semantic,
+        callgraph: &callgraph,
         trigram,
-        connections: Default::default(),
+        trusted: if !incremental || verify {
+            None
+        } else {
+            previous.as_ref().map(|manifest| (manifest, stamps.clone()))
+        },
     };
     prepared.profile.io.enter(super::io::Phase::Closure);
     let closure_started = Instant::now();
@@ -1427,6 +1601,19 @@ pub fn prepare_checkout_deferring(
         .unwrap_or(0);
     prepared.profile.enter(3, phase)?;
     prepared.publication = Some(publication);
+    prepared.manifest_cache = Some((
+        view.clone(),
+        manifest_incremental::CachedManifest {
+            generation: next_generation.clone(),
+            manifest: manifest.clone(),
+            stamps,
+            tree: head_tree,
+            metadata: std::sync::Arc::new(member_metadata),
+            admission,
+            head: head_snapshot,
+        },
+        verification_due,
+    ));
     prepared.report = AssemblyReport {
         generation: Some(next_generation),
         manifest: Some(manifest),
@@ -1934,6 +2121,7 @@ fn generation_number(generation: &str) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 struct SqliteClosure {
     semantic: PathBuf,
     callgraph: PathBuf,
@@ -1943,6 +2131,7 @@ struct SqliteClosure {
     connections: std::cell::RefCell<BTreeMap<bool, crate::db::lifecycle::TrackedConnection>>,
 }
 
+#[cfg(test)]
 impl PublicationClosure for SqliteClosure {
     fn contains_blob(&self, plane: ArtifactPlane, full_key: &str) -> Result<bool> {
         let Some(key) = decode_hex(full_key) else {
@@ -2209,7 +2398,7 @@ pub const MISSING_PAYLOAD_SOURCE_UNREADABLE: &str =
 /// Turns working-tree files into manifest candidates for one assembly.
 struct CandidateReader<'a> {
     request: &'a AssemblyRequest,
-    previous_entries: &'a BTreeMap<Vec<u8>, ManifestEntry>,
+    previous: Option<&'a Manifest>,
     callgraph: &'a BlobStore,
 }
 
@@ -2250,8 +2439,8 @@ impl CandidateReader<'_> {
                 let key_hex = key.to_hex();
                 let callgraph_is_current = trust_previous_key
                     && self
-                        .previous_entries
-                        .get(rel_path.as_bytes())
+                        .previous
+                        .and_then(|manifest| manifest.get(&rel_path))
                         .is_some_and(|entry| {
                             manifest_entry_callgraph_key(entry) == Some(key_hex.as_str())
                         });
@@ -2357,10 +2546,19 @@ fn heal_missing_payloads(
     candidates: &mut Vec<Candidate>,
     fresh_skips: &mut Vec<(Vec<u8>, Option<SkipReason>)>,
     fresh_reads: &mut std::collections::HashSet<Vec<u8>>,
+    trusted: Option<&Manifest>,
     phase: &mut impl FnMut(&str) -> Result<()>,
 ) -> Result<HealOutcome> {
     let request = reader.request;
     let mut outcome = HealOutcome::default();
+    let old_keys = trusted
+        .map(|manifest| {
+            manifest
+                .plane_keys()
+                .map(|(plane, key)| (plane == ArtifactPlane::Semantic, key))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
     // Candidates carrying a payload are stored by the put loop; the rest
     // assume their call-graph payload is already there.
     let callgraph_missing = reader
@@ -2369,7 +2567,8 @@ fn heal_missing_payloads(
             candidates
                 .iter()
                 .filter(|candidate| candidate.payload.is_none())
-                .filter_map(|candidate| manifest_entry_callgraph_key(&candidate.entry)),
+                .filter_map(|candidate| manifest_entry_callgraph_key(&candidate.entry))
+                .filter(|key| !old_keys.contains(&(false, *key))),
             None,
         )
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
@@ -2390,7 +2589,8 @@ fn heal_missing_payloads(
                 .filter(|(path, key)| {
                     request.semantic_keys.get(*path).map(String::as_str) != Some(*key)
                 })
-                .map(|(_, key)| key),
+                .map(|(_, key)| key)
+                .filter(|key| !old_keys.contains(&(true, *key))),
             None,
         )
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
@@ -2764,6 +2964,7 @@ mod reuse_tests {
     }
 }
 
+#[cfg(test)]
 fn membership_query(count: usize) -> String {
     format!(
         "SELECT full_key FROM blob_payloads INDEXED BY blob_membership WHERE full_key IN ({})",
@@ -2771,6 +2972,7 @@ fn membership_query(count: usize) -> String {
     )
 }
 
+#[cfg(test)]
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
     crate::blob_store::v2::parse_hex32(value).map(|bytes| bytes.to_vec())
 }

@@ -204,6 +204,29 @@ fn live_files() -> &'static RwLock<LiveFiles> {
     FILES.get_or_init(RwLock::default)
 }
 
+/// Identity-admission caches must be revoked when an external database opens or
+/// changes identity. Ignore the publisher's storage, whose transient connections
+/// reopen on every publication; its paths are excluded by name instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AdmissionSnapshot(BTreeMap<PathBuf, HashSet<LiveFileIdentity>>);
+
+pub(crate) fn admission_snapshot(storage: &Path) -> AdmissionSnapshot {
+    #[cfg(unix)]
+    refresh_sidecar_identities();
+    let storage = storage
+        .canonicalize()
+        .unwrap_or_else(|_| storage.to_path_buf());
+    AdmissionSnapshot(
+        open_databases()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(path, _)| !path.starts_with(&storage))
+            .map(|(path, database)| (path.clone(), database.identities.clone()))
+            .collect(),
+    )
+}
+
 fn database_files(key: &Path) -> [PathBuf; 4] {
     let sidecar = |suffix| {
         let mut path = key.as_os_str().to_os_string();

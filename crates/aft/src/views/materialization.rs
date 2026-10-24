@@ -205,7 +205,7 @@ pub(crate) fn manifest_diff_size(
 
 fn fingerprint(manifest: &crate::views::Manifest) -> Result<String> {
     let bytes = manifest
-        .to_json_bytes()
+        .json_bytes()
         .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
