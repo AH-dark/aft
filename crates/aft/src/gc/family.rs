@@ -42,7 +42,7 @@
 //! mark could miss a protected key; a deletion walk that reaches one simply
 //! stops, which only leaves garbage for the next sweep.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -408,6 +408,9 @@ fn sweep_pass(
     scheduled: Option<bool>,
 ) -> Result<FamilySweepReport, FamilySweepError> {
     let _ = requested_by;
+    // Drop after the flight, including on errors, so its final counter update
+    // cannot put a retired family back into telemetry.
+    let _retirement = SweepStatsRetirement(registry.path());
     let Some(mut lease) = registry.acquire_sweep()? else {
         update_stats(registry.path(), registry.family(), |stats| {
             stats.skipped += 1
@@ -1334,8 +1337,9 @@ fn may_collect(
     Ok(false)
 }
 
-/// Process-lifetime work counters, grouped by family directory. They are
-/// observational only; the durable lease and due clock decide collection.
+/// Work counters for a retained family directory. They are observational only;
+/// the durable lease and due clock decide collection. Eviction resets counters
+/// if that family is observed again.
 #[derive(Clone, Default, serde::Serialize)]
 pub(crate) struct SweepStats {
     family: String,
@@ -1345,10 +1349,136 @@ pub(crate) struct SweepStats {
     aborted: u64,
     stale_rows_touched: u64,
     last_outcome: String,
+    #[serde(skip)]
+    generation: u64,
 }
 
-fn stats() -> &'static Mutex<BTreeMap<PathBuf, SweepStats>> {
-    static STATS: OnceLock<Mutex<BTreeMap<PathBuf, SweepStats>>> = OnceLock::new();
+const SWEEP_STATS_FAMILY_LIMIT: usize = 64;
+
+#[derive(Default)]
+pub(crate) struct SweepStatsStore {
+    // Least recently updated first; health drops the oldest details first.
+    entries: std::collections::VecDeque<(PathBuf, SweepStats)>,
+    evicted_total: u64,
+    retired_total: u64,
+    generation: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct SweepStatsSnapshot {
+    pub(crate) details: Vec<SweepStats>,
+    pub(crate) evicted_total: u64,
+    pub(crate) retired_total: u64,
+}
+
+impl SweepStatsStore {
+    fn update<T>(
+        &mut self,
+        path: &Path,
+        family: &str,
+        update: impl FnOnce(&mut SweepStats) -> T,
+    ) -> T {
+        let directory = path.parent().unwrap_or(path);
+        let mut entry = self
+            .entries
+            .iter()
+            .position(|(key, _)| key == directory)
+            .and_then(|index| self.entries.remove(index))
+            .unwrap_or_else(|| (directory.to_path_buf(), SweepStats::default()));
+        entry.1.family = family.to_owned();
+        entry.1.family_directory = directory.display().to_string();
+        let result = update(&mut entry.1);
+        // Store-wide stamps also distinguish an evicted family's replacement
+        // from the old entry when a directory check is still in progress.
+        self.generation = self.generation.wrapping_add(1);
+        entry.1.generation = self.generation;
+        self.entries.push_back(entry);
+        if self.entries.len() > SWEEP_STATS_FAMILY_LIMIT {
+            self.entries.pop_front();
+            self.evicted_total = self.evicted_total.saturating_add(1);
+        }
+        result
+    }
+
+    fn generation_of(&self, directory: &Path) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|(key, _)| key == directory)
+            .map(|(_, stats)| stats.generation)
+    }
+
+    fn retire_if_unchanged(&mut self, directory: &Path, generation: u64) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|(key, stats)| key == directory && stats.generation == generation)
+        {
+            self.entries.remove(index);
+            self.retired_total = self.retired_total.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> SweepStatsSnapshot {
+        SweepStatsSnapshot {
+            details: self
+                .entries
+                .iter()
+                .rev()
+                .map(|(_, stats)| stats.clone())
+                .collect(),
+            evicted_total: self.evicted_total,
+            retired_total: self.retired_total,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_stale_rows(&mut self, path: &Path, family: &str, count: u64) {
+        self.update(path, family, |stats| stats.stale_rows_touched += count);
+    }
+}
+
+struct SweepStatsRetirement<'a>(&'a Path);
+
+impl Drop for SweepStatsRetirement<'_> {
+    fn drop(&mut self) {
+        retire_sweep_stats_if_missing(stats(), self.0, missing_family_directory);
+    }
+}
+
+fn missing_family_directory(directory: &Path) -> bool {
+    // Permission and other I/O errors do not prove retirement. Do not open a
+    // registry here: opening one can recreate a reclaimed directory.
+    std::fs::symlink_metadata(directory)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn retire_sweep_stats_if_missing(
+    store: &Mutex<SweepStatsStore>,
+    path: &Path,
+    missing: impl FnOnce(&Path) -> bool,
+) {
+    let directory = path.parent().unwrap_or(path);
+    let generation = store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .generation_of(directory);
+    let Some(generation) = generation else {
+        return;
+    };
+    // A mount can stall metadata reads indefinitely. Health snapshots share
+    // this mutex, so no filesystem work may run while it is held.
+    if missing(directory) {
+        // Recording again after the check began makes its absence observation
+        // stale, even if the family was evicted and reinserted in the meantime.
+        store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retire_if_unchanged(directory, generation);
+    }
+}
+
+fn stats() -> &'static Mutex<SweepStatsStore> {
+    static STATS: OnceLock<Mutex<SweepStatsStore>> = OnceLock::new();
     STATS.get_or_init(Mutex::default)
 }
 
@@ -1356,12 +1486,7 @@ fn update_stats<T>(path: &Path, family: &str, update: impl FnOnce(&mut SweepStat
     let mut stats = stats()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entry = stats
-        .entry(path.parent().unwrap_or(path).to_path_buf())
-        .or_default();
-    entry.family = family.to_owned();
-    entry.family_directory = path.parent().unwrap_or(path).display().to_string();
-    update(entry)
+    stats.update(path, family, update)
 }
 
 pub(crate) fn record_stale_rows(path: &Path, family: &str, count: u64) {
@@ -1370,11 +1495,15 @@ pub(crate) fn record_stale_rows(path: &Path, family: &str, count: u64) {
     }
 }
 
-pub(crate) fn sweep_stats() -> serde_json::Value {
-    let stats = stats()
+pub(crate) fn sweep_stats() -> SweepStatsSnapshot {
+    sweep_stats_from(stats())
+}
+
+fn sweep_stats_from(store: &Mutex<SweepStatsStore>) -> SweepStatsSnapshot {
+    let stats = store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    serde_json::to_value(stats.values().collect::<Vec<_>>()).unwrap_or_default()
+    stats.snapshot()
 }
 
 struct SweepFlight<'a> {
@@ -1435,6 +1564,157 @@ impl Drop for SweepFlight<'_> {
 #[cfg(test)]
 mod sweep_stats_tests {
     use super::*;
+
+    #[test]
+    fn health_snapshot_does_not_wait_for_retirement_directory_check() {
+        let path = PathBuf::from("family/semantic.db");
+        let store = std::sync::Arc::new(Mutex::new(SweepStatsStore::default()));
+        store.lock().unwrap().record_stale_rows(&path, "family", 1);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let retiring_store = store.clone();
+        let retiring = std::thread::spawn(move || {
+            retire_sweep_stats_if_missing(&retiring_store, &path, |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                true
+            });
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let reading_store = store.clone();
+        let reading = std::thread::spawn(move || {
+            read_tx
+                .send(sweep_stats_from(&reading_store).details.len())
+                .unwrap();
+        });
+        let read_while_check_held = read_rx.recv_timeout(Duration::from_secs(2)).ok();
+        release_tx.send(()).unwrap();
+        retiring.join().unwrap();
+        reading.join().unwrap();
+        assert_eq!(
+            read_while_check_held,
+            Some(1),
+            "health snapshots must not wait for filesystem I/O during retirement"
+        );
+    }
+
+    #[test]
+    fn retirement_preserves_a_family_recorded_during_the_directory_check() {
+        for evict_before_recording in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let directory = dir.path().join("family");
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("semantic.db");
+            let store = Mutex::new(SweepStatsStore::default());
+            store.lock().unwrap().record_stale_rows(&path, "family", 1);
+            std::fs::remove_dir(&directory).unwrap();
+            retire_sweep_stats_if_missing(&store, &path, |directory| {
+                let missing = missing_family_directory(directory);
+                assert!(missing);
+                std::fs::create_dir(directory).unwrap();
+                let mut store = store
+                    .try_lock()
+                    .expect("directory checks must not own the telemetry lock");
+                if evict_before_recording {
+                    for index in 0..64 {
+                        store.record_stale_rows(
+                            &dir.path().join(format!("other-{index}/semantic.db")),
+                            "other",
+                            1,
+                        );
+                    }
+                }
+                store.record_stale_rows(&path, "family", 1);
+                missing
+            });
+            let snapshot = sweep_stats_from(&store);
+            let family = snapshot
+                .details
+                .iter()
+                .find(|stats| stats.family == "family")
+                .expect("a fresh record must survive the older absence observation");
+            assert_eq!(
+                family.stale_rows_touched,
+                if evict_before_recording { 1 } else { 2 }
+            );
+            assert_eq!(snapshot.retired_total, 0);
+            assert_eq!(
+                snapshot.evicted_total,
+                if evict_before_recording { 2 } else { 0 }
+            );
+            assert!(serde_json::to_value(family)
+                .unwrap()
+                .get("generation")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn sweep_telemetry_retains_only_the_latest_64_families() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SweepStatsStore::default();
+        for index in 0..65 {
+            let family_dir = dir.path().join(format!("family-{index:03}"));
+            std::fs::create_dir(&family_dir).unwrap();
+            store.record_stale_rows(&family_dir.join("semantic.db"), "family", 1);
+        }
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.details.len(), 64);
+        assert_eq!(snapshot.evicted_total, 1);
+        assert_eq!(snapshot.retired_total, 0);
+        assert!(snapshot
+            .details
+            .iter()
+            .all(|entry| !entry.family_directory.ends_with("family-000")));
+        let hot_path = dir.path().join("family-001/semantic.db");
+        store.record_stale_rows(&hot_path, "family", 4);
+        store.record_stale_rows(&dir.path().join("family-065/semantic.db"), "family", 1);
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.evicted_total, 2);
+        assert_eq!(snapshot.details.len(), 64);
+        assert_eq!(snapshot.details[1].stale_rows_touched, 5);
+        assert!(snapshot
+            .details
+            .iter()
+            .all(|entry| !entry.family_directory.ends_with("family-002")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_retired_family_leaves_telemetry_at_the_next_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = crate::gc::family_read_tests::build(dir.path(), 1, |_| true);
+        let family_dir = fixture.registry.path().parent().unwrap().to_path_buf();
+        record_stale_rows(fixture.registry.path(), fixture.registry.family(), 1);
+        std::fs::remove_dir_all(&family_dir).unwrap();
+        let _ = sweep_family_scheduled(&fixture.registry, SweepBounds::default(), false);
+        assert!(sweep_stats()
+            .details
+            .iter()
+            .all(|entry| entry.family_directory != family_dir.display().to_string()));
+        assert!(!family_dir.exists());
+    }
+
+    #[test]
+    fn retired_family_removals_are_counted_separately_from_evictions() {
+        let dir = tempfile::tempdir().unwrap();
+        let family_dir = dir.path().join("family");
+        std::fs::create_dir(&family_dir).unwrap();
+        let path = family_dir.join("semantic.db");
+        let store = Mutex::new(SweepStatsStore::default());
+        store.lock().unwrap().record_stale_rows(&path, "family", 1);
+        retire_sweep_stats_if_missing(&store, &path, missing_family_directory);
+        assert_eq!(sweep_stats_from(&store).details.len(), 1);
+        std::fs::remove_dir(&family_dir).unwrap();
+        retire_sweep_stats_if_missing(&store, &path, missing_family_directory);
+        retire_sweep_stats_if_missing(&store, &path, missing_family_directory);
+        let snapshot = sweep_stats_from(&store);
+        assert!(snapshot.details.is_empty());
+        assert_eq!(snapshot.retired_total, 1);
+        assert_eq!(snapshot.evicted_total, 0);
+        assert!(!family_dir.exists());
+    }
 
     #[test]
     fn sweep_logging_does_not_block_other_family_touches() {
@@ -1513,7 +1793,7 @@ mod sweep_stats_tests {
         ];
         fixture.store.touch(&keys).unwrap();
         fixture.store.touch(&keys).unwrap();
-        let snapshot = sweep_stats();
+        let snapshot = serde_json::to_value(sweep_stats().details).unwrap();
         let family_dir = fixture
             .registry
             .path()
