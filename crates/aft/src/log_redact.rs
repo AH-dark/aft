@@ -187,6 +187,25 @@ struct ShellToken {
 /// their own); a backslash-newline continues the line; redirections may be
 /// attached to a word or spaced from it. Also returns the inside of every
 /// quoted run, which may hold a command for another shell.
+/// Bytes that separate words without ending the command: every ASCII
+/// whitespace byte except the newline (space, tab, carriage return, vertical
+/// tab, form feed; `u8::is_ascii_whitespace` leaves out the vertical tab).
+/// The command loop skips exactly these and the word scan stops at exactly
+/// these, so every byte a word stops at is one the loop around it consumes.
+fn is_shell_blank(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\x0b' | b'\x0c')
+}
+
+/// Bytes that end a word: blanks, plus the bytes that start an operator or
+/// end a command. The command loop has an arm for each of them.
+fn ends_shell_word(byte: u8) -> bool {
+    is_shell_blank(byte)
+        || matches!(
+            byte,
+            b'\n' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' | b'`'
+        )
+}
+
 fn split_shell_commands(text: &str) -> (Vec<Vec<ShellToken>>, Vec<std::ops::Range<usize>>) {
     let bytes = text.as_bytes();
     let mut commands = vec![Vec::new()];
@@ -198,8 +217,10 @@ fn split_shell_commands(text: &str) -> (Vec<Vec<ShellToken>>, Vec<std::ops::Rang
     };
     let mut at = 0;
     while at < bytes.len() {
+        note_shell_scan_steps(1);
+        let before = at;
         match bytes[at] {
-            b' ' | b'\t' | b'\r' => at += 1,
+            byte if is_shell_blank(byte) => at += 1,
             b'\\' if bytes.get(at + 1) == Some(&b'\n') => at += 2,
             b'\n' | b';' | b'(' | b')' | b'`' => {
                 end_command(&mut commands);
@@ -237,6 +258,14 @@ fn split_shell_commands(text: &str) -> (Vec<Vec<ShellToken>>, Vec<std::ops::Rang
                 }
             }
         }
+        // Every arm above consumes at least one byte: the word arm is only
+        // reached on a byte that does not end a word. Should a future change
+        // break that, step over one character rather than loop forever on
+        // a spawn path.
+        if at <= before {
+            debug_assert!(false, "shell scan stalled at byte {before} of {text:?}");
+            at = before + text[before..].chars().next().map_or(1, char::len_utf8);
+        }
     }
     (commands, quoted)
 }
@@ -247,6 +276,7 @@ fn scan_shell_word(text: &str, start: usize, quoted: &mut Vec<std::ops::Range<us
     let bytes = text.as_bytes();
     let mut at = start;
     while at < bytes.len() {
+        note_shell_scan_steps(1);
         match bytes[at] {
             b'\'' => {
                 let close = text[at + 1..]
@@ -265,11 +295,7 @@ fn scan_shell_word(text: &str, start: usize, quoted: &mut Vec<std::ops::Range<us
                 at = (close + 1).min(bytes.len());
             }
             b'\\' => at = (at + 2).min(bytes.len()),
-            byte if byte.is_ascii_whitespace()
-                || matches!(byte, b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' | b'`') =>
-            {
-                break
-            }
+            byte if ends_shell_word(byte) => break,
             _ => at += 1,
         }
     }
@@ -298,13 +324,12 @@ fn scan_redirect(
         at += 1;
     }
     let mut target = at;
-    while matches!(bytes.get(target), Some(b' ' | b'\t')) {
+    while bytes.get(target).is_some_and(|byte| is_shell_blank(*byte)) {
         target += 1;
     }
-    let starts_word = bytes.get(target).is_some_and(|byte| {
-        !byte.is_ascii_whitespace()
-            && !matches!(byte, b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' | b'`')
-    });
+    let starts_word = bytes
+        .get(target)
+        .is_some_and(|byte| !ends_shell_word(*byte));
     if starts_word {
         at = scan_shell_word(text, target, quoted);
     }
@@ -426,7 +451,7 @@ fn collect_tool_password_masks(
     masks: &mut Vec<(std::ops::Range<usize>, String)>,
 ) {
     let (commands, quoted) = split_shell_commands(text);
-    note_shell_scan_steps(text.len() + 1);
+    note_shell_scan_steps(1);
     let mut local = Vec::new();
     for tokens in &commands {
         note_shell_scan_steps(tokens.len());
@@ -1443,7 +1468,7 @@ mod tests {
             "../tests/fixtures/command_redaction_cases.json"
         ))
         .expect("command redaction fixture parses");
-        assert_eq!(fixture.masked.len(), 101);
+        assert_eq!(fixture.masked.len(), 104);
         assert!(fixture.untouched.len() > 800);
         for case in &fixture.masked {
             let masked = redact_command(&case.input);
@@ -1617,13 +1642,14 @@ mod tests {
 
     /// The command redactor runs on every spawned command, so it must never
     /// panic, whatever the command holds. Twenty thousand seeded random
-    /// commands mix quotes, backslashes, substitutions, operators, newlines
-    /// and multibyte text (combining marks, emoji), with unterminated quotes
-    /// and trailing backslashes. Each output must be `input` with only
-    /// placeholder replacements.
+    /// commands mix quotes, backslashes, substitutions, operators, every
+    /// ASCII whitespace byte, Unicode spaces and multibyte text (combining
+    /// marks, emoji), with unterminated quotes and trailing backslashes. Each
+    /// command runs under a linear step budget, so a stalled scan fails.
+    /// Each output must be `input` with only placeholder replacements.
     #[test]
     fn command_redaction_never_panics_and_changes_only_masked_bytes() {
-        const PIECES: [&str; 44] = [
+        const PIECES: [&str; 54] = [
             "'",
             "\"",
             "\\",
@@ -1668,6 +1694,16 @@ mod tests {
             "sudo",
             "\"-u",
             "x'y",
+            "\x0c",
+            "\x0b",
+            "\r",
+            "\u{a0}",
+            "\u{85}",
+            "\u{2028}",
+            "\u{2029}",
+            "\u{3000}",
+            "\u{feff}",
+            "\u{1680}",
         ];
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = move || {
@@ -1691,7 +1727,14 @@ mod tests {
                 input.push('\\');
             }
             for (name, redact) in redactors {
-                match std::panic::catch_unwind(|| redact(&input).into_owned()) {
+                // Under the same linear step budget as the 1 MB test, so a
+                // scan that stops advancing fails here instead of hanging.
+                SHELL_SCAN_STEPS.with(|steps| steps.set(0));
+                SHELL_SCAN_BUDGET
+                    .with(|budget| budget.set(3 * (QUOTED_COMMAND_DEPTH + 1) * input.len() + 16));
+                let result = std::panic::catch_unwind(|| redact(&input).into_owned());
+                SHELL_SCAN_BUDGET.with(|budget| budget.set(usize::MAX));
+                match result {
                     Err(_) => failures.push(format!("{name} panicked on {input:?}")),
                     Ok(output) => {
                         assert!(std::str::from_utf8(output.as_bytes()).is_ok());
@@ -1765,6 +1808,51 @@ mod tests {
                 input.chars().take(12).collect::<String>(),
                 started.elapsed()
             );
+        }
+    }
+
+    /// Run `mask_tool_passwords` under a step budget linear in the
+    /// command's length, so a scan that stops advancing panics at once.
+    fn mask_within_budget(command: &str) -> String {
+        let bound = 3 * (QUOTED_COMMAND_DEPTH + 1) * command.len() + 16;
+        SHELL_SCAN_STEPS.with(|steps| steps.set(0));
+        SHELL_SCAN_BUDGET.with(|budget| budget.set(bound));
+        let masked = std::panic::catch_unwind(|| mask_tool_passwords(command).into_owned());
+        SHELL_SCAN_BUDGET.with(|budget| budget.set(usize::MAX));
+        masked.unwrap_or_else(|_| panic!("scan stalled or panicked on {command:?}"))
+    }
+
+    /// A byte that ends a word must be consumed by the loop around the word,
+    /// or the scan stops advancing. A form feed did exactly that: words
+    /// ended at any ASCII whitespace, while the command loop skipped only
+    /// space, tab and carriage return. Every ASCII whitespace byte and a few
+    /// Unicode spaces, inside a quoted argument (scanned again as a command)
+    /// and between words, must keep the scan moving.
+    #[test]
+    fn every_ascii_and_unicode_space_keeps_the_scan_advancing() {
+        let ascii = ["\x0c", "\x0b", "\r", "\t", " "];
+        let unicode = [
+            "\u{a0}", "\u{85}", "\u{2028}", "\u{2029}", "\u{3000}", "\u{feff}",
+        ];
+        for space in ascii.iter().chain(&unicode) {
+            let quoted = format!("curl \"a{space}b\" -u admin:hunter2 h");
+            assert_eq!(
+                mask_within_budget(&quoted),
+                format!("curl \"a{space}b\" -u admin:{SECRET_PLACEHOLDER} h"),
+                "{space:?}"
+            );
+            for command in [
+                format!("curl{space}-u admin:hunter2 h"),
+                format!("curl -u admin:hunter2{space}h"),
+                format!("mysql{space}-phunter2 db"),
+                format!("sshpass -p hunter2{space}ssh h"),
+                format!("{space}{space}curl{space}{space}"),
+            ] {
+                let masked = mask_within_budget(&command);
+                if ascii.contains(space) {
+                    assert!(!masked.contains("hunter2"), "{command:?} -> {masked:?}");
+                }
+            }
         }
     }
 

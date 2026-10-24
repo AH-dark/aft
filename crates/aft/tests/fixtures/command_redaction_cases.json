@@ -403,6 +403,18 @@
   {
    "input": "curl</dev/null -u admin:pw1 https://one --next -uroot:pw2 https://two",
    "expected": "curl</dev/null -u admin:<REDACTED_SECRET> https://one --next -uroot:<REDACTED_SECRET> https://two"
+  },
+  {
+   "input": "curl \"a\fb\" -u admin:hunter2 h",
+   "expected": "curl \"a\fb\" -u admin:<REDACTED_SECRET> h"
+  },
+  {
+   "input": "curl\f-u admin:hunter2 h",
+   "expected": "curl\f-u admin:<REDACTED_SECRET> h"
+  },
+  {
+   "input": "mysql\u000b-phunter2 db",
+   "expected": "mysql\u000b-p<REDACTED_SECRET> db"
   }
  ],
  "untouched": [
