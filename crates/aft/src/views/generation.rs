@@ -2764,6 +2764,54 @@ mod storage_retention_tests {
     }
 
     #[test]
+    fn reader_registered_after_cleanup_census_keeps_its_generation() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
+        let registration = registry
+            .register_view_with_storage(
+                storage.path(),
+                "0000000000000001",
+                &storage.path().join("absent-root"),
+            )
+            .unwrap();
+        let view = registration.view_store().unwrap();
+        wait_for_generation_sweep_for_test(view.view_dir());
+        let old = view.derived_path("old").unwrap();
+        fs::write(&old, b"superseded database").unwrap();
+        fs::write(view.manifest_path("old").unwrap(), b"superseded manifest").unwrap();
+        // The reader arrives after the cleanup's census found "old"
+        // unprotected, but before cleanup claims it. The claim must see it.
+        let marker = Arc::new(Mutex::new(None));
+        let registered = Arc::clone(&marker);
+        let view_dir = view.view_dir().to_path_buf();
+        let hook = crate::storage_retention::observe_test_hook(
+            view.view_dir(),
+            Arc::new(move |step| {
+                if step == "generation-census" {
+                    let mut marker = registered.lock().unwrap();
+                    if marker.is_none() {
+                        *marker =
+                            Some(crate::root_cache::ReadMarker::create(&view_dir, "old").unwrap());
+                    }
+                }
+            }),
+        );
+        let removed = view.sweep_generations_with_bytes().unwrap();
+        assert!(
+            marker.lock().unwrap().is_some(),
+            "the census hook did not run"
+        );
+        assert_eq!(removed.removed_generations, 0);
+        assert!(old.exists(), "a reader-marked generation lost its database");
+        assert!(view.manifest_path("old").unwrap().exists());
+        drop(hook);
+        marker.lock().unwrap().take();
+        assert_eq!(view.sweep_generations().unwrap(), 1);
+        assert!(!old.exists());
+    }
+
+    #[test]
     fn post_publication_sweep_preserves_cloned_pages_after_donor_removal() {
         let temp = tempfile::tempdir().unwrap();
         let view = ViewStore::open(temp.path(), "0123456789abcdef").unwrap();
