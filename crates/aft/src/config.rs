@@ -864,7 +864,10 @@ impl BashConfig {
     /// keeps the user value: user names are often protective
     /// (`GIT_TERMINAL_PROMPT=0`), and a repository should add names rather
     /// than undo the user's.
-    pub(crate) fn configured_env(&self, project_trusted: bool) -> Vec<crate::config_resolve::ConfiguredBashEnv> {
+    pub(crate) fn configured_env(
+        &self,
+        project_trusted: bool,
+    ) -> Vec<crate::config_resolve::ConfiguredBashEnv> {
         let mut applied = Vec::new();
         if !self.env.is_empty() {
             applied.push(crate::config_resolve::ConfiguredBashEnv {

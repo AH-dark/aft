@@ -12,6 +12,11 @@ use std::collections::BTreeMap;
 use crate::config::Config;
 use crate::config_resolve::ConfiguredBashEnv;
 
+/// The note that says a project's `bash.env` did not apply because the project
+/// is not on the trust list, with the documented command for trusting it.
+pub(crate) const PROJECT_UNTRUSTED_NOTICE: &str =
+    "Project bash.env ignored: project not trusted (run npx @cortexkit/aft@latest doctor filters trust).";
+
 /// The user-tier names a runon job may receive, and the configuration this
 /// decision was made from. The same modules used to be read directly from
 /// `bash.env`, so a name is forwarded only when the user set it and the user
@@ -49,7 +54,10 @@ pub(crate) fn plan(config: &Config) -> RemoteEnvPlan {
 }
 
 /// The subset of one tier's configured map that this job may receive.
-pub(crate) fn forwarded_names(requested: &RemoteEnvPlan, configured: &ConfiguredBashEnv) -> BTreeMap<String, String> {
+pub(crate) fn forwarded_names(
+    requested: &RemoteEnvPlan,
+    configured: &ConfiguredBashEnv,
+) -> BTreeMap<String, String> {
     match configured.tier {
         // A listed user name is forwarded with its user value; a listed name
         // the user did not set is not invented here.
@@ -89,10 +97,7 @@ impl Disclosure {
             ));
         }
         if project_untrusted {
-            lines.push(
-                "Project bash.env ignored: project not trusted (run aft doctor filters trust)."
-                    .to_string(),
-            );
+            lines.push(PROJECT_UNTRUSTED_NOTICE.to_string());
         }
         if !shadowed_project_names.is_empty() {
             lines.push(format!(
@@ -174,11 +179,7 @@ mod tests {
 
     #[test]
     fn disclosure_names_what_the_job_does_not_receive() {
-        let config = config(
-            &[("TZ", "UTC")],
-            &[("IBToolNeverDeque", "1")],
-            &[],
-        );
+        let config = config(&[("TZ", "UTC")], &[("IBToolNeverDeque", "1")], &[]);
         let plan = plan(&config);
         let disclosure = Disclosure::build(&[], &[], false, &plan);
         let text = disclosure.lines.join("\n");
@@ -229,10 +230,10 @@ mod tests {
             &RemoteEnvPlan::default(),
         );
         let text = disclosure.lines.join("\n");
+        assert!(text.contains(PROJECT_UNTRUSTED_NOTICE), "{text}");
         assert!(
-            text.contains("Project bash.env ignored: project not trusted (run aft doctor filters trust)."),
+            text.contains("Project value for TZ ignored: user value wins."),
             "{text}"
         );
-        assert!(text.contains("Project value for TZ ignored: user value wins."), "{text}");
     }
 }

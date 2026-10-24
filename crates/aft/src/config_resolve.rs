@@ -819,8 +819,8 @@ pub fn resolve_config_for_harness(
             &mut warnings,
             &mut dropped,
         );
-        if let Some(error) = harness_refusal
-            .or_else(|| raw_bash_env_refusal(&raw, tier, tier_kind, None))
+        if let Some(error) =
+            harness_refusal.or_else(|| raw_bash_env_refusal(&raw, tier, tier_kind, None))
         {
             let errors = vec![error];
             return ResolveResult {
@@ -3670,6 +3670,11 @@ mod tests {
 
     #[test]
     fn cache_dir_and_bash_env_keep_distinct_harness_trust_rules() {
+        // `storage.cache_dir` is storage-wide: only the user-tier base may set
+        // it, at either level. `bash.env` has its own per-tier rule: a harness
+        // block merges names, and a project's names are carried for the
+        // per-command trust check instead of being dropped. The two rules must
+        // not borrow from each other.
         for harness in [
             crate::harness::Harness::Opencode,
             crate::harness::Harness::Pi,
@@ -3691,7 +3696,7 @@ mod tests {
                         "project",
                         r#"{
                         "storage":{"cache_dir":"/evil"},
-                        "bash":{"env":{"BASH_ENV":"/evil/startup"}},
+                        "bash":{"env":{"PROJECT_MARKER":"/evil/marker"}},
                         "harnesses":{
                             "opencode":{"storage":{"cache_dir":"/evil/override"},"bash":{"env":{"TZ":"project"}}},
                             "pi":{"storage":{"cache_dir":"/evil/override"},"bash":{"env":{"TZ":"project"}}}
@@ -3702,13 +3707,8 @@ mod tests {
                 Some(&harness),
             );
             assert!(result.errors.is_empty(), "{:?}", result.errors);
+            // Only the user-tier base selects the cache root, at either level.
             assert_eq!(result.config.cache_dir, Some("/cache/base".into()));
-            assert_eq!(result.config.bash.env.len(), 1);
-            assert_eq!(result.config.bash.env["TZ"], "Etc/GMT");
-            assert!(result
-                .dropped
-                .iter()
-                .any(|drop| drop.key == "bash.env" && drop.tier == "project"));
             assert!(result
                 .dropped
                 .iter()
@@ -3717,6 +3717,21 @@ mod tests {
                 .dropped
                 .iter()
                 .any(|drop| drop.key == "storage.cache_dir" && drop.tier == "project"));
+            // The harness block merges its `bash.env` name over the base one.
+            assert_eq!(result.config.bash.env.len(), 1);
+            assert_eq!(result.config.bash.env["TZ"], "Etc/GMT");
+            // The project's names are carried for the per-command trust check,
+            // never merged into the user map and never reported as dropped.
+            assert_eq!(
+                result.config.bash.project_env.get("TZ").map(String::as_str),
+                Some("project")
+            );
+            assert!(result
+                .config
+                .bash
+                .project_env
+                .contains_key("PROJECT_MARKER"));
+            assert!(!result.dropped.iter().any(|drop| drop.key == "bash.env"));
         }
     }
 
@@ -4463,7 +4478,10 @@ mod tests {
         // carried in `project_env`, which `commands/bash.rs` applies only while
         // the project root is trusted.
         let result = resolve_config(&[
-            tier("user", r#"{"bash":{"env":{"TZ":"UTC","SOME_USER_ENV":"from-user"}}}"#),
+            tier(
+                "user",
+                r#"{"bash":{"env":{"TZ":"UTC","SOME_USER_ENV":"from-user"}}}"#,
+            ),
             tier(
                 "project",
                 r#"{"bash":{"env":{"TZ":"Mars","SOME_PROJECT_ENV":"from-project"}}}"#,
@@ -4471,9 +4489,17 @@ mod tests {
         ]);
 
         assert!(result.errors.is_empty(), "{:?}", result.errors);
-        assert_eq!(result.config.bash.env.get("TZ").map(String::as_str), Some("UTC"));
         assert_eq!(
-            result.config.bash.env.get("SOME_USER_ENV").map(String::as_str),
+            result.config.bash.env.get("TZ").map(String::as_str),
+            Some("UTC")
+        );
+        assert_eq!(
+            result
+                .config
+                .bash
+                .env
+                .get("SOME_USER_ENV")
+                .map(String::as_str),
             Some("from-user")
         );
         assert!(!result.config.bash.env.contains_key("SOME_PROJECT_ENV"));
@@ -4517,7 +4543,10 @@ mod tests {
     #[test]
     fn bash_runon_env_is_user_only() {
         let result = resolve_config(&[
-            tier("user", r#"{"bash":{"env":{"TZ":"UTC"},"runon_env":["TZ"]}}"#),
+            tier(
+                "user",
+                r#"{"bash":{"env":{"TZ":"UTC"},"runon_env":["TZ"]}}"#,
+            ),
             tier(
                 "project",
                 r#"{"bash":{"env":{"IBToolNeverDeque":"1"},"runon_env":["IBToolNeverDeque"]}}"#,
@@ -4581,15 +4610,12 @@ mod tests {
                 let doc = |name: &str| {
                     let env = format!(r#""env": {{ "{name}": "value" }}"#);
                     if in_harness {
-                        format!(
-                            r#"{{ "harnesses": {{ "opencode": {{ "bash": {{ {env} }} }} }} }}"#
-                        )
+                        format!(r#"{{ "harnesses": {{ "opencode": {{ "bash": {{ {env} }} }} }} }}"#)
                     } else {
                         format!(r#"{{ "bash": {{ {env} }} }}"#)
                     }
                 };
-                for (tier_name, refused) in
-                    [("user", *refused_user), ("project", *refused_project)]
+                for (tier_name, refused) in [("user", *refused_user), ("project", *refused_project)]
                 {
                     let config_tier = tier(tier_name, &doc(name));
                     let result = resolve_config_for_harness(

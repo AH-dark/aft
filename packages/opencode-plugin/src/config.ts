@@ -813,7 +813,6 @@ function applyActiveHarnessOverride(config: AftConfig, trusted: boolean): AftCon
   const merged = { ...base, ...override } as AftConfigFields;
   if (base.storage) merged.storage = base.storage;
   else delete merged.storage;
-=
   // A harness block's `bash.env` merges names into the file's base map
   // instead of replacing it, so adding one name under `harnesses.<name>`
   // cannot silently drop every base name.
@@ -1477,7 +1476,6 @@ function unknownCacheConfigKey(config: Record<string, unknown>): string | undefi
   return undefined;
 }
 
-=
 /**
  * Throw when a project tier sets a `bash.env` name it may not set: credentials,
  * identity, network/TLS trust, or any name refused at every tier.

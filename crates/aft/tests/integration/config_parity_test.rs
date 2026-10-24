@@ -158,9 +158,10 @@ fn assert_case(dir: &Path) -> Option<String> {
         // schema cannot tell a user tier from a project tier on its own. The
         // refusal must still name the key, so a fixture cannot pass here by
         // having its environment field dropped silently.
-        let refused_here = result.errors.iter().all(|error| {
-            error.contains("blocked bash.env key")
-        });
+        let refused_here = result
+            .errors
+            .iter()
+            .all(|error| error.contains("blocked bash.env key"));
         if refused_here && case.starts_with("bash_env_") {
             return None;
         }
@@ -184,7 +185,9 @@ fn assert_case(dir: &Path) -> Option<String> {
     let mut golden = golden;
     // A project's `bash.env` is carried as `project_env` on the TypeScript side;
     // the Rust resolver reads the same values from the project tier itself.
-    golden.as_object_mut().map(|object| object.remove("project_env"));
+    golden
+        .as_object_mut()
+        .map(|object| object.remove("project_env"));
     fill_server_defaults(&mut golden);
     let mut want_json = serde_json::to_value(Config::default()).expect("serialize default config");
     overlay(&mut want_json, &golden);

@@ -1967,11 +1967,7 @@ impl BgTaskRegistry {
                     .chain(
                         env.clone()
                             .into_iter()
-                            .filter(|(key, _)| {
-                                !configured_env_names
-                                    .iter()
-                                    .any(|name| name == key)
-                            })
+                            .filter(|(key, _)| !configured_env_names.iter().any(|name| name == key))
                             .map(|(k, v)| (k.into(), v.into())),
                     )
                     .collect()

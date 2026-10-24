@@ -114,7 +114,13 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // Every configured name, including one a remote job does receive: the
     // remote request drops them all from its shell environment, so a value is
     // sent only when `bash.runon_env` puts it in the request map explicitly.
-    let configured_env_names = ctx.config().bash.configured_env(true).iter().flat_map(|configured| configured.names.keys().cloned()).collect::<Vec<_>>();
+    let configured_env_names = ctx
+        .config()
+        .bash
+        .configured_env(true)
+        .iter()
+        .flat_map(|configured| configured.names.keys().cloned())
+        .collect::<Vec<_>>();
     for configured in ctx.config().bash.configured_env(project_trusted) {
         let names = if remote_requested {
             crate::commands::bash_remote_env::forwarded_names(&remote_env_plan, &configured)
@@ -127,9 +133,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         // anyway. The disclosure still names them, so nothing is silent.
         let names = names
             .into_iter()
-            .filter(|(key, _)| {
-                !crate::agent_child_env::is_worker_test_thread_env_name(key)
-            })
+            .filter(|(key, _)| !crate::agent_child_env::is_worker_test_thread_env_name(key))
             .collect::<std::collections::BTreeMap<_, _>>();
         // The request map is the process-creation channel, with call-specific
         // values taking precedence over the configured stable defaults.
@@ -1858,7 +1862,12 @@ mod tests {
         assert!(!refused.success, "{:?}", refused.data);
         assert_eq!(refused.data["code"], "blocked_env_var");
         assert_eq!(
-            bash_output_for_test(&ctx, &project, &worker_thread_output_request("budget"), true),
+            bash_output_for_test(
+                &ctx,
+                &project,
+                &worker_thread_output_request("budget"),
+                true
+            ),
             "8|8"
         );
 

@@ -3,7 +3,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, user_config_tier, AftProcess, ReleaseOnDrop};
+use super::helpers::{user_config, AftProcess, ReleaseOnDrop};
+// The project-tier test is Unix-only, so this import is too.
+#[cfg(unix)]
+use super::helpers::user_config_tier;
 
 #[cfg(unix)]
 fn process_exists(pid: i32) -> bool {
@@ -1159,7 +1162,11 @@ fn project_bash_env_applies_only_after_trust_and_is_disclosed_once() {
         "{reply}"
     );
     assert!(!reply.contains("project-secret-value"), "{reply}");
-    let task = wait_for_status(&mut aft, untrusted["task_id"].as_str().unwrap(), "completed");
+    let task = wait_for_status(
+        &mut aft,
+        untrusted["task_id"].as_str().unwrap(),
+        "completed",
+    );
     assert_eq!(task["output_preview"], "unset");
 
     // Trusting the project root takes effect on the next command, no reload.

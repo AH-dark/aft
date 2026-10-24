@@ -68,25 +68,87 @@ pub fn is_project_env_trusted(storage_dir: Option<&Path>, project_root: &Path) -
 }
 
 /// The main checkout of a linked worktree, or `None` for a main checkout, a
-/// non-repository, or any failure. A linked worktree's `.git` is a file
-/// holding `gitdir: <common-dir>/worktrees/<name>`; the main checkout is two
-/// levels above that common directory. This reads the file rather than running
-/// git, so it costs one small read per bash call.
+/// non-repository, or any failure.
+///
+/// A linked worktree's `.git` is a file holding
+/// `gitdir: <main>/.git/worktrees/<name>`, and git pairs it with a back-pointer
+/// file `<main>/.git/worktrees/<name>/gitdir` holding the worktree's own `.git`
+/// path. This inherits trust only when both halves agree: the entry the first
+/// pointer names lives inside the main checkout it names, and the back-pointer
+/// names this exact project's `.git`. A folder that merely ships a `.git` file
+/// pointing at some trusted checkout has no such back-pointer and is not that
+/// checkout's worktree.
+///
+/// Everything here is bounded to small reads and `canonicalize`; no git process
+/// runs, so a bash call costs a few file reads.
 fn main_checkout_of(project_root: &Path) -> Option<PathBuf> {
     let marker = project_root.join(".git");
-    let pointer = fs::read_to_string(&marker).ok()?;
-    let git_dir = pointer.trim().strip_prefix("gitdir:")?.trim();
-    let git_dir = if Path::new(git_dir).is_absolute() {
-        PathBuf::from(git_dir)
-    } else {
-        project_root.join(git_dir)
-    };
+    let pointer = read_bounded(&marker)?;
+    let git_dir = resolve_pointer(project_root, pointer.trim().strip_prefix("gitdir:")?)?;
+    // `<main>/.git/worktrees/<name>` is the only shape git pairs this way.
+    let entry_name = git_dir.file_name()?;
     let worktrees = git_dir.parent()?;
     if worktrees.file_name()? != "worktrees" {
         return None;
     }
-    let main = worktrees.parent()?.parent()?;
-    main.canonicalize().ok()
+    let common_dir = worktrees.parent()?.canonicalize().ok()?;
+    // The main checkout is the directory that carries `.git`, which is the
+    // repository directory's own parent; deriving it from a canonicalized
+    // parent-of-parent could step above the checkout when temp roots nest.
+    let main = common_dir.parent()?;
+    let entry = worktrees.join(entry_name).canonicalize().ok()?;
+    // The entry git manages must live inside that main checkout, not wherever
+    // a forged pointer or a symlink sends it.
+    if !entry.starts_with(&main) {
+        return None;
+    }
+    // git writes the back-pointer into the paired entry; without one naming
+    // this project, the worktree does not belong to that checkout. git's own
+    // copy ends with a newline, and some tools write the bare path instead.
+    let back_pointer = read_bounded(&entry.join("gitdir"))?;
+    let claimed = resolve_pointer(
+        &entry,
+        back_pointer.trim().trim_start_matches("gitdir:").trim(),
+    )?;
+    if claimed.canonicalize().ok()? != marker.canonicalize().ok()? {
+        return None;
+    }
+    Some(main.to_path_buf())
+}
+
+/// Resolve a `gitdir:`/`gitdir` pointer target against the directory holding
+/// the file it was read from.
+fn resolve_pointer(base: &Path, target: &str) -> Option<PathBuf> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    // Git for Windows writes `C:/Users/me/repo/.git` with forward slashes, which
+    // the platform path parser does not treat as an absolute prefix.
+    #[cfg(windows)]
+    {
+        let mut chars = target.chars();
+        if matches!(chars.next(), Some(c) if c.is_ascii_alphabetic()) && chars.next() == Some(':') {
+            return Some(PathBuf::from(target));
+        }
+    }
+    let target = Path::new(target);
+    Some(if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        base.join(target)
+    })
+}
+
+/// Read a small pointer file. The cap keeps a hostile multi-gigabyte file from
+/// turning one trust check into a large read.
+fn read_bounded(path: &Path) -> Option<String> {
+    const MAX_POINTER_BYTES: u64 = 8 * 1024;
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_POINTER_BYTES {
+        return None;
+    }
+    fs::read_to_string(path).ok()
 }
 
 /// Add a project to the trusted set. Returns Ok if the file was updated (or
@@ -263,54 +325,11 @@ mod tests {
         assert!(listed.contains(&p2_canonical), "listed: {listed:?}");
     }
 
-    /// Lay out a main checkout with a linked worktree the way git does, so the
-    /// worktree-inherits-trust rule is exercised without running git.
-    fn linked_worktree(main: &Path, worktree: &Path) -> PathBuf {
-        let common = main.join(".git");
-        let git_dir = common.join("worktrees").join("linked");
-        fs::create_dir_all(&git_dir).unwrap();
-        fs::create_dir_all(worktree).unwrap();
-        fs::write(worktree.join(".git"), format!("gitdir: {}\n", git_dir.display())).unwrap();
-        git_dir
-    }
-
-    #[test]
-    fn linked_worktree_inherits_trust_from_its_main_checkout() {
-        let storage = tempdir().unwrap();
-        let main = tempdir().unwrap();
-        let worktree = tempdir().unwrap();
-        linked_worktree(main.path(), worktree.path());
-
-        // The exact-root filter rule does not inherit.
-        assert!(!is_project_trusted(Some(storage.path()), worktree.path()));
-        assert!(!is_project_env_trusted(Some(storage.path()), worktree.path()));
-
-        trust_project(storage.path(), main.path()).unwrap();
-        assert!(is_project_env_trusted(Some(storage.path()), worktree.path()));
-    }
-
-    #[test]
-    fn linked_worktree_of_an_untrusted_checkout_stays_untrusted() {
-        let storage = tempdir().unwrap();
-        let main = tempdir().unwrap();
-        let other = tempdir().unwrap();
-        let worktree = tempdir().unwrap();
-        linked_worktree(main.path(), worktree.path());
-        trust_project(storage.path(), other.path()).unwrap();
-        assert!(!is_project_env_trusted(Some(storage.path()), worktree.path()));
-    }
-
-    #[test]
-    fn main_checkout_has_no_parent_checkout_to_inherit_from() {
-        let main = tempdir().unwrap();
-        fs::create_dir_all(main.path().join(".git")).unwrap();
-        assert!(main_checkout_of(main.path()).is_none());
-    }
-
     #[test]
     fn no_storage_dir_means_untrusted() {
         let project = tempdir().unwrap();
         assert!(!is_project_trusted(None, project.path()));
+        assert!(!is_project_env_trusted(None, project.path()));
     }
 
     #[test]
@@ -327,5 +346,260 @@ mod tests {
         fs::write(trust_path(storage.path()), b"not valid json").unwrap();
         let project = tempdir().unwrap();
         assert!(!is_project_trusted(Some(storage.path()), project.path()));
+    }
+
+    // --- linked worktrees -------------------------------------------------
+    //
+    // A worktree inherits trust only from the pairing git writes: the
+    // worktree's `.git` names `<main>/.git/worktrees/<name>` and that entry's
+    // `gitdir` file names the worktree's own `.git` back. Every fixture below
+    // is a real repository, so the tests fail loudly if git cannot create one.
+
+    /// A trusted main checkout with an empty `.git` directory and no worktree.
+    fn trusted_main(storage: &Path, main: &Path) {
+        fs::create_dir_all(main.join(".git")).unwrap();
+        trust_project(storage, main).unwrap();
+    }
+
+    fn git(args: &[&str], cwd: &Path) -> std::process::Output {
+        let mut command = crate::effective_path::new_command("git").build();
+        command
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap_or_else(|error| panic!("run git {args:?} in {}: {error}", cwd.display()))
+    }
+
+    /// A main checkout with one real linked worktree created by git, returned
+    /// beside the directory that holds it (dropping that directory would
+    /// delete the worktree).
+    fn real_linked_worktree(main: &Path, parent: &Path) -> (tempfile::TempDir, PathBuf) {
+        let init = git(&["init", "-q"], main);
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let commit = git(
+            &[
+                "-c",
+                "user.email=t@example.test",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+            main,
+        );
+        assert!(
+            commit.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        let holder = tempdir().unwrap();
+        let worktree = parent.join("linked");
+        let add = git(
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().unwrap(),
+                "-b",
+                "linked",
+            ],
+            main,
+        );
+        assert!(
+            add.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        assert!(
+            worktree.join(".git").is_file(),
+            "a linked worktree carries a `.git` file"
+        );
+        (holder, worktree)
+    }
+
+    /// A trusted main checkout plus a real linked worktree of it.
+    fn trusted_checkout_with_worktree() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+    ) {
+        let storage = tempdir().unwrap();
+        let main = tempdir().unwrap();
+        let parent = tempdir().unwrap();
+        let (_holder, worktree) = real_linked_worktree(main.path(), parent.path());
+        trust_project(storage.path(), main.path()).unwrap();
+        (storage, main, parent, worktree)
+    }
+
+    #[test]
+    fn a_real_linked_worktree_of_a_trusted_checkout_inherits_trust() {
+        let (storage, _main, _parent, worktree) = trusted_checkout_with_worktree();
+        // The exact-root filter rule still sees only the worktree itself, so
+        // this proves the inheritance decision and not a direct hit.
+        assert!(!is_project_trusted(Some(storage.path()), &worktree));
+        assert!(is_project_env_trusted(Some(storage.path()), &worktree));
+    }
+
+    #[test]
+    fn a_forged_git_file_without_a_back_pointer_does_not_inherit_trust() {
+        // An unpacked tarball can ship this: a `.git` file aiming at a trusted
+        // checkout's worktree entry. git never paired that entry with this
+        // folder, so there is no back-pointer naming it.
+        let storage = tempdir().unwrap();
+        let main = tempdir().unwrap();
+        trusted_main(storage.path(), main.path());
+        let entry = main.path().join(".git").join("worktrees").join("forged");
+        fs::create_dir_all(&entry).unwrap();
+
+        let forged = tempdir().unwrap();
+        fs::write(
+            forged.path().join(".git"),
+            format!("gitdir: {}\n", entry.display()),
+        )
+        .unwrap();
+        assert!(
+            !is_project_env_trusted(Some(storage.path()), forged.path()),
+            "a `.git` file with no paired back-pointer must not inherit trust"
+        );
+
+        // A back-pointer naming a different folder is refused too.
+        let elsewhere = tempdir().unwrap();
+        fs::write(
+            entry.join("gitdir"),
+            format!("{}\n", elsewhere.path().join(".git").display()),
+        )
+        .unwrap();
+        assert!(
+            !is_project_env_trusted(Some(storage.path()), forged.path()),
+            "a back-pointer naming another folder must not inherit trust"
+        );
+
+        // Nor is one that names the forged folder itself instead of its `.git`.
+        fs::write(
+            entry.join("gitdir"),
+            format!("{}\n", forged.path().display()),
+        )
+        .unwrap();
+        assert!(
+            !is_project_env_trusted(Some(storage.path()), forged.path()),
+            "a back-pointer must name this project's `.git`, not the folder"
+        );
+    }
+
+    #[test]
+    fn an_entry_outside_the_named_checkout_does_not_inherit_trust() {
+        // A real trusted checkout, so "inside the checkout" means what it means
+        // in practice: inside the repository directory of an actual git repo.
+        let storage = tempdir().unwrap();
+        let main = tempdir().unwrap();
+        let parent = tempdir().unwrap();
+        let (_holder, worktree) = real_linked_worktree(main.path(), parent.path());
+        trust_project(storage.path(), main.path()).unwrap();
+        assert!(is_project_env_trusted(Some(storage.path()), &worktree));
+
+        // The worktree's `.git` names an entry that leaves the checkout it
+        // claims through `..`, so it does not resolve inside that checkout.
+        let outside = main
+            .path()
+            .join("..")
+            .join("aft-test-outside-entry")
+            .join("worktrees")
+            .join("x");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", outside.display()),
+        )
+        .unwrap();
+        assert!(
+            !is_project_env_trusted(Some(storage.path()), &worktree),
+            "an entry that resolves outside the named checkout must not inherit trust"
+        );
+
+        // The same holds when a symlink inside the checkout points at a
+        // directory outside it, even with a correct back-pointer in the target.
+        #[cfg(unix)]
+        {
+            let target_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/aft-trust-symlink-entry");
+            let _ = fs::remove_dir_all(&target_root);
+            fs::create_dir_all(&target_root).unwrap();
+            fs::write(
+                target_root.join("gitdir"),
+                format!("{}\n", worktree.join(".git").display()),
+            )
+            .unwrap();
+            let link = main.path().join(".git").join("worktrees").join("via-link");
+            std::os::unix::fs::symlink(&target_root, &link).unwrap();
+            fs::write(
+                worktree.join(".git"),
+                format!("gitdir: {}\n", link.display()),
+            )
+            .unwrap();
+            assert!(
+                !is_project_env_trusted(Some(storage.path()), &worktree),
+                "a symlinked entry that resolves outside the checkout must not inherit trust"
+            );
+            let _ = fs::remove_dir_all(&target_root);
+        }
+    }
+
+    #[test]
+    fn a_sibling_folder_reusing_a_worktrees_entry_does_not_inherit_trust() {
+        let (storage, _main, _parent, worktree) = trusted_checkout_with_worktree();
+        let pointer = fs::read_to_string(worktree.join(".git")).unwrap();
+        let entry = pointer
+            .trim()
+            .trim_start_matches("gitdir:")
+            .trim()
+            .to_string();
+
+        // A second folder points at the same entry; the entry names `worktree`.
+        let sibling = tempdir().unwrap();
+        fs::write(sibling.path().join(".git"), format!("gitdir: {entry}\n")).unwrap();
+        assert!(!is_project_env_trusted(
+            Some(storage.path()),
+            sibling.path()
+        ));
+    }
+
+    #[test]
+    fn an_oversized_pointer_file_is_refused() {
+        let (storage, _main, _parent, worktree) = trusted_checkout_with_worktree();
+        assert!(is_project_env_trusted(Some(storage.path()), &worktree));
+
+        let mut bytes = b"gitdir: ".to_vec();
+        bytes.resize(64 * 1024, b' ');
+        fs::write(worktree.join(".git"), &bytes).unwrap();
+        assert!(
+            !is_project_env_trusted(Some(storage.path()), &worktree),
+            "a pointer file above the cap must be refused unread"
+        );
+    }
+
+    #[test]
+    fn linked_worktree_of_an_untrusted_checkout_stays_untrusted() {
+        let storage = tempdir().unwrap();
+        let main = tempdir().unwrap();
+        let parent = tempdir().unwrap();
+        let (_holder, worktree) = real_linked_worktree(main.path(), parent.path());
+        let other = tempdir().unwrap();
+        trust_project(storage.path(), other.path()).unwrap();
+        assert!(!is_project_env_trusted(Some(storage.path()), &worktree));
+    }
+
+    #[test]
+    fn main_checkout_has_no_parent_checkout_to_inherit_from() {
+        let main = tempdir().unwrap();
+        fs::create_dir_all(main.path().join(".git")).unwrap();
+        assert!(main_checkout_of(main.path()).is_none());
     }
 }

@@ -102,11 +102,19 @@ fn an_untrusted_project_bash_env_is_ignored_until_the_project_is_trusted() {
 fn a_linked_worktree_inherits_trust_from_its_main_checkout() {
     let main = tempfile::tempdir().unwrap();
     let worktree = tempfile::tempdir().unwrap();
+    // Git pairs a linked worktree both ways: the worktree's `.git` names the
+    // entry, and the entry's `gitdir` names the worktree back. Trust is
+    // inherited only from a pair that agrees, so the fixture writes both.
     let git_dir = main.path().join(".git").join("worktrees").join("linked");
     std::fs::create_dir_all(&git_dir).unwrap();
     std::fs::write(
         worktree.path().join(".git"),
         format!("gitdir: {}\n", git_dir.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        git_dir.join("gitdir"),
+        format!("{}\n", worktree.path().join(".git").display()),
     )
     .unwrap();
     let storage = tempfile::tempdir().unwrap();
@@ -128,11 +136,7 @@ fn a_linked_worktree_inherits_trust_from_its_main_checkout() {
 
     trust(storage.path(), main.path());
     assert_eq!(
-        run_output(
-            &ctx,
-            worktree.path(),
-            &request("worktree-trusted", command)
-        ),
+        run_output(&ctx, worktree.path(), &request("worktree-trusted", command)),
         "from-worktree"
     );
 }
@@ -211,10 +215,7 @@ fn the_worker_test_thread_budget_survives_a_configured_value() {
     let ctx = context_with_env(
         &project,
         storage.path(),
-        &[
-            ("RUST_TEST_THREADS", "64"),
-            ("NEXTEST_TEST_THREADS", "64"),
-        ],
+        &[("RUST_TEST_THREADS", "64"), ("NEXTEST_TEST_THREADS", "64")],
         &[],
     );
     let mut request = worker_thread_output_request("budget");
@@ -231,7 +232,11 @@ fn a_refused_per_call_name_is_rejected_before_the_launch() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let ctx = context(project.path(), storage.path());
-    for name in ["AFT_INTERNAL_LINUX_SCOPE", "GIT_CONFIG_COUNT", "NODE_OPTIONS"] {
+    for name in [
+        "AFT_INTERNAL_LINUX_SCOPE",
+        "GIT_CONFIG_COUNT",
+        "NODE_OPTIONS",
+    ] {
         let mut request = request("refused", "printf hi");
         request.params["params"]["env"] = json!({ name: "1" });
         let response = handle(&request, &ctx);

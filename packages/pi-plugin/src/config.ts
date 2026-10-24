@@ -1189,7 +1189,6 @@ function applyActiveHarnessOverride(config: AftConfig, trusted: boolean): AftCon
   const merged = { ...base, ...override } as AftConfigFields;
   if (base.storage) merged.storage = base.storage;
   else delete merged.storage;
-=
   // A harness block's `bash.env` merges names into the file's base map
   // instead of replacing it, so adding one name under `harnesses.<name>`
   // cannot silently drop every base name.
