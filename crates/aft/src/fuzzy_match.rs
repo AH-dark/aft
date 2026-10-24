@@ -706,6 +706,9 @@ pub(crate) struct ReindentPlan<'a> {
     /// The matches being replaced, ascending by start.
     matches: &'a [FuzzyMatch],
     source_has_delimiter: std::cell::OnceCell<bool>,
+    /// Whether any two matches overlap, computed once per edit rather than
+    /// rescanned for every match of a replace-all.
+    overlapping: std::cell::OnceCell<bool>,
     shared: std::cell::OnceCell<Option<StringParse>>,
 }
 
@@ -734,6 +737,7 @@ impl<'a> ReindentPlan<'a> {
             path,
             matches,
             source_has_delimiter: std::cell::OnceCell::new(),
+            overlapping: std::cell::OnceCell::new(),
             shared: std::cell::OnceCell::new(),
         }
     }
@@ -837,19 +841,20 @@ impl<'a> ReindentPlan<'a> {
         };
         // Matches that overlap cannot all be inserted into one text; each is
         // parsed alone (the edit is rejected for the overlap anyway).
-        let overlapping = self
-            .matches
-            .windows(2)
-            .any(|pair| pair[0].byte_start + pair[0].byte_len > pair[1].byte_start);
+        let overlapping = *self.overlapping.get_or_init(|| {
+            self.matches
+                .windows(2)
+                .any(|pair| pair[0].byte_start + pair[0].byte_len > pair[1].byte_start)
+        });
         let single;
         let (parse, slot) = if overlapping {
             single = self.parse_with_replacements(lang, &[index]);
             (single.as_ref(), 0)
         } else {
-            let all: Vec<usize> = (0..self.matches.len()).collect();
-            let shared = self
-                .shared
-                .get_or_init(|| self.parse_with_replacements(lang, &all));
+            let shared = self.shared.get_or_init(|| {
+                let all: Vec<usize> = (0..self.matches.len()).collect();
+                self.parse_with_replacements(lang, &all)
+            });
             (shared.as_ref(), index)
         };
         let Some(parse) = parse else {
