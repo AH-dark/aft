@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::context::AppContext;
 use crate::error::AftError;
 use crate::format;
-use crate::parser::{detect_language, parse_source_with_cached_parser, FileParser};
+use crate::parser::{detect_language, parse_source_with_cached_parser, FileParser, LangId};
 
 #[cfg(windows)]
 mod windows_replace;
@@ -1131,7 +1131,47 @@ pub fn validate_syntax_with_parser(
 pub fn validate_syntax_str(content: &str, path: &Path) -> Option<bool> {
     let lang = detect_language(path)?;
     let tree = parse_source_with_cached_parser(path, content, lang).ok()?;
-    Some(!tree.root_node().has_error())
+    Some(first_tree_syntax_error_line(&tree, content, lang).is_none())
+}
+
+/// [`validate_syntax`] for a file an edit just wrote. It adds the checks that
+/// [`validate_syntax_str`] makes beyond tree-sitter's ERROR and MISSING nodes
+/// (Python block indentation), so an edit is judged the same way whichever
+/// path validates it. Outline keeps using [`validate_syntax`]: it only needs
+/// to know whether tree-sitter could recover the symbols.
+pub(crate) fn validate_edited_file_syntax(path: &Path) -> Result<Option<bool>, AftError> {
+    let verdict = validate_syntax(path)?;
+    if verdict != Some(true) || detect_language(path) != Some(LangId::Python) {
+        return Ok(verdict);
+    }
+    let source = read_edit_text(path).map_err(|error| AftError::IoError {
+        path: path.display().to_string(),
+        message: error.to_string(),
+    })?;
+    Ok(validate_syntax_str(&source, path))
+}
+
+/// 1-based line of the first syntax error in a parsed edit result, or `None`
+/// when the result is valid. tree-sitter's ERROR and MISSING nodes come
+/// first. A Python tree without them is then checked for block indentation
+/// that tree-sitter-python accepts but CPython rejects (see
+/// [`python_indent`]); without that check an edit that leaves an
+/// IndentationError would be reported as valid and never rolled back.
+pub(crate) fn first_tree_syntax_error_line(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    lang: LangId,
+) -> Option<usize> {
+    let root = tree.root_node();
+    if root.has_error() {
+        // `has_error` guarantees an ERROR or MISSING node; line 1 is only a
+        // fallback that the walk never reaches.
+        return Some(first_syntax_error_line(root).unwrap_or(1));
+    }
+    if lang == LangId::Python {
+        return python_indent::first_indentation_error_line(tree, source);
+    }
+    None
 }
 
 /// Check if the caller requested diff info in the response.
@@ -2065,6 +2105,7 @@ pub(crate) fn write_format_deferred_created(
 }
 
 mod bash;
+mod python_indent;
 mod swift;
 
 fn write_format_validate_impl(
@@ -2218,15 +2259,28 @@ fn write_format_validate_impl(
 }
 
 fn validate_captured_syntax(path: &Path, source: &str) -> Option<bool> {
-    parse_captured_syntax(path, source).map(|tree| !tree.root_node().has_error())
+    parse_captured_syntax_with_lang(path, source)
+        .map(|(tree, lang)| first_tree_syntax_error_line(&tree, source, lang).is_none())
 }
 
+#[cfg(test)]
 fn parse_captured_syntax(path: &Path, source: &str) -> Option<tree_sitter::Tree> {
+    parse_captured_syntax_with_lang(path, source).map(|(tree, _)| tree)
+}
+
+/// Parse an edit result for syntax checking, returning the language too so
+/// language-specific checks (Python indentation) can run on the same tree.
+fn parse_captured_syntax_with_lang(
+    path: &Path,
+    source: &str,
+) -> Option<(tree_sitter::Tree, LangId)> {
     let lang = detect_language(path)?;
     #[cfg(test)]
     A03_SYNTAX_PARSES.with(|count| count.set(count.get() + 1));
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Syntax);
-    crate::parser::parse_source_with_cached_parser(path, source, lang).ok()
+    crate::parser::parse_source_with_cached_parser(path, source, lang)
+        .ok()
+        .map(|tree| (tree, lang))
 }
 
 /// Syntax verdict for a file the current call created.
@@ -2257,15 +2311,18 @@ pub(crate) fn check_created_file_syntax(
     path: &Path,
     source: &str,
 ) -> CreatedFileSyntax {
-    let Some(tree) = parse_captured_syntax(path, source) else {
+    let Some((tree, lang)) = parse_captured_syntax_with_lang(path, source) else {
         return CreatedFileSyntax {
             valid: None,
             skipped_reason: None,
             first_error_line: None,
         };
     };
-    let root = tree.root_node();
-    let tree_valid = Some(!root.has_error());
+    // tree-sitter's verdict, including the Python indentation check, is
+    // computed once; the bash and Swift confirmations below re-judge only a
+    // rejection, exactly as they do for an existing file's edit.
+    let error_line = first_tree_syntax_error_line(&tree, source, lang);
+    let tree_valid = Some(error_line.is_none());
     // The line bash itself named for a syntax error it confirmed.
     let mut shell_error_line = None;
     let (valid, skipped_reason) = if tree_valid == Some(false) && bash::applies(path) {
@@ -2284,7 +2341,7 @@ pub(crate) fn check_created_file_syntax(
         }
     };
     let first_error_line = if valid == Some(false) {
-        shell_error_line.or_else(|| first_syntax_error_line(root))
+        shell_error_line.or(error_line)
     } else {
         None
     };
@@ -2480,6 +2537,27 @@ mod tests {
         );
         assert_eq!(unsupported.valid, None);
         assert_eq!(unsupported.first_error_line, None);
+    }
+
+    /// A Python file tree-sitter accepts but CPython rejects for its block
+    /// indentation is judged invalid on the same path as bash and Swift files,
+    /// with the line of the misplaced statement. Neither the bash nor the
+    /// Swift confirmation re-judges a Python verdict.
+    #[test]
+    fn created_python_file_reports_indentation_error_line() {
+        let path = Path::new("new.py");
+        let broken = "def g():\n    if True:\n        return 2\n            y = 5\n    return 3\n";
+        let policy = crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test();
+        let check = check_created_file_syntax(&policy, path, broken);
+        assert_eq!(check.valid, Some(false));
+        assert_eq!(check.skipped_reason, None);
+        assert_eq!(check.first_error_line, Some(4));
+        assert_eq!(validate_syntax_str(broken, path), Some(false));
+        let valid = "def g():\n    if True:\n        return 2\n    return 3\n";
+        assert_eq!(
+            check_created_file_syntax(&policy, path, valid).valid,
+            Some(true)
+        );
     }
 
     #[test]

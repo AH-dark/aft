@@ -47,6 +47,12 @@ pub enum AftError {
         path: String,
         message: String,
     },
+    /// A loose (whitespace-insensitive) match whose indentation differs from
+    /// the file in a way that has no single safe re-indentation of the
+    /// replacement. The edit is refused instead of guessing.
+    AmbiguousIndentation {
+        message: String,
+    },
 }
 
 impl AftError {
@@ -64,6 +70,7 @@ impl AftError {
             AftError::ScopeNotFound { .. } => "scope_not_found",
             AftError::MemberNotFound { .. } => "member_not_found",
             AftError::IoError { .. } => "io_error",
+            AftError::AmbiguousIndentation { .. } => "ambiguous_indentation",
         }
     }
 
@@ -149,6 +156,7 @@ impl fmt::Display for AftError {
             AftError::IoError { path, message } => {
                 write!(f, "I/O error on {}: {}", path, message)
             }
+            AftError::AmbiguousIndentation { message } => f.write_str(message),
         }
     }
 }

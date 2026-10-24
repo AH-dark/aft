@@ -369,14 +369,24 @@ fn apply_comment_match(
         let updated = super::edit_match::apply_sorted_non_overlapping_fuzzy_matches(
             source,
             &matches,
+            match_text,
             replacement,
+            None,
         )
         .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))?;
         Ok((updated, matches.len()))
     } else {
         let matched = &matches[occurrence.unwrap_or(0)];
         let mut effective = String::with_capacity(replacement.len().saturating_add(1));
-        super::edit_match::push_fuzzy_replacement(&mut effective, source, matched, replacement);
+        let plan = crate::fuzzy_match::ReindentPlan::new(
+            source,
+            match_text,
+            replacement,
+            None,
+            std::slice::from_ref(matched),
+        );
+        super::edit_match::push_fuzzy_replacement(&mut effective, &plan, 0)
+            .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))?;
         let updated = crate::edit::replace_byte_range(
             source,
             matched.byte_start,

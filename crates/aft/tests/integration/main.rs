@@ -101,6 +101,9 @@ mod inspect_todos_test;
 mod inspect_tsconfig_membership_test;
 mod inspect_unused_exports_test;
 mod is_semantic_indexed_extension_test;
+// Edits that used to leave Python with an IndentationError while reporting success
+// (issue #824).
+mod issue_824_edit_indentation_test;
 mod issue_827_828_repro_test;
 mod lexical_rank_test;
 mod lexical_score_test;

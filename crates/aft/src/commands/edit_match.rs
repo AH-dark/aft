@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::backup::CapturedRegularFile;
 use crate::context::AppContext;
-use crate::edit::{self, validate_syntax};
+use crate::edit::{self, validate_edited_file_syntax};
 use crate::format;
 
 use crate::protocol::{RawRequest, Response};
@@ -936,7 +936,7 @@ fn handle_glob_edit_match(
             format_skipped_count += 1;
             format_skip_reasons.insert(reason.clone());
         }
-        let syntax_valid = match validate_syntax(&edit.path) {
+        let syntax_valid = match validate_edited_file_syntax(&edit.path) {
             Ok(valid) => valid,
             Err(e) => {
                 if let Some(name) = &checkpoint_name {
@@ -1403,12 +1403,20 @@ fn fuzzy_replacement_restores_newline(
         && !replacement.ends_with('\n')
 }
 
+/// Append the text that replaces the plan's match at `index`: the
+/// replacement re-indented by the match's indentation shift (see
+/// [`crate::fuzzy_match::ReindentPlan`]), with line separators adjusted so
+/// the match boundary neither loses nor doubles a newline. Fails with
+/// `ambiguous_indentation` when the shift cannot be determined without
+/// guessing.
 pub(crate) fn push_fuzzy_replacement(
     output: &mut String,
-    source: &str,
-    matched: &crate::fuzzy_match::FuzzyMatch,
-    replacement: &str,
-) {
+    plan: &crate::fuzzy_match::ReindentPlan<'_>,
+    index: usize,
+) -> Result<(), crate::error::AftError> {
+    let source = plan.source();
+    let matched = plan.matched(index);
+    let replacement = &*plan.replacement_for(index)?;
     let end = matched.byte_start + matched.byte_len;
     // When the match leaves the source line separator outside its span, a
     // replacement ending in a newline must not introduce a second separator.
@@ -1427,12 +1435,15 @@ pub(crate) fn push_fuzzy_replacement(
     if fuzzy_replacement_restores_newline(source, matched, replacement) {
         output.push('\n');
     }
+    Ok(())
 }
 
 pub(crate) fn apply_sorted_non_overlapping_fuzzy_matches(
     source: &str,
     matches: &[crate::fuzzy_match::FuzzyMatch],
+    needle: &str,
     replacement: &str,
+    path: Option<&Path>,
 ) -> Result<String, crate::error::AftError> {
     let mut removed_bytes = 0usize;
     let mut replacement_bytes = 0usize;
@@ -1454,9 +1465,11 @@ pub(crate) fn apply_sorted_non_overlapping_fuzzy_matches(
         .saturating_add(replacement_bytes);
     let mut result = String::with_capacity(capacity);
     let mut copied_through = 0usize;
-    for matched in matches {
+    // One plan covers all the matches, so finding string lines parses at most once.
+    let plan = crate::fuzzy_match::ReindentPlan::new(source, needle, replacement, path, matches);
+    for (index, matched) in matches.iter().enumerate() {
         result.push_str(&source[copied_through..matched.byte_start]);
-        push_fuzzy_replacement(&mut result, source, matched, replacement);
+        push_fuzzy_replacement(&mut result, &plan, index)?;
         copied_through = matched.byte_start + matched.byte_len;
     }
     result.push_str(&source[copied_through..]);
@@ -1637,7 +1650,9 @@ fn handle_single_file_edit_match(
         let result = match apply_sorted_non_overlapping_fuzzy_matches(
             &source,
             &fuzzy_matches,
+            match_str,
             replacement,
+            Some(path.as_path()),
         ) {
             Ok(updated) => updated,
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
@@ -1647,7 +1662,16 @@ fn handle_single_file_edit_match(
         let target_idx = occurrence.unwrap_or(0);
         let matched = &fuzzy_matches[target_idx];
         let mut effective_replacement = String::with_capacity(replacement.len().saturating_add(1));
-        push_fuzzy_replacement(&mut effective_replacement, &source, matched, replacement);
+        let plan = crate::fuzzy_match::ReindentPlan::new(
+            &source,
+            match_str,
+            replacement,
+            Some(path.as_path()),
+            std::slice::from_ref(matched),
+        );
+        if let Err(e) = push_fuzzy_replacement(&mut effective_replacement, &plan, 0) {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
         (
             match edit::replace_byte_range(
                 &source,
@@ -1809,6 +1833,52 @@ fn handle_single_file_edit_match(
 mod replace_all_tests {
     use super::*;
 
+    /// Finding which replacement lines sit inside string literals parses the
+    /// edited file once for all the matches of a replace-all, and not at
+    /// all when the file, the matched lines and the replacement hold no
+    /// string delimiter.
+    #[test]
+    fn replace_all_parses_for_string_lines_at_most_once() {
+        use crate::fuzzy_match::STRING_LINE_PARSES;
+        let path = Path::new("t.py");
+        for (line, needle, replacement, shifted, parses) in [
+            (
+                "    v = 'a'\n",
+                "v = 'a' ",
+                "v = 'b'\nw = 'c'",
+                "    v = 'b'\n    w = 'c'\n",
+                1,
+            ),
+            (
+                "    v = 1\n",
+                "v = 1 ",
+                "v = 2\nw = 3",
+                "    v = 2\n    w = 3\n",
+                0,
+            ),
+        ] {
+            let source = format!("def f():\n{}", line.repeat(1_000));
+            let matches = crate::fuzzy_match::find_all_fuzzy(&source, needle);
+            assert_eq!(matches.len(), 1_000);
+            assert_eq!(matches[0].pass, 3, "the loose pass must match");
+            STRING_LINE_PARSES.with(|count| count.set(0));
+            let result = apply_sorted_non_overlapping_fuzzy_matches(
+                &source,
+                &matches,
+                needle,
+                replacement,
+                Some(path),
+            )
+            .unwrap();
+            assert_eq!(result, format!("def f():\n{}", shifted.repeat(1_000)));
+            assert_eq!(
+                STRING_LINE_PARSES.with(|count| count.get()),
+                parses,
+                "parses for {needle:?}"
+            );
+        }
+    }
+
     fn frozen_reverse_apply(
         source: &str,
         matches: &[crate::fuzzy_match::FuzzyMatch],
@@ -1865,8 +1935,14 @@ mod replace_all_tests {
                 "fixture must exercise replace_all: {needle:?}"
             );
             let expected = frozen_reverse_apply(source, &matches, replacement);
-            let actual = apply_sorted_non_overlapping_fuzzy_matches(source, &matches, replacement)
-                .expect("one-pass replacement");
+            let actual = apply_sorted_non_overlapping_fuzzy_matches(
+                source,
+                &matches,
+                needle,
+                replacement,
+                None,
+            )
+            .expect("one-pass replacement");
             assert_eq!(actual.as_bytes(), expected.as_bytes(), "needle={needle:?}");
         }
     }
@@ -1878,7 +1954,7 @@ mod replace_all_tests {
         assert_eq!(matches.len(), 1_024);
 
         let (result, allocations) = crate::test_allocations::count(|| {
-            apply_sorted_non_overlapping_fuzzy_matches(&source, &matches, "new")
+            apply_sorted_non_overlapping_fuzzy_matches(&source, &matches, "old", "new", None)
                 .expect("one-pass replacement")
         });
 
@@ -2164,12 +2240,21 @@ mod audit_regressions {
         let matches = crate::fuzzy_match::find_all_fuzzy(source, "a\nb\n");
         assert_eq!(matches.len(), 1);
         assert_eq!(
-            super::apply_sorted_non_overlapping_fuzzy_matches(source, &matches, "x\r\ny\r\n")
-                .unwrap(),
+            super::apply_sorted_non_overlapping_fuzzy_matches(
+                source,
+                &matches,
+                "a\nb\n",
+                "x\r\ny\r\n",
+                None,
+            )
+            .unwrap(),
             "x\r\ny\r\nc\r\n"
         );
         assert_eq!(
-            super::apply_sorted_non_overlapping_fuzzy_matches(source, &matches, "x\ny\n").unwrap(),
+            super::apply_sorted_non_overlapping_fuzzy_matches(
+                source, &matches, "a\nb\n", "x\ny\n", None
+            )
+            .unwrap(),
             "x\ny\r\nc\r\n"
         );
     }
