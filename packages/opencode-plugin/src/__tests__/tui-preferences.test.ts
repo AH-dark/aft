@@ -165,6 +165,16 @@ describe("resolveAftPrefs", () => {
     expect(prefs.sections.searchIndex).toBe(true);
     expect(prefs.rememberCollapsed).toBe(true);
   });
+
+  test("the prompt footer is on by default, off only for an explicit false", () => {
+    expect(resolveAftPrefs({}).footer).toBe(true);
+    expect(resolveAftPrefs({ aft: {} }).footer).toBe(true);
+    expect(resolveAftPrefs({ aft: { footer: false } }).footer).toBe(false);
+    expect(resolveAftPrefs({ aft: { footer: true } }).footer).toBe(true);
+    for (const invalid of ["false", 0, null, {}, []]) {
+      expect(resolveAftPrefs({ aft: { footer: invalid } }).footer).toBe(true);
+    }
+  });
 });
 
 describe("computeEffectiveOrder", () => {

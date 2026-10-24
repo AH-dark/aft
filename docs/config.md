@@ -653,6 +653,18 @@ With `subc.connection_file` set, background shell completions and pattern matche
 
 After a Location reload or host restart, AFT restores subscriptions in the background for up to 20 of that Location directory's newest sessions whose last update was within 24 hours. Recovery is sequential and does not delay Location startup or inspect another workspace's sessions. Sessions outside that window or cap recover on their next tool call or prompt.
 
+## OpenCode TUI preferences
+
+The AFT sidebar and the OpenCode 2 prompt footer read their display settings from the `aft` entry of OpenCode's shared `tui-preferences.jsonc`, not from `aft.jsonc`. The file is `$OPENCODE_CONFIG_DIR/tui-preferences.jsonc` when that variable is set, otherwise `$XDG_CONFIG_HOME/opencode/tui-preferences.jsonc` (default `~/.config/opencode/tui-preferences.jsonc`); `OPENCODE_TUI_PREFERENCES_FILE` names a different file. Edits take effect while OpenCode is running, without a restart.
+
+`footer` (default `true`) controls the AFT health line in the OpenCode 2 prompt footer (`AFT E0 W0 | D0 U0 C1 | T0`). Set it to `false` to remove the line; the sidebar and `/aft-status` are unaffected. A value other than `true` or `false` is ignored and the line stays on. OpenCode 1 has no AFT footer line, so the key has no effect there.
+
+```jsonc
+{
+  "aft": { "footer": false }
+}
+```
+
 ## Git co-authorship
 
 `git.co_author` controls commit attribution for AFT-spawned agent children. `"off"` is the default, `"auto"` derives the repository's bound agent from the gh-shim manifest and cached GitHub numeric ID, and an explicit `"Name <email>"` value is used verbatim. When enabled, AFT selects a complete dispatcher set through child-only `GIT_CONFIG_*` variables; it does not edit global or repository Git configuration. The dispatchers are identical for every project and storage root, so AFT writes them once per user to a directory named by a hash of their content, `<aft-cache>/git-hooks/<content-hash>`, where `<aft-cache>` is `AFT_CACHE_DIR` when set, otherwise `%LOCALAPPDATA%\aft` on Windows and `$XDG_CACHE_HOME/aft` or `~/.cache/aft` elsewhere (`<storage_root>/git-hooks/<content-hash>` when no home directory is known). The set is created atomically and never rewritten while intact, so each hook version is a single new executable per user. Each dispatcher preserves arguments, stdin, and exit status while chaining to the first executable repository hook from local `core.hooksPath`, the repository's Git directory, or `.githooks`. The `prepare-commit-msg` dispatcher adds attribution first so the repository hook can validate or amend it. AFT quarantines unknown or modified entries in its managed directory and regenerates the expected dispatchers before child launch. Project config may override this attribution key because attribution is not a trust boundary.

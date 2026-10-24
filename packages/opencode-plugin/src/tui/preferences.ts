@@ -39,6 +39,12 @@ export interface AftTuiPrefs {
   startCollapsed: boolean;
   rememberCollapsed: boolean;
   collapsed: boolean | null;
+  /**
+   * Whether OpenCode 2 shows AFT's health line (`AFT E0 W0 | D0 U0 C0 | T0`)
+   * in the prompt footer. Off hides it entirely; the sidebar and the status
+   * dialog are unaffected.
+   */
+  footer: boolean;
   header: {
     label: string;
     showVersion: boolean;
@@ -57,6 +63,7 @@ export const DEFAULT_PREFS: AftTuiPrefs = {
   startCollapsed: false,
   rememberCollapsed: true,
   collapsed: null,
+  footer: true,
   header: { label: "AFT", showVersion: true },
   sections: {
     searchIndex: true,
@@ -99,6 +106,7 @@ export function resolveAftPrefs(root: Record<string, unknown>): AftTuiPrefs {
     startCollapsed: bool(entry.startCollapsed, d.startCollapsed),
     rememberCollapsed: bool(entry.rememberCollapsed, d.rememberCollapsed),
     collapsed: typeof entry.collapsed === "boolean" ? entry.collapsed : null,
+    footer: bool(entry.footer, d.footer),
     header: {
       label: label(header.label, d.header.label, 20),
       showVersion: bool(header.showVersion, d.header.showVersion),
