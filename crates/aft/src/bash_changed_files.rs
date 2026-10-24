@@ -15,6 +15,8 @@ pub(crate) const MAX_DIFF_LINES: usize = 200;
 pub(crate) const MAX_REPORT_BYTES: usize = 64 * 1024;
 const MAX_FILE_BYTES: usize = 256 * 1024;
 const MAX_RENDER_TIME: Duration = Duration::from_secs(2);
+// Shared by both Git queries, including process startup and pipe collection.
+const GIT_CAPTURE_LIMIT: Duration = Duration::from_secs(1);
 const HEADER: &str =
     "Files changed while the command ran (changes by other processes may be included):";
 const DIRTY: &str = "no diff: it had uncommitted changes before the command";
@@ -812,20 +814,41 @@ impl Capture {
 }
 impl GitStart {
     fn read(root: &Path) -> Option<Self> {
+        let budget = GIT_CAPTURE_LIMIT;
+        // Debug builds let correctness tests choose an ample or exhausted budget
+        // without requiring Git process startup to meet a performance threshold.
+        #[cfg(debug_assertions)]
+        let budget = std::env::var("AFT_TEST_BASH_CHANGED_FILES_GIT_BUDGET_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value <= 30_000)
+            .map(Duration::from_millis)
+            .unwrap_or(budget);
+        Self::read_with_git(root, budget, |directory, args, deadline| {
+            crate::revision_read::bounded_git_bytes(directory, args, deadline, MAX_REPORT_BYTES)
+        })
+    }
+
+    fn read_with_git(
+        root: &Path,
+        budget: Duration,
+        mut git: impl FnMut(&Path, &[&str], Instant) -> Option<Vec<u8>>,
+    ) -> Option<Self> {
         let root = comparison_path(root);
-        let deadline = Instant::now() + Duration::from_millis(250);
-        let run = |args: &[&str]| {
-            crate::revision_read::bounded_git_bytes(&root, args, deadline, MAX_REPORT_BYTES)
+        let deadline = Instant::now() + budget;
+        let mut run = |args: &[&str]| {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            git(&root, args, deadline)
         };
-        let directory = PathBuf::from(
-            String::from_utf8(run(&["rev-parse", "--show-toplevel"])?)
-                .ok()?
-                .trim_end(),
-        );
-        let head = String::from_utf8(run(&["rev-parse", "--verify", "HEAD"])?)
-            .ok()?
-            .trim()
-            .to_string();
+        // One process returns both values; avoid paying for a second Git
+        // startup before the dirty-file query, especially on loaded runners.
+        let metadata =
+            String::from_utf8(run(&["rev-parse", "--show-toplevel", "--verify", "HEAD"])?).ok()?;
+        let (directory, head) = metadata.trim_end().rsplit_once('\n')?;
+        let directory = PathBuf::from(directory.strip_suffix('\r').unwrap_or(directory));
+        let head = head.trim().to_string();
         // Compare both index and worktree against the pinned HEAD, including
         // staged changes. Never refresh or write the caller's index.
         let bytes = run(&[

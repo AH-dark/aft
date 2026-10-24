@@ -907,6 +907,18 @@ fn bash_timeout_terminates_shell_process_group_grandchild() {
 #[cfg(unix)]
 #[test]
 fn bash_changed_files_foreground_and_background_completion_notice() {
+    // Verify actual diffs with an ample test budget, not a Git startup benchmark.
+    assert_changed_files_completion_with_git_budget("30000", false);
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn bash_changed_files_git_budget_exhaustion_reports_paths_without_diffs() {
+    assert_changed_files_completion_with_git_budget("0", true);
+}
+
+#[cfg(unix)]
+fn assert_changed_files_completion_with_git_budget(budget_ms: &str, exhausted: bool) {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     for args in [
@@ -934,6 +946,10 @@ fn bash_changed_files_foreground_and_background_completion_notice() {
             .success());
     }
     let mut aft = AftProcess::spawn_with_env(&[
+        (
+            "AFT_TEST_BASH_CHANGED_FILES_GIT_BUDGET_MS",
+            std::ffi::OsStr::new(budget_ms),
+        ),
         ("AFT_TEST_DISABLE_FILE_WATCHER", std::ffi::OsStr::new("0")),
         (
             "AFT_TEST_SYNC_FILE_WATCHER_START",
@@ -1017,17 +1033,7 @@ fn bash_changed_files_foreground_and_background_completion_notice() {
                     .contains(name),
                 "{completion}"
             );
-            assert!(
-                completion["_bash_changed_files"]["files"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|file| file["path"] == name
-                        && file["diff"]
-                            .as_str()
-                            .is_some_and(|diff| diff.contains("+hello"))),
-                "{completion}"
-            );
+            assert_changed_file_image(&completion["_bash_changed_files"], name, exhausted);
             assert_eq!(
                 completion["_bash_changed_files"]["incomplete"],
                 serde_json::json!([]),
@@ -1063,18 +1069,31 @@ fn bash_changed_files_foreground_and_background_completion_notice() {
                     .contains("Files changed while the command ran"),
                 "{result}"
             );
-            assert!(
-                result["_bash_changed_files"]["files"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|file| file["path"] == name
-                        && file["diff"]
-                            .as_str()
-                            .is_some_and(|diff| diff.contains("+hello"))),
-                "{result}"
-            );
+            assert_changed_file_image(&result["_bash_changed_files"], name, exhausted);
         }
+    }
+}
+
+#[cfg(unix)]
+fn assert_changed_file_image(report: &serde_json::Value, name: &str, exhausted: bool) {
+    let files = report["files"].as_array().unwrap();
+    if exhausted {
+        assert!(report["text"].as_str().unwrap().contains(
+            "No diffs: git before-images could not be captured within the time/output budget, so only paths are listed."
+        ), "{report}");
+        assert!(files.iter().any(|file| file["path"] == name), "{report}");
+        assert!(
+            files.iter().all(|file| file.get("diff").is_none()),
+            "{report}"
+        );
+    } else {
+        assert!(
+            files.iter().any(|file| file["path"] == name
+                && file["diff"]
+                    .as_str()
+                    .is_some_and(|diff| diff.contains("+hello"))),
+            "{report}"
+        );
     }
 }
 
