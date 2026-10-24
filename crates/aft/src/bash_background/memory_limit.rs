@@ -201,6 +201,30 @@ impl Drop for Monitor {
 mod linux {
     use std::path::{Path, PathBuf};
 
+    fn helper_command(executable: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new(executable);
+        // The user manager needs its session endpoint, not the daemon's credentials.
+        command.env_clear().env("PATH", "/usr/bin:/bin");
+        for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command
+    }
+
+    fn systemd_run_path_with(mut exists: impl FnMut(&Path) -> bool) -> Option<&'static Path> {
+        for path in [
+            Path::new("/usr/bin/systemd-run"),
+            Path::new("/bin/systemd-run"),
+        ] {
+            if exists(path) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
     fn current(pid: u32) -> Option<PathBuf> {
         let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
         let relative = text.lines().find_map(|line| line.strip_prefix("0::"))?;
@@ -242,8 +266,11 @@ mod linux {
         }
         // Ask the user manager for delegation when the current cgroup is not writable.
         // The bootstrap waits on stdin, so no uncontained payload can start.
-        use std::process::{Command, Stdio};
-        let Ok(mut helper) = Command::new("systemd-run")
+        use std::process::Stdio;
+        let Some(executable) = systemd_run_path_with(|path| path.is_file()) else {
+            return (None, None);
+        };
+        let Ok(mut helper) = helper_command(executable)
             .args([
                 "--user",
                 "--scope",
@@ -302,6 +329,110 @@ mod linux {
                 })
             })
         })
+    }
+
+    #[cfg(test)]
+    mod helper_env_tests {
+        use super::*;
+
+        const DRIVER: &str = "bash_background::memory_limit::linux::helper_env_tests::memory_limit_helper_environment_probe";
+
+        #[test]
+        fn memory_limit_helper_binary_uses_fixed_system_paths() {
+            let mut visited = Vec::new();
+            let path = systemd_run_path_with(|path| {
+                visited.push(path.to_path_buf());
+                path == Path::new("/bin/systemd-run")
+            });
+            assert_eq!(path, Some(Path::new("/bin/systemd-run")));
+            assert_eq!(
+                visited,
+                [
+                    PathBuf::from("/usr/bin/systemd-run"),
+                    PathBuf::from("/bin/systemd-run")
+                ]
+            );
+            assert!(systemd_run_path_with(|_| false).is_none());
+        }
+
+        #[test]
+        fn memory_limit_helper_environment_probe() {
+            if std::env::var("AFT_TEST_MEMORY_HELPER_PARENT").as_deref() != Ok("fixture") {
+                return;
+            }
+            let output = helper_command(Path::new("/usr/bin/env")).output().unwrap();
+            assert!(output.status.success());
+            let vars: std::collections::BTreeMap<String, String> = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    let (key, value) = line.split_once('=').unwrap();
+                    (key.into(), value.into())
+                })
+                .collect();
+            println!(
+                "HELPER_ENV_SNAPSHOT: {}",
+                serde_json::to_string(&vars).unwrap()
+            );
+        }
+
+        #[test]
+        fn memory_limit_helper_environment_excludes_daemon_launch_material() {
+            // A separate fixture parent avoids changing the test runner's environment.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .env_clear()
+                .envs([
+                    ("PATH", "/fixture/unsafe-path"),
+                    ("HOME", "/fixture/unsafe-home"),
+                    ("XDG_RUNTIME_DIR", "/fixture/runtime"),
+                    ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/fixture/bus"),
+                    ("AFT_TEST_MEMORY_HELPER_PARENT", "fixture"),
+                    ("AFT_SUBC_LAUNCH_NONCE", "fixture-nonce"),
+                    ("SUBC_MODULE_ID", "fixture-module-id"),
+                    ("SUBC_TOKEN", "fixture-subc-token"),
+                    ("CK_TEST_SECRET", "fixture-ck-secret"),
+                    ("AWS_SESSION_TOKEN", "fixture-unrelated-secret"),
+                ])
+                .args(["--exact", DRIVER, "--nocapture"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let json = stdout
+                .lines()
+                .find_map(|line| {
+                    line.split_once("HELPER_ENV_SNAPSHOT: ")
+                        .map(|(_, json)| json)
+                })
+                .expect("fixture helper environment");
+            let vars: std::collections::BTreeMap<String, String> =
+                serde_json::from_str(json).unwrap();
+            let forbidden: Vec<_> = vars
+                .keys()
+                .filter(|key| {
+                    key.starts_with("AFT_") || key.starts_with("SUBC_") || key.starts_with("CK_")
+                })
+                .collect();
+            assert!(
+                forbidden.is_empty(),
+                "helper inherited daemon launch names: {forbidden:?}"
+            );
+            assert_eq!(
+                vars,
+                std::collections::BTreeMap::from([
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    ("XDG_RUNTIME_DIR".into(), "/fixture/runtime".into()),
+                    (
+                        "DBUS_SESSION_BUS_ADDRESS".into(),
+                        "unix:path=/fixture/bus".into()
+                    ),
+                ])
+            );
+        }
     }
 }
 
