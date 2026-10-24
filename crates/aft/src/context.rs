@@ -1959,6 +1959,9 @@ pub(crate) struct WatcherDrainSliceState {
     pub(crate) scheduler_changed_path_count: usize,
     pub(crate) semantic_refresh_paths: Vec<PathBuf>,
     pub(crate) view_publication_paths: BTreeSet<PathBuf>,
+    /// Lost events require a whole-checkout read until a full request is handed
+    /// to the publisher. Later path batches must not dilute that obligation.
+    pub(crate) view_publication_full: bool,
     pub(crate) view_publication_due: Option<Instant>,
     pub(crate) path_slice_count: usize,
 }
@@ -2217,6 +2220,7 @@ impl WatcherDrainSliceState {
             scheduler_changed_path_count: 0,
             semantic_refresh_paths: Vec::new(),
             view_publication_paths: BTreeSet::new(),
+            view_publication_full: false,
             view_publication_due: None,
             path_slice_count: 0,
         }
@@ -6738,7 +6742,9 @@ impl AppContext {
             // publication paths are read before the publication jobs they are
             // handed to.
             if let Some(state) = self.watcher_drain_slice.lock().as_ref() {
-                if state.view_publication_due.is_some() && state.view_publication_paths.is_empty() {
+                if state.view_publication_due.is_some()
+                    && (state.view_publication_full || state.view_publication_paths.is_empty())
+                {
                     changes.whole_checkout = true;
                 }
                 changes.view_paths.extend(

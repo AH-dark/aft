@@ -3500,11 +3500,13 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
     if ctx.retire_deleted_view_root() {
         state.view_publication_due = None;
         state.view_publication_paths.clear();
+        state.view_publication_full = false;
         return;
     }
     if ctx.view_runtime_snapshot().is_none() {
         state.view_publication_due = None;
         state.view_publication_paths.clear();
+        state.view_publication_full = false;
         return;
     }
     if let Some(due) = ctx
@@ -3516,13 +3518,17 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
         state.view_publication_due = Some(due);
         return;
     }
-    let changed = state
-        .view_publication_paths
-        .iter()
-        .filter_map(|path| path.strip_prefix(&root).ok())
-        .filter_map(|path| aft::views::RelPath::from_os_path(path).ok())
-        .map(|path| path.as_bytes().to_vec())
-        .collect::<BTreeSet<_>>();
+    let changed = if state.view_publication_full {
+        BTreeSet::new()
+    } else {
+        state
+            .view_publication_paths
+            .iter()
+            .filter_map(|path| path.strip_prefix(&root).ok())
+            .filter_map(|path| aft::views::RelPath::from_os_path(path).ok())
+            .map(|path| path.as_bytes().to_vec())
+            .collect::<BTreeSet<_>>()
+    };
     match crate::executor::view_publication::schedule(
         ctx,
         changed,
@@ -3534,12 +3540,14 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
                 root.display()
             );
             state.view_publication_paths.clear();
+            state.view_publication_full = false;
             state.view_publication_due = None;
         }
         Err(error) => {
             if ctx.retire_deleted_view_root() || ctx.view_runtime_snapshot().is_none() {
                 state.view_publication_due = None;
                 state.view_publication_paths.clear();
+                state.view_publication_full = false;
                 return;
             }
             // Inline publication records and logs the failure in the same retry
@@ -3664,6 +3672,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     }
                 }
                 Ok(WatcherDispatchEvent::RescanRequired(reason)) => {
+                    state.view_publication_full = true;
                     dispatch_events_received += 1;
                     // A rescan means the watcher dropped the individual
                     // changed paths, so any of them may have changed the
@@ -3913,6 +3922,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 ctx.note_checkout_changed_for_callgraph();
                 ctx.reset_view_publication_retry();
                 state.view_publication_paths.clear();
+                state.view_publication_full = true;
                 state.view_publication_due = Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
             }
         }
@@ -3943,6 +3953,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     ctx.note_checkout_changed_for_callgraph();
                     ctx.reset_view_publication_retry();
                     state.view_publication_paths.clear();
+                    state.view_publication_full = true;
                     state.view_publication_due =
                         Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
                 }
@@ -4219,7 +4230,10 @@ fn finish_watcher_drain_for_test(
 }
 
 #[cfg(test)]
-fn drain_watcher_to_completion_for_test(ctx: &AppContext, max_paths: usize) -> DrainBatchOutcome {
+pub(crate) fn drain_watcher_to_completion_for_test(
+    ctx: &AppContext,
+    max_paths: usize,
+) -> DrainBatchOutcome {
     finish_watcher_drain_for_test(ctx, max_paths, drain_watcher_events_bounded(ctx, max_paths))
 }
 

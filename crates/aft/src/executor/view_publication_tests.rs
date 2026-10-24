@@ -1365,6 +1365,59 @@ fn publication_does_not_reuse_a_deleted_unchanged_member() {
 }
 
 #[test]
+fn publication_rescan_then_event_still_reads_the_whole_checkout() {
+    use crate::watcher_filter::{RescanReason, WatcherDispatchEvent};
+    let fixture = Fixture::new();
+    let before = fixture
+        .view
+        .load_manifest(&fixture.initial)
+        .unwrap()
+        .to_json_bytes()
+        .unwrap();
+    std::fs::write(
+        fixture.job_root().join("tracked.rs"),
+        "pub fn missed_by_watcher() {}\n",
+    )
+    .unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    *fixture.ctx.watcher_rx().lock() = Some(rx);
+    tx.send(WatcherDispatchEvent::RescanRequired(
+        RescanReason::KernelDropped,
+    ))
+    .unwrap();
+    // Complete the rescan before the later event arrives in the quiet window.
+    crate::runtime_drain::drain_watcher_to_completion_for_test(&fixture.ctx, usize::MAX);
+    assert!(fixture
+        .ctx
+        .watcher_drain_slice()
+        .lock()
+        .as_ref()
+        .unwrap()
+        .view_publication_due
+        .is_some());
+    tx.send(WatcherDispatchEvent::Paths(vec![fixture
+        .job_root()
+        .join("later.rs")]))
+        .unwrap();
+    crate::runtime_drain::drain_watcher_to_completion_for_test(&fixture.ctx, usize::MAX);
+    let mut state = fixture.ctx.watcher_drain_slice().lock().take().unwrap();
+    state.view_publication_due = Some(Instant::now());
+    crate::runtime_drain::publish_view_if_quiet(&fixture.ctx, &mut state);
+    let generation = fixture.view.current_generation().unwrap().unwrap();
+    assert_ne!(
+        before,
+        fixture
+            .view
+            .load_manifest(&generation)
+            .unwrap()
+            .to_json_bytes()
+            .unwrap(),
+        "the scheduled publication must read the edit omitted by the dropped events"
+    );
+    assert!(state.view_publication_due.is_none());
+}
+
+#[test]
 fn publication_io_error_names_operation_and_path() {
     let fixture = Fixture::new();
     let path = fixture.project.path().join("tracked.rs");
