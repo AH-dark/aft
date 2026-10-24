@@ -150,6 +150,17 @@ CREATE INDEX IF NOT EXISTS blob_membership ON blob_payloads(full_key);
 CREATE TABLE IF NOT EXISTS blob_quarantine (
     full_key BLOB NOT NULL PRIMARY KEY CHECK(length(full_key) = 32)
 ) WITHOUT ROWID;
+-- A new identity distinguishes a recreated store from its old, empty counter.
+CREATE TABLE IF NOT EXISTS blob_removals (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    identity BLOB NOT NULL,
+    removed INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO blob_removals VALUES(1, randomblob(16), 0);
+CREATE TRIGGER IF NOT EXISTS count_blob_removals AFTER DELETE ON blob_payloads
+BEGIN
+    UPDATE blob_removals SET removed = removed + 1 WHERE singleton = 1;
+END;
 "#;
 
 const CONTAINS_SQL: &str = "SELECT 1 FROM blob_payloads INDEXED BY blob_membership
@@ -592,6 +603,16 @@ impl BlobStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Read through the store's connection: opening another descriptor can
+    /// release process-wide SQLite locks when that descriptor is closed.
+    pub(crate) fn removal_stamp(&self) -> Result<(Vec<u8>, i64), BlobStoreError> {
+        Ok(self.connection.query_row(
+            "SELECT identity, removed FROM blob_removals WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?)
     }
 
     pub fn pragmas(&self) -> &BlobStorePragmas {
@@ -1095,8 +1116,13 @@ mod tests {
                 .connection
                 .pragma_query_value::<i64, _>(None, "schema_version", |row| row.get(0))
                 .unwrap(),
-            schema_version
+            // The removal counter and its trigger do not rebuild payload rows
+            // or indexes, but each legitimately advances SQLite's schema cookie.
+            schema_version + 2
         );
+        let (identity, removed) = store.removal_stamp().unwrap();
+        assert_eq!(identity.len(), 16);
+        assert_eq!(removed, 0);
     }
 
     /// Eight racing first-openers on a fresh file trip the WAL-switch BUSY that

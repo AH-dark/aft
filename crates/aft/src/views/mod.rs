@@ -458,17 +458,27 @@ impl ManifestEntry {
 }
 
 /// The one manifest that defines a view generation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Manifest {
     pub path_identity_version: u8,
-    entries: BTreeMap<RelPath, ManifestEntry>,
+    entries: std::sync::Arc<BTreeMap<RelPath, ManifestEntry>>,
+    json: std::sync::Arc<std::sync::OnceLock<(u8, std::sync::Arc<[u8]>)>>,
 }
+
+impl PartialEq for Manifest {
+    fn eq(&self, other: &Self) -> bool {
+        self.path_identity_version == other.path_identity_version && self.entries == other.entries
+    }
+}
+
+impl Eq for Manifest {}
 
 impl Manifest {
     pub fn new(entries: impl IntoIterator<Item = (RelPath, ManifestEntry)>) -> Result<Self> {
         let mut manifest = Self {
             path_identity_version: PATH_IDENTITY_VERSION,
-            entries: BTreeMap::new(),
+            entries: Default::default(),
+            json: Default::default(),
         };
         for (rel_path, entry) in entries {
             manifest.insert(rel_path, entry)?;
@@ -478,7 +488,11 @@ impl Manifest {
 
     pub fn insert(&mut self, rel_path: RelPath, entry: ManifestEntry) -> Result<()> {
         validate_member(&rel_path, &entry)?;
-        if self.entries.insert(rel_path, entry).is_some() {
+        self.json = Default::default();
+        if std::sync::Arc::make_mut(&mut self.entries)
+            .insert(rel_path, entry)
+            .is_some()
+        {
             return Err(ViewError::InvalidManifest(
                 "a manifest cannot contain the same rel_path twice".to_string(),
             ));
@@ -505,7 +519,19 @@ impl Manifest {
     }
 
     pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
-        Ok(serde_json::to_vec(self)?)
+        Ok(self.json_bytes()?.to_vec())
+    }
+
+    /// Fingerprints and the durable writer share the same canonical encoding.
+    pub(super) fn json_bytes(&self) -> Result<std::sync::Arc<[u8]>> {
+        if let Some((version, bytes)) = self.json.get() {
+            if *version == self.path_identity_version {
+                return Ok(bytes.clone());
+            }
+        }
+        let bytes: std::sync::Arc<[u8]> = serde_json::to_vec(self)?.into();
+        let _ = self.json.set((self.path_identity_version, bytes.clone()));
+        Ok(bytes)
     }
 
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
@@ -969,27 +995,9 @@ impl ViewStore {
         observe(observer, PublicationStep::AliasRowsDurable);
         timing.phase("alias_durability");
 
-        if let Some(previous) = reused {
-            // The pinned base already proved closure for immutable shared blobs.
-            // A semantic-only fill must validate just the newly referenced keys.
-            let old_keys = previous
-                .plane_keys()
-                .map(|(plane, key)| (plane == ArtifactPlane::Semantic, key))
-                .collect::<BTreeSet<_>>();
-            let new_keys = request
-                .manifest
-                .plane_keys()
-                .filter(|(plane, key)| {
-                    !old_keys.contains(&(*plane == ArtifactPlane::Semantic, *key))
-                })
-                .collect::<Vec<_>>();
-            closure.probe_blobs(&new_keys)?;
-            if !closure.trigram_is_present()? {
-                return Err(ViewError::MissingTrigram);
-            }
-        } else {
-            probe_publication_closure(request.manifest, &request.closure_requirements, closure)?;
-        }
+        // Reusing a derived database says nothing about deleted blob rows.
+        // Only the store-backed closure can revoke or reuse that proof.
+        probe_publication_closure(request.manifest, &request.closure_requirements, closure)?;
         observe(observer, PublicationStep::ClosureProbed);
         drop(blob_durability_barrier);
         timing.phase("closure_probe");
@@ -1271,7 +1279,7 @@ fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<()> {
             .write(true)
             .open(&temporary)
             .map_err(|error| ViewError::io_at("creating", &temporary, error))?;
-        file.write_all(&manifest.to_json_bytes()?)
+        file.write_all(&manifest.json_bytes()?)
             .map_err(|error| ViewError::io_at("writing", &temporary, error))?;
         file.write_all(b"\n")
             .map_err(|error| ViewError::io_at("writing", &temporary, error))?;
@@ -1396,6 +1404,35 @@ fn observe(observer: Option<&dyn PublicationObserver>, step: PublicationStep) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manifest_serialization_cache_is_shared_but_invalidated_by_insert() {
+        let mut manifest = super::Manifest::new([]).unwrap();
+        let bytes = manifest.json_bytes().unwrap();
+        let clone = manifest.clone();
+        assert!(std::sync::Arc::ptr_eq(&bytes, &clone.json_bytes().unwrap()));
+        manifest
+            .insert(
+                super::RelPath::new(b"link".to_vec()).unwrap(),
+                super::ManifestEntry::Symlink {
+                    target_bytes: super::ByteString::new(b"target".to_vec()),
+                },
+            )
+            .unwrap();
+        assert_ne!(
+            manifest.to_json_bytes().unwrap(),
+            clone.to_json_bytes().unwrap()
+        );
+        assert_eq!(
+            manifest.to_json_bytes().unwrap(),
+            serde_json::to_vec(&manifest).unwrap()
+        );
+        manifest.path_identity_version = super::PATH_IDENTITY_VERSION + 1;
+        assert_eq!(
+            manifest.to_json_bytes().unwrap(),
+            serde_json::to_vec(&manifest).unwrap()
+        );
+    }
+
     use super::*;
 
     /// Two publishers checkpoint the same artifact database before publishing.
