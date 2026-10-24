@@ -809,6 +809,9 @@ struct RecoveryContext {
     stderr_path: Option<String>,
     include_stderr_path: bool,
     artifact_access: ArtifactRecoveryAccess,
+    /// The command exited non-zero, so the reply cap keeps failure lines
+    /// from the middle of the output it cuts.
+    failed_exit: bool,
 }
 
 fn optional_string_bytes(value: Option<&String>) -> u64 {
@@ -2583,6 +2586,7 @@ impl BgTaskRegistry {
                 raw.truncated,
                 disk_truncation,
                 artifact_access,
+                matches!(metadata.exit_code, Some(code) if code != 0),
             )
         };
         normalize_piped_display_output(&mut rendered.output_preview);
@@ -12656,6 +12660,7 @@ fn render_compressed_with_recovery(
     input_truncated: bool,
     disk_truncation: DiskTruncation,
     artifact_access: ArtifactRecoveryAccess,
+    failed_exit: bool,
 ) -> TerminalOutputCache {
     // Preserve a single canonical trailing newline. A bare `.trim_end()` strips
     // the legitimate final newline that `echo` and most commands emit, so
@@ -12689,6 +12694,7 @@ fn render_compressed_with_recovery(
         stderr_path: stderr_path.clone(),
         include_stderr_path,
         artifact_access: artifact_access.clone(),
+        failed_exit,
     };
 
     let (output_preview, output_truncated) =
@@ -12707,13 +12713,14 @@ fn render_compressed_with_recovery(
 
 fn render_body_with_recovery_marker(body: &str, recovery: &mut RecoveryContext) -> (String, bool) {
     let final_lines = recovery.final_lines.clone();
+    let failed = recovery.failed_exit;
     render_body_with_recovery_marker_at_cap(
         body,
         recovery,
         FINAL_OUTPUT_CAP_BYTES,
-        |input| super::output::cap_final_output_preserving(input, None, &final_lines),
+        |input| super::output::cap_final_output_preserving(input, None, &final_lines, failed),
         |input, marker| {
-            super::output::cap_final_output_preserving(input, Some(marker), &final_lines)
+            super::output::cap_final_output_preserving(input, Some(marker), &final_lines, failed)
         },
     )
 }
@@ -13047,6 +13054,7 @@ fn render_raw_passthrough(
         stderr_path: stderr_path.clone(),
         include_stderr_path,
         artifact_access: artifact_access.clone(),
+        failed_exit: false,
     };
     let (output_preview, output_truncated) =
         render_raw_body_with_recovery_marker(&raw.text, &mut recovery);
@@ -16914,6 +16922,7 @@ mod tests {
                 task_id: "bash-test".to_string(),
                 readable: true,
             },
+            failed_exit: false,
         };
 
         let marker = recovery_marker(&recovery).expect("disk truncation must emit marker");
@@ -18973,13 +18982,11 @@ mod tests {
     }
 
     /// A command no compressor recognises gets only the reply byte cap, which
-    /// keeps a 6 KiB head and at most twenty tail lines. Failure lines in the
-    /// dropped middle vanish from the agent's reply even though the compressor
-    /// layer has a "[raw failure lines preserved by AFT]" rescue: that rescue
-    /// runs only after a specific compressor matched, and it runs before this
-    /// cap, not inside it.
+    /// keeps a 6 KiB head and at most twenty tail lines. The compressor-level
+    /// failure rescue never runs for it, so for a failed command the cap itself
+    /// keeps the failure lines it cuts from the middle, under the same label,
+    /// before the final line. A successful command's reply is unchanged.
     #[test]
-    #[ignore = "fails today (#759): the reply byte cap drops failure lines from the middle of unrecognised output"]
     fn reply_cap_keeps_failure_lines_from_the_middle_of_unrecognised_output() {
         let stdout: String = (1..=3000)
             .map(|index| match index {
@@ -19005,6 +19012,20 @@ mod tests {
                 shown(&foreground)
             );
         }
+        assert!(
+            foreground.contains(&format!(
+                "{}\nFAILED: step 1500 could not open fixture\nERROR: step 2200 lost its connection\nstep 3000 processed\n",
+                crate::compress::PRESERVED_FAILURES_LABEL
+            )),
+            "{foreground}"
+        );
+        let (succeeded, _completion) =
+            cargo_verdict_agent_text("./scripts/run-steps.sh", &stdout, "", 0);
+        assert!(
+            !succeeded.contains(crate::compress::PRESERVED_FAILURES_LABEL),
+            "{succeeded}"
+        );
+        assert!(!succeeded.contains("FAILED: step 1500"));
     }
 
     #[test]
