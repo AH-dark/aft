@@ -189,8 +189,7 @@ impl WriterFrame {
                     let response = super::result_body::too_large(
                         "retained-tool-reply",
                         outgoing.frame.body.len(),
-                        "retained tool reply",
-                        "paths, pattern, or offset/limit",
+                        "narrow the call with paths, pattern, or offset/limit",
                     );
                     Some(ToolCallResult {
                         text: response.data["message"].as_str().unwrap().into(),
@@ -1100,8 +1099,7 @@ fn build_result_body_frame(
         let response = super::result_body::too_large(
             "response_too_large",
             body.len(),
-            "tool reply",
-            "paths, pattern, or offset/limit",
+            "narrow the call with paths, pattern, or offset/limit",
         );
         let fallback = ToolCallResult {
             text: response.data["message"].as_str().unwrap().into(),

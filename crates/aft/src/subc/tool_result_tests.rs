@@ -49,6 +49,22 @@ fn opted_in(trust: BindTrust) -> wire::ToolResponsePolicy {
     }
 }
 
+#[test]
+fn tool_result_too_large_instructions_are_complete() {
+    for action in [
+        "read a smaller image",
+        "read a page with fewer or smaller images",
+        "narrow the call with paths, pattern, or offset/limit",
+    ] {
+        let response = result_body::too_large("id", 3 * 1024 * 1024, action);
+        assert_eq!(response.data["code"], "response_too_large");
+        assert_eq!(
+            response.data["message"],
+            format!("reply too large to send (3.00 MiB, limit 3 MiB); {action}")
+        );
+    }
+}
+
 fn project_frame(mut outgoing: wire::WriterFrame) -> Frame {
     outgoing.project_tool_result().unwrap();
     outgoing.frame

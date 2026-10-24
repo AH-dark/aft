@@ -10,7 +10,7 @@ pub(super) const DECLARE_RESULT_FORMAT: bool = false;
 pub(crate) const MAX_RESULT_BYTES: usize = cortexkit_role_tool_provider::result::MAX_RESULT_BYTES;
 pub(crate) const FALLBACK_ERROR_CODE: &str = "tool_error";
 pub(crate) const TOO_LARGE_SENTENCE: &str =
-    "reply too large to send ({size} MiB, limit 3 MiB): {what}; narrow it with {knob}";
+    "reply too large to send ({size} MiB, limit 3 MiB); {action}";
 
 pub(super) fn accepts(capabilities: Option<&[String]>) -> bool {
     capabilities.is_some_and(|items| items.iter().any(|item| item == RESULT_FORMAT))
@@ -56,10 +56,9 @@ pub(super) fn error_code(code: Option<&str>) -> String {
     }
 }
 
-pub(crate) fn too_large(id: &str, size: usize, what: &str, knob: &str) -> Response {
+pub(crate) fn too_large(id: &str, size: usize, action: &str) -> Response {
     let message = TOO_LARGE_SENTENCE
         .replace("{size}", &format!("{:.2}", size as f64 / (1024.0 * 1024.0)))
-        .replace("{what}", what)
-        .replace("{knob}", knob);
+        .replace("{action}", action);
     Response::error(id, "response_too_large", message)
 }

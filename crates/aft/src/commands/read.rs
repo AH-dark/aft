@@ -284,12 +284,7 @@ fn image_attachment_response(id: &str, image: ProcessedImage) -> Response {
             .saturating_mul(2)
             .saturating_add(16 * 1024);
         if wire_size >= crate::subc::result_body::MAX_RESULT_BYTES {
-            return crate::subc::result_body::too_large(
-                id,
-                wire_size,
-                "image read",
-                "a smaller image",
-            );
+            return crate::subc::result_body::too_large(id, wire_size, "read a smaller image");
         }
     }
     let data = match encode_base64_checked(&image.bytes, |encoded_len| {
@@ -969,8 +964,7 @@ fn github_read_response(
             return crate::subc::result_body::too_large(
                 &req.id,
                 wire_size,
-                "GitHub image read",
-                "a page with fewer or smaller images",
+                "read a page with fewer or smaller images",
             );
         }
     }
