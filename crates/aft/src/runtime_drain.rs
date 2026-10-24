@@ -3524,10 +3524,15 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
         state
             .view_publication_paths
             .iter()
-            .filter_map(|path| path.strip_prefix(&root).ok())
-            .filter_map(|path| aft::views::RelPath::from_os_path(path).ok())
-            .map(|path| path.as_bytes().to_vec())
-            .collect::<BTreeSet<_>>()
+            .map(|path| {
+                path.strip_prefix(&root).ok()
+                    .and_then(|path| aft::views::RelPath::from_os_path(path).ok())
+                    .map(|path| path.as_bytes().to_vec())
+            })
+            // Losing one spelling (including a differently cased root) loses
+            // evidence for the whole delta, not just for that one path.
+            .collect::<Option<BTreeSet<_>>>()
+            .unwrap_or_default()
     };
     match crate::executor::view_publication::schedule(
         ctx,

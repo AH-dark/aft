@@ -1418,6 +1418,56 @@ fn publication_rescan_then_event_still_reads_the_whole_checkout() {
 }
 
 #[test]
+fn publication_unrepresentable_watcher_path_preserves_full_read() {
+    for root_event in [false, true] {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.job_root().join("other.rs"), "pub fn before() {}\n").unwrap();
+        commit(&fixture.job_root());
+        fixture
+            .ctx
+            .publish_view_paths(BTreeSet::new(), true)
+            .unwrap();
+        let generation = fixture.view.current_generation().unwrap().unwrap();
+        let before = fixture.view.load_manifest(&generation).unwrap();
+        std::fs::write(
+            fixture.job_root().join("tracked.rs"),
+            "pub fn missed_spelling() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.job_root().join("other.rs"),
+            "pub fn reported() {}\n",
+        )
+        .unwrap();
+        let mut state = crate::context::WatcherDrainSliceState::new(
+            fixture.ctx.configure_generation(),
+            fixture.ctx.configure_content_generation(),
+        );
+        state
+            .view_publication_paths
+            .insert(fixture.job_root().join("other.rs"));
+        state.view_publication_paths.insert(if root_event {
+            fixture.job_root()
+        } else {
+            fixture
+                .job_root()
+                .with_file_name("different-root-spelling")
+                .join("tracked.rs")
+        });
+        state.view_publication_due = Some(Instant::now());
+        crate::runtime_drain::publish_view_if_quiet(&fixture.ctx, &mut state);
+        let generation = fixture.view.current_generation().unwrap().unwrap();
+        let after = fixture.view.load_manifest(&generation).unwrap();
+        let path = crate::views::RelPath::new(b"tracked.rs".to_vec()).unwrap();
+        assert_ne!(
+            before.get(&path),
+            after.get(&path),
+            "unrepresentable event was silently discarded: root_event={root_event}"
+        );
+    }
+}
+
+#[test]
 fn publication_io_error_names_operation_and_path() {
     let fixture = Fixture::new();
     let path = fixture.project.path().join("tracked.rs");

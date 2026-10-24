@@ -704,6 +704,9 @@ pub fn prepare_checkout_deferring(
     });
     let rebuild_all = request.changed_paths.is_empty()
         || subtree_changed
+        // Case and Unicode spellings can differ on insensitive filesystems.
+        // An unmatched notification cannot safely identify an unchanged entry.
+        || request.changed_paths.iter().any(|path| !head.iter().any(|entry| &entry.rel_path == path))
         || !head_cached
         || cached
             .as_ref()

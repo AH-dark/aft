@@ -553,6 +553,54 @@ mod tests {
     }
 
     #[test]
+    fn views_ambiguous_watcher_spellings_force_full_read() {
+        for variant in 0..3 {
+            let (project, _storage, mut request) = fixture();
+            let (actual, reported) = if variant == 1 {
+                use unicode_normalization::UnicodeNormalization;
+                let name = "caf\u{e9}.rs";
+                fs::write(project.path().join(name), "pub fn before() {}\n").unwrap();
+                git(project.path(), &["add", "-A"]);
+                git(project.path(), &["commit", "--quiet", "-m", "unicode"]);
+                publish(&request);
+                let tracked = head_tree_entries(project.path())
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.rel_path.starts_with(b"caf"))
+                    .unwrap();
+                let spelling = String::from_utf8(tracked.rel_path).unwrap();
+                let nfc: String = spelling.nfc().collect();
+                let nfd: String = spelling.nfd().collect();
+                (name.to_owned(), if spelling == nfc { nfd } else { nfc })
+            } else {
+                ("f1.rs".to_owned(), "F1.rs".to_owned())
+            };
+            if variant == 2 {
+                fs::rename(
+                    project.path().join(&actual),
+                    project.path().join("case-stage.rs"),
+                )
+                .unwrap();
+                fs::rename(
+                    project.path().join("case-stage.rs"),
+                    project.path().join(&reported),
+                )
+                .unwrap();
+                fs::write(project.path().join(&reported), "pub fn case_renamed() {}\n").unwrap();
+            } else {
+                fs::write(project.path().join(&actual), "pub fn changed() {}\n").unwrap();
+            }
+            fs::write(project.path().join("f0.rs"), "pub fn notified() {}\n").unwrap();
+            request.changed_paths = BTreeSet::from([b"f0.rs".to_vec(), reported.into_bytes()]);
+            assert_eq!(
+                publish(&request).to_json_bytes().unwrap(),
+                rebuild_manifest(&request).to_json_bytes().unwrap(),
+                "variant={variant}"
+            );
+        }
+    }
+
+    #[test]
     fn views_incremental_closure_uses_owning_connections_and_revokes_stale_proof() {
         let (_project, storage, request) = fixture();
         let view = ViewStore::open(storage.path(), &request.scope).unwrap();
@@ -617,7 +665,7 @@ mod tests {
                 let name = format!("f{index}.rs");
                 let path = project.path().join(&name);
                 let mut changed = BTreeSet::from([name.as_bytes().to_vec()]);
-                match (step + seed as usize) % 10 {
+                match (step + seed as usize) % 11 {
                     op @ (0 | 1) => {
                         let was_link = fs::symlink_metadata(&path)
                             .is_ok_and(|meta| meta.file_type().is_symlink());
@@ -711,7 +759,7 @@ mod tests {
                         );
                         request.changed_paths.clear();
                         publish(&request);
-                        if (step + seed as usize) % 10 == 8 {
+                        if (step + seed as usize) % 11 == 8 {
                             fs::remove_dir_all(project.path().join(&directory)).unwrap();
                         } else {
                             let destination = format!("moved-{step}");
@@ -729,6 +777,42 @@ mod tests {
                         .unwrap();
                         changed.insert(directory.into_bytes());
                         changed.insert(b"notify.rs".to_vec());
+                    }
+                    10 => {
+                        let lower = format!("case{step}.rs");
+                        let upper = format!("CASE{step}.rs");
+                        fs::write(project.path().join(&lower), "pub fn before_case() {}\n")
+                            .unwrap();
+                        fs::write(project.path().join("notify.rs"), "pub fn before() {}\n")
+                            .unwrap();
+                        git(project.path(), &["add", "-A"]);
+                        git(
+                            project.path(),
+                            &["commit", "--quiet", "--allow-empty", "-m", "case member"],
+                        );
+                        request.changed_paths.clear();
+                        publish(&request);
+                        fs::rename(
+                            project.path().join(&lower),
+                            project.path().join("case-stage.rs"),
+                        )
+                        .unwrap();
+                        fs::rename(
+                            project.path().join("case-stage.rs"),
+                            project.path().join(&upper),
+                        )
+                        .unwrap();
+                        fs::write(
+                            project.path().join(&upper),
+                            format!("pub fn case_{step}() {{}}\n"),
+                        )
+                        .unwrap();
+                        fs::write(
+                            project.path().join("notify.rs"),
+                            format!("pub fn notified_{step}() {{}}\n"),
+                        )
+                        .unwrap();
+                        changed = BTreeSet::from([upper.into_bytes(), b"notify.rs".to_vec()]);
                     }
                     _ => {
                         // A rescan must find an edit the watcher never named.
