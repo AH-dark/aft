@@ -520,6 +520,39 @@ mod tests {
     }
 
     #[test]
+    fn views_directory_events_remove_deleted_and_renamed_subtrees() {
+        for rename in [false, true] {
+            let (project, _storage, mut request) = fixture();
+            fs::create_dir_all(project.path().join("group/nested")).unwrap();
+            fs::write(project.path().join("group/a.rs"), "pub fn a() {}\n").unwrap();
+            fs::write(project.path().join("group/nested/b.rs"), "pub fn b() {}\n").unwrap();
+            git(project.path(), &["add", "-A"]);
+            git(project.path(), &["commit", "--quiet", "-m", "subtree"]);
+            publish(&request);
+            if rename {
+                fs::rename(project.path().join("group"), project.path().join("moved")).unwrap();
+            } else {
+                fs::remove_dir_all(project.path().join("group")).unwrap();
+            }
+            fs::write(project.path().join("f0.rs"), "pub fn notified() {}\n").unwrap();
+            // No child path is reported for the removed/renamed directory.
+            request.changed_paths = BTreeSet::from([b"group".to_vec(), b"f0.rs".to_vec()]);
+            if rename {
+                request.changed_paths.insert(b"moved".to_vec());
+            }
+            let manifest = publish(&request);
+            assert_eq!(
+                manifest.to_json_bytes().unwrap(),
+                rebuild_manifest(&request).to_json_bytes().unwrap(),
+                "rename={rename}"
+            );
+            assert!(manifest
+                .entries()
+                .all(|(path, _)| !path.as_bytes().starts_with(b"group/")));
+        }
+    }
+
+    #[test]
     fn views_incremental_closure_uses_owning_connections_and_revokes_stale_proof() {
         let (_project, storage, request) = fixture();
         let view = ViewStore::open(storage.path(), &request.scope).unwrap();
@@ -573,10 +606,10 @@ mod tests {
     fn views_incremental_random_sequences_equal_full_rebuild() {
         // Deterministic seeds keep a failing sequence reproducible. Each cycle
         // includes every operation, with random members, bytes and ordering.
-        for seed in [1u64, 0x5981, 0xdeadbeef] {
+        for seed in (1..=16u64).map(|value| value.wrapping_mul(0x9e3779b97f4a7c15)) {
             let (project, _storage, mut request) = fixture();
             let mut random = seed;
-            for step in 0..48 {
+            for step in 0..72 {
                 random ^= random << 13;
                 random ^= random >> 7;
                 random ^= random << 17;
@@ -584,7 +617,7 @@ mod tests {
                 let name = format!("f{index}.rs");
                 let path = project.path().join(&name);
                 let mut changed = BTreeSet::from([name.as_bytes().to_vec()]);
-                match (step + seed as usize) % 8 {
+                match (step + seed as usize) % 10 {
                     op @ (0 | 1) => {
                         let was_link = fs::symlink_metadata(&path)
                             .is_ok_and(|meta| meta.file_type().is_symlink());
@@ -659,6 +692,43 @@ mod tests {
                         if random & 1 == 0 {
                             git(project.path(), &["reset", "--quiet", "--hard", "HEAD~1"]);
                         }
+                    }
+                    8 | 9 => {
+                        let directory = format!("group-{step}");
+                        let nested = project.path().join(&directory).join("nested");
+                        fs::create_dir_all(&nested).unwrap();
+                        fs::write(
+                            nested.join("child.rs"),
+                            format!("pub fn child_{step}() {{}}\n"),
+                        )
+                        .unwrap();
+                        fs::write(project.path().join("notify.rs"), "pub fn before() {}\n")
+                            .unwrap();
+                        git(project.path(), &["add", "-A"]);
+                        git(
+                            project.path(),
+                            &["commit", "--quiet", "--allow-empty", "-m", "directory"],
+                        );
+                        request.changed_paths.clear();
+                        publish(&request);
+                        if (step + seed as usize) % 10 == 8 {
+                            fs::remove_dir_all(project.path().join(&directory)).unwrap();
+                        } else {
+                            let destination = format!("moved-{step}");
+                            fs::rename(
+                                project.path().join(&directory),
+                                project.path().join(&destination),
+                            )
+                            .unwrap();
+                            changed.insert(destination.into_bytes());
+                        }
+                        fs::write(
+                            project.path().join("notify.rs"),
+                            format!("pub fn after_{step}() {{}}\n"),
+                        )
+                        .unwrap();
+                        changed.insert(directory.into_bytes());
+                        changed.insert(b"notify.rs".to_vec());
                     }
                     _ => {
                         // A rescan must find an edit the watcher never named.

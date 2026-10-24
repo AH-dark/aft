@@ -691,7 +691,19 @@ pub fn prepare_checkout_deferring(
     let stamps = manifest_incremental::StoreStamps::read(&callgraph, &semantic)?;
     let admission = crate::db::file_identity::admission_snapshot(&request.storage);
     let trusted = cached.as_ref().filter(|cached| cached.stamps == stamps);
+    // Directory notifications may be the only evidence for changed, removed,
+    // or renamed children. Read their whole HEAD subtree rather than treating
+    // its cached members as individually observed unchanged files.
+    let subtree_changed = head.iter().any(|entry| {
+        request.changed_paths.iter().any(|path| {
+            entry
+                .rel_path
+                .strip_prefix(path.as_slice())
+                .is_some_and(|suffix| suffix.starts_with(b"/"))
+        })
+    });
     let rebuild_all = request.changed_paths.is_empty()
+        || subtree_changed
         || !head_cached
         || cached
             .as_ref()
