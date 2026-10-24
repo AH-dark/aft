@@ -1280,12 +1280,19 @@ fn cache_location_coordination_create_exhaustion_is_typed_busy() {
         .get_ref()
         .unwrap()
         .is::<crate::bash_background::persistence::CoordinationCreateContended>());
-    assert!(error
-        .to_string()
-        .contains(&root.path().join(IN_USE).display().to_string()));
+    let contended = error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<crate::bash_background::persistence::CoordinationCreateContended>()
+        .unwrap();
+    assert_eq!(contended.path(), root.path().join(IN_USE));
+    assert_eq!(
+        error.to_string(),
+        format!("{CACHE_DIR_BUSY}: {CACHE_DIR_BUSY_MESSAGE}")
+    );
     let warning = unavailable_warning(root.path(), &error.to_string());
     assert_eq!(warning.code, CACHE_DIR_BUSY);
-    assert!(warning.message.contains("retry configuration"));
+    assert_eq!(warning.message, CACHE_DIR_BUSY_MESSAGE);
     assert!(!warning.message.contains("is unavailable"));
     let attempts = attempts.lock().unwrap();
     assert_eq!(attempts.len(), 6);

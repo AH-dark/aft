@@ -4658,12 +4658,24 @@ pub(crate) struct CoordinationCreateContended {
 #[cfg(unix)]
 impl std::fmt::Display for CoordinationCreateContended {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "cache_dir_busy: openat create/reopen {} remained contended after {} attempts; retry configuration", self.path.display(), self.attempts)
+        write!(
+            formatter,
+            "{}: {}",
+            crate::cache_location::CACHE_DIR_BUSY,
+            crate::cache_location::CACHE_DIR_BUSY_MESSAGE
+        )
     }
 }
 
 #[cfg(unix)]
 impl std::error::Error for CoordinationCreateContended {}
+
+#[cfg(all(unix, test))]
+impl CoordinationCreateContended {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
 
 #[cfg(unix)]
 fn openat_file(
@@ -4694,12 +4706,15 @@ fn openat_file(
             result => return result,
         }
     }
+    let path = parent.join(name);
+    // The agent-facing text names no path; the operator log keeps it.
+    log::warn!(
+        "cache coordination create stayed contended: path={} attempts={attempts}",
+        path.display()
+    );
     Err(io::Error::new(
         io::ErrorKind::WouldBlock,
-        CoordinationCreateContended {
-            path: parent.join(name),
-            attempts,
-        },
+        CoordinationCreateContended { path, attempts },
     ))
 }
 

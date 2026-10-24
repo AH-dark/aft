@@ -763,7 +763,13 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         let code = crate::root_cache::cache_status_code(&reason);
         response.data["cache_unavailable_reason"] = serde_json::json!(code);
         if let Some(output) = response.data["text"].as_str() {
-            response.data["text"] = serde_json::json!(format!("{code}: {reason}\n\n{output}"));
+            // A busy reason already starts with its code; do not repeat it.
+            let line = if reason.starts_with(code) {
+                reason.clone()
+            } else {
+                format!("{code}: {reason}")
+            };
+            response.data["text"] = serde_json::json!(format!("{line}\n\n{output}"));
         }
     }
     response
@@ -950,7 +956,11 @@ fn handle_semantic_search_with_disk_fallback(
             &params,
             &shape,
             code,
-            format!("{code}: {reason}"),
+            if reason.starts_with(code) {
+                reason.clone()
+            } else {
+                format!("{code}: {reason}")
+            },
             disclosure,
             false,
             false,

@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 
 pub const CACHE_DIR_UNAVAILABLE: &str = "cache_dir_unavailable";
 pub const CACHE_DIR_BUSY: &str = "cache_dir_busy";
+/// What agents read when a project's cache folder was contended at setup.
+/// The project keeps working and AFT retries the setup once by itself.
+pub const CACHE_DIR_BUSY_MESSAGE: &str =
+    "cache folder busy: another project was creating it at the same moment; AFT retries automatically";
 pub(crate) fn cache_status_code(reason: &str) -> &'static str {
     if reason.starts_with(CACHE_DIR_BUSY) {
         CACHE_DIR_BUSY
@@ -820,10 +824,7 @@ pub(crate) fn unavailable_warning(
         tier: "user".into(),
         value: path.display().to_string(),
         message: if code == CACHE_DIR_BUSY {
-            format!(
-                "Cache coordination is busy at {} ({reason}); retry configuration.",
-                path.display()
-            )
+            CACHE_DIR_BUSY_MESSAGE.to_string()
         } else {
             format!("storage.cache_dir {} is unavailable ({reason}); AFT is running without its caches until it is back.", path.display())
         },
