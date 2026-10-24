@@ -280,7 +280,8 @@ if '/actions/artifacts/123/zip' in endpoint:
     with zipfile.ZipFile(stream, 'w') as archive: archive.writestr('queue-context.json', json.dumps(record))
     sys.stdout.buffer.write(stream.getvalue()); sys.exit(0)
 if '/actions/runs/42/jobs' in endpoint:
-    answer([[{'name': 'Unit / Unit tests (Linux)', 'conclusion': 'failure'}]])
+    # Real GitHub pages for this endpoint are objects, not arrays.
+    answer([{'total_count': 1, 'jobs': [{'name': 'Unit / Unit tests (Linux)', 'conclusion': 'failure'}]}])
 raise SystemExit('unhandled fake endpoint: '+endpoint)
 '''
 

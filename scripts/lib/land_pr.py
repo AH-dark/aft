@@ -239,7 +239,11 @@ def report_removed(repo: str, state: dict, removal: dict | None) -> None:
                 or run["conclusion"] not in {"failure", "timed_out", "cancelled"}):
             continue
         log(f"failing group {run['head_sha']}: {run['html_url']} ({run['conclusion']})")
-        jobs = pages(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100")
+        # The jobs endpoint pages are objects ({"total_count", "jobs"}),
+        # unlike the pulls endpoint, whose pages are arrays.
+        jobs = [job for page in json.loads(gh("api", "--paginate", "--slurp",
+                f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100"))
+                for job in page["jobs"]]
         bad = [job for job in jobs if job["conclusion"] in {"failure", "timed_out", "cancelled"}]
         for job in bad:
             log(f"  {job['name']}: {job['conclusion']}")
