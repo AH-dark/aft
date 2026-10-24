@@ -108,14 +108,29 @@ pub fn aft_redactor(text: &str) -> Cow<'_, str> {
 // The leading `(^|[^...])` group stands in for a look-behind, which the regex
 // crate lacks; replacements re-emit it.
 
-/// `NAME=value` where NAME is UPPER_SNAKE and contains a credential word
-/// followed by `=` or `_` (`GITHUB_TOKEN=`, `export DB_PASSWORD=`,
-/// `AWS_SECRET_ACCESS_KEY_ID=`). Plain substrings do not count: `MAX_TOKENS`,
-/// `TOKENIZERS_PARALLELISM`, `GIT_AUTHOR_NAME` and `GH_SHIM_BYPASS` stay.
+/// One whole shell word, as the shell would read it: single-quoted runs,
+/// double-quoted runs with backslash escapes, backslash-escaped characters
+/// and plain characters, concatenated (`'a'"b"c`, `my\ pass`), up to the
+/// next unquoted whitespace or shell operator. A quote left open runs to the
+/// end of the text. `<` ends a word, so an already-masked value is never
+/// matched again.
+macro_rules! shell_word {
+    () => {
+        r#"(?:'[^']*'?|"(?:\\[\s\S]|[^"\\])*"?|\\[\s\S]?|[^\s;&|<>()'"\\])+"#
+    };
+}
+
+/// `NAME=value` where NAME is UPPER_SNAKE and contains a credential word,
+/// at its start or after other letters, followed by `=` or `_` (`TOKEN=`,
+/// `GITHUB_TOKEN=`, `export DB_PASSWORD=`, `AWS_SECRET_ACCESS_KEY_ID=`).
+/// Plain substrings do not count: `MAX_TOKENS`, `TOKENIZERS_PARALLELISM`,
+/// `GIT_AUTHOR_NAME` and `GH_SHIM_BYPASS` stay.
 static COMMAND_SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
-    compile(
-        r#"(^|[^A-Za-z0-9_])([A-Z][A-Z0-9_]*?(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY|AUTH_KEY|_KEY|_PAT|_AUTH)(?:_[A-Z0-9]+)*=)("[^"]*"|'[^']*'|[^\s;&|)'"]+)"#,
-    )
+    compile(concat!(
+        r#"(^|[^A-Za-z0-9_])((?:[A-Z][A-Z0-9_]*?)?(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY|AUTH_KEY|_KEY|_PAT|_AUTH)(?:_[A-Z0-9]+)*=)("#,
+        shell_word!(),
+        ")"
+    ))
 });
 /// Assignment names ending in one of these name where a credential lives or
 /// who owns it, not the credential (`SSH_KEY_PATH=`, `AWS_ACCESS_KEY_ID=`).
@@ -141,22 +156,53 @@ const COMMAND_NON_SECRET_NAME_SUFFIXES: [&str; 16] = [
 /// `--flag value`. `--secret` is deliberately absent: gcloud and others use it
 /// for a secret's name.
 static COMMAND_SECRET_FLAG: LazyLock<Regex> = LazyLock::new(|| {
-    compile(
-        r#"(^|[^A-Za-z0-9_-])(--(?:password|passwd|pass|token|api-key|apikey|client-secret|auth-token|access-token|bearer)(?:=|[ \t]+))("[^"]*"|'[^']*'|[^\s;&|]+)"#,
-    )
+    compile(concat!(
+        r#"(^|[^A-Za-z0-9_-])(--(?:password|passwd|pass|token|api-key|apikey|client-secret|auth-token|access-token|bearer)(?:=|[ \t]+))("#,
+        shell_word!(),
+        ")"
+    ))
 });
 /// The MySQL family's attached password, `-p<value>`. Other tools' `-p`
 /// (cargo's package, ssh's port, mkdir's parents) is never touched.
 static COMMAND_MYSQL_PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
-    compile(r"\b((?:mysql|mariadb|mysqladmin|mysqldump)\b[^;&|\n]*?\s-p)([^\s;&|]+)")
+    compile(concat!(
+        r"\b((?:mysql|mariadb|mysqladmin|mysqldump)\b[^;&|\n]*?\s-p)(",
+        shell_word!(),
+        ")"
+    ))
 });
 /// `sshpass -p <value>`.
 static COMMAND_SSHPASS_PASSWORD: LazyLock<Regex> =
-    LazyLock::new(|| compile(r"\b(sshpass[ \t]+-p[ \t]*)([^\s;&|]+)"));
-/// The password half of `curl -u user:password` (or `--user`).
+    LazyLock::new(|| compile(concat!(r"\b(sshpass[ \t]+-p[ \t]*)(", shell_word!(), ")")));
+/// `curl -u user:password` (or `--user`): the whole credential word, whose
+/// password half (after the first `:`) is masked by [`mask_curl_password`].
 static COMMAND_CURL_USER_PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
-    compile(r#"\b(curl\b[^;&|\n]*?\s(?:-u|--user)[ \t]+["']?[^:\s"']+:)([^\s"']+)"#)
+    compile(concat!(
+        r"\b(curl\b[^;&|\n]*?\s(?:-u|--user)[ \t]+)(",
+        shell_word!(),
+        ")"
+    ))
 });
+
+/// Mask what follows the first `:` of a `user:password` word, keeping the
+/// user and a quote pair that wraps the whole word (`"admin:<masked>"`).
+/// A word without a password, or whose password is a reference, is kept.
+fn mask_curl_password(word: &str) -> Option<String> {
+    let quote = word
+        .chars()
+        .next()
+        .filter(|first| matches!(first, '"' | '\'') && word.len() > 1 && word.ends_with(*first));
+    let body = match quote {
+        Some(_) => &word[1..word.len() - 1],
+        None => word,
+    };
+    let (user, password) = body.split_once(':')?;
+    if command_value_is_reference(password) {
+        return None;
+    }
+    let quote = quote.map(String::from).unwrap_or_default();
+    Some(format!("{quote}{user}:{SECRET_PLACEHOLDER}{quote}"))
+}
 
 /// A value that names another value instead of holding one: a variable or
 /// command substitution (`$GH_TOKEN`, `"$(gcloud secrets ...)"`), an empty
@@ -202,11 +248,21 @@ pub fn redact_command(command: &str) -> Cow<'_, str> {
             }
         });
     }
+    if command.contains("curl") {
+        out = replace_in(
+            out,
+            None,
+            &COMMAND_CURL_USER_PASSWORD,
+            |caps: &Captures<'_>| match mask_curl_password(&caps[2]) {
+                Some(masked) => format!("{}{masked}", &caps[1]),
+                None => caps[0].to_string(),
+            },
+        );
+    }
     for (needle, pattern) in [
         ("mysql", &COMMAND_MYSQL_PASSWORD),
         ("mariadb", &COMMAND_MYSQL_PASSWORD),
         ("sshpass", &COMMAND_SSHPASS_PASSWORD),
-        ("curl", &COMMAND_CURL_USER_PASSWORD),
     ] {
         if command.contains(needle) {
             out = replace_in(out, None, pattern, |caps: &Captures<'_>| {
@@ -1002,7 +1058,7 @@ mod tests {
             "../tests/fixtures/command_redaction_cases.json"
         ))
         .expect("command redaction fixture parses");
-        assert_eq!(fixture.masked.len(), 24);
+        assert_eq!(fixture.masked.len(), 35);
         assert!(fixture.untouched.len() > 800);
         for case in &fixture.masked {
             let masked = redact_command(&case.input);

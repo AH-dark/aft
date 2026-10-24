@@ -95,6 +95,50 @@
   {
    "input": "NPM_AUTH=abc ./x",
    "expected": "NPM_AUTH=<REDACTED_SECRET> ./x"
+  },
+  {
+   "input": "TOKEN=hunter2 ./script",
+   "expected": "TOKEN=<REDACTED_SECRET> ./script"
+  },
+  {
+   "input": "PASSWORD=hunter2 ./script",
+   "expected": "PASSWORD=<REDACTED_SECRET> ./script"
+  },
+  {
+   "input": "curl -u \"admin:my password\" https://host",
+   "expected": "curl -u \"admin:<REDACTED_SECRET>\" https://host"
+  },
+  {
+   "input": "curl --user admin:'my password' https://host",
+   "expected": "curl --user admin:<REDACTED_SECRET> https://host"
+  },
+  {
+   "input": "mysql -u root -p\"my pass\" app",
+   "expected": "mysql -u root -p<REDACTED_SECRET> app"
+  },
+  {
+   "input": "sshpass -p 'my pass' ssh deploy@host",
+   "expected": "sshpass -p <REDACTED_SECRET> ssh deploy@host"
+  },
+  {
+   "input": "export DB_PASSWORD=\"a \\\"quoted\\\" pass\" && run",
+   "expected": "export DB_PASSWORD=<REDACTED_SECRET> && run"
+  },
+  {
+   "input": "API_KEY=abc\\ def ./x",
+   "expected": "API_KEY=<REDACTED_SECRET> ./x"
+  },
+  {
+   "input": "tool --password='a'\"b\"c next",
+   "expected": "tool --password=<REDACTED_SECRET> next"
+  },
+  {
+   "input": "tool --token \"a\\\"b c\" --verbose",
+   "expected": "tool --token <REDACTED_SECRET> --verbose"
+  },
+  {
+   "input": "NPM_TOKEN='a'\"b\"c npm publish",
+   "expected": "NPM_TOKEN=<REDACTED_SECRET> npm publish"
   }
  ],
  "untouched": [
