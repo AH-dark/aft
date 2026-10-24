@@ -498,13 +498,31 @@ enum CommentAt {
     NotComment,
 }
 
+/// For a Lua long comment opener at the start of `rest` (`--[[`, `--[=[`,
+/// `--[==[`, ...), the closer it needs: `]]`, `]=]`, `]==]`, ... with the same
+/// number of `=`. Lua ends a long comment only at the matching closer, so
+/// `--[==[` is not a line comment and `]]` does not close it.
+fn lua_long_comment_closer(rest: &str) -> Option<String> {
+    let after_open = rest.strip_prefix("--[")?;
+    let level = after_open.bytes().take_while(|byte| *byte == b'=').count();
+    after_open[level..]
+        .starts_with('[')
+        .then(|| format!("]{}]", "=".repeat(level)))
+}
+
 fn comment_len_at(rest: &str, lang: LangId) -> CommentAt {
     let block = |opener: &str, closer: &str| match rest[opener.len()..].find(closer) {
         Some(end) => CommentAt::Comment(opener.len() + end + closer.len()),
         None => CommentAt::Unterminated,
     };
-    if lang == LangId::Lua && rest.starts_with("--[[") {
-        return block("--[[", "]]");
+    if lang == LangId::Lua {
+        if let Some(closer) = lua_long_comment_closer(rest) {
+            let opener_len = closer.len() + 2;
+            return match rest[opener_len..].find(&closer) {
+                Some(end) => CommentAt::Comment(opener_len + end + closer.len()),
+                None => CommentAt::Unterminated,
+            };
+        }
     }
     if (lang == LangId::Lua && rest.starts_with("--"))
         || (supports_slash_line_comments(lang) && rest.starts_with("//"))

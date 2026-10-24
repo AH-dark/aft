@@ -438,3 +438,44 @@ fn organize_with_cr_only_line_endings_keeps_code_after_the_last_import() {
         "{content:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Lua long comments with level markers (`--[=[ ... ]=]`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn remove_lua_keeps_code_after_a_leveled_long_comment_on_the_import_line() {
+    let (resp, content) = remove_from_file(
+        "leveled.lua",
+        "local a = require(\"a\") --[==[ note ]==] local z = 1\nprint(z)\n",
+        "a",
+    );
+    assert_eq!(resp["success"], true, "remove should succeed: {resp:?}");
+    assert!(!content.contains("require(\"a\")"), "{content:?}");
+    assert!(
+        content.contains("--[==[ note ]==] local z = 1\nprint(z)\n"),
+        "code after the long comment must stay: {content:?}"
+    );
+}
+
+#[test]
+fn remove_lua_takes_a_same_line_leveled_long_comment_with_the_import() {
+    let (resp, content) = remove_from_file(
+        "leveled_tail.lua",
+        "local a = require(\"a\") --[=[ about a ]=]\nprint(1)\n",
+        "a",
+    );
+    assert_eq!(resp["success"], true, "remove should succeed: {resp:?}");
+    assert_eq!(content, "print(1)\n");
+}
+
+#[test]
+fn organize_lua_accepts_a_multi_line_leveled_long_comment_between_imports() {
+    let source =
+        "local b = require(\"b\") --[==[ about\nb ]==]\nlocal a = require(\"a\")\n\nprint(a, b)\n";
+    let (_, content) = organize_file("leveled_gap.lua", source);
+    assert_eq!(
+        content, source,
+        "a long comment spanning lines stays where it is and splits the sort"
+    );
+}
