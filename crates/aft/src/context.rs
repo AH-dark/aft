@@ -13163,13 +13163,25 @@ impl AppContext {
             .unwrap_or_else(|| PathBuf::from("<unconfigured>"))
     }
 
+    // On Windows, detached teardown workers can appear under the same Rust
+    // thread-start routine, so test-only names make them distinguishable.
+    #[cfg(all(test, windows))]
+    fn describe_teardown_thread_for_test(name: &str) {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadDescription};
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: the pseudo-handle names this thread and name is NUL-terminated.
+        unsafe { SetThreadDescription(GetCurrentThread(), name.as_ptr()) };
+    }
+
     fn spawn_watcher_shutdown(app: Arc<App>, root: PathBuf, runtime: WatcherThreadHandle) {
         const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
         // Signal the watcher before scheduling the joiner so teardown does not
         // depend on a newly spawned thread winning CPU time under fleet load.
         runtime.request_shutdown();
-        std::thread::spawn(
-            move || match runtime.shutdown_and_join_timeout(JOIN_TIMEOUT) {
+        std::thread::spawn(move || {
+            #[cfg(all(test, windows))]
+            Self::describe_teardown_thread_for_test("aft-watcher-shutdown-join");
+            match runtime.shutdown_and_join_timeout(JOIN_TIMEOUT) {
                 WatcherJoinOutcome::Joined => {
                     app.watcher_stopped();
                     crate::slog_info!("watcher stopped: {}", root.display());
@@ -13181,13 +13193,15 @@ impl AppContext {
                         root.display()
                     );
                     std::thread::spawn(move || {
+                        #[cfg(all(test, windows))]
+                        Self::describe_teardown_thread_for_test("aft-watcher-final-join");
                         let _ = join.join();
                         app.watcher_stopped();
                         crate::slog_info!("watcher stopped: {}", root.display());
                     });
                 }
-            },
-        );
+            }
+        });
     }
 
     fn take_watcher_runtime(&self) -> Option<WatcherThreadHandle> {
@@ -13718,6 +13732,8 @@ impl AppContext {
     pub(crate) fn release_idle_reopenable_resources_in_background(self: &Arc<Self>) {
         let ctx = Arc::clone(self);
         std::thread::spawn(move || {
+            #[cfg(all(test, windows))]
+            Self::describe_teardown_thread_for_test("aft-idle-resource-release");
             if !ctx.subc_unbound_quiesced() {
                 return;
             }

@@ -103,31 +103,81 @@ fn threads_started_since(
 }
 
 /// Give detached teardown threads (watcher and LSP reapers) time to exit:
-/// polls every 100 ms and returns the threads started since `baseline` once
-/// at most `at_most` of them could belong to a root, the set has not changed
-/// for five samples, or 10 seconds have passed. A settling heuristic, not
-/// proof that teardown finished.
+/// polls every 100 ms until no root-owned candidates remain or the existing
+/// 10-second deadline passes. An unchanged set is not completion: detached
+/// watcher joins can remain blocked for longer than five samples.
 fn settled_threads_started_since(
     baseline: &std::collections::HashSet<u64>,
-    at_most: usize,
 ) -> (Vec<ThreadRecord>, Vec<ThreadRecord>) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let ids = |threads: &[ThreadRecord]| threads.iter().map(|t| t.id).collect::<Vec<_>>();
-    let mut previous = threads_started_since(baseline);
-    let mut stable_samples = 0;
+    settle_thread_inventory(
+        || threads_started_since(baseline),
+        || std::thread::sleep(Duration::from_millis(100)),
+    )
+}
+
+fn settle_thread_inventory(
+    mut sample: impl FnMut() -> (Vec<ThreadRecord>, Vec<ThreadRecord>),
+    mut wait: impl FnMut(),
+) -> (Vec<ThreadRecord>, Vec<ThreadRecord>) {
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(10);
+    let mut previous = sample();
+    let mut pending = HashMap::new();
+    let mut exit_times = Vec::new();
     loop {
-        if previous.0.len() <= at_most || stable_samples >= 5 || Instant::now() >= deadline {
+        let current_ids: std::collections::HashSet<_> = previous.0.iter().map(|t| t.id).collect();
+        for thread in &previous.0 {
+            pending.insert(thread.id, thread.to_string());
+        }
+        pending.retain(|id, description| {
+            if current_ids.contains(id) {
+                true
+            } else {
+                let elapsed = started.elapsed().as_millis();
+                println!("retention: exited after {elapsed} ms: {description}");
+                exit_times.push(elapsed);
+                false
+            }
+        });
+        if previous.0.is_empty() || Instant::now() >= deadline {
+            if !exit_times.is_empty() {
+                exit_times.sort_unstable();
+                println!(
+                    "retention: observed_exits={} median_exit_ms={} max_exit_ms={}",
+                    exit_times.len(),
+                    (exit_times[(exit_times.len() - 1) / 2] + exit_times[exit_times.len() / 2]) / 2,
+                    exit_times.last().unwrap(),
+                );
+            }
             return previous;
         }
-        std::thread::sleep(Duration::from_millis(100));
-        let current = threads_started_since(baseline);
-        stable_samples = if ids(&current.0) == ids(&previous.0) {
-            stable_samples + 1
-        } else {
-            0
-        };
-        previous = current;
+        wait();
+        previous = sample();
     }
+}
+
+#[test]
+fn stable_thread_samples_are_not_teardown_completion() {
+    let mut samples = 0;
+    let (kept, _) = settle_thread_inventory(
+        || {
+            samples += 1;
+            let threads = if samples <= 8 {
+                vec![ThreadRecord {
+                    id: 42,
+                    name: Some("stable-set-probe".to_string()),
+                    start: None,
+                    os_workqueue: false,
+                }]
+            } else {
+                Vec::new()
+            };
+            (threads, Vec::new())
+        },
+        || {},
+    );
+    assert!(kept.is_empty(), "a plateau was mistaken for completion");
+    assert_eq!(samples, 9, "the census must observe the thread's exit");
 }
 
 /// A failure message line per thread.
@@ -184,7 +234,7 @@ mod thread_inventory {
                 let (start, os_workqueue) = win::describe_start(id as u32);
                 ThreadRecord {
                     id,
-                    name: None,
+                    name: win::thread_name(id as u32),
                     start,
                     os_workqueue,
                 }
@@ -195,8 +245,10 @@ mod thread_inventory {
     #[cfg(windows)]
     mod win {
         use std::ffi::c_void;
-        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
-        use windows_sys::Win32::System::Threading::{OpenThread, THREAD_QUERY_INFORMATION};
+        use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HMODULE};
+        use windows_sys::Win32::System::Threading::{
+            GetThreadDescription, OpenThread, THREAD_QUERY_INFORMATION,
+        };
 
         const THREAD_QUERY_SET_WIN32_START_ADDRESS: i32 = 9;
         const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x00000002;
@@ -217,6 +269,32 @@ mod thread_inventory {
         extern "system" {
             fn GetModuleHandleExW(flags: u32, address: *const u16, module: *mut HMODULE) -> i32;
             fn GetModuleFileNameW(module: HMODULE, filename: *mut u16, size: u32) -> u32;
+        }
+
+        pub(super) fn thread_name(id: u32) -> Option<String> {
+            // SAFETY: query a thread in this process and close the owned handle.
+            let thread = unsafe { OpenThread(THREAD_QUERY_INFORMATION, 0, id) };
+            if thread.is_null() {
+                return None;
+            }
+            let mut name = std::ptr::null_mut();
+            // SAFETY: name is writable; a successful call allocates a NUL-
+            // terminated UTF-16 description, released with LocalFree below.
+            let status = unsafe { GetThreadDescription(thread, &mut name) };
+            unsafe { CloseHandle(thread) };
+            if status < 0 || name.is_null() {
+                return None;
+            }
+            let mut length = 0;
+            // SAFETY: the successful call returned a NUL-terminated string.
+            while unsafe { *name.add(length) } != 0 {
+                length += 1;
+            }
+            let description =
+                unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(name, length)) };
+            // SAFETY: GetThreadDescription allocated this buffer with LocalAlloc.
+            unsafe { LocalFree(name.cast()) };
+            (!description.is_empty()).then_some(description)
         }
 
         pub(super) fn describe_start(id: u32) -> (Option<String>, bool) {
@@ -960,8 +1038,7 @@ fn evicted_idle_roots_release_their_per_context_threads() {
     );
     assert_eq!(outcome.evicted, ROOTS, "every idle root is evicted");
 
-    let (kept_threads, os_workqueue_threads) =
-        settled_threads_started_since(&baseline_thread_ids, 1);
+    let (kept_threads, os_workqueue_threads) = settled_threads_started_since(&baseline_thread_ids);
     let evicted_threads = thread_total();
     let evicted_heap = heap_in_use();
     let live_contexts = weak_contexts
@@ -1278,8 +1355,7 @@ fn evicted_worked_roots_keep_only_bookkeeping() {
         assert_eq!(ctx.symbol_cache().read().unwrap().len(), 0);
         assert!(!ctx.watcher_runtime_active());
     }
-    let (kept_threads, os_workqueue_threads) =
-        settled_threads_started_since(&baseline_thread_ids, 1);
+    let (kept_threads, os_workqueue_threads) = settled_threads_started_since(&baseline_thread_ids);
     let evicted_heap = settled_heap();
 
     // Drop the evicted contexts: the heap that leaves with them is what each
