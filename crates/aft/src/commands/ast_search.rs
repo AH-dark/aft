@@ -20,7 +20,9 @@ use crate::protocol::{RawRequest, Response};
 ///   - `globs` (string[], optional) — include/exclude glob filters; prefix `!` to exclude
 ///   - `context` (integer, optional) — lines of context around each match (default: 0)
 ///
-/// Returns: `{ matches: [{ file, line, column, text, meta_variables, context? }], total_matches, files_with_matches, files_searched, complete, skipped_files }`
+/// Returns: `{ matches: [{ file, line, column, text, meta_variables, meta_variable_text?, context? }], total_matches, files_with_matches, files_searched, complete, skipped_files }`
+///
+/// `meta_variable_text` maps each non-empty `$$$` capture to its source text.
 pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let pattern = match req.params.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p.to_string(),
@@ -224,6 +226,11 @@ fn search_file_compiled(
 
             let env = node_match.get_env();
             let mut meta_vars: HashMap<String, serde_json::Value> = HashMap::new();
+            // Source text of each `$$$` capture, from its first node to its
+            // last, separators and line breaks included. The array in
+            // `meta_variables` lists every matched node, punctuation included,
+            // so joining it does not reproduce the source.
+            let mut multi_capture_text: HashMap<String, serde_json::Value> = HashMap::new();
             for meta_var in env.get_matched_variables() {
                 use ast_grep_core::meta_var::MetaVariable;
                 match &meta_var {
@@ -237,6 +244,14 @@ fn search_file_compiled(
                     }
                     MetaVariable::MultiCapture(name) => {
                         let nodes = env.get_multiple_matches(name);
+                        if let (Some(first), Some(last)) = (nodes.first(), nodes.last()) {
+                            if let Some(text) = source.get(first.range().start..last.range().end) {
+                                multi_capture_text.insert(
+                                    format!("${}", name),
+                                    serde_json::Value::String(text.to_string()),
+                                );
+                            }
+                        }
                         let texts: Vec<serde_json::Value> = nodes
                             .iter()
                             .map(|n| serde_json::Value::String(n.text().to_string()))
@@ -254,6 +269,9 @@ fn search_file_compiled(
                 "text": text,
                 "meta_variables": meta_vars,
             });
+            if !multi_capture_text.is_empty() {
+                result["meta_variable_text"] = serde_json::json!(multi_capture_text);
+            }
 
             if context_lines > 0 {
                 let match_line_0 = start_pos.line();

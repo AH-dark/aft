@@ -101,6 +101,7 @@ mod inspect_todos_test;
 mod inspect_tsconfig_membership_test;
 mod inspect_unused_exports_test;
 mod is_semantic_indexed_extension_test;
+mod issue_827_828_repro_test;
 mod lexical_rank_test;
 mod lexical_score_test;
 mod locks_test;
