@@ -168,6 +168,20 @@ fn configure_real_rustfmt_test(aft: &mut AftProcess, project_root: &Path) {
         response["success"], true,
         "configure should succeed: {response:?}"
     );
+    // An out-of-range timeout does not fail configure: AFT discards just that
+    // key with an `invalid_config_section` warning and keeps the 10-second
+    // default, which would silently bring back the timeouts this budget
+    // exists to avoid. Fail here instead.
+    let discarded = response["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|warning| warning["code"] == "invalid_config_section")
+        .collect::<Vec<_>>();
+    assert!(
+        discarded.is_empty(),
+        "the test formatter budget must be accepted, not discarded: {discarded:?}"
+    );
 }
 
 fn install_rustfmt_edition_guard(dir: &std::path::Path, expected_edition: Option<&str>) {
