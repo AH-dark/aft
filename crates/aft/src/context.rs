@@ -6397,6 +6397,7 @@ impl AppContext {
     pub(crate) fn mark_subc_unbound(&self) {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
+        crate::provisional_identity_retry::cancel(self);
         self.release_view_publication_cache();
         crate::callgraph_store::retire_obsolete_callgraph_refresh_waiters();
         if let Some(root) = self.canonical_cache_root_opt() {
@@ -8867,7 +8868,15 @@ impl AppContext {
     }
 
     pub fn cache_unavailable_reason(&self) -> Option<String> {
-        crate::root_cache::cache_unavailable(&self.config())
+        let reason = crate::root_cache::cache_unavailable(&self.config())?;
+        if reason.starts_with(crate::root_cache::CACHE_DIR_BUSY)
+            && !crate::provisional_identity_retry::cache_retry_pending(self)
+        {
+            // The folder is still busy, but cancelled or unbound work must not
+            // promise an automatic retry to an agent.
+            return Some(crate::root_cache::CACHE_DIR_BUSY.to_string());
+        }
+        Some(reason)
     }
 
     /// A connect is starting: any deferred cache recovery queued for an

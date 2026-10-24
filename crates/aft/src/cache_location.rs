@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 pub const CACHE_DIR_UNAVAILABLE: &str = "cache_dir_unavailable";
 pub const CACHE_DIR_BUSY: &str = "cache_dir_busy";
 /// What agents read when a project's cache folder was contended at setup.
-/// The project keeps working and AFT retries the setup once by itself.
+/// The project keeps working and AFT retries with backoff while it stays bound.
 pub const CACHE_DIR_BUSY_MESSAGE: &str =
     "cache folder busy: another project was creating it at the same moment; AFT retries automatically";
 pub(crate) fn cache_status_code(reason: &str) -> &'static str {

@@ -7199,7 +7199,7 @@ fn cancel_unbound_configure_jobs(
 }
 
 pub(crate) fn cancel_deferred_configure_maintenance(ctx: &AppContext) -> usize {
-    // An unbound root does no indexing, so it stops retrying its identity too.
+    // An unbound or quiesced root stops both identity and cache recovery.
     crate::provisional_identity_retry::cancel(ctx);
     let parked = ctx
         .take_parked_configure_tail()
@@ -14184,6 +14184,262 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn cache_retry_fixture() -> (tempfile::TempDir, PathBuf, AppContext, RawRequest) {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        fs::create_dir(&project).unwrap();
+        init_git_fixture(&project);
+        fs::write(project.join("needle.rs"), "fn cache_retry_needle() {}\n").unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let request = configure_request_with_params(json!({
+            "project_root": project, "storage_dir": storage, "harness": "opencode",
+            "config": [user_tier(json!({"indexes": {"trigram": true, "semantic": false, "callgraph": false}}))],
+        }));
+        (temp, project, ctx, request)
+    }
+
+    #[cfg(unix)]
+    fn force_cache_coordination_busy(
+        _: std::os::fd::RawFd,
+        name: &std::ffi::OsStr,
+        _: i32,
+    ) -> Option<std::io::Result<std::fs::File>> {
+        (name == std::ffi::OsStr::new(".aft-in-use.lock"))
+            .then(|| Err(std::io::Error::from_raw_os_error(libc::ENOENT)))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_cache_coordination_busy_twice_then_free_retries_three_attempts() {
+        use crate::provisional_identity_retry::{
+            advance_clock_for_test, drain_inline, with_clock_for_test,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _storage_override = crate::test_env::without_storage_override();
+        with_clock_for_test(|| {
+            let (_temp, project, ctx, request) = cache_retry_fixture();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            crate::bash_background::persistence::with_openat_file_hook(
+                Box::new(move |_, name, _| {
+                    if name != std::ffi::OsStr::new(".aft-in-use.lock") {
+                        return None;
+                    }
+                    // Each busy preparation exhausts six immediate syscall attempts.
+                    // The third preparation is allowed to use the real opener.
+                    (observed.fetch_add(1, Ordering::SeqCst) < 12)
+                        .then(|| Err(std::io::Error::from_raw_os_error(libc::ENOENT)))
+                }),
+                || {
+                    let response = handle_configure_for_test(&request, &ctx);
+                    assert!(response.success, "{response:?}");
+                    assert!(response.data["warnings"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|warning| warning["message"]
+                            == crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+                    assert_eq!(calls.load(Ordering::SeqCst), 6);
+                    assert!(ctx
+                        .cache_unavailable_reason()
+                        .unwrap()
+                        .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+                    assert!(!drain_inline(&ctx), "first retry waits one second");
+
+                    advance_clock_for_test(Duration::from_secs(1));
+                    assert!(drain_inline(&ctx), "second preparation remains busy");
+                    assert_eq!(calls.load(Ordering::SeqCst), 12);
+                    assert!(ctx.provisional_identity_retry().is_armed());
+                    assert_eq!(
+                        ctx.provisional_identity_retry().attempts_for_test(),
+                        Some(1)
+                    );
+                    assert!(ctx
+                        .cache_unavailable_reason()
+                        .unwrap()
+                        .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+                    advance_clock_for_test(Duration::from_secs(1));
+                    assert!(
+                        !drain_inline(&ctx),
+                        "failed retry backs off for two seconds"
+                    );
+                    advance_clock_for_test(Duration::from_secs(1));
+                    assert!(drain_inline(&ctx), "third preparation recovers");
+                    assert_eq!(calls.load(Ordering::SeqCst), 13);
+                    assert!(ctx.cache_unavailable_reason().is_none());
+                    assert!(!ctx
+                        .degraded_reasons()
+                        .iter()
+                        .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY));
+                    assert!(ctx
+                        .cached_artifact_cache_key(&fs::canonicalize(project).unwrap())
+                        .is_some());
+                    assert!(!ctx.provisional_identity_retry().is_armed());
+                    advance_clock_for_test(Duration::from_secs(3600));
+                    assert!(
+                        !drain_inline(&ctx),
+                        "there is no fourth preparation after success"
+                    );
+                    assert_eq!(calls.load(Ordering::SeqCst), 13);
+                },
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_cache_coordination_unbind_mid_backoff_cancels_retry() {
+        use crate::provisional_identity_retry::{
+            advance_clock_for_test, drain_inline, with_clock_for_test,
+        };
+
+        let _storage_override = crate::test_env::without_storage_override();
+        with_clock_for_test(|| {
+            let (_temp, project, ctx, request) = cache_retry_fixture();
+            crate::bash_background::persistence::with_openat_file_hook(
+                Box::new(force_cache_coordination_busy),
+                || {
+                    assert!(handle_configure_for_test(&request, &ctx).success);
+                    advance_clock_for_test(Duration::from_secs(1));
+                    assert!(drain_inline(&ctx));
+                },
+            );
+            advance_clock_for_test(Duration::from_secs(1));
+            assert!(ctx.provisional_identity_retry().is_armed());
+            assert!(!ctx.provisional_identity_retry().is_due());
+            assert!(ctx
+                .cache_unavailable_reason()
+                .unwrap()
+                .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+            ctx.mark_subc_unbound();
+            assert!(!ctx.provisional_identity_retry().is_armed());
+            assert!(!ctx
+                .cache_unavailable_reason()
+                .unwrap()
+                .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+            advance_clock_for_test(Duration::from_secs(3600));
+            assert!(!drain_inline(&ctx));
+            assert!(!ctx.provisional_identity_retry().is_due());
+            assert!(ctx
+                .cached_artifact_cache_key(&fs::canonicalize(project).unwrap())
+                .is_none());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_cache_coordination_two_busy_roots_retry_independently() {
+        use crate::provisional_identity_retry::{
+            advance_clock_for_test, drain_inline, with_clock_for_test,
+        };
+
+        let _storage_override = crate::test_env::without_storage_override();
+        with_clock_for_test(|| {
+            let (_first_temp, _, first, first_request) = cache_retry_fixture();
+            let (_second_temp, _, second, second_request) = cache_retry_fixture();
+            crate::bash_background::persistence::with_openat_file_hook(
+                Box::new(force_cache_coordination_busy),
+                || {
+                    assert!(handle_configure_for_test(&first_request, &first).success);
+                    assert!(handle_configure_for_test(&second_request, &second).success);
+                },
+            );
+            advance_clock_for_test(Duration::from_secs(1));
+            assert!(drain_inline(&first));
+            assert!(first.cache_unavailable_reason().is_none());
+            assert!(!first.provisional_identity_retry().is_armed());
+            crate::bash_background::persistence::with_openat_file_hook(
+                Box::new(force_cache_coordination_busy),
+                || assert!(drain_inline(&second)),
+            );
+            assert!(second.provisional_identity_retry().is_armed());
+            assert!(!second.provisional_identity_retry().is_due());
+            assert!(!drain_inline(&first));
+            // Cache recovery does not inherit the identity retry's five-minute give-up.
+            advance_clock_for_test(Duration::from_secs(600));
+            crate::bash_background::persistence::with_openat_file_hook(
+                Box::new(force_cache_coordination_busy),
+                || assert!(drain_inline(&second)),
+            );
+            assert_eq!(
+                second.provisional_identity_retry().attempts_for_test(),
+                Some(2)
+            );
+            assert!(second
+                .cache_unavailable_reason()
+                .unwrap()
+                .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+            assert!(first.cache_unavailable_reason().is_none());
+            advance_clock_for_test(Duration::from_secs(3));
+            assert!(
+                !drain_inline(&second),
+                "only the second root waits for its four-second backoff"
+            );
+            advance_clock_for_test(Duration::from_secs(1));
+            assert!(drain_inline(&second));
+            assert!(second.cache_unavailable_reason().is_none());
+            assert!(!second.provisional_identity_retry().is_armed());
+            assert!(!drain_inline(&first));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_cache_coordination_message_requires_pending_or_due_retry() {
+        use crate::provisional_identity_retry::{
+            advance_clock_for_test, drain_inline, poll, with_clock_for_test,
+        };
+
+        let _storage_override = crate::test_env::without_storage_override();
+        with_clock_for_test(|| {
+            let (_temp, _, ctx, request) = cache_retry_fixture();
+            crate::bash_background::persistence::with_openat_file_hook(
+                Box::new(force_cache_coordination_busy),
+                || assert!(handle_configure_for_test(&request, &ctx).success),
+            );
+            assert!(ctx
+                .cache_unavailable_reason()
+                .unwrap()
+                .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+            assert!(!ctx.provisional_identity_retry().is_due());
+            advance_clock_for_test(Duration::from_secs(1));
+            assert!(ctx.provisional_identity_retry().is_due());
+            let replay = poll(&ctx).unwrap();
+            assert!(poll(&ctx).is_none(), "one prepared replay per root");
+            assert!(ctx
+                .cache_unavailable_reason()
+                .unwrap()
+                .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+            // Dropping an unadmitted replay leaves a bounded deadline, not a lost retry.
+            drop(replay);
+            assert!(!ctx.provisional_identity_retry().is_due());
+            advance_clock_for_test(Duration::from_secs(2));
+            assert!(drain_inline(&ctx));
+            assert!(ctx.cache_unavailable_reason().is_none());
+
+            let (_cancel_temp, _, ctx, request) = cache_retry_fixture();
+            crate::bash_background::persistence::with_openat_file_hook(
+                Box::new(force_cache_coordination_busy),
+                || assert!(handle_configure_for_test(&request, &ctx).success),
+            );
+            assert!(ctx
+                .cache_unavailable_reason()
+                .unwrap()
+                .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+            super::cancel_deferred_configure_maintenance(&ctx);
+            assert!(!ctx.provisional_identity_retry().is_armed());
+            assert!(!ctx
+                .cache_unavailable_reason()
+                .unwrap()
+                .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+            advance_clock_for_test(Duration::from_secs(3600));
+            assert!(!drain_inline(&ctx));
+        });
+    }
+
+    #[cfg(unix)]
     #[test]
     fn configure_cache_coordination_busy_bind_retries_once_while_bound() {
         let _storage_override = crate::test_env::without_storage_override();
@@ -14195,13 +14451,7 @@ mod tests {
             (name == std::ffi::OsStr::new(".aft-in-use.lock"))
                 .then(|| Err(std::io::Error::from_raw_os_error(libc::ENOENT)))
         }
-        for outcome in [
-            "recover",
-            "edited",
-            "still_busy",
-            "unbound",
-            "unbound_after_poll",
-        ] {
+        for outcome in ["recover", "edited", "unbound", "unbound_after_poll"] {
             crate::provisional_identity_retry::with_timing_for_test(
                 Duration::ZERO,
                 Duration::from_secs(1),
@@ -14273,17 +14523,12 @@ mod tests {
                     } else if outcome == "unbound" {
                         ctx.mark_subc_unbound();
                         assert!(!crate::provisional_identity_retry::drain_inline(&ctx));
-                    } else if outcome == "still_busy" {
-                        assert!(crate::bash_background::persistence::with_openat_file_hook(
-                            Box::new(inject_busy),
-                            || crate::provisional_identity_retry::drain_inline(&ctx),
-                        ));
                     } else {
                         assert!(crate::provisional_identity_retry::drain_inline(&ctx));
                     }
                     assert!(
                         !ctx.provisional_identity_retry().is_armed(),
-                        "only one automatic cache retry is allowed"
+                        "settled or unbound roots must have no retry"
                     );
                     assert!(!crate::provisional_identity_retry::drain_inline(&ctx));
                     if outcome == "recover" || outcome == "edited" {

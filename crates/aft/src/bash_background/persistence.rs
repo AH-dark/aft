@@ -4711,7 +4711,7 @@ fn openat_file(
         attempts,
     };
     // The agent-facing text names no path; the operator log keeps it.
-    log::warn!(
+    log::debug!(
         "cache coordination create stayed contended: path={} attempts={}",
         contention.path.display(),
         contention.attempts
