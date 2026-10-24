@@ -1,3 +1,5 @@
+import { stat } from "node:fs/promises";
+import type { BridgeClock } from "./bridge.js";
 import { spawn } from "./child-process.js";
 import {
   type NpmInvocation,
@@ -7,13 +9,28 @@ import {
   terminateNpmProcessTree,
 } from "./npm-resolver.js";
 
-// Keep the in-flight promise and its settled result: all packages and later
-// install passes using the same npm executable share one capability check.
-const npmCutoffSupport = new Map<string, Promise<boolean>>();
+type NpmProbeOutcome = "supported" | "unsupported" | "transient";
+interface NpmExecutableIdentity {
+  size: number;
+  mtimeMs: number;
+}
+interface NpmCutoffEntry {
+  identity: NpmExecutableIdentity | undefined;
+  pending: Promise<NpmProbeOutcome>;
+  settled?: { outcome: NpmProbeOutcome; retryAt: number };
+}
+
+const npmCutoffSupport = new Map<string, NpmCutoffEntry>();
 const NPM_PROBE_TIMEOUT_MS = 5_000;
 const NPM_PROBE_OUTPUT_LIMIT = 1_048_576;
+const NPM_PROBE_RETRY_MS = 5 * 60_000;
+const SYSTEM_CLOCK: BridgeClock = {
+  now: () => Date.now(),
+  setTimeout: (callback, ms) => setTimeout(callback, ms),
+  clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+};
 
-function probeNpmCutoffSupport(npm: ResolvedNpm): Promise<boolean> {
+function probeNpmCutoffSupport(npm: ResolvedNpm, clock: BridgeClock): Promise<NpmProbeOutcome> {
   const invocation = npmInvocation(npm, ["--version"]);
   return new Promise((resolve) => {
     const child = spawn(invocation.command, invocation.args, {
@@ -27,13 +44,13 @@ function probeNpmCutoffSupport(npm: ResolvedNpm): Promise<boolean> {
     let stderrBytes = 0;
     let settled = false;
     let stopping = false;
-    const finish = (supported: boolean) => {
+    const finish = (outcome: NpmProbeOutcome) => {
       if (settled) return;
       settled = true;
-      clearTimeout(deadline);
+      clock.clearTimeout(deadline);
       child.stdout?.destroy();
       child.stderr?.destroy();
-      resolve(supported);
+      resolve(outcome);
     };
     const stop = () => {
       if (settled || stopping) return;
@@ -48,11 +65,11 @@ function probeNpmCutoffSupport(npm: ResolvedNpm): Promise<boolean> {
         }
       }
       void terminateNpmProcessTree(child, invocation, process.env, 500).then(
-        () => finish(false),
-        () => finish(false),
+        () => finish("transient"),
+        () => finish("transient"),
       );
     };
-    const deadline = setTimeout(stop, NPM_PROBE_TIMEOUT_MS);
+    const deadline = clock.setTimeout(stop, NPM_PROBE_TIMEOUT_MS);
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => {
       if (settled || stopping) return;
@@ -65,21 +82,45 @@ function probeNpmCutoffSupport(npm: ResolvedNpm): Promise<boolean> {
       stderrBytes += Buffer.byteLength(chunk);
       if (stderrBytes > NPM_PROBE_OUTPUT_LIMIT) stop();
     });
-    child.once("error", () => finish(false));
+    child.once("error", () => finish("transient"));
     child.once("close", (code) => {
       const major = Number(/^([0-9]+)\.[0-9]+\.[0-9]+(?:\s|$)/.exec(stdout.trim())?.[1]);
-      finish(!stopping && code === 0 && Number.isSafeInteger(major) && major >= 7);
+      if (stopping || code !== 0 || !Number.isSafeInteger(major)) finish("transient");
+      else finish(major >= 7 ? "supported" : "unsupported");
     });
   });
 }
 
-function npmSupportsCutoff(npm: ResolvedNpm): Promise<boolean> {
+async function npmSupportsCutoff(npm: ResolvedNpm, clock: BridgeClock): Promise<NpmProbeOutcome> {
+  const identity = await stat(npm.command)
+    .then(({ size, mtimeMs }) => ({ size, mtimeMs }))
+    .catch(() => undefined);
   const existing = npmCutoffSupport.get(npm.command);
-  if (existing) return existing;
+  const sameIdentity =
+    existing &&
+    existing.identity?.size === identity?.size &&
+    existing.identity?.mtimeMs === identity?.mtimeMs;
+  if (existing && sameIdentity) {
+    // Pending callers share the probe. Only a clean, parseable version is a
+    // durable verdict, and only while its executable identity remains known.
+    if (
+      !existing.settled ||
+      (identity !== undefined && existing.settled.outcome !== "transient") ||
+      clock.now() < existing.settled.retryAt
+    )
+      return existing.pending;
+  }
   const pending = Promise.resolve()
-    .then(() => probeNpmCutoffSupport(npm))
-    .catch(() => false);
-  npmCutoffSupport.set(npm.command, pending);
+    .then(() => probeNpmCutoffSupport(npm, clock))
+    .catch((): NpmProbeOutcome => "transient")
+    .then((outcome) => {
+      // Update the captured entry, not the map: an executable replacement may
+      // already have installed a newer in-flight probe for the same path.
+      entry.settled = { outcome, retryAt: clock.now() + NPM_PROBE_RETRY_MS };
+      return outcome;
+    });
+  const entry: NpmCutoffEntry = { identity, pending };
+  npmCutoffSupport.set(npm.command, entry);
   return pending;
 }
 
@@ -97,8 +138,9 @@ export async function lspNpmInstallInvocation(
   npm: ResolvedNpm,
   target: string,
   before?: string,
+  clock: BridgeClock = SYSTEM_CLOCK,
 ): Promise<NpmInvocation | null> {
-  if (before !== undefined && !(await npmSupportsCutoff(npm))) return null;
+  if (before !== undefined && (await npmSupportsCutoff(npm, clock)) !== "supported") return null;
   return npmInvocation(npm, [
     "install",
     "--no-save",
