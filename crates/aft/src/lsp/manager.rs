@@ -303,6 +303,113 @@ pub struct ApplicabilityWalk {
     /// First root marker seen per server kind, with the directory holding it
     /// and the marker's file name.
     markers: HashMap<ServerKind, (ServerDef, PathBuf, String)>,
+    /// Walker entries visited. The applicability cache adds files it accepts
+    /// without walking, so a tree that grows past
+    /// [`APPLICABILITY_WALK_ENTRY_LIMIT`] is walked again and reported incomplete.
+    entries: usize,
+}
+
+/// Entries a whole-project applicability walk may visit before it reports an
+/// incomplete result.
+pub(super) const APPLICABILITY_WALK_ENTRY_LIMIT: usize = 200_000;
+
+impl ApplicabilityWalk {
+    pub(super) fn entries(&self) -> usize {
+        self.entries
+    }
+}
+
+/// Decides whether files created or removed since a whole-project walk leave
+/// that walk's result as a fresh walk would find it, so the cached result can
+/// be kept without walking the tree again.
+///
+/// A walk's result is the set of server keys its files select plus the first
+/// root marker per server kind. The caller has already ruled out every change
+/// to a path the walk read to resolve those keys: root markers, ignore files,
+/// TypeScript installs, and the directories the walk visited. With those
+/// fixed, each surviving file resolves to the same keys it did before, so:
+///
+/// - a created file changes the result only if it selects a key no walked
+///   file selects (the first file of a language or workspace);
+/// - a removed file changes it only if it was the file a candidate was
+///   recorded with, or a recorded marker. Any other removed file had a
+///   recorded file selecting each of its keys, and that file survives.
+///
+/// Which file is recorded per key follows directory listing order, so a
+/// fresh walk may record a different file of the same key; spawning accepts
+/// any file of the key.
+pub(super) struct ApplicabilityTopologyCheck<'a> {
+    walk: &'a ApplicabilityWalk,
+    root: &'a Path,
+    keys: HashSet<ServerKey>,
+    resolver: crate::lsp::registry::WalkServerResolver<'a>,
+}
+
+impl<'a> ApplicabilityTopologyCheck<'a> {
+    /// `root` and `config` must be the ones the walk ran with, in the
+    /// normalized spelling watcher paths use.
+    pub(super) fn new(walk: &'a ApplicabilityWalk, root: &'a Path, config: &'a Config) -> Self {
+        Self {
+            walk,
+            root,
+            keys: walk
+                .candidates
+                .iter()
+                .map(|candidate| candidate.key.clone())
+                .collect(),
+            resolver: crate::lsp::registry::WalkServerResolver::new(
+                config,
+                crate::lsp::roots::RootPathMode::WalkEntry,
+            ),
+        }
+    }
+
+    /// Whether a walk that also met the existing regular file `file` would
+    /// select no server key beyond the recorded ones and no new marker.
+    pub(super) fn absorbs_present_file(&mut self, file: &Path) -> bool {
+        let Ok(relative) = file.strip_prefix(self.root) else {
+            return true;
+        };
+        // The walk never yields an entry below, or named, a hidden or skipped
+        // component (`standard_filters` hides dot names; `filter_entry`
+        // applies `skip_in_server_walk`), so such a file adds nothing.
+        for (index, component) in relative.components().enumerate() {
+            let name = component.as_os_str().to_string_lossy();
+            if name.starts_with('.')
+                || crate::lsp::roots::skip_in_server_walk(name.as_ref(), index + 1)
+            {
+                return true;
+            }
+        }
+        if self.resolver.marker_servers(file).next().is_some() {
+            return false;
+        }
+        let keys = &self.keys;
+        let mut covered = true;
+        self.resolver
+            .for_each_file_server(file, |definition, root| {
+                covered &= keys.contains(&ServerKey {
+                    kind: definition.kind.clone(),
+                    root: root.to_path_buf(),
+                });
+            });
+        covered
+    }
+
+    /// Whether removing `path` (a file, or a directory nothing recorded as
+    /// visited) keeps every recorded candidate file and marker.
+    pub(super) fn survives_removed_path(&self, path: &Path) -> bool {
+        !self
+            .walk
+            .candidates
+            .iter()
+            .any(|candidate| candidate.source_file.starts_with(path))
+            && !self
+                .walk
+                .markers
+                .values()
+                .any(|(_, dir, name)| dir.join(name).starts_with(path))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -7899,7 +8006,7 @@ pub fn walk_applicable_area(
             scope_roots,
             &config,
             deadline,
-            200_000,
+            APPLICABILITY_WALK_ENTRY_LIMIT,
             crate::lsp::roots::RootPathMode::WalkEntry,
         )
     };
@@ -8021,7 +8128,9 @@ fn walk_applicable_area_uncached(
         .build();
 
     let mut resolver = crate::lsp::registry::WalkServerResolver::new(config, mode);
+    let mut entries = 0;
     for (visited, entry) in walker.enumerate() {
+        entries = visited + 1;
         if std::time::Instant::now() >= deadline {
             return Err(ApplicabilityResolutionError::RequestDeadline {
                 root: project_root.to_path_buf(),
@@ -8086,6 +8195,7 @@ fn walk_applicable_area_uncached(
     Ok(ApplicabilityWalk {
         candidates,
         markers,
+        entries,
     })
 }
 
