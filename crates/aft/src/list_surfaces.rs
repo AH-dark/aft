@@ -340,6 +340,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "commands/read.rs",
+        enclosing_item: "fit_github_images, process_image_fitting",
+        location_or_primitive: "remaining image byte budget, MAX_IMAGE_FIT_STEPS",
+        reason: "binary image sidecars are a bounded multimodal supplement, not pageable result records; omitted attachments are disclosed in read text with an exact count and source links, while local images shrink to a fixed floor or refuse explicitly",
+    },
+    ExclusionEntry {
         file: "bash_permissions/scan.rs",
         enclosing_item: "top_level_directory_targets, MAX_CWD_PATHS, insert",
         location_or_primitive: "MAX_CWD_PATHS",

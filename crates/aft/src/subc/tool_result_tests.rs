@@ -207,7 +207,7 @@ fn tool_result_images_are_ordered_and_kept_in_structured_content() {
 }
 
 #[test]
-fn tool_result_builders_refuse_large_images_and_bound_ast_matches() {
+fn tool_result_builders_fit_large_images_and_bound_ast_matches() {
     let project = scratch_project();
     let root = project.path();
     let ctx = context(root);
@@ -224,9 +224,34 @@ fn tool_result_builders_refuse_large_images_and_bound_ast_matches() {
     let result = run(&ctx, root, "read", json!({"path":path}), &|req, ctx| {
         crate::commands::read::handle_read(&req, ctx)
     });
-    assert!(!result.response.success);
-    assert_eq!(result.response.data["code"], "response_too_large");
-    assert!(result.text.contains("a smaller image"));
+    assert!(result.response.success, "{:?}", result.response);
+    assert!(
+        result.response.data["attachments"][0]["width"]
+            .as_u64()
+            .unwrap()
+            < 1024
+    );
+    assert_eq!(result.response.data["attachments"][0]["resized"], true);
+    assert_eq!(result.response.data["attachments"][0]["encoding"], "jpeg");
+    let image_frame = project_frame(
+        wire::build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(1, 1),
+            1,
+            control_flags(),
+            &result,
+            opted_in(BindTrust::FirstParty),
+        )
+        .unwrap(),
+    );
+    let image_body: ToolResult = serde_json::from_slice(&image_frame.body).unwrap();
+    assert_eq!(
+        image_body.is_error,
+        Some(false),
+        "fitted image must survive the final reply budget"
+    );
+    assert_eq!(image_body.content.len(), 2);
+    validate(&image_body).unwrap();
     let ast = root.join("large.js");
     std::fs::write(&ast, "console.log(1);\n".repeat(24000)).unwrap();
     let result = run(
