@@ -1354,7 +1354,24 @@ impl Sequence {
 fn applicability_walk_incremental_batches_match_fresh_walks() {
     let mut retained = 0;
     let mut walks = 0;
-    for seed in [0x9e37_79b9_7f4a_7c15, 7, 42, 1234] {
+    for seed in [
+        0x9e37_79b9_7f4a_7c15,
+        7,
+        42,
+        1234,
+        0xdead_beef,
+        31,
+        99,
+        2024,
+        0x5eed,
+        65_537,
+        777,
+        13,
+        0xc0ffee,
+        4096,
+        123_456_789,
+        8,
+    ] {
         let (kept, walked) = differential_sequence(seed, 80);
         retained += kept;
         walks += walked;
@@ -1390,6 +1407,7 @@ fn differential_sequence(seed: u64, batches: usize) -> (u64, u64) {
             "web/node_modules/typescript/package.json",
             r#"{"name":"typescript","version":"7.0.2"}"#,
         ),
+        ("pkg/package.json", "{}"),
         ("py/pyproject.toml", "[project]\nname = 'py'\n"),
         ("py/app.py", ""),
         ("scripts/run.sh", ""),
@@ -1410,6 +1428,7 @@ fn differential_sequence(seed: u64, batches: usize) -> (u64, u64) {
         "crates/core/src",
         "go",
         "web/src",
+        "pkg",
         "py",
         "scripts",
         "docs",
@@ -1475,7 +1494,37 @@ fn differential_sequence(seed: u64, batches: usize) -> (u64, u64) {
         for _ in 0..operations {
             counter += 1;
             match sequence.below(100) {
-                0..=34 => {
+                30..=34 => {
+                    // Install or remove one package's TypeScript, reported as
+                    // the topmost directory that appeared or disappeared.
+                    let package = root.join(["", "web", "pkg"][sequence.below(3)]);
+                    if !package.is_dir() {
+                        continue;
+                    }
+                    let modules = package.join("node_modules");
+                    if modules.exists() && sequence.below(2) == 0 {
+                        std::fs::remove_dir_all(&modules).unwrap();
+                        files.retain(|file| !file.starts_with(&modules));
+                        dirs.retain(|dir| !dir.starts_with(&modules));
+                        paths.push(modules);
+                    } else {
+                        let version = ["5.4.5", "5.9.3", "7.0.2"][sequence.below(3)];
+                        let install = modules.join("typescript");
+                        let reported = if modules.exists() {
+                            install.clone()
+                        } else {
+                            modules
+                        };
+                        std::fs::create_dir_all(&install).unwrap();
+                        std::fs::write(
+                            install.join("package.json"),
+                            format!(r#"{{"name":"typescript","version":"{version}"}}"#),
+                        )
+                        .unwrap();
+                        paths.push(reported);
+                    }
+                }
+                0..=29 => {
                     let dir = &dirs[sequence.below(dirs.len())];
                     let ext = extensions[sequence.below(extensions.len())];
                     let file = dir.join(format!("f{counter}.{ext}"));
@@ -1734,4 +1783,63 @@ fn applicability_walk_entry_estimate_counts_new_parent_directories_at_the_limit(
         std::fs::remove_dir_all(fixture.root.join("fresh")).ok();
         std::fs::remove_file(fixture.root.join("extra.py")).ok();
     }
+}
+
+/// The root and a child package each install the same TypeScript, and only
+/// the root has TypeScript sources, so the walk never reads the child's
+/// install. The child's first TypeScript file shares the root's server and is
+/// kept without a walk, but deciding that read the child's install. Removing
+/// the child's `node_modules`, reported alone, must then walk again.
+#[test]
+fn applicability_walk_kept_create_records_the_inputs_it_read() {
+    let mut fixture = WatcherWalkFixture::new();
+    // Oxlint looks for its configuration above the checkout, in directories
+    // parallel tests change; this test counts walks.
+    fixture.config.disabled_lsp.insert("oxlint".into());
+    let typescript = r#"{"name":"typescript","version":"5.4.5"}"#;
+    for (name, contents) in [
+        ("node_modules/typescript/package.json", typescript),
+        ("src/index.ts", ""),
+        ("pkg/package.json", "{}"),
+        ("pkg/node_modules/typescript/package.json", typescript),
+    ] {
+        let path = fixture.root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    super::super::typescript_project::clear_typescript_selection();
+    fixture.walk();
+    let source = fixture.root.join("pkg/a.ts");
+    std::fs::write(&source, "").unwrap();
+    let created = [source];
+    forget_typescript_selection_for(&created);
+    fixture.batch(
+        &created,
+        notify::EventKind::Create(notify::event::CreateKind::File),
+    );
+    fixture.walk();
+    assert_eq!(
+        fixture.cache.metrics(&fixture.root).full_walks,
+        1,
+        "the child's file shares the root's TypeScript server: {:?}",
+        fixture.cache.metrics(&fixture.root)
+    );
+    let modules = fixture.root.join("pkg/node_modules");
+    std::fs::remove_dir_all(&modules).unwrap();
+    let removed = [modules];
+    forget_typescript_selection_for(&removed);
+    fixture.batch(
+        &removed,
+        notify::EventKind::Remove(notify::event::RemoveKind::Folder),
+    );
+    let result = fixture.walk();
+    assert_eq!(
+        canonical(&result),
+        canonical(&scan(&fixture.root, &fixture.config))
+    );
+    assert_eq!(
+        fixture.cache.metrics(&fixture.root).full_walks,
+        2,
+        "removing an install the kept create read must walk again"
+    );
 }

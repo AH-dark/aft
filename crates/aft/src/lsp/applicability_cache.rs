@@ -578,6 +578,10 @@ impl ApplicabilityCache {
         let states: Vec<_> = paths.iter().map(|path| PathState::read(path)).collect();
         let mut absorbed = Vec::with_capacity(bases.len());
         for basis in bases {
+            // Classifying a created file probes markers and TypeScript installs
+            // the walk may never have read. Capture them like a walk does, so a
+            // later change to one invalidates the kept result.
+            let capture = Capture::start(&basis.root);
             let mut check = super::manager::ApplicabilityTopologyCheck::new(
                 &basis.walk,
                 &basis.root,
@@ -636,13 +640,29 @@ impl ApplicabilityCache {
             {
                 return false;
             }
-            absorbed.push(added);
+            drop(check);
+            absorbed.push((added, capture.finish()));
         }
-        for (basis, added) in bases.iter().zip(absorbed) {
+        for (basis, (added, (dependencies, inputs, input_identities))) in bases.iter().zip(absorbed)
+        {
+            let new_dirs: Vec<_> = input_directories(&basis.root, &inputs)
+                .into_iter()
+                .filter(|dir| !basis.input_dirs.contains(dir))
+                .collect();
             let mut state = basis.flight.state.lock();
             // A newer generation was invalidated or walked after these events.
             if state.generation == basis.generation {
                 state.absorbed_entries += added;
+                // Keep a state recorded earlier: if it differs from the one
+                // read now, the next lookup's validation walks again.
+                for (path, path_state) in dependencies {
+                    state.dependencies.entry(path).or_insert(path_state);
+                }
+                if !new_dirs.is_empty() {
+                    Arc::make_mut(&mut state.input_dirs).extend(new_dirs);
+                }
+                state.inputs.extend(inputs);
+                state.input_identities.extend(input_identities);
             }
         }
         true
