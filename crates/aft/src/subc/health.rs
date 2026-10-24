@@ -5307,24 +5307,10 @@ mod tests {
         app: &App,
         expected: u64,
     ) -> HealthReport {
-        refresh_until_root_count_with_walk_counts(cache, executor, app, expected).0
-    }
-
-    fn refresh_until_root_count_with_walk_counts(
-        cache: &HealthRollupCache,
-        executor: &Executor,
-        app: &App,
-        expected: u64,
-    ) -> (HealthReport, Vec<(bool, usize)>) {
         let metrics = DispatchPathMetrics::new();
         let deadline = Instant::now() + Duration::from_secs(30);
-        let mut walks_by_attempt = Vec::new();
         loop {
-            let walks_before = crate::context::memory_estimate_walks_for_test();
             cache.refresh(executor, app);
-            let walks = crate::context::memory_estimate_walks_for_test() - walks_before;
-            let rollup_root_count = cache.snapshot().0.metrics["root_count"].as_u64();
-            walks_by_attempt.push((rollup_root_count == Some(expected), walks));
             let report = build_health_report(cache, executor, &HashMap::new(), &metrics, app);
             // Both the rollup and the live probe can skip a contended scheduler.
             // Wait for the roots, not the diagnostic values being asserted, so
@@ -5340,7 +5326,7 @@ mod tests {
                 == Some(expected)
                 && !scheduler_busy
             {
-                return (report, walks_by_attempt);
+                return report;
             }
             assert!(
                 Instant::now() < deadline,
@@ -6404,20 +6390,30 @@ mod tests {
             "a contended refresh walked the root's indexes"
         );
 
-        let (report, walks_by_attempt) =
-            refresh_until_root_count_with_walk_counts(&cache, &executor, &app, 1);
-        assert_eq!(report.metrics.unwrap()["root_count"], 1);
-        // The census row and rollup row must share a single root-index walk.
-        assert!(
-            walks_by_attempt.iter().any(|(successful, _)| *successful),
-            "no successful root census was observed: {walks_by_attempt:?}"
-        );
-        assert!(
-            walks_by_attempt
-                .iter()
-                .all(|(successful, walks)| { *walks == if *successful { 1 } else { 0 } }),
-            "memory walks did not match each attempt's census outcome: {walks_by_attempt:?}"
-        );
+        let epoch = Instant::now();
+        let refresh_at = |now_ms| {
+            cache.clock_ms.store(now_ms, Ordering::Relaxed);
+            let walks_before = crate::context::memory_estimate_walks_for_test();
+            let census_before = cache.census_builds_for_test();
+            crate::context::with_memory_walk_clock_for_test(
+                epoch + Duration::from_millis(now_ms),
+                || cache.refresh_for_test(&executor, &app),
+            );
+            let rollup = cache.snapshot().0;
+            // Root membership is valid for both a new census and a reused one;
+            // root_count does not say whether this refresh walked any indexes.
+            assert_eq!(rollup.metrics["root_count"], 1);
+            (
+                crate::context::memory_estimate_walks_for_test() - walks_before,
+                cache.census_builds_for_test() - census_before,
+                rollup.memory_census_at_ms,
+            )
+        };
+        // The census row and rollup row share one root-index walk. Both reuse
+        // it inside the window and measure again exactly at the 30 s boundary.
+        assert_eq!(refresh_at(0), (1, 1, Some(0)));
+        assert_eq!(refresh_at(29_999), (0, 0, Some(0)));
+        assert_eq!(refresh_at(30_000), (1, 1, Some(30_000)));
     }
 
     #[test]

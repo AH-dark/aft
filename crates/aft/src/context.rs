@@ -1322,6 +1322,25 @@ thread_local! {
     /// Walks of each resident index on this thread: semantic, trigram and
     /// symbol cache, in that order.
     static MEMORY_INDEX_WALKS: std::cell::RefCell<[usize; 3]> = const { std::cell::RefCell::new([0; 3]) };
+    static MEMORY_WALK_CLOCK: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Override only this thread's memory-walk clock for a synchronous test refresh.
+#[cfg(test)]
+pub(crate) fn with_memory_walk_clock_for_test<T>(now: Instant, refresh: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Instant>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MEMORY_WALK_CLOCK.with(|clock| clock.set(self.0));
+        }
+    }
+    let _reset = Reset(MEMORY_WALK_CLOCK.with(|clock| clock.replace(Some(now))));
+    refresh()
+}
+
+#[cfg(test)]
+fn memory_walk_now_for_test() -> Instant {
+    MEMORY_WALK_CLOCK.with(|clock| clock.get().unwrap_or_else(Instant::now))
 }
 
 #[cfg(test)]
@@ -1344,12 +1363,18 @@ fn reuse_or_walk_index_memory<S: PartialEq>(
     walk: impl FnOnce() -> crate::memory::MemoryEstimate,
 ) -> (crate::memory::MemoryEstimate, Instant, bool) {
     if let (Some(shape), Some(previous)) = (shape.as_ref(), cached.as_ref()) {
-        if &previous.shape == shape && previous.measured_at.elapsed() < HEALTH_MEMORY_REUSE_INTERVAL
-        {
+        #[cfg(not(test))]
+        let age = previous.measured_at.elapsed();
+        #[cfg(test)]
+        let age = memory_walk_now_for_test().saturating_duration_since(previous.measured_at);
+        if &previous.shape == shape && age < HEALTH_MEMORY_REUSE_INTERVAL {
             return (previous.estimate.clone(), previous.measured_at, false);
         }
     }
+    #[cfg(not(test))]
     let measured_at = Instant::now();
+    #[cfg(test)]
+    let measured_at = memory_walk_now_for_test();
     let estimate = walk();
     // A walk that found its index locked is never reused, so the next rollup
     // tries again rather than serving `busy` for 30 s.
@@ -15914,7 +15939,10 @@ impl AppContext {
         let semantic_shape = self.semantic_memory_shape();
         let trigram_shape = self.trigram_memory_shape();
         let symbol_shape = self.symbol_memory_shape();
+        #[cfg(not(test))]
         let now = Instant::now();
+        #[cfg(test)]
+        let now = memory_walk_now_for_test();
         let mut walks = self.health_memory_walk.lock();
         let mut walked_any = false;
         let mut oldest = now;
@@ -15961,8 +15989,11 @@ impl AppContext {
             trigram,
             symbols,
         };
-        let measured_age_ms =
-            u64::try_from(walked.measured_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        #[cfg(not(test))]
+        let age = walked.measured_at.elapsed();
+        #[cfg(test)]
+        let age = now.saturating_duration_since(walked.measured_at);
+        let measured_age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
         let estimates = self.memory_estimates_from(walked);
         let rollup =
             Self::memory_root_rollup_from(&estimates).with_measured_age_ms(measured_age_ms);
