@@ -100,8 +100,8 @@ class MergeQueueWorkflowTests(unittest.TestCase):
         self.assertIn("--head", descriptor["run"])
         for step in gate["steps"]:
             if step.get("name") in (
-                "Download the shared release AFT",
-                "Check the shared release AFT",
+                "Download the shared search-quality AFT",
+                "Check the shared search-quality AFT",
                 "Provision search-quality corpora at their pinned commits",
                 "Evaluate committed search-quality reference",
             ):
