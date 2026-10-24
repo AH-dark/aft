@@ -5348,18 +5348,26 @@ impl LspManager {
             .has_fresh_report_for_server_file(server, &normalized)
     }
 
-    /// True if this exact server/file pair has a current report that a
-    /// document pull produced, as opposed to a push.
-    pub(crate) fn has_pulled_report_for_server_file(
-        &self,
-        server: &ServerKey,
-        file: &Path,
-    ) -> bool {
+    /// True if this server/file pair has a current report that describes the
+    /// text the server now holds for the open document: a document pull
+    /// produced it, or a push carried the open document's version. An
+    /// unversioned push (a late clearing reply to an earlier close, for
+    /// example) proves neither.
+    pub(crate) fn has_report_for_open_document(&self, server: &ServerKey, file: &Path) -> bool {
         let normalized = normalize_lookup_path(file);
+        let open_version = self
+            .documents
+            .get(server)
+            .and_then(|documents| documents.version(&normalized));
         self.diagnostics
             .entries_for_file(&normalized)
             .into_iter()
-            .any(|(key, entry)| key == server && !entry.stale && entry.from_document_pull)
+            .any(|(key, entry)| {
+                key == server
+                    && !entry.stale
+                    && (entry.from_document_pull
+                        || (entry.version.is_some() && entry.version == open_version))
+            })
     }
 
     /// True if any server has an authoritative report for this file: neither

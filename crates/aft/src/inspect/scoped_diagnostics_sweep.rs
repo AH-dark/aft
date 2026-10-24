@@ -303,10 +303,11 @@ pub(crate) fn sweep_scoped_files(
             // A document that was already open is analyzed continuously
             // (an edit opened it, for example); its current report is
             // live and is read as it stands. For a server that answers
-            // pulls that holds only for a pulled report: AFT's own edits
-            // mark a pulled report stale, and a push from such a server (a
-            // late clearing reply to an earlier close, for example) does
-            // not describe the open text, so the server is asked again.
+            // pulls that holds only for a report that describes the open
+            // text: a pulled one (AFT's own edits mark it stale) or a push
+            // carrying the open document's version. An unversioned push (a
+            // late clearing reply to an earlier close, for example) proves
+            // neither, so the server is asked again.
             // rust-analyzer answering pulls is asked again even then: it
             // analyzes a document only when asked, so its stored report can
             // predate an edit to another file (removing a struct field the
@@ -322,7 +323,7 @@ pub(crate) fn sweep_scoped_files(
                 && (matches!(key.kind, ServerKind::Rust | ServerKind::Python)
                     || matches!(&key.kind, ServerKind::Custom(id) if id.as_ref() == "basedpyright"));
             let live_report = if pulls {
-                lsp.has_pulled_report_for_server_file(&key, file)
+                lsp.has_report_for_open_document(&key, file)
             } else {
                 lsp.has_diagnostic_report_for_server_file(&key, file)
             };
