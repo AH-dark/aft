@@ -870,11 +870,9 @@ pub struct PullFileResult {
 #[derive(Debug, Clone)]
 pub struct PullWorkspaceResult {
     pub server_key: ServerKey,
-    /// Files for which a Full report was received and cached. Files that came
-    /// back as `Unchanged` are NOT listed here because their cached entry was
-    /// already authoritative.
+    /// Files whose full or unchanged reports were accepted into the cache.
     pub files_reported: Vec<PathBuf>,
-    /// True if the server returned a full response within the timeout.
+    /// True if a full response arrived and every report could be applied.
     pub complete: bool,
     /// True if we cancelled (request timed out before the server responded).
     pub cancelled: bool,
@@ -882,6 +880,28 @@ pub struct PullWorkspaceResult {
     /// other fields are empty and the caller should fall back to file-mode
     /// pull or to push semantics.
     pub supports_workspace: bool,
+}
+
+/// A workspace request keeps the exact result IDs sent to the server because
+/// another push or pull can replace the live cache while the lock is released.
+pub(crate) struct PendingWorkspacePull {
+    request: crate::lsp::client::PendingLspRequest,
+    previous_result_ids: HashMap<PathBuf, String>,
+}
+
+/// The reply retains its request's cache identities through the unlocked wait.
+pub(crate) struct WorkspacePullReply {
+    reply: Result<serde_json::Value, LspError>,
+    previous_result_ids: HashMap<PathBuf, String>,
+}
+
+impl PendingWorkspacePull {
+    fn wait(self, timeout: Duration) -> WorkspacePullReply {
+        WorkspacePullReply {
+            reply: self.request.wait(timeout),
+            previous_result_ids: self.previous_result_ids,
+        }
+    }
 }
 
 pub struct DrainedLspEvents {
@@ -2745,18 +2765,20 @@ impl LspManager {
     /// paths are unknown, but every open document they could matter for is
     /// checked.
     pub(crate) fn resync_drifted_open_documents(&mut self, config: &Config) -> usize {
-        let drifted: std::collections::BTreeSet<PathBuf> = self
+        let paths: std::collections::BTreeSet<PathBuf> = self
             .documents
             .values()
-            .flat_map(|store| {
-                store
-                    .open_documents()
-                    .into_iter()
-                    .filter(|path| store.is_stale_on_disk(path))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|store| store.open_documents().into_iter().cloned())
             .collect();
+        let drifted = paths
+            .into_iter()
+            .filter(|path| {
+                let snapshot = DiskSnapshot::read(path);
+                self.documents
+                    .values()
+                    .any(|store| store.is_open(path) && store.is_stale_against(path, &snapshot))
+            })
+            .collect::<Vec<_>>();
         let mut resynced = 0;
         for path in drifted {
             let Ok(content) = std::fs::read_to_string(&path) else {
@@ -2813,6 +2835,7 @@ impl LspManager {
         #[cfg(windows)]
         trace.push(format!("resolved_events={canonical_events:?}"));
 
+        let mut first_error = None;
         let keys: Vec<ServerKey> = self.clients.keys().cloned().collect();
         #[cfg(windows)]
         if keys.is_empty() {
@@ -2824,7 +2847,16 @@ impl LspManager {
                 if !path.starts_with(&key.root) {
                     continue;
                 }
-                changes.push(FileEvent::new(uri_for_path(path)?, *typ));
+                match uri_for_path(path) {
+                    Ok(uri) => changes.push(FileEvent::new(uri, *typ)),
+                    Err(error) => {
+                        log::warn!(
+                            "watched-file URI conversion failed for {}: {error}",
+                            path.display()
+                        );
+                        first_error.get_or_insert(error);
+                    }
+                }
             }
 
             if changes.is_empty() {
@@ -2834,17 +2866,11 @@ impl LspManager {
             }
 
             if let Some(client) = self.clients.get_mut(&key) {
-                // Send when the server either advertised initialize-time
-                // watched-file support or dynamically registered a watcher.
-                // The dynamic client capability we send during initialize only
-                // permits runtime registration; it is tracked separately via
-                // `has_watched_file_registration()`.
-                let supports_static_watched_files = client.supports_watched_files();
                 let has_dynamic_registration = client.has_watched_file_registration();
-                if !(supports_static_watched_files || has_dynamic_registration) {
+                if !has_dynamic_registration {
                     #[cfg(windows)]
                     trace.push(format!(
-                        "key={key:?}; changes={changes:?}; outcome=unsupported; static={supports_static_watched_files}; dynamic={has_dynamic_registration}"
+                        "key={key:?}; changes={changes:?}; outcome=unsupported; dynamic={has_dynamic_registration}"
                     ));
                     if self.watched_file_skip_logged.insert(key.clone()) {
                         log::debug!(
@@ -2869,11 +2895,8 @@ impl LspManager {
                     }
                 ));
                 if let Err(error) = send_result {
-                    #[cfg(windows)]
-                    {
-                        self.last_watched_file_notification_trace = trace.join("\n");
-                    }
-                    return Err(error);
+                    log::warn!("watched-file notification failed for {key:?}: {error}");
+                    first_error.get_or_insert(error);
                 }
             }
         }
@@ -2882,7 +2905,10 @@ impl LspManager {
         {
             self.last_watched_file_notification_trace = trace.join("\n");
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Forward changes the project file watcher saw (edits made by other
@@ -2953,7 +2979,7 @@ impl LspManager {
             let mut sent_to_registered_watcher: Vec<PathBuf> = Vec::new();
 
             if let Some(client) = self.clients.get(&key) {
-                if client.supports_watched_files() || client.has_watched_file_registration() {
+                if client.has_watched_file_registration() {
                     let watchers = client.registered_file_watchers();
                     let is_config =
                         |raw: &Path| is_config_file_path_with_custom(raw, extra_config_markers);
@@ -3181,8 +3207,15 @@ impl LspManager {
                         text_document: TextDocumentIdentifier::new(uri.clone()),
                     })
                 {
+                    let was_queued = matches!(err, LspError::Timeout(_));
                     if first_error.is_none() {
                         first_error = Some(err);
+                    }
+                    if !was_queued {
+                        // A pre-queue rejection leaves the server's document
+                        // open. Keep local state so a later retry sends didClose
+                        // rather than a duplicate didOpen.
+                        continue;
                     }
                 }
             }
@@ -4726,7 +4759,7 @@ impl LspManager {
     pub(crate) fn begin_workspace_pull(
         &mut self,
         server_key: &ServerKey,
-    ) -> Result<Option<crate::lsp::client::PendingLspRequest>, LspError> {
+    ) -> Result<Option<PendingWorkspacePull>, LspError> {
         let supports_workspace = self
             .clients
             .get(server_key)
@@ -4745,7 +4778,7 @@ impl LspManager {
         // Report the result ids of current reports so the server can answer
         // "unchanged" for those files instead of resending every report;
         // an unchanged item leaves the stored report as it is.
-        let previous_result_ids = self
+        let previous_result_ids: Vec<_> = self
             .diagnostics
             .result_ids_for_server(server_key)
             .into_iter()
@@ -4755,6 +4788,10 @@ impl LspManager {
                     value,
                 })
             })
+            .collect();
+        let sent_result_ids = previous_result_ids
+            .iter()
+            .filter_map(|previous| Some((uri_to_path(&previous.uri)?, previous.value.clone())))
             .collect();
         let params = AftWorkspaceDiagnosticParams {
             identifier,
@@ -4767,15 +4804,24 @@ impl LspManager {
             .get_mut(server_key)
             .ok_or_else(|| LspError::ServerNotReady("server not found".into()))?
             .start_request::<AftWorkspaceDiagnosticRequest>(params)
-            .map(Some)
+            .map(|request| {
+                Some(PendingWorkspacePull {
+                    request,
+                    previous_result_ids: sent_result_ids,
+                })
+            })
     }
 
     /// Store the reply to a request sent by [`Self::begin_workspace_pull`].
     pub(crate) fn finish_workspace_pull(
         &mut self,
         server_key: &ServerKey,
-        reply: Result<serde_json::Value, LspError>,
+        reply: WorkspacePullReply,
     ) -> Result<PullWorkspaceResult, LspError> {
+        let WorkspacePullReply {
+            reply,
+            previous_result_ids,
+        } = reply;
         let result = match reply.and_then(|value| {
             serde_json::from_value::<lsp_types::WorkspaceDiagnosticReportResult>(value)
                 .map_err(Into::into)
@@ -4803,35 +4849,58 @@ impl LspManager {
         // Extract the items list. Partial responses are not a complete
         // workspace view, but the partial payload can still contain useful
         // document reports; ingest those while surfacing complete=false.
-        let (items, complete) = match result {
+        let (items, mut complete) = match result {
             lsp_types::WorkspaceDiagnosticReportResult::Report(report) => (report.items, true),
             lsp_types::WorkspaceDiagnosticReportResult::Partial(partial) => (partial.items, false),
         };
 
-        // Ingest each file report into the diagnostics store.
+        // Workspace and document pulls share version/authority rules. Only a
+        // document request completes the per-document analysis wait below.
         let mut files_reported = Vec::with_capacity(items.len());
         for item in items {
-            match item {
-                lsp_types::WorkspaceDocumentDiagnosticReport::Full(full) => {
-                    if let Some(file) = uri_to_path(&full.uri) {
-                        let stored = from_lsp_diagnostics(
-                            file.clone(),
-                            full.full_document_diagnostic_report.items.clone(),
-                            &server_key.kind,
-                        );
-                        self.diagnostics.publish_with_result_id(
-                            server_key.clone(),
-                            file.clone(),
-                            stored,
-                            full.full_document_diagnostic_report.result_id.clone(),
-                        );
-                        files_reported.push(file);
-                    }
+            let (uri, version, report) = match item {
+                lsp_types::WorkspaceDocumentDiagnosticReport::Full(full) => (
+                    full.uri,
+                    full.version,
+                    lsp_types::DocumentDiagnosticReportKind::Full(
+                        full.full_document_diagnostic_report,
+                    ),
+                ),
+                lsp_types::WorkspaceDocumentDiagnosticReport::Unchanged(unchanged) => (
+                    unchanged.uri,
+                    unchanged.version,
+                    lsp_types::DocumentDiagnosticReportKind::Unchanged(
+                        unchanged.unchanged_document_diagnostic_report,
+                    ),
+                ),
+            };
+            if let Some(file) = uri_to_path(&uri) {
+                let previous = self
+                    .diagnostics
+                    .entries_for_file(&file)
+                    .into_iter()
+                    .find(|(stored, _)| **stored == *server_key)
+                    .map(|(_, entry)| entry.clone());
+                if matches!(
+                    &report,
+                    lsp_types::DocumentDiagnosticReportKind::Unchanged(_)
+                ) && !previous_result_ids.get(&file).is_some_and(|sent| {
+                    previous.as_ref().and_then(|entry| entry.result_id.as_ref()) == Some(sent)
+                }) {
+                    // An unchanged verdict concerns the report sent with the
+                    // request, not a replacement published while it was in flight.
+                    complete = false;
+                    continue;
                 }
-                lsp_types::WorkspaceDocumentDiagnosticReport::Unchanged(_unchanged) => {
-                    // "Unchanged" means the previously cached report is still
-                    // valid. We left it in place; nothing to do.
-                }
+                self.ingest_document_report_kind(
+                    server_key,
+                    &file,
+                    version.and_then(|version| i32::try_from(version).ok()),
+                    previous,
+                    false,
+                    report,
+                );
+                files_reported.push(file);
             }
         }
 
@@ -4864,9 +4933,7 @@ impl LspManager {
         let result = ServerAttemptResult::SpawnFailed { binary, reason };
         self.clients.remove(key);
         self.remember_exit_report(report);
-        self.server_binaries.remove(key);
-        self.documents.remove(key);
-        self.diagnostics.clear_for_server(key);
+        self.forget_server_state(Some(key));
         Some(self.record_failed_spawn(key, result, durability))
     }
 
@@ -4890,14 +4957,57 @@ impl LspManager {
             }
         };
 
+        let (primary, related) = match report {
+            lsp_types::DocumentDiagnosticReport::Full(full) => (
+                lsp_types::DocumentDiagnosticReportKind::Full(full.full_document_diagnostic_report),
+                full.related_documents,
+            ),
+            lsp_types::DocumentDiagnosticReport::Unchanged(unchanged) => (
+                lsp_types::DocumentDiagnosticReportKind::Unchanged(
+                    unchanged.unchanged_document_diagnostic_report,
+                ),
+                unchanged.related_documents,
+            ),
+        };
+        for (uri, report) in related.into_iter().flatten() {
+            if let Some(file) = uri_to_path(&uri) {
+                // Related reports have no document version. They may refresh
+                // cached data but cannot prove a versioned post-edit barrier.
+                let previous = self
+                    .diagnostics
+                    .entries_for_file(&file)
+                    .into_iter()
+                    .find(|(stored, entry)| {
+                        **stored == *key && entry.from_document_pull && entry.result_id.is_some()
+                    })
+                    .map(|(_, entry)| entry.clone());
+                self.ingest_document_report_kind(key, &file, None, previous, true, report);
+            }
+        }
+        self.ingest_document_report_kind(
+            key,
+            canonical_path,
+            document_version,
+            previous_report,
+            true,
+            primary,
+        )
+    }
+
+    fn ingest_document_report_kind(
+        &mut self,
+        key: &ServerKey,
+        canonical_path: &Path,
+        document_version: Option<i32>,
+        previous_report: Option<DiagnosticEntry>,
+        document_pull: bool,
+        report: lsp_types::DocumentDiagnosticReportKind,
+    ) -> PullFileOutcome {
         match report {
-            lsp_types::DocumentDiagnosticReport::Full(full) => {
-                let result_id = full.full_document_diagnostic_report.result_id.clone();
-                let stored = from_lsp_diagnostics(
-                    canonical_path.to_path_buf(),
-                    full.full_document_diagnostic_report.items.clone(),
-                    &key.kind,
-                );
+            lsp_types::DocumentDiagnosticReportKind::Full(full) => {
+                let result_id = full.result_id;
+                let stored =
+                    from_lsp_diagnostics(canonical_path.to_path_buf(), full.items, &key.kind);
                 let count = stored.len();
                 let provisional = self.clients.get(key).is_some_and(|client| {
                     client.diagnostics_are_provisional() && !client.uses_analysis_progress()
@@ -4910,13 +5020,15 @@ impl LspManager {
                     document_version,
                     provisional,
                 );
-                self.diagnostics.mark_document_pull(key, canonical_path);
-                self.note_document_pull_completed(key, canonical_path);
+                if document_pull {
+                    self.diagnostics.mark_document_pull(key, canonical_path);
+                    self.note_document_pull_completed(key, canonical_path);
+                }
                 PullFileOutcome::Full {
                     diagnostic_count: count,
                 }
             }
-            lsp_types::DocumentDiagnosticReport::Unchanged(unchanged) => {
+            lsp_types::DocumentDiagnosticReportKind::Unchanged(unchanged) => {
                 // The server says the previous resultId is still valid for the
                 // current document. That is only usable if we already have a
                 // report for this exact server/file; an initial `unchanged`
@@ -4931,12 +5043,14 @@ impl LspManager {
                         key.clone(),
                         canonical_path.to_path_buf(),
                         previous.diagnostics,
-                        Some(unchanged.unchanged_document_diagnostic_report.result_id),
+                        Some(unchanged.result_id),
                         document_version,
                         !authoritative,
                     );
-                    self.diagnostics.mark_document_pull(key, canonical_path);
-                    self.note_document_pull_completed(key, canonical_path);
+                    if document_pull {
+                        self.diagnostics.mark_document_pull(key, canonical_path);
+                        self.note_document_pull_completed(key, canonical_path);
+                    }
                     PullFileOutcome::Unchanged
                 } else {
                     PullFileOutcome::RequestFailed {
@@ -4953,11 +5067,33 @@ impl LspManager {
     pub fn take_all_clients(&mut self) -> Vec<(ServerKey, LspClient)> {
         let clients: Vec<_> = self.clients.drain().collect();
         self.clients_generation = self.clients_generation.wrapping_add(1);
-        self.inspect_rust_checks.clear();
-        self.server_binaries.clear();
-        self.documents.clear();
-        self.diagnostics = DiagnosticsStore::new();
+        self.forget_server_state(None);
         clients
+    }
+
+    /// Forget instance-owned state without changing start reservations or
+    /// failure backoff. Those have their own generation and retry lifecycles.
+    fn forget_server_state(&mut self, key: Option<&ServerKey>) {
+        let keep = |server: &ServerKey| key.is_some_and(|key| key != server);
+        self.inspect_rust_checks.retain(|server, _| keep(server));
+        self.server_binaries.retain(|server, _| keep(server));
+        self.documents.retain(|server, _| keep(server));
+        self.watched_file_skip_logged.retain(keep);
+        self.latest_push_for_pull_servers
+            .retain(|(server, _), _| keep(server));
+        self.latest_pull_for_rust
+            .retain(|(server, _), _| keep(server));
+        self.inspect_closed_documents
+            .retain(|(server, _), _| keep(server));
+        self.late_close_replies
+            .retain(|(server, _), _| keep(server));
+        self.close_answering_servers.retain(keep);
+        self.versioned_publish_servers.retain(keep);
+        if let Some(key) = key {
+            self.diagnostics.clear_for_server(key);
+        } else {
+            self.diagnostics = DiagnosticsStore::new();
+        }
     }
 
     pub(crate) fn quiesce(&mut self) -> Vec<(ServerKey, LspClient)> {
@@ -5781,19 +5917,7 @@ impl LspManager {
                     // belonged to an older process and must not tear it down.
                     None
                 } else {
-                    self.server_binaries.remove(&key);
-                    self.documents.remove(&key);
-                    self.diagnostics.clear_for_server(&key);
-                    self.latest_push_for_pull_servers
-                        .retain(|(server, _), _| *server != key);
-                    self.latest_pull_for_rust
-                        .retain(|(server, _), _| *server != key);
-                    self.inspect_closed_documents
-                        .retain(|(server, _), _| *server != key);
-                    self.late_close_replies
-                        .retain(|(server, _), _| *server != key);
-                    self.close_answering_servers.remove(&key);
-                    self.versioned_publish_servers.remove(&key);
+                    self.forget_server_state(Some(&key));
                     None
                 }
             }
@@ -7045,8 +7169,8 @@ fn resolve_for_lsp_uri(file_path: &Path) -> PathBuf {
 }
 
 pub(crate) fn language_id_for_extension(ext: &str) -> &'static str {
-    match ext {
-        "ts" => "typescript",
+    match ext.to_ascii_lowercase().as_str() {
+        "ts" | "mts" | "cts" => "typescript",
         "tsx" => "typescriptreact",
         "js" | "mjs" | "cjs" => "javascript",
         "jsx" => "javascriptreact",
@@ -7055,6 +7179,40 @@ pub(crate) fn language_id_for_extension(ext: &str) -> &'static str {
         "go" => "go",
         "html" | "htm" => "html",
         "md" | "markdown" | "mdx" | "mkd" | "mkdn" | "mdown" | "mdwn" | "qmd" | "rmd" => "markdown",
+        "vue" => "vue",
+        "svelte" => "svelte",
+        "astro" => "astro",
+        "sh" | "bash" | "zsh" => "shellscript",
+        "yaml" | "yml" => "yaml",
+        "clj" | "cljs" | "cljc" | "edn" => "clojure",
+        "dart" => "dart",
+        "ex" | "exs" => "elixir",
+        "fs" | "fsi" | "fsx" | "fsscript" => "fsharp",
+        "gleam" => "gleam",
+        "hs" | "lhs" => "haskell",
+        "java" => "java",
+        "jl" => "julia",
+        "nix" => "nix",
+        "ml" | "mli" => "ocaml",
+        "php" => "php",
+        "rb" | "rake" | "gemspec" | "ru" => "ruby",
+        "swift" => "swift",
+        "cs" | "csx" => "csharp",
+        "razor" | "cshtml" => "razor",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" => "cpp",
+        "lua" => "lua",
+        "zig" | "zon" => "zig",
+        "typ" | "typc" => "typst",
+        "kt" | "kts" => "kotlin",
+        "tex" => "latex",
+        "bib" => "bibtex",
+        "tf" => "terraform",
+        "tfvars" => "terraform-vars",
+        "prisma" => "prisma",
+        "json" => "json",
+        "jsonc" => "jsonc",
+        "dockerfile" => "dockerfile",
         _ => "plaintext",
     }
 }
@@ -8438,6 +8596,10 @@ fn env_binary_override_from(
 }
 
 #[cfg(test)]
+#[path = "manager_regression_tests.rs"]
+mod regression_tests;
+
+#[cfg(test)]
 mod env_binary_override_tests {
     use super::*;
 
@@ -8586,6 +8748,36 @@ mod project_applicability_tests {
 
 #[cfg(test)]
 mod language_id_tests {
+    #[test]
+    fn every_registered_extension_has_a_language_id() {
+        for server in crate::lsp::registry::builtin_servers() {
+            for extension in &server.extensions {
+                assert_ne!(
+                    super::language_id_for_extension(extension),
+                    "plaintext",
+                    "{extension}"
+                );
+                assert_eq!(
+                    super::language_id_for_extension(extension),
+                    super::language_id_for_extension(&extension.to_uppercase())
+                );
+            }
+        }
+        assert_eq!(
+            super::language_id_for_extension("unregistered"),
+            "plaintext"
+        );
+        for (extension, id) in [
+            ("vue", "vue"),
+            ("astro", "astro"),
+            ("svelte", "svelte"),
+            ("sh", "shellscript"),
+            ("cs", "csharp"),
+            ("tfvars", "terraform-vars"),
+        ] {
+            assert_eq!(super::language_id_for_extension(extension), id);
+        }
+    }
     use super::language_id_for_extension;
 
     #[test]
@@ -9616,7 +9808,7 @@ mod server_exit_reap_tests {
             Path::new("sh"),
             &[
                 "-c".to_string(),
-                "printf 'Content-Length: 3\r\n\r\n{{{'; exec sleep 60".to_string(),
+                "printf 'Content-Length: invalid\r\n\r\n'; exec sleep 60".to_string(),
             ],
             &HashMap::new(),
             event_tx,

@@ -3428,7 +3428,7 @@ fn watcher_drain_forwards_nothing_to_a_server_without_watched_file_support() {
 }
 
 #[test]
-fn watcher_drain_forwards_config_files_to_a_server_without_registered_globs() {
+fn watcher_drain_ignores_echoed_client_capabilities_without_registration() {
     let (_temp_dir, root, file, ctx, watcher_tx) =
         fake_rust_server_with_watcher(|_| env_pair("AFT_FAKE_LSP_STATIC_WATCHED_FILES_ONLY", "1"));
     fs::write(root.join("Cargo.lock"), "version = 4\n").expect("write lockfile");
@@ -3443,11 +3443,9 @@ fn watcher_drain_forwards_config_files_to_a_server_without_registered_globs() {
     drain_watcher_events(&ctx);
 
     let (watched, _) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
-    assert_eq!(watched.len(), 1, "{watched:?}");
-    assert_eq!(
-        forwarded_changes(&root, &watched[0]),
-        vec![("Cargo.lock".to_string(), 2), ("Cargo.toml".to_string(), 2)],
-        "without globs, only project configuration files are forwarded"
+    assert!(
+        watched.is_empty(),
+        "an echoed client capability is not a subscription: {watched:?}"
     );
 }
 
@@ -3484,6 +3482,238 @@ fn watcher_overflow_sends_no_per_file_flood() {
     assert!(
         watched.is_empty(),
         "a rescan sends no per-file notifications: {watched:?}"
+    );
+}
+
+#[test]
+fn workspace_unchanged_reply_does_not_relabel_an_interleaved_report() {
+    for replacement_id in [None, Some(None), Some(Some("B"))] {
+        let (_temp, root, files) = rust_workspace_with_files(&["main.rs"]);
+        let config = Config {
+            project_root: Some(root),
+            ..Config::default()
+        };
+        let mut manager = LspManager::new();
+        manager.override_binary(ServerKind::Rust, fake_server_path());
+        for name in [
+            "AFT_FAKE_LSP_PULL",
+            "AFT_FAKE_LSP_WORKSPACE",
+            "AFT_FAKE_LSP_WS_UNCHANGED",
+        ] {
+            manager.set_extra_env(name, "1");
+        }
+        let keys = manager.ensure_server_for_file(&files[0], &config);
+        assert_eq!(keys.len(), 1, "workspace producer must start");
+        let key = &keys[0];
+        let file = key.root.join("src/main.rs");
+        let diagnostics = |message| {
+            aft::lsp::diagnostics::from_lsp_diagnostics(
+                file.clone(),
+                vec![serde_json::from_value(serde_json::json!({
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                "message": message, "severity": 1
+            })).unwrap()],
+                &key.kind,
+            )
+        };
+        manager
+            .diagnostics_store_mut_for_test()
+            .publish_full_with_provisional(
+                key.clone(),
+                file.clone(),
+                diagnostics("A"),
+                Some("A".into()),
+                Some(1),
+                false,
+            );
+        let manager = parking_lot::Mutex::new(manager);
+        let locks = std::cell::Cell::new(0);
+        let result = aft::lsp::manager::pull_workspace_diagnostics_unlocked(
+            || {
+                let mut manager = manager.lock();
+                locks.set(locks.get() + 1);
+                if locks.get() == 2 {
+                    // The second lock is the completion hook, after the request
+                    // has been sent and awaited without owning the manager.
+                    if let Some(result_id) = replacement_id {
+                        manager
+                            .diagnostics_store_mut_for_test()
+                            .publish_full_with_provisional(
+                                key.clone(),
+                                file.clone(),
+                                diagnostics("B"),
+                                result_id.map(str::to_owned),
+                                Some(2),
+                                false,
+                            );
+                    }
+                }
+                manager
+            },
+            key,
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert_eq!(
+            locks.get(),
+            2,
+            "the interleaving hook must run after request submission"
+        );
+        let current = manager
+            .lock()
+            .diagnostics_store_for_test()
+            .entries_for_file(&file)
+            .into_iter()
+            .find(|(server, _)| **server == *key)
+            .map(|(_, entry)| entry.clone())
+            .expect("the cached report must remain present");
+        if let Some(result_id) = replacement_id {
+            assert_eq!(current.diagnostics[0].message, "B");
+            assert_eq!(
+                current.result_id.as_deref(),
+                result_id,
+                "an unchanged verdict for A must not relabel the replacement report B"
+            );
+            assert_eq!(
+                current.version,
+                Some(2),
+                "the replacement's version must remain intact"
+            );
+            assert!(
+                !result.complete,
+                "a rejected unchanged item is not a complete workspace report"
+            );
+            assert!(!result.files_reported.contains(&file));
+        } else {
+            assert_eq!(current.diagnostics[0].message, "A");
+            assert_eq!(current.result_id.as_deref(), Some("next-A"));
+            assert_eq!(current.version, Some(99));
+            assert!(
+                result.complete,
+                "a matching unchanged reply must remain usable"
+            );
+            assert_eq!(result.files_reported, vec![file]);
+        }
+    }
+}
+
+#[test]
+fn overflowing_document_backlog_leaves_disjoint_unchanged_documents_unsent() {
+    let (_temp, root, files) = rust_workspace_with_files(&["main.rs", "probe.rs"]);
+    fs::write(root.join("pyproject.toml"), "[project]\nname = \"demo\"\n").unwrap();
+    let python = root.join("main.py");
+    fs::write(&python, "pass\n").unwrap();
+    let log = root.join("did-change.jsonl");
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        }),
+    )
+    .with_test_checkpoint_store();
+    {
+        let mut manager = ctx.lsp();
+        manager.override_binary(ServerKind::Rust, fake_server_path());
+        manager.override_binary(ServerKind::Python, fake_server_path());
+        manager.set_extra_env("AFT_FAKE_LSP_DID_CHANGE_LOG", log.to_str().unwrap());
+    }
+    let documents = [
+        (files[0].clone(), "fn main() {}\n", ServerKind::Rust),
+        (python, "pass\n", ServerKind::Python),
+    ];
+    let config = ctx.config();
+    let mut before = Vec::new();
+    for (file, content, kind) in &documents {
+        let versions = ctx
+            .lsp()
+            .notify_file_changed_versioned(file, content, &config)
+            .unwrap();
+        assert_eq!(versions.len(), 1, "one producer must own {file:?}");
+        assert_eq!(&versions[0].0.kind, kind);
+        wait_for_publish(&mut ctx.lsp());
+        let snapshot = ctx.lsp().snapshot_pre_edit_state(file);
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "each file must be open in only one store"
+        );
+        assert_eq!(
+            snapshot
+                .get(&versions[0].0)
+                .expect("owning store must be captured")
+                .document_version_at_capture,
+            Some(0)
+        );
+        before.push(snapshot);
+    }
+    assert_ne!(before[0].keys().next(), before[1].keys().next());
+    let probe = &files[1];
+    ctx.lsp()
+        .notify_file_changed_versioned(probe, "fn main() {}\n", &config)
+        .unwrap();
+    wait_for_publish(&mut ctx.lsp());
+    fs::write(probe, "fn main() { 1; }\n").unwrap();
+    {
+        let _held = ctx.lsp();
+        // The helper may take one full batch before blocking on this lock.
+        // A second full batch plus one path guarantees that a batch overflows.
+        for index in 0..=2 * aft::lsp::pending_changes::PENDING_LSP_DOCUMENTS_CAP {
+            ctx.lsp_notify_file_changed(&root.join(format!("noise-{index}.rs")), "ignored");
+        }
+        assert!(
+            ctx.lsp_pending_changes_for_test(),
+            "the held manager must retain the overflowing backlog"
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while ctx.lsp_pending_changes_for_test() {
+        assert!(Instant::now() < deadline, "overflow backlog did not drain");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let probe_state = ctx.lsp().snapshot_pre_edit_state(probe);
+    assert_eq!(
+        probe_state
+            .values()
+            .next()
+            .expect("probe must remain open")
+            .document_version_at_capture,
+        Some(1),
+        "the unqueued disk change must prove an overflow resync ran"
+    );
+    for ((file, _, _), previous) in documents.iter().zip(&before) {
+        let current = ctx.lsp().snapshot_pre_edit_state(file);
+        assert_eq!(
+            current.len(),
+            1,
+            "only the owning store must contain {file:?}"
+        );
+        for (key, snapshot) in previous {
+            assert_eq!(
+                current
+                    .get(key)
+                    .expect("owning producer must remain open")
+                    .document_version_at_capture,
+                snapshot.document_version_at_capture,
+                "overflow must not send didChange for unchanged {file:?} absent from another store"
+            );
+        }
+    }
+    let probe_ack = collect_event(&mut ctx.lsp(), |event| {
+        matches!(event,
+        LspEvent::Notification { method, .. } if method == "custom/documentChanged")
+    });
+    assert!(probe_ack.is_some(), "overflow probe must reach its server");
+    // The probe acknowledgement is consumed. FIFO acknowledgements for these
+    // barriers account for exactly two additional changes in the log.
+    for (file, content, _) in &documents {
+        server_reports_before_barrier(&ctx, file, content);
+    }
+    let changes = fs::read_to_string(&log).expect("barrier changes must be logged");
+    assert_eq!(
+        changes.lines().count(),
+        3,
+        "only the drifted probe and two barriers may send didChange: {changes}"
     );
 }
 

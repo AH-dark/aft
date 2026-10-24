@@ -653,6 +653,7 @@ def notification(method, params):
 
 mode = os.environ.get("AFT_PROTOCOL_LSP_MODE", "watch")
 next_request_id = 100
+watched_count = 0
 
 while True:
     message = read_message()
@@ -683,6 +684,7 @@ while True:
             })
             next_request_id += 1
     elif method == "workspace/didChangeWatchedFiles":
+        watched_count += 1
         notification("custom/watchedFilesChanged", message.get("params"))
         request(next_request_id, "client/unregisterCapability", {
             "unregisterations": [{
@@ -691,6 +693,8 @@ while True:
             }]
         })
         next_request_id += 1
+    elif method == "textDocument/didSave":
+        notification("custom/watchedCount", {"count": watched_count})
     elif method == "workspace/diagnostic":
         pass
     elif method == "$/cancelRequest":
@@ -1161,7 +1165,109 @@ fn watched_file_capability_defaults_false_when_initialize_has_no_field() {
 }
 
 #[test]
-fn static_watched_file_capability_allows_notification_without_dynamic_registration() {
+fn watched_file_batch_continues_after_a_server_rejects_send() {
+    assert!(
+        protocol_server_prerequisites_available(),
+        "protocol fixture requires Python"
+    );
+    let temp = tempdir().unwrap();
+    let physical_roots = temp.path().join("physical-roots");
+    fs::create_dir_all(&physical_roots).unwrap();
+    // Exercise caller aliases on Linux as well as macOS's /var spelling.
+    #[cfg(unix)]
+    let caller_roots = {
+        let alias = temp.path().join("caller-roots");
+        std::os::unix::fs::symlink(&physical_roots, &alias).unwrap();
+        alias
+    };
+    #[cfg(not(unix))]
+    let caller_roots = physical_roots;
+    let (_script_dir, script) = executable_protocol_server_script();
+    let mut manager = LspManager::new();
+    let mut config = Config::default();
+    let mut sources = Vec::new();
+    for id in ["batch-a", "batch-b"] {
+        let root = caller_roots.join(id);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("marker.txt"), "marker").unwrap();
+        let source = root.join(format!("main.{id}"));
+        fs::write(&source, "content").unwrap();
+        config.lsp_servers.push(UserServerDef {
+            id: id.into(),
+            extensions: vec![id.into()],
+            binary: id.into(),
+            args: Vec::new(),
+            root_markers: vec!["marker.txt".into()],
+            env: HashMap::new(),
+            initialization_options: None,
+            disabled: false,
+        });
+        manager.override_binary(ServerKind::Custom(Arc::from(id)), script.clone());
+        sources.push(source);
+    }
+    let mut sources_by_key = HashMap::new();
+    for source in sources {
+        let started = manager.ensure_server_for_file(&source, &config);
+        assert_eq!(started.len(), 1, "the fixture must start one producer");
+        let key = started
+            .into_iter()
+            .next()
+            .expect("one producer was started");
+        #[cfg(unix)]
+        assert_ne!(
+            key.root.as_path(),
+            source.parent().unwrap(),
+            "the caller alias must differ from the product's canonical identity"
+        );
+        sources_by_key.insert(key, source);
+        collect_event(
+            &mut manager,
+            |event| {
+                matches!(event,
+            LspEvent::ServerRequest { method, .. } if method == "client/registerCapability")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("watch registration");
+    }
+    // Use the manager's own iteration order so the rejected send precedes the
+    // healthy recipient without depending on HashMap's randomized ordering.
+    let keys = manager.active_server_keys();
+    let [failed_key, healthy_key] = keys.as_slice() else {
+        panic!("expected two fixture producers, got {keys:?}");
+    };
+    let failed_source = sources_by_key
+        .get(failed_key)
+        .unwrap_or_else(|| panic!("failed producer key {failed_key:?} has no fixture source"));
+    assert!(
+        sources_by_key.contains_key(healthy_key),
+        "healthy producer key {healthy_key:?} has no fixture source"
+    );
+    let failed = manager.client_for_file_mut(failed_source, &config).unwrap();
+    failed.shutdown().unwrap();
+    assert!(
+        failed.child_exited(),
+        "shutdown must reap the fixture child"
+    );
+    let changes = keys
+        .iter()
+        .map(|key| (key.root.join("config.json"), FileChangeType::CHANGED))
+        .collect::<Vec<_>>();
+    assert!(manager
+        .notify_files_watched_changed(&changes, &config)
+        .is_err());
+    let received = collect_notification(&mut manager, "custom/watchedFilesChanged");
+    assert_eq!(received["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        received["changes"][0]["uri"],
+        aft::lsp::position::uri_for_path(&healthy_key.root.join("config.json"))
+            .unwrap()
+            .as_str()
+    );
+}
+
+#[test]
+fn echoed_client_watched_file_capability_does_not_enable_notifications() {
     if skip_if_protocol_server_prerequisites_missing() {
         return;
     }
@@ -1197,24 +1303,34 @@ fn static_watched_file_capability_allows_notification_without_dynamic_registrati
     let keys = manager.ensure_server_for_file(&source, &config);
     assert_eq!(keys.len(), 1);
     assert!(
-        manager
+        !manager
             .client_for_file(&source, &config)
             .expect("client")
             .supports_watched_files(),
-        "initialize-time watched-file support should be captured"
+        "a client capability echoed by the server must not enable notifications"
     );
 
     manager
         .notify_files_watched_changed(&[(changed, FileChangeType::CHANGED)], &config)
         .expect("send watched-file change");
 
-    let watched = collect_optional_notification(
-        &mut manager,
-        "custom/watchedFilesChanged",
-        Duration::from_secs(2),
-    )
-    .expect("static watched-file support should receive notification");
-    assert_eq!(watched["changes"][0]["type"], 2);
+    manager
+        .client_for_file_mut(&source, &config)
+        .unwrap()
+        .send_notification::<lsp_types::notification::DidSaveTextDocument>(
+            lsp_types::DidSaveTextDocumentParams {
+                text_document: lsp_types::TextDocumentIdentifier::new(
+                    aft::lsp::position::uri_for_path(&source).unwrap(),
+                ),
+                text: None,
+            },
+        )
+        .unwrap();
+    let barrier = collect_notification(&mut manager, "custom/watchedCount");
+    assert_eq!(
+        barrier["count"], 0,
+        "unregistered server received watched-file notifications"
+    );
 }
 
 #[test]
