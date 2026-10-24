@@ -3004,7 +3004,8 @@ impl BgTaskRegistry {
             .map_err(|e| e.to_string())?;
         #[cfg(test)]
         tests::after_local_fallback_marker(&task.task_id);
-        let child = spawn_detached_child(
+        let mut memory_monitor = self.prepare_memory_limit(&task.task_id)?;
+        let mut child = spawn_detached_child(
             &local.plan,
             &metadata.command,
             super::super::BashShell::Bash,
@@ -3014,13 +3015,36 @@ impl BgTaskRegistry {
             &local.env,
             state.io_handles.as_mut().ok_or("task handles absent")?,
             local.capture_pipeline,
+            memory_monitor.is_some(),
             local.linux_scope,
-            // local_fallback_started was persisted above before process creation;
-            // a later failed PID write reports unknown, never "did not run" or a
-            // second execution. This caller has no ordinary-local "run" sender,
-            // so its wrapper must start without that identity-checkpoint gate.
-            LocalIdentityGate::CommittedFallback,
+            // The fallback's execution marker is already durable. Only capped
+            // commands need a second gate here, to attach the memory container.
+            if memory_monitor.is_some() {
+                LocalIdentityGate::Required
+            } else {
+                LocalIdentityGate::CommittedFallback
+            },
         )?;
+        if let Some(mut monitor) = memory_monitor.take() {
+            if let Err(error) = monitor.attach(child.id()) {
+                super::super::process::terminate_pgid(child.id() as i32, None);
+                let _ = child.wait();
+                return Err(error);
+            }
+            state.metadata.memory_policy = Some(monitor.policy.clone());
+            self.inner
+                .memory_monitors
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(task.task_id.clone(), monitor);
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .ok_or("memory cap launch gate missing")?
+                .write_all(b"run\n")
+                .map_err(|error| error.to_string())?;
+        }
         #[cfg(test)]
         if tests::simulate_crash_before_local_pid(&task.task_id) {
             return Ok(());

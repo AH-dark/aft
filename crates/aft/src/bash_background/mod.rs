@@ -7,6 +7,7 @@ pub mod buffer;
 mod exit_observer;
 mod gc_cursor;
 mod gc_memo;
+mod memory_limit;
 pub mod output;
 pub mod persistence;
 pub mod process;
@@ -1249,6 +1250,8 @@ pub(crate) fn spawn(
     #[cfg(unix)]
     ctx.bash_background()
         .set_db_schema_hints(ctx.config().bash.db_schema_hints);
+    ctx.bash_background()
+        .set_memory_limit(ctx.config().bash.memory_limit_mib);
     #[cfg(unix)]
     let remote_result = remote.map(|launch| {
         ctx.bash_background().spawn_remote_typed(
