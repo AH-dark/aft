@@ -11,7 +11,7 @@ use crate::protocol::PushFrame;
 #[cfg(test)]
 use crate::watcher_filter::RescanReason;
 use crate::watcher_filter::{watcher_path_is_infra_skip_under, WatcherDispatchEvent};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-timing-hooks"))]
 use std::collections::HashMap;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -187,14 +187,14 @@ struct SemanticRefreshRecoveryGate {
 static SEMANTIC_REFRESH_RECOVERY_GATE: OnceLock<Mutex<Option<SemanticRefreshRecoveryGate>>> =
     OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-timing-hooks"))]
 struct WatcherPhaseCommitGate {
     reached_tx: crossbeam_channel::Sender<()>,
     release_rx: crossbeam_channel::Receiver<()>,
 }
 
-#[cfg(test)]
-// Parallel libtests must not replace another path's in-flight barrier.
+#[cfg(any(test, feature = "test-timing-hooks"))]
+// Parallel tests must not replace another path's in-flight barrier.
 static WATCHER_PHASE_COMMIT_GATE: std::sync::OnceLock<
     Mutex<HashMap<PathBuf, WatcherPhaseCommitGate>>,
 > = std::sync::OnceLock::new();
@@ -252,8 +252,10 @@ fn wait_on_watcher_rescan_gate_for_test(ctx: &AppContext) {
 #[cfg(not(test))]
 fn wait_on_watcher_rescan_gate_for_test(_ctx: &AppContext) {}
 
-#[cfg(test)]
-fn install_watcher_phase_commit_gate_for_test(
+/// Hold one real watcher path application until its test releases the drain.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-timing-hooks"))]
+pub fn install_watcher_phase_commit_gate_for_test(
     target: PathBuf,
 ) -> (
     crossbeam_channel::Receiver<()>,
@@ -275,7 +277,7 @@ fn install_watcher_phase_commit_gate_for_test(
     (reached_rx, release_tx)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-timing-hooks"))]
 fn wait_on_watcher_phase_commit_gate_for_test(path: &Path) {
     let gate = WATCHER_PHASE_COMMIT_GATE
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -288,7 +290,7 @@ fn wait_on_watcher_phase_commit_gate_for_test(path: &Path) {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-timing-hooks")))]
 fn wait_on_watcher_phase_commit_gate_for_test(_path: &Path) {}
 
 #[cfg(test)]
