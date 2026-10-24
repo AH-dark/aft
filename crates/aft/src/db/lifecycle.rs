@@ -554,7 +554,8 @@ pub(crate) fn sqlite_open_path(path: &Path) -> std::borrow::Cow<'_, Path> {
 /// An immutable read of a quiescent main file must not create empty WAL/SHM
 /// files. If frames already exist, normal read-only SQLite reads include them.
 /// A racing writer can make this census stale. Before unlinking, generation
-/// cleanup rereads the pointer under an IMMEDIATE transaction and, for V2,
+/// cleanup rechecks the pointer in its own transaction (which it can only
+/// promote to a writer if nothing committed since its census) and, for V2,
 /// rechecks membership under the family registry's write transaction.
 pub(crate) fn census_open_path(path: &Path) -> rusqlite::Result<PathBuf> {
     let mut wal = path.as_os_str().to_owned();
