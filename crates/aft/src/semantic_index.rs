@@ -1622,7 +1622,7 @@ impl SemanticIndexLock {
         crate::private_storage::open_dir(storage_dir, &dir)?;
         let _acquire_guard = SEMANTIC_LOCK_ACQUIRE_MUTEX
             .lock()
-            .map_err(|_| std::io::Error::other("semantic cache lock acquisition mutex poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         fs_lock::try_acquire(&path, Duration::from_secs(2))
             .map(|guard| Self {
                 _guard: Some(guard),
@@ -18546,6 +18546,21 @@ public class Greeter {
 #[cfg(test)]
 mod embedding_backend_retry_status_tests {
     use super::*;
+
+    #[test]
+    fn audit10_semantic_lock_poison_recovers() {
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = SEMANTIC_LOCK_ACQUIRE_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("simulate acquisition panic");
+        });
+        assert!(poisoned.is_err());
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let lock = SemanticIndexLock::acquire(storage.path(), "poison", project.path()).unwrap();
+        assert!(lock._guard.is_some());
+    }
 
     fn audit10_vector_index(vectors: Vec<Vec<f32>>) -> SemanticIndex {
         let root = std::env::current_dir().unwrap();

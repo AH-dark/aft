@@ -369,7 +369,7 @@ impl CacheLock {
         crate::private_storage::open_keyed_dir(cache_dir, "index")?;
         let _acquire_guard = CACHE_LOCK_ACQUIRE_MUTEX
             .lock()
-            .map_err(|_| std::io::Error::other("search cache lock acquisition mutex poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         fs_lock::try_acquire(&path, timeout)
             .map(|guard| Self {
                 _guard: Some(guard),
@@ -12198,6 +12198,22 @@ mod tests {
         assert!(parse_git_name_status_z(b"R100\0old.rs\0").is_none());
         assert!(parse_git_name_status_z(b"M\0file.rs").is_none());
         assert!(!git_diff_within_path_limit(b"R100\0old.rs\0", 512));
+    }
+
+    #[test]
+    fn audit10_search_lock_poison_recovers() {
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = super::CACHE_LOCK_ACQUIRE_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("simulate acquisition panic");
+        });
+        assert!(poisoned.is_err());
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let cache_dir = storage.path().join("index").join("poison");
+        let lock = super::CacheLock::acquire(&cache_dir, project.path()).unwrap();
+        assert!(lock._guard.is_some());
     }
 
     #[test]
