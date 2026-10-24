@@ -419,6 +419,10 @@ impl ViewStore {
         &self,
         registry: Option<&super::registry::FamilyRegistry>,
     ) -> Result<GenerationSweep> {
+        let lock = sweep_lock(self.view_dir());
+        let _serialized = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut removed = self.reap_generation_trash()?;
         if !self.has_superseded_artifacts()? {
             return Ok(removed);
@@ -566,8 +570,11 @@ impl ViewStore {
             rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
             true,
         )?;
-        // Maintenance reserves no writer time while another transaction is active.
-        pointer.busy_timeout(Duration::ZERO)?;
+        // The publisher's pointer policy. A wait can only happen while this
+        // connection holds no lock: SQLite skips the busy handler when a read
+        // transaction asks to become a writer, so the claim's promotion below
+        // fails at once (and cleanup yields) while any other writer is active.
+        pointer.busy_timeout(super::POINTER_BUSY_TIMEOUT)?;
         let mode: String = pointer.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
             return Ok(GenerationSweep::default());
@@ -1036,6 +1043,25 @@ fn checkpoint_lock(path: &Path) -> Arc<Mutex<()>> {
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+// Two cleanups of one view in this process would each see the other's claim
+// as a competing writer and yield, possibly leaving both incomplete. Run them
+// one after another instead. This lock is in-process only and never held by a
+// publisher, so it cannot delay publication.
+fn sweep_lock(path: &Path) -> Arc<Mutex<()>> {
+    static SWEEP_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = SWEEP_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks.retain(|_, lock| lock.strong_count() > 0);
     if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
         return lock;
     }

@@ -286,10 +286,9 @@ pub(crate) struct RegistryLocation {
 impl RegistryLocation {
     pub(crate) fn open_for_sweep(&self) -> RegistryResult<Option<FamilyRegistry>> {
         let registry = FamilyRegistry::open_existing_isolated(&self.storage, &self.family, false)?;
-        if let Some(registry) = &registry {
-            // Cleanup never queues behind a publisher's registry transaction.
-            lock(&registry.inner.connection).busy_timeout(Duration::ZERO)?;
-        }
+        // The connection keeps the publisher's registry busy policy. Cleanup
+        // takes the registry barrier only while it holds no other lock, so a
+        // wait here can delay cleanup but never a publisher.
         if let (Some(registry), Some(durable)) = (&registry, &self.durable) {
             registry
                 .bind_durable_storage(durable)

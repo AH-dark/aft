@@ -1178,16 +1178,18 @@ impl ViewStore {
 }
 
 // Filesystem-only protection/reference changes must invalidate a cleanup read
-// snapshot before it can promote that snapshot to an unlink claim.
+// snapshot before it can promote that snapshot to an unlink claim. The epoch
+// lives in the header's user_version, so bumping it commits a real change
+// (which advances other connections' data_version) without adding a page.
 fn bump_pointer_generation_epoch(connection: &Connection) -> rusqlite::Result<()> {
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS generation_epoch (
-             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-             epoch INTEGER NOT NULL
-         );
-         INSERT INTO generation_epoch(singleton, epoch) VALUES (1, 1)
-         ON CONFLICT(singleton) DO UPDATE SET epoch = epoch + 1;",
-    )
+    let epoch: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    // user_version is a signed 32-bit header field.
+    let next = if epoch >= i64::from(i32::MAX) {
+        1
+    } else {
+        epoch + 1
+    };
+    connection.pragma_update(None, "user_version", next)
 }
 
 fn view_storage_root(view_dir: &Path) -> &Path {
