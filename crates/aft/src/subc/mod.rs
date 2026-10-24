@@ -201,7 +201,7 @@ mod access_grants;
 mod bash;
 mod bind_log;
 #[cfg(test)]
-mod content_v1_tests;
+mod tool_result_tests;
 // The grant tests run real shell commands, which need a POSIX shell.
 #[cfg(all(test, unix))]
 mod bash_grant_tests;

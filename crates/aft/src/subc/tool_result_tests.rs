@@ -8,7 +8,7 @@ use cortexkit_role_tool_provider::result::{validate, ToolResult};
 use std::cell::Cell;
 
 #[test]
-fn content_v1_error_code_is_preserved_or_falls_back() {
+fn tool_result_error_code_is_preserved_or_falls_back() {
     for (response, expected) in [
         (
             Response::error("test", "path_outside_root", "outside"),
@@ -55,7 +55,7 @@ fn project_frame(mut outgoing: wire::WriterFrame) -> Frame {
 }
 
 #[test]
-fn content_v1_error_code_normalization_and_success_omission() {
+fn tool_result_error_code_normalization_and_success_omission() {
     for (raw, expected) in [
         ("HTTP-Error / 403", "http_error_403"),
         ("__Permission__Required__", "permission_required"),
@@ -101,7 +101,7 @@ fn content_v1_error_code_normalization_and_success_omission() {
 }
 
 #[test]
-fn content_v1_serialized_size_is_strictly_below_three_mib() {
+fn tool_result_serialized_size_is_strictly_below_three_mib() {
     let mut result = ToolCallResult {
         text: String::new(),
         response: Response::success("id", json!({})),
@@ -148,7 +148,7 @@ fn scratch_project() -> tempfile::TempDir {
 }
 
 #[test]
-fn content_v1_images_are_ordered_and_kept_in_structured_content() {
+fn tool_result_images_are_ordered_and_kept_in_structured_content() {
     let project = scratch_project();
     let root = project.path();
     let path = root.join("small.png");
@@ -191,7 +191,7 @@ fn content_v1_images_are_ordered_and_kept_in_structured_content() {
 }
 
 #[test]
-fn content_v1_builders_refuse_large_images_and_bound_ast_matches() {
+fn tool_result_builders_refuse_large_images_and_bound_ast_matches() {
     let project = scratch_project();
     let root = project.path();
     let ctx = context(root);
@@ -251,7 +251,7 @@ fn content_v1_builders_refuse_large_images_and_bound_ast_matches() {
 }
 
 #[test]
-fn content_v1_catalog_switch_preserves_schemas_digests_and_pins() {
+fn tool_result_catalog_switch_preserves_schemas_digests_and_pins() {
     for preset in tool_provider::CatalogPreset::ALL {
         let original = tool_provider::tools_for_session(preset, &[], true, true, true);
         let mut enabled = original.clone();
@@ -275,7 +275,7 @@ fn content_v1_catalog_switch_preserves_schemas_digests_and_pins() {
 }
 
 #[tokio::test]
-async fn content_v1_capability_is_selected_per_bind_not_per_call() {
+async fn tool_result_capability_is_selected_per_bind_not_per_call() {
     let project = scratch_project();
     let root = project.path().to_path_buf();
     let module_root = root.clone();
@@ -429,7 +429,7 @@ async fn content_v1_capability_is_selected_per_bind_not_per_call() {
 }
 
 #[test]
-fn content_v1_retained_legacy_replies_use_the_current_route() {
+fn tool_result_retained_legacy_replies_use_the_current_route() {
     for trust in [BindTrust::FirstParty, BindTrust::Untrusted] {
         let result = ToolCallResult {
             text: "outside root".into(),
@@ -534,7 +534,7 @@ fn content_v1_retained_legacy_replies_use_the_current_route() {
 }
 
 #[tokio::test]
-async fn content_v1_ledger_records_before_projection_and_replays_by_route() {
+async fn tool_result_ledger_records_before_projection_and_replays_by_route() {
     use crate::db::call_ledger as ledger;
     let (dir, root) = test_support::test_root("result-projection-ledger");
     let ctx = test_support::test_ctx();
@@ -706,8 +706,8 @@ fn run(
     let format = crate::subc_format::FormatContext::from_tool_call(tool, &args, root);
     let call = ToolCallContext {
         project_root: root.to_path_buf(),
-        session_id: Some("content-v1-audit".into()),
-        request_id: "content-v1-audit".into(),
+        session_id: Some("tool-result-audit".into()),
+        request_id: "tool-result-audit".into(),
         diagnostics_on_edit: false,
         preview: false,
         edit_slot_survives: None,
@@ -735,7 +735,7 @@ fn finalize(ctx: &AppContext, tool: &str, response: &mut Response, text: &mut St
         response,
         text,
         ctx,
-        "content-v1-audit",
+        "tool-result-audit",
         tool,
         false,
     );
@@ -829,7 +829,7 @@ fn native_response(mut flat: Value) -> Response {
 }
 
 #[test]
-fn content_v1_real_reply_validation_report() {
+fn tool_result_real_reply_validation_report() {
     REPLIES.set(0);
     CODES.with_borrow_mut(|codes| codes.clear());
     let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/scratch");
@@ -982,7 +982,7 @@ fn live_cases(ctx: Arc<AppContext>, root: &Path, scratch: &Path) {
         let owner = Arc::new(());
         let _ask =
             crate::access_policy::ask_route_guard(Some(crate::access_policy::AskRoute::Plugin {
-                scope: crate::access_policy::plugin::Scope::new(&owner, "content-v1-audit"),
+                scope: crate::access_policy::plugin::Scope::new(&owner, "tool-result-audit"),
                 once: Vec::new(),
             }));
         run(&ctx, root, "read", json!({"path": outside}), &dispatch)
