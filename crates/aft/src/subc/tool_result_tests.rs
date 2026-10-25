@@ -7,6 +7,20 @@ use crate::run_tool_call::{
 use cortexkit_role_tool_provider::result::{validate, ToolResult};
 use std::cell::Cell;
 
+/// Removing fixture actors releases the process-wide root-cache read markers.
+/// Executor shutdown alone only joins threads; it does not unregister actors.
+struct FixtureActors(Arc<Executor>);
+
+impl Drop for FixtureActors {
+    fn drop(&mut self) {
+        for (root, ctx) in self.0.actor_entries() {
+            ctx.bash_background().shutdown();
+            ctx.clear_db();
+            self.0.remove_actor(&root);
+        }
+    }
+}
+
 #[test]
 fn tool_result_error_code_is_preserved_or_falls_back() {
     for (response, expected) in [
@@ -320,6 +334,9 @@ async fn tool_result_capability_is_selected_per_bind_not_per_call() {
     let project = scratch_project();
     let root = project.path().to_path_buf();
     let module_root = root.clone();
+    let executor = Arc::new(Executor::new());
+    let _actors = FixtureActors(executor.clone());
+    let loop_executor = executor.clone();
     let (mut daemon, module) = tokio::io::duplex(64 * 1024);
     let module_thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -332,7 +349,7 @@ async fn tool_result_capability_is_selected_per_bind_not_per_call() {
             write,
             &module_root.join("absent-connection.json"),
             App::default_shared(),
-            Arc::new(Executor::new()),
+            loop_executor,
             |request, _| {
                 if request.command == "configure" {
                     return Response::success(request.id, json!({}));
@@ -582,6 +599,7 @@ async fn tool_result_ledger_records_before_projection_and_replays_by_route() {
     let path = dir.path().join("aft.db");
     ctx.set_db(Arc::new(StdMutex::new(crate::db::open(&path).unwrap())));
     let executor = Arc::new(Executor::new());
+    let _actors = FixtureActors(executor.clone());
     executor.register_actor(root.clone(), ctx);
     let identity = |enabled| {
         let mut identity = test_support::route_identity(&root, "result-projection");
@@ -686,6 +704,7 @@ async fn tool_result_ledger_records_before_projection_and_replays_by_route() {
         stored.body, legacy,
         "the ledger must retain pre-projection legacy bytes"
     );
+    drop(conn);
     for (enabled, corr) in [(false, 8), (true, 9)] {
         assert!(edge
             .defer(
@@ -726,6 +745,7 @@ async fn assert_keyed_projection_replay_is_exact(result: ToolCallResult, trust: 
     let path = dir.path().join("aft.db");
     ctx.set_db(Arc::new(StdMutex::new(crate::db::open(&path).unwrap())));
     let executor = Arc::new(Executor::new());
+    let _actors = FixtureActors(executor.clone());
     executor.register_actor(root.clone(), ctx.clone());
     let identity = |enabled| {
         let mut identity = test_support::route_identity(&root, "exact-projection");
@@ -859,6 +879,7 @@ async fn assert_keyed_projection_replay_is_exact(result: ToolCallResult, trust: 
     )
     .unwrap();
     assert_eq!(rendered.bytes, first.body);
+    drop(conn);
     // A new ledger edge and database connection rule out an in-memory replay cache.
     let (restarted, _ready) = tool_provider::LedgerEdge::new();
     ctx.set_db(Arc::new(StdMutex::new(crate::db::open(&path).unwrap())));
@@ -1099,6 +1120,136 @@ fn tool_result_retention_is_bounded_trust_independent_and_keeps_legacy_view() {
     assert_eq!(
         replay.body, expected.body,
         "each receiving view still applies the same serialized reply cap"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn fixture_descriptor_targets() -> std::collections::BTreeMap<String, usize> {
+    let mut targets = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir("/proc/self/fd").expect("read process descriptors") {
+        let entry = entry.unwrap();
+        if let Ok(target) = std::fs::read_link(entry.path()) {
+            let target = target.to_string_lossy().into_owned();
+            // The directory iterator itself contributes one transient descriptor.
+            if target == format!("/proc/{}/fd", std::process::id()) {
+                continue;
+            }
+            *targets.entry(target).or_default() += 1;
+        }
+    }
+    targets
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tool_result_fixtures_release_descriptors() {
+    const CHILD: &str = "AFT_TOOL_RESULT_FD_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // A fresh process excludes unrelated parallel tests from the descriptor
+        // census, while still exercising the real fixture setup and teardown.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "subc::tool_result_tests::tool_result_fixtures_release_descriptors",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated fixture descriptor census");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stdout.lines().filter(|line| line.starts_with("FD_CENSUS")) {
+            println!("{line}");
+        }
+        assert!(
+            output.status.success(),
+            "fixture descriptor census failed:\n{stdout}\n{stderr}"
+        );
+        return;
+    }
+    let cases: &[(&str, fn())] = &[
+        (
+            "error_code",
+            tool_result_error_code_is_preserved_or_falls_back,
+        ),
+        ("wording", tool_result_too_large_instructions_are_complete),
+        (
+            "normalization",
+            tool_result_error_code_normalization_and_success_omission,
+        ),
+        (
+            "size_cap",
+            tool_result_serialized_size_is_strictly_below_three_mib,
+        ),
+        (
+            "image_parts",
+            tool_result_images_are_ordered_and_kept_in_structured_content,
+        ),
+        (
+            "fitted_image_and_ast",
+            tool_result_builders_fit_large_images_and_bound_ast_matches,
+        ),
+        (
+            "catalog",
+            tool_result_catalog_switch_preserves_schemas_digests_and_pins,
+        ),
+        (
+            "route_binding",
+            tool_result_capability_is_selected_per_bind_not_per_call,
+        ),
+        (
+            "legacy_replay",
+            tool_result_retained_legacy_replies_use_the_current_route,
+        ),
+        (
+            "ledger_recording",
+            tool_result_ledger_records_before_projection_and_replays_by_route,
+        ),
+        (
+            "image_replay",
+            tool_result_keyed_image_replay_is_exact_on_untrusted_and_trusted_routes,
+        ),
+        (
+            "error_replay",
+            tool_result_keyed_error_replay_is_exact_on_untrusted_and_trusted_routes,
+        ),
+        (
+            "retained_source",
+            tool_result_retention_is_bounded_trust_independent_and_keeps_legacy_view,
+        ),
+        (
+            "real_reply_corpus",
+            tool_result_real_reply_validation_report,
+        ),
+    ];
+    let mut leaks = Vec::new();
+    for (name, fixture) in cases {
+        fixture(); // Initialize legitimate process-wide caches before measuring.
+        let initial = fixture_descriptor_targets();
+        let before: usize = initial.values().sum();
+        for round in 0..20 {
+            let prior: usize = fixture_descriptor_targets().values().sum();
+            fixture();
+            let current: usize = fixture_descriptor_targets().values().sum();
+            println!("FD_CENSUS {name} round={round} before={prior} after={current}");
+        }
+        let final_targets = fixture_descriptor_targets();
+        let after: usize = final_targets.values().sum();
+        let retained: Vec<_> = final_targets
+            .iter()
+            .filter_map(|(target, count)| {
+                let extra = count.saturating_sub(*initial.get(target).unwrap_or(&0));
+                (extra > 0).then(|| format!("{extra} x {target}"))
+            })
+            .collect();
+        println!("FD_CENSUS SUMMARY {name} before={before} after={after} retained={retained:?}");
+        if after > before {
+            leaks.push(format!("{name}: {before} -> {after}; {retained:?}"));
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "fixtures retained descriptors after twenty runs: {leaks:#?}"
     );
 }
 
