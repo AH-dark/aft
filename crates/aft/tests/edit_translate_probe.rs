@@ -163,13 +163,15 @@ fn translate(tool: &str, args: &Value, project_root: &Path, app_ctx: &AppContext
             != aft::commands::edit_match::EditTargetKind::Literal
     };
     let typed = args.as_object().expect("probe arguments are an object");
-    black_box(subc_translate_owned_with_edit_target_probe(
+    if let Err(error) = subc_translate_owned_with_edit_target_probe(
         tool,
         Value::Object(typed.clone()),
         project_root,
         TranslateContext::default(),
         &probe,
-    ));
+    ) {
+        panic!("probe arguments must translate: {:?}", error.message);
+    }
 }
 
 fn pair(mut samples: Vec<Duration>) -> (f64, f64) {
