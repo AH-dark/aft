@@ -22386,28 +22386,32 @@ mod tests {
 mod terminal_lifecycle_tests {
     use super::*;
 
-    #[test]
-    fn missing_deferred_actor_resolves_and_cancels_pending_work() {
-        let (_dir, root) = test_support::test_root("missing-deferred-actor");
+    fn register_pending_call(
+        registry: &mut PendingSubcResponses,
+        active: &ActiveToolCalls,
+        root: &ProjectRootId,
+        route: RouteChannel,
+        corr: u64,
+        tool: &str,
+    ) -> JobCancellation {
         let cancellation = JobCancellation::new();
         let pending = PendingResponse::polling(
-            "missing-actor".into(),
+            format!("pending-{corr}"),
             "session".into(),
-            "inspect".into(),
-            Box::new(|_| panic!("a removed actor cannot be polled")),
+            tool.into(),
+            Box::new(|_| panic!("removed or drained work cannot be polled")),
         )
         .with_cancellation(cancellation.clone());
-        let mut registry = PendingSubcResponses::default();
         registry.register(PendingSubcResponse {
             io_budget: None,
             ledger_key: None,
-            route: route_key(42, 1),
-            corr: 3,
+            route,
+            corr,
             flags: control_flags(),
             ver: PROTOCOL_VERSION,
-            root,
+            root: root.clone(),
             session_id: "session".into(),
-            bare_name: "inspect".into(),
+            bare_name: tool.into(),
             format_context: crate::subc_format::FormatContext::default(),
             bind_trust: BindTrust::FirstParty,
             pending,
@@ -22415,11 +22419,202 @@ mod terminal_lifecycle_tests {
             phase_trace: PhaseTrace::new(Instant::now()),
             held_since: Instant::now(),
         });
-        let resolved = registry.poll_ready(&Executor::new());
-        assert_eq!(resolved.len(), 1);
-        assert!(registry.is_empty());
-        assert!(cancellation.cancel_already_requested());
-        assert_eq!(resolved[0].response.data["code"], "actor_not_registered");
+        active.lock().unwrap().insert(
+            (route, corr),
+            ActiveToolCall {
+                root_id: root.clone(),
+                cancellation: cancellation.clone(),
+                detach_policy: RouteDetachPolicy::CancelOnDetach,
+                tool: tool.into(),
+                started_at: Instant::now(),
+                request: test_support::test_request_meta(),
+                answering: false,
+            },
+        );
+        cancellation
+    }
+
+    async fn assert_terminals_before_goodbye(
+        tx: &WriterSender,
+        rx: &mut mpsc::Receiver<wire::WriterFrame>,
+        route: RouteChannel,
+        expected: &[(u64, &str)],
+    ) {
+        // Teardown does not send Goodbye itself. Queue a later close on the
+        // same writer to prove the terminals were already queued, not spawned.
+        send_frame(
+            tx,
+            &DispatchPathMetrics::new(),
+            build_goodbye_frame(PROTOCOL_VERSION, route.channel, route.epoch, 0).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut frames = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            frames.push(frame);
+        }
+        assert_eq!(frames.last().unwrap().header.ty, FrameType::Goodbye);
+        assert_eq!(frames.len(), expected.len() + 1, "one terminal per corr");
+        for &(corr, code) in expected {
+            let terminals: Vec<_> = frames
+                .iter()
+                .filter(|frame| {
+                    frame.header.channel == route.channel
+                        && frame.header.epoch == route.epoch
+                        && frame.header.corr == corr
+                        && matches!(
+                            frame.header.ty,
+                            FrameType::Response | FrameType::Error | FrameType::StreamEnd
+                        )
+                })
+                .collect();
+            assert_eq!(
+                terminals.len(),
+                1,
+                "exactly one terminal for {route} corr {corr}"
+            );
+            let body: Value = serde_json::from_slice(&terminals[0].body).unwrap();
+            assert_eq!(body["structuredContent"]["code"], code);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_deferred_actor_resolves_and_cancels_pending_work() {
+        let (_dir, root) = test_support::test_root("missing-deferred-actor");
+        let executor = Executor::new();
+        let route = route_key(42, 1);
+        let routes = HashMap::from([(route, test_support::route_identity(&root, "session"))]);
+        for transport_gone in [false, true] {
+            let mut registry = PendingSubcResponses::default();
+            let active = ActiveToolCalls::default();
+            let cancellation =
+                register_pending_call(&mut registry, &active, &root, route, 3, "inspect");
+            let resolved = registry.poll_ready(&executor);
+            assert_eq!(resolved.len(), 1);
+            assert!(registry.is_empty());
+            assert!(cancellation.cancel_already_requested());
+            assert_eq!(resolved[0].response.data["code"], "actor_not_registered");
+            let (tx, mut rx) = mpsc::channel(8);
+            if transport_gone {
+                rx.close();
+            }
+            let result = deliver_resolved_subc_response(
+                &tx,
+                resolved.into_iter().next().unwrap(),
+                &routes,
+                &mut HashMap::new(),
+                &executor,
+                &active,
+                &Arc::new(Notify::new()),
+                &DispatchPathMetrics::new(),
+                MAX_FRAME_BODY_LEN as usize,
+            )
+            .await;
+            assert!(active.lock().unwrap().is_empty());
+            assert!(registry.poll_ready(&executor).is_empty());
+            if transport_gone {
+                // A closed writer cannot carry a terminal; delivery must report
+                // that transport failure instead of silently claiming success.
+                assert!(matches!(result, Err(SubcError::WriterClosed)));
+                assert!(rx.try_recv().is_err());
+            } else {
+                result.unwrap();
+                assert_terminals_before_goodbye(
+                    &tx,
+                    &mut rx,
+                    route,
+                    &[(3, "actor_not_registered")],
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_drain_without_shutdown_callback_sends_one_terminal_per_corr() {
+        for shutdown in [false, true] {
+            for actor_gone in [false, true] {
+                let (_dir, root) = test_support::test_root("deferred-drain-terminal");
+                let executor = Arc::new(Executor::new());
+                if !actor_gone {
+                    executor.register_actor(root.clone(), test_support::test_ctx());
+                }
+                let route = route_key(42, 1);
+                let mut routes =
+                    HashMap::from([(route, test_support::route_identity(&root, "session"))]);
+                let active = ActiveToolCalls::default();
+                let mut registry = PendingSubcResponses::default();
+                let cancellations: Vec<_> = [(3, "lsp_hover"), (4, "bash_watch")]
+                    .into_iter()
+                    .map(|(corr, tool)| {
+                        register_pending_call(&mut registry, &active, &root, route, corr, tool)
+                    })
+                    .collect();
+                let (tx, mut rx) = mpsc::channel(8);
+                let metrics = DispatchPathMetrics::new();
+                let shutdown_signal = Arc::new(Notify::new());
+                if shutdown {
+                    for resolved in registry.drain_on_shutdown(&executor) {
+                        deliver_resolved_subc_response(
+                            &tx,
+                            resolved,
+                            &routes,
+                            &mut HashMap::new(),
+                            &executor,
+                            &active,
+                            &shutdown_signal,
+                            &metrics,
+                            MAX_FRAME_BODY_LEN as usize,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                } else {
+                    teardown_installed_route(
+                        &tx,
+                        &metrics,
+                        &executor,
+                        route,
+                        "higher-epoch RouteBind",
+                        Some(&root),
+                        &mut HashMap::from([(route.channel, route.epoch)]),
+                        &mut routes,
+                        &mut HashMap::new(),
+                        &mut HashMap::from([(root.clone(), HashSet::from([route]))]),
+                        &mut HashMap::new(),
+                        &mut HashMap::new(),
+                        &mut HashMap::new(),
+                        &mut HashMap::new(),
+                        &mut HashMap::new(),
+                        &mut HashMap::new(),
+                        &active,
+                        &mut registry,
+                        &mut HashMap::new(),
+                        &mut RetryBuffer::new(),
+                        &mut HashMap::new(),
+                        &shutdown_signal,
+                        MAX_FRAME_BODY_LEN as usize,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(routes.is_empty());
+                }
+                assert!(registry.is_empty());
+                assert!(cancellations
+                    .iter()
+                    .all(JobCancellation::cancel_already_requested));
+                assert!(registry.drain_on_shutdown(&executor).is_empty());
+                assert_terminals_before_goodbye(
+                    &tx,
+                    &mut rx,
+                    route,
+                    &[(3, "request_cancelled"), (4, "request_cancelled")],
+                )
+                .await;
+                assert!(active.lock().unwrap().is_empty());
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
