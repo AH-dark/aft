@@ -3924,6 +3924,14 @@ pub fn write_kill_marker_if_absent(paths: &TaskPaths) -> io::Result<()> {
 }
 
 pub fn read_exit_marker(paths: &TaskPaths) -> io::Result<Option<ExitMarker>> {
+    read_exit_marker_with_reason(paths, super::watchdog::MarkerReadReason::Unprobed)
+}
+
+pub(super) fn read_exit_marker_with_reason(
+    paths: &TaskPaths,
+    reason: super::watchdog::MarkerReadReason,
+) -> io::Result<Option<ExitMarker>> {
+    super::watchdog::record_marker_read(reason);
     let mut file = match open_task_artifact(paths, TaskArtifact::Exit) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -3957,6 +3965,7 @@ pub fn read_exit_marker(paths: &TaskPaths) -> io::Result<Option<ExitMarker>> {
 pub(crate) struct ExitMarkerProbe {
     /// Identity of the marker file when a full read last found it empty.
     empty: Option<EmptyMarkerIdentity>,
+    polled: bool,
 }
 
 /// Identity of an empty, regular marker file. Only empty files are recorded:
@@ -4008,10 +4017,15 @@ pub(crate) fn poll_exit_marker(
     paths: &TaskPaths,
     probe: &mut ExitMarkerProbe,
 ) -> io::Result<Option<ExitMarker>> {
+    let first_poll = !std::mem::replace(&mut probe.polled, true);
     #[cfg(test)]
     work_counts::record_stat();
+    let mut nonempty = false;
     let identity = match fs::symlink_metadata(&paths.exit) {
-        Ok(metadata) => EmptyMarkerIdentity::of(&metadata),
+        Ok(metadata) => {
+            nonempty = metadata.is_file() && metadata.len() > 0;
+            EmptyMarkerIdentity::of(&metadata)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             probe.empty = None;
             return Ok(None);
@@ -4022,7 +4036,14 @@ pub(crate) fn poll_exit_marker(
         return Ok(None);
     }
     probe.empty = None;
-    let marker = read_exit_marker(paths)?;
+    let reason = if first_poll {
+        super::watchdog::MarkerReadReason::FirstPoll
+    } else if nonempty {
+        super::watchdog::MarkerReadReason::NonemptyMarker
+    } else {
+        super::watchdog::MarkerReadReason::ChangedProbe
+    };
+    let marker = read_exit_marker_with_reason(paths, reason)?;
     if marker.is_none() {
         // `identity` was sampled before the read. If bytes landed after the
         // sample, the size no longer matches it and the next poll reads again.

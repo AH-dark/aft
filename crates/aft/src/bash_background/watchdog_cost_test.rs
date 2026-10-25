@@ -951,6 +951,78 @@ fn watchdog_cost_failed_cleanup_deletion_is_retried() {
     assert!(!paths.dir.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn watchdog_cost_terminal_scratch_retry_does_not_reread_exit_marker() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (mut metadata, paths) = fixture(storage.path(), "session", false, 0);
+    let scratch = storage.path().join("scratch");
+    fs::create_dir(&scratch).unwrap();
+    metadata.mode = BgMode::Pty;
+    // Model a leader that exits while its process group still has descendants.
+    // The test's own group stays alive until cleanup is explicitly unblocked.
+    metadata.mark_running(std::process::id(), unsafe { libc::getpgrp() });
+    metadata.finished_at = None;
+    metadata.duration_ms = None;
+    metadata.sandbox_temp_dir = Some(scratch.clone());
+    write_task_at(
+        &resolve_task_layout(&paths.session_dir, &paths.task_id).unwrap(),
+        &metadata,
+    )
+    .unwrap();
+    fs::write(&paths.exit, b"0\n").unwrap();
+    registry
+        .insert_rehydrated_task(metadata, paths.clone(), true)
+        .unwrap();
+    let task = registry.task(&paths.task_id).unwrap();
+    let mut awaiting_reader = HashMap::new();
+    let mut pass = || {
+        super::super::watchdog::run_pass(&registry, WatchdogPassCause::Tick, &mut awaiting_reader);
+    };
+    pass();
+    assert!(
+        !task.is_running(),
+        "the written marker must settle the leader"
+    );
+    assert_eq!(
+        registry.running_tasks().len(),
+        1,
+        "scratch still needs cleanup"
+    );
+
+    work_counts::reset();
+    for _ in 0..20 {
+        pass();
+    }
+    let counts = work_counts::get();
+    assert_eq!(
+        counts.marker_reads, 0,
+        "a terminal cleanup retry re-read the marker"
+    );
+    assert_eq!(
+        counts.metadata_reads, 0,
+        "a terminal cleanup retry resolved the layout"
+    );
+    assert_eq!(counts.opens, 0);
+    assert!(scratch.exists());
+    assert_eq!(registry.drain_completions().len(), 1);
+
+    // Once the process group is gone, the same watchdog candidate must still
+    // settle scratch retention and retire, without observing the exit again.
+    {
+        let mut state = task.lock_state().unwrap();
+        state.metadata.child_pid = None;
+        state.metadata.pgid = None;
+    }
+    pass();
+    assert!(registry.running_tasks().is_empty());
+    assert!(
+        scratch.exists(),
+        "scratch must remain readable during retention"
+    );
+}
+
 /// Opt-in plain-read census of the live task store; no DB or GC is involved.
 #[cfg(unix)]
 #[test]
@@ -1324,5 +1396,85 @@ fn watchdog_cost_exit_marker_poll_measurement() {
         assert!(tasks.iter().all(|task| task.is_running()));
         eprintln!("{count} running tasks, before: {before}");
         eprintln!("{count} running tasks, after:  {after}");
+    }
+}
+
+/// Measure the current watchdog path, including terminal candidates retained
+/// for a live process group. Trace the BEGIN/END windows with strace to exclude
+/// fixture creation from syscall counts. Run alone with --ignored --nocapture
+/// --test-threads=1; CPU is measured only on the calling thread.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "measurement: prints retained-terminal and running poll-pass cost"]
+fn watchdog_cost_retained_terminal_poll_measurement() {
+    fn cpu_micros() -> u64 {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) },
+            0
+        );
+        let micros = |time: libc::timeval| time.tv_sec as u64 * 1_000_000 + time.tv_usec as u64;
+        micros(usage.ru_utime) + micros(usage.ru_stime)
+    }
+    const PASSES: u64 = 200;
+    for count in [100usize, 500] {
+        for retained in [true, false] {
+            let storage = tempfile::tempdir().unwrap();
+            let registry = BgTaskRegistry::default();
+            for _ in 0..count {
+                let (mut metadata, paths) = fixture(storage.path(), "session", true, 0);
+                metadata.mode = BgMode::Pty;
+                metadata.child_pid = Some(std::process::id());
+                metadata.pgid = Some(unsafe { libc::getpgrp() });
+                if retained {
+                    metadata.sandbox_temp_dir = Some(storage.path().join("scratch"));
+                    fs::write(&paths.exit, b"0\n").unwrap();
+                } else {
+                    metadata.mark_running(std::process::id(), unsafe { libc::getpgrp() });
+                    metadata.finished_at = None;
+                    metadata.duration_ms = None;
+                }
+                write_task_at(
+                    &resolve_task_layout(&paths.session_dir, &paths.task_id).unwrap(),
+                    &metadata,
+                )
+                .unwrap();
+                registry
+                    .insert_rehydrated_task(metadata, paths, true)
+                    .unwrap();
+            }
+            let mut awaiting = HashMap::new();
+            let mut pass = || {
+                super::super::watchdog::run_pass(&registry, WatchdogPassCause::Tick, &mut awaiting)
+            };
+            pass();
+            assert_eq!(registry.running_tasks().len(), count);
+            let kind = if retained {
+                "retained_terminal"
+            } else {
+                "running"
+            };
+            work_counts::reset();
+            eprintln!("WATCHDOG_MEASUREMENT_BEGIN tasks={count} kind={kind} passes={PASSES}");
+            let cpu = cpu_micros();
+            for _ in 0..PASSES {
+                pass();
+            }
+            let cpu = cpu_micros() - cpu;
+            eprintln!("WATCHDOG_MEASUREMENT_END");
+            let counts = work_counts::get();
+            let per = |value: usize| value as f64 / PASSES as f64;
+            eprintln!("tasks={count} kind={kind} cpu_us/pass={:.2} opens/pass={:.0} metadata_reads/pass={:.0} marker_reads/pass={:.0} stats/pass={:.0}",
+                cpu as f64 / PASSES as f64, per(counts.opens), per(counts.metadata_reads),
+                per(counts.marker_reads), per(counts.stats));
+            if !retained {
+                assert_eq!(counts.metadata_reads, 0, "running control resolved layouts");
+                assert_eq!(
+                    counts.marker_reads, 0,
+                    "running control re-read empty markers"
+                );
+                assert_eq!(counts.stats, count * PASSES as usize);
+            }
+        }
     }
 }
