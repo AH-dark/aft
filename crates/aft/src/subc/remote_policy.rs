@@ -56,11 +56,27 @@ fn policy_key(identity: &RouteIdentity, preset: Option<&str>) -> Result<PolicyKe
     })
 }
 
+/// Catalog parameters can persist access settings even when the route has no
+/// saved worker policy. A head's worker-plan preview alone needs no database.
+pub(super) fn catalog_needs_database(body: &Value, identity: &RouteIdentity) -> bool {
+    let preset = body.get("preset").and_then(Value::as_str).unwrap_or("head");
+    key(identity, Some("worker")).is_some()
+        || body
+            .get("params")
+            .and_then(Value::as_object)
+            .is_some_and(|params| {
+                (params.contains_key("mode")
+                    && (preset != "worker" || access_grants::alfonso_worker(identity)))
+                    || (preset == "worker" && params.contains_key("allow_paths"))
+            })
+}
+
 pub(super) fn catalog(
     mut body: Value,
     identity: &RouteIdentity,
     ctx: &AppContext,
 ) -> Result<Value, subc_protocol::ErrorBody> {
+    let needs_database = catalog_needs_database(&body, identity);
     let preset = body
         .get("preset")
         .and_then(Value::as_str)
@@ -140,6 +156,19 @@ pub(super) fn catalog(
     } else {
         None
     };
+    if needs_database {
+        if let Some(refusal) = ctx.database_runtime_refusal("tool.catalog", "tool.catalog") {
+            return Err(subc_protocol::ErrorBody::new(
+                refusal.data["code"]
+                    .as_str()
+                    .unwrap_or("database_unavailable"),
+                refusal.data["message"]
+                    .as_str()
+                    .unwrap_or("catalog persistence unavailable"),
+            )
+            .with_detail(json!({"retryable": refusal.data["retryable"]})));
+        }
+    }
     access_grants::catalog(original.get("allow_paths"), identity, ctx, &preset)?;
     // A head preflighting a worker plan validates its override without changing
     // its own session. The actual worker fetch persists the override on its scope.
