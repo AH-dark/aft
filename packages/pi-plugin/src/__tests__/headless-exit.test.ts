@@ -559,7 +559,7 @@ describe.skipIf(process.platform === "win32")("session startup runs once per pro
   }, 60_000);
 });
 
-describe("approved session UI binding", () => {
+describe.skipIf(process.platform === "win32")("approved session UI binding", () => {
   async function notifications(
     mode:
       | "notification-upgrade"

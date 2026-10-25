@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
@@ -18,10 +18,31 @@ function temporary<T>(fn: (root: string) => T): T {
   }
 }
 
-function binary(root: string, version: string, body: string): void {
+function binary(root: string, version: string, exitCode: number): void {
   const dir = join(root, "cache", "bin", `v${version}`);
   mkdirSync(dir, { recursive: true });
-  linkCachedExecutable(join(dir, getAftBinaryName()), `#!/bin/sh\n${body}\n`);
+  // The resolver spawns aft.exe directly on Windows, so the fixture must be a
+  // real executable. Bun loads the forwarded command's script from our cwd.
+  copyFileSync(process.execPath, join(dir, getAftBinaryName()));
+  writeFileSync(join(dir, "exit-code"), String(exitCode));
+  const scriptDir = join(root, "commands");
+  mkdirSync(scriptDir, { recursive: true });
+  for (const command of commands) {
+    writeFileSync(
+      join(scriptDir, command),
+      `import { readFileSync } from "node:fs";
+       import { dirname, join } from "node:path";
+       if (process.argv[2] !== "fixture-argument") process.exit(9);
+       process.exit(Number(readFileSync(join(dirname(process.execPath), "exit-code"), "utf8")));
+      `,
+    );
+  }
+}
+
+function signalBinary(root: string, version: string): void {
+  const dir = join(root, "cache", "bin", `v${version}`);
+  mkdirSync(dir, { recursive: true });
+  linkCachedExecutable(join(dir, getAftBinaryName()), "#!/bin/sh\nkill -TERM $$\n");
 }
 
 function forwarded(root: string, command: string, versionOverride?: string) {
@@ -29,6 +50,8 @@ function forwarded(root: string, command: string, versionOverride?: string) {
   const versionModule = join(import.meta.dir, "..", "lib", "self-version.ts");
   const empty = join(root, "empty");
   mkdirSync(empty, { recursive: true });
+  const cwd = join(root, "commands");
+  mkdirSync(cwd, { recursive: true });
   const name = `run${command[0]?.toUpperCase()}${command.slice(1)}`;
   return spawnSync(
     process.execPath,
@@ -44,7 +67,14 @@ function forwarded(root: string, command: string, versionOverride?: string) {
     {
       encoding: "utf8",
       timeout: 5000,
-      env: { ...process.env, HOME: root, AFT_CACHE_DIR: join(root, "cache"), PATH: empty },
+      cwd,
+      env: {
+        ...process.env,
+        HOME: root,
+        USERPROFILE: root,
+        AFT_CACHE_DIR: join(root, "cache"),
+        PATH: empty,
+      },
     },
   );
 }
@@ -53,30 +83,33 @@ describe("approved native forwarding", () => {
   for (const command of commands) {
     test(`${command} prefers the CLI version rather than the newest cache`, () => {
       temporary((root) => {
-        binary(root, getSelfVersion(), 'test "$2" = fixture-argument && exit 7\nexit 9');
-        binary(root, "99.0.0", "exit 11");
+        binary(root, getSelfVersion(), 7);
+        binary(root, "99.0.0", 11);
         expect(forwarded(root, command).status).toBe(7);
       });
     });
 
-    test(`${command} preserves native signal termination`, () => {
-      temporary((root) => {
-        binary(root, getSelfVersion(), "kill -TERM $$");
-        expect(forwarded(root, command).status).toBe(143);
-      });
-    });
+    test.skipIf(process.platform === "win32")(
+      `${command} preserves native signal termination (Unix signals are unavailable on Windows)`,
+      () => {
+        temporary((root) => {
+          signalBinary(root, getSelfVersion());
+          expect(forwarded(root, command).status).toBe(143);
+        });
+      },
+    );
 
     test(`${command} preserves newest-cache fallback when CLI version is unknown`, () => {
       temporary((root) => {
-        binary(root, "0.1.0", "exit 7");
-        binary(root, "99.0.0", "exit 11");
+        binary(root, "0.1.0", 7);
+        binary(root, "99.0.0", 11);
         expect(forwarded(root, command, "unknown").status).toBe(11);
       });
     });
 
     test(`${command} does not silently use a mismatched cached version`, () => {
       temporary((root) => {
-        binary(root, "99.0.0", "exit 11");
+        binary(root, "99.0.0", 11);
         const result = forwarded(root, command);
         expect(result.status).toBe(1);
         expect(result.stderr).toContain(`v${getSelfVersion()}`);
