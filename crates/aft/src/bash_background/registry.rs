@@ -11156,9 +11156,15 @@ impl BgTaskRegistry {
                     _ => KillSignalPlan::Nothing,
                 }
             } else if let Ok(Some(marker)) = read_exit_marker(&task.paths) {
+                let memory_kill = terminal_status == BgTaskStatus::Failed
+                    && state.metadata.memory_policy.is_some()
+                    && reason.is_some();
+                // A cap violation is a forced stop, not a natural exit. Polling
+                // for output here would reschedule the same memory kill before
+                // ConPTY can close, leaving the task running indefinitely.
                 #[cfg(any(windows, test))]
                 let needs_pty_drain = matches!(&state.runtime, TaskRuntime::Pty(Some(pty))
-                    if pty.output_drain.is_some() && !pty.was_killed.load(Ordering::SeqCst));
+                    if pty.output_drain.is_some() && !pty.was_killed.load(Ordering::SeqCst) && !memory_kill);
                 #[cfg(not(any(windows, test)))]
                 let needs_pty_drain = false;
                 if needs_pty_drain {
@@ -11171,9 +11177,6 @@ impl BgTaskRegistry {
                         unreachable!()
                     }
                 } else {
-                    let memory_kill = terminal_status == BgTaskStatus::Failed
-                        && state.metadata.memory_policy.is_some()
-                        && reason.is_some();
                     let terminal_reason = if marker == ExitMarker::Killed || memory_kill {
                         reason.clone()
                     } else {
