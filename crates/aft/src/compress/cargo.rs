@@ -90,7 +90,10 @@ fn compress_build_like(output: &str) -> CompressionResult {
 
     while index < lines.len() {
         let line = lines[index];
-        if is_ignored_progress(line) {
+        let noise = line.trim().is_empty()
+            || (is_cargo_status_line(line) && !is_final_cargo_summary(line))
+            || is_test_progress_line(line.trim());
+        if noise {
             index += 1;
             continue;
         }
@@ -103,16 +106,21 @@ fn compress_build_like(output: &str) -> CompressionResult {
             };
             let start = index;
             index += 1;
-            while index < lines.len() && !starts_next_build_message(lines[index]) {
+            // The block owns the diagnostic's own body only. A line that does
+            // not continue it (another tool's verdict in a gate script) is not
+            // the diagnostic's to lose when the block is capped.
+            while index < lines.len()
+                && !starts_next_build_message(lines[index])
+                && (lines[index].trim().is_empty() || is_diagnostic_continuation(lines[index]))
+            {
                 index += 1;
             }
             blocks.push(ClassifiedBlock::new(class, lines[start..index].join("\n")));
             continue;
         }
 
-        if is_final_cargo_summary(line) {
-            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
-        }
+        // Cargo's final summary and any line cargo did not write itself.
+        blocks.push(ClassifiedBlock::unclassified(line.to_string()));
         index += 1;
     }
 
@@ -122,7 +130,7 @@ fn compress_build_like(output: &str) -> CompressionResult {
 }
 
 fn starts_next_build_message(line: &str) -> bool {
-    is_ignored_progress(line)
+    is_cargo_status_line(line)
         || is_warning_or_error(line)
         || line.trim_start().starts_with("error[")
         || is_final_cargo_summary(line)
@@ -771,6 +779,77 @@ error: could not compile `demo` (lib test) due to 1 previous error
             result.text
         );
         assert!(!result.text.contains("test a ... ok"), "{}", result.text);
+    }
+
+    #[test]
+    fn cargo_build_like_summaries_keep_lines_they_do_not_read() {
+        // Eleven warnings: one more than the warning cap, so the last warning
+        // block is dropped. The verdict printed after it is not part of it.
+        let mut output = String::from("fmt-ok\n    Checking demo v0.1.0 (/tmp/demo)\n");
+        for index in 0..11 {
+            output.push_str(&format!(
+                "warning: unused variable: `x{index}`\n --> src/lib.rs:{line}:9\n  |\n{line} |     let x{index} = 1;\n  |         ^^ help: prefix it with an underscore\n  |\n  = note: `#[warn(unused_variables)]` on by default\n\n",
+                line = index + 1
+            ));
+        }
+        output.push_str("win-check rc=101\nwarning: `demo` (lib) generated 11 warnings\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.50s\n");
+
+        for command in ["cargo build", "cargo check", "cargo clippy"] {
+            let result = CargoCompressor.compress_with_exit_code(command, &output, Some(0));
+
+            assert!(
+                result.text.starts_with("fmt-ok\n"),
+                "{command}: {}",
+                result.text
+            );
+            assert!(
+                result.text.contains("\nwin-check rc=101\n"),
+                "{command}: {}",
+                result.text
+            );
+            assert!(
+                !result.text.contains("Checking demo"),
+                "{command}: {}",
+                result.text
+            );
+            assert!(
+                result.text.contains("Finished `dev` profile"),
+                "{command}: {}",
+                result.text
+            );
+            assert_eq!(result.dropped_by_class.get(&DropClass::Warning), Some(&2));
+        }
+    }
+
+    #[test]
+    fn cargo_test_compile_error_summary_keeps_lines_it_does_not_read() {
+        let output = "fmt-ok\n   Compiling demo v0.1.0 (/tmp/demo)\nerror[E0432]: unresolved import `crate::missing`\n --> src/lib.rs:1:5\n  |\n1 | use crate::missing;\n  |     ^^^^^^^^^^^^^^ no `missing` in the root\n\nwin-check rc=101\nerror: could not compile `demo` (lib test) due to 1 previous error\n";
+
+        let result = compress_test(output, Some(101));
+
+        assert!(
+            result.text.starts_with("fmt-ok\nerror[E0432]"),
+            "{}",
+            result.text
+        );
+        assert!(
+            result
+                .text
+                .contains("no `missing` in the root\nwin-check rc=101\nerror: could not compile"),
+            "{}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn cargo_nextest_output_keeps_lines_it_does_not_read() {
+        // `cargo nextest` has no extractor of its own and falls back to
+        // generic dedup, which must not lose a mixed-in verdict either.
+        let output = "fmt-ok\nwin-check rc=101\n    Starting 2 tests across 1 binary\n        PASS [   0.004s] demo tests::a\n        PASS [   0.004s] demo tests::b\n     Summary [   0.010s] 2 tests run: 2 passed, 0 skipped\n";
+
+        let result = CargoCompressor.compress_with_exit_code("cargo nextest run", output, Some(0));
+
+        assert_eq!(result.text, output);
     }
 
     #[test]

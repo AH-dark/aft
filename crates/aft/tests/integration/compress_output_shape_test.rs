@@ -260,8 +260,10 @@ fn cargo_and_go_build_commands_do_not_get_pulled_into_test_output_sniffers() {
     let cargo = compress("cargo build", cargo_output);
     assert!(cargo.contains("warning: unused variable"));
     assert!(cargo.contains("Finished `dev` profile"));
+    // Only the cargo build summary drops cargo's own `Compiling` lines.
     assert!(!cargo.contains("Compiling app"));
-    assert!(!cargo.contains("PASS"));
+    // A line cargo did not write is not the summary's to drop.
+    assert!(cargo.contains("PASS\nwarning: unused variable"));
 
     let go_output = "PASS\nmain.go:10:5: undefined: missingFunc\n";
     let go = compress("go build ./...", go_output);
