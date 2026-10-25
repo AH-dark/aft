@@ -309,18 +309,7 @@ pub(crate) struct CacheLease {
 
 impl CacheLease {
     pub(crate) fn new(view_dir: &Path) -> Self {
-        let mut states = verification_states()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        states.retain(|_, state| state.strong_count() > 0);
-        let state = states
-            .get(view_dir)
-            .and_then(Weak::upgrade)
-            .unwrap_or_else(|| {
-                let state = Arc::new(Mutex::new(VerificationState::default()));
-                states.insert(view_dir.to_path_buf(), Arc::downgrade(&state));
-                state
-            });
+        let state = state_for(view_dir);
         state.lock().unwrap_or_else(|e| e.into_inner()).owners += 1;
         Self {
             view_dir: view_dir.to_path_buf(),
@@ -390,18 +379,9 @@ impl Drop for CacheLease {
             }
         };
         drop(retired);
-        let mut states = verification_states()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.owners == 0
-            && state.active_preparations == 0
-            && states
-                .get(&self.view_dir)
-                .is_some_and(|weak| weak.ptr_eq(&Arc::downgrade(&self.state)))
-        {
-            states.remove(&self.view_dir);
-        }
+        // A lease acquisition may already hold an Arc without having incremented
+        // owners. Leave its registry identity intact; state_for prunes dead Weak
+        // entries after all leases and preparations release their Arcs.
     }
 }
 
@@ -705,11 +685,12 @@ fn full_verification_required(cache: &VerificationState, now: Instant) -> bool {
 }
 
 pub(super) fn full_verification_due(view_dir: &Path) -> bool {
-    let states = match verification_states().try_lock() {
-        Ok(states) => states,
-        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return true,
-    };
+    // The registry protects only map metadata, never per-view locks or I/O.
+    // Wait for that short lookup: another view's registry activity is not
+    // evidence that this view needs a full verification.
+    let states = verification_states()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let Some(state) = states.get(view_dir).and_then(Weak::upgrade) else {
         return true;
     };
@@ -1097,6 +1078,21 @@ mod tests {
         drop(second);
         assert!(!cache_contains_for_test(view.view_dir()));
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn views_in_flight_state_lookup_keeps_lease_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = CacheLease::new(directory.path());
+        // A new lease or preparation can have upgraded the registry's Weak
+        // entry without acquiring the per-view state lock yet.
+        let in_flight = state_for(directory.path());
+        drop(first);
+        let next = CacheLease::new(directory.path());
+        assert!(
+            Arc::ptr_eq(&in_flight, &next.state),
+            "a live state lookup must not split one view's verification identity"
+        );
     }
 
     #[test]
@@ -1521,6 +1517,80 @@ mod tests {
             rebuild_manifest(&request).to_json_bytes().unwrap()
         );
         assert!(!full_verification_due(view.view_dir()));
+    }
+
+    #[test]
+    fn views_other_view_verification_does_not_wake_an_idle_root() {
+        use crate::context::{AppContext, ViewRuntimeSnapshot};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root");
+        let view_dir = directory.path().join("view");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&view_dir).unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.clone());
+        config.views.enabled = true;
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.set_canonical_cache_root(root.clone());
+        ctx.install_view_runtime(
+            ViewRuntimeSnapshot {
+                query_pin: None,
+                storage: directory.path().to_owned(),
+                family: "verification-probe".into(),
+                scope: "verification-probe".into(),
+                view_dir: view_dir.clone(),
+                generation: Some("verified".into()),
+                manifest: None,
+                head_fingerprint: String::new(),
+                head_metadata: crate::alias::GitHeadMetadata {
+                    head_path: root.join(".git/HEAD"),
+                    head_mtime: None,
+                    resolved_ref_path: None,
+                    resolved_ref_mtime: None,
+                },
+                pending_paths: BTreeSet::new(),
+                pending_inputs: BTreeMap::new(),
+            },
+            None,
+        );
+        let own_state = state_for(&view_dir);
+        own_state.lock().unwrap().last_full = Some(Instant::now());
+        crate::runtime_drain::drain_watcher_events(&ctx);
+        assert!(!ctx.watcher_drain_has_work());
+
+        let _other_preparation = begin_preparation(&directory.path().join("other-view"));
+        std::thread::scope(|scope| {
+            let states = verification_states().lock().unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let probe_ctx = &ctx;
+            let probe = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                result_tx.send(probe_ctx.watcher_drain_has_work()).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Keep another view's registry operation in flight until the probe
+            // either answers or waits for the registry. Release it before
+            // asserting so a failed assertion cannot poison the shared map.
+            let early = result_rx.recv_timeout(Duration::from_millis(100));
+            drop(states);
+            let due =
+                early.unwrap_or_else(|_| result_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            probe.join().unwrap();
+            assert!(
+                !due,
+                "another view's registry operation must not enqueue a watcher drain for an idle root"
+            );
+        });
+
+        let _held_own_state = own_state.lock().unwrap();
+        assert!(
+            ctx.watcher_drain_has_work(),
+            "contention on this view's verification state must still count as pending work"
+        );
     }
 
     #[test]
