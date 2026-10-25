@@ -1,0 +1,1 @@
+- bash_kill no longer reports a command as failed when the command's exit arrives while the kill is being sent; once AFT commits to the kill, the task reads as killed.
