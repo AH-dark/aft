@@ -15,6 +15,39 @@ use crate::search_index::ExactEvidenceScope;
 
 const MAX_EXACT_MEMO_ENTRIES: usize = 128;
 const MAX_RETIRED_POISONED_KEYS: usize = 128;
+const MAX_LITERAL_PRESENCE_ENTRIES: usize = 128;
+
+/// Whether some file holds a code literal's whole text, as one search settled
+/// it. `Undetermined` means the check could not finish (its read bound ran
+/// out, or a file could not be read); it never means absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiteralPresence {
+    Present,
+    Absent,
+    Undetermined,
+}
+
+/// Size and modification time of a file when it was read, used to tell
+/// whether it changed since.
+pub type FileStamp = Option<(u64, Option<std::time::SystemTime>)>;
+
+/// One settled presence answer and what it rests on, so a later page of the
+/// same query can tell whether it still holds without reading any file.
+#[derive(Clone, Debug)]
+pub struct LiteralPresenceEntry {
+    pub presence: LiteralPresence,
+    /// The files whose text decided the answer, as they were when read: the
+    /// holder for `Present`, every file read for `Absent`.
+    pub read: Vec<(PathBuf, FileStamp)>,
+    /// For `Absent`: every file the index said might hold the literal. A
+    /// file that gains the literal joins this set, so a different set means
+    /// the answer must be settled again.
+    pub candidates: Vec<PathBuf>,
+}
+
+/// Key of a presence answer: the root searched, the index generation it was
+/// settled on, and the literal as the exact lane compares phrases.
+pub type LiteralPresenceKey = (PathBuf, GenerationToken, String);
 
 /// Normalize query for memo key comparison.
 pub fn normalize_query(query: &str) -> String {
@@ -192,6 +225,9 @@ pub struct ExactMemoStore {
     in_flight_changed: Condvar,
     next_epoch: AtomicUsize,
     pub verifier_counter: Arc<AtomicUsize>,
+    /// Presence answers for code literals, kept so every page of one query
+    /// reuses the first page's answer instead of reading files again.
+    literal_presence: Mutex<HashMap<LiteralPresenceKey, LiteralPresenceEntry>>,
 }
 
 struct VerificationPermit<'a> {
@@ -224,7 +260,23 @@ impl ExactMemoStore {
             in_flight_changed: Condvar::new(),
             next_epoch: AtomicUsize::new(0),
             verifier_counter: Arc::new(AtomicUsize::new(0)),
+            literal_presence: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The presence answer an earlier page of this query settled, if any.
+    pub fn literal_presence(&self, key: &LiteralPresenceKey) -> Option<LiteralPresenceEntry> {
+        self.literal_presence.lock().get(key).cloned()
+    }
+
+    /// Keep a presence answer for later pages. The cache is small: when it
+    /// is full it starts over, which only costs a later page one re-check.
+    pub fn store_literal_presence(&self, key: LiteralPresenceKey, entry: LiteralPresenceEntry) {
+        let mut cache = self.literal_presence.lock();
+        if cache.len() >= MAX_LITERAL_PRESENCE_ENTRIES && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, entry);
     }
 
     /// Number of verifier calls executed across all keys.
@@ -560,6 +612,7 @@ impl ExactMemoStore {
         let _admission = self.in_flight.lock();
         self.entries.write().clear();
         self.lifecycle.write().clear();
+        self.literal_presence.lock().clear();
     }
 }
 

@@ -98,7 +98,7 @@ pub fn register_lane(registry: &mut LaneRegistry, lane: Arc<dyn SearchLane>) {
 }
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -4154,6 +4154,207 @@ fn snippet_set_by_engine(result: &HybridResult) -> bool {
         || result.source == NEAREST_NAME_SOURCE
 }
 
+/// Most files the presence check reads for one query before it gives up.
+const LITERAL_PRESENCE_MAX_READS: usize = 256;
+
+/// How long the presence check may read files for one query before it
+/// gives up.
+const LITERAL_PRESENCE_BUDGET: Duration = Duration::from_millis(250);
+
+#[cfg(test)]
+thread_local! {
+    /// Files the presence check read on this thread.
+    static LITERAL_PRESENCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Times the presence check went past the exact candidates to the
+    /// corpus on this thread.
+    static LITERAL_PRESENCE_CORPUS_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Replaces `LITERAL_PRESENCE_MAX_READS` on this thread.
+    static LITERAL_PRESENCE_MAX_READS_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The presence check's counters on this thread, as (files read, corpus
+/// scans), reset to zero.
+#[cfg(test)]
+fn take_literal_presence_counts() -> (usize, usize) {
+    (
+        LITERAL_PRESENCE_READS.with(|count| count.replace(0)),
+        LITERAL_PRESENCE_CORPUS_SCANS.with(|count| count.replace(0)),
+    )
+}
+
+fn literal_presence_max_reads() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = LITERAL_PRESENCE_MAX_READS_OVERRIDE.with(std::cell::Cell::get) {
+        return limit;
+    }
+    LITERAL_PRESENCE_MAX_READS
+}
+
+fn file_stamp(path: &Path) -> memo::FileStamp {
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.len(), metadata.modified().ok()))
+}
+
+/// Whether some file holds the whole of `phrase`, for the missing-literal
+/// notice; only `Absent` lets the reply say no file contains it.
+///
+/// The answer is settled once per query (root, index generation, literal)
+/// and kept in the exact memo, so later pages of the same query reuse it:
+/// they only check, from file metadata and the index's postings, that the
+/// files it rests on are unchanged and that no new file may hold the
+/// literal.
+fn literal_presence(
+    ctx: &AppContext,
+    snapshot: &crate::search_index::SearchIndexSnapshot,
+    project_root: &Path,
+    generation: &GenerationToken,
+    phrase: &str,
+    exact_candidates: &[CandidateResult],
+) -> memo::LiteralPresence {
+    let normalized = exact_lane::normalize_exact_phrase(phrase);
+    let key = (
+        project_root.to_path_buf(),
+        generation.clone(),
+        normalized.clone(),
+    );
+    let store = ctx.search_exact_memo();
+    if let Some(entry) = store.literal_presence(&key) {
+        if literal_presence_still_holds(&entry, snapshot, phrase, project_root) {
+            return entry.presence;
+        }
+    }
+    let entry = settle_literal_presence(
+        snapshot,
+        project_root,
+        phrase,
+        &normalized,
+        exact_candidates,
+    );
+    let presence = entry.presence;
+    store.store_literal_presence(key, entry);
+    presence
+}
+
+/// Whether a kept answer still describes the files: the files it read are
+/// the same size and age, and for an absence the index offers the same
+/// possible holders (a file that gained the literal would join them).
+fn literal_presence_still_holds(
+    entry: &memo::LiteralPresenceEntry,
+    snapshot: &crate::search_index::SearchIndexSnapshot,
+    phrase: &str,
+    project_root: &Path,
+) -> bool {
+    let unchanged = entry
+        .read
+        .iter()
+        .all(|(path, stamp)| stamp.is_some() && file_stamp(path) == *stamp);
+    match entry.presence {
+        // Making no claim is always safe, and repeating the same bounded
+        // check on every page would cost each page what the first one did.
+        memo::LiteralPresence::Undetermined => true,
+        memo::LiteralPresence::Present => unchanged,
+        memo::LiteralPresence::Absent => {
+            unchanged
+                && snapshot
+                    .files_possibly_holding_phrase(phrase, project_root)
+                    .as_ref()
+                    == Some(&entry.candidates)
+        }
+    }
+}
+
+/// Files read by one presence check, within its bounds.
+struct PresenceReads {
+    normalized: String,
+    deadline: Instant,
+    max_reads: usize,
+    read: Vec<(PathBuf, memo::FileStamp)>,
+    seen: HashSet<PathBuf>,
+}
+
+impl PresenceReads {
+    /// `Some(true)` when `path` holds the literal, `Some(false)` when it does
+    /// not (or was already read), `None` when the check cannot tell: its
+    /// bounds ran out or the file could not be read.
+    fn holds(&mut self, path: &Path) -> Option<bool> {
+        if !self.seen.insert(path.to_path_buf()) {
+            return Some(false);
+        }
+        if self.read.len() >= self.max_reads || Instant::now() >= self.deadline {
+            return None;
+        }
+        #[cfg(test)]
+        LITERAL_PRESENCE_READS.with(|count| count.set(count.get() + 1));
+        let stamp = file_stamp(path);
+        let text = crate::search_index::read_searchable_text(path)?;
+        self.read.push((path.to_path_buf(), stamp));
+        Some(exact_lane::normalize_exact_phrase(&text).contains(&self.normalized))
+    }
+
+    fn entry(
+        self,
+        presence: memo::LiteralPresence,
+        candidates: Vec<PathBuf>,
+    ) -> memo::LiteralPresenceEntry {
+        let read = match presence {
+            // A presence rests on its holder alone, the last file read.
+            memo::LiteralPresence::Present => self.read.into_iter().last().into_iter().collect(),
+            memo::LiteralPresence::Absent => self.read,
+            memo::LiteralPresence::Undetermined => Vec::new(),
+        };
+        memo::LiteralPresenceEntry {
+            presence,
+            read,
+            candidates,
+        }
+    }
+}
+
+/// Settle whether some file holds the literal, reading as little as
+/// possible: the exact candidates first, in rank order, stopping at the first
+/// that holds it (the common case reads one file); only when none does, the
+/// other files the index says may hold it, again stopping at the first
+/// holder. Running out of reads or time, or meeting an unreadable file,
+/// settles nothing: that is never an absence.
+fn settle_literal_presence(
+    snapshot: &crate::search_index::SearchIndexSnapshot,
+    project_root: &Path,
+    phrase: &str,
+    normalized: &str,
+    exact_candidates: &[CandidateResult],
+) -> memo::LiteralPresenceEntry {
+    use memo::LiteralPresence::{Absent, Present, Undetermined};
+    let mut reads = PresenceReads {
+        normalized: normalized.to_string(),
+        deadline: Instant::now() + LITERAL_PRESENCE_BUDGET,
+        max_reads: literal_presence_max_reads(),
+        read: Vec::new(),
+        seen: HashSet::new(),
+    };
+    for candidate in exact_candidates {
+        match reads.holds(&candidate.path) {
+            Some(true) => return reads.entry(Present, Vec::new()),
+            Some(false) => {}
+            None => return reads.entry(Undetermined, Vec::new()),
+        }
+    }
+    #[cfg(test)]
+    LITERAL_PRESENCE_CORPUS_SCANS.with(|count| count.set(count.get() + 1));
+    let Some(candidates) = snapshot.files_possibly_holding_phrase(phrase, project_root) else {
+        return reads.entry(Undetermined, Vec::new());
+    };
+    for path in &candidates {
+        match reads.holds(path) {
+            Some(true) => return reads.entry(Present, Vec::new()),
+            Some(false) => {}
+            None => return reads.entry(Undetermined, Vec::new()),
+        }
+    }
+    reads.entry(Absent, candidates)
+}
+
 /// What a request carrying both `query` and `pattern` adds to an engine run.
 struct SplitEngineInput<'a> {
     patterns: &'a split_query::PatternList,
@@ -4804,7 +5005,7 @@ fn run_engine_ranking(
     // for `bash_wait_detach(`) is exact evidence too. A file counts only when
     // its text holds the whole literal, punctuation included, compared the way
     // the exact lane compares phrases (case and runs of whitespace ignored).
-    // A file that cannot be read is assumed to hold it, so no claim is made.
+    // Only a settled absence makes the claim; see `literal_presence`.
     let literal_absent = (not_found.is_none()
         && plan.shape == SearchShape::CodeLiteral
         && exact_disclosures.is_empty()
@@ -4812,21 +5013,14 @@ fn run_engine_ranking(
     .then(|| exact_lane::exact_phrase(exact_input))
     .filter(|phrase| phrase.len() >= 3)
     .filter(|phrase| {
-        let normalized = exact_lane::normalize_exact_phrase(phrase);
-        let possible_holders = exact_candidates
-            .iter()
-            .map(|candidate| candidate.path.clone())
-            .chain(
-                snapshot
-                    .whole_corpus_exact_pass(exact_input, project_root, None)
-                    .into_iter()
-                    .map(|found| found.path),
-            )
-            .collect::<BTreeSet<_>>();
-        !possible_holders.iter().any(|path| {
-            crate::search_index::read_searchable_text(path)
-                .is_none_or(|text| exact_lane::normalize_exact_phrase(&text).contains(&normalized))
-        })
+        literal_presence(
+            ctx,
+            &snapshot,
+            project_root,
+            &generation,
+            phrase,
+            &exact_candidates,
+        ) == memo::LiteralPresence::Absent
     })
     .map(str::to_string);
 
@@ -9143,6 +9337,123 @@ mod tests {
                 ..Config::default()
             },
         )
+    }
+
+    /// A project holding `files`, with a ready trigram index, semantic
+    /// search off and the presence-check counters reset.
+    fn presence_project(files: &[(&str, &str)]) -> (tempfile::TempDir, AppContext) {
+        let project = tempfile::tempdir().expect("project");
+        let root = fs::canonicalize(project.path()).expect("canonical root");
+        for (relative, text) in files {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+            fs::write(path, text).expect("write fixture");
+        }
+        let ctx = test_context(&root);
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Disabled;
+        *ctx.search_index().write().unwrap() = Some(SearchIndex::build(&root));
+        take_literal_presence_counts();
+        (project, ctx)
+    }
+
+    fn presence_search(ctx: &AppContext, query: &str, top_k: usize, offset: usize) -> String {
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "literal-presence-test",
+            "command": "semantic_search",
+            "query": query,
+            "top_k": top_k,
+            "offset": offset,
+        }))
+        .expect("request");
+        let response = response_value(handle_semantic_search(&request, ctx));
+        assert_eq!(response["success"], true, "{response}");
+        response["text"].as_str().expect("text").to_string()
+    }
+
+    const BASH_WAIT_DETACH_ABSENT: &str = "No file contains `bash_wait_detach(`.";
+
+    /// The common case: the first exact candidate holds the literal. One file
+    /// is read and the corpus is never scanned.
+    #[test]
+    fn literal_held_by_the_first_exact_candidate_reads_one_file_and_no_corpus() {
+        let (_project, ctx) = presence_project(&[(
+            "src/run.rs",
+            "pub fn bash_wait_detach(task: u32) {\n    drop(task);\n}\n",
+        )]);
+        let text = presence_search(&ctx, "bash_wait_detach(", 10, 0);
+        assert!(!text.contains("No file contains"), "{text}");
+        assert_eq!(
+            take_literal_presence_counts(),
+            (1, 0),
+            "(files read, corpus scans): {text}"
+        );
+    }
+
+    /// The literal is held only by a test file, which the request's exact
+    /// candidates leave out: the candidates do not hold it, so the corpus is
+    /// scanned exactly once and finds it.
+    #[test]
+    fn literal_held_only_outside_the_candidates_scans_the_corpus_once() {
+        let (_project, ctx) = presence_project(&[
+            (
+                "src/config.rs",
+                "pub fn defaults() {\n    let bash_wait_detach = true;\n    drop(bash_wait_detach);\n}\n",
+            ),
+            ("tests/run_test.rs", "fn runs() {\n    bash_wait_detach(1);\n}\n"),
+        ]);
+        let text = presence_search(&ctx, "bash_wait_detach(", 10, 0);
+        assert!(!text.contains("No file contains"), "{text}");
+        let (_, corpus_scans) = take_literal_presence_counts();
+        assert_eq!(corpus_scans, 1, "{text}");
+    }
+
+    /// Running out of reads before the check finishes settles nothing, so
+    /// the reply makes no absence claim; with room to finish, the same
+    /// project gets the claim.
+    #[test]
+    fn exhausted_presence_bound_makes_no_absence_claim() {
+        let files = [(
+            "src/config.rs",
+            "pub fn defaults() {\n    let bash_wait_detach = true;\n    drop(bash_wait_detach);\n}\n",
+        )];
+        let (_project, ctx) = presence_project(&files);
+        LITERAL_PRESENCE_MAX_READS_OVERRIDE.with(|limit| limit.set(Some(0)));
+        let bounded = presence_search(&ctx, "bash_wait_detach(", 10, 0);
+        LITERAL_PRESENCE_MAX_READS_OVERRIDE.with(|limit| limit.set(None));
+        assert!(!bounded.contains("No file contains"), "{bounded}");
+        assert!(!bounded.contains("[similar]"), "{bounded}");
+
+        let (_project, ctx) = presence_project(&files);
+        let unbounded = presence_search(&ctx, "bash_wait_detach(", 10, 0);
+        assert!(
+            unbounded.starts_with(BASH_WAIT_DETACH_ABSENT),
+            "{unbounded}"
+        );
+    }
+
+    /// The answer is settled once per query: a later page reuses it and
+    /// reads no file and scans no corpus, while still saying the same thing.
+    #[test]
+    fn later_pages_reuse_the_presence_answer() {
+        let (_project, ctx) = presence_project(&[
+            (
+                "src/config.rs",
+                "pub fn defaults() {\n    let bash_wait_detach = true;\n    drop(bash_wait_detach);\n}\n",
+            ),
+            ("config/settings.toml", "bash_wait_detach = true\n"),
+            ("docs/bash.md", "Use bash to wait for a task, then detach it.\n"),
+        ]);
+        let first = presence_search(&ctx, "bash_wait_detach(", 1, 0);
+        assert!(first.starts_with(BASH_WAIT_DETACH_ABSENT), "{first}");
+        let (first_reads, first_scans) = take_literal_presence_counts();
+        assert!(
+            first_reads > 0 && first_scans == 1,
+            "{first_reads} {first_scans}"
+        );
+
+        let second = presence_search(&ctx, "bash_wait_detach(", 1, 1);
+        assert!(second.starts_with(BASH_WAIT_DETACH_ABSENT), "{second}");
+        assert_eq!(take_literal_presence_counts(), (0, 0), "{second}");
     }
 
     /// A readiness sample runs on the search path, so it reports the views-on
