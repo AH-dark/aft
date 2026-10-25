@@ -1270,7 +1270,8 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                         let refresh_paths =
                             semantic_paths_with_changed_content(ctx, &index, refresh_paths);
                         index.invalidate_files(&refresh_paths);
-                        let corpus_refresh = ctx.take_pending_semantic_corpus_refresh()
+                        let corpus_refresh = (ctx.take_pending_semantic_corpus_refresh()
+                            || index.summaries_need_repair())
                             && !ctx.shared_artifacts_read_only();
                         if let Some(root) = ctx.canonical_cache_root_opt() {
                             let semantic_config = ctx.config().semantic.clone();
@@ -1948,15 +1949,29 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                 }
             }
             SemanticRefreshEvent::CorpusFailed { paths, error } => {
+                let summary_repair_pending = !ctx.shared_artifacts_read_only()
+                    && ctx
+                        .semantic_index()
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .as_ref()
+                        .is_some_and(|index| index.summaries_need_repair());
+                if summary_repair_pending {
+                    ctx.mark_pending_semantic_corpus_refresh();
+                }
                 // A transient backend blip during a corpus refresh must NOT
                 // destroy the working index — the prior index is still valid and
                 // serving. Keep it Ready and let the next watcher/ignore change
                 // re-trigger the refresh, rather than nuking everything to
                 // `Failed` over a connection hiccup (the same park-forever trap
-                // the initial build now rides out). Permanent errors (dimension
-                // mismatch, too-many-files) still drop the index and surface the
-                // real failure.
-                if aft::semantic_index::embedding_failure_is_transient(&error) {
+                // the initial build now rides out). A deferred summary repair
+                // also keeps the published cache and records a pending corpus
+                // refresh for retry: its saved vectors are still usable even
+                // if the backend rejects the replacement input. Other permanent
+                // refresh errors still drop the index and surface the failure.
+                if aft::semantic_index::embedding_failure_is_transient(&error)
+                    || summary_repair_pending
+                {
                     let clean = aft::semantic_index::strip_transient_embedding_marker(&error);
                     let has_index = ctx
                         .semantic_index()

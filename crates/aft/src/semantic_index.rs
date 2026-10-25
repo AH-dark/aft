@@ -8094,7 +8094,7 @@ impl SemanticIndex {
             .filter(|budget| *budget < EmbedTextCaps::default().total_chars)
     }
 
-    fn summaries_need_repair(&self) -> bool {
+    pub(crate) fn summaries_need_repair(&self) -> bool {
         !self.summary_budget_limited && self.limited_summary_budget().is_some()
     }
 
@@ -8121,7 +8121,7 @@ impl SemanticIndex {
     /// A cached summary's new input is an exact prefix of its old input. Repair
     /// that row directly: unchanged symbol vectors do not need parsing or calls
     /// to the embedding backend. The marker is checked before examining rows.
-    fn repair_legacy_file_summaries<F>(
+    pub(crate) fn repair_legacy_file_summaries<F>(
         &mut self,
         embed: &mut F,
         max_batch_size: usize,
@@ -8131,6 +8131,11 @@ impl SemanticIndex {
     {
         if !self.summaries_need_repair() {
             return Ok(false);
+        }
+        if self.shared_base.is_some() || !self.view_runs.is_empty() {
+            // Refresh workers fork the published cache into a frozen base.
+            // Materialize a private snapshot, never the published vector slots.
+            *self = Self::from_bytes(&self.to_bytes(), &self.project_root)?;
         }
         let budget = self
             .limited_summary_budget()
@@ -9280,7 +9285,20 @@ impl SemanticIndex {
         ) else {
             return Ok(None);
         };
-        let repaired = index.repair_legacy_file_summaries(embed, max_batch_size)?;
+        let repaired = match index.repair_legacy_file_summaries(embed, max_batch_size) {
+            Ok(repaired) => repaired,
+            Err(error)
+                if embedding_failure_is_transient(&error)
+                    || crate::synapse_embed::LanePause::from_error(&error).is_some() =>
+            {
+                slog_warn!(
+                    "summary budget repair deferred; keeping saved semantic vectors: {}",
+                    strip_transient_embedding_marker(&error)
+                );
+                false
+            }
+            Err(error) => return Err(error),
+        };
         Ok(Some((index, repaired)))
     }
 
@@ -11130,6 +11148,7 @@ where
 }
 
 /// Assembles the same canonical file runs from validated fresh or reused rows.
+#[cfg(test)]
 pub(crate) fn embed_view_files_with_rows<F>(
     files: Vec<Vec<SemanticChunk>>,
     rows_fn: &mut F,
@@ -11137,6 +11156,20 @@ pub(crate) fn embed_view_files_with_rows<F>(
 ) -> Result<Vec<SemanticVectors>, String>
 where
     F: FnMut(Vec<String>) -> Result<Vec<BuildEmbeddingRow>, String>,
+{
+    embed_view_files_with_rows_at_offset(files, &mut |_, texts| rows_fn(texts), max_batch_size)
+}
+
+/// The offset is the checkpoint's flattened chunk cursor, including batches
+/// completed by an earlier attempt. Callers can align their reused-row slots
+/// without consuming the beginning of a resumed file twice.
+pub(crate) fn embed_view_files_with_rows_at_offset<F>(
+    files: Vec<Vec<SemanticChunk>>,
+    rows_fn: &mut F,
+    max_batch_size: usize,
+) -> Result<Vec<SemanticVectors>, String>
+where
+    F: FnMut(usize, Vec<String>) -> Result<Vec<BuildEmbeddingRow>, String>,
 {
     let resume = prepared_pause_job()
         .and_then(|job| job.borrow_mut().view.take())
@@ -11172,7 +11205,7 @@ where
             .iter()
             .map(|(_, chunk)| chunk.embed_text.clone())
             .collect();
-        let rows = match rows_fn(texts) {
+        let rows = match rows_fn(batch_start, texts) {
             Ok(rows) => rows,
             Err(error) => {
                 if let Some(job) = observe_lane_pause(&error) {

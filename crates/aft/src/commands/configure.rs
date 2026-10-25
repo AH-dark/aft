@@ -1461,6 +1461,7 @@ fn spawn_semantic_refresh_worker(
                                 })
                             })
                             .ok_or_else(|| SUPERSEDED_SEMANTIC_BUILD.to_string())?;
+                        index.repair_legacy_file_summaries(&mut embed, max_batch_size)?;
                         index.refresh_stale_files_with_strategy_and_blob_reuse(
                             &project_root,
                             &current_files,
@@ -15598,11 +15599,16 @@ mod tests {
         requests: Arc<Mutex<Vec<Vec<String>>>>,
         request_changed: Arc<Condvar>,
         response_release: Arc<(Mutex<usize>, Condvar)>,
+        fail_summaries: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
     impl CountingEmbeddingServer {
         fn start() -> Self {
+            Self::start_with_dimension(3)
+        }
+
+        fn start_with_dimension(dimension: usize) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding mock");
             let addr = listener.local_addr().expect("embedding mock addr");
             listener
@@ -15612,10 +15618,12 @@ mod tests {
             let requests = Arc::new(Mutex::new(Vec::new()));
             let request_changed = Arc::new(Condvar::new());
             let response_release = Arc::new((Mutex::new(0usize), Condvar::new()));
+            let fail_summaries = Arc::new(AtomicBool::new(false));
             let stop_for_thread = Arc::clone(&stop);
             let requests_for_thread = Arc::clone(&requests);
             let request_changed_for_thread = Arc::clone(&request_changed);
             let response_release_for_thread = Arc::clone(&response_release);
+            let fail_summaries_for_thread = Arc::clone(&fail_summaries);
             let handle = std::thread::spawn(move || {
                 while !stop_for_thread.load(Ordering::Relaxed) {
                     match listener.accept() {
@@ -15623,12 +15631,15 @@ mod tests {
                             let requests = Arc::clone(&requests_for_thread);
                             let request_changed = Arc::clone(&request_changed_for_thread);
                             let response_release = Arc::clone(&response_release_for_thread);
+                            let fail_summaries = Arc::clone(&fail_summaries_for_thread);
                             std::thread::spawn(move || {
                                 handle_counting_embedding_request(
                                     stream,
                                     requests,
                                     request_changed,
                                     response_release,
+                                    fail_summaries,
+                                    dimension,
                                 )
                             });
                         }
@@ -15645,6 +15656,7 @@ mod tests {
                 requests,
                 request_changed,
                 response_release,
+                fail_summaries,
                 handle: Some(handle),
             }
         }
@@ -15754,6 +15766,8 @@ mod tests {
         requests: Arc<Mutex<Vec<Vec<String>>>>,
         request_changed: Arc<Condvar>,
         response_release: Arc<(Mutex<usize>, Condvar)>,
+        fail_summaries: Arc<AtomicBool>,
+        dimension: usize,
     ) {
         stream
             .set_nonblocking(false)
@@ -15788,6 +15802,14 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(inputs.clone());
         request_changed.notify_all();
+        if fail_summaries.load(Ordering::SeqCst)
+            && inputs.iter().any(|text| text.contains("kind:file-summary"))
+        {
+            let body = "temporary summary backend outage";
+            let response = format!("HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = stream.write_all(response.as_bytes());
+            return;
+        }
         if inputs
             .iter()
             .any(|text| text != "semantic index fingerprint probe")
@@ -15811,7 +15833,7 @@ mod tests {
             .map(|(index, _)| {
                 let base = index as f64 + 1.0;
                 json!({
-                    "embedding": [base, base + 0.1, base + 0.2],
+                    "embedding": (0..dimension).map(|axis| base + axis as f64 * 0.1).collect::<Vec<_>>(),
                     "index": index,
                 })
             })
@@ -15825,6 +15847,96 @@ mod tests {
         stream
             .write_all(response.as_bytes())
             .expect("write embedding response");
+    }
+
+    #[test]
+    fn legacy_summary_repair_outage_installs_saved_searches_then_retries() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _backoff = EnvVarGuard::set("AFT_SEMANTIC_RETRY_BACKOFF_MS", "500");
+        let _quiet = EnvVarGuard::set("AFT_SEMANTIC_QUIET_WINDOW_MS", "1");
+        let (_project, storage, root, _) =
+            crate::semantic_index::saved_pre_budget_summary_fixture(true);
+        let server = CountingEmbeddingServer::start_with_dimension(4);
+        server.release_responses();
+        server.fail_summaries.store(true, Ordering::SeqCst);
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "counting-test-embedding".to_string(),
+            base_url: Some(server.base_url.clone()),
+            max_input_tokens: Some(20),
+            ..Default::default()
+        };
+        let mut saved =
+            SemanticIndex::read_from_disk(storage.path(), "summary-budget", &root, false, None)
+                .unwrap();
+        saved.set_fingerprint(
+            crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(&config, 4),
+        );
+        let key = crate::search_index::artifact_cache_key(&root);
+        assert!(saved.write_to_disk(storage.path(), &key));
+        let ctx = AppContext::new(
+            crate::context::default_language_provider_factory(),
+            Config::default(),
+        );
+        let request = configure_request_with_params(json!({
+            "project_root":root, "harness":"opencode", "storage_dir":storage.path(),
+            "config":[user_tier(json!({
+                "views":{"enabled":false},
+                "indexes":{"trigram":false,"semantic":true,"callgraph":false},
+                "semantic":{"backend":"openai_compatible","model":"counting-test-embedding","base_url":server.base_url,"max_input_tokens":20,"timeout_ms":5000,"max_batch_size":64}
+            }))]
+        }));
+        let response = handle_configure(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(30));
+        {
+            let index = ctx.semantic_index().read().unwrap();
+            let index = index
+                .as_ref()
+                .expect("usable saved index must be installed during repair outage");
+            assert!(index
+                .search(&[1.0, 0.0, 0.0, 0.0], 100)
+                .iter()
+                .any(|row| row.name == "exported"));
+            assert!(
+                index.summaries_need_repair(),
+                "a failed repair must leave its marker unset"
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            crate::runtime_drain::drain_semantic_refresh_events(&ctx);
+            if ctx.pending_reconciliation_snapshot_for_test().4
+                && crate::runtime_drain::semantic_refresh_probe_is_scheduled_for_test(&ctx)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the failed summary repair did not retain a corpus retry"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        server.fail_summaries.store(false, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            crate::runtime_drain::drain_build_completions(&ctx);
+            crate::runtime_drain::drain_semantic_refresh_events(&ctx);
+            if ctx
+                .semantic_index()
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|index| !index.summaries_need_repair())
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the automatic probe did not retry the deferred summary repair"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// A root with a ready semantic index embedded through `server`, a live

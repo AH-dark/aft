@@ -737,10 +737,12 @@ impl SemanticPlane {
         // A live entry supersedes the generation: its base run, if any, holds
         // other content and must never be scored.
         let live = matches!(snapshot.source(path), Source::Live(_));
-        if !live
-            && resident.members.get(path) == Some(&content)
-            && !(repair_summaries && resident.legacy_summaries.contains(path))
-        {
+        if !live && resident.members.get(path) == Some(&content) {
+            if repair_summaries && resident.legacy_summaries.contains(path) {
+                if let Some(key) = state.fill.get(path, &content, FamilyPlane::Semantic) {
+                    return VectorSource::Fill(*key);
+                }
+            }
             return VectorSource::Base;
         }
         if let Some(key) = state.fill.get(path, &content, FamilyPlane::Semantic) {
@@ -754,8 +756,27 @@ impl SemanticPlane {
         VectorSource::Pending
     }
 
-    /// Work for this checkout: every current member with no vectors for its
-    /// current content under this producer, and no recorded failure.
+    fn summary_repair_pending(
+        state: &ViewState,
+        resident: &Resident,
+        snapshot: &Snapshot,
+        path: &RelPath,
+        content: ContentHash,
+        repair_summaries: bool,
+    ) -> bool {
+        repair_summaries
+            && resident.legacy_summaries.contains(path)
+            && resident.members.get(path) == Some(&content)
+            && !matches!(snapshot.source(path), Source::Live(_))
+            && state
+                .fill
+                .get(path, &content, FamilyPlane::Semantic)
+                .is_none()
+            && !state.failed.contains_key(&(path.clone(), content))
+    }
+
+    /// Missing vectors and owner-only summary repairs are separate work:
+    /// a queued repair must not withdraw the file's published vectors.
     fn work_items(
         &self,
         state: &ViewState,
@@ -772,7 +793,14 @@ impl SemanticPlane {
                     return None;
                 };
                 (applies_to(&path)
-                    && matches!(
+                    && (Self::summary_repair_pending(
+                        state,
+                        resident,
+                        snapshot,
+                        &path,
+                        content,
+                        repair_summaries,
+                    ) || matches!(
                         Self::vector_source(
                             state,
                             resident,
@@ -782,7 +810,7 @@ impl SemanticPlane {
                             repair_summaries
                         ),
                         VectorSource::Pending
-                    ))
+                    )))
                 .then(|| WorkItem {
                     plane: FamilyPlane::Semantic,
                     rel_path: path,
@@ -1091,9 +1119,21 @@ impl SemanticPlane {
                 chunks.push(file_chunks);
             }
             let mut canonical_chunks = Vec::new();
+            let row_plan = if let Some(plan) = legacy_reuse.as_mut() {
+                let mut rows = Vec::with_capacity(batch_texts);
+                for _ in 0..batch_texts {
+                    rows.push(
+                        plan.pop_front()
+                            .ok_or_else(|| plane_error("summary repair row plan exhausted"))?,
+                    );
+                }
+                Some(rows)
+            } else {
+                None
+            };
             let embedded = {
-                let mut rows = |batch: Vec<String>| {
-                    let Some(plan) = legacy_reuse.as_mut() else {
+                let mut rows = |batch_start: usize, batch: Vec<String>| {
+                    let Some(plan) = row_plan.as_ref() else {
                         return self.embed_chunks(
                             &arena,
                             &store,
@@ -1106,11 +1146,14 @@ impl SemanticPlane {
                     };
                     let mut rows = Vec::with_capacity(batch.len());
                     let mut missing = Vec::new();
-                    for text in batch {
-                        let (expected, reuse) = plan
-                            .pop_front()
-                            .ok_or("summary repair row plan exhausted")?;
-                        if expected != text {
+                    let end = batch_start
+                        .checked_add(batch.len())
+                        .ok_or("summary repair row cursor overflow")?;
+                    let planned = plan
+                        .get(batch_start..end)
+                        .ok_or("summary repair row plan exhausted")?;
+                    for (text, (expected, reuse)) in batch.into_iter().zip(planned) {
+                        if expected != &text {
                             return Err("summary repair row plan changed".to_string());
                         }
                         if let Some(vector) = reuse {
@@ -1120,7 +1163,7 @@ impl SemanticPlane {
                                 embedded_text: text,
                                 vector: vector.to_vec(),
                             }));
-                            canonical_chunks.push(vector);
+                            canonical_chunks.push(Arc::clone(vector));
                             report.chunk_reused += 1;
                         } else {
                             missing.push(text);
@@ -1150,7 +1193,7 @@ impl SemanticPlane {
                         })
                         .collect())
                 };
-                crate::semantic_index::embed_view_files_with_rows(
+                crate::semantic_index::embed_view_files_with_rows_at_offset(
                     chunks,
                     &mut rows,
                     budget.max_batch,
@@ -1991,6 +2034,17 @@ impl SemanticPlane {
             if !applies_to(&path) {
                 continue;
             }
+            if Self::summary_repair_pending(
+                &state,
+                &resident,
+                snapshot,
+                &path,
+                content,
+                repair_summaries,
+            ) {
+                pending += 1;
+                continue;
+            }
             match Self::vector_source(
                 &state,
                 &resident,
@@ -2730,6 +2784,118 @@ mod tests {
             symbols(plane.cached_index(&checkout.access).unwrap()),
             before
         );
+    }
+
+    #[test]
+    fn summary_repair_keeps_saved_symbols_searchable_while_held() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let caps = EmbedTextCaps {
+            total_chars: 70,
+            ..EmbedTextCaps::default()
+        };
+        let (legacy, _, _) = legacy_summary_checkout(storage.path(), root.path(), caps);
+        let plane = Arc::new(SemanticPlane::new(
+            storage.path().to_path_buf(),
+            SemanticProducer::current("model-a", caps),
+        ));
+        let checkout = Checkout::with_owner(root.path(), legacy.owner.clone(), &plane);
+        let snapshot = checkout.load();
+        let current = snapshot.clone();
+        let mut during = None;
+        let report = plane
+            .fill(
+                &checkout.owner,
+                &snapshot,
+                FillBudget::default(),
+                &mut |texts: Vec<String>| {
+                    during = Some(checkout.query(&snapshot, "model-a", "module"));
+                    Ok(texts.iter().map(|text| vector("model-a", text)).collect())
+                },
+                &move || current.clone(),
+            )
+            .unwrap();
+        assert_eq!(report.embedded_texts, 1);
+        let during = during.expect("the summary embedding must hold the repair open");
+        assert!(
+            during.results.iter().any(|row| row.name == "exported"),
+            "saved symbols disappeared during repair: {during:?}"
+        );
+        assert!(
+            during.complete(),
+            "a held repair must not withdraw published results"
+        );
+        assert!(checkout
+            .query(&checkout.installed(), "model-a", "module")
+            .results
+            .iter()
+            .any(|row| row.name == "exported"));
+    }
+
+    #[test]
+    fn small_budget_fill_resumes_after_second_batch_pause_with_aligned_rows() {
+        use crate::semantic_index::{retry_lane_pause, with_lane_pause_clock, PauseRetryScope};
+        use crate::synapse_embed::{pause_test_support::*, LanePause, SynapseEmbeddingError};
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_tree(root.path(), &[("src/many.rs", "pub fn first() {\n    1;\n}\npub fn second() {\n    2;\n}\npub fn third() {\n    3;\n}\n")]);
+        let caps = EmbedTextCaps {
+            total_chars: 70,
+            ..EmbedTextCaps::default()
+        };
+        let plane = Arc::new(SemanticPlane::new(
+            storage.path().to_path_buf(),
+            SemanticProducer::current("model-a", caps),
+        ));
+        let checkout = Checkout::open(storage.path(), "paused-small-budget", root.path(), &plane);
+        let snapshot = checkout.load();
+        let current = snapshot.clone();
+        let mut inputs = Vec::new();
+        let result = with_lane_pause_clock(START, |clock| {
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(5), Duration::from_secs(300), || true);
+            retry_lane_pause(|| {
+                let report = plane
+                    .fill(
+                        &checkout.owner,
+                        &snapshot,
+                        FillBudget {
+                            max_batch: 1,
+                            ..FillBudget::default()
+                        },
+                        &mut |texts: Vec<String>| {
+                            inputs.extend(texts.clone());
+                            if inputs.len() == 2 && clock.load(Ordering::SeqCst) == START {
+                                Err(SynapseEmbeddingError::LanePaused(LanePause {
+                                    lane_id: MODEL.into(),
+                                    fingerprint: Some("pinned".into()),
+                                    retry_after_ms: Some(PAUSE_MS),
+                                    paused_until_ms: START + PAUSE_MS,
+                                    reason: "maintenance".into(),
+                                    cause: Default::default(),
+                                    safe_to_retry_same_request: true,
+                                    record_id: 0,
+                                })
+                                .to_string())
+                            } else {
+                                Ok(texts.iter().map(|text| vector("model-a", text)).collect())
+                            }
+                        },
+                        &|| current.clone(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                match report.errors.first() {
+                    Some(error) => Err(error.clone()),
+                    None => Ok(report),
+                }
+            })
+        });
+        assert!(result.is_ok(), "paused fill did not resume: {result:?}");
+        assert_eq!(inputs.len(), 4, "only the paused request may be retried");
+        assert_eq!(inputs[1], inputs[2]);
+        let query = checkout.query(&checkout.installed(), "model-a", "module");
+        assert_eq!(query.results.len(), 3);
+        assert!(query.complete());
     }
 
     const LARGE_DEFINITIONS: usize = 300;
