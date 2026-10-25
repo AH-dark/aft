@@ -2708,6 +2708,76 @@ fn sleep_before_embedding_retry(attempt_index: usize) {
 const QUERY_EMBEDDING_CANCELLED_MARKER: &str = "__AFT_QUERY_EMBEDDING_CANCELLED__";
 const QUERY_EMBEDDING_CANCEL_POLL: Duration = Duration::from_millis(10);
 
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+type QueryEmbeddingPhaseObserver = Box<dyn FnMut(&'static str)>;
+
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+thread_local! {
+    static QUERY_EMBEDDING_PHASE_OBSERVER: std::cell::RefCell<Option<QueryEmbeddingPhaseObserver>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Observe query phases on the calling test thread without changing other searches.
+/// The observer and its call sites are absent from normal release builds.
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+#[doc(hidden)]
+pub fn with_query_embedding_phase_observer_for_test<T>(
+    observer: impl FnMut(&'static str) + 'static,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<QueryEmbeddingPhaseObserver>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            QUERY_EMBEDDING_PHASE_OBSERVER.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset =
+        Reset(QUERY_EMBEDDING_PHASE_OBSERVER.with(|slot| slot.replace(Some(Box::new(observer)))));
+    action()
+}
+
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+pub(crate) fn observe_query_embedding_phase(phase: &'static str) {
+    QUERY_EMBEDDING_PHASE_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow_mut().as_mut() {
+            observer(phase);
+        }
+    });
+}
+
+#[cfg(all(test, any(debug_assertions, feature = "test-timing-hooks")))]
+mod query_embedding_phase_observer_tests {
+    use super::*;
+    use std::{cell::RefCell, rc::Rc};
+
+    #[test]
+    fn query_embedding_phase_observer_restores_scope_after_panic_and_ignores_other_threads() {
+        let phases = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&phases);
+        with_query_embedding_phase_observer_for_test(
+            move |phase| observed.borrow_mut().push(phase),
+            || {
+                observe_query_embedding_phase("outer_before");
+                let nested = std::panic::catch_unwind(|| {
+                    with_query_embedding_phase_observer_for_test(
+                        |phase| assert_eq!(phase, "nested"),
+                        || {
+                            observe_query_embedding_phase("nested");
+                            panic!("exercise observer cleanup");
+                        },
+                    );
+                });
+                assert!(nested.is_err());
+                std::thread::spawn(|| observe_query_embedding_phase("other_thread"))
+                    .join()
+                    .unwrap();
+                observe_query_embedding_phase("outer_after");
+            },
+        );
+        observe_query_embedding_phase("outside_scope");
+        assert_eq!(*phases.borrow(), ["outer_before", "outer_after"]);
+    }
+}
+
 enum EmbeddingExchange {
     SendFailed(reqwest::Error),
     Response {
@@ -2730,13 +2800,31 @@ fn execute_embedding_exchange(request: reqwest::blocking::RequestBuilder) -> Emb
             std::thread::sleep(*delay);
         }
     });
-    match request.send() {
+    #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+    observe_query_embedding_phase("request_send");
+    let exchange = match request.send() {
         Ok(response) => EmbeddingExchange::Response {
             status: response.status(),
             body: response.text(),
         },
         Err(error) => EmbeddingExchange::SendFailed(error),
+    };
+    #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+    {
+        let error = match &exchange {
+            EmbeddingExchange::SendFailed(error)
+            | EmbeddingExchange::Response {
+                body: Err(error), ..
+            } => Some(error),
+            _ => None,
+        };
+        // Reqwest owns the timer. Record when its timeout becomes observable,
+        // rather than pretending to know when the private timer was scheduled.
+        if error.is_some_and(reqwest::Error::is_timeout) {
+            observe_query_embedding_phase("deadline_fire_observed");
+        }
     }
+    exchange
 }
 
 fn execute_query_embedding_exchange(

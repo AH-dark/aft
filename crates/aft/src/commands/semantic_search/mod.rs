@@ -6720,6 +6720,8 @@ fn semantic_unavailable_or_fallback_response(
     extensions: &dyn extensions::SearchExtensions,
     engine_plan: &extensions::LanePlan<'_>,
 ) -> Response {
+    #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+    crate::semantic_index::observe_query_embedding_phase("fallback_start");
     if engine_plan.readiness.lexical_index {
         let mut lexical_plan = engine_plan.clone();
         lexical_plan
@@ -7438,6 +7440,8 @@ fn search_index_ready(ctx: &AppContext) -> bool {
 }
 
 fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
+    #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+    crate::semantic_index::observe_query_embedding_phase("embed_query_entry");
     let index_dimension = {
         let semantic_index =
             try_read_with_budget(ctx.semantic_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
@@ -7511,13 +7515,22 @@ fn embed_query_for_dimension(
     let semantic_config = ctx.config().semantic.clone();
     let query_budget = QueryBudget::from_config(&semantic_config);
     let mut model_ref = ctx.semantic_embedding_model().lock();
+    #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+    crate::semantic_index::observe_query_embedding_phase("model_mutex_first_acquired");
 
     if model_ref.is_none() {
         drop(model_ref);
 
-        let constructed_model = EmbeddingModel::from_config_for_query(&semantic_config)?;
+        #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+        crate::semantic_index::observe_query_embedding_phase("model_construction_start");
+        let constructed_model = EmbeddingModel::from_config_for_query(&semantic_config);
+        #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+        crate::semantic_index::observe_query_embedding_phase("model_construction_end");
+        let constructed_model = constructed_model?;
 
         model_ref = ctx.semantic_embedding_model().lock();
+        #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+        crate::semantic_index::observe_query_embedding_phase("model_mutex_second_acquired");
         if model_ref.is_none() {
             *model_ref = Some(constructed_model);
         } else {
@@ -7526,6 +7539,8 @@ fn embed_query_for_dimension(
                 let _discarded_model = constructed_model;
             }
             model_ref = ctx.semantic_embedding_model().lock();
+            #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+            crate::semantic_index::observe_query_embedding_phase("model_mutex_reacquired");
         }
     }
 
