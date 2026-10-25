@@ -2608,7 +2608,7 @@ async fn bind_route_stamped_with_elicitation(
         session,
         role_versions,
         stamp,
-        elicitation,
+        elicitation.then(|| vec!["elicitation".into()]),
         None,
     )
     .await
@@ -2621,7 +2621,7 @@ async fn bind_route_stamped_with_mode(
     session: &str,
     role_versions: Option<BTreeMap<String, String>>,
     stamp: &RouteStamp,
-    elicitation: bool,
+    consumer_capabilities: Option<Vec<String>>,
     mode: Option<cortexkit_role_tool_provider::CallMode>,
 ) -> Result<Route, HarnessError> {
     let wire = handle.wire.clone();
@@ -2635,7 +2635,7 @@ async fn bind_route_stamped_with_mode(
         },
         identity: BindIdentity::new(project, harness, session),
         principal: Some(decode_principal(&stamp.principal)?),
-        consumer_capabilities: elicitation.then(|| vec!["elicitation".into()]),
+        consumer_capabilities,
         admission_facts: None,
         scope: stamp
             .scope
@@ -2961,6 +2961,27 @@ impl ToolProviderSubject for Subject {
             unlisted_mode: cortexkit_role_tool_provider::CallMode::Flow,
         })
     }
+    async fn route_with_consumer_capabilities(
+        &self,
+        handle: &Process,
+        stamp: &RouteStamp,
+        consumer_capabilities: &[String],
+    ) -> Result<Route, HarnessError> {
+        let mut route = bind_route_stamped_with_mode(
+            handle,
+            &handle.root.join("project"),
+            "runner",
+            "conformance-session",
+            Some(BTreeMap::from([("tool-provider".into(), "v1".into())])),
+            stamp,
+            Some(consumer_capabilities.to_vec()),
+            None,
+        )
+        .await?;
+        route.scoped_preset = stamp.scope.as_ref().map(|_| self.preset.unwrap_or("head"));
+        wait_for_route_ready(&route, self.quick_call()).await;
+        Ok(route)
+    }
     async fn route_with_mode(
         &self,
         handle: &Process,
@@ -2982,7 +3003,7 @@ impl ToolProviderSubject for Subject {
             "conformance-session",
             Some(BTreeMap::from([("tool-provider".into(), "v1".into())])),
             &stamp,
-            false,
+            None,
             Some(mode.clone()),
         )
         .await?;
