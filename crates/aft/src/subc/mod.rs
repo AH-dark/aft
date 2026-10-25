@@ -6600,6 +6600,9 @@ where
             })?;
             let measure = queued.tool_response_trace.is_some();
             let dequeued = measure.then(Instant::now);
+            let dequeued_cpu = measure
+                .then(crate::run_tool_call::ThreadCpuSample::now)
+                .flatten();
             metrics.writer_active.store(true, Ordering::Relaxed);
             decrement_counted_channel(&metrics.writer_queued);
             let write_timing = write_frame_contiguous(
@@ -6630,6 +6633,10 @@ where
                     write_timing.write_started,
                     write_timing.write_finished,
                     write_timing.frame_bytes,
+                    crate::run_tool_call::ThreadCpuSample::elapsed(
+                        dequeued_cpu,
+                        write_timing.write_started_cpu,
+                    ),
                 ) {
                     let session = completed.session.clone();
                     log_ctx::with_session(Some(session.clone()), || {
@@ -6660,6 +6667,7 @@ where
 
 struct FrameWriteTiming {
     write_started: Instant,
+    write_started_cpu: Option<crate::run_tool_call::ThreadCpuSample>,
     write_finished: Instant,
     frame_bytes: usize,
 }
@@ -6690,6 +6698,9 @@ where
     buffer.extend_from_slice(&header);
     buffer.extend_from_slice(body);
     let write_started = measure.then(Instant::now);
+    let write_started_cpu = measure
+        .then(crate::run_tool_call::ThreadCpuSample::now)
+        .flatten();
     writer
         .write_all(buffer)
         .await
@@ -6702,6 +6713,7 @@ where
     }
     Ok(write_started.map(|write_started| FrameWriteTiming {
         write_started,
+        write_started_cpu,
         write_finished: write_finished.expect("measured write has a finish timestamp"),
         frame_bytes,
     }))
@@ -11292,7 +11304,7 @@ async fn deliver_resolved_subc_response(
             });
         }
     }
-    entry.phase_trace.mark_execute_done();
+    entry.phase_trace.mark_execute_done_after_await();
     let finalizer = |response: &mut Response, text: &mut String| {
         if let Some(ctx) = &ctx {
             crate::response_finalize::finalize_tool_response(

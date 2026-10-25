@@ -2394,16 +2394,16 @@ pub fn note_tool_call_trace(
             channel,
             corr,
             duration_millis_u64(phases.total),
-            duration_millis_u64(phases.queue),
-            duration_millis_u64(phases.translate),
-            duration_millis_u64(phases.execute),
-            duration_millis_u64(phases.format),
-            duration_millis_u64(phases.finalize),
-            duration_millis_u64(phases.egress),
-            duration_millis_u64(phases.egress_enqueue),
-            duration_millis_u64(phases.egress_queue),
-            duration_millis_u64(phases.egress_prepare),
-            duration_millis_u64(phases.egress_write),
+            slow_phase_time(phases.queue, None),
+            slow_phase_time(phases.translate, phases.cpu.translate),
+            slow_phase_time(phases.execute, phases.cpu.execute),
+            slow_phase_time(phases.format, phases.cpu.format),
+            slow_phase_time(phases.finalize, phases.cpu.finalize),
+            slow_phase_time(phases.egress, None),
+            slow_phase_time(phases.egress_enqueue, None),
+            slow_phase_time(phases.egress_queue, None),
+            slow_phase_time(phases.egress_prepare, phases.cpu.egress_prepare),
+            slow_phase_time(phases.egress_write, None),
             phases.frame_bytes,
             phases.writer_queue_depth,
             phases.writer_active_at_enqueue,
@@ -2419,6 +2419,19 @@ pub fn note_tool_call_trace(
         SLOW_TOOL_CALL_CAPTURE
             .with(|captured| captured.borrow_mut().push((level, message.clone())));
         log::log!(level, "{}{}", crate::log_ctx::session_prefix(), message);
+    }
+}
+
+fn slow_phase_time(wall: Duration, cpu: Option<Duration>) -> String {
+    // Fractional milliseconds keep microsecond translation work visible beside
+    // scheduling delay. Unknown CPU is explicit, not a misleading zero.
+    match cpu {
+        Some(cpu) => format!(
+            "{:.3}ms/cpu={:.3}ms",
+            duration_millis_f64(wall),
+            duration_millis_f64(cpu)
+        ),
+        None => format!("{:.3}ms/cpu=?", duration_millis_f64(wall)),
     }
 }
 
@@ -3371,6 +3384,7 @@ mod tests {
 
     fn slow_phases() -> ToolCallPhaseDurations {
         ToolCallPhaseDurations {
+            cpu: crate::run_tool_call::ToolCallPhaseCpu::default(),
             queue: Duration::ZERO,
             translate: Duration::ZERO,
             execute: Duration::from_millis(120),
@@ -3416,6 +3430,21 @@ mod tests {
                 .map(|(level, _)| level)
                 .collect()
         })
+    }
+
+    #[test]
+    fn slow_phase_time_renders_wall_and_cpu_in_one_field() {
+        assert_eq!(
+            slow_phase_time(
+                Duration::from_micros(39_123),
+                Some(Duration::from_micros(4))
+            ),
+            "39.123ms/cpu=0.004ms"
+        );
+        assert_eq!(
+            slow_phase_time(Duration::from_millis(50), None),
+            "50.000ms/cpu=?"
+        );
     }
 
     #[test]

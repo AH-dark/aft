@@ -5646,7 +5646,7 @@ mod route_tests {
             .expect("tool.catalog replies must carry response timing");
         let now = Instant::now();
         let completed = trace
-            .finish(now, now, now, reply.frame.body.len())
+            .finish(now, now, now, reply.frame.body.len(), None)
             .expect("tool.catalog trace must have executor and writer timings");
         assert!(completed.phases.total > Duration::from_millis(50));
         assert!(completed.phases.queue > Duration::from_millis(50));
