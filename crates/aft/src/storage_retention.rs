@@ -2536,7 +2536,31 @@ fn reap_trash(
                 }
                 let mut snapshot = Vec::new();
                 let mut entries = entries;
+                // Mount-local retirement needs admission only for the snapshot.
+                // Yield promptly to binders and cap this lock hold separately
+                // from the much slower, admission-free unlink work.
+                let admission_deadline = Instant::now() + Duration::from_millis(10);
+                #[cfg(test)]
+                test_hook(trash, "trash-snapshot");
                 loop {
+                    if mount_local && bind_pending(&storage.durable) {
+                        report.incomplete = true;
+                        report.keep(
+                            trash,
+                            "bind_pending",
+                            "snapshot yielded to checkout binding",
+                        );
+                        break;
+                    }
+                    if mount_local && Instant::now() >= admission_deadline {
+                        report.incomplete = true;
+                        report.keep(
+                            trash,
+                            "admission_budget",
+                            "mount snapshot admission deadline reached",
+                        );
+                        break;
+                    }
                     if let Err(error) = budget.entry() {
                         report.incomplete = true;
                         report.keep(trash, "enumeration_budget", error);
@@ -5220,6 +5244,81 @@ mod storage_retention_tests {
             "{report:?}"
         );
         assert!(retired.join("derived-abc.sqlite").exists());
+    }
+
+    #[test]
+    fn retention_trash_guard_mount_snapshot_yields_to_bind() {
+        let (temp, retired) = retired_view_fixture();
+        let pending = temp.path().join("retention/bind-pending.lock");
+        let _binder = crate::fs_lock::try_acquire(&pending, Duration::ZERO).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        let (result, logs) = crate::logging::capture_log_lines(|| {
+            reap_trash(
+                &StoragePaths::same(temp.path()),
+                retired.parent().unwrap(),
+                true,
+                deadline,
+                &mut budget,
+                &mut report,
+            )
+        });
+        assert!(result.unwrap());
+        assert_eq!(
+            report.kept_by_reason.get("bind_pending"),
+            Some(&1),
+            "{report:?}"
+        );
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.contains("retained reason=bind_pending:"))
+                .count(),
+            1
+        );
+        assert!(report.incomplete);
+        assert!(retired.exists());
+    }
+
+    #[test]
+    fn retention_trash_guard_mount_snapshot_admission_deadline() {
+        let (temp, retired) = retired_view_fixture();
+        let trash = retired.parent().unwrap();
+        let _hook = observe_test_hook(
+            trash,
+            Arc::new(|step| {
+                if step == "trash-snapshot" {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        let (result, logs) = crate::logging::capture_log_lines(|| {
+            reap_trash(
+                &StoragePaths::same(temp.path()),
+                trash,
+                true,
+                deadline,
+                &mut budget,
+                &mut report,
+            )
+        });
+        assert!(result.unwrap());
+        assert_eq!(
+            report.kept_by_reason.get("admission_budget"),
+            Some(&1),
+            "{report:?}"
+        );
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.contains("retained reason=admission_budget:"))
+                .count(),
+            1
+        );
+        assert!(report.incomplete);
+        assert!(retired.exists());
     }
 
     #[test]
