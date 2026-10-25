@@ -1,46 +1,8 @@
 //! Offline, thread-CPU profiling of the real health rollup, not a parallel implementation.
 use super::*;
-use std::cell::RefCell;
+pub(super) use crate::test_allocations::profile::Timer;
+use crate::test_allocations::profile::{cpu_ns, STEPS};
 use std::collections::BTreeMap;
-
-thread_local! {
-    static STEPS: RefCell<Option<BTreeMap<&'static str, u64>>> = const { RefCell::new(None) };
-}
-
-fn cpu_ns() -> u64 {
-    let mut time = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    assert_eq!(
-        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
-        0
-    );
-    time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
-}
-
-pub(super) struct Timer(Option<u64>);
-
-impl Timer {
-    pub(super) fn new() -> Self {
-        Self(STEPS.with(|steps| steps.borrow().is_some().then(cpu_ns)))
-    }
-
-    pub(super) fn mark(&mut self, step: &'static str) {
-        if let Some(previous) = self.0 {
-            let now = cpu_ns();
-            STEPS.with(|steps| {
-                *steps
-                    .borrow_mut()
-                    .as_mut()
-                    .unwrap()
-                    .entry(step)
-                    .or_default() += now - previous;
-            });
-            self.0 = Some(now);
-        }
-    }
-}
 
 #[test]
 #[ignore = "offline per-step measurement with configurable roots and a large aft.db"]
@@ -65,6 +27,8 @@ fn bench_health_rollup_steps() {
     //   AFT_ROLLUP_BENCH_CENSUS_READS=1  read the memory census after every
     //                             tick, as a client polling `memory.census`
     //                             does
+    //   AFT_ROLLUP_BENCH_STANDING=1  declare and pin every bound root in the
+    //                             daemon's standing-root configuration
     let env_count = |name: &str, default: usize| -> usize {
         std::env::var(name)
             .ok()
@@ -79,6 +43,7 @@ fn bench_health_rollup_steps() {
     let arena_chunks = env_count("AFT_ROLLUP_BENCH_ARENA_CHUNKS", 0);
     let census_reads =
         std::env::var("AFT_ROLLUP_BENCH_CENSUS_READS").is_ok_and(|value| value == "1");
+    let standing = std::env::var("AFT_ROLLUP_BENCH_STANDING").is_ok_and(|value| value == "1");
     const TICKS: usize = 20;
     let (park_tx, park_rx) = std::sync::mpsc::channel::<()>();
     let park_rx = Arc::new(std::sync::Mutex::new(park_rx));
@@ -202,6 +167,23 @@ fn bench_health_rollup_steps() {
         assert!(executor.register_actor(root, ctx));
         dirs.push(dir);
     }
+    if standing {
+        let roots = executor
+            .actor_entries()
+            .iter()
+            .map(|(root, _)| crate::config::IndexRootConfig {
+                path: root.as_path().display().to_string(),
+                indexes: vec![crate::config::IndexKind::Search],
+            })
+            .collect::<Vec<_>>();
+        for (_, ctx) in executor.actor_entries() {
+            ctx.update_config(|config| config.index.roots = roots.clone());
+        }
+        let config = executor.actor_entries()[0].1.config();
+        crate::standing_roots::StandingRoots::default()
+            .reconcile(&config)
+            .unwrap();
+    }
     let cache = HealthRollupCache::new();
     cache.clock_ms.store(0, Ordering::Relaxed);
     cache.refresh_for_test(&executor, &app);
@@ -286,75 +268,83 @@ fn bench_health_rollup_steps() {
     let opens_before = crate::path_status::STORE_OPENS.with(std::cell::Cell::get);
     let reads_before = crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
     let mut writer_opens = 0;
-    for tick in 1..=TICKS {
-        if churn {
-            // What publishing views, reads and an occasional edit do between
-            // two ticks; kept out of the measured time.
-            for view_dir in &churn_view_dirs {
-                let mut status = crate::path_status::PathStatusStore::open(view_dir).unwrap();
-                writer_opens += 1;
-                status
-                    .mark_pending_many([(&b"src/a.rs"[..], "bench")], 1)
-                    .unwrap();
-                status.clear_many([&b"src/gone.rs"[..]]).unwrap();
-            }
-            let path = format!("src/churn_{tick}.rs");
-            for (index, (root, ctx)) in executor.actor_entries().into_iter().enumerate() {
-                let file = root.as_path().join(&path);
-                ctx.symbol_cache().write().unwrap().insert(
-                    file.clone(),
-                    std::time::SystemTime::UNIX_EPOCH,
-                    1,
-                    blake3::hash(path.as_bytes()),
-                    Vec::new(),
-                );
-                if index % 10 == tick % 10 {
-                    if let Some(index) = ctx.search_index().write().unwrap().as_mut() {
-                        index.index_file(&file, b"fn churn() {}");
+    let (_, allocations) = crate::test_allocations::count(|| {
+        for tick in 1..=TICKS {
+            if churn {
+                // What publishing views, reads and an occasional edit do between
+                // two ticks; kept out of the measured time.
+                for view_dir in &churn_view_dirs {
+                    let mut status = crate::path_status::PathStatusStore::open(view_dir).unwrap();
+                    writer_opens += 1;
+                    status
+                        .mark_pending_many([(&b"src/a.rs"[..], "bench")], 1)
+                        .unwrap();
+                    status.clear_many([&b"src/gone.rs"[..]]).unwrap();
+                }
+                let path = format!("src/churn_{tick}.rs");
+                for (index, (root, ctx)) in executor.actor_entries().into_iter().enumerate() {
+                    let file = root.as_path().join(&path);
+                    ctx.symbol_cache().write().unwrap().insert(
+                        file.clone(),
+                        std::time::SystemTime::UNIX_EPOCH,
+                        1,
+                        blake3::hash(path.as_bytes()),
+                        Vec::new(),
+                    );
+                    if index % 10 == tick % 10 {
+                        if let Some(index) = ctx.search_index().write().unwrap().as_mut() {
+                            index.index_file(&file, b"fn churn() {}");
+                        }
                     }
                 }
             }
-        }
-        let started = cpu_ns();
-        cache.clock_ms.store(tick as u64 * 3000, Ordering::Relaxed);
-        let built = build_health_diagnostic_rollup_from_actors(
-            &cache,
-            &executor,
-            &app,
-            executor.actor_entries(),
-        );
-        let tick_metrics = &built.tick;
-        elapsed_total += tick_metrics["elapsed_ms"].as_f64().unwrap();
-        for (step, value) in tick_metrics["steps"].as_object().unwrap() {
-            *elapsed_steps.entry(step.clone()).or_default() +=
-                value["elapsed_ms"].as_f64().unwrap();
-        }
-        let mut publish_timer = Timer::new();
-        cache.publish(Some(built));
-        publish_timer.mark("publish holder / old JSON drop");
-        total += cpu_ns() - started;
-        if census_reads {
-            std::hint::black_box(cache.memory_census());
-        }
-        if [1, 5, 10, 20].contains(&tick) {
-            println!(
-                "active WAL bytes at tick {tick} (bytes: stores): {:?}",
-                wal_sizes()
+            let started = cpu_ns();
+            cache.clock_ms.store(tick as u64 * 3000, Ordering::Relaxed);
+            let built = build_health_diagnostic_rollup_from_actors(
+                &cache,
+                &executor,
+                &app,
+                executor.actor_entries(),
             );
+            let tick_metrics = &built.tick;
+            elapsed_total += tick_metrics["elapsed_ms"].as_f64().unwrap();
+            for (step, value) in tick_metrics["steps"].as_object().unwrap() {
+                *elapsed_steps.entry(step.clone()).or_default() +=
+                    value["elapsed_ms"].as_f64().unwrap();
+            }
+            let mut publish_timer = Timer::new();
+            cache.publish(Some(built));
+            publish_timer.mark("publish holder / old JSON drop");
+            total += cpu_ns() - started;
+            if census_reads {
+                std::hint::black_box(cache.memory_census());
+            }
+            if [1, 5, 10, 20].contains(&tick) {
+                println!(
+                    "active WAL bytes at tick {tick} (bytes: stores): {:?}",
+                    wal_sizes()
+                );
+            }
         }
-    }
+    });
     let steps = STEPS.with(|steps| steps.borrow_mut().take().unwrap());
     println!(
-        "roots={roots_count} routes=300 persisted_views={} installed_views={roots_count} extra_threads={thread_count} files_per_root={files_per_root} churn={churn} arena_chunks={arena_chunks} census_reads={census_reads} aft_db_bytes={bytes} ticks={TICKS} interval_s=3 CPU (not wall)",
+        "roots={roots_count} routes=300 persisted_views={} installed_views={roots_count} extra_threads={thread_count} files_per_root={files_per_root} churn={churn} arena_chunks={arena_chunks} census_reads={census_reads} standing={standing} aft_db_bytes={bytes} ticks={TICKS} interval_s=3 CPU (not wall)",
         roots_count * 10
     );
-    for (step, ns) in steps {
+    for (step, (ns, allocations, bytes)) in steps {
         println!(
-            "{step}: us/tick={:.2} us/second={:.2}",
+            "{step}: us/tick={:.2} us/second={:.2} allocations/tick={} allocated_bytes/tick={}",
             ns as f64 / TICKS as f64 / 1000.,
-            ns as f64 / TICKS as f64 / 3000.
+            ns as f64 / TICKS as f64 / 3000.,
+            allocations / TICKS,
+            bytes / TICKS,
         );
     }
+    println!(
+        "total allocations including between-tick churn: {}",
+        allocations
+    );
     for (step, ms) in elapsed_steps {
         println!("{step}: elapsed_ms/tick={:.3}", ms / TICKS as f64);
     }

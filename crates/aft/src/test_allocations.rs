@@ -70,6 +70,64 @@ pub(crate) fn count_bytes<T>(operation: impl FnOnce() -> T) -> (T, usize) {
     (result, ALLOCATION_BYTES.with(Cell::get))
 }
 
+/// Read the current thread's counters without starting a nested counting scope.
+pub(crate) fn snapshot() -> (usize, usize) {
+    (
+        ALLOCATION_COUNT.with(Cell::get),
+        ALLOCATION_BYTES.with(Cell::get),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod profile {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    thread_local! {
+        pub(crate) static STEPS: RefCell<Option<BTreeMap<&'static str, (u64, usize, usize)>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn cpu_ns() -> u64 {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+            0
+        );
+        time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+    }
+
+    pub(crate) struct Timer(Option<(u64, (usize, usize))>);
+
+    impl Timer {
+        pub(crate) fn new() -> Self {
+            Self(STEPS.with(|steps| {
+                steps
+                    .borrow()
+                    .is_some()
+                    .then(|| (cpu_ns(), super::snapshot()))
+            }))
+        }
+
+        pub(crate) fn mark(&mut self, step: &'static str) {
+            if let Some((previous, allocations)) = self.0 {
+                let now = cpu_ns();
+                let current = super::snapshot();
+                STEPS.with(|steps| {
+                    let mut steps = steps.borrow_mut();
+                    let entry = steps.as_mut().unwrap().entry(step).or_default();
+                    entry.0 += now - previous;
+                    entry.1 += current.0 - allocations.0;
+                    entry.2 += current.1 - allocations.1;
+                });
+                self.0 = Some((cpu_ns(), super::snapshot()));
+            }
+        }
+    }
+}
+
 /// Includes Rayon worker allocations; only use in isolated, single-test runs.
 pub(crate) fn count_process<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
     struct Guard;
