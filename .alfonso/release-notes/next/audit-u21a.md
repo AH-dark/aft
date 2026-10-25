@@ -1,0 +1,1 @@
+- Search caches recover from corrupt data and poisoned locks, and a slow embedding call now counts as one timeout instead of one per retry.
