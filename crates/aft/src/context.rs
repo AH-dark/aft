@@ -21420,7 +21420,11 @@ mod status_emitter_tests {
             .recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 5_000))
             .expect("the slow project's status build started");
         fast.status_emitter().signal(fast.build_status_snapshot());
-        let fast_frame = fast_rx.recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 2_000));
+        // The slow build stays gated until released below, so a fast status that
+        // waited for it would never arrive; a generous bound therefore cannot
+        // hide that bug. It only absorbs a loaded Windows runner, where the fast
+        // build alone has taken over 2 s.
+        let fast_frame = fast_rx.recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 10_000));
         // Release before asserting, so a failure does not leave the shared
         // status machinery blocked for other tests.
         let _ = gate.release.send(());
