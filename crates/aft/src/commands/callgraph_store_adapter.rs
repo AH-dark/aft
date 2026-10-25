@@ -3806,6 +3806,102 @@ mod trace_to_tests {
     }
 
     #[test]
+    fn reverse_replies_batch_all_boundary_symbols_once() {
+        for width in [2, 20] {
+            for depth in [1, 5, 100] {
+                let (mut store, target) = layered_store(width, depth + 1);
+                let first = store.nodes[&("layer_1_0.ts".into(), "layer_1_0".into())].clone();
+                // The layered fanout supplies diamond joins; this back edge
+                // makes revisiting an already expanded symbol unavoidable.
+                store.add_caller(&first, &target);
+                for include_tests in [false, true] {
+                    for op in ["callers", "impact"] {
+                        store.reset_query_counts();
+                        let (depth_limited, truncated) = if op == "callers" {
+                            let reply = callers_result(
+                                &store,
+                                Path::new(&target.file),
+                                &target.symbol,
+                                depth,
+                                include_tests,
+                            )
+                            .unwrap();
+                            (reply.depth_limited, reply.truncated)
+                        } else {
+                            let reply = impact_result(
+                                &store,
+                                Path::new(&target.file),
+                                &target.symbol,
+                                depth,
+                                include_tests,
+                            )
+                            .unwrap();
+                            (reply.depth_limited, reply.truncated)
+                        };
+                        assert!(depth_limited);
+                        // At depth one this back edge lies beyond the boundary,
+                        // so it adds one to the omitted count.
+                        assert_eq!(truncated, width * width + usize::from(depth == 1));
+                        assert_eq!(store.total_caller_queries(), 0);
+                        assert_eq!(store.total_caller_frontier_queries(), depth);
+                        assert_eq!(
+                            store.caller_frontier_target_count(),
+                            1 + width * (depth - 1)
+                        );
+                        assert_eq!(
+                            store.total_caller_count_queries(),
+                            1,
+                            "{op}: width={width}, depth={depth}, include_tests={include_tests}"
+                        );
+                        assert_eq!(store.caller_count_target_count(), width);
+                        println!(
+                            "{op}: width={width}, depth={depth}, include_tests={include_tests}: boundary_calls=1 boundary_targets={width} frontier_calls={depth} omitted={truncated}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reverse_replies_preserve_diamond_cycle_and_hidden_test_json() {
+        let mut store = CountingStore::new();
+        let target = node("target", false);
+        let alpha = node("alpha", false);
+        let beta = node("beta", false);
+        let shared = node("shared", false);
+        let test = StoreNode::for_test("shared.test.ts", "test", true);
+        let entry = node("entry", true);
+        for item in [&target, &alpha, &beta, &shared, &test, &entry] {
+            store.add_node(item.clone());
+        }
+        // Reverse insertion order and a duplicate exercise output sorting and
+        // site deduplication independently of traversal order.
+        store.add_caller_at(&target, &beta, 3);
+        store.add_caller_at(&target, &alpha, 2);
+        store.add_caller_at(&target, &alpha, 2);
+        store.add_caller_at(&alpha, &shared, 4);
+        store.add_caller_at(&beta, &shared, 4);
+        store.add_caller_at(&shared, &target, 1);
+        store.add_caller_at(&shared, &entry, 5);
+        store.add_caller_at(&alpha, &test, 6);
+        store.add_caller_at(&test, &entry, 5);
+
+        let callers = callers_result(&store, Path::new(&target.file), &target.symbol, 2, false)
+            .expect("callers result");
+        assert_eq!(
+            serde_json::to_string(&callers).unwrap(),
+            r#"{"symbol":"target","file":"target.ts","callers":[{"file":"alpha.ts","callers":[{"symbol":"alpha","line":2}]},{"file":"beta.ts","callers":[{"symbol":"beta","line":3}]},{"file":"shared.ts","callers":[{"symbol":"shared","line":4},{"symbol":"shared","line":4}]}],"total_callers":5,"hidden_test_callers":1,"scanned_files":6,"depth_limited":true,"truncated":3,"callers_list_envelope":{"shown":4,"total":{"kind":"at_least","value":4},"unit":"items","reason":"depth","causes":["depth"],"narrow":["depth","includeTests"]}}"#
+        );
+        let impact = impact_result(&store, Path::new(&target.file), &target.symbol, 2, false)
+            .expect("impact result");
+        assert_eq!(
+            serde_json::to_string(&impact).unwrap(),
+            r#"{"symbol":"target","file":"target.ts","parameters":[],"total_affected":5,"hidden_test_callers":1,"affected_files":3,"callers":[{"caller_symbol":"alpha","caller_file":"alpha.ts","line":2,"is_entry_point":false,"parameters":[]},{"caller_symbol":"beta","caller_file":"beta.ts","line":3,"is_entry_point":false,"parameters":[]},{"caller_symbol":"shared","caller_file":"shared.ts","line":4,"is_entry_point":false,"parameters":[]},{"caller_symbol":"shared","caller_file":"shared.ts","line":4,"is_entry_point":false,"parameters":[]}],"depth_limited":true,"truncated":3,"sites_list_envelope":{"shown":4,"total":{"kind":"at_least","value":4},"unit":"sites","reason":"depth","causes":["depth"],"narrow":["depth","includeTests"]}}"#
+        );
+    }
+
+    #[test]
     fn callers_reexpand_a_symbol_reached_later_at_a_shallower_depth() {
         let mut store = CountingStore::new();
         let target = node("target", false);
