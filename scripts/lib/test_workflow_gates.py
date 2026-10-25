@@ -858,6 +858,24 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertLess(warm, keychain)
         self.assertIn("extract_nextest_archive_for_prewarm", GATE_TEXT[prewarm_start:keychain])
         self.assertIn("AFT_NEXTEST_ARCHIVE_BIN_FILE", GATE_TEXT[prewarm_start:keychain])
+        extract_helper = GATE_TEXT[GATE_TEXT.index("extract_nextest_archive_for_prewarm() {"):prewarm_start]
+        self.assertLess(extract_helper.index('df -h "$extract_to"'), extract_helper.index("cargo nextest list"))
+
+    def test_macos_libtest_downloads_verify_before_extract(self) -> None:
+        suite = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/_unit-suite.yml"))
+        for job in ("unit-macos-libtest-shard", "unit-macos-inventory-proof"):
+            steps = suite["jobs"][job]["steps"]
+            consumer = next(index for index, step in enumerate(steps) if step.get("run") in (
+                "./scripts/rust-test-gate.sh", "python3 scripts/rust-test-inventory-proof.py",
+            ))
+            for artifact, archive in (("macos-libtest-archive", "macos-libtest-nextest.tar.zst"),
+                                      ("macos-bin-archive", "macos-bin-nextest.tar.zst")):
+                download = next(step for step in steps if step.get("with", {}).get("name") == artifact)
+                with self.subTest(job=job, artifact=artifact):
+                    self.assertEqual(download["uses"], DOWNLOAD_RETRY)
+                    self.assertEqual(download["with"].get("verify-zstd"), archive)
+                    self.assertNotIn("continue-on-error", download)
+                    self.assertLess(steps.index(download), consumer)
 
     def test_macos_backtrace_probe_runs_once_in_archive_builder_not_shards(self) -> None:
         probe = "cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists"
@@ -1112,6 +1130,31 @@ class ArtifactRetryTests(unittest.TestCase):
         ):
             self.assertIn(expected, files)
 
+    def test_download_verification_rejects_a_truncated_zstd_frame(self) -> None:
+        document = workflow_gates.parse_workflow(str(_local_target(DOWNLOAD_RETRY)))
+        steps = document["runs"]["steps"]
+        verifications = [step for step in steps if str(step.get("id", "")).startswith("verify-")]
+        self.assertEqual(len(verifications), 3)
+        self.assertEqual([step.get("continue-on-error") for step in verifications], ["true", "true", None])
+        for index, verify in enumerate(verifications, 1):
+            with self.subTest(attempt=index):
+                self.assertEqual(verify["id"], f"verify-{index}")
+                self.assertIn(f"steps.attempt-{index}.outcome == 'success'", verify["if"])
+                self.assertIn("inputs.verify-zstd != ''", verify["if"])
+                self.assertEqual(verify["env"]["ARCHIVE_PATH"], "${{ inputs.path }}/${{ inputs.verify-zstd }}")
+                self.assertLess(steps.index(next(step for step in steps if step.get("id") == f"attempt-{index}")),
+                                steps.index(verify))
+                with tempfile.TemporaryDirectory() as temp:
+                    archive = Path(temp) / "archive with spaces.tar.zst"
+                    compressed = subprocess.run(["zstd", "-q", "-c"], input=b"nextest test executable" * 1000,
+                                                capture_output=True, check=True).stdout
+                    env = dict(os.environ, ARCHIVE_PATH=str(archive))
+                    for payload, valid in ((compressed, True), (compressed[:-1], False)):
+                        archive.write_bytes(payload)
+                        result = subprocess.run(["bash", "-c", verify["run"]], env=env,
+                                                text=True, capture_output=True, check=False)
+                        self.assertEqual(result.returncode == 0, valid, result.stdout + result.stderr)
+
     def test_required_check_artifact_steps_use_the_retrying_actions(self) -> None:
         wrappers = {str(_local_target(action).relative_to(REPO_ROOT)) for action in RETRY_ACTIONS}
         offenders = []
@@ -1157,22 +1200,28 @@ class ArtifactRetryTests(unittest.TestCase):
                 document = workflow_gates.parse_workflow(str(_local_target(action)))
                 self.assertEqual(document["runs"]["using"], "composite")
                 steps = document["runs"]["steps"]
-                kinds = ["attempt" if step.get("uses") == inner else step.get("run") for step in steps]
+                transfer_steps = [step for step in steps if not str(step.get("id", "")).startswith("verify-")]
+                kinds = ["attempt" if step.get("uses") == inner else step.get("run") for step in transfer_steps]
                 self.assertEqual(kinds, ["attempt", "sleep 60", "attempt", "sleep 120", "attempt"])
                 attempts = [step for step in steps if step.get("uses") == inner]
                 self.assertEqual([step["id"] for step in attempts], ["attempt-1", "attempt-2", "attempt-3"])
                 self.assertEqual(attempts[0]["if"], "${{ !cancelled() }}")
                 for index in (1, 2):
-                    retry_if = f"${{{{ !cancelled() && steps.attempt-{index}.outcome == 'failure' }}}}"
+                    failure = f"steps.attempt-{index}.outcome == 'failure'"
+                    if action == DOWNLOAD_RETRY:
+                        failure = f"({failure} || steps.verify-{index}.outcome == 'failure')"
+                    retry_if = f"${{{{ !cancelled() && {failure} }}}}"
                     self.assertEqual(attempts[index]["if"], retry_if)
-                    self.assertEqual(steps[2 * index - 1]["if"], retry_if)
-                    self.assertEqual(steps[2 * index - 1]["shell"], "bash")
+                    self.assertEqual(transfer_steps[2 * index - 1]["if"], retry_if)
+                    self.assertEqual(transfer_steps[2 * index - 1]["shell"], "bash")
                 # Only the last attempt may fail the action: that is what keeps
                 # a missing artifact failing the job.
                 self.assertEqual([step.get("continue-on-error") for step in attempts], ["true", "true", None])
                 inputs = document["inputs"]
                 for step in attempts:
                     for name in inputs:
+                        if name == "verify-zstd":
+                            continue
                         self.assertEqual(step["with"][name], f"${{{{ inputs.{name} }}}}")
                 if action == UPLOAD_RETRY:
                     self.assertEqual(inputs["if-no-files-found"]["default"], "warn")
