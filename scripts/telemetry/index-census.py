@@ -26,6 +26,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import DefaultDict, Iterable
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.index_event import index_event_root_matches
+
 
 # Exact sample: 2026-09-02T10:00:33Z [aft] [ses_f9e6fd934ffeTrgWkNC1ZDFQcg] callgraph cold-build decision: reason=corpus drift; action=force rebuild
 DECISION_RE = re.compile(r"callgraph cold-build decision: reason=(?P<reason>.+?); action=(?P<action>.+)$")
@@ -654,6 +657,7 @@ def main() -> int:
     selected_set = set(selected_roots)
     infos = [collect_shape(root, cache_roots[root], repo_by_root[root]) for root in selected_roots]
     stats = {root: RootStats() for root in selected_roots}
+    index_roots: dict[str, list[str]] = defaultdict(list)
     keys_to_roots: DefaultDict[str, list[str]] = defaultdict(list)
     primary_keys: DefaultDict[str, list[str]] = defaultdict(list)
     for root, record in cache_roots.items():
@@ -802,7 +806,15 @@ def main() -> int:
                 index_fields = parse_index_event_fields(line)
                 if index_fields:
                     pattern_counts["index_event"] += 1
-                    target = assign(clean_root(index_fields.get("root", "")) or event_root, "index_event")
+                    logged_root = index_fields.get("root", "")
+                    if logged_root not in index_roots:
+                        index_roots[logged_root] = [
+                            root for root in cache_roots
+                            if index_event_root_matches(logged_root, root)
+                        ]
+                    matches = index_roots[logged_root]
+                    matched_root = matches[0] if len(matches) == 1 else None
+                    target = assign(matched_root if logged_root else event_root, "index_event")
                     if target:
                         apply_index_event(target, index_fields)
                 if match := SLOW_WAITING_ON_RE.search(line):

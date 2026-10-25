@@ -1,0 +1,1 @@
+- Index timing and progress measurements now remain available in daemon logs even when project paths are long.
