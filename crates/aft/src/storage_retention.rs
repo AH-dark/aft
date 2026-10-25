@@ -94,6 +94,8 @@ pub(crate) struct SweepReport {
     /// Vanished-checkout view folders still due after this pass. Protected
     /// folders remain in this count so a stalled backlog is visible in health.
     pub due_views_remaining: usize,
+    /// Last background trash census, updated independently of the root sweep.
+    pub trash: TrashReport,
     /// The share of this pass spent on keys already past their grace.
     pub due_first: DomainReport,
     /// The share of this pass spent on view folders with no registry member
@@ -112,6 +114,30 @@ pub(crate) struct SweepReport {
     pub domains: BTreeMap<String, DomainReport>,
     /// Wall time by stage, including setup and blob work outside the root budget.
     pub timings_ms: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct TrashReport {
+    pub at_ms: u64,
+    /// Remaining entries and logical bytes observed by a bounded, no-follow walk.
+    pub entries: usize,
+    pub bytes_estimate: u64,
+    pub oldest_age_ms: Option<u64>,
+    pub removed_entries: usize,
+    /// The census could not examine all trash or measure every remaining tree.
+    pub incomplete: bool,
+    /// Counts kept entries, or deferred containers when admission or census failed.
+    pub kept_by_reason: BTreeMap<String, usize>,
+}
+
+impl TrashReport {
+    fn keep(&mut self, path: &Path, reason: &str, detail: impl std::fmt::Display) {
+        *self.kept_by_reason.entry(reason.into()).or_default() += 1;
+        crate::slog_warn!(
+            "storage retention trash={} retained reason={reason}: {detail}",
+            path.display()
+        );
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -181,6 +207,8 @@ struct State {
     /// cannot starve the ones after them.
     due_cursor: Option<String>,
     reaping: bool,
+    trash: TrashReport,
+    reaper_cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 pub(crate) fn startup_sweeps_ready(storage: &Path) -> bool {
@@ -2213,6 +2241,15 @@ fn validate_tree(
     deadline: Instant,
     measure: bool,
 ) -> io::Result<Vec<(PathBuf, u64)>> {
+    validate_tree_with_admission(cache, deadline, measure, &|| Ok(()))
+}
+
+fn validate_tree_with_admission(
+    cache: &Path,
+    deadline: Instant,
+    measure: bool,
+    admission: &dyn Fn() -> io::Result<()>,
+) -> io::Result<Vec<(PathBuf, u64)>> {
     #[cfg(test)]
     test_hook(cache, "walk");
     if !fs::symlink_metadata(cache)?.is_dir() {
@@ -2223,12 +2260,20 @@ fn validate_tree(
     let mut result = Vec::new();
     let mut examined = 0;
     while let Some(directory) = pending.pop() {
+        admission()?;
         if Instant::now() >= deadline {
             return Err(io::Error::other("retention deadline reached"));
         }
-        for entry in bounded_dirs(&directory, TREE_ENTRIES.saturating_sub(examined))? {
+        let mut entries = fs::read_dir(&directory)?;
+        loop {
+            admission()?;
             if Instant::now() >= deadline {
                 return Err(io::Error::other("retention deadline reached"));
+            }
+            let Some(entry) = entries.next() else { break };
+            let entry = entry?;
+            if examined >= TREE_ENTRIES {
+                return Err(io::Error::other("retention tree entry limit reached"));
             }
             examined += 1;
             let kind = entry.file_type()?;
@@ -2264,10 +2309,19 @@ struct RetirementWitness {
 fn retirement_members(
     directory: &crate::bash_background::persistence::PinnedDir,
 ) -> io::Result<BTreeMap<String, (u64, u64)>> {
-    let mut members = BTreeMap::new();
-    for name in directory.repair_names(
+    retirement_members_with_budget(
+        directory,
         &mut crate::bash_background::persistence::RepairBudget::with_entries(TREE_ENTRIES + 1),
-    )? {
+    )
+}
+
+fn retirement_members_with_budget(
+    directory: &crate::bash_background::persistence::PinnedDir,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+) -> io::Result<BTreeMap<String, (u64, u64)>> {
+    let mut members = BTreeMap::new();
+    for name in directory.repair_names(&mut budget.limited(TREE_ENTRIES + 1))? {
+        budget.entry()?;
         if name == RETIREMENT_WITNESS || name == ".retention-trash" {
             continue;
         }
@@ -2311,6 +2365,7 @@ fn verify_retirement_witness(
     storage: &StoragePaths,
     directory: &crate::bash_background::persistence::PinnedDir,
     nonce: &str,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
 ) -> io::Result<()> {
     use std::io::Read;
     let file = directory.repair_read_file(std::ffi::OsStr::new(RETIREMENT_WITNESS))?;
@@ -2332,7 +2387,7 @@ fn verify_retirement_witness(
     {
         return Err(io::Error::other("unverified retirement identity retained"));
     }
-    for (name, actual) in retirement_members(directory)? {
+    for (name, actual) in retirement_members_with_budget(directory, budget)? {
         if witness.members.get(&name) != Some(&actual) {
             return Err(io::Error::other("unverified retirement member retained"));
         }
@@ -2443,9 +2498,16 @@ fn retired_mount_point(cache: &Path) -> bool {
         })
 }
 
-/// Returns whether any recognizable tombstones could not be reclaimed. A busy
+/// Returns whether any trash remains or the census was incomplete. A busy
 /// mount-local snapshot also keeps the pending hint for a later reaper pass.
-fn reap_trash(storage: &StoragePaths, trash: &Path, mount_local: bool) -> io::Result<bool> {
+fn reap_trash(
+    storage: &StoragePaths,
+    trash: &Path,
+    mount_local: bool,
+    deadline: Instant,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+    report: &mut TrashReport,
+) -> io::Result<bool> {
     let entries = {
         // Snapshot mount-local tombstones under admission so a concurrent
         // retirement finishes moving entries before any of them are unlinked.
@@ -2456,7 +2518,11 @@ fn reap_trash(storage: &StoragePaths, trash: &Path, mount_local: bool) -> io::Re
                 Duration::ZERO,
             ) {
                 Ok(lease) => Some(lease),
-                Err(_) => return Ok(true),
+                Err(error) => {
+                    report.incomplete = true;
+                    report.keep(trash, "admission_busy", error);
+                    return Ok(true);
+                }
             }
         } else {
             None
@@ -2468,7 +2534,25 @@ fn reap_trash(storage: &StoragePaths, trash: &Path, mount_local: bool) -> io::Re
                         "foreign retention trash filesystem retained",
                     ));
                 }
-                entries.collect::<io::Result<Vec<_>>>()?
+                let mut snapshot = Vec::new();
+                let mut entries = entries;
+                loop {
+                    if let Err(error) = budget.entry() {
+                        report.incomplete = true;
+                        report.keep(trash, "enumeration_budget", error);
+                        break;
+                    }
+                    match entries.next() {
+                        Some(Ok(entry)) => snapshot.push(entry),
+                        Some(Err(error)) => {
+                            report.incomplete = true;
+                            report.keep(trash, "enumeration_error", error);
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                snapshot
             }
             Ok(_) => return Err(io::Error::other("non-directory retention trash retained")),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -2482,77 +2566,130 @@ fn reap_trash(storage: &StoragePaths, trash: &Path, mount_local: bool) -> io::Re
             Err(error) => return Err(error),
         }
     };
-    let protected = crate::root_cache::retention_protections(storage)?;
-    let parent = match crate::bash_background::persistence::PinnedDir::open(trash) {
-        Ok(parent) => parent,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    let mut pending = false;
-    for entry in entries {
+    if entries.is_empty() && !mount_local {
+        return Ok(report.incomplete);
+    }
+    let protected = crate::root_cache::retention_protections_with_budget(storage, budget);
+    let parent = crate::bash_background::persistence::PinnedDir::repair_open_path(
+        trash
+            .parent()
+            .ok_or_else(|| io::Error::other("missing trash parent"))?,
+    )
+    .and_then(|parent| parent.repair_child_same_mount(std::ffi::OsStr::new(".retention-trash")));
+    let mut pending = report.incomplete;
+    let mut entries = entries.into_iter();
+    while entries.len() != 0 {
+        if let Err(error) = budget.enter(0) {
+            pending = true;
+            report.incomplete = true;
+            report.keep(trash, "entry_budget", error);
+            break;
+        }
+        let entry = entries.next().unwrap();
+        report.entries += 1;
+        let path = entry.path();
+        let age = entry
+            .metadata()
+            .ok()
+            .map(|metadata| {
+                if metadata.is_dir() {
+                    fs::symlink_metadata(path.join(RETIREMENT_WITNESS)).unwrap_or(metadata)
+                } else {
+                    metadata
+                }
+            })
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+            .map(|age| age.as_millis().min(u64::MAX as u128) as u64);
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !name.strip_prefix("retired-").is_some_and(|nonce| {
-            nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }) {
-            continue;
-        }
-        let path = entry.path();
-        if mount_local && crate::cross_volume::is_mount_point(&path)? {
-            pending = true;
-            continue;
-        }
-        let child = parent.repair_child(entry.file_name().as_os_str())?;
-        let expected = child.directory_identity()?;
-        if let Err(error) = verify_retirement_witness(storage, &child, &name["retired-".len()..]) {
-            if child
-                .repair_names(
-                    &mut crate::bash_background::persistence::RepairBudget::with_entries(1),
-                )
-                .is_ok_and(|names| names.is_empty())
-            {
-                parent.repair_remove_child(
-                    entry.file_name().as_os_str(),
-                    expected,
-                    &protected,
-                    &mut 0,
-                )?;
-            } else {
-                pending = true;
-                crate::slog_warn!(
-                    "storage retention trash={} unverified retirement retained: {error}",
-                    path.display()
-                );
+        let mut bytes = 0;
+        let result = (|| -> Result<(), (&str, io::Error)> {
+            budget.enter(0).map_err(|error| ("budget", error))?;
+            // Measure only safe, same-filesystem trees. Measurements omit unsafe
+            // or unexamined trees and can precede a partially successful unlink.
+            let files = validate_tree_with_admission(&path, deadline, true, &|| budget.enter(0))
+                .map_err(|error| ("tree_guard", error))?;
+            bytes = files.iter().map(|(_, size)| *size).sum();
+            if !name.strip_prefix("retired-").is_some_and(|nonce| {
+                nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+                return Err(("foreign_name", io::Error::other("unrecognized trash entry")));
             }
-            continue;
-        }
-        // Check entry types and filesystem boundaries again after a restart;
-        // an unexpected symlink or mount must keep the trash, not be unlinked.
-        if let Err(error) = validate_tree(&path, Instant::now() + Duration::from_secs(60), false) {
-            pending = true;
-            crate::slog_warn!(
-                "storage retention trash={} retained: {error}",
-                path.display()
+            if mount_local
+                && crate::cross_volume::is_mount_point(&path)
+                    .map_err(|error| ("mount_guard", error))?
+            {
+                return Err(("mount_guard", io::Error::other("foreign trash mount")));
+            }
+            let parent = parent
+                .as_ref()
+                .map_err(|error| ("open_parent", io::Error::other(error.to_string())))?;
+            let child = parent
+                .repair_child(entry.file_name().as_os_str())
+                .map_err(|error| ("open_child", error))?;
+            child
+                .repair_check_boundary(parent, &[])
+                .map_err(|error| ("mount_guard", error))?;
+            let expected = child
+                .directory_identity()
+                .map_err(|error| ("identity", error))?;
+            verify_retirement_witness(storage, &child, &name["retired-".len()..], budget)
+                .map_err(|error| ("witness", error))?;
+            let protected = protected
+                .as_ref()
+                .map_err(|error| ("protections", io::Error::other(error.to_string())))?;
+            #[cfg(test)]
+            test_hook(&storage.artifacts, "reap-root");
+            let mut warnings = Vec::new();
+            let result = parent.repair_remove_child_with_budget(
+                entry.file_name().as_os_str(),
+                expected,
+                protected,
+                &mut 0,
+                &mut warnings,
+                budget,
             );
-            continue;
-        }
-        #[cfg(test)]
-        test_hook(&storage.artifacts, "reap-root");
-        if let Err(error) =
-            parent.repair_remove_child(entry.file_name().as_os_str(), expected, &protected, &mut 0)
-        {
+            for warning in warnings {
+                crate::slog_warn!("{warning}");
+            }
+            result.map_err(|error| ("unlink_guard", error))?;
+            match parent.repair_child(entry.file_name().as_os_str()) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(("unlink_status", error)),
+                Ok(_) => Err((
+                    "unlink_pending",
+                    io::Error::other("directory still present after unlink"),
+                )),
+            }
+        })();
+        if let Err((reason, error)) = result {
             pending = true;
-            crate::slog_warn!(
-                "storage retention trash={} unlink deferred: {error}",
-                path.display()
-            );
+            report.incomplete |= bytes == 0;
+            report.bytes_estimate = report.bytes_estimate.saturating_add(bytes);
+            if let Some(age) = age {
+                report.oldest_age_ms = Some(report.oldest_age_ms.unwrap_or(0).max(age));
+            }
+            report.keep(&path, reason, error);
+        } else {
+            report.entries -= 1;
+            report.removed_entries += 1;
         }
     }
     if mount_local {
         // Never recursively delete the container: a concurrent retirement may
         // have populated it since the snapshot. An empty-directory unlink is
         // safe outside admission and leaves any new tombstones for a later pass.
-        let _ = fs::remove_dir(trash);
+        match fs::remove_dir(trash) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                pending = true;
+                report.incomplete = true;
+                report.keep(trash, "container_not_empty", error);
+            }
+            Err(error) => return Err(error),
+        }
         // Flush the remaining container's unlinks, then the container's own
         // deletion in its mount-local parent before clearing the durable hint.
         match crate::durability::sync_dir(trash) {
@@ -2566,11 +2703,58 @@ fn reap_trash(storage: &StoragePaths, trash: &Path, mount_local: bool) -> io::Re
 }
 
 fn reap_retired(storage: &StoragePaths) -> io::Result<()> {
+    let cancelled = states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&storage.artifacts)
+        .and_then(|state| state.reaper_cancelled.clone())
+        .unwrap_or_else(|| Arc::new(|| false));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut budget = crate::bash_background::persistence::RepairBudget::until(deadline, cancelled);
+    let mut report = TrashReport {
+        at_ms: crate::pins::now_ms(),
+        ..Default::default()
+    };
+    let result = reap_retired_with_budget(storage, deadline, &mut budget, &mut report);
+    if let Err(error) = &result {
+        report.incomplete = true;
+        if report.kept_by_reason.is_empty() {
+            report.keep(&storage.artifacts, "reaper_pass", error);
+        }
+    }
+    crate::slog_info!(
+        "storage retention trash root={} report={}",
+        storage.artifacts.display(),
+        serde_json::to_string(&report).unwrap_or_default()
+    );
+    let mut states = states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = states.entry(storage.artifacts.clone()).or_default();
+    state.trash = report.clone();
+    if let Some(sweep) = &mut state.report {
+        sweep.trash = report;
+    }
+    result
+}
+
+fn reap_retired_with_budget(
+    storage: &StoragePaths,
+    deadline: Instant,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+    report: &mut TrashReport,
+) -> io::Result<()> {
+    crate::root_cache::check_cache_access(&storage.artifacts)?;
+    if !crate::root_cache::storage_allows_root_keyed(&storage.durable)? {
+        return Err(io::Error::other("network storage retained"));
+    }
     // Different daemon processes may discover the same tombstones. This lock
     // is separate from admission: slow unlinks must not block binds or pins.
-    let _lease =
-        crate::fs_lock::try_acquire(&storage.durable.join("retention/reap.lock"), Duration::ZERO)
-            .map_err(|error| io::Error::other(error.to_string()))?;
+    let lock = storage.durable.join("retention/reap.lock");
+    let _lease = crate::fs_lock::try_acquire(&lock, Duration::ZERO).map_err(|error| {
+        report.keep(&lock, "reap_lock", &error);
+        io::Error::other(error.to_string())
+    })?;
     let marker = storage.durable.join("retention/mount-trash-pending");
     let mount_scan = match fs::read(&marker) {
         Ok(generation) => Some(generation),
@@ -2579,10 +2763,16 @@ fn reap_retired(storage: &StoragePaths) -> io::Result<()> {
     };
     let mut mount_trash_pending = false;
     for (domain, flat) in domain_paths(storage)? {
+        budget.enter(0)?;
         if flat {
             continue;
         }
-        reap_trash(storage, &domain.join(".retention-trash"), false)?;
+        let trash = domain.join(".retention-trash");
+        if let Err(error) = reap_trash(storage, &trash, false, deadline, budget, report) {
+            report.incomplete = true;
+            report.keep(&trash, "trash_container", &error);
+            return Err(error);
+        }
         if mount_scan.is_none() {
             continue;
         }
@@ -2591,7 +2781,10 @@ fn reap_retired(storage: &StoragePaths) -> io::Result<()> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        for entry in entries {
+        let mut entries = entries;
+        loop {
+            budget.entry()?;
+            let Some(entry) = entries.next() else { break };
             let entry = entry?;
             let cache = entry.path();
             if !key_valid(&entry.file_name().to_string_lossy()) || !entry.file_type()?.is_dir() {
@@ -2606,7 +2799,15 @@ fn reap_retired(storage: &StoragePaths) -> io::Result<()> {
                 Err(error) => return Err(error),
             };
             if mounted {
-                mount_trash_pending |= reap_trash(storage, &cache.join(".retention-trash"), true)?;
+                let trash = cache.join(".retention-trash");
+                match reap_trash(storage, &trash, true, deadline, budget, report) {
+                    Ok(pending) => mount_trash_pending |= pending,
+                    Err(error) => {
+                        report.incomplete = true;
+                        report.keep(&trash, "trash_container", &error);
+                        return Err(error);
+                    }
+                }
             }
         }
     }
@@ -2618,6 +2819,7 @@ fn reap_retired(storage: &StoragePaths) -> io::Result<()> {
                 &storage.durable.join("retention/sweep.lock"),
                 Duration::ZERO,
             ) else {
+                report.keep(&marker, "marker_admission_busy", "sweep admission is busy");
                 return Ok(());
             };
             // Retirements publish under the same sweep.lock held by _admission.
@@ -2628,7 +2830,14 @@ fn reap_retired(storage: &StoragePaths) -> io::Result<()> {
                     fs::remove_file(&marker)?;
                     crate::durability::sync_dir(&storage.durable.join("retention"))?;
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    report.incomplete = true;
+                    report.keep(
+                        &marker,
+                        "marker_generation_changed",
+                        "a concurrent retirement published more trash",
+                    );
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
@@ -3955,17 +4164,17 @@ fn run_pass_with_budget(
         report
             .timings_ms
             .insert("roots".into(), phase.elapsed().as_millis() as u64);
-        // A stopped pass leaves pending mount trash for a later pass instead
-        // of starting new mount scans and unlinks after cancellation or expiry.
-        if !report.cancelled && !cancelled() && clock() < deadline {
-            schedule_reaper(storage);
-        }
         Ok(())
     })();
     if let Err(error) = result {
         if error.kind() != io::ErrorKind::Interrupted {
             report.errors.push(error.to_string());
         }
+    }
+    // Trash is already detached from live caches. Its independent deadline and
+    // lock must not depend on how much of the root sweep's budget remains.
+    if !report.cancelled && !cancelled() {
+        schedule_reaper(storage);
     }
     // Blob stores have their own mark-before-sweep barrier. Release the root
     // barrier before entering it; otherwise pin admission would deadlock.
@@ -4000,6 +4209,7 @@ fn run_pass_with_budget(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let state = states.entry(storage.artifacts.clone()).or_default();
+    report.trash = state.trash.clone();
     if report.cancelled {
         state.last_run = None;
     }
@@ -4694,6 +4904,324 @@ fn record_v3_removal(domain: &mut DomainReport, bytes: Option<u64>) {
 
 #[cfg(test)]
 mod storage_retention_tests {
+    fn retired_view_fixture() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("retention")).unwrap();
+        let view = temp.path().join("views/0123456789abcdef");
+        fs::create_dir_all(&view).unwrap();
+        for name in [
+            "derived-abc.sqlite",
+            "derived-abc.sqlite-shm",
+            "derived-abc.sqlite-wal",
+            "derived-abc.ref",
+            "cache.lock",
+        ] {
+            fs::write(view.join(name), b"retired payload").unwrap();
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .open(view.join("derived-abc.sqlite"))
+            .unwrap()
+            .set_len(1_500_000_000)
+            .unwrap();
+        retire_directory(temp.path(), &view).unwrap();
+        let retired = fs::read_dir(temp.path().join("views/.retention-trash"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        (temp, retired)
+    }
+
+    #[test]
+    fn retention_trash_real_view_shape_is_reaped() {
+        let (temp, retired) = retired_view_fixture();
+        reap_retired(temp.path()).unwrap();
+        assert!(
+            !retired.exists(),
+            "a verified 1.5 GB view must be reclaimed"
+        );
+    }
+
+    #[test]
+    fn retention_trash_expired_sweep_still_reaps_verified_view() {
+        let (temp, retired) = retired_view_fixture();
+        fs::create_dir(temp.path().join("views/ffffffffffffffff")).unwrap();
+        let report = run_pass_with_budget(
+            temp.path(),
+            &|| false,
+            &|| Instant::now() + NO_TIME_BOUND * 2,
+            NO_TIME_BOUND,
+        );
+        assert!(report.stopped_early, "{report:?}");
+        let until = Instant::now() + Duration::from_secs(10);
+        while reaper_running_for_test(temp.path()) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !retired.exists(),
+            "expired sweep must still launch trash reclaim"
+        );
+        assert_eq!(trash_report(temp.path()).removed_entries, 1);
+    }
+
+    fn trash_report(storage: &Path) -> TrashReport {
+        states()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(storage)
+            .unwrap()
+            .trash
+            .clone()
+    }
+
+    fn assert_trash_kept_once(storage: &Path, entry: &Path, reason: &'static str) -> TrashReport {
+        let (result, logs) = crate::logging::capture_log_lines(|| reap_retired(storage));
+        if let Err(error) = result {
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        }
+        let report = trash_report(storage);
+        assert!(entry.exists(), "guard {reason} removed the entry");
+        assert_eq!(report.entries, 1, "{report:?}");
+        assert_eq!(report.removed_entries, 0, "{report:?}");
+        assert_eq!(report.kept_by_reason.get(reason), Some(&1), "{report:?}");
+        let warning = format!(
+            "storage retention trash={} retained reason={reason}:",
+            entry.display()
+        );
+        assert_eq!(
+            logs.iter().filter(|line| line.contains(&warning)).count(),
+            1,
+            "one retention warning per kept entry: {logs:?}"
+        );
+        report
+    }
+
+    #[test]
+    fn retention_trash_guard_missing_witness_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        fs::remove_file(retired.join(RETIREMENT_WITNESS)).unwrap();
+        let report = assert_trash_kept_once(temp.path(), &retired, "witness");
+        assert!(report.bytes_estimate >= 1_500_000_000, "{report:?}");
+        assert!(report.oldest_age_ms.is_some(), "{report:?}");
+    }
+
+    #[test]
+    fn retention_trash_guard_foreign_owner_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        let path = retired.join(RETIREMENT_WITNESS);
+        let mut witness: RetirementWitness = read_json(&path).unwrap();
+        witness.owner = (0, 0);
+        fs::write(path, serde_json::to_vec(&witness).unwrap()).unwrap();
+        assert_trash_kept_once(temp.path(), &retired, "witness");
+    }
+
+    fn change_witness(entry: &Path, change: impl FnOnce(&mut RetirementWitness)) {
+        let path = entry.join(RETIREMENT_WITNESS);
+        let mut witness: RetirementWitness = read_json(&path).unwrap();
+        change(&mut witness);
+        fs::write(path, serde_json::to_vec(&witness).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn retention_trash_guard_witness_nonce() {
+        let (temp, retired) = retired_view_fixture();
+        change_witness(&retired, |witness| witness.nonce = "foreign".into());
+        assert_trash_kept_once(temp.path(), &retired, "witness");
+    }
+
+    #[test]
+    fn retention_trash_guard_witness_directory_identity() {
+        let (temp, retired) = retired_view_fixture();
+        change_witness(&retired, |witness| witness.directory = (0, 0));
+        assert_trash_kept_once(temp.path(), &retired, "witness");
+    }
+
+    #[test]
+    fn retention_trash_guard_witness_version() {
+        let (temp, retired) = retired_view_fixture();
+        change_witness(&retired, |witness| witness.version = 2);
+        assert_trash_kept_once(temp.path(), &retired, "witness");
+    }
+
+    #[test]
+    fn retention_trash_guard_changed_member_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        fs::write(retired.join("unwitnessed.sqlite"), b"foreign").unwrap();
+        assert_trash_kept_once(temp.path(), &retired, "witness");
+    }
+
+    #[test]
+    fn retention_trash_guard_foreign_name_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        let foreign = retired.with_file_name("foreign-view");
+        fs::rename(retired, &foreign).unwrap();
+        assert_trash_kept_once(temp.path(), &foreign, "foreign_name");
+    }
+
+    #[test]
+    fn retention_trash_guard_unverified_empty_directory_is_kept() {
+        let (temp, retired) = retired_view_fixture();
+        fs::remove_dir_all(&retired).unwrap();
+        fs::create_dir(&retired).unwrap();
+        assert_trash_kept_once(temp.path(), &retired, "witness");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_trash_guard_symlink_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        let canary = temp.path().join("canary");
+        fs::write(&canary, b"must survive").unwrap();
+        std::os::unix::fs::symlink(&canary, retired.join("symlink")).unwrap();
+        assert_trash_kept_once(temp.path(), &retired, "tree_guard");
+        assert_eq!(fs::read(canary).unwrap(), b"must survive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_trash_guard_protected_directory_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        std::os::unix::fs::symlink(&retired, temp.path().join("durable-alias")).unwrap();
+        assert_trash_kept_once(temp.path(), &retired, "unlink_guard");
+        assert!(retired.join("derived-abc.sqlite").exists());
+    }
+
+    #[test]
+    fn retention_trash_guard_foreign_filesystem_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        let nested = retired.join("foreign-mount");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("canary"), b"foreign").unwrap();
+        let _mount = crate::walk_boundary::simulated_volumes::simulate(&nested, u64::MAX - 21);
+        assert_trash_kept_once(temp.path(), &retired, "tree_guard");
+        assert!(nested.join("canary").exists());
+    }
+
+    #[test]
+    fn retention_trash_guard_reap_lock_is_reported_without_waiting() {
+        let (temp, retired) = retired_view_fixture();
+        let lock = temp.path().join("retention/reap.lock");
+        let _lease = crate::fs_lock::try_acquire(&lock, Duration::ZERO).unwrap();
+        assert!(reap_retired(temp.path()).is_err());
+        let report = trash_report(temp.path());
+        assert_eq!(report.kept_by_reason.get("reap_lock"), Some(&1));
+        assert!(report.incomplete);
+        assert!(retired.exists());
+    }
+
+    #[test]
+    fn retention_trash_guard_deadline_and_cancellation_bound_the_iterator() {
+        let (temp, retired) = retired_view_fixture();
+        for cancelled in [false, true] {
+            let deadline = if cancelled {
+                Instant::now() + Duration::from_secs(60)
+            } else {
+                Instant::now()
+            };
+            let mut budget = crate::bash_background::persistence::RepairBudget::until(
+                deadline,
+                Arc::new(move || cancelled),
+            );
+            let mut report = TrashReport::default();
+            assert!(reap_trash(
+                &StoragePaths::same(temp.path()),
+                retired.parent().unwrap(),
+                false,
+                deadline,
+                &mut budget,
+                &mut report
+            )
+            .unwrap());
+            assert_eq!(
+                report.kept_by_reason.get("enumeration_budget"),
+                Some(&1),
+                "{report:?}"
+            );
+            assert!(report.incomplete);
+            assert!(retired.join("derived-abc.sqlite").exists());
+        }
+    }
+
+    #[test]
+    fn retention_trash_guard_cancellation_before_unlink() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (temp, retired) = retired_view_fixture();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let observed = cancelled.clone();
+        states()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(temp.path().to_path_buf())
+            .or_default()
+            .reaper_cancelled = Some(Arc::new(move || observed.load(Ordering::SeqCst)));
+        let _hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "reap-root" {
+                    cancelled.store(true, Ordering::SeqCst);
+                }
+            }),
+        );
+        assert_trash_kept_once(temp.path(), &retired, "unlink_guard");
+        assert!(retired.join("derived-abc.sqlite").exists());
+    }
+
+    #[test]
+    fn retention_trash_guard_mount_admission_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        let _admission = barrier(temp.path()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        let trash = retired.parent().unwrap();
+        let (result, logs) = crate::logging::capture_log_lines(|| {
+            reap_trash(
+                &StoragePaths::same(temp.path()),
+                trash,
+                true,
+                deadline,
+                &mut budget,
+                &mut report,
+            )
+        });
+        assert!(result.unwrap());
+        assert_eq!(report.kept_by_reason.get("admission_busy"), Some(&1));
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.contains("retained reason=admission_busy:"))
+                .count(),
+            1
+        );
+        assert!(report.incomplete);
+        assert!(retired.exists());
+    }
+
+    #[test]
+    fn retention_trash_guard_mount_root_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        let _mount = crate::walk_boundary::simulated_volumes::simulate(&retired, u64::MAX - 22);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        assert!(reap_trash(
+            &StoragePaths::same(temp.path()),
+            retired.parent().unwrap(),
+            true,
+            deadline,
+            &mut budget,
+            &mut report
+        )
+        .unwrap());
+        assert_eq!(
+            report.kept_by_reason.get("mount_guard"),
+            Some(&1),
+            "{report:?}"
+        );
+        assert!(retired.join("derived-abc.sqlite").exists());
+    }
+
     #[test]
     fn bind_profile_separates_waits_from_publication() {
         let root = tempfile::tempdir().unwrap();
@@ -8308,11 +8836,15 @@ mod storage_retention_tests {
         assert!(cancel || report.stopped_early, "{report:?}");
         assert_eq!(
             launches.load(Ordering::SeqCst),
-            0,
-            "a cancelled or expired pass must not launch the reaper"
+            usize::from(!cancel),
+            "only cancellation, not root-budget expiry, prevents reaper launch"
         );
         assert_eq!(fs::read(&marker).unwrap(), generation);
         assert!(retired.join("payload.bin").exists());
+        let until = Instant::now() + Duration::from_secs(10);
+        while reaper_running_for_test(temp.path()) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         drop(hook);
         drop(reaper);
         reap_retired(temp.path()).unwrap();
@@ -8326,7 +8858,7 @@ mod storage_retention_tests {
     }
 
     #[test]
-    fn retention_expired_pass_does_not_launch_mount_trash_reaper() {
+    fn retention_expired_pass_launches_mount_trash_reaper() {
         stopped_pass_keeps_mount_trash(false);
     }
 
@@ -8428,14 +8960,28 @@ mod storage_retention_tests {
 
         crate::durability::take();
         reap_retired(temp.path()).unwrap();
-        assert!(!marker.exists(), "a durable reap clears the pending marker");
+        assert_eq!(
+            marker.exists(),
+            keep_container,
+            "unrecognized trash must remain discoverable after a durable reap"
+        );
         #[cfg(unix)]
         {
             let events = crate::durability::take();
             assert!(events.contains(&(crate::durability::EventKind::DirectorySync, path)));
             if keep_container {
-                assert!(events.contains(&(crate::durability::EventKind::DirectorySync, trash)));
+                assert!(
+                    events.contains(&(crate::durability::EventKind::DirectorySync, trash.clone()))
+                );
             }
+        }
+        if keep_container {
+            fs::remove_file(trash.join("unknown")).unwrap();
+            reap_retired(temp.path()).unwrap();
+            assert!(
+                !marker.exists(),
+                "only a clean durable reap clears the marker"
+            );
         }
     }
 
@@ -10170,6 +10716,11 @@ pub(crate) fn schedule(
         }
         state.running = true;
         state.last_run = Some(Instant::now());
+        let admission = admission.clone();
+        let generation = generation.clone();
+        state.reaper_cancelled = Some(Arc::new(move || {
+            !admission.is_current(&generation, expected)
+        }));
     }
     let key = storage.clone();
     if let Err(error) = std::thread::Builder::new()
