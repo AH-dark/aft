@@ -113,6 +113,13 @@ impl Daemon {
                                             continue;
                                         }
                                     };
+                                    // Slow-query tests withhold application replies, not transport
+                                    // liveness. Ignoring probes makes the SDK retire a healthy route.
+                                    if request.header.ty == FrameType::Ping {
+                                        let pong = Frame::build(FrameType::Pong, Flags::new(false, Priority::Interactive, false), 0, 0, request.header.corr, Vec::new()).unwrap();
+                                        subc_transport::write_frame(&mut stream, &pong).await.unwrap();
+                                        continue;
+                                    }
                                     if request.header.ty == FrameType::Goodbye {
                                         active -= 1;
                                         let mut count = counts.0.lock().unwrap();
@@ -263,18 +270,21 @@ impl Daemon {
     }
 
     fn wait_queries(&self, queries: usize) {
+        self.wait_queries_with_timeout(queries, Duration::from_secs(2));
+    }
+
+    fn wait_queries_with_timeout(&self, queries: usize, timeout: Duration) {
         let (counts, _) = self
             .counts
             .1
-            .wait_timeout_while(
-                self.counts.0.lock().unwrap(),
-                Duration::from_secs(2),
-                |counts| counts.queries < queries,
-            )
+            .wait_timeout_while(self.counts.0.lock().unwrap(), timeout, |counts| {
+                counts.queries < queries
+            })
             .unwrap();
         assert!(
             counts.queries >= queries,
-            "expected requests did not reach the wire"
+            "expected {queries} requests on the wire, received {}",
+            counts.queries
         );
     }
 
@@ -604,13 +614,161 @@ impl Drop for AttemptTimeout {
 }
 
 #[test]
+fn synapse_presend_deadlines_are_timeouts_and_count_once_per_call() {
+    let daemon = Daemon::start(1, false);
+    let mut client = SynapseEmbeddingClient::from_config(&daemon.config(0)).unwrap();
+    let shared = Arc::clone(&client.state.connection);
+    let original = shared
+        .runtime
+        .block_on(client.state.ensure_route())
+        .unwrap();
+    // SDK 0.31 has a fixed 1024-request route window. Unanswered requests
+    // retain all its permits, so subsequent attempts cannot send a body.
+    const ROUTE_WINDOW: usize = 1024;
+    let held = shared.runtime.block_on(async {
+        let mut held = Vec::new();
+        for _ in 0..ROUTE_WINDOW {
+            let connection = Arc::clone(&original);
+            held.push(tokio::spawn(async move {
+                connection
+                    .consumer
+                    .request(
+                        &connection.route,
+                        serde_json::to_vec(&json!({
+                            "method": QUERY_OPERATION, "params": {"text": "timeout"}
+                        }))
+                        .unwrap(),
+                        CallOptions {
+                            timeout: Duration::from_secs(3600),
+                            ..CallOptions::default()
+                        },
+                    )
+                    .await
+            }));
+        }
+        held
+    });
+    daemon.wait_queries_with_timeout(ROUTE_WINDOW, Duration::from_secs(30));
+    let _attempts = AttemptTimeout::set(Duration::from_secs(60));
+    let clock = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    for call in 0..CIRCUIT_TIMEOUT_THRESHOLD {
+        let result = clock.block_on(client.state.call(
+            QUERY_OPERATION,
+            json!({"text": "timeout"}),
+            Duration::from_secs(3600),
+        ));
+        if call + 1 < CIRCUIT_TIMEOUT_THRESHOLD {
+            assert!(
+                matches!(result, Err(SynapseEmbeddingError::Timeout(_))),
+                "call {call}: {result:?}"
+            );
+            assert!(client.state.circuit_open_until.is_none());
+        } else {
+            assert!(matches!(result, Err(SynapseEmbeddingError::CircuitOpen)));
+        }
+        assert_eq!(client.state.consecutive_timeouts, call + 1);
+        assert_eq!(daemon.counts.0.lock().unwrap().queries, ROUTE_WINDOW);
+    }
+    let current = shared
+        .runtime
+        .block_on(client.state.ensure_route())
+        .unwrap();
+    assert!(Arc::ptr_eq(&original, &current));
+    shared.runtime.block_on(async {
+        for request in held {
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+        }
+    });
+    drop(current);
+    drop(original);
+    drop(client);
+    drop(shared);
+    daemon.wait_closed();
+    daemon.finish();
+}
+
+#[test]
+fn synapse_stale_handle_before_send_retries_fresh_route_without_timeout() {
+    let daemon = Daemon::start(1, false);
+    let mut client = SynapseEmbeddingClient::from_config(&daemon.config(0)).unwrap();
+    let shared = Arc::clone(&client.state.connection);
+    let original = shared
+        .runtime
+        .block_on(client.state.ensure_route())
+        .unwrap();
+    // Capture a handle, then replace its transport before sending. The handle's
+    // connection token is now stale even though the channel and epoch match.
+    let consumer = shared
+        .runtime
+        .block_on(SubcConsumer::connect(
+            &daemon.path,
+            ConsumerOptions {
+                reconnect_backoff: subc_client_rs::RetryBackoff {
+                    max_attempts: 0,
+                    ..Default::default()
+                },
+                ..ConsumerOptions::default()
+            },
+        ))
+        .unwrap();
+    let stale = Arc::new(ActiveConnection {
+        consumer,
+        route: original.route.clone(),
+    });
+    let error = shared
+        .runtime
+        .block_on(stale.consumer.request(
+            &stale.route,
+            br#"{"method":"embed.query","params":{"text":"not-sent"}}"#.to_vec(),
+            CallOptions::default(),
+        ))
+        .unwrap_err();
+    assert!(matches!(error, CallError::StaleRouteHandle(_)), "{error:?}");
+    assert_eq!(daemon.counts.0.lock().unwrap().queries, 0);
+    *shared.runtime.block_on(shared.active.lock()) = Some(Arc::clone(&stale));
+    // One extra timeout would open the circuit instead of allowing recovery.
+    client.state.consecutive_timeouts = CIRCUIT_TIMEOUT_THRESHOLD - 1;
+    assert_eq!(
+        client
+            .embed_query("fresh-route", Duration::from_secs(10))
+            .unwrap(),
+        vec![1.0, 0.0]
+    );
+    assert_eq!(client.state.consecutive_timeouts, 0);
+    assert!(client.state.circuit_open_until.is_none());
+    let current = shared
+        .runtime
+        .block_on(client.state.ensure_route())
+        .unwrap();
+    assert!(!Arc::ptr_eq(&stale, &current));
+    {
+        let counts = daemon.counts.0.lock().unwrap();
+        assert_eq!(counts.connections, 3);
+        assert_eq!(counts.opens, 2);
+        assert_eq!(counts.queries, 1);
+    }
+    drop(current);
+    drop(stale);
+    drop(original);
+    drop(client);
+    drop(shared);
+    daemon.wait_closed();
+    daemon.finish();
+}
+
+#[test]
 fn synapse_attempt_deadlines_inside_one_call_count_one_timeout() {
     let daemon = Daemon::start(1, false);
     let mut client = SynapseEmbeddingClient::from_config(&daemon.config(0)).unwrap();
-    let attempts = AttemptTimeout::set(Duration::from_millis(50));
-    // Every attempt reaches the transport's own deadline, well inside the
-    // call's budget, so the call retries until its attempts run out.
-    let result = client.embed_query("timeout", Duration::from_secs(10));
+    // The daemon receives but never answers. Allow ample time for sending
+    // instead of racing a loaded runner's writer with a 50ms deadline.
+    let attempts = AttemptTimeout::set(Duration::from_secs(2));
+    let result = client.embed_query("timeout", Duration::from_secs(30));
     drop(attempts);
     assert!(
         matches!(result, Err(SynapseEmbeddingError::Timeout(_))),
@@ -639,9 +797,11 @@ fn synapse_attempt_deadlines_inside_one_call_count_one_timeout() {
 fn synapse_threshold_many_slow_calls_still_open_the_circuit() {
     let daemon = Daemon::start(1, false);
     let mut client = SynapseEmbeddingClient::from_config(&daemon.config(0)).unwrap();
-    let attempts = AttemptTimeout::set(Duration::from_millis(50));
+    // Keep the send budget generous; only the missing reply should expire it.
+    let attempts = AttemptTimeout::set(Duration::from_secs(2));
     for call in 0..CIRCUIT_TIMEOUT_THRESHOLD {
-        let result = client.embed_query("timeout", Duration::from_secs(10));
+        let queries = daemon.counts.0.lock().unwrap().queries;
+        let result = client.embed_query("timeout", Duration::from_secs(30));
         if call + 1 < CIRCUIT_TIMEOUT_THRESHOLD {
             assert!(
                 matches!(result, Err(SynapseEmbeddingError::Timeout(_))),
@@ -655,6 +815,15 @@ fn synapse_threshold_many_slow_calls_still_open_the_circuit() {
             );
         }
         assert_eq!(client.state.consecutive_timeouts, call + 1);
+        assert_eq!(
+            daemon.counts.0.lock().unwrap().queries - queries,
+            if call + 1 < CIRCUIT_TIMEOUT_THRESHOLD {
+                MAX_CALL_ATTEMPTS
+            } else {
+                1
+            },
+            "each attempt must reach the daemon before its deadline"
+        );
     }
     drop(attempts);
     assert!(client.state.circuit_open_until.is_some());
