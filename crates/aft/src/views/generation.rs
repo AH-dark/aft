@@ -408,7 +408,35 @@ impl ViewStore {
         &self,
     ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<[u8; 32]>>> {
         let mut result = std::collections::BTreeMap::new();
+        self.visit_blob_references(
+            super::reference_sidecar::global(),
+            &mut || Ok(()),
+            &mut |generation, keys| {
+                let mut all = vec![[0_u8; 32]; keys.len()];
+                keys.read(0, &mut all)?;
+                result.insert(generation.to_owned(), all.into_iter().collect());
+                Ok(())
+            },
+        )?;
+        Ok(result)
+    }
+
+    /// Show every published generation's referenced keys to `visit`, read
+    /// from each manifest's reference sidecar and derived from the JSON only
+    /// when the sidecar is missing or not valid for that manifest. `check`
+    /// runs before each directory entry so a caller's deadline or cancellation
+    /// stops the scan between files rather than after the whole view.
+    pub(crate) fn visit_blob_references(
+        &self,
+        sidecars: &super::reference_sidecar::ReferenceSidecars,
+        check: &mut dyn FnMut() -> std::io::Result<()>,
+        visit: &mut dyn FnMut(
+            &str,
+            &dyn super::reference_sidecar::SortedKeys,
+        ) -> std::io::Result<()>,
+    ) -> Result<()> {
         for entry in generation_directory_entries(self.view_dir(), GENERATION_DIRECTORY_LIMIT)? {
+            check()?;
             let name = entry.file_name();
             let Some(generation) = name
                 .to_str()
@@ -417,10 +445,14 @@ impl ViewStore {
             else {
                 continue;
             };
-            let keys = manifest_reference_keys(generation, &fs::read(entry.path())?)?;
-            result.insert(generation.to_owned(), keys);
+            sidecars.visit(
+                self.view_dir(),
+                generation,
+                |bytes| manifest_reference_keys(generation, bytes),
+                &mut |keys| visit(generation, keys),
+            )?;
         }
-        Ok(result)
+        Ok(())
     }
 
     /// Remove generation files only after checking both durable publication and
@@ -601,6 +633,10 @@ impl ViewStore {
                         .and_then(|name| name.strip_suffix(".json"))
                 })
                 .or_else(|| {
+                    name.strip_prefix("manifest-")
+                        .and_then(|name| name.strip_suffix(".keys"))
+                })
+                .or_else(|| {
                     name.strip_prefix("trigram-")
                         .and_then(|name| name.strip_suffix(".bin"))
                 })
@@ -666,6 +702,10 @@ impl ViewStore {
                 .or_else(|| {
                     name.strip_prefix("manifest-")
                         .and_then(|s| s.strip_suffix(".json"))
+                })
+                .or_else(|| {
+                    name.strip_prefix("manifest-")
+                        .and_then(|s| s.strip_suffix(".keys"))
                 })
                 .or_else(|| {
                     name.strip_prefix("trigram-")
@@ -959,6 +999,10 @@ impl ViewStore {
             Ok(self.view_dir().join(format!("derived-{generation}.ref"))),
             self.trigram_path(generation),
             self.manifest_path(generation),
+            super::validate_generation(generation).map(|()| {
+                self.view_dir()
+                    .join(super::reference_sidecar::sidecar_name(generation))
+            }),
         ]
         .into_iter()
         .flatten()
@@ -966,13 +1010,14 @@ impl ViewStore {
             if keep_derived
                 && (path
                     .extension()
-                    .is_some_and(|extension| extension == "sqlite")
+                    .is_some_and(|extension| extension == "sqlite" || extension == "keys")
                     || self
                         .manifest_path(generation)
                         .is_ok_and(|manifest| path == manifest))
             {
                 // The referenced database's manifest is the incremental clone
                 // baseline. Its trigram is not referenced and can be reclaimed.
+                // The manifest's reference sidecar stays with the manifest.
                 continue;
             }
             let suffixes = if path
@@ -3020,4 +3065,221 @@ mod storage_retention_tests {
         assert_eq!(view.sweep_generations().unwrap(), 1);
         assert!(!path.exists());
     }
+
+    type KeyMap = std::collections::BTreeMap<String, Vec<[u8; 32]>>;
+
+    /// A sidecar policy that trusts files immediately, so a test can replace a
+    /// manifest within the same second and still exercise sidecar reads.
+    fn eager_sidecars() -> super::super::reference_sidecar::ReferenceSidecars {
+        super::super::reference_sidecar::ReferenceSidecars::new(Duration::ZERO)
+    }
+
+    fn sidecar_scan(
+        view: &ViewStore,
+        sidecars: &super::super::reference_sidecar::ReferenceSidecars,
+    ) -> KeyMap {
+        let mut result = KeyMap::new();
+        view.visit_blob_references(sidecars, &mut || Ok(()), &mut |generation, keys| {
+            let mut all = vec![[0_u8; 32]; keys.len()];
+            keys.read(0, &mut all)?;
+            result.insert(generation.to_owned(), all);
+            Ok(())
+        })
+        .unwrap();
+        result
+    }
+
+    /// The reference implementation: read and decode every manifest.
+    fn uncached_scan(view: &ViewStore) -> KeyMap {
+        let mut result = KeyMap::new();
+        for entry in fs::read_dir(view.view_dir()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            let Some(generation) = name
+                .strip_prefix("manifest-")
+                .and_then(|name| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let keys = manifest_reference_keys(generation, &fs::read(entry.path()).unwrap())
+                .unwrap()
+                .into_iter()
+                .collect();
+            result.insert(generation.to_owned(), keys);
+        }
+        result
+    }
+
+    fn source(
+        view: &ViewStore,
+        sidecars: &super::super::reference_sidecar::ReferenceSidecars,
+        generation: &str,
+    ) -> super::super::reference_sidecar::KeySource {
+        sidecars
+            .visit(
+                view.view_dir(),
+                generation,
+                |bytes| manifest_reference_keys(generation, bytes),
+                &mut |_| Ok(()),
+            )
+            .unwrap()
+    }
+
+    /// Three entries with full-length keys: every manifest written here has
+    /// the same byte length, so only file identity can tell versions apart.
+    fn fixed_size_manifest(keys: [[u8; 32]; 3]) -> Vec<u8> {
+        let hex =
+            |key: [u8; 32]| -> String { key.iter().map(|byte| format!("{byte:02x}")).collect() };
+        crate::views::Manifest::new(["a.rs", "b.rs", "c.rs"].into_iter().zip(keys).map(
+            |(path, key)| {
+                (
+                    crate::views::RelPath::new(path.as_bytes().to_vec()).unwrap(),
+                    crate::views::ManifestEntry::Regular {
+                        mode: 0o100644,
+                        resolution_input: false,
+                        planes: crate::views::RegularPlanes {
+                            semantic: None,
+                            callgraph: Some(hex(key)),
+                        },
+                    },
+                )
+            },
+        ))
+        .unwrap()
+        .to_json_bytes()
+        .unwrap()
+    }
+
+    /// Replace through a rename, as an atomic writer would: the new file gets
+    /// a new inode while the old one still exists.
+    fn replace_manifest(view: &ViewStore, generation: &str, bytes: &[u8]) {
+        let staging = view.view_dir().join("staging.tmp");
+        fs::write(&staging, bytes).unwrap();
+        fs::rename(&staging, view.manifest_path(generation).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn reference_sidecar_follows_a_replaced_manifest_and_leaves_with_a_deleted_one() {
+        use super::super::reference_sidecar::KeySource;
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "reference-sidecar-replace").unwrap();
+        let sidecars = eager_sidecars();
+        replace_manifest(
+            &view,
+            "g",
+            &fixed_size_manifest([[1; 32], [2; 32], [3; 32]]),
+        );
+        assert_eq!(
+            source(&view, &sidecars, "g"),
+            KeySource::Decoded { written: true }
+        );
+        assert_eq!(source(&view, &sidecars, "g"), KeySource::Sidecar);
+        assert_eq!(
+            sidecar_scan(&view, &sidecars)["g"],
+            [[1; 32], [2; 32], [3; 32]]
+        );
+
+        replace_manifest(
+            &view,
+            "g",
+            &fixed_size_manifest([[4; 32], [5; 32], [6; 32]]),
+        );
+        assert_eq!(
+            sidecar_scan(&view, &sidecars)["g"],
+            [[4; 32], [5; 32], [6; 32]]
+        );
+        assert_eq!(source(&view, &sidecars, "g"), KeySource::Sidecar);
+
+        // A sidecar whose manifest is gone names no generation, and the
+        // generation sweep removes it with the rest of that generation.
+        let sidecar = view.view_dir().join("manifest-g.keys");
+        assert!(sidecar.is_file());
+        fs::remove_file(view.manifest_path("g").unwrap()).unwrap();
+        assert!(sidecar_scan(&view, &sidecars).is_empty());
+        assert!(view.has_superseded_artifacts().unwrap());
+        assert_eq!(view.sweep_generations().unwrap(), 1);
+        assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn reference_sidecar_scan_matches_uncached_decode_across_random_generation_churn() {
+        use super::super::reference_sidecar::KeySource;
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "reference-sidecar-churn").unwrap();
+        let sidecars = eager_sidecars();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut live: Vec<String> = Vec::new();
+        for round in 0..200 {
+            // Keys come from a small alphabet so generations often share sets.
+            let mut key = || [(next() % 6) as u8; 32];
+            let bytes = fixed_size_manifest([key(), key(), key()]);
+            match next() % 4 {
+                0 | 1 if live.len() < 8 => {
+                    let generation = format!("gen-{round}");
+                    replace_manifest(&view, &generation, &bytes);
+                    live.push(generation);
+                }
+                2 if !live.is_empty() => {
+                    let generation = live[next() as usize % live.len()].clone();
+                    replace_manifest(&view, &generation, &bytes);
+                }
+                _ if !live.is_empty() => {
+                    let generation = live.swap_remove(next() as usize % live.len());
+                    fs::remove_file(view.manifest_path(&generation).unwrap()).unwrap();
+                }
+                _ => {}
+            }
+            let expected = uncached_scan(&view);
+            assert_eq!(sidecar_scan(&view, &sidecars), expected, "round {round}");
+            // Every manifest now has a sidecar that the next scan reads.
+            for generation in expected.keys() {
+                assert_eq!(
+                    source(&view, &sidecars, generation),
+                    KeySource::Sidecar,
+                    "round {round} {generation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reference_scan_checks_its_deadline_before_every_manifest() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "reference-sidecar-deadline").unwrap();
+        for generation in ["a", "b", "c"] {
+            replace_manifest(&view, generation, &fixed_size_manifest([[7; 32]; 3]));
+        }
+        let sidecars = eager_sidecars();
+        let mut calls = 0;
+        let result = view.visit_blob_references(
+            &sidecars,
+            &mut || {
+                calls += 1;
+                if calls == 2 {
+                    Err(std::io::Error::other("deadline"))
+                } else {
+                    Ok(())
+                }
+            },
+            &mut |_, _| Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
+    }
+}
+
+/// Decode a manifest's reference keys straight from its JSON, for tests that
+/// compare sidecars against the reference implementation.
+#[cfg(test)]
+pub(crate) fn decode_reference_keys_for_test(
+    generation: &str,
+    bytes: &[u8],
+) -> Result<std::collections::BTreeSet<[u8; 32]>> {
+    manifest_reference_keys(generation, bytes)
 }

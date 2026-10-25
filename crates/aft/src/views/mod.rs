@@ -25,6 +25,14 @@ mod profile;
 #[cfg(test)]
 pub(crate) use profile::observe_publication_phases_for_test;
 pub(crate) mod read;
+pub(crate) mod reference_sidecar;
+
+/// Make every manifest reference sidecar be fully re-verified on its next use.
+/// Benchmarks use this to measure the cost the verification memo saves.
+#[doc(hidden)]
+pub fn forget_verified_reference_sidecars() {
+    reference_sidecar::global().forget_verified();
+}
 
 // Per-checkout (v2) view core: registry, manifests, snapshots, readiness,
 // trigram segments, the plane contracts and the parity harness.
@@ -1031,6 +1039,23 @@ impl ViewStore {
         timing.phase("closure_probe");
 
         write_manifest_once(&manifest_path, request.manifest)?;
+        // Blob GC reads this generation's keys from the sidecar instead of the
+        // JSON. A failure only means GC derives the sidecar from the JSON later.
+        let reference_keys = request
+            .manifest
+            .plane_keys()
+            .filter_map(|(_, key)| crate::blob_store::v2::parse_hex32(key))
+            .collect::<BTreeSet<_>>();
+        if let Err(error) =
+            reference_sidecar::write_published(&self.view_dir, request.generation, &reference_keys)
+        {
+            log::debug!(
+                "views: reference sidecar not written view={} generation={} error={error}",
+                self.view_dir.display(),
+                request.generation
+            );
+        }
+        drop(reference_keys);
         observe(observer, PublicationStep::ManifestFileWritten);
         sync_directory(&self.view_dir)?;
         observe(observer, PublicationStep::ManifestParentFsynced);
