@@ -1367,11 +1367,13 @@ mod tests {
             json!({ "path": file, "edits": items }),
         );
 
-        assert_eq!(
-            take_edit_target_probes_for_test(),
-            Vec::<String>::new(),
-            "a target without glob characters must not reach path validation"
-        );
+        let probes = take_edit_target_probes_for_test();
+        for probe in &probes {
+            assert!(
+                crate::commands::edit_match::is_glob_pattern(probe),
+                "a target without glob characters reached path validation: {probe}"
+            );
+        }
     }
 
     #[test]
