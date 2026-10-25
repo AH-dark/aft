@@ -684,7 +684,29 @@ impl Fixture {
             request["call_key"].as_str().unwrap(),
             json!({"state":"settled", "outcome":"allow_scope", "answered_by":"user"}),
         );
-        let allowed = self.read(&self.worker, &target, 202).await;
+        // The short budget only parks the unanswered call. Applying its answer
+        // needs the normal budget, including time on the blocking database pool.
+        set_hold_budget_for_test(None);
+        let received = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        install_test_transport(Some(Arc::new(ReceiptGate {
+            fake: Arc::clone(&self.fake),
+            received: Arc::clone(&received),
+            release: Arc::clone(&release),
+        })));
+        let mut replies = self.send_read(&self.worker, &target, 202).await;
+        // ReceiptGate signals after the receipt callback has applied the grant,
+        // not merely after the fake transport has returned an allow answer.
+        let applied = tokio::time::timeout(Duration::from_secs(10), received.notified()).await;
+        release.notify_one();
+        applied.expect("the scope grant is applied before continuing");
+        let allowed = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+            .await
+            .expect("the approved read ends with one terminal frame")
+            .expect("writer stays open");
+        let allowed: Value = serde_json::from_slice(&allowed.body).unwrap();
+        install_test_transport(Some(Arc::new(SharedFake(Arc::clone(&self.fake)))));
+        set_hold_budget_for_test(Some(Duration::from_millis(100)));
         assert!(text(&allowed).contains("head-owned contents"), "{allowed}");
     }
 }
