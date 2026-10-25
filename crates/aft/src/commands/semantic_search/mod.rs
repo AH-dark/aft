@@ -57,11 +57,11 @@ pub trait SearchLane: Send + Sync {
     fn plan_order_index(&self) -> usize {
         self.kind().default_plan_order_index()
     }
-    fn execute(&self, _input: &LaneInput<'_>) -> LaneExecution {
-        LaneExecution {
+    fn execute(&self, _input: &LaneInput<'_>) -> std::io::Result<LaneExecution> {
+        Ok(LaneExecution {
             kind: self.kind(),
             candidates: Vec::new(),
-        }
+        })
     }
 }
 
@@ -1298,11 +1298,12 @@ fn collect_pattern_list(
     pattern: &str,
 ) -> Result<split_query::PatternList, Response> {
     if let Some(collection) = regex_route_collection(ctx, compiled, include_tests) {
-        return Ok(split_query::PatternList::from_collection(
-            collection,
-            project_root,
-            pattern,
-        ));
+        return Ok(match collection {
+            Ok(collection) => {
+                split_query::PatternList::from_collection(collection, project_root, pattern)
+            }
+            Err(error) => split_query::PatternList::from_index_failure(pattern, error),
+        });
     }
     let scope = grep_executor::resolve_grep_scope(
         ctx,
@@ -1542,11 +1543,12 @@ fn handle_split_search<'a>(
         }
     };
     let patterns = match external {
-        Some(corpus) => split_query::PatternList::from_collection(
-            corpus.collect(compiled, include_tests),
-            project_root,
-            pattern,
-        ),
+        Some(corpus) => match corpus.collect(compiled, include_tests) {
+            Ok(collection) => {
+                split_query::PatternList::from_collection(collection, project_root, pattern)
+            }
+            Err(error) => split_query::PatternList::from_index_failure(pattern, error),
+        },
         None => {
             match collect_pattern_list(req, ctx, project_root, compiled, include_tests, pattern) {
                 Ok(patterns) => patterns,
@@ -1775,13 +1777,15 @@ fn handle_split_search<'a>(
         }),
     );
     disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
+    disclose_index_gaps(&ranked.index_disclosures, &mut text, &mut extras);
     if let Some(gaps) = &semantic.checkout_gaps {
         gaps.disclose(project_root, &mut text, &mut extras);
     }
     let partial = !semantic.served
         || semantic_gap.is_some()
         || semantic.checkout_gaps.is_some()
-        || !lexical_ready;
+        || !lexical_ready
+        || !ranked.index_disclosures.is_empty();
     // `status` uses the query-only words for the same lane state (see
     // `split_reply_status`); `complete` is false whenever any input was
     // bounded or a lane did not serve.
@@ -3095,7 +3099,7 @@ fn handle_external_grep_search(
 
     let literal = effective_mode == SearchMode::Literal;
     let fetch_limit = page_request.offset().saturating_add(top_k);
-    let mut result = search_index.snapshot().search_grep_bounded(
+    let mut result = match search_index.snapshot().search_grep_bounded(
         &compiled,
         &[],
         &[],
@@ -3104,7 +3108,10 @@ fn handle_external_grep_search(
         grep_path_exclusion(include_tests),
         grep_executor::MAX_FALLBACK_WALK_FILES,
         grep_executor::FALLBACK_WALK_BUDGET,
-    );
+    ) {
+        Ok(result) => result,
+        Err(error) => return Response::error(&req.id, "internal_error", error.to_string()),
+    };
     result
         .matches
         .retain(|grep_match| grep_match.file.is_file());
@@ -3416,6 +3423,7 @@ fn handle_external_semantic_or_hybrid_search(
     disclose_rerank_note(&ranked.rerank_note, &mut text);
     disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
     disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
+    disclose_index_gaps(&ranked.index_disclosures, &mut text, &mut extras);
 
     search_response(
         req,
@@ -3714,12 +3722,17 @@ fn handle_grep_search(
     // With a ready index, rank every file the trigram index admits before the
     // page is cut. Without one, the bounded grep scan below is all there is.
     let ranked = match external {
-        Some(corpus) => Some(rank_regex_collection(
-            corpus.collect(&compiled, include_tests),
-            project_root,
-            query,
-        )),
+        Some(corpus) => Some(
+            corpus
+                .collect(&compiled, include_tests)
+                .map(|collection| rank_regex_collection(collection, project_root, query)),
+        ),
         None => ranked_regex_route_result(ctx, project_root, &compiled, include_tests, query),
+    };
+    let ranked = match ranked {
+        Some(Ok(ranked)) => Some(ranked),
+        Some(Err(error)) => return Response::error(&req.id, "internal_error", error.to_string()),
+        None => None,
     };
     let (mut result, ranked_files, examination_note) = if let Some((ranked, note)) = ranked {
         (ranked.summary, Some(ranked.files), note)
@@ -3898,9 +3911,9 @@ fn ranked_regex_route_result(
     compiled: &pattern_compile::CompiledPattern,
     include_tests: bool,
     query: &str,
-) -> Option<(regex_route::RankedFiles, Option<String>)> {
+) -> Option<std::io::Result<(regex_route::RankedFiles, Option<String>)>> {
     let collection = regex_route_collection(ctx, compiled, include_tests)?;
-    Some(rank_regex_collection(collection, project_root, query))
+    Some(collection.map(|collection| rank_regex_collection(collection, project_root, query)))
 }
 
 fn rank_regex_collection(
@@ -3929,7 +3942,7 @@ fn regex_route_collection(
     ctx: &AppContext,
     compiled: &pattern_compile::CompiledPattern,
     include_tests: bool,
-) -> Option<crate::search_index::GrepFileCollection> {
+) -> Option<std::io::Result<crate::search_index::GrepFileCollection>> {
     let snapshot = {
         let guard = try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)?;
         let index = guard.as_ref()?;
@@ -4101,11 +4114,11 @@ impl SearchLane for PreparedEngineLane {
         self.kind
     }
 
-    fn execute(&self, _input: &LaneInput<'_>) -> LaneExecution {
-        LaneExecution {
+    fn execute(&self, _input: &LaneInput<'_>) -> std::io::Result<LaneExecution> {
+        Ok(LaneExecution {
             kind: self.kind,
             candidates: self.candidates.clone(),
-        }
+        })
     }
 }
 
@@ -4123,6 +4136,7 @@ struct EngineRanking {
     missing_on_disk: usize,
     anchored_admission: (usize, usize),
     exact_disclosures: Vec<String>,
+    index_disclosures: Vec<String>,
     /// Files the exact pass matched, before paging. A reply's notices use it to
     /// say what the exact pass found instead of assuming it found something.
     exact_match_files: usize,
@@ -4213,7 +4227,7 @@ fn literal_presence(
     generation: &GenerationToken,
     phrase: &str,
     exact_candidates: &[CandidateResult],
-) -> memo::LiteralPresence {
+) -> std::io::Result<memo::LiteralPresence> {
     let normalized = exact_lane::normalize_exact_phrase(phrase);
     let key = (
         project_root.to_path_buf(),
@@ -4222,8 +4236,8 @@ fn literal_presence(
     );
     let store = ctx.search_exact_memo();
     if let Some(entry) = store.literal_presence(&key) {
-        if literal_presence_still_holds(&entry, snapshot, phrase, project_root) {
-            return entry.presence;
+        if literal_presence_still_holds(&entry, snapshot, phrase, project_root)? {
+            return Ok(entry.presence);
         }
     }
     let entry = settle_literal_presence(
@@ -4232,10 +4246,10 @@ fn literal_presence(
         phrase,
         &normalized,
         exact_candidates,
-    );
+    )?;
     let presence = entry.presence;
     store.store_literal_presence(key, entry);
-    presence
+    Ok(presence)
 }
 
 /// Whether a kept answer still describes the files: the files it read are
@@ -4246,12 +4260,12 @@ fn literal_presence_still_holds(
     snapshot: &crate::search_index::SearchIndexSnapshot,
     phrase: &str,
     project_root: &Path,
-) -> bool {
+) -> std::io::Result<bool> {
     let unchanged = entry
         .read
         .iter()
         .all(|(path, stamp)| stamp.is_some() && file_stamp(path) == *stamp);
-    match entry.presence {
+    Ok(match entry.presence {
         // Making no claim is always safe, and repeating the same bounded
         // check on every page would cost each page what the first one did.
         memo::LiteralPresence::Undetermined => true,
@@ -4259,11 +4273,11 @@ fn literal_presence_still_holds(
         memo::LiteralPresence::Absent => {
             unchanged
                 && snapshot
-                    .files_possibly_holding_phrase(phrase, project_root)
+                    .files_possibly_holding_phrase(phrase, project_root)?
                     .as_ref()
                     == Some(&entry.candidates)
         }
-    }
+    })
 }
 
 /// Files read by one presence check, within its bounds.
@@ -4325,7 +4339,7 @@ fn settle_literal_presence(
     phrase: &str,
     normalized: &str,
     exact_candidates: &[CandidateResult],
-) -> memo::LiteralPresenceEntry {
+) -> std::io::Result<memo::LiteralPresenceEntry> {
     use memo::LiteralPresence::{Absent, Present, Undetermined};
     let mut reads = PresenceReads {
         normalized: normalized.to_string(),
@@ -4336,24 +4350,24 @@ fn settle_literal_presence(
     };
     for candidate in exact_candidates {
         match reads.holds(&candidate.path) {
-            Some(true) => return reads.entry(Present, Vec::new()),
+            Some(true) => return Ok(reads.entry(Present, Vec::new())),
             Some(false) => {}
-            None => return reads.entry(Undetermined, Vec::new()),
+            None => return Ok(reads.entry(Undetermined, Vec::new())),
         }
     }
     #[cfg(test)]
     LITERAL_PRESENCE_CORPUS_SCANS.with(|count| count.set(count.get() + 1));
-    let Some(candidates) = snapshot.files_possibly_holding_phrase(phrase, project_root) else {
-        return reads.entry(Undetermined, Vec::new());
+    let Some(candidates) = snapshot.files_possibly_holding_phrase(phrase, project_root)? else {
+        return Ok(reads.entry(Undetermined, Vec::new()));
     };
     for path in &candidates {
         match reads.holds(path) {
-            Some(true) => return reads.entry(Present, Vec::new()),
+            Some(true) => return Ok(reads.entry(Present, Vec::new())),
             Some(false) => {}
-            None => return reads.entry(Undetermined, Vec::new()),
+            None => return Ok(reads.entry(Undetermined, Vec::new())),
         }
     }
-    reads.entry(Absent, candidates)
+    Ok(reads.entry(Absent, candidates))
 }
 
 /// What a request carrying both `query` and `pattern` adds to an engine run.
@@ -4406,6 +4420,22 @@ fn disclose_exact_gaps(
     for disclosure in disclosures {
         text.push('\n');
         text.push_str(disclosure);
+    }
+}
+
+fn disclose_index_gaps(
+    disclosures: &[String],
+    text: &mut String,
+    extras: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if disclosures.is_empty() {
+        return;
+    }
+    extras.insert("complete".into(), serde_json::json!(false));
+    extras.insert("index_read_gap".into(), serde_json::json!(disclosures));
+    for reason in disclosures {
+        text.push('\n');
+        text.push_str(reason);
     }
 }
 
@@ -4774,13 +4804,26 @@ fn run_engine_ranking(
     let exactness_tokens = exact_lane::exact_verification_tokens(query);
     let candidate_filter =
         |path: &Path| path_allowed_by_include_tests(path, project_root, include_tests);
-    let lexical = CanonicalLexicalLane::from_snapshot(
+    let mut index_disclosures = split
+        .map(|split| split.patterns.index_read_gaps.clone())
+        .unwrap_or_default();
+    let lexical = match CanonicalLexicalLane::from_snapshot(
         &snapshot,
         &query_trigrams,
         Some(&candidate_filter),
         lexical_lane::LEXICAL_ENUMERATION_LIMIT,
-    )
-    .map_err(|error| error.to_string())?;
+    ) {
+        Ok(lane) => lane,
+        Err(lexical_lane::LexicalLaneError::PostingRead(reason)) => {
+            index_disclosures.push(reason);
+            CanonicalLexicalLane::from_scored_candidates(
+                Vec::new(),
+                lexical_lane::LEXICAL_ENUMERATION_LIMIT,
+            )
+            .map_err(|error| error.to_string())?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let lexical_scores = lexical
         .canonical_order()
         .iter()
@@ -4971,6 +5014,7 @@ fn run_engine_ranking(
     let not_found = (plan.shape == SearchShape::Identifier
         && exact_candidates.is_empty()
         && exact_disclosures.is_empty()
+        && index_disclosures.is_empty()
         && index.is_ready())
     .then(|| nearest_names::looked_up_identifiers(exact_input))
     .flatten()
@@ -4981,7 +5025,11 @@ fn run_engine_ranking(
         identifiers.iter().all(|identifier| {
             snapshot
                 .whole_corpus_exact_pass(identifier, project_root, None)
-                .is_empty()
+                .map(|matches| matches.is_empty())
+                .unwrap_or_else(|error| {
+                    index_disclosures.push(error.to_string());
+                    false
+                })
         })
     })
     .map(|identifiers| {
@@ -5014,14 +5062,20 @@ fn run_engine_ranking(
     .then(|| exact_lane::exact_phrase(exact_input))
     .filter(|phrase| phrase.len() >= 3)
     .filter(|phrase| {
-        literal_presence(
+        match literal_presence(
             ctx,
             &snapshot,
             project_root,
             &generation,
             phrase,
             &exact_candidates,
-        ) == memo::LiteralPresence::Absent
+        ) {
+            Ok(presence) => presence == memo::LiteralPresence::Absent,
+            Err(error) => {
+                index_disclosures.push(error.to_string());
+                false
+            }
+        }
     })
     .map(str::to_string);
 
@@ -5197,7 +5251,11 @@ fn run_engine_ranking(
                             Some(&|candidate: &Path| candidate == path.as_path()),
                             1,
                         )
-                        .files
+                        .map(|result| result.files)
+                        .unwrap_or_else(|error| {
+                            index_disclosures.push(error.to_string());
+                            Vec::new()
+                        })
                         .first()
                         .map(|(_, score)| *score);
                     split_query::has_query_relevance(
@@ -5233,8 +5291,15 @@ fn run_engine_ranking(
                 candidates: exact_candidates.clone(),
             }),
             SearchLaneKind::Anchored => {
-                let (candidates, examined, excluded) = anchored_lane::AnchoredLane::new()
-                    .execute_with_admission_report(&index, project_root, query, include_tests);
+                let (candidates, examined, excluded) = match anchored_lane::AnchoredLane::new()
+                    .execute_with_admission_report(&index, project_root, query, include_tests)
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        index_disclosures.push(error.to_string());
+                        (Vec::new(), 0, 0)
+                    }
+                };
                 anchored_admission = (examined, excluded);
                 query_paths.extend(candidates.iter().map(|candidate| candidate.path.clone()));
                 Arc::new(PreparedEngineLane {
@@ -5286,7 +5351,13 @@ fn run_engine_ranking(
         let lane = registry
             .get(*kind)
             .ok_or_else(|| format!("selected callback {kind} was not registered"))?;
-        let execution = extensions.execute_lane(lane.as_ref(), &input);
+        let execution = match extensions.execute_lane(lane.as_ref(), &input) {
+            Ok(execution) => execution,
+            Err(error) => {
+                index_disclosures.push(format!("{kind} index source unavailable: {error}"));
+                continue;
+            }
+        };
         *callback_counts.entry(*kind).or_insert(0usize) += 1;
         if execution.kind != *kind {
             return Err(format!(
@@ -5299,6 +5370,9 @@ fn run_engine_ranking(
         }
     }
 
+    if !index_disclosures.is_empty() && executions.is_empty() {
+        return Err(index_disclosures.join("; "));
+    }
     let mut canonical_descriptors = HashMap::new();
     for candidate in executions
         .iter()
@@ -5773,6 +5847,7 @@ fn run_engine_ranking(
             missing_on_disk: 0,
             anchored_admission: (0, 0),
             exact_disclosures,
+            index_disclosures,
             exact_match_files,
             rerank_note: None,
             prose_found,
@@ -5797,6 +5872,7 @@ fn run_engine_ranking(
         missing_on_disk,
         anchored_admission,
         exact_disclosures,
+        index_disclosures,
         exact_match_files,
         rerank_note,
         prose_found,
@@ -5913,6 +5989,7 @@ fn handle_engine_only_search(
     disclose_rerank_note(&ranked.rerank_note, &mut text);
     disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
     disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
+    disclose_index_gaps(&ranked.index_disclosures, &mut text, &mut extras);
     search_response(
         req,
         SearchResponseParts {
@@ -6300,6 +6377,7 @@ fn handle_semantic_or_hybrid_search(
     disclose_rerank_note(&engine_ranking.rerank_note, &mut text);
     disclose_anchored_admission(engine_ranking.anchored_admission, &mut text, &mut extras);
     disclose_exact_gaps(&engine_ranking.exact_disclosures, &mut text, &mut extras);
+    disclose_index_gaps(&engine_ranking.index_disclosures, &mut text, &mut extras);
     if let Some(gaps) = &semantic_gaps {
         gaps.disclose(project_root, &mut text, &mut extras);
     }
@@ -6445,6 +6523,7 @@ fn zero_result_escalation_response(
     disclose_rerank_note(&ranked.rerank_note, &mut text);
     disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
     disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
+    disclose_index_gaps(&ranked.index_disclosures, &mut text, &mut extras);
     extras.insert("structuredContent".to_string(), ranked.structured_content);
     search_response(
         req,
@@ -6638,6 +6717,7 @@ fn semantic_unavailable_or_fallback_response(
         disclose_rerank_note(&ranked.rerank_note, &mut text);
         disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
         disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
+        disclose_index_gaps(&ranked.index_disclosures, &mut text, &mut extras);
 
         return search_response(
             req,
@@ -6970,6 +7050,8 @@ fn execute_degraded_grep_fallback(
     let walk_budget_reached = read_budget_reached.load(Ordering::Relaxed);
     Ok(DegradedGrepFallbackResult {
         grep: GrepResult {
+            index_sources_unavailable: false,
+            index_read_gaps: Vec::new(),
             matches,
             total_matches,
             files_searched,
@@ -10995,6 +11077,8 @@ mod tests {
     #[test]
     fn empty_degraded_grep_fallback_names_missing_semantic_coverage() {
         let result = GrepResult {
+            index_sources_unavailable: false,
+            index_read_gaps: Vec::new(),
             matches: Vec::new(),
             total_matches: 0,
             files_searched: 0,
@@ -12003,7 +12087,8 @@ mod tests {
                 false,
                 "alpha|omega",
             )
-            .expect("ready index");
+            .expect("ready index")
+            .unwrap();
             assert!(note.is_none());
             result
                 .summary
@@ -15797,7 +15882,9 @@ mod split_request_tests {
             _ => panic!("pattern compiles"),
         };
         let patterns = split_query::PatternList::from_collection(
-            regex_route_collection(&ctx, &compiled, false).expect("ready index"),
+            regex_route_collection(&ctx, &compiled, false)
+                .expect("ready index")
+                .unwrap(),
             &root,
             r"load_\d+",
         );
@@ -15884,7 +15971,9 @@ mod split_request_tests {
             _ => panic!("pattern compiles"),
         };
         split_query::PatternList::from_collection(
-            regex_route_collection(ctx, &compiled, false).expect("ready index"),
+            regex_route_collection(ctx, &compiled, false)
+                .expect("ready index")
+                .unwrap(),
             root,
             pattern,
         )

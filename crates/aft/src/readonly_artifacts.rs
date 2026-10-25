@@ -1023,6 +1023,7 @@ mod tests {
         assert_eq!(
             index
                 .grep("readonly_needle", true, &[], &[], &root.join("src"), 10)
+                .expect("grep over a test index")
                 .matches
                 .len(),
             1
@@ -1466,6 +1467,7 @@ mod tests {
                 assert_eq!(
                     index
                         .grep("switched_needle", true, &[], &[], &root, 10)
+                        .expect("grep over a test index")
                         .matches
                         .len(),
                     1
@@ -1562,6 +1564,7 @@ mod tests {
             assert_eq!(
                 index
                     .grep("readonly_needle", true, &[], &[], &root, 10)
+                    .expect("grep over a test index")
                     .matches
                     .len(),
                 1
@@ -1665,6 +1668,7 @@ mod tests {
         assert_eq!(
             first
                 .grep("original_needle", true, &[], &[], &root, 10)
+                .expect("grep over a test index")
                 .matches
                 .len(),
             1
@@ -1679,6 +1683,7 @@ mod tests {
         assert_eq!(
             second
                 .grep("replacement_needle", true, &[], &[], &root, 10)
+                .expect("grep over a test index")
                 .matches
                 .len(),
             1,
@@ -1904,16 +1909,19 @@ mod tests {
             other => panic!("literal compile failed: {other:?}"),
         };
 
-        let result = index.snapshot().search_grep_bounded(
-            &compiled,
-            &[],
-            &[],
-            &root,
-            10,
-            None,
-            1,
-            std::time::Duration::from_secs(1),
-        );
+        let result = index
+            .snapshot()
+            .search_grep_bounded(
+                &compiled,
+                &[],
+                &[],
+                &root,
+                10,
+                None,
+                1,
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
         assert!(result.matches.is_empty());
         assert!(result.files_searched <= 1);
         assert!(result.truncated);

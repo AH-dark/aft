@@ -189,6 +189,7 @@ impl PatternFile {
 /// frozen so its positions cannot depend on the requested page.
 #[derive(Clone, Debug)]
 pub(crate) struct PatternList {
+    pub index_read_gaps: Vec<String>,
     /// The pattern as the agent wrote it.
     pub pattern: String,
     pub files: Vec<PatternFile>,
@@ -227,10 +228,25 @@ impl PatternList {
             })
             .collect();
         Self {
+            index_read_gaps: Vec::new(),
             pattern: pattern.to_string(),
             files,
             examination,
             alternatives,
+        }
+    }
+
+    pub(crate) fn from_index_failure(pattern: &str, error: std::io::Error) -> Self {
+        Self {
+            index_read_gaps: vec![error.to_string()],
+            pattern: pattern.to_string(),
+            files: Vec::new(),
+            examination: PatternExamination {
+                capped: true,
+                files_examined: 0,
+                candidate_files: 0,
+            },
+            alternatives: Vec::new(),
         }
     }
 
@@ -1882,6 +1898,8 @@ mod tests {
     #[test]
     fn bounded_scan_groups_lines_by_file_and_keeps_the_bound() {
         let result = GrepResult {
+            index_sources_unavailable: false,
+            index_read_gaps: Vec::new(),
             matches: vec![
                 grep_match("/p/a.rs", 1, "load()", "load"),
                 grep_match("/p/b.rs", 2, "pub fn load() {", "load"),

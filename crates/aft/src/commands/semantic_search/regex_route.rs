@@ -330,6 +330,8 @@ pub(crate) fn rank_collection(
 
     RankedFiles {
         summary: GrepResult {
+            index_sources_unavailable: false,
+            index_read_gaps: Vec::new(),
             matches: files.iter().map(|file| file.lines[0].clone()).collect(),
             total_matches,
             files_searched: collection.files_examined,
@@ -813,19 +815,21 @@ mod tests {
             panic!("pattern compiles");
         };
         let collect = |max_files: usize, max_lines_per_file: usize| {
-            snapshot.collect_grep_matches_by_file(
-                &pattern,
-                &PathFilters::default(),
-                &root,
-                None,
-                GrepExaminationLimits {
-                    max_files,
-                    budget: Duration::from_secs(60),
-                    max_lines_per_file,
-                },
-                &examine_priority,
-                &|grep_match: &GrepMatch| grep_match.line_text.contains("alpha(); alpha"),
-            )
+            snapshot
+                .collect_grep_matches_by_file(
+                    &pattern,
+                    &PathFilters::default(),
+                    &root,
+                    None,
+                    GrepExaminationLimits {
+                        max_files,
+                        budget: Duration::from_secs(60),
+                        max_lines_per_file,
+                    },
+                    &examine_priority,
+                    &|grep_match: &GrepMatch| grep_match.line_text.contains("alpha(); alpha"),
+                )
+                .unwrap()
         };
 
         let all = collect(100, 100);

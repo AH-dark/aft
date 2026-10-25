@@ -4975,6 +4975,7 @@ mod tests {
                 .as_ref()
                 .expect("search index installed")
                 .grep("retired_marker", true, &[], &[], &root, usize::MAX)
+                .unwrap()
                 .total_matches
         };
         assert_eq!(grep_total(&ctx), 1);
@@ -5539,6 +5540,7 @@ mod tests {
             .expect("persisted search index");
         assert_eq!(
             disk.grep("new_watcher_marker", true, &[], &[], &root_path, 10)
+                .unwrap()
                 .matches
                 .len(),
             1,
@@ -5546,6 +5548,7 @@ mod tests {
         );
         assert!(
             disk.grep("old_generation_marker", true, &[], &[], &root_path, 10)
+                .unwrap()
                 .matches
                 .is_empty(),
             "older configure build must not overwrite the newer watcher refresh"
@@ -5591,6 +5594,7 @@ mod tests {
                     .as_ref()
                     .expect("search index")
                     .grep("watcher_marker", true, &[], &[], root, 10)
+                    .unwrap()
                     .matches
                     .is_empty(),
                 "watcher work dequeued before teardown must not mutate the index after unbind"
@@ -5614,6 +5618,7 @@ mod tests {
                 .as_ref()
                 .expect("search index")
                 .grep("watcher_marker", true, &[], &[], root, 10)
+                .unwrap()
                 .matches
                 .len(),
             1,
@@ -6351,7 +6356,11 @@ mod tests {
         let index = search.as_ref().expect("search index");
         for (marker, path) in [("first_marker", &first), ("second_marker", &second)] {
             assert_eq!(
-                index.grep(marker, true, &[], &[], &root, 10).matches.len(),
+                index
+                    .grep(marker, true, &[], &[], &root, 10)
+                    .expect("grep over a test index")
+                    .matches
+                    .len(),
                 1,
                 "post-rebind replay must apply {} ({})",
                 marker,
@@ -6413,14 +6422,16 @@ mod tests {
             let search = ctx.search_index().read().unwrap();
             let index = search.as_ref().unwrap();
             assert!(!index.ready);
-            let fresh = index.grep(
-                "zzzz_refreshed_token",
-                true,
-                &[],
-                &[],
-                &root,
-                MUTATION_REFRESH_ENTRY_CAP,
-            );
+            let fresh = index
+                .grep(
+                    "zzzz_refreshed_token",
+                    true,
+                    &[],
+                    &[],
+                    &root,
+                    MUTATION_REFRESH_ENTRY_CAP,
+                )
+                .expect("grep over a test index");
             assert_eq!(fresh.matches.len(), retained.len() - 1);
             assert!(fresh.files_searched > 0);
         }
@@ -6459,6 +6470,7 @@ mod tests {
         assert_eq!(
             index
                 .grep("zzzz_uncollected_token", true, &[], &[], &root, 10)
+                .expect("grep over a test index")
                 .matches
                 .len(),
             1
@@ -6533,6 +6545,7 @@ mod tests {
         let found = |token: &str| {
             index
                 .grep(token, true, &[], &[], &base, 10)
+                .expect("grep over a test index")
                 .matches
                 .into_iter()
                 .map(|found| found.file)
@@ -6638,11 +6651,14 @@ mod tests {
         assert!(response.success, "{response:?}");
         let search = ctx.search_index().read().unwrap();
         let index = search.as_ref().unwrap();
-        let fresh = index.grep("zzzz_kept_token", true, &[], &[], &root, 10);
+        let fresh = index
+            .grep("zzzz_kept_token", true, &[], &[], &root, 10)
+            .expect("grep over a test index");
         assert_eq!(fresh.matches.len(), 1);
         assert!(fresh.files_searched > 0);
         assert!(index
             .grep("qqqq_deleted_token", true, &[], &[], &root, 10)
+            .expect("grep over a test index")
             .matches
             .is_empty());
         assert!(index.glob("**/*", &root).iter().all(|path| path != &old));
@@ -6683,11 +6699,14 @@ mod tests {
         let assert_fresh = || {
             let search = ctx.search_index().read().unwrap();
             let index = search.as_ref().unwrap();
-            let fresh = index.grep("zzzz_restored_token", true, &[], &[], &root, 10);
+            let fresh = index
+                .grep("zzzz_restored_token", true, &[], &[], &root, 10)
+                .expect("grep over a test index");
             assert_eq!(fresh.matches.len(), 1);
             assert!(fresh.files_searched > 0);
             assert!(index
                 .grep("qqqq_deleted_token", true, &[], &[], &root, 10)
+                .expect("grep over a test index")
                 .matches
                 .is_empty());
             assert!(index.glob("**/*", &root).iter().all(|path| path != &old));
@@ -6725,6 +6744,7 @@ mod tests {
             assert_eq!(
                 index
                     .grep("fresh_write_marker", true, &[], &[], &root, 10)
+                    .expect("grep over a test index")
                     .matches
                     .len(),
                 1,
@@ -6732,6 +6752,7 @@ mod tests {
             );
             assert!(index
                 .grep("old_write_marker", true, &[], &[], &root, 10)
+                .expect("grep over a test index")
                 .matches
                 .is_empty());
         };
@@ -6789,6 +6810,7 @@ mod tests {
                 .as_ref()
                 .expect("installed search index")
                 .grep("repaired_marker", true, &[], &[], &root, 10)
+                .unwrap()
                 .matches
                 .len(),
             1,
@@ -6937,6 +6959,7 @@ mod tests {
             .as_ref()
             .expect("installed replacement index")
             .grep("LostLoadNeedle", true, &[], &[], &root, 10)
+            .unwrap()
             .matches
             .len();
         assert_eq!(
@@ -9036,6 +9059,7 @@ mod watcher_slice_tests {
             .as_ref()
             .expect("resident search index")
             .grep(pattern, true, &[], &[], root, 10)
+            .unwrap()
             .matches
             .len()
     }
@@ -9362,6 +9386,7 @@ mod watcher_slice_tests {
         assert_eq!(
             restored
                 .grep("new owner token", true, &[], &[], &canonical, 10)
+                .unwrap()
                 .matches
                 .len(),
             1,

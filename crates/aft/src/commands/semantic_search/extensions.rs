@@ -408,7 +408,11 @@ pub trait SearchExtensions: Send + Sync {
         default_lane_plan(*shape, facts, readiness.clone())
     }
 
-    fn execute_lane(&self, lane: &dyn SearchLane, input: &LaneInput<'_>) -> LaneExecution {
+    fn execute_lane(
+        &self,
+        lane: &dyn SearchLane,
+        input: &LaneInput<'_>,
+    ) -> std::io::Result<LaneExecution> {
         lane.execute(input)
     }
 }

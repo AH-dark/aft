@@ -774,6 +774,7 @@ mod tests {
                 1_000,
                 Duration::from_secs(5),
             )
+            .unwrap()
             .matches
             .into_iter()
             .map(|grep_match| grep_match.file)

@@ -859,7 +859,7 @@ fn execute_root_profiled(
         // holds no files (everything ignored, or an empty project): that is a
         // real, complete answer, not a missing scope.
         if indexed_scope_has_files || is_same_directory(&root.search_root, project_root) {
-            let (result, mut query_timings) = snapshot
+            let (result, mut query_timings) = match snapshot
                 .search_grep_profiled_with_filters_and_query_in_order(
                     pattern,
                     query,
@@ -868,7 +868,15 @@ fn execute_root_profiled(
                     max_results,
                     params.path_exclusion,
                     order,
-                );
+                ) {
+                Ok(result) => result,
+                Err(error) => {
+                    return (
+                        failed_index_grep(error),
+                        GrepExecutionPhaseTimings::default(),
+                    )
+                }
+            };
             query_timings.post_filter += scope_elapsed;
             return (
                 result,
@@ -944,6 +952,8 @@ pub(crate) fn is_same_directory(left: &Path, right: &Path) -> bool {
 
 fn empty_grep_result(index_status: IndexStatus, fully_degraded: bool) -> GrepResult {
     GrepResult {
+        index_sources_unavailable: false,
+        index_read_gaps: Vec::new(),
         matches: Vec::new(),
         total_matches: 0,
         files_searched: 0,
@@ -959,6 +969,13 @@ fn empty_grep_result(index_status: IndexStatus, fully_degraded: bool) -> GrepRes
         files_read_directly: 0,
         walk_bound: None,
     }
+}
+
+pub(crate) fn failed_index_grep(error: std::io::Error) -> GrepResult {
+    let mut result = empty_grep_result(IndexStatus::Fallback, true);
+    result.index_sources_unavailable = true;
+    result.index_read_gaps.push(error.to_string());
+    result
 }
 
 /// Grep a single explicitly-named file directly, bypassing the trigram index
@@ -1014,6 +1031,8 @@ fn grep_explicit_file_with_output(
     let files_searched = files_searched.load(Ordering::Relaxed);
 
     GrepResult {
+        index_sources_unavailable: false,
+        index_read_gaps: Vec::new(),
         total_matches: total_matches.load(Ordering::Relaxed),
         matches,
         files_searched,
@@ -1045,6 +1064,11 @@ fn merge_grep_results_with_canonicalizer(
     max_results: usize,
     mut canonicalize: impl FnMut(&Path) -> PathBuf,
 ) -> GrepResult {
+    let index_sources_unavailable = !results.is_empty()
+        && results
+            .iter()
+            .all(|result| result.index_sources_unavailable);
+    let mut index_read_gaps = Vec::new();
     let mut canonical_files = HashMap::new();
     let mut matches = Vec::new();
     let mut total_matches = 0usize;
@@ -1065,6 +1089,7 @@ fn merge_grep_results_with_canonicalizer(
 
     for result in results {
         let mut child_files = HashSet::new();
+        index_read_gaps.extend(result.index_read_gaps);
         total_matches += result.total_matches;
         files_searched += result.files_searched;
         files_with_matches += result.files_with_matches;
@@ -1106,6 +1131,8 @@ fn merge_grep_results_with_canonicalizer(
     }
 
     GrepResult {
+        index_sources_unavailable,
+        index_read_gaps,
         matches,
         total_matches,
         files_searched,
@@ -2195,6 +2222,8 @@ fn fallback_grep_with_limits_counted(
     let files_searched = files_searched.load(Ordering::Relaxed);
 
     GrepResult {
+        index_sources_unavailable: false,
+        index_read_gaps: Vec::new(),
         total_matches: total_matches.load(Ordering::Relaxed),
         matches,
         files_searched,
@@ -3004,6 +3033,8 @@ mod tests {
 
     fn result(matches: Vec<GrepMatch>, truncated: bool, status: IndexStatus) -> GrepResult {
         GrepResult {
+            index_sources_unavailable: false,
+            index_read_gaps: Vec::new(),
             total_matches: matches.len(),
             files_searched: matches.len(),
             files_with_matches: matches.len(),
@@ -3844,6 +3875,7 @@ mod tests {
                             scope.per_root_max,
                             None,
                         )
+                        .unwrap()
                         .0
                 })
                 .collect(),
@@ -3904,6 +3936,7 @@ mod tests {
             for root in &roots {
                 let result = snapshot
                     .search_grep_profiled_with_filters(&pattern, &filters, root, 100, None)
+                    .unwrap()
                     .0;
                 std::hint::black_box(result.total_matches);
             }
@@ -3915,6 +3948,7 @@ mod tests {
                     .search_grep_profiled_with_filters_and_query(
                         &pattern, &query, &filters, root, 100, None,
                     )
+                    .unwrap()
                     .0;
                 std::hint::black_box(result.total_matches);
             }
