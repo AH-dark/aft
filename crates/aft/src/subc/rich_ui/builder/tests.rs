@@ -1,0 +1,559 @@
+use super::*;
+use crate::subc::tool_provider::{tools_for_session, CatalogPreset};
+use cortexkit_role_tool_provider::call::SchemaPin;
+
+fn fixture(name: &str) -> Value {
+    macro_rules! fixtures {
+        ($($file:literal),+ $(,)?) => {
+            match name {
+                $($file => &include_bytes!(concat!("../../../../tests/fixtures/rich_ui/", $file))[..],)+
+                _ => panic!("unknown freeze fixture {name}"),
+            }
+        };
+    }
+    let bytes = fixtures!(
+        "placeholder-row.json",
+        "placeholder-page.json",
+        "bash-pins.json",
+        "field-table.json",
+        "result-vectors.json",
+        "handler-replies.json",
+        "media-outcomes.json",
+        "gate-contract.json",
+        "target-arguments.json",
+        "bound-task.json",
+        "transport-contract.json"
+    );
+    serde_json::from_slice(bytes).unwrap()
+}
+
+fn bash_pins() -> Vec<String> {
+    let mut pins = Vec::new();
+    for preset in [CatalogPreset::Head, CatalogPreset::Worker] {
+        for runon in [false, true] {
+            for tool in tools_for_session(preset, &[], true, runon, false) {
+                if tool.name == "bash" {
+                    pins.push(
+                        SchemaPin::new("bash", &tool.schema_digest, 2)
+                            .encode()
+                            .unwrap(),
+                    );
+                }
+            }
+        }
+    }
+    pins.sort();
+    pins.dedup();
+    pins
+}
+
+fn inputs() -> (Value, Vec<Value>, Vec<Value>, Vec<Template>) {
+    let templates = ["placeholder-row.json", "placeholder-page.json"]
+        .into_iter()
+        .map(|name| template(fixture(name)).unwrap())
+        .collect::<Vec<_>>();
+    let views = vec![json!({"tool": "bash", "definitionDigests": bash_pins(),
+        "viewRecord": {"schema": "aft.bash.view", "version": 1},
+        "row": {"template": templates[0].digest},
+        "page": {"template": templates[1].digest, "reads": templates[1].value["reads"]},
+    })];
+    (
+        templates[0].value["catalog"].clone(),
+        operations::operations(),
+        views,
+        templates,
+    )
+}
+
+fn manifest() -> Manifest {
+    let (catalog, operations, views, templates) = inputs();
+    build(catalog, operations, views, templates).unwrap()
+}
+
+#[test]
+fn golden_manifest_and_digest_are_platform_independent() {
+    let built = manifest();
+    if std::env::var_os("AFT_RICH_UI_PRINT_FREEZE").is_some() {
+        println!(
+            "FREEZE_MANIFEST={}",
+            String::from_utf8(built.bytes.clone()).unwrap()
+        );
+        println!("FREEZE_DIGEST={}", built.digest);
+        println!(
+            "FREEZE_PINS={}",
+            built.value["views"][0]["definitionDigests"]
+        );
+    }
+    assert_eq!(
+        built.bytes,
+        include_bytes!("../../../../tests/fixtures/rich_ui/manifest.jcs.json")
+    );
+    assert_eq!(
+        built.digest,
+        include_str!("../../../../tests/fixtures/rich_ui/manifest.sha256").trim()
+    );
+    assert_eq!(
+        built.value["views"][0]["definitionDigests"],
+        fixture("bash-pins.json")
+    );
+    assert_eq!(
+        built.value["views"][0]["page"]["reads"],
+        built
+            .templates
+            .iter()
+            .find(|t| t.value["profile"] == "tool_page")
+            .unwrap()
+            .value["reads"]
+    );
+}
+
+#[test]
+fn catalog_and_template_order_do_not_change_bytes() {
+    let expected = manifest().bytes;
+    let (catalog, mut operations, mut views, mut templates) = inputs();
+    operations.reverse();
+    templates.reverse();
+    views[0]["definitionDigests"]
+        .as_array_mut()
+        .unwrap()
+        .reverse();
+    views[0]["page"]["reads"].as_array_mut().unwrap().reverse();
+    assert_eq!(
+        expected,
+        build(catalog, operations, views, templates).unwrap().bytes
+    );
+}
+
+#[test]
+fn runtime_catalog_filters_are_not_builder_inputs() {
+    let expected = manifest().bytes;
+    for revision_reads in [false, true] {
+        let filtered = tools_for_session(
+            CatalogPreset::Head,
+            &["bash".into(), "read".into()],
+            false,
+            false,
+            revision_reads,
+        );
+        assert!(!filtered.iter().any(|tool| tool.name == "bash"));
+        assert_eq!(expected, manifest().bytes);
+    }
+    // The public provider version is a reviewed literal, not CARGO_PKG_VERSION.
+    assert_eq!(manifest().value["providerVersion"], "1.0");
+}
+
+#[test]
+fn frozen_fields_and_result_vectors_match_each_operation() {
+    let table = fixture("field-table.json");
+    let vectors = fixture("result-vectors.json");
+    let ops = operations::operations();
+    assert_eq!(ops.len(), 10);
+    assert_eq!(table.as_object().unwrap().len(), 10);
+    for op in ops {
+        let id = op["id"].as_str().unwrap();
+        assert_eq!(table[id]["operation"], op, "{id}");
+        for key in [
+            "args",
+            if op["kind"] == "page" {
+                "item"
+            } else {
+                "result"
+            },
+        ] {
+            schema::check_schema(&op[key]).unwrap();
+        }
+        if op["scope"] == "call" {
+            assert_eq!(op["bound"], json!({"task": "call"}));
+            for field in ["task", "taskId", "session", "session_id", "sessionId"] {
+                assert!(op["args"]["fields"].get(field).is_none());
+            }
+        }
+        if id == "bash_status" {
+            assert_eq!(op["args"], json!({"type":"record", "fields":{}}));
+        }
+        if id == "bash_output" {
+            assert_eq!(op["page"]["total"], false);
+            assert!(vectors[id].get("total").is_none());
+            for item in vectors[id]["items"].as_array().unwrap() {
+                schema::validate(&op["item"], item).unwrap();
+            }
+        } else {
+            schema::validate(&op["result"], &vectors[id]).unwrap();
+        }
+    }
+}
+
+#[test]
+fn projection_drops_unknown_fields_but_never_defaults_required_fields() {
+    for op in operations::operations()
+        .into_iter()
+        .filter(|op| op["kind"] == "query")
+    {
+        let id = op["id"].as_str().unwrap();
+        let mut source = fixture("result-vectors.json")[id].clone();
+        source["canary"] = json!("must not leave");
+        let projected = operations::project(&op["result"], &source);
+        assert!(projected.get("canary").is_none(), "{id}");
+        schema::validate(&op["result"], &projected).unwrap();
+        let missing = operations::project(&op["result"], &json!({}));
+        assert!(schema::validate(&op["result"], &missing).is_err(), "{id}");
+    }
+}
+
+#[test]
+fn production_is_unpublished_and_fixed_messages_are_bounded() {
+    assert!(production_manifest().is_none());
+    for (_, message) in operations::FIXED_MESSAGES {
+        assert!(message.len() <= 1024);
+    }
+    assert!(operations::GENERIC_MESSAGE.len() <= 1024);
+    assert_eq!(
+        operations::fixed_message("unlisted_code"),
+        operations::GENERIC_MESSAGE
+    );
+    for (code, message) in operations::FIXED_MESSAGES {
+        assert_eq!(operations::fixed_message(code), *message);
+    }
+}
+
+#[test]
+fn builder_enforces_count_caps_at_exact_boundaries() {
+    for (kind, limit, error) in [
+        ("operations", 64, BuildError::Operations),
+        ("views", 64, BuildError::Views),
+        ("templates", 128, BuildError::Templates),
+        ("pins", 16, BuildError::DefinitionDigests),
+    ] {
+        for extra in [0, 1] {
+            let (catalog, mut ops, mut views, mut templates) = inputs();
+            match kind {
+                "operations" => {
+                    let base = ops[0].clone();
+                    ops = (0..limit + extra)
+                        .map(|n| {
+                            let mut v = base.clone();
+                            v["id"] = json!(format!("op_{n}"));
+                            v
+                        })
+                        .collect();
+                }
+                "views" => {
+                    let base = views[0].clone();
+                    views = (0..limit + extra)
+                        .map(|n| {
+                            let mut v = base.clone();
+                            v["tool"] = json!(format!("tool_{n}"));
+                            v
+                        })
+                        .collect();
+                }
+                "templates" => {
+                    templates = (0..limit + extra)
+                        .map(|n| {
+                            let mut v = fixture("placeholder-row.json");
+                            v["source"] = json!(format!("placeholder {n}"));
+                            template(v).unwrap()
+                        })
+                        .collect();
+                }
+                "pins" => {
+                    views[0]["definitionDigests"] = json!((0..limit + extra)
+                        .map(|n| format!("tp1:bash:{n}:2"))
+                        .collect::<Vec<_>>())
+                }
+                _ => unreachable!(),
+            }
+            let result = build(catalog, ops, views, templates);
+            if extra == 0 {
+                assert!(result.is_ok(), "{kind}: {:?}", result.err());
+            } else {
+                assert_eq!(result.err(), Some(error.clone()), "{kind}");
+            }
+        }
+    }
+}
+
+#[test]
+fn builder_enforces_source_and_manifest_byte_caps() {
+    for extra in [0, 1] {
+        let mut value = fixture("placeholder-row.json");
+        value["source"] = json!("x".repeat(65_536 + extra));
+        let result = template(value);
+        if extra == 0 {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(result.err(), Some(BuildError::SourceBytes));
+        }
+    }
+    let (catalog, mut ops, views, templates) = inputs();
+    ops[0]["result"]["fields"]["padding"] =
+        json!({"type":"string", "maxBytes": 1048576, "enum":[""]});
+    let base = build(catalog.clone(), ops.clone(), views.clone(), templates)
+        .unwrap()
+        .bytes
+        .len();
+    for extra in [0, 1] {
+        ops[0]["result"]["fields"]["padding"]["enum"][0] =
+            json!("x".repeat(MANIFEST_BYTES - base + extra));
+        let templates = inputs().3;
+        let result = build(catalog.clone(), ops.clone(), views.clone(), templates);
+        if extra == 0 {
+            assert_eq!(result.unwrap().bytes.len(), MANIFEST_BYTES);
+        } else {
+            assert_eq!(result.err(), Some(BuildError::ManifestBytes));
+        }
+    }
+}
+
+#[test]
+fn builder_rejects_non_integer_numbers_in_manifest_and_templates() {
+    for number in [
+        json!(0.5),
+        json!(9007199254740992_u64),
+        json!(-9007199254740992_i64),
+    ] {
+        let (mut catalog, ops, views, templates) = inputs();
+        catalog["version"] = number.clone();
+        assert_eq!(
+            build(catalog, ops, views, templates).err(),
+            Some(BuildError::Number)
+        );
+        let mut value = fixture("placeholder-row.json");
+        value["catalog"]["version"] = number;
+        assert_eq!(template(value).err(), Some(BuildError::Number));
+    }
+}
+
+#[test]
+fn builder_rejects_unknown_or_deep_schema_constructs() {
+    for bad in [
+        json!({"type":"union"}),
+        (0..8).fold(
+            json!({"type":"boolean"}),
+            |inner, _| json!({"type":"list", "items": inner, "maxItems": 1}),
+        ),
+    ] {
+        for key in ["args", "result", "item"] {
+            let (catalog, mut ops, views, templates) = inputs();
+            let op = ops
+                .iter_mut()
+                .find(|op| (op["kind"] == "page") == (key == "item"))
+                .unwrap();
+            op[key] = bad.clone();
+            assert_eq!(
+                build(catalog, ops, views, templates).err(),
+                Some(BuildError::Schema)
+            );
+        }
+    }
+}
+
+#[test]
+fn handler_projection_vectors_match_the_frozen_results() {
+    let sources = fixture("handler-replies.json");
+    let expected = fixture("result-vectors.json");
+    for op in operations::operations()
+        .iter()
+        .filter(|op| op["kind"] == "query")
+    {
+        let id = op["id"].as_str().unwrap();
+        let result = operations::project_reply(op, &sources[id]);
+        assert_eq!(result, expected[id], "{id}");
+        schema::validate(&op["result"], &result).unwrap();
+        let result = operations::project_reply(op, &json!({}));
+        assert!(schema::validate(&op["result"], &result).is_err(), "{id}");
+    }
+    let status = operations::operations()
+        .into_iter()
+        .find(|op| op["id"] == "bash_status")
+        .unwrap();
+    for (raw, running) in [
+        ("starting", true),
+        ("running", true),
+        ("killing", true),
+        ("completed", false),
+        ("failed", false),
+        ("killed", false),
+        ("timed_out", false),
+        ("fate_unknown", false),
+    ] {
+        assert_eq!(
+            operations::project_reply(&status, &json!({"status":raw,"exit_code":null})),
+            json!({"running":running,"exitCode":null})
+        );
+    }
+    let bad =
+        operations::project_reply(&status, &json!({"status":"future_state","exit_code":null}));
+    assert!(schema::validate(&status["result"], &bad).is_err());
+}
+
+#[test]
+fn field_table_covers_every_published_result_field_and_flag() {
+    fn rows(schema: &Value, prefix: &str, placement: &str, out: &mut Vec<Value>) {
+        for (key, field) in schema["fields"].as_object().unwrap() {
+            let key = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            out.push(json!({"key":key, "required":field["optional"] != true,
+                "nullable":field["nullable"] == true, "placement":placement}));
+            if field["type"] == "record" {
+                rows(field, &key, placement, out);
+            }
+        }
+    }
+    let table = fixture("field-table.json");
+    for op in operations::operations() {
+        let id = op["id"].as_str().unwrap();
+        let page = op["kind"] == "page";
+        let mut expected = Vec::new();
+        rows(
+            &op[if page { "item" } else { "result" }],
+            "",
+            if page { "items" } else { "result" },
+            &mut expected,
+        );
+        if page {
+            expected.push(json!({"key":"next","required":true,"nullable":true,"placement":"next"}));
+        }
+        let mut actual = table[id]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| {
+                assert!(!field["source"].as_str().unwrap().is_empty());
+                let mut field = field.clone();
+                field.as_object_mut().unwrap().remove("source");
+                field
+            })
+            .collect::<Vec<_>>();
+        actual.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
+        expected.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
+        assert_eq!(actual, expected, "{id}");
+    }
+}
+
+#[test]
+fn gate_targets_bound_task_and_media_have_frozen_fixtures() {
+    let gate = fixture("gate-contract.json");
+    assert_eq!(
+        gate["served"],
+        json!([
+            "read",
+            "aft_outline",
+            "aft_zoom",
+            "aft_search",
+            "grep",
+            "glob",
+            "aft_callgraph",
+            "bash_status",
+            "bash_watch"
+        ])
+    );
+    assert_eq!(
+        gate["precedence"],
+        json!(["tool name", "target", "rich_ui_op"])
+    );
+    assert_eq!(
+        gate["refusal_message"],
+        "This route is read-only: <tool> is not available to the rich-UI provider."
+    );
+    assert_eq!(
+        gate["target_refusal_message"],
+        "This route is read-only: <kind> targets are not available to the rich-UI provider."
+    );
+    let targets = fixture("target-arguments.json");
+    assert_eq!(targets.as_array().unwrap().len(), 39);
+    for op in operations::operations()
+        .iter()
+        .filter(|op| op["scope"] == "session")
+    {
+        let id = op["id"].as_str().unwrap();
+        for field in op["args"]["fields"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| matches!(key.as_str(), "path" | "target" | "toPath" | "batch"))
+        {
+            let target_field = if field == "batch" {
+                "batch[].target"
+            } else {
+                field
+            };
+            assert!(targets
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["operation"] == id && t["field"] == target_field));
+        }
+    }
+    for row in targets.as_array().unwrap() {
+        let id = row["operation"].as_str().unwrap();
+        let form = row["form"].as_str().unwrap();
+        let gate_refusal = row["field"] != "ref"
+            && (matches!(id, "outline" | "zoom")
+                || (id == "read" && (form.starts_with("issue://") || form.starts_with("pr://"))));
+        assert_eq!(
+            row["refused_by"],
+            if gate_refusal { "gate" } else { "step5" }
+        );
+        assert_eq!(
+            row["code"],
+            if gate_refusal {
+                "carrier_read_only"
+            } else {
+                "args_invalid"
+            }
+        );
+    }
+    let bound = fixture("bound-task.json");
+    assert_eq!(bound["bound"], json!({"task":"call"}));
+    assert_eq!(
+        bound["operations"],
+        json!(["bash_status", "bash_output", "bash_watch"])
+    );
+    assert_eq!(bound["wire_argument"], "task");
+    let media = fixture("media-outcomes.json");
+    assert_eq!(media.as_array().unwrap().len(), 9);
+    for row in media.as_array().unwrap() {
+        assert_eq!(
+            operations::media_refusal(
+                row["operation"].as_str().unwrap(),
+                row["kind"].as_str().unwrap()
+            ),
+            row["code"].as_str()
+        );
+    }
+    assert_eq!(operations::media_refusal("read", "text"), None);
+}
+
+#[test]
+fn transport_contract_pins_chunk_carrier_frame_key_and_bind_labels() {
+    let contract = fixture("transport-contract.json");
+    assert_eq!(contract["chunks"]["decodedBytesMax"], CHUNK_BYTES);
+    assert_eq!(
+        contract["chunks"]["replyFields"],
+        json!(["digest", "index", "chunks", "bytes", "data"])
+    );
+    assert_eq!(contract["chunks"]["refusalFrame"], "Error");
+    assert_eq!(
+        contract["carrier"]["bodyFields"],
+        json!(["content", "isError", "structuredContent"])
+    );
+    assert_eq!(
+        contract["carrier"]["success"],
+        json!({"content":[{"type":"text","text":""}],"isError":false,"structuredContent":{"running":false,"exitCode":0}})
+    );
+    assert_eq!(
+        contract["carrier"]["failure"]["structuredContent"]["message"],
+        operations::fixed_message("args_invalid")
+    );
+    assert_eq!(contract["frameKey"]["freshPerReadOrAbsent"], true);
+    assert_eq!(contract["frameKey"]["ledgerScope"], Value::Null);
+    assert_eq!(
+        contract["binding"]["equalLabels"],
+        json!(["project_root", "harness", "session"])
+    );
+    assert_eq!(contract["binding"]["mismatchCode"], "session_not_bound");
+}
