@@ -640,6 +640,14 @@ struct SettlementFlight {
     session: String,
     binding: Value,
     key: AskKey,
+    member: Arc<()>,
+    group: Arc<SettlementGroup>,
+}
+
+/// Members retain the result while they overlap, even after its publisher exits.
+/// The owner token identifies the only publisher without retaining its flight.
+struct SettlementGroup {
+    owner: StdMutex<Option<Arc<()>>>,
     settled: AtomicBool,
     done: tokio::sync::watch::Sender<Option<Option<SharedReply>>>,
 }
@@ -651,7 +659,7 @@ struct SettlementOwner(Arc<SettlementFlight>);
 
 impl SettlementOwner {
     fn new(call: &HeldCall) -> Self {
-        let flight = Arc::new(SettlementFlight {
+        let mut flight = SettlementFlight {
             root: call.identity.root.clone().into(),
             session: call.identity.session.clone(),
             binding: serde_json::to_value(&call.identity.scope).expect("scope stamp is JSON"),
@@ -659,18 +667,45 @@ impl SettlementOwner {
                 scope: access_grants::scope_key(&call.identity),
                 args_hash: args_hash(&call.identity, &call.tool, &call.arguments),
             },
-            settled: AtomicBool::new(false),
-            done: tokio::sync::watch::channel(None).0,
-        });
-        SETTLEMENT_FLIGHTS
-            .lock()
-            .unwrap()
-            .push(Arc::downgrade(&flight));
+            member: Arc::new(()),
+            group: Arc::new(SettlementGroup {
+                owner: StdMutex::new(None),
+                settled: AtomicBool::new(false),
+                done: tokio::sync::watch::channel(None).0,
+            }),
+        };
+        let mut flights = SETTLEMENT_FLIGHTS.lock().unwrap();
+        let retain_overlap = true;
+        #[cfg(test)]
+        let retain_overlap =
+            retain_overlap && tests::SETTLED_GROUP_RETENTION_ENABLED.load(Ordering::SeqCst);
+        if retain_overlap {
+            if let Some(other) = flights
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .find(|other| {
+                    other.root == flight.root
+                        && other.session == flight.session
+                        && other.binding == flight.binding
+                        && other.key == flight.key
+                })
+            {
+                // Join before either receipt arrives. Looking up only settled
+                // flights can miss a publisher that already returned and dropped.
+                flight.group = Arc::clone(&other.group);
+            }
+        }
+        let flight = Arc::new(flight);
+        flights.push(Arc::downgrade(&flight));
         Self(flight)
     }
 
     fn complete(&self, result: &Option<(Response, Option<String>)>) {
+        if !self.0.owns_group() {
+            return;
+        }
         self.0
+            .group
             .done
             .send_replace(Some(result.as_ref().map(|(response, text)| SharedReply {
                 success: response.success,
@@ -682,8 +717,8 @@ impl SettlementOwner {
 
 impl Drop for SettlementOwner {
     fn drop(&mut self) {
-        if self.0.done.borrow().is_none() {
-            self.0.done.send_replace(Some(None));
+        if self.0.owns_group() && self.0.group.done.borrow().is_none() {
+            self.0.group.done.send_replace(Some(None));
         }
         SETTLEMENT_FLIGHTS.lock().unwrap().retain(|flight| {
             flight
@@ -694,30 +729,40 @@ impl Drop for SettlementOwner {
 }
 
 impl SettlementFlight {
+    fn owns_group(&self) -> bool {
+        self.group
+            .owner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, &self.member))
+    }
+
     /// Elect one application owner even if two open awaits receive the answer.
-    fn other_settled(self: &Arc<Self>, receiving: bool) -> Option<Arc<Self>> {
+    fn other_settled(self: &Arc<Self>, receiving: bool) -> Option<Arc<SettlementGroup>> {
         #[cfg(test)]
         if !tests::SETTLED_JOIN_ENABLED.load(Ordering::SeqCst) {
             return None;
         }
-        let flights = SETTLEMENT_FLIGHTS.lock().unwrap();
-        let other = flights
-            .iter()
-            .filter_map(std::sync::Weak::upgrade)
-            .find(|other| {
-                !Arc::ptr_eq(other, self)
-                    && other.root == self.root
-                    && other.session == self.session
-                    && other.binding == self.binding
-                    && other.key == self.key
-                    && other.settled.load(Ordering::SeqCst)
-            });
-        if other.is_none() && receiving {
-            self.settled.store(true, Ordering::SeqCst);
+        let mut owner = self.group.owner.lock().unwrap();
+        if let Some(publisher) = owner.as_ref() {
+            if !Arc::ptr_eq(publisher, &self.member) {
+                return (receiving
+                    || self.group.settled.load(Ordering::SeqCst)
+                    || self.group.done.borrow().is_some())
+                .then(|| Arc::clone(&self.group));
+            }
+        } else if receiving {
+            *owner = Some(Arc::clone(&self.member));
         }
-        other
+        if receiving {
+            self.group.settled.store(true, Ordering::SeqCst);
+        }
+        None
     }
+}
 
+impl SettlementGroup {
     async fn result(
         &self,
         call: &HeldCall,
@@ -930,7 +975,7 @@ where
                 match requested_ask(&response) {
                     Some(next) => {
                         // A new outside path has its own unanswered question.
-                        flight.settled.store(false, Ordering::SeqCst);
+                        flight.group.settled.store(false, Ordering::SeqCst);
                         grant = next;
                     }
                     None => {

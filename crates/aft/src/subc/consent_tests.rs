@@ -1093,6 +1093,7 @@ static SETTLED_WAITER_JOINED: AtomicBool = AtomicBool::new(false);
 // the non-test library.
 pub(super) static SETTLED_DEADLINE_ENABLED: AtomicBool = AtomicBool::new(true);
 pub(super) static SETTLED_JOIN_ENABLED: AtomicBool = AtomicBool::new(true);
+pub(super) static SETTLED_GROUP_RETENTION_ENABLED: AtomicBool = AtomicBool::new(true);
 pub(super) static SETTLED_WAIT_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn settled_deadline_waiting() {
@@ -1160,6 +1161,137 @@ async fn consent_retry_during_settled_claim_reuses_the_terminal_result() {
     assert_eq!(
         code(&f.read(&f.worker, &target, 793).await),
         "access_pending"
+    );
+}
+
+#[cfg(unix)]
+struct DelayedSecondConsentReceipt {
+    fake: Arc<FakeCingulate>,
+    awaits: AtomicU64,
+    second_waiting: Arc<Notify>,
+    second_received: Arc<Notify>,
+    release_second: Arc<Notify>,
+}
+
+#[cfg(unix)]
+impl ConsentTransport for DelayedSecondConsentReceipt {
+    fn call(&self, call: ConsentCall) -> ConsentFuture {
+        SharedFake(Arc::clone(&self.fake)).call(call)
+    }
+
+    fn call_with_receipt(&self, call: ConsentCall, receipt: ConsentReceipt) -> ConsentFuture {
+        let second =
+            call.method == "consent.await" && self.awaits.fetch_add(1, Ordering::SeqCst) == 1;
+        let reply = self.call(call);
+        let waiting = Arc::clone(&self.second_waiting);
+        let received = Arc::clone(&self.second_received);
+        let release = Arc::clone(&self.release_second);
+        Box::pin(async move {
+            if second {
+                waiting.notify_one();
+            }
+            let record = reply.await?;
+            if second {
+                received.notify_one();
+                release.notified().await;
+            }
+            receipt(record).await
+        })
+    }
+}
+
+#[cfg(unix)]
+async fn complete_overlap_with_delayed_receipt() -> (Fixture, PathBuf) {
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(None);
+    let waiting = Arc::new(Notify::new());
+    let received = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let transport = Arc::new(DelayedSecondConsentReceipt {
+        fake: Arc::clone(&f.fake),
+        awaits: AtomicU64::new(0),
+        second_waiting: Arc::clone(&waiting),
+        second_received: Arc::clone(&received),
+        release_second: Arc::clone(&release),
+    });
+    install_test_transport(Some(transport.clone()));
+    let target = f.head_root.join("shared.txt");
+    let mut first = f.send_read(&f.worker, &target, 821).await;
+    wait_for(|| transport.awaits.load(Ordering::SeqCst) >= 1).await;
+    let mut second = f.send_read(&f.worker, &target, 822).await;
+    tokio::time::timeout(Duration::from_secs(10), waiting.notified())
+        .await
+        .unwrap();
+    let request = &f.fake.calls("consent.request")[0];
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_once", "answered_by":"user"}),
+    );
+    tokio::time::timeout(Duration::from_secs(10), received.notified())
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(10), first.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let first: Value = serde_json::from_slice(&first.body).unwrap();
+    assert!(text(&first).contains("head-owned contents"), "{first}");
+    // Sending the terminal frame happens after run_with_consent returns and its
+    // SettlementOwner drops. The second call's receipt callback is still paused.
+    std::fs::write(&target, "contents changed after the approved read\n").unwrap();
+    release.notify_one();
+    let second = tokio::time::timeout(Duration::from_secs(10), second.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let second: Value = serde_json::from_slice(&second.body).unwrap();
+    assert_eq!(
+        text(&second),
+        text(&first),
+        "the delayed overlapping call must retain the original result: {second}"
+    );
+    assert_eq!(
+        f.fake.state.lock().unwrap().asks.len(),
+        1,
+        "both calls must use one permission ask"
+    );
+    assert_eq!(
+        f.fake.calls("consent.request").len(),
+        2,
+        "only the two original overlapping calls requested consent"
+    );
+    assert!(f.asks().is_empty());
+    assert!(
+        f.worker_grants().is_empty(),
+        "sharing a result must not install a standing grant"
+    );
+    (f, target)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_overlapping_retry_keeps_result_after_settlement_owner_drops() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _completed = complete_overlap_with_delayed_receipt().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_completed_overlap_group_is_not_a_result_cache() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let (f, target) = complete_overlap_with_delayed_receipt().await;
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    let later = f.read(&f.worker, &target, 823).await;
+    assert_eq!(
+        code(&later),
+        "access_pending",
+        "a later call needs a new approval: {later}"
+    );
+    assert_eq!(f.fake.state.lock().unwrap().asks.len(), 2);
+    let requests = f.fake.calls("consent.request");
+    assert_ne!(
+        requests[0]["call_key"],
+        requests.last().unwrap()["call_key"]
     );
 }
 
