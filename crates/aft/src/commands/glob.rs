@@ -38,7 +38,11 @@ const MAX_DIRECTORY_SECTIONS: usize = 8;
 const MAX_DISPLAY_DIRECTORIES: usize = 6;
 
 pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
-    crate::bounded_io::command(req, ctx, handle_glob_inner)
+    ctx.with_read_policy_snapshot(&req.id, || {
+        crate::context::confinement::with_floor_disclosure(|| {
+            crate::bounded_io::command(req, ctx, handle_glob_inner)
+        })
+    })
 }
 
 fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -53,13 +57,16 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    if let Err(error) = build_path_filters(&[pattern.to_string()], &[]) {
-        return Response::error(
-            &req.id,
-            "invalid_request",
-            format!("glob: invalid pattern: {}", error),
-        );
-    }
+    let filters = match build_path_filters(&[pattern.to_string()], &[]) {
+        Ok(filters) => filters,
+        Err(error) => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                format!("glob: invalid pattern: {}", error),
+            )
+        }
+    };
 
     let project_root = ctx
         .config()
@@ -67,6 +74,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let project_root = crate::bounded_io::canonicalize(&project_root).unwrap_or(project_root);
+    crate::context::confinement::set_floor_filter(&project_root, &filters);
     let search_roots = match req.params.get("path").and_then(|value| value.as_str()) {
         Some(path) => match resolve_path_or_multi(
             path,
@@ -263,27 +271,49 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // still lists another checkout's files): only paths present on disk in this
     // checkout are returned. Only the page is checked, and the page is refilled
     // from the following matches, so present files keep their order.
-    let presence = crate::search_index::take_present_on_disk(
+    let candidate_count = files.len();
+    let (presence, _) = match crate::search_index::take_present_on_disk_with_admission(
         files,
         DEFAULT_MAX_RESULTS,
         |path| path.as_path(),
         "glob",
-    );
+        |path| match ctx.validate_read_path(&req.id, req.session(), path) {
+            Ok(_) => Ok(true),
+            Err(response) if response.data["code"] == "denied_floor" => {
+                crate::context::confinement::capture().record_matched_floor(path);
+                Ok(false)
+            }
+            Err(response) => Err(response),
+        },
+    ) {
+        Ok(presence) => presence,
+        Err(response) => return response,
+    };
     let missing_on_disk = presence.dropped;
     let presence_budget_exhausted = presence.budget_exhausted;
     let files = presence.present;
-    let total = files.len() + presence.unexamined;
-    let result_truncated = total > DEFAULT_MAX_RESULTS || presence_budget_exhausted;
+    let admitted_count = files.len();
+    // The public count includes discovered candidates beyond the returned page.
+    // Missing or denied candidates checked in this window are already excluded.
+    let total = admitted_count.saturating_add(presence.unexamined);
+    let all_candidates_checked = presence.unexamined == 0;
+    let result_truncated = presence.unexamined > 0 || presence_budget_exhausted;
 
     let mut body = serde_json::json!({
         "text": format_glob_text(&files, pattern, &project_root, result_truncated),
-        "complete": !walk_truncated && skipped_foreign_mounts == 0 && !presence_budget_exhausted,
+        "complete": all_candidates_checked && !walk_truncated && skipped_foreign_mounts == 0 && !presence_budget_exhausted,
         "no_files_matched_scope": !scope_has_files,
         "skipped_foreign_mounts": skipped_foreign_mounts,
         "files": files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
-        "total": total,
+        "total": all_candidates_checked.then_some(total),
         "truncated": result_truncated,
     });
+    if !all_candidates_checked {
+        body["total_lower_bound"] = serde_json::json!(total);
+        body["admitted_count"] = serde_json::json!(admitted_count);
+        body["candidate_count"] = serde_json::json!(candidate_count);
+        body["unexamined_files"] = serde_json::json!(presence.unexamined);
+    }
     if walk_truncated {
         body["walk_truncated"] = serde_json::Value::Bool(true);
     }
@@ -845,6 +875,58 @@ fn format_directory_label(directory: Option<&Path>) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn glob_bulk_fixture_preserves_examined_lower_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(dir.path()).unwrap();
+        let bulk = project.join("bulk");
+        std::fs::create_dir(&bulk).unwrap();
+        for index in 0..140 {
+            std::fs::write(bulk.join(format!("fixture-{index:03}.txt")), "fixture\n").unwrap();
+        }
+        let mut observed = Vec::new();
+        for indexed in [false, true] {
+            let ctx = AppContext::new(
+                crate::context::default_language_provider_factory(),
+                crate::config::Config {
+                    project_root: Some(project.clone()),
+                    ..Default::default()
+                },
+            );
+            if indexed {
+                *ctx.search_index().write().unwrap() =
+                    Some(crate::search_index::SearchIndex::build(&project));
+            }
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "glob-bulk-lower-bound", "command": "glob", "pattern": "bulk/*.txt"
+            }))
+            .unwrap();
+            let response = handle_glob(&request, &ctx);
+            assert!(response.success, "{response:?}");
+            let body = &response.data;
+            let lower_bound = body["total_lower_bound"]
+                .as_u64()
+                .or_else(|| body["total"].as_u64())
+                .unwrap();
+            let rendered = crate::subc_format::format_response("glob", &response, false);
+            let trailer = rendered.lines().last().unwrap().to_owned();
+            println!(
+                "GLOB_BULK_FIXTURE indexed={indexed} lower_bound={lower_bound} returned={} trailer={trailer}",
+                body["files"].as_array().unwrap().len()
+            );
+            assert_eq!(body["files"].as_array().unwrap().len(), 100);
+            observed.push((indexed, lower_bound, trailer));
+        }
+        let trailer = "shown 5 of ≥140 files (cap) · narrow: path";
+        assert_eq!(
+            observed,
+            vec![
+                (false, 140, trailer.to_owned()),
+                (true, 140, trailer.to_owned())
+            ]
+        );
+    }
+
     fn exact_file_glob_fixture() -> (tempfile::TempDir, AppContext, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let project = std::fs::canonicalize(dir.path()).unwrap();
@@ -1184,14 +1266,20 @@ mod tests {
         *ctx.search_index().write().unwrap() =
             Some(crate::search_index::SearchIndex::build(&project));
         let request = serde_json::from_value(serde_json::json!({
-            "id": "audit", "command": "glob", "pattern": "*.rs"
+            "id": "glob-page-cost-audit", "command": "glob", "pattern": "*.rs"
         }))
         .unwrap();
         crate::search_index::audit_work_reset();
+        let policy_work = crate::context::policy_load_probe::Probe::new("glob-page-cost-audit");
         let response = handle_glob(&request, &ctx);
         let body = serde_json::to_value(response).unwrap();
         assert_eq!(body["files"].as_array().unwrap().len(), 100);
-        assert_eq!(body["total"], 1000);
+        assert!(body["total"].is_null());
+        assert_eq!(body["candidate_count"], 1000);
+        assert_eq!(body["total_lower_bound"], 1000);
+        assert_eq!(body["admitted_count"], 100);
+        assert_eq!(body["unexamined_files"], 900);
+        assert_eq!(body["complete"], false);
         let expected = (900..1000)
             .rev()
             .map(|i| project.join(format!("file_{i:04}.rs")))
@@ -1214,6 +1302,7 @@ mod tests {
         assert_eq!(work.sort_stats, 0, "{work:?}");
         assert_eq!(work.sort_canonicalizes, 0, "{work:?}");
         assert_eq!(work.presence_checks, 100, "{work:?}");
+        assert_eq!(policy_work.counts().read_paths, 100);
     }
 
     fn files(paths: &[&str]) -> Vec<PathBuf> {

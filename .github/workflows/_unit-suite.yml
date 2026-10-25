@@ -93,6 +93,8 @@ jobs:
         run: python3 scripts/rust-test-inventory-proof.py
         env:
           AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/linux-nextest.tar.zst
+          # Must equal the unit-linux-libtest-shard matrix size.
+          AFT_UNIT_PARTITION_COUNT: "3"
 
       - name: Report nextest archive size
         run: |
@@ -635,8 +637,10 @@ jobs:
   # cannot exercise these paths.
   #
   # Build library, binary, and non-watcher integration archives in parallel,
-  # then split each inventory into three hash partitions. The library harness
-  # is the dominant link, so it does not share an archive build with other tests.
+  # then split them into hash partitions: five for the lib/bin tests and three
+  # for the integration tests. The library harness is the dominant link, so it
+  # does not share an archive build with other tests. With five lib shards, the
+  # slowest one takes about as long as its single longest test (about 4 minutes).
   # Watcher tests stay serial; conformance and Bun tests use their own lane.
   # ---------------------------------------------------------------------------
   unit-macos-nextest-archive:
@@ -866,6 +870,8 @@ jobs:
           AFT_NEXTEST_SOURCE_INVENTORY_INTEGRATION_FILE: ${{ runner.temp }}/macos-integration-inventory.json
           AFT_WATCHER_TEST_INVENTORY_FILE: ${{ runner.temp }}/macos-watcher-inventory.txt
           AFT_DOCTEST_INVENTORY_FILE: ${{ runner.temp }}/macos-doctest-inventory.txt
+          # Must equal the unit-macos-libtest-shard matrix size.
+          AFT_UNIT_PARTITION_COUNT: "5"
 
   unit-macos:
     name: Unit tests (macOS)
@@ -949,7 +955,7 @@ jobs:
           shard: "3"
 
   unit-macos-libtest-shard:
-    name: Cargo libtest shard ${{ matrix.shard }}/3 (macOS)
+    name: Cargo libtest shard ${{ matrix.shard }}/5 (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     needs:
       - unit-macos-libtest-archive
@@ -962,9 +968,9 @@ jobs:
       CARGO_INCREMENTAL: "0"
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 5
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v5
 
@@ -1002,7 +1008,7 @@ jobs:
           AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
           AFT_NEXTEST_ARCHIVE_BIN_FILE: ${{ runner.temp }}/macos-bin-nextest.tar.zst
           AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}
-          AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
+          AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/5
           AFT_GATE_SKIP_RELEASE_STORM: "1"
           NEXTEST_TEST_THREADS: "num-cpus"
 
@@ -1176,9 +1182,11 @@ jobs:
   # and Windows process/path/signal differences. Same suite as Linux but on a
   # real Windows runner — does NOT spin up OpenCode, that's the e2e job.
   #
-  # Build the full non-watcher nextest archive once. Integration and libtest
-  # cases run in separate three-way partitions; watcher tests retain their
-  # single-threaded libtest execution alongside the conformance gate.
+  # Build the full non-watcher nextest archive once. Integration cases run in
+  # three hash partitions and lib/bin cases in six. The lib/bin tests keep
+  # every runner thread busy, so their time falls almost in proportion to the
+  # shard count. Watcher tests retain their single-threaded libtest execution
+  # alongside the conformance gate.
   #
   # These shards cover Windows-only cfg paths and native process/path/signal
   # behavior. Integration tests send filesystem paths in NDJSON requests through
@@ -1238,6 +1246,8 @@ jobs:
         shell: pwsh
         env:
           AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/windows-nextest.tar.zst
+          # Must equal the unit-windows-libtest-shard matrix size.
+          AFT_UNIT_PARTITION_COUNT: "6"
 
       - name: Report nextest archive size
         run: |
@@ -1285,16 +1295,16 @@ jobs:
           done
 
   unit-windows-libtest-shard:
-    name: Cargo libtest shard ${{ matrix.shard }}/3 (Windows)
+    name: Cargo libtest shard ${{ matrix.shard }}/6 (Windows)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     needs: unit-windows-nextest-archive
     runs-on: windows-2022
     timeout-minutes: 20
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 6
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v5
 
@@ -1330,7 +1340,7 @@ jobs:
           AFT_UNIT_TEST_RUNNER: nextest
           AFT_GATE_PHASES: lib-shard
           AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/windows-nextest.tar.zst
-          AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
+          AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/6
           AFT_GATE_SKIP_RELEASE_STORM: "1"
           NEXTEST_TEST_THREADS: "4"
 

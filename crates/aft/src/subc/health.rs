@@ -1008,6 +1008,17 @@ impl DispatchPathMetrics {
         self.reap.record(last_sweep_ms, census)
     }
 
+    /// The last sweep's census as the health surface reports it, without the
+    /// wall-clock sweep time.
+    #[cfg(test)]
+    pub(super) fn reap_census_for_test(&self) -> Value {
+        let mut census = self.reap.snapshot();
+        if let Some(fields) = census.as_object_mut() {
+            fields.remove("last_sweep_ms");
+        }
+        census
+    }
+
     pub(super) fn record_bg_runtime(
         &self,
         subscriptions: usize,

@@ -18,6 +18,185 @@ use crate::artifact_owner::{
 };
 use crate::backup::hash_session;
 use crate::backup::BackupStore;
+
+mod read_policy_cache {
+    use crate::{access_policy::AccessPolicy, db::access_grants::ScopeKey};
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
+
+    // Synchronous request lifetime only. Context, scope and approval-route
+    // identity keep nested calls from borrowing another authority snapshot.
+    pub(super) struct Entry {
+        context: usize,
+        request: String,
+        scope: Option<ScopeKey>,
+        route_generation: u64,
+        policy: RefCell<Option<Arc<AccessPolicy>>>,
+        unrestored: RefCell<Option<Vec<crate::context::launch_grants::UnrestoredGrant>>>,
+    }
+
+    impl Entry {
+        fn clear(&self) {
+            self.policy.borrow_mut().take();
+            self.unrestored.borrow_mut().take();
+        }
+
+        pub(super) fn get(&self) -> Option<Arc<AccessPolicy>> {
+            self.policy.borrow().clone()
+        }
+        pub(super) fn set(&self, policy: Arc<AccessPolicy>) {
+            *self.policy.borrow_mut() = Some(policy);
+        }
+        pub(super) fn unrestored(
+            &self,
+        ) -> Option<Vec<crate::context::launch_grants::UnrestoredGrant>> {
+            self.unrestored.borrow().clone()
+        }
+        pub(super) fn set_unrestored(
+            &self,
+            grants: Vec<crate::context::launch_grants::UnrestoredGrant>,
+        ) {
+            *self.unrestored.borrow_mut() = Some(grants);
+        }
+    }
+
+    thread_local! {
+        static CURRENT: RefCell<Option<Rc<Entry>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn current(context: usize, request: &str) -> Option<Rc<Entry>> {
+        CURRENT.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|entry| {
+                    let authority_matches = crate::access_policy::scope_matches(&entry.scope)
+                        && entry.route_generation == crate::access_policy::ask_route_generation();
+                    if !authority_matches {
+                        entry.clear();
+                    }
+                    entry.context == context && entry.request == request && authority_matches
+                })
+                .cloned()
+        })
+    }
+
+    pub(super) fn with<R>(context: usize, request: &str, run: impl FnOnce() -> R) -> R {
+        struct Restore(Option<Rc<Entry>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT.with(|slot| {
+                    slot.replace(self.0.take());
+                });
+            }
+        }
+        let entry = Rc::new(Entry {
+            context,
+            request: request.to_owned(),
+            scope: crate::access_policy::current_scope(),
+            route_generation: crate::access_policy::ask_route_generation(),
+            policy: RefCell::new(None),
+            unrestored: RefCell::new(None),
+        });
+        let previous = CURRENT.with(|slot| slot.replace(Some(entry)));
+        let _restore = Restore(previous);
+        if let Some(previous) = &_restore.0 {
+            // A nested call under another authority must not revive the outer
+            // call's old grants when its cache slot is restored on return.
+            if !crate::access_policy::scope_matches(&previous.scope)
+                || previous.route_generation != crate::access_policy::ask_route_generation()
+            {
+                previous.clear();
+            }
+        }
+        run()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn read_policy_cache_restores_outer_entry_and_clears_on_unwind() {
+            assert!(CURRENT.with(|slot| slot.borrow().is_none()));
+            with(7, "same-request", || {
+                let outer = current(7, "same-request").unwrap();
+                with(7, "same-request", || {
+                    let inner = current(7, "same-request").unwrap();
+                    assert!(!Rc::ptr_eq(&outer, &inner));
+                });
+                assert!(Rc::ptr_eq(&outer, &current(7, "same-request").unwrap()));
+            });
+            assert!(CURRENT.with(|slot| slot.borrow().is_none()));
+            let panicked = std::panic::catch_unwind(|| {
+                with(7, "same-request", || panic!("cache lifetime probe"));
+            });
+            assert!(panicked.is_err());
+            assert!(CURRENT.with(|slot| slot.borrow().is_none()));
+            with(7, "same-request", || {
+                assert!(current(7, "same-request").is_some())
+            });
+            assert!(CURRENT.with(|slot| slot.borrow().is_none()));
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod policy_load_probe {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex, OnceLock},
+    };
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Counts {
+        pub policies: usize,
+        pub grants: usize,
+        pub read_paths: usize,
+    }
+    type Shared = Arc<Mutex<Counts>>;
+    fn probes() -> &'static Mutex<HashMap<String, Shared>> {
+        static PROBES: OnceLock<Mutex<HashMap<String, Shared>>> = OnceLock::new();
+        PROBES.get_or_init(Mutex::default)
+    }
+    pub(crate) struct Probe {
+        request: String,
+        counts: Shared,
+    }
+    impl Probe {
+        pub(crate) fn new(request: &str) -> Self {
+            let counts = Arc::new(Mutex::new(Counts::default()));
+            probes()
+                .lock()
+                .unwrap()
+                .insert(request.to_owned(), counts.clone());
+            Self {
+                request: request.to_owned(),
+                counts,
+            }
+        }
+        pub(crate) fn counts(&self) -> Counts {
+            *self.counts.lock().unwrap()
+        }
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            probes().lock().unwrap().remove(&self.request);
+        }
+    }
+    pub(super) fn policy(request: &str) {
+        if let Some(counts) = probes().lock().unwrap().get(request) {
+            counts.lock().unwrap().policies += 1;
+        }
+    }
+    pub(super) fn grants(request: &str) {
+        if let Some(counts) = probes().lock().unwrap().get(request) {
+            counts.lock().unwrap().grants += 1;
+        }
+    }
+    pub(super) fn read_path(request: &str) {
+        if let Some(counts) = probes().lock().unwrap().get(request) {
+            counts.lock().unwrap().read_paths += 1;
+        }
+    }
+}
 use crate::bash_background::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry};
 use crate::callgraph_store::{CallGraphStore, CallGraphStoreError, ReadonlyCallGraphStore};
 use crate::checkpoint::CheckpointStore;
@@ -996,7 +1175,7 @@ pub struct RootHealthSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RootHealthSummary {
-    cache_unavailable: bool,
+    cache_unavailable: Option<&'static str>,
     state: RootHealthState,
     search_index_status: Option<&'static str>,
     semantic_index: Option<SemanticHealthComponentSnapshot>,
@@ -1016,7 +1195,7 @@ impl RootHealthSummary {
     fn busy() -> Self {
         Self {
             state: RootHealthState::Busy,
-            cache_unavailable: false,
+            cache_unavailable: None,
             search_index_status: None,
             semantic_index: None,
             callgraph_store_status: None,
@@ -1077,9 +1256,7 @@ impl RootHealthSummary {
                 _ => (None, None),
             };
         RootHealthSnapshot {
-            cache_unavailable_reason: self
-                .cache_unavailable
-                .then_some(crate::root_cache::CACHE_DIR_UNAVAILABLE),
+            cache_unavailable_reason: self.cache_unavailable,
             project_root: project_root.display().to_string(),
             actor_count: 1,
             state: self.state,
@@ -2123,6 +2300,75 @@ pub(crate) struct PendingReconciliationState {
     tier2: BTreeSet<PathBuf>,
     semantic: BTreeSet<PathBuf>,
     corpus_refresh: bool,
+}
+
+/// Put one taken pending-path set back into the context's live set.
+///
+/// The idle reaper takes and restores these sets on every sweep for each
+/// unbound root an artifact blocker keeps resident, on the subc frame loop.
+/// Usually nothing was recorded while the set was out, so the taken set moves
+/// back whole without comparing a single path. Re-inserting path by path cost
+/// a full-path comparison per tree level for every pending path, every sweep.
+/// When the watcher did record paths meanwhile, the two sorted sets are merged
+/// in one linear pass.
+fn restore_pending_paths(pending: &mut BTreeSet<PathBuf>, mut taken: BTreeSet<PathBuf>) {
+    #[cfg(test)]
+    if pending_restore_work::legacy_enabled() {
+        // The path-by-path re-insertion this function replaced, kept so tests
+        // can compare reap decisions and work against it.
+        pending_restore_work::note_merged(taken.len());
+        pending.extend(taken);
+        return;
+    }
+    if taken.is_empty() {
+        return;
+    }
+    if pending.is_empty() {
+        *pending = taken;
+        return;
+    }
+    #[cfg(test)]
+    pending_restore_work::note_merged(pending.len() + taken.len());
+    pending.append(&mut taken);
+}
+
+/// Counts the pending paths [`restore_pending_paths`] had to merge one by one
+/// on the calling thread, so tests can assert that a reap sweep's restore
+/// work does not grow with the number of roots or pending paths.
+#[cfg(test)]
+pub(crate) mod pending_restore_work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MERGED: Cell<usize> = const { Cell::new(0) };
+        static LEGACY: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn note_merged(paths: usize) {
+        MERGED.with(|merged| merged.set(merged.get() + paths));
+    }
+
+    /// Paths merged one by one on this thread since the last call.
+    pub(crate) fn take_merged() -> usize {
+        MERGED.with(|merged| merged.replace(0))
+    }
+
+    pub(super) fn legacy_enabled() -> bool {
+        LEGACY.with(Cell::get)
+    }
+
+    /// Run `f` with restores on this thread re-inserting every taken path
+    /// one by one, as they did before restores moved whole sets back.
+    pub(crate) fn with_legacy_restore<R>(f: impl FnOnce() -> R) -> R {
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                LEGACY.with(|legacy| legacy.set(self.0));
+            }
+        }
+        let _reset = Reset(LEGACY.with(|legacy| legacy.replace(true)));
+        f()
+    }
 }
 
 /// Why [`AppContext::artifact_eviction_blocker`] refused eviction. The idle
@@ -5464,7 +5710,9 @@ impl AppContext {
             Ok(guard) => Arc::clone(&*guard),
             Err(_) => return RootHealthSummary::busy(),
         };
-        let cache_unavailable = crate::root_cache::cache_unavailable(&config).is_some();
+        let cache_unavailable_reason = crate::root_cache::cache_unavailable(&config)
+            .map(|reason| crate::root_cache::cache_status_code(&reason));
+        let cache_unavailable = cache_unavailable_reason.is_some();
         // Answers from other subsystems are taken before any of this
         // context's guards below. The guards are held until the summary is
         // built, and the frame loop's maintenance probes read the same
@@ -5755,7 +6003,7 @@ impl AppContext {
         };
 
         RootHealthSummary {
-            cache_unavailable,
+            cache_unavailable: cache_unavailable_reason,
             state: RootHealthState::Ready,
             search_index_status: Some(search_index_status),
             semantic_index: Some(semantic_index),
@@ -6397,6 +6645,7 @@ impl AppContext {
     pub(crate) fn mark_subc_unbound(&self) {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
+        crate::provisional_identity_retry::cancel(self);
         self.release_view_publication_cache();
         crate::callgraph_store::retire_obsolete_callgraph_refresh_waiters();
         if let Some(root) = self.canonical_cache_root_opt() {
@@ -8867,7 +9116,15 @@ impl AppContext {
     }
 
     pub fn cache_unavailable_reason(&self) -> Option<String> {
-        crate::root_cache::cache_unavailable(&self.config())
+        let reason = crate::root_cache::cache_unavailable(&self.config())?;
+        if reason.starts_with(crate::root_cache::CACHE_DIR_BUSY)
+            && !crate::provisional_identity_retry::cache_retry_pending(self)
+        {
+            // The folder is still busy, but cancelled or unbound work must not
+            // promise an automatic retry to an agent.
+            return Some(crate::root_cache::CACHE_DIR_BUSY.to_string());
+        }
+        Some(reason)
     }
 
     /// A connect is starting: any deferred cache recovery queued for an
@@ -11733,6 +11990,27 @@ impl AppContext {
         std::mem::take(&mut *self.pending_semantic_corpus_refresh.lock())
     }
 
+    /// Copies of the pending search, callgraph, Tier-2 and semantic path sets
+    /// and the corpus-refresh flag, unfiltered and left in place.
+    #[cfg(test)]
+    pub(crate) fn pending_reconciliation_snapshot_for_test(
+        &self,
+    ) -> (
+        BTreeSet<PathBuf>,
+        BTreeSet<PathBuf>,
+        BTreeSet<PathBuf>,
+        BTreeSet<PathBuf>,
+        bool,
+    ) {
+        (
+            self.pending_search_index_paths.lock().clone(),
+            self.pending_callgraph_store_paths.lock().clone(),
+            self.pending_tier2_paths.lock().clone(),
+            self.pending_semantic_index_paths.lock().clone(),
+            *self.pending_semantic_corpus_refresh.lock(),
+        )
+    }
+
     pub fn clear_pending_index_updates(&self) {
         self.clear_pending_index_updates_with_callgraph(true);
     }
@@ -11752,14 +12030,16 @@ impl AppContext {
     }
 
     pub(crate) fn restore_pending_reconciliation_state(&self, state: PendingReconciliationState) {
-        self.pending_search_index_paths.lock().extend(state.search);
-        self.pending_callgraph_store_paths
-            .lock()
-            .extend(state.callgraph);
-        self.pending_tier2_paths.lock().extend(state.tier2);
-        self.pending_semantic_index_paths
-            .lock()
-            .extend(state.semantic);
+        restore_pending_paths(&mut self.pending_search_index_paths.lock(), state.search);
+        restore_pending_paths(
+            &mut self.pending_callgraph_store_paths.lock(),
+            state.callgraph,
+        );
+        restore_pending_paths(&mut self.pending_tier2_paths.lock(), state.tier2);
+        restore_pending_paths(
+            &mut self.pending_semantic_index_paths.lock(),
+            state.semantic,
+        );
         if state.corpus_refresh {
             *self.pending_semantic_corpus_refresh.lock() = true;
         }
@@ -13630,10 +13910,10 @@ impl AppContext {
         })();
         match guards {
             Some((mut search, mut callgraph, mut tier2, mut semantic, mut corpus_refresh)) => {
-                search.extend(state.search);
-                callgraph.extend(state.callgraph);
-                tier2.extend(state.tier2);
-                semantic.extend(state.semantic);
+                restore_pending_paths(&mut search, state.search);
+                restore_pending_paths(&mut callgraph, state.callgraph);
+                restore_pending_paths(&mut tier2, state.tier2);
+                restore_pending_paths(&mut semantic, state.semantic);
                 if state.corpus_refresh {
                     *corpus_refresh = true;
                 }
@@ -15003,6 +15283,21 @@ impl AppContext {
         &self,
         req_id: &str,
     ) -> Result<Vec<launch_grants::UnrestoredGrant>, crate::protocol::Response> {
+        if let Some(entry) = read_policy_cache::current(self as *const Self as usize, req_id) {
+            if let Some(grants) = entry.unrestored() {
+                return Ok(grants);
+            }
+            let grants = self.load_unrestored_launch_grants(req_id)?;
+            entry.set_unrestored(grants.clone());
+            return Ok(grants);
+        }
+        self.load_unrestored_launch_grants(req_id)
+    }
+
+    fn load_unrestored_launch_grants(
+        &self,
+        req_id: &str,
+    ) -> Result<Vec<launch_grants::UnrestoredGrant>, crate::protocol::Response> {
         let crate::access_policy::AskRoute::Consent {
             launch: Some(key), ..
         } = crate::access_policy::current_ask_route()
@@ -15095,6 +15390,41 @@ impl AppContext {
         &self,
         req_id: &str,
     ) -> Result<crate::access_policy::AccessPolicy, crate::protocol::Response> {
+        if read_policy_cache::current(self as *const Self as usize, req_id).is_some() {
+            return self
+                .shared_access_policy(req_id)
+                .map(|policy| (*policy).clone());
+        }
+        self.build_access_policy(req_id)
+    }
+
+    /// Keep authority stable within one read-list request, never across calls,
+    /// context changes, scope epochs or approval-route changes.
+    pub(crate) fn with_read_policy_snapshot<R>(&self, req_id: &str, run: impl FnOnce() -> R) -> R {
+        read_policy_cache::with(self as *const Self as usize, req_id, run)
+    }
+
+    fn shared_access_policy(
+        &self,
+        req_id: &str,
+    ) -> Result<Arc<crate::access_policy::AccessPolicy>, crate::protocol::Response> {
+        if let Some(entry) = read_policy_cache::current(self as *const Self as usize, req_id) {
+            if let Some(policy) = entry.get() {
+                return Ok(policy);
+            }
+            let policy = Arc::new(self.build_access_policy(req_id)?);
+            entry.set(policy.clone());
+            return Ok(policy);
+        }
+        self.build_access_policy(req_id).map(Arc::new)
+    }
+
+    fn build_access_policy(
+        &self,
+        req_id: &str,
+    ) -> Result<crate::access_policy::AccessPolicy, crate::protocol::Response> {
+        #[cfg(test)]
+        policy_load_probe::policy(req_id);
         use crate::access_policy::{AccessDecision, AccessDenial, AccessPolicy, OutsideRoots};
         let config = self.config();
         let standalone = matches!(
@@ -15131,6 +15461,8 @@ impl AppContext {
             .unwrap_or_default();
         let storage = self.storage_dir();
         let (grants, mode, worker) = if let Some(scope) = crate::access_policy::current_scope() {
+            #[cfg(test)]
+            policy_load_probe::grants(req_id);
             match self.db() {
                 Some(db) => {
                     let conn = db.lock().map_err(|_| {
@@ -15512,6 +15844,10 @@ impl AppContext {
         } else {
             AccessOperation::Write
         };
+        #[cfg(test)]
+        if operation == AccessOperation::Read {
+            policy_load_probe::read_path(req_id);
+        }
         let identify = move |resolved: PathBuf| {
             if preserve_final {
                 // Resolve the parent before removing dot components: link/.. can
@@ -15563,54 +15899,68 @@ impl AppContext {
                     .is_readable_task_path(session, &identity)
         });
         self.check_unrestored_path(req_id, &identity, artifact_session, preserve_final)?;
-        let mut policy = self.access_policy(req_id)?;
+        let mut policy = self.shared_access_policy(req_id)?;
         // A lost thread-local route must not turn a known plugin host into the
         // legacy CLI allow path, even if that root's config has no harness yet.
         // It is reported after the policy decision so a path the policy denies
         // anyway (outside a restricted root, under a floor) keeps that answer.
         let route_missing = self.missing_plugin_route()
             && !policy.roots.iter().any(|root| identity.starts_with(root));
+        let decide = |policy: &crate::access_policy::AccessPolicy| {
+            if preserve_final {
+                policy.decide_tree_write(&identity)
+            } else if operation == AccessOperation::Read {
+                policy.decide_resolved(operation, &identity, owned_artifact)
+            } else {
+                policy.decide(operation, &identity, owned_artifact)
+            }
+        };
+        let mut decision = decide(&policy);
         if let crate::access_policy::AskRoute::Plugin { scope, .. } =
             crate::access_policy::current_ask_route()
         {
-            let registry = self.bash_background.clone();
-            let session = scope.session().to_owned();
-            // Ownership is judged on the entry the tool names. A read opens
-            // the fully resolved target, so `identity` is that entry. A write
-            // is judged on the requested spelling with its parent resolved
-            // and its final component kept as spelled, the same identity the
-            // write-location check uses. An outside entry that is a symlink
-            // into the session's scratch is therefore a different entry and
-            // never owned: deleting, replacing or writing through it still
-            // asks, because those act on (or through) the outside link.
-            let spelled = (artifact_session.is_none() && !preserve_final)
-                .then(|| self.resolve_relative_path(original));
-            let location_identity = identity.clone();
-            policy.standalone_owned_scratch = crate::bounded_io::run(&identity, None, move |_| {
-                let location = match spelled {
-                    Some(spelled) => match (spelled.parent(), spelled.file_name()) {
-                        (Some(parent), Some(name)) => policy_path(parent).join(name),
-                        _ => policy_path(&spelled),
-                    },
-                    None => location_identity,
-                };
-                Ok(session_owned_scratch_location(
-                    &registry, &session, &location,
-                ))
-            })
-            .map_err(|error| {
-                crate::protocol::Response::error(
-                    req_id,
-                    crate::bounded_io::timeout_code(&error),
-                    error.to_string(),
-                )
-            })?;
+            if !matches!(
+                decision,
+                AccessDecision::Allow | AccessDecision::Deny(AccessDenial::Floor)
+            ) {
+                let registry = self.bash_background.clone();
+                let session = scope.session().to_owned();
+                // Ownership is judged on the entry the tool names. A read opens
+                // the fully resolved target, so `identity` is that entry. A write
+                // is judged on the requested spelling with its parent resolved
+                // and its final component kept as spelled, the same identity the
+                // write-location check uses. An outside entry that is a symlink
+                // into the session's scratch is therefore a different entry and
+                // never owned: deleting, replacing or writing through it still
+                // asks, because those act on (or through) the outside link.
+                let spelled = (artifact_session.is_none() && !preserve_final)
+                    .then(|| self.resolve_relative_path(original));
+                let location_identity = identity.clone();
+                let owned_scratch = crate::bounded_io::run(&identity, None, move |_| {
+                    let location = match spelled {
+                        Some(spelled) => match (spelled.parent(), spelled.file_name()) {
+                            (Some(parent), Some(name)) => policy_path(parent).join(name),
+                            _ => policy_path(&spelled),
+                        },
+                        None => location_identity,
+                    };
+                    Ok(session_owned_scratch_location(
+                        &registry, &session, &location,
+                    ))
+                })
+                .map_err(|error| {
+                    crate::protocol::Response::error(
+                        req_id,
+                        crate::bounded_io::timeout_code(&error),
+                        error.to_string(),
+                    )
+                })?;
+                if owned_scratch {
+                    Arc::make_mut(&mut policy).standalone_owned_scratch = true;
+                    decision = decide(&policy);
+                }
+            }
         }
-        let decision = if preserve_final {
-            policy.decide_tree_write(&identity)
-        } else {
-            policy.decide(operation, &identity, owned_artifact)
-        };
         if route_missing && !matches!(decision, AccessDecision::Deny(_)) {
             return Err(crate::protocol::Response::error(
                 req_id,
