@@ -93,9 +93,11 @@ struct State {
 pub(crate) struct SnapshotStore {
     root: PathBuf,
     state: Mutex<State>,
-    /// How far tests have moved this store's clock forward.
+    /// The store's clock in tests. It moves only when a test advances it,
+    /// so time a slow machine spends writing snapshot files cannot carry a
+    /// snapshot past an expiry boundary the test is checking.
     #[cfg(test)]
-    skew: Mutex<Duration>,
+    clock: Mutex<Instant>,
 }
 
 impl SnapshotStore {
@@ -131,14 +133,14 @@ impl SnapshotStore {
             root,
             state: Mutex::new(State::default()),
             #[cfg(test)]
-            skew: Mutex::new(Duration::ZERO),
+            clock: Mutex::new(Instant::now()),
         }
     }
 
     fn now(&self) -> Instant {
         #[cfg(test)]
         {
-            Instant::now() + *self.skew.lock().unwrap()
+            *self.clock.lock().unwrap()
         }
         #[cfg(not(test))]
         {
@@ -148,7 +150,7 @@ impl SnapshotStore {
 
     #[cfg(test)]
     pub(crate) fn advance_for_test(&self, by: Duration) {
-        *self.skew.lock().unwrap() += by;
+        *self.clock.lock().unwrap() += by;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
