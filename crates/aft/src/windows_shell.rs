@@ -287,6 +287,11 @@ impl WindowsShell {
 
     /// Preserve the original single-shell path when cmd cannot retain the
     /// requested working folder or cannot transport the generated invocation.
+    /// For network-share (UNC) paths, long working folders, and environment or
+    /// transport edge cases, live calls still obtain the real process exit code.
+    /// An explicit `exit N` skips this wrapper's marker, so losing the daemon's
+    /// child handle before it records that code can leave a detached piped task
+    /// as `FateUnknown`.
     pub(crate) fn write_direct_wrapper(
         &self,
         command: &str,

@@ -8,10 +8,16 @@ use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROC
 const JOB_OBJECT_MSG_JOB_MEMORY_LIMIT: u32 = 10;
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus};
 
+#[cfg(test)]
+#[path = "memory_limit_windows_test_trace.rs"]
+pub(crate) mod test_trace;
+
 pub(super) struct Job {
     handle: HANDLE,
     port: HANDLE,
     limit: usize,
+    #[cfg(test)]
+    trace: Option<test_trace::Writer>,
 }
 
 // Handles are owned here and accessed only under the registry's monitor mutex.
@@ -19,6 +25,8 @@ unsafe impl Send for Job {}
 
 impl Job {
     pub fn new(mib: u64, task_id: &str) -> Result<Self, String> {
+        #[cfg(test)]
+        let trace = test_trace::Writer::current(task_id);
         unsafe {
             let name: Vec<u16> = format!("Local\\AFT-memory-{task_id}\0")
                 .encode_utf16()
@@ -35,6 +43,8 @@ impl Job {
                 handle,
                 port,
                 limit,
+                #[cfg(test)]
+                trace,
             };
             if port.is_null() {
                 return Err(error());
@@ -70,21 +80,44 @@ impl Job {
     }
 
     pub fn attach(&self, pid: u32) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(trace) = &self.trace {
+            trace.attach_begin(pid);
+        }
         unsafe {
             let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
             if process.is_null() {
-                return Err(error());
+                let failure = error();
+                #[cfg(test)]
+                if let Some(trace) = &self.trace {
+                    trace.event(&format!("attach_open_failed error={failure}"));
+                }
+                return Err(failure);
             }
             let assigned = AssignProcessToJobObject(self.handle, process);
             CloseHandle(process);
             if assigned == 0 {
-                return Err(error());
+                let failure = error();
+                #[cfg(test)]
+                if let Some(trace) = &self.trace {
+                    trace.event(&format!("attach_result ok=false error={failure}"));
+                }
+                return Err(failure);
+            }
+            #[cfg(test)]
+            if let Some(trace) = &self.trace {
+                trace.event("attach_result ok=true error=none");
+                trace.event(&test_trace::process("waiter", pid, self.handle));
             }
         }
         Ok(())
     }
 
     pub fn exceeded(&self) -> bool {
+        #[cfg(test)]
+        if let Some(trace) = &self.trace {
+            trace.sample(self.peak(), self.limit);
+        }
         // Limit the notification drain so a fork-heavy command cannot monopolize a tick.
         for _ in 0..64 {
             let mut message = 0;
@@ -97,6 +130,10 @@ impl Job {
                 break;
             }
             if message == JOB_OBJECT_MSG_JOB_MEMORY_LIMIT {
+                #[cfg(test)]
+                if let Some(trace) = &self.trace {
+                    trace.event("job_memory_limit_notification");
+                }
                 return true;
             }
         }
@@ -126,8 +163,24 @@ impl Job {
     }
 
     pub fn terminate(&self) {
+        #[cfg(test)]
+        if let Some(trace) = &self.trace {
+            trace.event("job_kill_begin");
+        }
         unsafe {
-            TerminateJobObject(self.handle, 137);
+            let _terminated = TerminateJobObject(self.handle, 137);
+            #[cfg(test)]
+            if let Some(trace) = &self.trace {
+                trace.event(&format!(
+                    "job_kill_result ok={} error={}",
+                    _terminated != 0,
+                    if _terminated == 0 {
+                        std::io::Error::last_os_error().to_string()
+                    } else {
+                        "none".into()
+                    }
+                ));
+            }
         }
     }
 }

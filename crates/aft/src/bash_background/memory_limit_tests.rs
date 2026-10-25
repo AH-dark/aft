@@ -130,6 +130,12 @@ fn memory_limit_allocator_child() {
         return;
     };
     #[cfg(windows)]
+    let trace = std::env::var_os("AFT_TEST_MEMORY_TRACE_FILE").map(PathBuf::from);
+    #[cfg(windows)]
+    if let Some(base) = &trace {
+        super::super::memory_limit::test_trace::hog_start(base);
+    }
+    #[cfg(windows)]
     if let Some(ready) = std::env::var_os("AFT_TEST_MEMORY_CHILD_READY") {
         std::fs::write(ready, std::process::id().to_string()).unwrap();
         let release = PathBuf::from(std::env::var_os("AFT_TEST_MEMORY_CHILD_RELEASE").unwrap());
@@ -140,6 +146,10 @@ fn memory_limit_allocator_child() {
         }
     }
     let allocation = vec![0x5a_u8; mib * 1024 * 1024];
+    #[cfg(windows)]
+    if let Some(base) = &trace {
+        super::super::memory_limit::test_trace::hog_allocated(base);
+    }
     std::hint::black_box(&allocation);
     std::thread::park_timeout(Duration::from_secs(12));
     std::hint::black_box(&allocation);
@@ -153,6 +163,10 @@ fn allocate_past_cap(
     attach_error: Option<i32>,
 ) {
     let temp = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    let trace_path = temp.path().join("memory-trace");
+    #[cfg(windows)]
+    let diagnostic = super::super::memory_limit::test_trace::Guard::new(trace_path.clone(), pty);
     #[cfg(target_os = "linux")]
     let attach_fault = attach_error.map(|errno| {
         super::super::memory_limit::AttachFaultGuard::for_thread(
@@ -170,8 +184,8 @@ fn allocate_past_cap(
     let command = format!("'{}' --exact {ALLOCATOR} --nocapture", executable.display());
     #[cfg(windows)]
     let command = format!(
-        "& '{}' --exact {ALLOCATOR} --nocapture",
-        executable.display()
+        "[IO.File]::WriteAllText('{}', ([string]$PID + ' ' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())); & '{}' --exact {ALLOCATOR} --nocapture",
+        trace_path.with_extension("pwsh").display().to_string().replace('\'', "''"), executable.display()
     );
     #[cfg(unix)]
     let command = if aggregate {
@@ -185,6 +199,11 @@ fn allocate_past_cap(
         "AFT_TEST_ALLOCATE_MIB".into(),
         if aggregate { "40" } else { "192" }.into(),
     )]);
+    #[cfg(windows)]
+    env.insert(
+        "AFT_TEST_MEMORY_TRACE_FILE".into(),
+        trace_path.display().to_string(),
+    );
     for key in ["PATH", "SystemRoot", "WINDIR", "USERPROFILE", "TEMP", "TMP"] {
         if let Ok(value) = std::env::var(key) {
             env.insert(key.into(), value);
@@ -308,6 +327,14 @@ fn allocate_past_cap(
         let snapshot = registry
             .status(&id, "memory-test", None, None, 4096)
             .unwrap();
+        #[cfg(windows)]
+        {
+            diagnostic.observe(&format!(
+                "task={id} status={:?} {}",
+                snapshot.info.status,
+                windows_memory_job_diagnostic(&id)
+            ));
+        }
         if snapshot.info.status.is_terminal() {
             assert_eq!(snapshot.info.status, BgTaskStatus::Failed, "{snapshot:?}");
             let reason = snapshot.info.status_reason.clone().unwrap_or_default();
@@ -359,11 +386,78 @@ fn allocate_past_cap(
             break;
         }
         if Instant::now() >= deadline {
+            #[cfg(windows)]
+            diagnostic.observe(&format!(
+                "phase=test_timeout_before_cleanup task={id} snapshot={snapshot:?} {}",
+                windows_memory_job_diagnostic(&id)
+            ));
             let _ = registry.kill(&id, "memory-test");
             panic!("memory cap did not stop the command before its timeout");
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+#[cfg(windows)]
+fn windows_memory_job_diagnostic(id: &str) -> String {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::*;
+    let name: Vec<u16> = format!("Local\\AFT-memory-{id}\0").encode_utf16().collect();
+    let job = unsafe { OpenJobObjectW(0x0004, 0, name.as_ptr()) };
+    if job.is_null() {
+        return format!("job_query_error={}", std::io::Error::last_os_error());
+    }
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    let peak_ok = unsafe {
+        QueryInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of_val(&limits) as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    let mut list = [0usize; 66];
+    let list_ok = unsafe {
+        QueryInformationJobObject(
+            job,
+            JobObjectBasicProcessIdList,
+            list.as_mut_ptr().cast(),
+            std::mem::size_of_val(&list) as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    let count = if list_ok != 0 {
+        unsafe {
+            (*(list.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST)).NumberOfProcessIdsInList
+                as usize
+        }
+    } else {
+        0
+    };
+    assert!(
+        count <= 64,
+        "unexpected memory-test process tree size: {count}"
+    );
+    let pids = if list_ok != 0 {
+        unsafe {
+            std::slice::from_raw_parts(
+                (*(list.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST))
+                    .ProcessIdList
+                    .as_ptr(),
+                count,
+            )
+        }
+    } else {
+        &[]
+    };
+    unsafe {
+        CloseHandle(job);
+    }
+    format!(
+        "job_peak_bytes={} limit_bytes={} peak_ok={peak_ok} members={pids:?} list_ok={list_ok}",
+        limits.PeakJobMemoryUsed, limits.JobMemoryLimit
+    )
 }
 
 #[test]
