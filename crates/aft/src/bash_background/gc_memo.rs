@@ -326,9 +326,21 @@ pub(crate) fn metadata_written(path: &Path) {
     let mut roots = roots()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(state) = roots.get_mut(root) else {
-        return;
+    // The store key is canonical, but remembered sessions retain the caller's
+    // spelling (for example /var versus /private/var on macOS). Match that
+    // session on an alias miss without adding filesystem I/O to every write.
+    let key = if roots.contains_key(root) {
+        root.to_path_buf()
+    } else {
+        let Some(key) = roots
+            .iter()
+            .find_map(|(key, state)| state.sessions.contains_key(session).then(|| key.clone()))
+        else {
+            return;
+        };
+        key
     };
+    let state = roots.get_mut(&key).expect("known GC store");
     state.write_generation = state.write_generation.wrapping_add(1);
     let Some(entry) = state
         .sessions
@@ -391,8 +403,11 @@ impl GcMemo {
         Self { root }
     }
 
-    pub(crate) fn write_generation(&self) -> u64 {
-        with_root(&self.root, |state| state.write_generation)
+    pub(crate) fn write_generation(&self, session_dir: &Path) -> u64 {
+        with_root(&self.root, |state| {
+            state.sessions.entry(session_dir.to_path_buf()).or_default();
+            state.write_generation
+        })
     }
 
     /// Scheduled requests may arrive from many roots or replays. Validation
@@ -851,7 +866,7 @@ mod tests {
                 session: session_stamp,
                 task_dir: Some(Stamp::of(&task).unwrap()),
                 metadata: Stamp::of(&metadata).unwrap(),
-                write_generation: memo.write_generation(),
+                write_generation: memo.write_generation(&session),
             },
             AbandonmentInput {
                 finished_at: Some(finished),
@@ -875,20 +890,20 @@ mod tests {
     fn metadata_write_during_evaluation_keeps_its_invalidation() {
         let storage = tempfile::tempdir().unwrap();
         let root = storage.path().join("bash-tasks");
-        let session = root.join("session");
+        let session = root.join("..").join("bash-tasks").join("session");
         let task_dir = session.join("bash-0000000000000001");
         let metadata = task_dir
             .join("control")
             .join(super::super::persistence::METADATA_FILE);
         std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
         std::fs::write(&metadata, b"{}").unwrap();
-        let memo = GcMemo::new(root);
+        let memo = GcMemo::new(root.canonicalize().unwrap());
         let evidence = Evidence {
             layout: TaskLayout::Directory,
             session: Stamp::of(&session).unwrap(),
             task_dir: Some(Stamp::of(&task_dir).unwrap()),
             metadata: Stamp::of(&metadata).unwrap(),
-            write_generation: memo.write_generation(),
+            write_generation: memo.write_generation(&session),
         };
         metadata_written(&metadata);
         memo.remember_grace(&session, "bash-0000000000000001", evidence);

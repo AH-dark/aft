@@ -8133,7 +8133,7 @@ impl BgTaskRegistry {
                     if !examined.insert((session_dir.clone(), task_id.clone())) {
                         continue;
                     }
-                    let write_generation = memo.write_generation();
+                    let write_generation = memo.write_generation(&session_dir);
                     // A task judged not deletable on an earlier lap, whose
                     // folders and metadata are unchanged since, is skipped
                     // without opening anything (see `gc_memo`).
