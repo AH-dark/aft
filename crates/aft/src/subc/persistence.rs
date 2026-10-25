@@ -197,10 +197,10 @@ impl DatabaseWaits {
     }
 
     /// Return the frame unchanged unless this is a persistence-dependent call
-    /// on a bound root whose database is opening, or any catalog fetch or
-    /// tool call on a scoped worker route whose saved confinement is not yet
-    /// known. Failure and overflow are answered by the ordinary tool refusal
-    /// path without waiting.
+    /// on a bound root whose database is opening, a catalog that needs to
+    /// persist access settings, or a scoped worker's request whose saved
+    /// confinement is not yet known. Failure and overflow are answered by the
+    /// request's readiness refusal path without waiting.
     pub(super) fn defer(
         &mut self,
         decoded: DecodedFrame,
@@ -230,7 +230,12 @@ impl DatabaseWaits {
         if let Some(operation) =
             operation.filter(|operation| tool_provider::recognized_operation(operation))
         {
-            if confine_wait && matches!(operation, "tool.catalog" | "tool.call") {
+            // Access settings (notably a head's approval mode) also use aft.db.
+            // Their readiness must not depend on having a saved worker policy.
+            let catalog_wait = operation == "tool.catalog"
+                && ctx.database_runtime_initializing()
+                && remote_policy::catalog_needs_database(body, identity);
+            if catalog_wait || (confine_wait && matches!(operation, "tool.catalog" | "tool.call")) {
                 let name = operation.to_string();
                 let deadline_ms = body.get("deadline_ms").and_then(Value::as_u64);
                 return self.wait(decoded, route, &ctx, name, deadline_ms, true);
@@ -726,6 +731,190 @@ mod tests {
         }));
         assert!(remote_policy::key(&worker, Some("worker")).is_some());
         (worker, unscoped)
+    }
+
+    fn head_catalog(
+        root: &ProjectRootId,
+        deadline_ms: Option<u64>,
+    ) -> (RouteIdentity, DecodedFrame) {
+        let (mut head, _) = scoped_worker_and_head(root);
+        let scope = Arc::get_mut(&mut head.0).unwrap().scope.as_mut().unwrap();
+        scope.kind = subc_protocol::scope::ScopeKind::Head;
+        scope.owner = Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        };
+        let decoded = DecodedFrame {
+            parsed_body: Default::default(),
+            confinement: None,
+            launch_restore: None,
+            codemode_policies: None,
+            frame: Frame::build(
+                FrameType::Request,
+                control_flags(),
+                43,
+                1,
+                7,
+                serde_json::to_vec(&json!({
+                    "op": "tool.catalog", "preset": "head", "params": {"mode": "ask"},
+                    "deadline_ms": deadline_ms,
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+            phase_trace: PhaseTrace::new(Instant::now()),
+        };
+        (head, decoded)
+    }
+
+    async fn head_catalog_reply(
+        decoded: DecodedFrame,
+        identity: RouteIdentity,
+        executor: &Arc<Executor>,
+    ) -> Frame {
+        let (writer, mut replies) = mpsc::channel(8);
+        let body = decoded.body().unwrap().clone();
+        submit_provider_read(
+            &writer,
+            &decoded.frame,
+            identity,
+            executor,
+            &Arc::default(),
+            &Arc::new(DispatchPathMetrics::new()),
+            "tool.catalog",
+            body,
+            decoded.phase_trace,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), replies.recv())
+            .await
+            .expect("catalog reply")
+            .unwrap()
+            .frame
+    }
+
+    #[tokio::test]
+    async fn head_catalog_waits_for_database_and_persists_mode() {
+        use std::future::Future;
+        let (dir, root) = test_support::test_root("head-catalog-database-wait");
+        let ctx = test_support::test_ctx();
+        // Bind acknowledges a configured root before the deferred open installs
+        // its handle. Hold that state explicitly, without racing a real open.
+        ctx.mark_database_runtime_initializing_for_test();
+        assert!(ctx.db().is_none());
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx.clone()));
+        let (head, decoded) = head_catalog(&root, None);
+        let routes = HashMap::from([(route_key(43, 1), head.clone())]);
+        let mut waits = DatabaseWaits::default();
+        let decoded = match waits.defer(decoded, &routes, &executor) {
+            Ok(()) => {
+                let resumed = waits.next();
+                tokio::pin!(resumed);
+                tokio::task::yield_now().await;
+                std::future::poll_fn(|cx| {
+                    assert!(
+                        resumed.as_mut().poll(cx).is_pending(),
+                        "catalog resumed before database open"
+                    );
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                ctx.set_db(Arc::new(std::sync::Mutex::new(
+                    crate::db::open(&dir.path().join("aft.db")).unwrap(),
+                )));
+                ctx.finish_database_runtime(Ok(()));
+                resumed.await
+            }
+            Err(decoded) => decoded,
+        };
+        let reply = head_catalog_reply(decoded, head.clone(), &executor).await;
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        let db = ctx.db().expect("successful catalog requires persistence");
+        let conn = db.lock().unwrap();
+        let key = access_grants::policy_scope_key(&head);
+        assert!(crate::db::access_grants::is_head(&conn, &key).unwrap());
+        assert_eq!(
+            crate::db::access_grants::mode(&conn, &key).unwrap(),
+            crate::access_policy::ApprovalMode::Ask
+        );
+    }
+
+    #[tokio::test]
+    async fn head_catalog_database_deadline_and_failure_are_retryable() {
+        let (_dir, root) = test_support::test_root("head-catalog-database-refusal");
+        let ctx = test_support::test_ctx();
+        ctx.mark_database_runtime_initializing_for_test();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx.clone()));
+        for code in ["database_initializing", "database_unavailable"] {
+            let (head, decoded) = head_catalog(&root, Some(0));
+            let routes = HashMap::from([(route_key(43, 1), head.clone())]);
+            let mut waits = DatabaseWaits::default();
+            let decoded = match waits.defer(decoded, &routes, &executor) {
+                Ok(()) => waits.next().await,
+                Err(decoded) => decoded,
+            };
+            let reply = head_catalog_reply(decoded, head, &executor).await;
+            assert_eq!(reply.header.ty, FrameType::Error);
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(body["code"], code, "{body}");
+            assert_eq!(body["detail"]["retryable"], true, "{body}");
+            assert!(ctx.db().is_none());
+            ctx.finish_database_runtime_error("injected database busy failure".into(), true);
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_database_requirement_tracks_access_settings_not_head_worker_previews() {
+        let (_dir, root) = test_support::test_root("head-catalog-database-parameters");
+        let ctx = test_support::test_ctx();
+        ctx.mark_database_runtime_initializing_for_test();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx.clone()));
+        for (preset, params, needs_database) in [
+            ("head", json!({"mode": "ask"}), true),
+            ("worker", json!({"allow_paths": []}), true),
+            ("worker", json!({"mode": "ask"}), false),
+            ("worker", json!({"remote_exec": {"enabled": false}}), false),
+            ("head", json!({}), false),
+        ] {
+            let (head, mut decoded) = head_catalog(&root, None);
+            let body = json!({"op": "tool.catalog", "preset": preset, "params": params});
+            decoded.frame = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                43,
+                1,
+                7,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+            let routes = HashMap::from([(route_key(43, 1), head.clone())]);
+            let mut waits = DatabaseWaits::default();
+            match waits.defer(decoded, &routes, &executor) {
+                Ok(()) => assert!(needs_database, "preview waited for persistence: {body}"),
+                Err(decoded) => {
+                    assert!(
+                        !needs_database,
+                        "access settings bypassed persistence: {body}"
+                    );
+                    let reply = head_catalog_reply(decoded, head, &executor).await;
+                    assert_eq!(
+                        reply.header.ty,
+                        FrameType::Response,
+                        "{}",
+                        String::from_utf8_lossy(&reply.body)
+                    );
+                }
+            }
+            assert!(ctx.db().is_none());
+        }
     }
 
     #[tokio::test]
