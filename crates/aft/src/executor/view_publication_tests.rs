@@ -423,6 +423,137 @@ fn publication_precheck_scopes_database_admission_to_its_members() {
         .is_none());
 }
 
+// Admission is process-wide. Run these probes alone so another test's database
+// lifetime cannot activate the fresh-stat fallback and hide a missing guard.
+fn precheck_guard_child(test: &str) -> bool {
+    const CHILD: &str = "AFT_VIEW_PRECHECK_GUARD_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(test) {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(CHILD, test)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("running 1 test"),
+        "isolated test did not run: {stdout}"
+    );
+    assert!(
+        output.status.success(),
+        "isolated {test} failed:\n{}\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
+fn settled_precheck_admission(fixture: &Fixture) -> crate::db::file_identity::AdmissionSnapshot {
+    assert!(fixture
+        .ctx
+        .can_skip_irrelevant_view_paths(&BTreeSet::from([b"output/untracked.rs".to_vec()])));
+    let admission = crate::db::file_identity::admission_snapshot(fixture._storage.path());
+    // Refresh the successful proof after the positive control. From this
+    // publication to the tested probe, do not query the view's pointer database.
+    fixture
+        .ctx
+        .publish_view_paths(BTreeSet::new(), true)
+        .unwrap();
+    assert_eq!(
+        crate::db::file_identity::admission_snapshot(fixture._storage.path()),
+        admission,
+        "settled publication changed external database admission"
+    );
+    admission
+}
+
+#[test]
+fn publication_precheck_guard_refuses_named_tracked_edit_without_admission_change() {
+    if !precheck_guard_child("executor::view_publication::tests::publication_precheck_guard_refuses_named_tracked_edit_without_admission_change") {
+        return;
+    }
+    let fixture = Fixture::new();
+    let admission = settled_precheck_admission(&fixture);
+    std::fs::write(
+        fixture.job_root().join("tracked.rs"),
+        "pub fn tracked_worktree_edit() {}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        crate::db::file_identity::admission_snapshot(fixture._storage.path()),
+        admission
+    );
+    let skippable = fixture
+        .ctx
+        .can_skip_irrelevant_view_paths(&BTreeSet::from([b"tracked.rs".to_vec()]));
+    assert_eq!(
+        crate::db::file_identity::admission_snapshot(fixture._storage.path()),
+        admission,
+        "probe changed database admission"
+    );
+    assert!(
+        !skippable,
+        "a named tracked edit must be refused by the membership guard"
+    );
+}
+
+#[test]
+fn publication_precheck_guard_refuses_index_only_add_without_admission_change() {
+    if !precheck_guard_child("executor::view_publication::tests::publication_precheck_guard_refuses_index_only_add_without_admission_change") {
+        return;
+    }
+    let fixture = Fixture::new();
+    let admission = settled_precheck_admission(&fixture);
+    let head_members = || {
+        let mut command = std::process::Command::new("git");
+        crate::test_env::apply_hermetic_git_env(command.current_dir(fixture.project.path()));
+        let output = command.args(["ls-tree", "-r", "HEAD"]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    let head_before = head_members();
+    let tracked_before = std::fs::read(fixture.job_root().join("tracked.rs")).unwrap();
+    let index = fixture.job_root().join(".git/index");
+    let index_before = std::fs::read(&index).unwrap();
+    std::fs::write(
+        fixture.job_root().join("staged-only.rs"),
+        "pub fn staged_only() {}\n",
+    )
+    .unwrap();
+    git(fixture.project.path(), &["add", "staged-only.rs"]);
+    assert_ne!(std::fs::read(index).unwrap(), index_before);
+    assert_eq!(
+        head_members(),
+        head_before,
+        "staging must not change HEAD membership"
+    );
+    assert_eq!(
+        std::fs::read(fixture.job_root().join("tracked.rs")).unwrap(),
+        tracked_before
+    );
+    assert_eq!(
+        crate::db::file_identity::admission_snapshot(fixture._storage.path()),
+        admission
+    );
+    let skippable = fixture
+        .ctx
+        .can_skip_irrelevant_view_paths(&BTreeSet::from([b"staged-only.rs".to_vec()]));
+    assert_eq!(
+        crate::db::file_identity::admission_snapshot(fixture._storage.path()),
+        admission,
+        "probe changed database admission"
+    );
+    assert!(
+        !skippable,
+        "a staged nonmember must be refused by the index guard"
+    );
+}
+
 #[test]
 fn publication_precheck_preserves_head_index_directories_and_verification() {
     let fixture = Fixture::new();
