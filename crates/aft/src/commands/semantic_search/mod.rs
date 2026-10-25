@@ -2531,6 +2531,9 @@ fn handle_external_search(
             page_request,
             extensions,
             engine_plan,
+            disk_check
+                .as_ref()
+                .is_none_or(|(check, _)| check.verified()),
         ),
     };
     if let Some((check, age)) = &disk_check {
@@ -3193,6 +3196,7 @@ fn handle_external_semantic_or_hybrid_search(
     page_request: paging::ValidatedPageRequest,
     extensions: &dyn extensions::SearchExtensions,
     engine_plan: &extensions::LanePlan<'_>,
+    disk_checked_in_full: bool,
 ) -> Response {
     let mut semantic_status = "ready";
     let semantic_index = match semantic_artifact {
@@ -3360,7 +3364,15 @@ fn handle_external_semantic_or_hybrid_search(
         more_available,
         snippets_incomplete,
         Some(ctx),
-        ranked.literal_absent.as_deref(),
+        // "No file contains" holds only when the saved index was compared
+        // with every file on disk. A check cut short by its budget leaves
+        // files whose current text the index may not hold; the reply then
+        // says how far the check got (see `disclose_checked_saved_index`)
+        // and makes no claim that the literal is absent.
+        ranked
+            .literal_absent
+            .as_deref()
+            .filter(|_| disk_checked_in_full),
     );
     if let Some(answer) = &ranked.not_found {
         text = answer.render(&display_root);
@@ -14987,6 +14999,49 @@ mod split_request_tests {
                 }
             }
         }
+    }
+
+    /// The missing-literal notice claims no file contains the literal, so it
+    /// may appear only when the check against the files on disk covered every
+    /// file. A check its walk budget cut short says how far it got instead,
+    /// and the reply makes no not-found claim.
+    #[test]
+    fn external_missing_literal_notice_needs_a_complete_disk_check() {
+        let session = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (_dir, root) = project();
+        git_init(&root);
+        save_external_index(&root, storage.path());
+        let ctx = external_context(session.path(), storage.path(), false);
+        let params = serde_json::json!({"query": "load_settings(", "path": root, "topK": 10});
+        let notice = "No file contains `load_settings(`.";
+
+        let full = external_disk_check::with_budgets_for_test(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            || search(&ctx, params.clone()),
+        );
+        assert_eq!(full["success"], true, "{full}");
+        assert_eq!(full["saved_index_check"]["complete"], true, "{full}");
+        let text = full["text"].as_str().unwrap();
+        assert!(text.contains(notice), "{text}");
+
+        let stopped = external_disk_check::with_budgets_for_test(
+            Duration::ZERO,
+            Duration::from_secs(5),
+            || search(&ctx, params.clone()),
+        );
+        assert_eq!(stopped["success"], true, "{stopped}");
+        assert_eq!(stopped["saved_index_check"]["complete"], false, "{stopped}");
+        assert_eq!(stopped["complete"], false, "{stopped}");
+        let text = stopped["text"].as_str().unwrap();
+        assert!(!text.contains("No file contains"), "{text}");
+        assert!(!text.contains("[similar]"), "{text}");
+        assert!(!text.contains("not found"), "{text}");
+        assert!(
+            text.contains("only 0 files on disk were compared with it before the time limit"),
+            "{text}"
+        );
     }
 
     #[test]
