@@ -400,7 +400,7 @@ fn publication_precheck_scopes_database_admission_to_its_members() {
     connection
         .execute_batch("CREATE TABLE unrelated(value TEXT)")
         .unwrap();
-    let noise = BTreeSet::from([b"output/untracked.rs".to_vec()]);
+    let noise = fixture.non_member_paths();
     assert!(
         fixture.ctx.can_skip_irrelevant_view_paths(&noise),
         "unrelated live databases must not force manifest work"
@@ -452,7 +452,7 @@ fn precheck_guard_child(test: &str) -> bool {
 fn settled_precheck_admission(fixture: &Fixture) -> crate::db::file_identity::AdmissionSnapshot {
     assert!(fixture
         .ctx
-        .can_skip_irrelevant_view_paths(&BTreeSet::from([b"output/untracked.rs".to_vec()])));
+        .can_skip_irrelevant_view_paths(&fixture.non_member_paths()));
     let admission = crate::db::file_identity::admission_snapshot(fixture._storage.path());
     // Refresh the successful proof after the positive control. From this
     // publication to the tested probe, do not query the view's pointer database.
@@ -555,10 +555,87 @@ fn publication_precheck_guard_refuses_index_only_add_without_admission_change() 
 }
 
 #[test]
+fn publication_precheck_revision_hard_link_alias_updates_tracked_manifest() {
+    if !precheck_guard_child("executor::view_publication::tests::publication_precheck_revision_hard_link_alias_updates_tracked_manifest") {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.ctx.isolate_cold_build_limiter_for_test(2);
+    let admission = settled_precheck_admission(&fixture);
+    let root = fixture.job_root();
+    std::fs::hard_link(root.join("tracked.rs"), root.join("output.rs")).unwrap();
+    let edited = b"pub fn changed_through_nonmember_alias() {}\n";
+    std::fs::write(root.join("output.rs"), edited).unwrap();
+    let paths = BTreeSet::from([b"output.rs".to_vec()]);
+    assert_eq!(
+        crate::db::file_identity::admission_snapshot(fixture._storage.path()),
+        admission
+    );
+    let skippable = fixture.ctx.can_skip_irrelevant_view_paths(&paths);
+    assert_eq!(
+        crate::db::file_identity::admission_snapshot(fixture._storage.path()),
+        admission
+    );
+    assert!(
+        !skippable,
+        "a newly linked nonmember can modify a manifest member"
+    );
+    fixture.schedule_paths(paths);
+    fixture.wait_idle();
+    let generation = fixture.view.current_generation().unwrap().unwrap();
+    assert_ne!(generation, fixture.initial);
+    let manifest = fixture.view.load_manifest(&generation).unwrap();
+    let path = crate::views::RelPath::new(b"tracked.rs".to_vec()).unwrap();
+    let Some(crate::views::ManifestEntry::Regular { planes, .. }) = manifest.get(&path) else {
+        panic!("tracked member must remain in the published manifest");
+    };
+    let expected = crate::blob_store::CallgraphKey::from_bytes(
+        edited,
+        "rust",
+        crate::views::callgraph::PRODUCER,
+    )
+    .full_key()
+    .to_hex();
+    assert_eq!(planes.callgraph.as_deref(), Some(expected.as_str()));
+}
+
+#[test]
+fn publication_precheck_revision_paths_are_built_once_per_head() {
+    if !precheck_guard_child("executor::view_publication::tests::publication_precheck_revision_paths_are_built_once_per_head") {
+        return;
+    }
+    let fixture = Fixture::with_files(1225);
+    let noise = fixture.non_member_paths();
+    let before = crate::views::assembly::precheck_path_builds_for_test();
+    for _ in 0..50 {
+        assert!(!fixture
+            .ctx
+            .can_skip_irrelevant_view_paths(&BTreeSet::from([b"tracked.rs".to_vec()])));
+        assert!(fixture.ctx.can_skip_irrelevant_view_paths(&noise));
+    }
+    let builds = crate::views::assembly::precheck_path_builds_for_test() - before;
+    eprintln!("PRECHECK_HEAD_PATHS members=1226 batches=100 builds={builds}");
+    assert_eq!(
+        builds, 1,
+        "the same HEAD must reuse its folded membership set"
+    );
+}
+
+#[test]
+fn publication_precheck_revision_missing_named_path_refuses_shortcut() {
+    let fixture = Fixture::new();
+    let paths = BTreeSet::from([b"missing.rs".to_vec()]);
+    assert!(
+        !fixture.ctx.can_skip_irrelevant_view_paths(&paths),
+        "an unstatable event path is not evidence for skipping publication"
+    );
+}
+
+#[test]
 fn publication_precheck_preserves_head_index_directories_and_verification() {
     let fixture = Fixture::new();
     fixture.ctx.isolate_cold_build_limiter_for_test(2);
-    let noise = BTreeSet::from([b"output/untracked.rs".to_vec()]);
+    let noise = fixture.non_member_paths();
     std::fs::create_dir(fixture.job_root().join("src")).unwrap();
     std::fs::write(
         fixture.job_root().join("src/member.rs"),
@@ -614,7 +691,7 @@ fn publication_precheck_preserves_head_index_directories_and_verification() {
 fn publication_precheck_keeps_pending_work_and_payload_repair() {
     let fixture = Fixture::new();
     fixture.ctx.isolate_cold_build_limiter_for_test(2);
-    let noise = BTreeSet::from([b"output/untracked.rs".to_vec()]);
+    let noise = fixture.non_member_paths();
     assert!(fixture.ctx.can_skip_irrelevant_view_paths(&noise));
     let mut snapshot = fixture.ctx.view_runtime_snapshot().unwrap();
     snapshot.pending_paths.insert(b"tracked.rs".to_vec());
@@ -665,7 +742,7 @@ fn publication_precheck_keeps_pending_work_and_payload_repair() {
 fn publication_precheck_requires_idle_cached_and_ready_generation() {
     let fixture = Fixture::new();
     fixture.ctx.isolate_cold_build_limiter_for_test(2);
-    let noise = BTreeSet::from([b"output/untracked.rs".to_vec()]);
+    let noise = fixture.non_member_paths();
     let mut prepared = fixture
         .ctx
         .prepare_view_paths(BTreeSet::new(), true, &mut |_| Ok(()))
@@ -863,6 +940,12 @@ impl Fixture {
         self.ctx
             .canonical_cache_root_opt()
             .expect("fixture configured a canonical cache root")
+    }
+    fn non_member_paths(&self) -> BTreeSet<Vec<u8>> {
+        let root = self.job_root();
+        std::fs::create_dir_all(root.join("output")).unwrap();
+        std::fs::write(root.join("output/untracked.rs"), "pub fn generated() {}\n").unwrap();
+        BTreeSet::from([b"output/untracked.rs".to_vec()])
     }
     fn change(&self, symbol: &str) {
         std::fs::write(

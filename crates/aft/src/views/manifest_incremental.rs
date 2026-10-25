@@ -4,6 +4,12 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 #[cfg(test)]
 thread_local! {
     static PATH_COMPARISONS: std::cell::Cell<(usize, Option<usize>)> = const { std::cell::Cell::new((0, None)) };
+    static PRECHECK_PATH_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn precheck_path_builds_for_test() -> usize {
+    PRECHECK_PATH_BUILDS.with(std::cell::Cell::get)
 }
 
 #[inline]
@@ -105,6 +111,7 @@ pub(super) struct HeadSnapshot {
     index: IndexStamp,
     entries: Arc<Vec<crate::alias::TrackedPath>>,
     paths: Arc<OnceLock<HeadPaths>>,
+    relevant: Arc<OnceLock<Option<BTreeSet<Vec<u8>>>>>,
 }
 
 pub(super) struct HeadRead {
@@ -510,7 +517,17 @@ pub(super) fn cache_memory_for_test(view_dir: &Path) -> CacheMemoryEstimate {
                 })
                 .sum()
         });
-        (head_bytes, index_bytes)
+        let relevant_bytes = head
+            .relevant
+            .get()
+            .and_then(Option::as_ref)
+            .map_or(0, |names| {
+                names
+                    .iter()
+                    .map(|name| size_of::<Vec<u8>>() + name.capacity())
+                    .sum::<usize>()
+            });
+        (head_bytes, index_bytes + relevant_bytes)
     });
     let payload_bytes = size_of::<RootCache>()
         + manifest_dynamic
@@ -642,6 +659,7 @@ pub(super) fn head(request: &AssemblyRequest, view: &ViewStore) -> Result<HeadRe
         index,
         entries: entries.clone(),
         paths: paths.clone(),
+        relevant: Arc::new(OnceLock::new()),
     });
     Ok(HeadRead {
         tree,
@@ -649,6 +667,19 @@ pub(super) fn head(request: &AssemblyRequest, view: &ViewStore) -> Result<HeadRe
         cached: false,
         snapshot,
         paths,
+    })
+}
+
+fn named_paths_have_single_link(request: &AssemblyRequest) -> bool {
+    request.changed_paths.iter().all(|path| {
+        // The metadata helper falls back to an unknown identity and a best-effort
+        // count on Windows errors. Only an observed count can prove one link.
+        matches!(
+            crate::file_identity::metadata_with_link_count(
+                &request.project_root.join(path_from_bytes(path))
+            ),
+            Ok((_, crate::file_identity::FileIdentity::Known { .. }, 1))
+        )
     })
 }
 
@@ -695,19 +726,27 @@ pub(super) fn irrelevant_delta(
     // Case-fold ASCII names even on case-sensitive hosts: the same watcher
     // batches can come from case-insensitive checkouts. Non-ASCII spellings,
     // host path aliases and control files are uncertain, never evidence for a skip.
-    let mut relevant = BTreeSet::new();
-    for entry in head.entries.iter() {
-        if !entry.rel_path.is_ascii() {
-            return Ok(false);
-        }
-        let path = entry.rel_path.to_ascii_lowercase();
-        for (index, byte) in path.iter().enumerate() {
-            if *byte == b'/' {
-                relevant.insert(path[..index].to_vec());
+    let relevant = head.relevant.get_or_init(|| {
+        #[cfg(test)]
+        PRECHECK_PATH_BUILDS.with(|builds| builds.set(builds.get() + 1));
+        let mut relevant = BTreeSet::new();
+        for entry in head.entries.iter() {
+            if !entry.rel_path.is_ascii() {
+                return None;
             }
+            let path = entry.rel_path.to_ascii_lowercase();
+            for (index, byte) in path.iter().enumerate() {
+                if *byte == b'/' {
+                    relevant.insert(path[..index].to_vec());
+                }
+            }
+            relevant.insert(path);
         }
-        relevant.insert(path);
-    }
+        Some(relevant)
+    });
+    let Some(relevant) = relevant else {
+        return Ok(false);
+    };
     if request.changed_paths.iter().any(|path| {
         let lower = path.to_ascii_lowercase();
         !path.is_ascii()
@@ -724,6 +763,11 @@ pub(super) fn irrelevant_delta(
             )
             || relevant.contains(&path.to_ascii_lowercase())
     }) {
+        return Ok(false);
+    }
+    // A nonmember name can be a new hard link to a tracked member. Its own
+    // current link count must be checked even when cached member stats are valid.
+    if !named_paths_have_single_link(request) {
         return Ok(false);
     }
     let tree = std::process::Command::new("git")

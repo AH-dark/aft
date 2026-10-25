@@ -41,6 +41,11 @@ pub(crate) fn full_verification_due(view_dir: &Path) -> bool {
     manifest_incremental::full_verification_due(view_dir)
 }
 
+#[cfg(test)]
+pub(crate) fn precheck_path_builds_for_test() -> usize {
+    manifest_incremental::precheck_path_builds_for_test()
+}
+
 /// Avoid build admission for notifications outside committed membership. This
 /// does not replace rescans, semantic handoffs, artifact repair or graph builds.
 pub(crate) fn can_skip_irrelevant_paths(request: &AssemblyRequest, defer_derived: bool) -> bool {
