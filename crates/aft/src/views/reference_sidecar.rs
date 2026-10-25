@@ -237,6 +237,14 @@ pub(crate) struct ReferenceSidecars {
     /// Re-hashing every sidecar on every pass would read all of them in full;
     /// a sidecar whose own stamp is unchanged since it was verified is not.
     verified: Mutex<HashMap<PathBuf, Verified>>,
+    /// How old a sidecar's own timestamps must be before its verification is
+    /// remembered. Where timestamps are coarse (Windows, Linux before
+    /// multigrain timestamps, HFS+), a sidecar rewritten in place within the
+    /// same tick as its verification keeps its stamp, so remembering a young
+    /// sidecar could serve bytes that were never checked. This is the same
+    /// reasoning as the settle window for manifests, and it does not depend on
+    /// that policy, which tests set to zero.
+    memo_settle: Duration,
 }
 
 pub(crate) fn global() -> &'static ReferenceSidecars {
@@ -324,6 +332,15 @@ impl ReferenceSidecars {
         Self {
             settle,
             verified: Mutex::new(HashMap::new()),
+            memo_settle: SETTLE,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_memo_settle(settle: Duration, memo_settle: Duration) -> Self {
+        Self {
+            memo_settle,
+            ..Self::new(settle)
         }
     }
 
@@ -446,6 +463,11 @@ impl ReferenceSidecars {
             return None;
         }
         let mut verified = self.verified();
+        if !now_nanos().is_some_and(|now| sidecar.settled_by(now, self.memo_settle)) {
+            // Verified for this visit only; checked again on the next one.
+            verified.remove(path);
+            return Some(SidecarKeys { file, count });
+        }
         if verified.len() >= MAX_VERIFIED {
             verified.clear();
         }
@@ -594,6 +616,59 @@ mod tests {
             visit_keys(&strict, view.path(), "g"),
             (KeySource::Decoded { written: false }, keys_of(&replacement))
         );
+    }
+
+    #[test]
+    fn reference_sidecar_memo_never_remembers_a_sidecar_inside_the_settle_window() {
+        let view = tempfile::tempdir().unwrap();
+        // Trust and write sidecars at once; only the memo rule is under test.
+        let sidecars = ReferenceSidecars::new(Duration::ZERO);
+        write_manifest(view.path(), "g", &manifest_bytes());
+        assert_eq!(
+            visit_keys(&sidecars, view.path(), "g").0,
+            KeySource::Decoded { written: true }
+        );
+        assert_eq!(
+            visit_keys(&sidecars, view.path(), "g").0,
+            KeySource::Sidecar
+        );
+        // The sidecar was fully verified, but it changed moments ago: on a
+        // filesystem with coarse timestamps an in-place rewrite within the
+        // same tick would keep its stamp, so it must not be remembered.
+        assert_eq!(sidecars.verified().len(), 0);
+        // Once the sidecar is old enough, its verification is remembered.
+        let settled = ReferenceSidecars::with_memo_settle(Duration::ZERO, Duration::ZERO);
+        assert_eq!(visit_keys(&settled, view.path(), "g").0, KeySource::Sidecar);
+        assert_eq!(settled.verified().len(), 1);
+        assert_eq!(
+            visit_keys(&settled, view.path(), "g"),
+            (KeySource::Sidecar, keys_of(&manifest_bytes()))
+        );
+    }
+
+    #[test]
+    fn reference_sidecar_damaged_in_place_with_its_timestamps_restored_is_re_derived() {
+        let view = tempfile::tempdir().unwrap();
+        let sidecars = ReferenceSidecars::new(Duration::ZERO);
+        write_manifest(view.path(), "g", &manifest_bytes());
+        let expected = keys_of(&manifest_bytes());
+        visit_keys(&sidecars, view.path(), "g");
+        assert_eq!(
+            visit_keys(&sidecars, view.path(), "g").0,
+            KeySource::Sidecar
+        );
+        // Damage the last key in place, keeping the length, then put the
+        // modification time back. Where the stamp has no change time
+        // (Windows), this is what a same-tick rewrite looks like.
+        let sidecar = view.path().join(sidecar_name("g"));
+        let modified = fs::metadata(&sidecar).unwrap().modified().unwrap();
+        let mut bytes = fs::read(&sidecar).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(&sidecar, &bytes).unwrap();
+        filetime::set_file_mtime(&sidecar, filetime::FileTime::from_system_time(modified)).unwrap();
+        let (source, keys) = visit_keys(&sidecars, view.path(), "g");
+        assert_ne!(source, KeySource::Sidecar);
+        assert_eq!(keys, expected);
     }
 
     #[test]
