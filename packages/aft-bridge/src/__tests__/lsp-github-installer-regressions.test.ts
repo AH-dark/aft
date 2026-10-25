@@ -75,6 +75,14 @@ const config = { autoInstall: true, graceDays: 7, versions: {}, disabled: new Se
 const clangd = findGithubServerById("clangd");
 if (!clangd) throw new Error("clangd fixture missing");
 
+describe("release platforms", () => {
+  test("clangd declines Linux ARM64 instead of selecting an x64 executable", () => {
+    expect(clangd.resolveAsset("linux", "arm64", "21.1.0")).toBeNull();
+    expect(clangd.resolveAsset("linux", "x64", "21.1.0")?.name).toBe("clangd-linux-21.1.0.zip");
+    expect(clangd.resolveAsset("darwin", "arm64", "21.1.0")?.name).toBe("clangd-mac-21.1.0.zip");
+  });
+});
+
 describe("archive prechecks", () => {
   test("tar size precheck reads sizes rather than numeric filenames", async () => {
     await cacheFixture(async (root) => {
