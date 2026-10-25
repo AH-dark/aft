@@ -1654,7 +1654,8 @@ pub(crate) struct BgTaskState {
     pub(crate) kill_in_flight: bool,
     pub(crate) buffer: BgBuffer,
     terminal_output_cache: Option<TerminalOutputCache>,
-    /// PTY timeout intent or a memory stop that must survive marker finalization.
+    /// PTY timeout intent, a known memory stop, or a piped kill's committed
+    /// outcome after observing no natural marker before the signal decision.
     pub(crate) pending_terminal_override: Option<BgTaskStatus>,
 }
 
@@ -11124,6 +11125,16 @@ impl BgTaskRegistry {
         let task = self
             .task_for_session(task_id, session_id)
             .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
+        let pending_memory_reason = task
+            .lock_state()
+            .ok()
+            .and_then(|state| pending_memory_stop_reason(&state));
+        let terminal_status = if pending_memory_reason.is_some() {
+            BgTaskStatus::Failed
+        } else {
+            terminal_status
+        };
+        let reason = pending_memory_reason.or(reason);
         let memory_kill = terminal_status == BgTaskStatus::Failed
             && reason.is_some()
             && task
@@ -11182,6 +11193,9 @@ impl BgTaskRegistry {
                     _ => KillSignalPlan::Nothing,
                 }
             } else if let Ok(Some(marker)) = read_exit_marker(&task.paths) {
+                let memory_reason = pending_memory_stop_reason(&state);
+                let memory_kill = memory_kill || memory_reason.is_some();
+                let reason = memory_reason.or_else(|| reason.clone());
                 // A cap violation is a forced stop, not a natural exit. Polling
                 // for output here would reschedule the same memory kill before
                 // ConPTY can close, leaving the task running indefinitely.
@@ -11200,16 +11214,31 @@ impl BgTaskRegistry {
                         unreachable!()
                     }
                 } else {
-                    let terminal_reason = if marker == ExitMarker::Killed || memory_kill {
-                        reason.clone()
+                    // A repeated kill can observe the first kill's committed waiter result.
+                    let committed_piped_override = if state.metadata.mode == BgMode::Pipes {
+                        state.pending_terminal_override.clone()
                     } else {
                         None
                     };
-                    state.metadata = terminal_metadata_from_marker(
-                        state.metadata.clone(),
-                        marker,
-                        terminal_reason,
-                    );
+                    let terminal_reason = if marker == ExitMarker::Killed || memory_kill {
+                        reason.clone()
+                    } else if committed_piped_override.is_some() {
+                        state.metadata.status_reason.clone()
+                    } else {
+                        None
+                    };
+                    state.metadata = if let Some(target_status) = committed_piped_override {
+                        let mut metadata = state.metadata.clone();
+                        let exit_code = terminal_exit_code_for_status(&target_status);
+                        metadata.mark_terminal(target_status, exit_code, terminal_reason);
+                        metadata
+                    } else {
+                        terminal_metadata_from_marker(
+                            state.metadata.clone(),
+                            marker,
+                            terminal_reason,
+                        )
+                    };
                     if memory_kill {
                         state.metadata.mark_terminal(
                             BgTaskStatus::Failed,
@@ -11331,10 +11360,27 @@ impl BgTaskRegistry {
                 // A command may have finished after Killing was published but
                 // before any signal was delivered. Its own marker wins even
                 // when no status reader has published the terminal state yet.
-                let natural_exit_before_signal = read_exit_marker(&task.paths)
-                    .ok()
-                    .flatten()
-                    .filter(|marker| !memory_kill && matches!(marker, ExitMarker::Code(_)));
+                let natural_exit_before_signal = {
+                    let mut state = task
+                        .lock_state()
+                        .map_err(|_| "background task lock poisoned".to_string())?;
+                    let marker = read_exit_marker(&task.paths)
+                        .ok()
+                        .flatten()
+                        .filter(|marker| !memory_kill && matches!(marker, ExitMarker::Code(_)));
+                    if marker.is_none()
+                        && !state.metadata.status.is_terminal()
+                        && pending_memory_stop_reason(&state).is_none()
+                    {
+                        // Serialize the signal decision with marker finalization.
+                        // A later numeric marker can be the waiter's report of
+                        // this kill, not an independent natural completion.
+                        state.pending_terminal_override = Some(terminal_status.clone());
+                    }
+                    marker
+                };
+                #[cfg(test)]
+                wait_on_kill_signal_gate_for_test(&format!("{}:committed", task.task_id));
                 #[cfg(feature = "test-timing-hooks")]
                 if scope_diagnostic {
                     crate::slog_info!("scope diagnostic phase=signal_started task={task_id} child_pid={child_pid:?} elapsed_ms={}", diagnostic_start.elapsed().as_millis());
@@ -11366,8 +11412,16 @@ impl BgTaskRegistry {
                 // (the task's own exit marker, read by the watchdog) stands.
                 if !state.metadata.status.is_terminal() {
                     state.detached = true;
+                    let memory_reason = pending_memory_stop_reason(&state);
+                    let memory_kill = memory_kill || memory_reason.is_some();
+                    let reason = memory_reason.or(reason);
+                    let terminal_status = if memory_kill {
+                        BgTaskStatus::Failed
+                    } else {
+                        terminal_status
+                    };
 
-                    if let Some(marker) = natural_exit_before_signal {
+                    if let Some(marker) = natural_exit_before_signal.filter(|_| !memory_kill) {
                         state.metadata =
                             terminal_metadata_from_marker(state.metadata.clone(), marker, None);
                     } else {
@@ -11520,6 +11574,9 @@ impl BgTaskRegistry {
         // signal, so the kill publishes it here.
         #[cfg(windows)]
         if !state.metadata.status.is_terminal() {
+            let memory_reason = pending_memory_stop_reason(&state);
+            let memory_kill = memory_kill || memory_reason.is_some();
+            let reason = memory_reason.or(reason);
             let default_status = if terminal_status == BgTaskStatus::TimedOut {
                 BgTaskStatus::TimedOut
             } else {
@@ -11650,12 +11707,18 @@ impl BgTaskRegistry {
             let memory_reason = pending_memory_stop_reason(&state);
             let pending_override = state.pending_terminal_override.take();
             let is_pty = state.metadata.mode == BgMode::Pty;
-            // A numeric marker normally describes a natural exit, not the
-            // kill's intent. A recorded memory breach is already a forced
-            // outcome and must keep its cap reason even if this poll wins.
+            let committed_piped_override = if is_pty {
+                None
+            } else {
+                pending_override.clone()
+            };
+            // Before a piped kill commits, numeric markers remain natural exits.
+            // A known memory breach or committed signal outcome takes precedence
+            // over later numeric waiter reports.
             let inherited_reason = if state.metadata.status == BgTaskStatus::Killing
                 && matches!(marker, ExitMarker::Code(_))
                 && memory_reason.is_none()
+                && committed_piped_override.is_none()
             {
                 None
             } else {
@@ -11671,6 +11734,11 @@ impl BgTaskRegistry {
                 let mut new_metadata = if memory_reason.is_some() {
                     let mut metadata = metadata.clone();
                     metadata.mark_terminal(BgTaskStatus::Failed, Some(137), reason.clone());
+                    metadata
+                } else if let Some(target_status) = committed_piped_override.clone() {
+                    let mut metadata = metadata.clone();
+                    let exit_code = terminal_exit_code_for_status(&target_status);
+                    metadata.mark_terminal(target_status, exit_code, reason.clone());
                     metadata
                 } else if is_pty && marker == ExitMarker::Killed {
                     let mut metadata = metadata.clone();
@@ -22252,6 +22320,116 @@ mod tests {
         registry.kill(&task_id, "session").unwrap();
         assert!(completions_for(&registry, &task_id).is_empty());
         assert_eq!(pattern_match_frames(&frames).len(), 1);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn explicit_kill_marker_order_preserves_the_signal_commit() {
+        for after_commit in [false, true] {
+            for code in [0, 7] {
+                let registry = BgTaskRegistry::default();
+                registry.inner.shutdown.store(true, Ordering::SeqCst);
+                let dir = tempfile::tempdir().unwrap();
+                let ready = dir.path().join("ready");
+                #[cfg(unix)]
+                let (shell, shell_path, command) = (
+                    crate::bash_background::BashShell::Bash,
+                    PathBuf::from("/bin/sh"),
+                    format!(
+                        "printf ready > '{}'; sleep 30",
+                        ready.display().to_string().replace('\'', "'\\''")
+                    ),
+                );
+                #[cfg(windows)]
+                let (shell, shell_path, command) = (
+                    crate::bash_background::BashShell::Powershell,
+                    PathBuf::from("pwsh.exe"),
+                    format!(
+                        "[IO.File]::WriteAllText('{}', 'ready'); Start-Sleep -Seconds 30",
+                        ready.display().to_string().replace('\'', "''")
+                    ),
+                );
+                let id = registry
+                    .spawn_with_shell_in_slot_typed(
+                        SpawnPlan::Unsandboxed,
+                        &command,
+                        shell,
+                        shell_path,
+                        "session".into(),
+                        dir.path().into(),
+                        HashMap::new(),
+                        crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                        None,
+                        dir.path().into(),
+                        crate::bash_background::TaskSlot::Background { max: 10 },
+                        true,
+                        false,
+                        Some(dir.path().into()),
+                    )
+                    .unwrap();
+                let task = registry.task_for_test(&id).unwrap();
+                let ready_deadline = Instant::now() + Duration::from_secs(10);
+                while !ready.exists() {
+                    assert!(Instant::now() < ready_deadline, "command did not start");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let gate_key = if after_commit {
+                    format!("{id}:committed")
+                } else {
+                    id.clone()
+                };
+                let (reached, release) = install_kill_signal_gate_for_test(&gate_key);
+                let kill_registry = registry.clone();
+                let kill_id = id.clone();
+                let killer = std::thread::spawn(move || kill_registry.kill(&kill_id, "session"));
+                reached.recv_timeout(Duration::from_secs(10)).unwrap();
+
+                // Model either a natural exit before the signal decision or a
+                // numeric waiter result that arrives after the kill owns it.
+                task.lock_state()
+                    .unwrap()
+                    .io_handles
+                    .as_mut()
+                    .unwrap()
+                    .write(TaskArtifact::Exit, code.to_string().as_bytes())
+                    .unwrap();
+                if code == 7 {
+                    // A repeated kill is another consumer of the waiter's marker.
+                    registry.kill(&id, "session").unwrap();
+                } else {
+                    registry.poll_task(&task).unwrap();
+                }
+                let expected_status = if after_commit {
+                    BgTaskStatus::Killed
+                } else if code == 0 {
+                    BgTaskStatus::Completed
+                } else {
+                    BgTaskStatus::Failed
+                };
+                let expected_code = if after_commit { 137 } else { code };
+                let observed = registry.status(&id, "session", None, None, 0).unwrap();
+                assert_eq!(
+                    observed.info.status, expected_status,
+                    "after_commit={after_commit} marker={code}"
+                );
+                assert_eq!(observed.exit_code, Some(expected_code));
+                release.send(()).unwrap();
+                let killed = killer.join().unwrap().unwrap();
+                assert_eq!(killed.info.status, expected_status);
+                assert_eq!(killed.exit_code, Some(expected_code));
+                let after = registry.status(&id, "session", None, None, 0).unwrap();
+                assert_eq!(after.info.status, expected_status);
+                assert_eq!(after.exit_code, Some(expected_code));
+                assert_eq!(read_task(&task.paths.json).unwrap().status, expected_status);
+                let completions = registry
+                    .pending_completions_for_session("session")
+                    .into_iter()
+                    .filter(|completion| completion.task_id == id)
+                    .collect::<Vec<_>>();
+                assert_eq!(completions.len(), 1);
+                assert_eq!(completions[0].status, expected_status);
+            }
+        }
     }
 
     #[cfg(unix)]
