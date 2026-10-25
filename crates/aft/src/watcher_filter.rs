@@ -689,29 +689,42 @@ impl WatcherExclusionPaths {
         self.lasting.len() != previous_len
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn refresh_event(&mut self, event: &notify::Event) -> Vec<PathBuf> {
+        self.refresh_events(std::iter::once(event))
+    }
+
+    pub(crate) fn refresh_events<'a>(
+        &mut self,
+        events: impl IntoIterator<Item = &'a notify::Event>,
+    ) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut rescan = false;
         // Content, metadata and access events cannot replace a directory.
         // Keep their high-volume path free of filesystem probes.
-        if !event.need_rescan()
-            && !matches!(
+        for event in events {
+            if event.need_rescan() {
+                rescan = true;
+            } else if !matches!(
                 event.kind,
                 notify::EventKind::Create(_)
                     | notify::EventKind::Remove(_)
                     | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
-            )
-        {
+            ) {
+                continue;
+            }
+            paths.extend(event.paths.iter().cloned());
+        }
+        if paths.is_empty() && !rescan {
             return Vec::new();
         }
         let previous = self.external.clone();
-        if event.need_rescan() {
+        if rescan {
             // Overflow events may have no paths. Recheck every known external
             // boundary, including replacements whose topology event was lost.
-            let mut paths = event.paths.clone();
             paths.extend(self.external.iter().cloned());
-            self.refresh_touched(&paths);
-        } else {
-            self.refresh_touched(&event.paths);
         }
+        self.refresh_touched(&paths);
         self.external
             .symmetric_difference(&previous)
             .cloned()
@@ -726,14 +739,36 @@ impl WatcherExclusionPaths {
             return false;
         };
         let previous = self.external.clone();
+        // Component results are keyed by lexical path and shared only within
+        // this batch. Discarding the cache at the next batch invalidates both a
+        // touched path and descendants of a renamed/replaced parent, including
+        // external ancestors reported only through a child event. Walks retain
+        // their independent uncached boundary checks.
+        let mut cache = BTreeMap::new();
         self.external.retain(|excluded| {
             !paths
                 .iter()
                 .any(|path| path.starts_with(excluded) || excluded.starts_with(path))
-                || boundary.kind(excluded) == ExclusionPathKind::External
+                || boundary.classify_cached(excluded, &mut cache).0 == ExclusionPathKind::External
         });
+        let mut seen = BTreeSet::new();
         for path in paths {
-            if let (_, Some(external)) = boundary.classify(path) {
+            // Discovery need not spend more exclusion slots below an installed
+            // lasting exclusion. Probe through that boundary in case it became
+            // a link, not through every build artifact. This only shortens the
+            // probe: exact-path native exclusions may still deliver descendants,
+            // and their events must still reach the ordinary corpus filter.
+            let probe = self
+                .lasting
+                .iter()
+                .map(|entry| entry.path())
+                .filter(|excluded| path.starts_with(excluded))
+                .min_by_key(|excluded| excluded.components().count())
+                .unwrap_or(path);
+            if !seen.insert(probe) {
+                continue;
+            }
+            if let (_, Some(external)) = boundary.classify_cached(probe, &mut cache) {
                 // Keep the shared budget within FSEvents' eight-exclusion limit.
                 // Full slots do not permit traversal: every directory scan
                 // independently checks symlinks and device boundaries.
@@ -934,6 +969,51 @@ impl WatcherWalkBoundary {
     }
 
     fn classify(&self, path: &Path) -> (ExclusionPathKind, Option<PathBuf>) {
+        self.classify_with(path, |path| self.component_kind(path))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
+    fn classify_cached(
+        &self,
+        path: &Path,
+        cache: &mut BTreeMap<PathBuf, ExclusionPathKind>,
+    ) -> (ExclusionPathKind, Option<PathBuf>) {
+        self.classify_with(path, |path| {
+            *cache
+                .entry(path.to_path_buf())
+                .or_insert_with(|| self.component_kind(path))
+        })
+    }
+
+    fn component_kind(&self, path: &Path) -> ExclusionPathKind {
+        let metadata = match watcher_boundary_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ExclusionPathKind::Absent;
+            }
+            Err(_) => return ExclusionPathKind::Other,
+        };
+        if metadata.file_type().is_symlink() {
+            return ExclusionPathKind::External;
+        }
+        if !metadata.is_dir() {
+            return ExclusionPathKind::Other;
+        }
+        if self
+            .device
+            .zip(exclusion_device(path, &metadata))
+            .is_some_and(|(root, child)| !crate::walk_boundary::same_filesystem_device(root, child))
+        {
+            return ExclusionPathKind::External;
+        }
+        ExclusionPathKind::LocalDirectory
+    }
+
+    fn classify_with(
+        &self,
+        path: &Path,
+        mut component_kind: impl FnMut(&Path) -> ExclusionPathKind,
+    ) -> (ExclusionPathKind, Option<PathBuf>) {
         #[cfg(test)]
         EXCLUSION_TEST_CLASSIFICATIONS.with(|calls| calls.set(calls.get() + 1));
         let Ok(relative) = path.strip_prefix(&self.root) else {
@@ -945,27 +1025,10 @@ impl WatcherWalkBoundary {
                 return (ExclusionPathKind::Other, None);
             }
             current.push(component);
-            let metadata = match watcher_boundary_metadata(&current) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return (ExclusionPathKind::Absent, None)
-                }
-                Err(_) => return (ExclusionPathKind::Other, None),
-            };
-            if metadata.file_type().is_symlink() {
-                return (ExclusionPathKind::External, Some(current));
-            }
-            if !metadata.is_dir() {
-                return (ExclusionPathKind::Other, None);
-            }
-            if self
-                .device
-                .zip(exclusion_device(&current, &metadata))
-                .is_some_and(|(root, child)| {
-                    !crate::walk_boundary::same_filesystem_device(root, child)
-                })
-            {
-                return (ExclusionPathKind::External, Some(current));
+            match component_kind(&current) {
+                ExclusionPathKind::LocalDirectory => {}
+                ExclusionPathKind::External => return (ExclusionPathKind::External, Some(current)),
+                kind => return (kind, None),
             }
         }
         (ExclusionPathKind::LocalDirectory, None)
@@ -978,7 +1041,10 @@ impl WatcherWalkBoundary {
 
 fn watcher_boundary_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
     #[cfg(test)]
-    EXCLUSION_TEST_LSTATS.with(|calls| calls.set(calls.get() + 1));
+    {
+        EXCLUSION_TEST_LSTATS.with(|calls| calls.set(calls.get() + 1));
+        EXCLUSION_TEST_STAT_PATHS.with(|paths| paths.borrow_mut().push(path.to_path_buf()));
+    }
     fs::symlink_metadata(path)
 }
 
@@ -1220,6 +1286,8 @@ pub(crate) fn exclusion_read_dir(path: &Path) -> std::io::Result<fs::ReadDir> {
 thread_local! {
     pub(crate) static EXCLUSION_TEST_OPENS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
     pub(crate) static EXCLUSION_TEST_LSTATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EXCLUSION_TEST_STAT_PATHS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    static WATCHER_TEST_ROOT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static EXCLUSION_TEST_CLASSIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static EXCLUSION_TEST_DEVICE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
@@ -2254,6 +2322,7 @@ struct WatcherFilterThread {
     content_only_paths: BTreeSet<PathBuf>,
     recent_paths: VecDeque<(PathBuf, Instant)>,
     flush_deadline: Option<Instant>,
+    next_root_check: Instant,
     /// Events the dispatch channel had no room for, oldest first. Changed
     /// paths are merged into one event while they wait; see `hold_event`.
     backlog: VecDeque<WatcherDispatchEvent>,
@@ -2292,6 +2361,7 @@ impl WatcherFilterThread {
             content_only_paths: BTreeSet::new(),
             recent_paths: VecDeque::with_capacity(WATCHER_ATTRIBUTION_RING_CAPACITY),
             flush_deadline: None,
+            next_root_check: Instant::now(),
             backlog: VecDeque::new(),
             overflow_burst: None,
             #[cfg(test)]
@@ -2319,7 +2389,7 @@ impl WatcherFilterThread {
             if !self.retry_backlog() {
                 return;
             }
-            if self.project_root_was_deleted() {
+            if self.project_root_was_deleted(Instant::now()) {
                 self.raw_paths.clear();
                 self.content_only_paths.clear();
                 let _ = self.send_dispatch_final(WatcherDispatchEvent::RootDeleted);
@@ -2416,7 +2486,15 @@ impl WatcherFilterThread {
         }
     }
 
-    fn project_root_was_deleted(&self) -> bool {
+    fn project_root_was_deleted(&mut self, now: Instant) -> bool {
+        // Check on a wall-clock cadence, not once per raw event. Ignored build
+        // bursts can otherwise turn the root-deletion fallback into a stat loop.
+        if now < self.next_root_check {
+            return false;
+        }
+        self.next_root_check = now + ROOT_DELETED_CHECK_INTERVAL;
+        #[cfg(test)]
+        WATCHER_TEST_ROOT_PROBES.with(|calls| calls.set(calls.get() + 1));
         !self.config.project_root.exists()
     }
 
@@ -2664,15 +2742,15 @@ impl WatcherFilterThread {
     fn next_recv_timeout(&self) -> Duration {
         // Wake in time to flush a pending overflow summary, and sooner while
         // dispatch-backlogged events are waiting for room.
-        let mut timeout =
-            self.overflow_burst
-                .as_ref()
-                .map_or(ROOT_DELETED_CHECK_INTERVAL, |burst| {
-                    (burst.3 + WATCHER_OVERFLOW_QUIET_INTERVAL)
-                        .min(burst.2 + WATCHER_OVERFLOW_MAX_INTERVAL)
-                        .saturating_duration_since(Instant::now())
-                        .min(ROOT_DELETED_CHECK_INTERVAL)
-                });
+        let root_timeout = self
+            .next_root_check
+            .saturating_duration_since(Instant::now());
+        let mut timeout = self.overflow_burst.as_ref().map_or(root_timeout, |burst| {
+            (burst.3 + WATCHER_OVERFLOW_QUIET_INTERVAL)
+                .min(burst.2 + WATCHER_OVERFLOW_MAX_INTERVAL)
+                .saturating_duration_since(Instant::now())
+                .min(root_timeout)
+        });
         if !self.backlog.is_empty() {
             timeout = timeout.min(DISPATCH_BACKLOG_RETRY_INTERVAL);
         }
@@ -2789,7 +2867,7 @@ impl WatcherFilterThread {
         while !self.shutdown.load(Ordering::SeqCst)
             && self.matcher_generation.load(Ordering::SeqCst) == observed_generation
         {
-            if self.project_root_was_deleted() {
+            if self.project_root_was_deleted(Instant::now()) {
                 let _ = self.send_dispatch_final(WatcherDispatchEvent::RootDeleted);
                 return false;
             }
@@ -3683,6 +3761,147 @@ mod tests {
     #[cfg(unix)]
     fn exclusion_tempdir() -> TempDir {
         tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn excluded_topology_burst_stats_follow_distinct_directories() {
+        const EVENTS: usize = 512;
+        for _ in 0..2 {
+            let root = TempDir::new().unwrap();
+            let excluded = root.path().join("packages/pkg/target");
+            fs::create_dir_all(&excluded).unwrap();
+            let paths: Vec<_> = (0..EVENTS)
+                .map(|index| excluded.join(format!("object-{index}.o")))
+                .collect();
+            let mut state = WatcherExclusionPaths::new(
+                root.path(),
+                &[WatcherExclusion {
+                    path: excluded.clone(),
+                    source: WatcherExclusionSource::Ecosystem,
+                }],
+            );
+            EXCLUSION_TEST_STAT_PATHS.with(|paths| paths.borrow_mut().clear());
+            let events: Vec<_> = paths
+                .into_iter()
+                .map(|path| notify::Event::new(EventKind::Create(CreateKind::File)).add_path(path))
+                .collect();
+            assert!(state.refresh_events(&events).is_empty());
+            let stats = EXCLUSION_TEST_STAT_PATHS.with(|paths| paths.borrow().clone());
+            eprintln!(
+                "root={} events={EVENTS} lstat={}",
+                root.path().display(),
+                stats.len()
+            );
+            assert_eq!(
+                stats.len(),
+                3,
+                "only the distinct covering directories need lstat"
+            );
+            assert_eq!(
+                stats,
+                vec![
+                    root.path().join("packages"),
+                    root.path().join("packages/pkg"),
+                    excluded.clone()
+                ]
+            );
+            assert_eq!(state.paths(), vec![excluded]);
+        }
+    }
+
+    #[test]
+    fn topology_batch_reuses_component_probes_without_an_exclusion() {
+        let root = TempDir::new().unwrap();
+        let directory = root.path().join("src/nested");
+        fs::create_dir_all(&directory).unwrap();
+        let mut state = WatcherExclusionPaths::new(root.path(), &[]);
+        let events: Vec<_> = (0..128)
+            .map(|index| {
+                notify::Event::new(EventKind::Create(CreateKind::File))
+                    .add_path(directory.join(format!("source-{index}.rs")))
+            })
+            .collect();
+        for _ in 0..2 {
+            EXCLUSION_TEST_STAT_PATHS.with(|paths| paths.borrow_mut().clear());
+            assert!(state.refresh_events(&events).is_empty());
+            let stats = EXCLUSION_TEST_STAT_PATHS.with(|paths| paths.borrow().clone());
+            assert_eq!(
+                stats.len(),
+                130,
+                "two directories plus each unknown leaf, not three probes per event"
+            );
+            assert_eq!(stats.iter().filter(|path| **path == directory).count(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn topology_batch_cache_expires_for_child_parent_and_pathless_events() {
+        let root = exclusion_tempdir();
+        let outside = TempDir::new().unwrap();
+        let parent = root.path().join("parent");
+        let excluded = parent.join("target");
+        fs::create_dir_all(&excluded).unwrap();
+        let mut state = WatcherExclusionPaths::new(
+            root.path(),
+            &[WatcherExclusion {
+                path: excluded.clone(),
+                source: WatcherExclusionSource::Ecosystem,
+            }],
+        );
+        let child_event = notify::Event::new(EventKind::Create(CreateKind::File))
+            .add_path(excluded.join("object.o"));
+        assert!(state.refresh_event(&child_event).is_empty());
+        fs::remove_dir(&excluded).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &excluded).unwrap();
+        assert_eq!(state.refresh_event(&child_event), vec![excluded.clone()]);
+        fs::remove_file(&excluded).unwrap();
+        assert_eq!(
+            state.refresh_event(
+                &notify::Event::new(EventKind::Remove(notify::event::RemoveKind::Folder))
+                    .add_path(parent.clone())
+            ),
+            vec![excluded.clone()]
+        );
+        fs::create_dir(&excluded).unwrap();
+        assert!(state.refresh_event(&child_event).is_empty());
+        fs::remove_dir(&excluded).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &excluded).unwrap();
+        assert_eq!(state.refresh_event(&child_event), vec![excluded.clone()]);
+        fs::remove_file(&excluded).unwrap();
+        fs::create_dir(&excluded).unwrap();
+        assert_eq!(
+            state.refresh_event(&notify::Event::new(EventKind::Other).set_flag(Flag::Rescan)),
+            vec![excluded.clone()]
+        );
+        assert_eq!(state.paths(), vec![excluded]);
+    }
+
+    #[test]
+    fn root_existence_probes_follow_poll_deadlines_not_event_count() {
+        let root = TempDir::new().unwrap();
+        let (dispatch_tx, _dispatch_rx) = watcher_dispatch_channel();
+        let mut filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root.path().to_path_buf(), None),
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(0)),
+            dispatch_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let now = Instant::now();
+        WATCHER_TEST_ROOT_PROBES.with(|calls| calls.set(0));
+        for _ in 0..10_000 {
+            assert!(!filter.project_root_was_deleted(now));
+        }
+        WATCHER_TEST_ROOT_PROBES.with(|calls| assert_eq!(calls.get(), 1));
+        fs::remove_dir(root.path()).unwrap();
+        assert!(filter.project_root_was_deleted(now + ROOT_DELETED_CHECK_INTERVAL));
+        WATCHER_TEST_ROOT_PROBES.with(|calls| assert_eq!(calls.get(), 2));
+        filter.next_root_check = Instant::now();
+        assert!(
+            filter.next_recv_timeout().is_zero(),
+            "continuous intake cannot postpone the next root check"
+        );
     }
 
     #[test]
