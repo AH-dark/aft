@@ -88,6 +88,7 @@ import { NPM_LSP_TABLE } from "./lsp-npm-table.js";
 import {
   type ConfigureWarning,
   deliverConfigureWarnings,
+  formatLspInstallSummary,
   sendFeatureAnnouncement,
   sendLspInstallSummary,
 } from "./notifications.js";
@@ -766,6 +767,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         })
         .then((updatedPaths) => {
           const skipped = [...npmResult.skipped, ...ghResult.skipped];
+          const summary = formatLspInstallSummary(skipped);
+          if (summary) warn(summary);
           if (!sendLspInstallSummary(skipped, activeSessionContext) && !hostShutdownStarted)
             pendingInstallSummary = skipped;
           return updatedPaths;

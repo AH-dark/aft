@@ -110,7 +110,11 @@ function makeFakeInnerPool() {
 }
 
 const mode = process.env.HARNESS_MODE;
-if (mode === "notification-summary" || mode === "notification-retry") {
+if (
+  mode === "notification-summary" ||
+  mode === "notification-retry" ||
+  mode === "notification-log-retry"
+) {
   const { mock } = await import("bun:test");
   const npmModule = new URL("../../lsp-auto-install.ts", import.meta.url).pathname;
   const realNpm = await import(npmModule);
@@ -219,6 +223,24 @@ if (mode === "plugin-validate") {
 } else if (mode?.startsWith("notification-")) {
   await new Promise<void>((resolve) => setImmediate(resolve));
   const { readFileSync } = await import("node:fs");
+  if (mode === "notification-log-retry") {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      for (const event of ["before_agent_start", "turn_end"]) {
+        for (const handler of handlers.get(event) ?? []) {
+          await handler({}, sessionCtx("headless-session"));
+        }
+      }
+    }
+    emit("headless-turns-done");
+    for (let attempt = 0; attempt < 2; attempt++) {
+      for (const event of ["before_agent_start", "turn_end"]) {
+        for (const handler of handlers.get(event) ?? []) {
+          await handler({}, { ...sessionCtx("retry-session"), hasUI: true });
+        }
+      }
+    }
+    emit("ui-turns-done");
+  }
   if (mode === "notification-retry") {
     emit(
       "pending-marker",

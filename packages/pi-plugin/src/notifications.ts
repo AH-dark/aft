@@ -3,7 +3,7 @@ import {
   markAnnouncementSeen,
   shouldShowAnnouncement,
 } from "@cortexkit/aft-bridge";
-import { log, warn } from "./logger.js";
+import { log } from "./logger.js";
 
 const WARNING_MARKER = "🔧 AFT: ⚠️";
 const FEATURE_MARKER = "🔧 AFT: ✨";
@@ -231,10 +231,9 @@ export function sendFeatureAnnouncement(
   return true;
 }
 
-export function sendLspInstallSummary(
+export function formatLspInstallSummary(
   skipped: readonly { id: string; reason: string }[],
-  client?: unknown,
-): boolean {
+): string | undefined {
   const actionable = skipped.filter(
     (item) =>
       ![
@@ -245,12 +244,20 @@ export function sendLspInstallSummary(
         "another install in progress",
       ].includes(item.reason.toLowerCase()),
   );
-  if (!actionable.length) return true;
+  if (!actionable.length) return undefined;
   const lines = actionable.map((item) => `  • ${item.id}: ${item.reason}`).join("\n");
-  const message =
+  return (
     `[lsp] skipped or failed to install ${actionable.length} server(s):\n${lines}\n` +
     'Pin a working version with `lsp.versions: { "<package>": "<version>" }` if grace is blocking, ' +
-    "or set `lsp.auto_install: false` to suppress.";
-  warn(message);
-  return notifyPi(client, message, "warning");
+    "or set `lsp.auto_install: false` to suppress."
+  );
+}
+
+/** Retry UI delivery without repeating the warning logged when installation settled. */
+export function sendLspInstallSummary(
+  skipped: readonly { id: string; reason: string }[],
+  client?: unknown,
+): boolean {
+  const message = formatLspInstallSummary(skipped);
+  return message === undefined || notifyPi(client, message, "warning");
 }

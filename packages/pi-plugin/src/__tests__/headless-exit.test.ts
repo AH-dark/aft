@@ -59,7 +59,8 @@ function spawnHarness(
     | "notification-upgrade"
     | "notification-headless"
     | "notification-summary"
-    | "notification-retry",
+    | "notification-retry"
+    | "notification-log-retry",
 ) {
   const tempDir = mkdtempSync(join(tmpdir(), "aft-pi-headless-exit-"));
   tempDirs.push(tempDir);
@@ -113,6 +114,7 @@ function spawnHarness(
   }
   if (mode === "subagent") env.MAGIC_CONTEXT_PI_SUBAGENT = "1";
   else delete env.MAGIC_CONTEXT_PI_SUBAGENT;
+  if (mode === "notification-log-retry") env.AFT_LOG_STDERR = "1";
 
   const child = spawn(
     process.execPath,
@@ -565,7 +567,8 @@ describe.skipIf(process.platform === "win32")("approved session UI binding", () 
       | "notification-upgrade"
       | "notification-headless"
       | "notification-summary"
-      | "notification-retry",
+      | "notification-retry"
+      | "notification-log-retry",
   ) {
     const { child } = spawnHarness(mode);
     let stdout = "";
@@ -643,6 +646,27 @@ describe.skipIf(process.platform === "win32")("approved session UI binding", () 
     const warnings = toasts.filter((toast) => toast.type === "warning");
     expect(warnings).toHaveLength(1);
     expect(warnings[0]?.sessionId).toBe("harness-session");
+    expect(warnings[0]?.message).toContain("fixture install failed");
+    expect(warnings[0]?.message).not.toContain("routine-server");
+  });
+
+  test("headless install-summary retries log once and deliver once when UI becomes available", async () => {
+    const run = await notifications("notification-log-retry");
+    expect(run.code).toBe(0);
+    expect(run.stdout).toContain("EVENT headless-turns-done");
+    expect(run.stdout).toContain("EVENT ui-turns-done");
+    expect(run.stdout.split("EVENT headless-turns-done")[0]).not.toContain("EVENT ui-toast ");
+    const summaryLogs = run.stderr.match(
+      /\] WARN \[aft-pi\] \[lsp\] skipped or failed to install \d+ server\(s\):/g,
+    );
+    expect(summaryLogs).toHaveLength(1);
+    const warnings = run.stdout
+      .split("\n")
+      .filter((line) => line.startsWith("EVENT ui-toast "))
+      .map((line) => JSON.parse(line.slice("EVENT ui-toast ".length)))
+      .filter((toast) => toast.type === "warning");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.sessionId).toBe("retry-session");
     expect(warnings[0]?.message).toContain("fixture install failed");
     expect(warnings[0]?.message).not.toContain("routine-server");
   });
