@@ -94,12 +94,23 @@ fn call(f: &Fixture, principal: Option<Principal>, params: Value) -> CollectCall
     }
 }
 
-/// Hooks whose open is `open` and that swap nothing.
-fn no_open<'a>(open: OpenFile<'a>) -> ReadHooks<'a> {
-    ReadHooks {
-        open,
-        after_check: None,
-    }
+/// Hooks that record every path the reader opens (on a bounded I/O helper
+/// thread, so the record is shared) and then open it as production does.
+fn recording_hooks() -> (ReadHooks<'static>, Arc<Mutex<Vec<PathBuf>>>) {
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&opened);
+    let hooks = ReadHooks {
+        open: Arc::new(move |root: &Path, target: &Path| {
+            record.lock().unwrap().push(target.to_path_buf());
+            file_read_exact::open_no_follow(root, target)
+        }),
+        ..ReadHooks::production()
+    };
+    (hooks, opened)
+}
+
+fn opened_paths(opened: &Arc<Mutex<Vec<PathBuf>>>) -> Vec<PathBuf> {
+    opened.lock().unwrap().clone()
 }
 
 fn collect_params(entry: &str) -> Value {
@@ -108,19 +119,9 @@ fn collect_params(entry: &str) -> Value {
 
 /// Collect `index.html`, recording every path the reader opens.
 fn collect_recording(f: &Fixture) -> (Response, Vec<PathBuf>) {
-    let opened = Mutex::new(Vec::new());
-    let open = |root: &Path, target: &Path| {
-        opened.lock().unwrap().push(target.to_path_buf());
-        file_read_exact::open_no_follow(root, target)
-    };
-    let response = collect_with_hooks(
-        call(f, core(), collect_params("index.html")),
-        ReadHooks {
-            open: &open,
-            after_check: None,
-        },
-    );
-    (response, opened.into_inner().unwrap())
+    let (hooks, opened) = recording_hooks();
+    let response = collect_with_hooks(call(f, core(), collect_params("index.html")), hooks);
+    (response, opened_paths(&opened))
 }
 
 fn omitted(response: &Response) -> Vec<(String, String)> {
@@ -188,10 +189,9 @@ fn page_collect_entry_refusals_name_no_denied_contents() {
         ("absent.html", "entry_unreadable", "missing"),
         ("ok.png", "entry_not_html", "extension"),
     ] {
-        let response = collect_with_hooks(
-            call(&f, core(), collect_params(entry)),
-            no_open(&|_, _| panic!("{entry}: nothing may be opened")),
-        );
+        let (hooks, opened) = recording_hooks();
+        let response = collect_with_hooks(call(&f, core(), collect_params(entry)), hooks);
+        assert_eq!(opened_paths(&opened), Vec::<PathBuf>::new(), "{entry}");
         assert!(!response.success);
         assert_eq!(response.data["code"], code, "{entry}");
         assert_eq!(
@@ -217,12 +217,18 @@ fn page_collect_refuses_callers_other_than_core() {
             module_id: "aft".into(),
         }),
     ] {
+        let (hooks, opened) = recording_hooks();
         let response = collect_with_hooks(
             call(&f, principal.clone(), collect_params("index.html")),
-            no_open(&|_, _| panic!("a refused caller opened a file")),
+            hooks,
         );
         assert_eq!(
             response.data["code"], "page_caller_refused",
+            "{principal:?}"
+        );
+        assert_eq!(
+            opened_paths(&opened),
+            Vec::<PathBuf>::new(),
             "{principal:?}"
         );
         let ReadReply::Refused(response) = read(
@@ -241,15 +247,17 @@ fn page_collect_refuses_callers_other_than_core() {
 #[test]
 fn page_collect_unbound_session_is_refused() {
     let f = fixture(BindTrust::FirstParty);
+    let (hooks, opened) = recording_hooks();
     let response = collect_with_hooks(
         call(
             &f,
             core(),
             json!({"harness": HARNESS, "session": "other", "entry": "index.html"}),
         ),
-        no_open(&|_, _| panic!("opened a file for an unbound session")),
+        hooks,
     );
     assert_eq!(response.data["code"], SESSION_NOT_BOUND);
+    assert_eq!(opened_paths(&opened), Vec::<PathBuf>::new());
 }
 
 fn channel(number: u16) -> RouteChannel {
@@ -435,16 +443,12 @@ fn page_collect_symlink_swapped_to_a_database_after_the_check_is_never_opened() 
                 *swapped.lock().unwrap() = true;
             }
         };
-        let opened = Mutex::new(Vec::new());
-        let open = |root: &Path, path: &Path| {
-            opened.lock().unwrap().push(path.to_path_buf());
-            file_read_exact::open_no_follow(root, path)
-        };
+        let (hooks, opened) = recording_hooks();
         let response = collect_with_hooks(
             call(&f, core(), collect_params("swap.html")),
             ReadHooks {
-                open: &open,
                 after_check: Some(&swap),
+                ..hooks
             },
         );
         assert!(*swapped.lock().unwrap(), "the swap hook never ran");
@@ -456,7 +460,7 @@ fn page_collect_symlink_swapped_to_a_database_after_the_check_is_never_opened() 
             target.display()
         );
         assert_eq!(
-            opened.into_inner().unwrap(),
+            opened_paths(&opened),
             vec![f.root.join("swap.html")],
             "a database was opened through the swapped link {}",
             target.display()
@@ -764,11 +768,7 @@ async fn page_collect_untrusted_session_never_reaches_outside_its_root() {
     assert!(!read_tool_allows(&f, &f.outside_path, 2).await);
 
     // And page.collect leaves it out, without opening it.
-    let opened = Mutex::new(Vec::new());
-    let open = |root: &Path, target: &Path| {
-        opened.lock().unwrap().push(target.to_path_buf());
-        file_read_exact::open_no_follow(root, target)
-    };
+    let (hooks, opened) = recording_hooks();
     let response = collect_with_hooks(
         CollectCall {
             params: json!({"harness": HARNESS, "session": SESSION, "entry": "index.html"}),
@@ -777,10 +777,7 @@ async fn page_collect_untrusted_session_never_reaches_outside_its_root() {
             executor: Arc::clone(&f.executor),
             store: Arc::new(SnapshotStore::open(&f.ctx.storage_dir())),
         },
-        ReadHooks {
-            open: &open,
-            after_check: None,
-        },
+        hooks,
     );
     assert!(response.success, "{:?}", response.data);
     assert!(
@@ -788,9 +785,146 @@ async fn page_collect_untrusted_session_never_reaches_outside_its_root() {
         "{:?}",
         response.data
     );
-    let opened = opened.into_inner().unwrap();
+    let opened = opened_paths(&opened);
     assert!(
         !opened.iter().any(|path| path.starts_with(&f.outside)),
         "a file outside the untrusted session's root was opened: {opened:?}"
     );
+}
+
+/// A `<base href>` that leads out of the session's root moves the page's
+/// references there, where the session's read policy refuses them: they are
+/// listed as denied and never opened.
+#[test]
+fn page_collect_base_leaving_the_root_is_denied_and_never_opened() {
+    let f = fixture(BindTrust::FirstParty);
+    let outside_name = f.outside.file_name().unwrap().to_str().unwrap();
+    std::fs::write(
+        f.root.join("based.html"),
+        format!(r#"<base href="../{outside_name}/"><img src="outside.png"><img src="x.png">"#),
+    )
+    .unwrap();
+    let (hooks, opened) = recording_hooks();
+    let response = collect_with_hooks(call(&f, core(), collect_params("based.html")), hooks);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(
+        omitted(&response),
+        vec![
+            (
+                format!("../{outside_name}/outside.png"),
+                "denied".to_string()
+            ),
+            (format!("../{outside_name}/x.png"), "denied".to_string()),
+        ]
+    );
+    assert_eq!(opened_paths(&opened), vec![f.root.join("based.html")]);
+}
+
+/// Longest a test stall holds a read. Past it the read goes on, so a reader
+/// that waits for its reads (instead of bounding them) is late, not hung.
+const STALL_MAX: Duration = Duration::from_secs(4);
+
+/// Holds every read of a file named `name` on the reader's I/O helper, as a
+/// hung network filesystem would, until dropped or [`STALL_MAX`] passes.
+struct Stall(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+impl Drop for Stall {
+    fn drop(&mut self) {
+        *self.0 .0.lock().unwrap() = true;
+        self.0 .1.notify_all();
+    }
+}
+
+fn stall_reads_of(name: &'static str) -> (BeforeRead, Stall) {
+    let released = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let gate = Arc::clone(&released);
+    let hook: BeforeRead = Arc::new(move |path: &Path| {
+        if path.ends_with(name) {
+            let (released, wake) = &*gate;
+            let guard = released.lock().unwrap();
+            let _ = wake
+                .wait_timeout_while(guard, STALL_MAX, |released| !*released)
+                .unwrap();
+        }
+    });
+    (hook, Stall(released))
+}
+
+fn stalled_call(f: &Fixture, store: &Arc<SnapshotStore>, entry: &str) -> CollectCall {
+    CollectCall {
+        params: json!({
+            "harness": HARNESS, "session": SESSION, "entry": entry,
+            "limits": {"deadline_ms": 300},
+        }),
+        principal: core(),
+        routes: f.routes.clone(),
+        executor: Arc::clone(&f.executor),
+        store: Arc::clone(store),
+    }
+}
+
+/// A referenced file whose read stalls is listed as past the deadline, and
+/// the collection returns at its deadline, not when the read finishes.
+#[test]
+fn page_collect_stalled_read_is_a_deadline_omission() {
+    let f = fixture(BindTrust::FirstParty);
+    std::fs::write(f.root.join("stall.html"), r#"<img src="ok.png">"#).unwrap();
+    let store = Arc::new(SnapshotStore::open(&f.ctx.storage_dir()));
+    let (before_read, _stall) = stall_reads_of("ok.png");
+    let hooks = ReadHooks {
+        before_read: Some(before_read),
+        ..ReadHooks::production()
+    };
+    let started = Instant::now();
+    let response = collect_with_hooks(stalled_call(&f, &store, "stall.html"), hooks);
+    let elapsed = started.elapsed();
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(
+        omitted(&response),
+        vec![("ok.png".to_string(), "deadline".to_string())]
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "returned after {elapsed:?}"
+    );
+}
+
+/// Four collections whose pages stall each give their snapshot place back
+/// when they return at the deadline, so a fifth collection still runs.
+#[test]
+fn page_collect_stalled_collections_free_their_snapshot_places() {
+    let f = fixture(BindTrust::FirstParty);
+    std::fs::write(f.root.join("stall.html"), r#"<img src="ok.png">"#).unwrap();
+    let store = Arc::new(SnapshotStore::open(&f.ctx.storage_dir()));
+    let (before_read, _stall) = stall_reads_of("stall.html");
+    for attempt in 0..crate::page_collect::snapshot::MAX_LIVE {
+        let hooks = ReadHooks {
+            before_read: Some(Arc::clone(&before_read)),
+            ..ReadHooks::production()
+        };
+        let started = Instant::now();
+        let response = collect_with_hooks(stalled_call(&f, &store, "stall.html"), hooks);
+        let elapsed = started.elapsed();
+        assert_eq!(
+            response.data["code"], "entry_unreadable",
+            "{attempt}: {:?}",
+            response.data
+        );
+        assert_eq!(response.data["detail"], json!({"reason": "deadline"}));
+        // The page gets at least a second (the page-read minimum).
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "{attempt}: returned after {elapsed:?}"
+        );
+        assert_eq!(
+            store.live_count(),
+            0,
+            "{attempt}: a stalled collection kept its place"
+        );
+    }
+    let response = collect_with_hooks(
+        stalled_call(&f, &store, "index.html"),
+        ReadHooks::production(),
+    );
+    assert!(response.success, "{:?}", response.data);
 }

@@ -32,10 +32,11 @@ fn page_collect_html_references_in_document_order() {
         <a href="not-collected.html">link</a>
         <source srcset="video.webm">
         </body></html>"#;
-    let (references, dropped) = html_references(html);
-    assert_eq!(dropped, 0);
+    let scan = html_references(html);
+    assert_eq!(scan.dropped, 0);
+    assert_eq!(scan.base, None);
     assert_eq!(
-        raws(&references),
+        raws(&scan.references),
         vec![
             ("css/site.css", RefKind::Stylesheet),
             ("favicon.ico", RefKind::Plain),
@@ -67,15 +68,18 @@ fn page_collect_malformed_html_never_panics() {
     ] {
         let _ = html_references(input);
     }
-    let (references, _) = html_references(b"<p><img src=ok.png <img src='two.png'>");
-    assert!(references.iter().any(|reference| reference.raw == "ok.png"));
+    let scan = html_references(b"<p><img src=ok.png <img src='two.png'>");
+    assert!(scan
+        .references
+        .iter()
+        .any(|reference| reference.raw == "ok.png"));
 }
 
 #[test]
 fn page_collect_attribute_entities_are_decoded() {
-    let (references, _) = html_references(br#"<img src="a&amp;b.png"><img src="c&#x2e;png">"#);
+    let scan = html_references(br#"<img src="a&amp;b.png"><img src="c&#x2e;png">"#);
     assert_eq!(
-        raws(&references),
+        raws(&scan.references),
         vec![("a&b.png", RefKind::Plain), ("c.png", RefKind::Plain)]
     );
 }
@@ -148,17 +152,26 @@ fn page_collect_resolve_reference_rules() {
     for raw in ["", "  ", "#top", "?v=1"] {
         assert_eq!(resolve_reference(raw, &none), Resolved::Skip, "{raw:?}");
     }
-    // Anything with a scheme, a host or an absolute path is never fetched.
+    // Web addresses, as written or protocol-relative, are remote.
     for raw in [
         "http://example.com/a.png",
-        "https://x/y",
+        "HTTPS://x/y",
+        "//host/a.png",
+        "/\\host/a.png",
+    ] {
+        assert_eq!(resolve_reference(raw, &none), Resolved::Remote, "{raw:?}");
+    }
+    // Everything else that is not a relative path is not_relative.
+    for raw in [
         "data:image/png;base64,AAAA",
         "file:///etc/passwd",
-        "//host/a.png",
+        "blob:https://example.com/uuid",
+        "javascript:alert(1)",
+        "ftp://example.com/a.png",
         "/etc/passwd",
         "\\\\server\\share\\a.png",
         "C:/Windows/win.ini",
-        "javascript:alert(1)",
+        "c:\\Windows\\win.ini",
     ] {
         assert_eq!(
             resolve_reference(raw, &none),
@@ -267,7 +280,12 @@ impl FakeSource {
 }
 
 impl PageSource for FakeSource {
-    fn read(&mut self, path: &Path, limit: u64) -> Result<Vec<u8>, ReadFailure> {
+    fn read(
+        &mut self,
+        path: &Path,
+        limit: u64,
+        _deadline: Instant,
+    ) -> Result<Vec<u8>, ReadFailure> {
         self.reads.push(path.to_path_buf());
         if self.denied.iter().any(|denied| path.starts_with(denied)) {
             return Err(ReadFailure::Denied);
@@ -296,6 +314,14 @@ impl SnapshotSink for MemorySink {
             sha256: format!("{:x}", sha2::Sha256::digest(bytes)),
             mime: mime_for(path),
         })
+    }
+
+    fn bytes(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        self.0
+            .iter()
+            .find(|(stored, _)| stored == path)
+            .map(|(_, bytes)| bytes.clone())
+            .ok_or_else(|| std::io::ErrorKind::NotFound.into())
     }
 }
 
@@ -370,7 +396,7 @@ fn page_collect_walk_lists_files_and_omissions() {
     assert_eq!(
         omitted(&collected),
         vec![
-            ("https://cdn/x.png", "not_relative"),
+            ("https://cdn/x.png", "remote"),
             ("secret/key.png", "denied"),
             ("gone.png", "missing"),
         ]
@@ -750,4 +776,192 @@ fn page_collect_same_page_twice_has_identical_hashes() {
     }
     assert_ne!(snapshots[0].0, snapshots[1].0);
     assert_eq!(snapshots[0].1, snapshots[1].1);
+}
+
+/// An attribute of nothing but `&` is decoded in linear work: each `&`
+/// looks for its `;` only in the few bytes a known reference can span.
+#[test]
+fn page_collect_entity_decoding_is_linear() {
+    let ampersands = "&".repeat(1 << 20);
+    let page = format!(r#"<img src="{ampersands}">"#);
+    // Fails at once if any `&` searches much past its own reference window.
+    scan::entity_bytes_examined::reset(12 << 20);
+    let scan = html_references(page.as_bytes());
+    let examined = scan::entity_bytes_examined::get();
+    assert!(examined <= 11 << 20, "{examined} bytes examined");
+    assert_eq!(scan.references.len(), 1);
+    assert_eq!(scan.references[0].raw, ampersands);
+    // References are still decoded when their `;` is in the window.
+    assert_eq!(
+        scan::decode_entities("a&#x2e;b&amp;c&#46;d&gt"),
+        "a.b&c.d&gt"
+    );
+}
+
+/// A file named first as a plain file and then as a stylesheet, or the
+/// other way round, is copied once and scanned once as a stylesheet.
+#[test]
+fn page_collect_file_named_as_plain_and_stylesheet_is_scanned_once() {
+    let root = root();
+    let css: &[u8] = b"@import 'y.css'; a { background: url(z.png) }";
+    for page in [
+        &br#"<img src="x.css"><link rel=stylesheet href="x.css">"#[..],
+        br#"<link rel=stylesheet href="x.css"><img src="x.css">"#,
+    ] {
+        let mut source = FakeSource::with(
+            &root,
+            &[
+                ("index.html", page),
+                ("x.css", css),
+                ("y.css", b"b { color: red }"),
+                ("z.png", b"Z"),
+            ],
+        );
+        let collected = run(&mut source, Limits::DEFAULT).unwrap();
+        let mut files = names(&collected);
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["index.html", "x.css", "y.css", "z.png"],
+            "{}",
+            String::from_utf8_lossy(page)
+        );
+        assert!(collected.omitted.is_empty(), "{:?}", collected.omitted);
+        let x_reads = source
+            .reads
+            .iter()
+            .filter(|read| read.ends_with("x.css"))
+            .count();
+        assert_eq!(x_reads, 1, "x.css was read more than once");
+    }
+    // The stored bytes are read back from a real snapshot too.
+    let (_dir, store) = store();
+    let mut builder = store.begin().unwrap();
+    let mut source = FakeSource::with(
+        &root,
+        &[
+            (
+                "index.html",
+                br#"<img src="x.css"><link rel=stylesheet href="x.css">"#,
+            ),
+            ("x.css", css),
+            ("y.css", b"b { color: red }"),
+            ("z.png", b"Z"),
+        ],
+    );
+    let collected = collect(
+        &root.join("index.html"),
+        &Limits::DEFAULT,
+        Instant::now(),
+        &mut source,
+        &mut builder,
+    )
+    .unwrap();
+    assert_eq!(collected.files.len(), 4);
+}
+
+#[test]
+fn page_collect_resolve_base_rules() {
+    let dir = |segments: &[&str]| {
+        RefBase::Dir(segments.iter().map(|segment| segment.to_string()).collect())
+    };
+    assert_eq!(resolve_base("assets/"), dir(&["assets"]));
+    assert_eq!(resolve_base("assets/page.html?x#y"), dir(&["assets"]));
+    assert_eq!(resolve_base("a/../b/./c/"), dir(&["b", "c"]));
+    assert_eq!(resolve_base("../../up/"), dir(&["..", "..", "up"]));
+    assert_eq!(resolve_base("page.html"), dir(&[]));
+    assert_eq!(resolve_base(""), dir(&[]));
+    assert_eq!(resolve_base("#top"), dir(&[]));
+    for web in [
+        "https://cdn.example.com/x/",
+        "http://x/",
+        "//cdn.example.com/",
+    ] {
+        assert_eq!(resolve_base(web), RefBase::Web, "{web}");
+    }
+    for absolute in [
+        "/static/",
+        "file:///etc/",
+        "data:text/html,",
+        "\\\\server\\share\\",
+        "C:/site/",
+    ] {
+        assert_eq!(resolve_base(absolute), RefBase::Absolute, "{absolute}");
+    }
+    assert_eq!(resolve_base("%FF/"), RefBase::Invalid);
+}
+
+/// Relative references, inline styles included, resolve against the first
+/// `<base href>`; a later `<base>` is ignored.
+#[test]
+fn page_collect_relative_base_moves_references() {
+    let root = root();
+    let mut source = FakeSource::with(
+        &root,
+        &[
+            (
+                "index.html",
+                br#"<head><base href="assets/"><base href="ignored/"></head>
+                <img src="a.png"><div style="background: url(b.png)"></div>
+                <link rel=stylesheet href="s.css"><img src="https://cdn/x.png">"#,
+            ),
+            ("assets/a.png", b"A"),
+            ("assets/b.png", b"B"),
+            ("assets/s.css", b"p { background: url(img/c.png) }"),
+            ("assets/img/c.png", b"C"),
+            ("ignored/a.png", b"wrong base"),
+        ],
+    );
+    let collected = run(&mut source, Limits::DEFAULT).unwrap();
+    assert_eq!(
+        names(&collected),
+        vec![
+            "index.html",
+            "assets/a.png",
+            "assets/b.png",
+            "assets/s.css",
+            "assets/img/c.png"
+        ]
+    );
+    assert_eq!(omitted(&collected), vec![("https://cdn/x.png", "remote")]);
+}
+
+/// A web base makes every relative reference a web address, listed as
+/// `remote`; an absolute file or non-web base makes them `not_relative`.
+/// Neither is ever read, and references with their own scheme keep theirs.
+#[test]
+fn page_collect_absolute_base_moves_references_out_of_reach() {
+    let root = root();
+    for (base, moved) in [
+        ("https://cdn.example.com/site/", "remote"),
+        ("//cdn.example.com/site/", "remote"),
+        ("http://cdn.example.com/", "remote"),
+        ("/static/", "not_relative"),
+        ("file:///srv/site/", "not_relative"),
+    ] {
+        let page = format!(
+            r##"<base href="{base}"><img src="a.png"><img src="a.png"><img src="data:x">
+            <div style="background:url(b.png)"></div><img src="#top">"##
+        );
+        let mut source = FakeSource::with(
+            &root,
+            &[
+                ("index.html", page.as_bytes()),
+                ("a.png", b"A"),
+                ("b.png", b"B"),
+            ],
+        );
+        let collected = run(&mut source, Limits::DEFAULT).unwrap();
+        assert_eq!(names(&collected), vec!["index.html"], "{base}");
+        assert_eq!(
+            omitted(&collected),
+            vec![
+                ("a.png", moved),
+                ("data:x", "not_relative"),
+                ("b.png", moved),
+            ],
+            "{base}"
+        );
+        assert_eq!(source.reads, vec![root.join("index.html")], "{base}");
+    }
 }

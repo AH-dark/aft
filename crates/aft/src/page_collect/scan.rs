@@ -40,6 +40,8 @@ pub(crate) const MAX_REFERENCES_PER_FILE: usize = 4096;
 struct Found {
     list: Vec<Reference>,
     dropped: usize,
+    /// The `href` of the document's first `<base>` element that has one.
+    base: Option<String>,
 }
 
 impl Found {
@@ -52,18 +54,40 @@ impl Found {
     }
 }
 
-/// References in an HTML document, and the count of those past the cap.
-pub(crate) fn html_references(source: &[u8]) -> (Vec<Reference>, usize) {
+/// What an HTML document references.
+#[derive(Debug, Default)]
+pub(crate) struct HtmlScan {
+    /// References in document order.
+    pub references: Vec<Reference>,
+    /// References past [`MAX_REFERENCES_PER_FILE`], counted but not kept.
+    pub dropped: usize,
+    /// The `href` of the first `<base>` element that has one. Browsers use
+    /// only that one, for every relative URL in the document.
+    pub base: Option<String>,
+}
+
+impl From<Found> for HtmlScan {
+    fn from(found: Found) -> Self {
+        HtmlScan {
+            references: found.list,
+            dropped: found.dropped,
+            base: found.base,
+        }
+    }
+}
+
+/// References in an HTML document.
+pub(crate) fn html_references(source: &[u8]) -> HtmlScan {
     let mut out = Found::default();
     let mut parser = tree_sitter::Parser::new();
     if parser
         .set_language(&tree_sitter_html::LANGUAGE.into())
         .is_err()
     {
-        return (out.list, out.dropped);
+        return out.into();
     }
     let Some(tree) = parser.parse(source, None) else {
-        return (out.list, out.dropped);
+        return out.into();
     };
     // Iterative walk: a deeply nested malformed page must not exhaust the stack.
     let mut cursor = tree.walk();
@@ -93,7 +117,7 @@ pub(crate) fn html_references(source: &[u8]) -> (Vec<Reference>, usize) {
             }
         }
     }
-    (out.list, out.dropped)
+    out.into()
 }
 
 fn tag_references(tag: tree_sitter::Node<'_>, source: &[u8], out: &mut Found) {
@@ -142,6 +166,11 @@ fn tag_references(tag: tree_sitter::Node<'_>, source: &[u8], out: &mut Found) {
     if let Some(srcset) = get("srcset") {
         for candidate in srcset_urls(srcset) {
             out.push(candidate, RefKind::Plain);
+        }
+    }
+    if name == "base" && out.base.is_none() {
+        if let Some(href) = get("href") {
+            out.base = Some(href.to_string());
         }
     }
     if name == "link" {
@@ -391,6 +420,44 @@ fn css_escape(source: &[u8], start: usize, out: &mut Vec<u8>, in_string: bool) -
     i + 1
 }
 
+/// How many bytes from a `&` the closing `;` of a reference may be.
+const ENTITY_WINDOW: usize = 11;
+
+/// Bytes [`decode_entities`] has searched for a `;` on this thread. A test
+/// can cap it, so a decoder that searches too far fails at once instead of
+/// running for minutes.
+#[cfg(test)]
+pub(crate) mod entity_bytes_examined {
+    use std::cell::Cell;
+
+    thread_local! {
+        static EXAMINED: Cell<usize> = const { Cell::new(0) };
+        static CAP: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+
+    pub(crate) fn add(bytes: usize) {
+        let total = EXAMINED.with(|examined| {
+            let total = examined.get().saturating_add(bytes);
+            examined.set(total);
+            total
+        });
+        assert!(
+            total <= CAP.with(Cell::get),
+            "decode_entities searched {total} bytes, over the test's cap"
+        );
+    }
+
+    /// Start counting from zero, failing once `cap` bytes are passed.
+    pub(crate) fn reset(cap: usize) {
+        EXAMINED.with(|examined| examined.set(0));
+        CAP.with(|limit| limit.set(cap));
+    }
+
+    pub(crate) fn get() -> usize {
+        EXAMINED.with(Cell::get)
+    }
+}
+
 /// Decode the HTML character references an attribute value may hold: the
 /// five named ones a URL plausibly carries and numeric references. Anything
 /// else is kept as written.
@@ -403,7 +470,13 @@ pub(crate) fn decode_entities(value: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let end = rest.find(';').filter(|end| *end <= 10);
+        // A reference this decoder knows is at most ten bytes before its
+        // `;`, so only that window is searched: searching the whole rest of
+        // the value for every `&` would be quadratic in its length.
+        let window = &rest.as_bytes()[..rest.len().min(ENTITY_WINDOW)];
+        #[cfg(test)]
+        entity_bytes_examined::add(window.len());
+        let end = window.iter().position(|byte| *byte == b';');
         let decoded = end.and_then(|end| {
             let body = &rest[1..end];
             let character = match body {

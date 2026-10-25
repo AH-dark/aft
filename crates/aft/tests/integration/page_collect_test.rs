@@ -145,6 +145,8 @@ fn write_site(root: &std::path::Path) {
 </head><body>
   <img src="img/logo%20mark.png" srcset="img/logo%20mark.png 1x, img/logo@2x.png 2x">
   <img src="data:image/png;base64,AAAA">
+  <img src="//cdn.example.com/p.png">
+  <img src="http://example.com/h.png">
   <img src="img/missing.png">
   <img src="cache.db">
   <img src="../../outside.png">
@@ -300,8 +302,10 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
     assert_eq!(
         data["omitted"],
         json!([
-            {"path": "https://cdn.example.com/x.css", "reason": "not_relative"},
+            {"path": "https://cdn.example.com/x.css", "reason": "remote"},
             {"path": "data:image/png;base64,AAAA", "reason": "not_relative"},
+            {"path": "//cdn.example.com/p.png", "reason": "remote"},
+            {"path": "http://example.com/h.png", "reason": "remote"},
             {"path": "img/missing.png", "reason": "missing"},
             {"path": "cache.db", "reason": "denied"},
             {"path": "../../outside.png", "reason": "denied"},

@@ -145,41 +145,73 @@ pub(super) fn choose_route(
 }
 
 /// How a session reader opens a checked file: below `walk_root`, never
-/// following a symlink component.
-pub(super) type OpenFile<'a> = &'a dyn Fn(&Path, &Path) -> Result<OpenedFile, ReadExactRefusal>;
+/// following a symlink component. Runs on a bounded I/O helper thread.
+pub(super) type OpenFile =
+    Arc<dyn Fn(&Path, &Path) -> Result<OpenedFile, ReadExactRefusal> + Send + Sync>;
 
-/// How a session reader opens files, and a test's view into its checks.
-#[derive(Clone, Copy)]
+/// Runs on the bounded I/O helper thread just before a checked file's bytes
+/// are read, with that file's path.
+pub(super) type BeforeRead = Arc<dyn Fn(&Path) + Send + Sync>;
+
+/// How a session reader opens files, and a test's view into its steps.
+#[derive(Clone)]
 pub(super) struct ReadHooks<'a> {
-    pub(super) open: OpenFile<'a>,
+    pub(super) open: OpenFile,
     /// Runs with each spelled path after its policy check and before it is
     /// resolved, so a test can swap what the spelling points at in between.
     pub(super) after_check: Option<&'a dyn Fn(&Path)>,
+    /// Lets a test stall a read the way a hung network filesystem would.
+    pub(super) before_read: Option<BeforeRead>,
+}
+
+impl ReadHooks<'_> {
+    /// The hooks production uses: the no-follow open, nothing else.
+    pub(super) fn production() -> Self {
+        ReadHooks {
+            open: Arc::new(|root, target| file_read_exact::open_no_follow(root, target)),
+            after_check: None,
+            before_read: None,
+        }
+    }
 }
 
 /// Reads page files as one agent session's `read` tool may. Must run inside
 /// `call_policy::with_tool_call_policy` for that session's route.
+///
+/// Every step that can block on the filesystem (the policy checks' stats,
+/// resolution, the storage-floor stat, the open, and the read) runs on the
+/// bounded I/O helpers under a budget that ends at the read's deadline. A
+/// file whose I/O is still stuck then is reported as past the deadline and
+/// the collection goes on; the stuck helper keeps the open file until its
+/// call returns.
 pub(super) struct SessionReader<'a> {
     pub(super) ctx: &'a AppContext,
     pub(super) session: &'a str,
     pub(super) request_id: &'a str,
-    pub(super) deadline: Instant,
     pub(super) hooks: ReadHooks<'a>,
 }
 
 impl SessionReader<'_> {
-    fn denied_or_deadline(&self) -> ReadFailure {
-        if Instant::now() >= self.deadline {
-            ReadFailure::Deadline
-        } else {
-            ReadFailure::Denied
-        }
-    }
-
     fn policy_allows(&self, path: &Path) -> bool {
         self.ctx
             .validate_read_path(self.request_id, self.session, path)
             .is_ok()
+    }
+
+    /// [`storage_floor`] on a bounded helper.
+    fn floor(&self, path: &Path, deadline: Instant) -> Result<bool, ReadFailure> {
+        crate::bounded_io::run(path, Some(deadline), |path| Ok(storage_floor(&path)))
+            .map_err(|_| ReadFailure::Deadline)
+    }
+}
+
+/// `failure`, unless the read's deadline has passed: a check that failed
+/// because its I/O ran out of time is reported as the deadline.
+fn unless_late(deadline: Instant, failure: ReadFailure) -> ReadFailure {
+    if Instant::now() >= deadline {
+        ReadFailure::Deadline
+    } else {
+        failure
     }
 }
 
@@ -194,16 +226,26 @@ fn storage_floor(path: &Path) -> bool {
     crate::project_content::is_excluded(path)
 }
 
+/// A file opened on a helper: the handle, its metadata, and where it is.
+type Opened = (OpenedFile, std::fs::Metadata, PathBuf);
+
 impl PageSource for SessionReader<'_> {
-    fn read(&mut self, path: &Path, limit: u64) -> Result<Vec<u8>, ReadFailure> {
+    fn read(&mut self, path: &Path, limit: u64, deadline: Instant) -> Result<Vec<u8>, ReadFailure> {
         use std::io::Read;
-        if storage_floor(path) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ReadFailure::Deadline);
+        }
+        // This file's own budget: its stuck I/O ends at the deadline and does
+        // not fail the I/O of files read after it.
+        let _io = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(remaining)));
+        if self.floor(path, deadline)? {
             return Err(ReadFailure::Denied);
         }
         let checked = self
             .ctx
             .validate_read_path(self.request_id, self.session, path)
-            .map_err(|_| self.denied_or_deadline())?;
+            .map_err(|_| unless_late(deadline, ReadFailure::Denied))?;
         if let Some(after_check) = self.hooks.after_check {
             after_check(path);
         }
@@ -213,19 +255,19 @@ impl PageSource for SessionReader<'_> {
         let resolved = match crate::bounded_io::canonicalize(&checked) {
             Ok(resolved) => crate::inspect::job::normalize_path(&resolved),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ReadFailure::Missing)
+                return Err(unless_late(deadline, ReadFailure::Missing))
             }
-            Err(_) => return Err(self.denied_or_deadline()),
+            Err(_) => return Err(unless_late(deadline, ReadFailure::Denied)),
         };
         // The spelled-path floor check above cannot see where a re-pointed
         // symlink now leads; this one guards the open itself.
-        if storage_floor(&resolved) {
+        if self.floor(&resolved, deadline)? {
             return Err(ReadFailure::Denied);
         }
         if resolved != crate::inspect::job::normalize_path(&checked)
             && !self.policy_allows(&resolved)
         {
-            return Err(ReadFailure::Denied);
+            return Err(unless_late(deadline, ReadFailure::Denied));
         }
         // The walk starts at the filesystem root: the resolved path has no
         // symlink in it, so the component-by-component no-follow open lands
@@ -235,22 +277,32 @@ impl PageSource for SessionReader<'_> {
             .last()
             .unwrap_or(&resolved)
             .to_path_buf();
-        let mut file = match (self.hooks.open)(&walk_root, &resolved) {
-            Ok(file) => file,
-            Err(ReadExactRefusal::NotFound) => return Err(ReadFailure::Missing),
-            Err(ReadExactRefusal::AccessDenied) => return Err(ReadFailure::Denied),
-            Err(_) => return Err(ReadFailure::Missing),
-        };
-        let metadata = file.metadata().map_err(|_| ReadFailure::Missing)?;
-        if crate::db::file_identity::is_live_sqlite_handle(&metadata) {
-            return Err(ReadFailure::Denied);
-        }
+        let open = Arc::clone(&self.hooks.open);
+        let opened = crate::bounded_io::run(&resolved, Some(deadline), move |resolved| {
+            let file = match open(&walk_root, &resolved) {
+                Ok(file) => file,
+                Err(ReadExactRefusal::NotFound) => return Ok(Err(ReadFailure::Missing)),
+                Err(ReadExactRefusal::AccessDenied) => return Ok(Err(ReadFailure::Denied)),
+                Err(_) => return Ok(Err(ReadFailure::Missing)),
+            };
+            let Ok(metadata) = file.metadata() else {
+                return Ok(Err(ReadFailure::Missing));
+            };
+            if crate::db::file_identity::is_live_sqlite_handle(&metadata) {
+                return Ok(Err(ReadFailure::Denied));
+            }
+            // Where the handle really is, judged below on the caller's thread.
+            let Ok(opened) = file_read_exact::opened_location(&file) else {
+                return Ok(Err(ReadFailure::Denied));
+            };
+            let opened = crate::inspect::job::normalize_path(&opened);
+            Ok(Ok::<Opened, ReadFailure>((file, metadata, opened)))
+        })
+        .map_err(|_| ReadFailure::Deadline)??;
+        let (file, metadata, opened) = opened;
         // Where the handle really is must pass the same policy again.
-        let opened = file_read_exact::opened_location(&file)
-            .map(|opened| crate::inspect::job::normalize_path(&opened))
-            .map_err(|_| ReadFailure::Denied)?;
-        if storage_floor(&opened) || (opened != resolved && !self.policy_allows(&opened)) {
-            return Err(ReadFailure::Denied);
+        if self.floor(&opened, deadline)? || (opened != resolved && !self.policy_allows(&opened)) {
+            return Err(unless_late(deadline, ReadFailure::Denied));
         }
         if !metadata.is_file() {
             return Err(ReadFailure::Missing);
@@ -260,11 +312,20 @@ impl PageSource for SessionReader<'_> {
                 size: metadata.len(),
             });
         }
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        (&mut *file)
-            .take(limit + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| ReadFailure::Missing)?;
+        let before_read = self.hooks.before_read.clone();
+        let bytes = crate::bounded_io::run(&resolved, Some(deadline), move |resolved| {
+            if let Some(before_read) = before_read {
+                before_read(&resolved);
+            }
+            let mut file = file;
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            Ok((&mut *file)
+                .take(limit + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes)
+                .map_err(|_| ReadFailure::Missing))
+        })
+        .map_err(|_| ReadFailure::Deadline)??;
         if bytes.len() as u64 > limit {
             return Err(ReadFailure::TooLarge {
                 size: bytes.len() as u64,
@@ -296,13 +357,7 @@ pub(super) struct CollectCall {
 
 /// Handle `page.collect` on a blocking thread.
 pub(super) fn collect(call: CollectCall) -> Response {
-    collect_with_hooks(
-        call,
-        ReadHooks {
-            open: &|root, target| file_read_exact::open_no_follow(root, target),
-            after_check: None,
-        },
-    )
+    collect_with_hooks(call, ReadHooks::production())
 }
 
 pub(super) fn collect_with_hooks(call: CollectCall, hooks: ReadHooks<'_>) -> Response {
@@ -391,9 +446,9 @@ pub(super) fn collect_with_hooks(call: CollectCall, hooks: ReadHooks<'_>) -> Res
             return refusal(OP, page::CollectRefusal::Storage(error).into_error())
         }
     };
-    let deadline = started + Duration::from_millis(limits.deadline_ms);
-    // Path checks get at least a second, so the page itself can be judged
-    // even under a tiny deadline; referenced files stop at the deadline.
+    // The collection's own checks (the confinement admission checks the
+    // page's spelling) get at least a second. Each file read then runs
+    // under its own budget, which ends at that file's deadline.
     let budget = crate::bounded_io::Budget::after(
         Duration::from_millis(limits.deadline_ms).max(Duration::from_secs(1)),
     );
@@ -421,7 +476,6 @@ pub(super) fn collect_with_hooks(call: CollectCall, hooks: ReadHooks<'_>) -> Res
                 ctx: &ctx,
                 session: &identity.session,
                 request_id: &request_id,
-                deadline,
                 hooks,
             };
             page::collect(&entry, &limits, started, &mut reader, &mut builder)

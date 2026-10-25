@@ -345,6 +345,14 @@ impl SnapshotSink for Builder {
         );
         Ok(record)
     }
+
+    fn bytes(&self, path: &str) -> io::Result<Vec<u8>> {
+        let file = self
+            .files
+            .get(path)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not in this snapshot"))?;
+        std::fs::read(self.dir.join(&file.disk_name))
+    }
 }
 
 impl Builder {

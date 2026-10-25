@@ -17,7 +17,7 @@
 pub(crate) mod scan;
 pub(crate) mod snapshot;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -30,6 +30,9 @@ pub(crate) const READ_OPERATION: &str = "page.read";
 pub(crate) const RELEASE_OPERATION: &str = "page.release";
 /// HELLO capability: this module serves the page-bundle operations.
 pub(crate) const CAPABILITY: &str = "page-collect/v1";
+
+/// The least time the page itself gets to be read, whatever the deadline.
+const ENTRY_READ_MIN: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Largest `page.read` length.
 pub(crate) const MAX_READ_LENGTH: u64 = 1024 * 1024;
@@ -111,7 +114,9 @@ pub(crate) enum OmitReason {
     Denied,
     /// No readable regular file is there, or the reference names no file.
     Missing,
-    /// It has a scheme, a host or an absolute path; never fetched.
+    /// Not a relative path: an absolute file path, a `file:`, `data:`,
+    /// `blob:`, `javascript:` or other non-web URL, or a Windows drive or
+    /// UNC path. Never fetched.
     NotRelative,
     OverFileLimit,
     OverTotalLimit,
@@ -119,6 +124,10 @@ pub(crate) enum OmitReason {
     /// A stylesheet nested deeper than `import_depth`.
     DepthLimit,
     Deadline,
+    /// A web address (`http:`, `https:` or `//host/...`), as written or
+    /// as the page's `<base href>` makes a relative reference. Never
+    /// fetched.
+    Remote,
 }
 
 impl OmitReason {
@@ -132,6 +141,7 @@ impl OmitReason {
             Self::OverCountLimit => "over_count_limit",
             Self::DepthLimit => "depth_limit",
             Self::Deadline => "deadline",
+            Self::Remote => "remote",
         }
     }
 }
@@ -141,6 +151,9 @@ impl OmitReason {
 pub(crate) enum Resolved {
     /// It names the referring document itself (empty, `#frag`, `?query`).
     Skip,
+    /// A web address; see [`OmitReason::Remote`].
+    Remote,
+    /// Not a relative file path; see [`OmitReason::NotRelative`].
     NotRelative,
     /// It cannot name a file: undecodable, a directory, or a decoded
     /// segment that would change the path's shape.
@@ -164,11 +177,13 @@ pub(crate) fn resolve_reference(raw: &str, base: &[String]) -> Resolved {
     if cleaned.is_empty() || cleaned.starts_with('#') || cleaned.starts_with('?') {
         return Resolved::Skip;
     }
+    match absolute_kind(cleaned) {
+        Some(Absolute::Web) => return Resolved::Remote,
+        Some(Absolute::Other) => return Resolved::NotRelative,
+        None => {}
+    }
     // Browsers read a backslash in a relative URL as a slash.
     let cleaned = cleaned.replace('\\', "/");
-    if cleaned.starts_with('/') || has_scheme(&cleaned) {
-        return Resolved::NotRelative;
-    }
     let path_part = cleaned
         .split(['?', '#'])
         .next()
@@ -203,6 +218,45 @@ pub(crate) fn resolve_reference(raw: &str, base: &[String]) -> Resolved {
         return Resolved::Invalid;
     }
     Resolved::Path(segments)
+}
+
+/// What a reference that is not a relative path points at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Absolute {
+    /// A web address: `http:`, `https:`, or protocol-relative `//host`.
+    Web,
+    /// Anything else: an absolute file path, another scheme, or a Windows
+    /// drive or UNC path.
+    Other,
+}
+
+/// Whether `trimmed` (a reference with its surrounding whitespace removed)
+/// is not a relative path, and if so what it points at.
+fn absolute_kind(trimmed: &str) -> Option<Absolute> {
+    // A UNC path (`\\server\share`) is a file path, not a web address.
+    if trimmed.starts_with("\\\\") {
+        return Some(Absolute::Other);
+    }
+    // Browsers read a backslash in a URL as a slash.
+    let slashed = trimmed.replace('\\', "/");
+    if slashed.starts_with("//") {
+        return Some(Absolute::Web);
+    }
+    if slashed.starts_with('/') {
+        return Some(Absolute::Other);
+    }
+    if !has_scheme(&slashed) {
+        return None;
+    }
+    let scheme = slashed.split(':').next().unwrap_or_default();
+    Some(
+        if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+            Absolute::Web
+        } else {
+            // A one-letter scheme is a Windows drive (`C:/...`).
+            Absolute::Other
+        },
+    )
 }
 
 fn has_scheme(value: &str) -> bool {
@@ -324,8 +378,9 @@ pub(crate) enum ReadFailure {
 pub(crate) trait PageSource {
     /// Read the whole file at `path` (absolute, lexically normalized), or
     /// fail with [`ReadFailure::TooLarge`] when it holds more than `limit`
-    /// bytes.
-    fn read(&mut self, path: &Path, limit: u64) -> Result<Vec<u8>, ReadFailure>;
+    /// bytes, or with [`ReadFailure::Deadline`] when its I/O has not
+    /// finished by `deadline`.
+    fn read(&mut self, path: &Path, limit: u64, deadline: Instant) -> Result<Vec<u8>, ReadFailure>;
 }
 
 /// Why `page.collect` refused. Each maps to one refusal code.
@@ -413,11 +468,83 @@ pub(crate) struct Collected {
 /// snapshot's private folder.
 pub(crate) trait SnapshotSink {
     fn add(&mut self, path: &str, bytes: &[u8]) -> std::io::Result<FileRecord>;
+    /// The bytes stored for `path` by an earlier [`SnapshotSink::add`].
+    fn bytes(&self, path: &str) -> std::io::Result<Vec<u8>>;
+}
+
+/// What relative references in a file resolve against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RefBase {
+    /// A folder, as segments relative to the page's folder (leading `..`
+    /// segments are above it).
+    Dir(Vec<String>),
+    /// The page's `<base href>` is a web address: every relative reference
+    /// in the page then names a web address too.
+    Web,
+    /// The page's `<base href>` is an absolute file path or a non-web URL:
+    /// every relative reference in the page then names one too.
+    Absolute,
+    /// The page's `<base href>` names no folder: a segment is not valid
+    /// percent-encoded UTF-8, or decodes to a separator, NUL or colon. Its
+    /// relative references then name no file.
+    Invalid,
+}
+
+/// The folder a page's `<base href>` makes its relative references resolve
+/// against. Like a document URL, the base's last segment is a file name and
+/// is dropped (`sub/` and `sub/page.html` both name `sub`).
+pub(crate) fn resolve_base(raw: &str) -> RefBase {
+    let cleaned: String = raw
+        .chars()
+        .filter(|character| !matches!(character, '\t' | '\n' | '\r'))
+        .collect();
+    let trimmed = cleaned.trim_matches(|character: char| character <= ' ');
+    match absolute_kind(trimmed) {
+        Some(Absolute::Web) => return RefBase::Web,
+        Some(Absolute::Other) => return RefBase::Absolute,
+        None => {}
+    }
+    let cleaned = trimmed.replace('\\', "/");
+    let path_part = cleaned.split(['?', '#']).next().unwrap_or_default();
+    let mut raw_segments = path_part.split('/').collect::<Vec<_>>();
+    // The last segment is the base document's own name.
+    raw_segments.pop();
+    let mut segments: Vec<String> = Vec::new();
+    for segment in raw_segments {
+        let Some(decoded) = percent_decode(segment) else {
+            return RefBase::Invalid;
+        };
+        if decoded.contains(['/', '\\', '\0', ':']) {
+            return RefBase::Invalid;
+        }
+        match decoded.as_str() {
+            "" | "." => {}
+            ".." => {
+                if segments.last().is_some_and(|last| last != "..") {
+                    segments.pop();
+                } else {
+                    segments.push("..".to_string());
+                }
+            }
+            _ => segments.push(decoded),
+        }
+    }
+    RefBase::Dir(segments)
+}
+
+/// What has become of one path the page names.
+enum Seen {
+    /// In the bundle. `scanned` says whether its own references have been
+    /// taken: a file is scanned when a reference uses it as a stylesheet
+    /// within `import_depth` (the page itself starts as scanned).
+    Copied { scanned: bool },
+    /// Listed in `omitted`.
+    Omitted,
 }
 
 struct Pending {
     reference: Reference,
-    base: Vec<String>,
+    base: RefBase,
     /// For a stylesheet: how many stylesheets deep it is (one for a
     /// stylesheet the page links or imports from a `<style>` element).
     level: u64,
@@ -448,7 +575,10 @@ pub(crate) fn collect(
         });
     }
     let entry_limit = limits.entry_max_bytes.min(limits.max_total_bytes);
-    let html = match source.read(entry, entry_limit) {
+    // The page itself gets at least a second, so it can be read even under a
+    // tiny deadline; the files it names stop at the deadline.
+    let entry_deadline = deadline.max(started + ENTRY_READ_MIN);
+    let html = match source.read(entry, entry_limit, entry_deadline) {
         Ok(bytes) => bytes,
         Err(ReadFailure::Denied) => {
             return Err(CollectRefusal::EntryUnreadable { reason: "denied" })
@@ -480,15 +610,21 @@ pub(crate) fn collect(
     let mut total = record.size;
     collected.files.push(record);
 
-    let mut seen: HashSet<String> = HashSet::from([entry_name]);
+    // The page itself is never scanned as a stylesheet.
+    let mut seen: HashMap<String, Seen> =
+        HashMap::from([(entry_name, Seen::Copied { scanned: true })]);
     let mut seen_raw: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<Pending> = VecDeque::new();
-    let (references, dropped) = scan::html_references(&html);
-    collected.omitted_unlisted += dropped as u64;
+    let page = scan::html_references(&html);
+    collected.omitted_unlisted += page.dropped as u64;
     drop(html);
-    queue.extend(references.into_iter().map(|reference| Pending {
+    let page_base = page
+        .base
+        .as_deref()
+        .map_or(RefBase::Dir(Vec::new()), resolve_base);
+    queue.extend(page.references.into_iter().map(|reference| Pending {
         reference,
-        base: Vec::new(),
+        base: page_base.clone(),
         level: 1,
     }));
 
@@ -499,6 +635,21 @@ pub(crate) fn collect(
             collected.omitted_unlisted += 1;
         }
     };
+    // Queue the references of the stylesheet stored as `segments`.
+    let scan_stylesheet = |queue: &mut VecDeque<Pending>,
+                           collected: &mut Collected,
+                           segments: &[String],
+                           bytes: &[u8],
+                           level: u64| {
+        let folder = segments[..segments.len() - 1].to_vec();
+        let (references, dropped) = scan::css_references(bytes);
+        collected.omitted_unlisted += dropped as u64;
+        queue.extend(references.into_iter().map(|reference| Pending {
+            reference,
+            base: RefBase::Dir(folder.clone()),
+            level: level + 1,
+        }));
+    };
 
     while let Some(Pending {
         reference,
@@ -506,12 +657,29 @@ pub(crate) fn collect(
         level,
     }) = queue.pop_front()
     {
-        let segments = match resolve_reference(&reference.raw, &base) {
+        let resolved = match &base {
+            RefBase::Dir(base) => resolve_reference(&reference.raw, base),
+            _ => resolve_reference(&reference.raw, &[]),
+        };
+        // A page base changes only references that would have named a file:
+        // a fragment still names the page, and a reference with its own
+        // scheme or root stays what it is.
+        let resolved = match (resolved, &base) {
+            (Resolved::Path(_), RefBase::Web) => Resolved::Remote,
+            (Resolved::Path(_), RefBase::Absolute) => Resolved::NotRelative,
+            (Resolved::Path(_), RefBase::Invalid) => Resolved::Invalid,
+            (resolved, _) => resolved,
+        };
+        let segments = match resolved {
             Resolved::Skip => continue,
-            Resolved::NotRelative | Resolved::Invalid
+            Resolved::Remote | Resolved::NotRelative | Resolved::Invalid
                 if !seen_raw.insert(reference.raw.clone()) =>
             {
                 continue
+            }
+            Resolved::Remote => {
+                omit(&mut collected, reference.raw, OmitReason::Remote);
+                continue;
             }
             Resolved::NotRelative => {
                 omit(&mut collected, reference.raw, OmitReason::NotRelative);
@@ -524,26 +692,39 @@ pub(crate) fn collect(
             Resolved::Path(segments) => segments,
         };
         let display = segments.join("/");
-        if !seen.insert(display.clone()) {
-            continue;
-        }
         let stylesheet = reference.kind == RefKind::Stylesheet;
-        if stylesheet && level > limits.import_depth {
-            omit(&mut collected, display, OmitReason::DepthLimit);
-            continue;
+        match seen.get_mut(&display) {
+            Some(Seen::Omitted) => continue,
+            // Copied once already. A file first named as a plain file and
+            // now as a stylesheet is scanned now, from its stored bytes.
+            Some(Seen::Copied { scanned }) => {
+                if stylesheet && !*scanned && level <= limits.import_depth {
+                    *scanned = true;
+                    let bytes = sink.bytes(&display).map_err(CollectRefusal::Storage)?;
+                    scan_stylesheet(&mut queue, &mut collected, &segments, &bytes, level);
+                }
+                continue;
+            }
+            None => {}
         }
-        if collected.files.len() as u64 >= limits.max_files {
-            omit(&mut collected, display, OmitReason::OverCountLimit);
-            continue;
-        }
-        if Instant::now() >= deadline {
-            omit(&mut collected, display, OmitReason::Deadline);
+        let reason = if stylesheet && level > limits.import_depth {
+            Some(OmitReason::DepthLimit)
+        } else if collected.files.len() as u64 >= limits.max_files {
+            Some(OmitReason::OverCountLimit)
+        } else if Instant::now() >= deadline {
+            Some(OmitReason::Deadline)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            seen.insert(display.clone(), Seen::Omitted);
+            omit(&mut collected, display, reason);
             continue;
         }
         let remaining = limits.max_total_bytes.saturating_sub(total);
         let limit = limits.max_file_bytes.min(remaining);
         let path = absolute(&entry_dir, &segments);
-        let bytes = match source.read(&path, limit) {
+        let bytes = match source.read(&path, limit, deadline) {
             Ok(bytes) => bytes,
             Err(failure) => {
                 let reason = match failure {
@@ -555,6 +736,7 @@ pub(crate) fn collect(
                     }
                     ReadFailure::TooLarge { .. } => OmitReason::OverTotalLimit,
                 };
+                seen.insert(display.clone(), Seen::Omitted);
                 omit(&mut collected, display, reason);
                 continue;
             }
@@ -564,15 +746,14 @@ pub(crate) fn collect(
             .map_err(CollectRefusal::Storage)?;
         total += record.size;
         collected.files.push(record);
+        seen.insert(
+            display,
+            Seen::Copied {
+                scanned: stylesheet,
+            },
+        );
         if stylesheet {
-            let folder = segments[..segments.len() - 1].to_vec();
-            let (references, dropped) = scan::css_references(&bytes);
-            collected.omitted_unlisted += dropped as u64;
-            queue.extend(references.into_iter().map(|reference| Pending {
-                reference,
-                base: folder.clone(),
-                level: level + 1,
-            }));
+            scan_stylesheet(&mut queue, &mut collected, &segments, &bytes, level);
         }
     }
     Ok(collected)
