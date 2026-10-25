@@ -14734,7 +14734,7 @@ fn detached_shell_command_for(
     memory_gated: bool,
     workdir: &Path,
     environment: &HashMap<String, String>,
-) -> Result<(Command, Vec<(String, OsString)>, bool), String> {
+) -> Result<(Command, Option<(String, String)>, bool), String> {
     use crate::windows_shell::WindowsShell;
     // User command text stays in a private file. Only generated loader text
     // and paths are transported to the shell and its exit-status waiter.
@@ -14788,11 +14788,7 @@ fn detached_shell_command_for(
         }
     }
 
-    let mut launch_environment = shell
-        .wrapper_environment(command, &wrapper_path)
-        .map(|(key, value)| (key.to_string(), value))
-        .into_iter()
-        .collect::<Vec<_>>();
+    let mut waiter_environment = None;
     let mut memory_file_gate = shell.uses_memory_file_gate();
     if matches!(shell, WindowsShell::Pwsh | WindowsShell::Powershell) {
         let args = cmd.get_args().map(OsString::from).collect::<Vec<_>>();
@@ -14809,7 +14805,7 @@ fn detached_shell_command_for(
         {
             cmd = Command::new(waiter.program);
             cmd.args(waiter.args);
-            launch_environment.push((waiter.environment.0, waiter.environment.1.into()));
+            waiter_environment = Some(waiter.environment);
             // The cmd root blocks on stdin before creating PowerShell. Attach
             // the Job Object to that root before the parent releases the gate.
             memory_file_gate = false;
@@ -14829,7 +14825,7 @@ fn detached_shell_command_for(
     // CREATE_BREAKAWAY_FROM_JOB — see `detached_shell_command_for` callers
     // for the breakaway-fallback strategy.
     cmd.creation_flags(creation_flags);
-    Ok((cmd, launch_environment, memory_file_gate))
+    Ok((cmd, waiter_environment, memory_file_gate))
 }
 
 #[cfg(unix)]
@@ -15072,7 +15068,7 @@ fn spawn_detached_child(
                 let stderr = io_handles.clone_file(TaskArtifact::Stderr).map_err(|e| {
                     PipedAttemptError::Setup(format!("failed to clone stderr capture handle: {e}"))
                 })?;
-                let (mut cmd, launch_environment, memory_file_gate) = detached_shell_command_for(
+                let (mut cmd, waiter_environment, memory_file_gate) = detached_shell_command_for(
                     shell.clone(),
                     command,
                     &paths.exit,
@@ -15093,7 +15089,12 @@ fn spawn_detached_child(
                     .stderr(Stdio::from(stderr));
                 crate::agent_child_env::apply_to_command(&mut cmd, env);
                 crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut cmd, env);
-                cmd.envs(launch_environment);
+                if let Some((key, value)) = waiter_environment {
+                    cmd.env(key, value);
+                }
+                if let Some((key, value)) = shell.wrapper_environment(command) {
+                    cmd.env(key, value);
+                }
                 cmd.spawn().map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
                     crate::slog_warn!("background bash spawn: {} returned NotFound at runtime — trying next candidate", shell.binary());
