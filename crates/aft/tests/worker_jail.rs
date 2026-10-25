@@ -2495,6 +2495,7 @@ fn native_available() -> bool {
 #[cfg(target_os = "linux")]
 fn account_home_canary_writable(home: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
 
     let canary = aft::worker_jail_canary::dir_for_home(home);
     // Canary preparation creates missing parents; probe the nearest existing
@@ -2508,7 +2509,18 @@ fn account_home_canary_writable(home: &Path) -> std::io::Result<()> {
                 let path = std::ffi::CString::new(ancestor.as_os_str().as_bytes())?;
                 // SAFETY: path is a live, NUL-terminated string for this call.
                 if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
-                    return Err(std::io::Error::last_os_error());
+                    let error = std::io::Error::last_os_error();
+                    // Preparation chmods only the real canary directory to 0700.
+                    // Its owner can repair permissions, but existing parents are
+                    // not repaired and symlink canary directories are refused.
+                    if error.kind() == std::io::ErrorKind::PermissionDenied && ancestor == canary {
+                        let metadata = std::fs::symlink_metadata(ancestor)?;
+                        // SAFETY: geteuid takes no arguments and has no preconditions.
+                        if metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() } {
+                            return Ok(());
+                        }
+                    }
+                    return Err(error);
                 }
                 return Ok(());
             }
@@ -2531,6 +2543,53 @@ fn worker_canary_preflight_accepts_missing_and_existing_directories_without_writ
     std::fs::create_dir_all(&canary).unwrap();
     account_home_canary_writable(&home).unwrap();
     assert!(std::fs::read_dir(&canary).unwrap().next().is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_canary_preflight_accepts_owned_readonly_canary_without_chmod() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let canary = aft::worker_jail_canary::dir_for_home(&home);
+    std::fs::create_dir_all(&canary).unwrap();
+    // SAFETY: geteuid takes no arguments and has no preconditions.
+    assert_eq!(std::fs::metadata(&canary).unwrap().uid(), unsafe {
+        libc::geteuid()
+    });
+    std::fs::set_permissions(&canary, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let result = account_home_canary_writable(&home);
+    let mode = std::fs::metadata(&canary).unwrap().permissions().mode() & 0o777;
+    std::fs::set_permissions(&canary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(mode, 0o500, "the preflight must not repair permissions");
+    result.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_canary_preflight_does_not_repair_readonly_ancestor() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // SAFETY: geteuid takes no arguments and has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("readonly ancestor probe skipped: root can bypass directory permissions");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let canary = aft::worker_jail_canary::dir_for_home(&home);
+    let parent = canary.parent().unwrap();
+    std::fs::create_dir_all(parent).unwrap();
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let result = account_home_canary_writable(&home);
+    let mode = std::fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(mode, 0o500, "the preflight must not repair permissions");
+    assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EACCES));
+    assert!(!canary.exists());
 }
 
 #[cfg(target_os = "linux")]
