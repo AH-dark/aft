@@ -1018,32 +1018,40 @@ mod tests {
 
     #[test]
     fn cpu_phase_busy_loop_is_close_to_wall_time() {
-        // Retry short samples so a single scheduler preemption does not turn
-        // a CPU-clock test into an assertion about build-server load.
-        let mut samples = Vec::new();
-        for _ in 0..5 {
-            let mut trace = PhaseTrace::new(Instant::now());
-            trace.mark_executor_submitted();
-            trace.mark_job_admitted();
-            let start = Instant::now();
-            let mut value = 1u64;
-            while start.elapsed() < Duration::from_millis(30) {
-                value = std::hint::black_box(value.wrapping_mul(3).wrapping_add(1));
+        const TARGET_CPU: Duration = Duration::from_millis(10);
+        const MAX_ITERATIONS: u32 = 1_000_000;
+        let mut trace = PhaseTrace::new(Instant::now());
+        trace.mark_executor_submitted();
+        trace.mark_job_admitted();
+        let start = ThreadCpuSample::now().expect("thread CPU clock is available");
+        let mut value = 1u64;
+        let mut elapsed = Duration::ZERO;
+        // Stop on CPU progress, not wall time, so descheduling cannot reduce
+        // the measured work. The iteration cap also bounds a stalled clock.
+        for _ in 0..MAX_ITERATIONS {
+            value = std::hint::black_box(value.wrapping_mul(3).wrapping_add(1));
+            elapsed = ThreadCpuSample::elapsed(Some(start), ThreadCpuSample::now())
+                .expect("thread CPU clock became unavailable or moved backwards");
+            if elapsed >= TARGET_CPU {
+                break;
             }
-            trace.mark_translate_done();
-            let phases = finish_cpu_phase(trace);
-            let cpu = phases.cpu.translate.expect("thread CPU clock is available");
-            assert!(
-                cpu <= phases.translate + Duration::from_millis(2),
-                "CPU {cpu:?} exceeds wall {:?}",
-                phases.translate
-            );
-            if cpu > phases.translate / 2 {
-                return;
-            }
-            samples.push((phases.translate, cpu));
         }
-        panic!("busy phase did not spend most of its wall time on CPU: {samples:?}");
+        assert!(
+            elapsed >= TARGET_CPU,
+            "thread CPU clock failed to advance by {TARGET_CPU:?} within {MAX_ITERATIONS} iterations: elapsed={elapsed:?}"
+        );
+        trace.mark_translate_done();
+        let phases = finish_cpu_phase(trace);
+        let cpu = phases.cpu.translate.expect("thread CPU clock is available");
+        assert!(
+            cpu >= TARGET_CPU,
+            "recorded translate CPU {cpu:?} is below {TARGET_CPU:?}"
+        );
+        assert!(
+            cpu <= phases.translate + Duration::from_millis(2),
+            "CPU {cpu:?} exceeds wall {:?}",
+            phases.translate
+        );
     }
 
     #[test]
