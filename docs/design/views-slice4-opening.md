@@ -60,10 +60,9 @@ mechanism. Each implementation slice rebases on current main before merging.
 
 ## Four required implementation conditions
 
-These conditions adopt the third design review of the revision-2.2 views design
-(its recommendation and start decision) and that design's corrected contracts
-for shared bases, references and durability. The 3a exit artifact overrides
-older design spellings and paths.
+These conditions adopt the views design's corrected contracts for shared
+bases, base references and durability, as settled by its final pre-build
+review. The 3a exit artifact overrides older design spellings and paths.
 
 ### C3 — terminal cleanup and generation-aware base edges
 
