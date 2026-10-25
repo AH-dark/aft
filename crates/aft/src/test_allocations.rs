@@ -71,6 +71,7 @@ pub(crate) fn count_bytes<T>(operation: impl FnOnce() -> T) -> (T, usize) {
 }
 
 /// Read the current thread's counters without starting a nested counting scope.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn snapshot() -> (usize, usize) {
     (
         ALLOCATION_COUNT.with(Cell::get),
@@ -85,6 +86,8 @@ pub(crate) mod profile {
 
     thread_local! {
         pub(crate) static STEPS: RefCell<Option<BTreeMap<&'static str, (u64, usize, usize)>>> = const { RefCell::new(None) };
+        pub(crate) static TRACE_PHASES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static NEXT_TRACE_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     pub(crate) fn cpu_ns() -> u64 {
@@ -99,16 +102,26 @@ pub(crate) mod profile {
         time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
     }
 
-    pub(crate) struct Timer(Option<(u64, (usize, usize))>);
+    pub(crate) struct Timer(Option<(u64, (usize, usize))>, Option<u64>);
 
     impl Timer {
         pub(crate) fn new() -> Self {
-            Self(STEPS.with(|steps| {
+            let sample = STEPS.with(|steps| {
                 steps
                     .borrow()
                     .is_some()
                     .then(|| (cpu_ns(), super::snapshot()))
-            }))
+            });
+            let trace = (sample.is_some() && TRACE_PHASES.with(std::cell::Cell::get)).then(|| {
+                let id = NEXT_TRACE_ID.with(|next| {
+                    let id = next.get();
+                    next.set(id + 1);
+                    id
+                });
+                eprintln!("AFT_PHASE|start|{id}");
+                id
+            });
+            Self(sample, trace)
         }
 
         pub(crate) fn mark(&mut self, step: &'static str) {
@@ -122,7 +135,18 @@ pub(crate) mod profile {
                     entry.1 += current.0 - allocations.0;
                     entry.2 += current.1 - allocations.1;
                 });
+                if let Some(id) = self.1 {
+                    eprintln!("AFT_PHASE|mark|{id}|{step}");
+                }
                 self.0 = Some((cpu_ns(), super::snapshot()));
+            }
+        }
+    }
+
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            if let Some(id) = self.1 {
+                eprintln!("AFT_PHASE|end|{id}");
             }
         }
     }
