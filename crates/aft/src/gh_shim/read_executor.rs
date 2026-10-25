@@ -209,10 +209,11 @@ pub(super) fn decode_reply(request: &WireRequest, value: &Value) -> Result<ReadR
             ReadReply::JobLog(reply)
         }
     };
-    if reply.bytes().map_err(decode_error)?.len() > REPLY_BYTES {
-        return Err(ReadError::Refused(
-            "governed read response exceeds 1 MiB; narrow the request".into(),
-        ));
+    let size = reply.bytes().map_err(decode_error)?.len();
+    if size > REPLY_BYTES {
+        return Err(ReadError::Refused(format!(
+            "governed read response is {size} bytes; cap is {REPLY_BYTES} bytes (1 MiB); narrow the request"
+        )));
     }
     Ok(reply)
 }
