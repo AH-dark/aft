@@ -1,0 +1,1 @@
+- Semantic search repairs saved file summaries that exceed a small embedding text budget on load, instead of keeping oversized summaries written by older builds.
