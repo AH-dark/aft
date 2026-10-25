@@ -325,6 +325,13 @@ impl SnapshotSink for MemorySink {
     }
 }
 
+/// The default limits with stylesheet imports followed four levels deep,
+/// for tests about nested stylesheets rather than the depth limit.
+const DEEP: Limits = Limits {
+    import_depth: 4,
+    ..Limits::DEFAULT
+};
+
 fn root() -> PathBuf {
     if cfg!(windows) {
         PathBuf::from(r"C:\site")
@@ -380,7 +387,7 @@ fn page_collect_walk_lists_files_and_omissions() {
         ],
     );
     source.denied.push(root.join("secret"));
-    let collected = run(&mut source, Limits::DEFAULT).unwrap();
+    let collected = run(&mut source, DEEP).unwrap();
     assert_eq!(collected.entry, "index.html");
     assert_eq!(
         names(&collected),
@@ -484,7 +491,7 @@ fn page_collect_every_limit_fires_with_its_reason() {
         &mut source,
         Limits {
             max_file_bytes: 50,
-            ..Limits::DEFAULT
+            ..DEEP
         },
     )
     .unwrap();
@@ -499,7 +506,7 @@ fn page_collect_every_limit_fires_with_its_reason() {
         &mut source,
         Limits {
             max_total_bytes: used + 15,
-            ..Limits::DEFAULT
+            ..DEEP
         },
     )
     .unwrap();
@@ -518,7 +525,7 @@ fn page_collect_every_limit_fires_with_its_reason() {
         &mut source,
         Limits {
             max_files: 3,
-            ..Limits::DEFAULT
+            ..DEEP
         },
     )
     .unwrap();
@@ -539,7 +546,7 @@ fn page_collect_every_limit_fires_with_its_reason() {
         &mut source,
         Limits {
             deadline_ms: 0,
-            ..Limits::DEFAULT
+            ..DEEP
         },
     )
     .unwrap();
@@ -618,6 +625,14 @@ fn page_collect_entry_refusals() {
     assert!(sniff_html(b"\xEF\xBB\xBF  \n<!doctype html>"));
 }
 
+/// The session the tests' snapshots are collected for.
+fn owner() -> snapshot::SnapshotOwner {
+    snapshot::SnapshotOwner {
+        harness: "test-harness".into(),
+        session: "page-session".into(),
+    }
+}
+
 fn store() -> (tempfile::TempDir, Arc<SnapshotStore>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SnapshotStore::open(dir.path()));
@@ -625,7 +640,7 @@ fn store() -> (tempfile::TempDir, Arc<SnapshotStore>) {
 }
 
 fn one_file(store: &Arc<SnapshotStore>, bytes: &[u8]) -> String {
-    let mut builder = store.begin().unwrap();
+    let mut builder = store.begin(owner()).unwrap();
     builder.add("index.html", bytes).unwrap();
     builder.commit().0
 }
@@ -634,28 +649,36 @@ fn one_file(store: &Arc<SnapshotStore>, bytes: &[u8]) -> String {
 fn page_collect_snapshot_read_ranges() {
     let (_dir, store) = store();
     let id = one_file(&store, b"0123456789");
-    assert_eq!(store.read(&id, "index.html", 0, 4).unwrap(), b"0123");
-    assert_eq!(store.read(&id, "index.html", 8, 100).unwrap(), b"89");
-    assert_eq!(store.read(&id, "index.html", 10, 1).unwrap(), b"");
     assert_eq!(
-        store.read(&id, "index.html", 11, 1),
+        store.read(&id, &owner(), "index.html", 0, 4).unwrap(),
+        b"0123"
+    );
+    assert_eq!(
+        store.read(&id, &owner(), "index.html", 8, 100).unwrap(),
+        b"89"
+    );
+    assert_eq!(store.read(&id, &owner(), "index.html", 10, 1).unwrap(), b"");
+    assert_eq!(
+        store.read(&id, &owner(), "index.html", 11, 1),
         Err(ReadRefusal::BadRange)
     );
     assert_eq!(
-        store.read(&id, "index.html", 0, 0),
+        store.read(&id, &owner(), "index.html", 0, 0),
         Err(ReadRefusal::BadRange)
     );
     assert_eq!(
-        store.read(&id, "index.html", 0, MAX_READ_LENGTH + 1),
+        store.read(&id, &owner(), "index.html", 0, MAX_READ_LENGTH + 1),
         Err(ReadRefusal::BadRange)
     );
-    assert!(store.read(&id, "index.html", 0, MAX_READ_LENGTH).is_ok());
+    assert!(store
+        .read(&id, &owner(), "index.html", 0, MAX_READ_LENGTH)
+        .is_ok());
     assert_eq!(
-        store.read(&id, "other.html", 0, 1),
+        store.read(&id, &owner(), "other.html", 0, 1),
         Err(ReadRefusal::NotInSnapshot)
     );
     assert_eq!(
-        store.read("no-such-snapshot", "index.html", 0, 1),
+        store.read("no-such-snapshot", &owner(), "index.html", 0, 1),
         Err(ReadRefusal::Expired)
     );
 }
@@ -667,12 +690,12 @@ fn page_collect_snapshot_expires_and_is_deleted() {
     let folder = store.root().join(&id);
     assert!(folder.is_dir());
     store.advance_for_test(TTL - Duration::from_millis(1));
-    assert!(store.read(&id, "index.html", 0, 1).is_ok());
+    assert!(store.read(&id, &owner(), "index.html", 0, 1).is_ok());
     store.advance_for_test(Duration::from_millis(1));
     store.expire_due();
     assert!(!folder.exists(), "an expired snapshot's files remain");
     assert_eq!(
-        store.read(&id, "index.html", 0, 1),
+        store.read(&id, &owner(), "index.html", 0, 1),
         Err(ReadRefusal::Expired)
     );
 }
@@ -684,21 +707,26 @@ fn page_collect_fifth_snapshot_is_busy_until_one_ends() {
         .map(|_| one_file(&store, b"<html>"))
         .collect::<Vec<_>>();
     store.advance_for_test(Duration::from_secs(10));
-    match store.begin() {
+    match store.begin(owner()) {
         Err(BeginError::Busy(busy)) => {
             assert!((40_000..=50_000).contains(&busy.retry_after_ms), "{busy:?}")
         }
         Err(BeginError::Io(error)) => panic!("{error}"),
         Ok(_) => panic!("a fifth snapshot was admitted"),
     }
-    assert!(store.release(&ids[0]));
-    let builder = store.begin().expect("a released place is free again");
+    assert!(store.release(&ids[0], &owner()));
+    let builder = store
+        .begin(owner())
+        .expect("a released place is free again");
     // A collection in progress holds a place too.
-    assert!(matches!(store.begin(), Err(BeginError::Busy(_))));
+    assert!(matches!(store.begin(owner()), Err(BeginError::Busy(_))));
     drop(builder);
     assert_eq!(store.live_count(), MAX_LIVE - 1);
     store.advance_for_test(TTL);
-    assert!(store.begin().is_ok(), "expired snapshots free their places");
+    assert!(
+        store.begin(owner()).is_ok(),
+        "expired snapshots free their places"
+    );
 }
 
 #[test]
@@ -706,12 +734,12 @@ fn page_collect_release_is_idempotent() {
     let (_dir, store) = store();
     let id = one_file(&store, b"<html>");
     let folder = store.root().join(&id);
-    assert!(store.release(&id));
+    assert!(store.release(&id, &owner()));
     assert!(!folder.exists());
-    assert!(!store.release(&id));
-    assert!(!store.release("never-existed"));
+    assert!(!store.release(&id, &owner()));
+    assert!(!store.release("never-existed", &owner()));
     assert_eq!(
-        store.read(&id, "index.html", 0, 1),
+        store.read(&id, &owner(), "index.html", 0, 1),
         Err(ReadRefusal::Expired)
     );
 }
@@ -719,7 +747,7 @@ fn page_collect_release_is_idempotent() {
 #[test]
 fn page_collect_abandoned_builder_leaves_nothing() {
     let (_dir, store) = store();
-    let mut builder = store.begin().unwrap();
+    let mut builder = store.begin(owner()).unwrap();
     builder.add("index.html", b"<html>").unwrap();
     drop(builder);
     assert_eq!(store.live_count(), 0);
@@ -762,7 +790,7 @@ fn page_collect_same_page_twice_has_identical_hashes() {
     ];
     let mut snapshots = Vec::new();
     for _ in 0..2 {
-        let mut builder = store.begin().unwrap();
+        let mut builder = store.begin(owner()).unwrap();
         let collected = collect(
             &root.join("index.html"),
             &Limits::DEFAULT,
@@ -817,7 +845,7 @@ fn page_collect_file_named_as_plain_and_stylesheet_is_scanned_once() {
                 ("z.png", b"Z"),
             ],
         );
-        let collected = run(&mut source, Limits::DEFAULT).unwrap();
+        let collected = run(&mut source, DEEP).unwrap();
         let mut files = names(&collected);
         files.sort();
         assert_eq!(
@@ -836,7 +864,7 @@ fn page_collect_file_named_as_plain_and_stylesheet_is_scanned_once() {
     }
     // The stored bytes are read back from a real snapshot too.
     let (_dir, store) = store();
-    let mut builder = store.begin().unwrap();
+    let mut builder = store.begin(owner()).unwrap();
     let mut source = FakeSource::with(
         &root,
         &[
@@ -851,7 +879,7 @@ fn page_collect_file_named_as_plain_and_stylesheet_is_scanned_once() {
     );
     let collected = collect(
         &root.join("index.html"),
-        &Limits::DEFAULT,
+        &DEEP,
         Instant::now(),
         &mut source,
         &mut builder,
@@ -964,4 +992,124 @@ fn page_collect_absolute_base_moves_references_out_of_reach() {
         );
         assert_eq!(source.reads, vec![root.join("index.html")], "{base}");
     }
+}
+
+/// A snapshot answers only to the session it was collected for.
+#[test]
+fn page_collect_snapshot_answers_only_its_own_session() {
+    let (_dir, store) = store();
+    let id = one_file(&store, b"<html>");
+    let stranger = snapshot::SnapshotOwner {
+        harness: "test-harness".into(),
+        session: "another-session".into(),
+    };
+    assert_eq!(
+        store.read(&id, &stranger, "index.html", 0, 1),
+        Err(ReadRefusal::Expired)
+    );
+    assert!(!store.release(&id, &stranger));
+    assert_eq!(
+        store.read(&id, &owner(), "index.html", 0, 6).unwrap(),
+        b"<html>"
+    );
+    assert!(store.release(&id, &owner()));
+}
+
+/// The default import depth, 1: the page and the stylesheets it links are
+/// scanned, and every `url()` in those stylesheets is collected. A linked
+/// stylesheet's own `@import` of another stylesheet is `depth_limit`. An
+/// `@import` in the page's `<style>` element counts like a link.
+#[test]
+fn page_collect_default_import_depth_follows_one_level() {
+    assert_eq!(Limits::DEFAULT.import_depth, 1);
+    let root = root();
+    let mut source = FakeSource::with(
+        &root,
+        &[
+            (
+                "index.html",
+                br#"<link rel=stylesheet href="a.css"><style>@import "c.css";</style>"#,
+            ),
+            (
+                "a.css",
+                b"@import 'b.css'; p { background: url(img/a.png) }",
+            ),
+            ("b.css", b"q { background: url(img/b.png) }"),
+            (
+                "c.css",
+                b"@import 'd.css'; r { background: url(img/c.png) }",
+            ),
+            ("d.css", b"s {}"),
+            ("img/a.png", b"A"),
+            ("img/b.png", b"B"),
+            ("img/c.png", b"C"),
+        ],
+    );
+    let collected = run(&mut source, Limits::DEFAULT).unwrap();
+    assert_eq!(
+        names(&collected),
+        vec!["index.html", "a.css", "c.css", "img/a.png", "img/c.png"]
+    );
+    assert_eq!(
+        omitted(&collected),
+        vec![("b.css", "depth_limit"), ("d.css", "depth_limit")]
+    );
+    assert!(!source.reads.contains(&root.join("b.css")));
+    assert!(!source.reads.contains(&root.join("d.css")));
+}
+
+/// A page whose `<base href>` is a megabyte long, followed by thousands of
+/// short references, shares that one base across every queued reference
+/// instead of copying it per reference. References whose base plus path
+/// passes the collector's 4096-byte path limit are omitted as missing.
+#[test]
+fn page_collect_long_base_is_shared_not_copied() {
+    let root = root();
+    let base = format!("{}/", "b".repeat(1 << 20));
+    let mut page = format!(r#"<base href="{base}">"#);
+    for index in 0..4000 {
+        page.push_str(&format!(r#"<img src="i{index}.png">"#));
+    }
+    assert!(page.len() < Limits::DEFAULT.entry_max_bytes as usize);
+    let mut source = FakeSource::with(&root, &[("index.html", page.as_bytes())]);
+    // Fails at once if the base is copied for even a few references.
+    super::ref_base_bytes_copied::reset(4 << 20);
+    let collected = run(&mut source, Limits::DEFAULT).unwrap();
+    assert_eq!(super::ref_base_bytes_copied::get(), 0);
+    assert_eq!(names(&collected), vec!["index.html"]);
+    assert!(collected
+        .omitted
+        .iter()
+        .all(|omitted| omitted.reason == OmitReason::Missing && omitted.path.len() < 16));
+    assert_eq!(
+        collected.omitted.len() as u64 + collected.omitted_unlisted,
+        4000
+    );
+    assert_eq!(source.reads, vec![root.join("index.html")]);
+}
+
+/// CSS names may be written with escapes; `url(` and `@import` are found
+/// however they are spelled, and an escape that spells another name is not
+/// taken for them.
+#[test]
+fn page_collect_css_escaped_names() {
+    let (references, _) = css_references(
+        br#"a { background: u\72l(image.png) }
+        @\69mport 'theme.css';
+        b { background: u\72x(not-a-url.png) }
+        c { background: \75 rl(spaced.png) }
+        d { background: \55\52\4c(upper.png) }
+        @IMPORT "loud.css";
+        @\69mportant 'nope.css';"#,
+    );
+    assert_eq!(
+        raws(&references),
+        vec![
+            ("image.png", RefKind::Plain),
+            ("theme.css", RefKind::Stylesheet),
+            ("spaced.png", RefKind::Plain),
+            ("upper.png", RefKind::Plain),
+            ("loud.css", RefKind::Stylesheet),
+        ]
+    );
 }

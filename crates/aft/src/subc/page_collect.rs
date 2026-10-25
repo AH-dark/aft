@@ -13,7 +13,7 @@
 
 use super::*;
 use crate::commands::file_read_exact::{self, OpenedFile, ReadExactRefusal};
-use crate::page_collect::snapshot::{BeginError, SnapshotStore};
+use crate::page_collect::snapshot::{BeginError, SnapshotOwner, SnapshotStore};
 use crate::page_collect::{self as page, Limits, PageSource, ReadFailure};
 
 /// The module whose management principal may call these operations.
@@ -427,7 +427,11 @@ pub(super) fn collect_with_hooks(call: CollectCall, hooks: ReadHooks<'_>) -> Res
     } else {
         identity.project_root.join(entry_spelling)
     });
-    let mut builder = match call.store.begin() {
+    let owner = SnapshotOwner {
+        harness: params.harness.clone(),
+        session: params.session.clone(),
+    };
+    let mut builder = match call.store.begin(owner) {
         Ok(builder) => builder,
         Err(BeginError::Busy(busy)) => {
             return refusal(
@@ -521,6 +525,8 @@ pub(super) enum ReadReply {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadParams {
+    harness: String,
+    session: String,
     snapshot: String,
     path: String,
     #[serde(default)]
@@ -541,7 +547,19 @@ pub(super) fn read(
         Ok(params) => params,
         Err(error) => return ReadReply::Refused(invalid(OP, format!("page.read params: {error}"))),
     };
-    match store.read(&params.snapshot, &params.path, params.offset, params.length) {
+    // A snapshot answers only to the harness/session pair it was collected
+    // for.
+    let owner = SnapshotOwner {
+        harness: params.harness,
+        session: params.session,
+    };
+    match store.read(
+        &params.snapshot,
+        &owner,
+        &params.path,
+        params.offset,
+        params.length,
+    ) {
         Ok(bytes) => ReadReply::Bytes(bytes),
         Err(refusal_kind) => {
             let message = match refusal_kind {
@@ -567,6 +585,8 @@ pub(super) fn read(
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReleaseParams {
+    harness: String,
+    session: String,
     snapshot: String,
 }
 
@@ -583,7 +603,11 @@ pub(super) fn release(
         Ok(params) => params,
         Err(error) => return invalid(OP, format!("page.release params: {error}")),
     };
-    let released = store.release(&params.snapshot);
+    let owner = SnapshotOwner {
+        harness: params.harness,
+        session: params.session,
+    };
+    let released = store.release(&params.snapshot, &owner);
     Response::success(
         response_id(OP),
         json!({ "snapshot": params.snapshot, "released": released }),

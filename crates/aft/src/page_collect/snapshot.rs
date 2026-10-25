@@ -66,9 +66,19 @@ struct StoredFile {
     size: u64,
 }
 
+/// The harness and agent session a snapshot was collected for.
+/// `page.read` and `page.release` name both, and a snapshot answers only to
+/// that pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SnapshotOwner {
+    pub harness: String,
+    pub session: String,
+}
+
 struct Snapshot {
     dir: PathBuf,
     expires: Instant,
+    owner: SnapshotOwner,
     files: BTreeMap<String, StoredFile>,
 }
 
@@ -173,8 +183,9 @@ impl SnapshotStore {
         remove_dirs(dirs);
     }
 
-    /// Start a snapshot, or refuse with [`Busy`] when [`MAX_LIVE`] are live.
-    pub(crate) fn begin(self: &Arc<Self>) -> Result<Builder, BeginError> {
+    /// Start a snapshot for `owner`, or refuse with [`Busy`] when
+    /// [`MAX_LIVE`] are live.
+    pub(crate) fn begin(self: &Arc<Self>, owner: SnapshotOwner) -> Result<Builder, BeginError> {
         let expired;
         {
             let mut state = self.lock();
@@ -207,6 +218,7 @@ impl SnapshotStore {
         Ok(Builder {
             reservation: Some(reservation),
             id,
+            owner,
             dir,
             files: BTreeMap::new(),
             committed: false,
@@ -214,10 +226,13 @@ impl SnapshotStore {
     }
 
     /// Bytes `offset..offset+length` (cut at the end of the file) of
-    /// `path` in snapshot `id`, read from the snapshot folder only.
+    /// `path` in snapshot `id`, read from the snapshot folder only. A
+    /// snapshot of another session is answered exactly like one that does
+    /// not exist.
     pub(crate) fn read(
         &self,
         id: &str,
+        owner: &SnapshotOwner,
         path: &str,
         offset: u64,
         length: u64,
@@ -228,7 +243,9 @@ impl SnapshotStore {
             (state.ready.get(id).cloned(), expired)
         };
         remove_dirs(expired);
-        let snapshot = snapshot.ok_or(ReadRefusal::Expired)?;
+        let snapshot = snapshot
+            .filter(|snapshot| snapshot.owner == *owner)
+            .ok_or(ReadRefusal::Expired)?;
         let file = snapshot.files.get(path).ok_or(ReadRefusal::NotInSnapshot)?;
         if length == 0 || length > super::MAX_READ_LENGTH || offset > file.size {
             return Err(ReadRefusal::BadRange);
@@ -249,11 +266,16 @@ impl SnapshotStore {
         Ok(bytes)
     }
 
-    /// Delete snapshot `id`. Returns whether it was live.
-    pub(crate) fn release(&self, id: &str) -> bool {
+    /// Delete snapshot `id` if it is `owner`'s. Returns whether it was
+    /// live; a snapshot of another session is left alone and reported as
+    /// not live, as an unknown one is.
+    pub(crate) fn release(&self, id: &str, owner: &SnapshotOwner) -> bool {
         let (removed, expired) = {
             let mut state = self.lock();
-            let removed = state.ready.remove(id);
+            let removed = match state.ready.get(id) {
+                Some(snapshot) if snapshot.owner == *owner => state.ready.remove(id),
+                _ => None,
+            };
             (removed, self.take_expired(&mut state))
         };
         let live = removed.is_some();
@@ -316,6 +338,7 @@ impl Drop for Reservation {
 pub(crate) struct Builder {
     reservation: Option<Reservation>,
     id: String,
+    owner: SnapshotOwner,
     dir: PathBuf,
     files: BTreeMap<String, StoredFile>,
     committed: bool,
@@ -371,6 +394,7 @@ impl Builder {
         let snapshot = Arc::new(Snapshot {
             dir: self.dir.clone(),
             expires: store.now() + TTL,
+            owner: self.owner.clone(),
             files: std::mem::take(&mut self.files),
         });
         {

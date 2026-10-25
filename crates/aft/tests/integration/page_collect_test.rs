@@ -119,6 +119,15 @@ impl Site {
     }
 }
 
+/// `params` for `page.read` or `page.release` as core sends them: keyed by
+/// the session the snapshot was collected for.
+fn keyed(mut params: Value) -> Value {
+    params["harness"] = json!(HARNESS);
+    params["session"] = json!(SESSION);
+    params
+}
+
+/// `page.collect` params as core sends them.
 fn collect_params(entry: &str) -> Value {
     json!({
         "harness": HARNESS,
@@ -126,7 +135,7 @@ fn collect_params(entry: &str) -> Value {
         "entry": entry,
         "limits": {
             "entry_max_bytes": 2_097_152, "max_files": 64, "max_file_bytes": 8_388_608,
-            "max_total_bytes": 20_971_520, "import_depth": 4, "deadline_ms": 5000,
+            "max_total_bytes": 20_971_520, "import_depth": 1, "deadline_ms": 5000,
         },
     })
 }
@@ -295,7 +304,6 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
             "img/logo mark.png",
             "img/logo@2x.png",
             "app.js",
-            "css/theme.css",
             "img/bg.png",
         ]
     );
@@ -309,6 +317,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
             {"path": "img/missing.png", "reason": "missing"},
             {"path": "cache.db", "reason": "denied"},
             {"path": "../../outside.png", "reason": "denied"},
+            {"path": "css/theme.css", "reason": "depth_limit"},
         ])
     );
     let snapshot = data["snapshot"].as_str().unwrap().to_string();
@@ -333,7 +342,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
     let (request, bytes, shown) = site
         .read(
             stream,
-            json!({"snapshot": snapshot, "path": "img/logo mark.png", "offset": 0, "length": 1_048_576}),
+            keyed(json!({"snapshot": snapshot, "path": "img/logo mark.png", "offset": 0, "length": 1_048_576})),
         )
         .await;
     sample("read-bytes", &request, &shown);
@@ -342,26 +351,30 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
     let (request, bytes, shown) = site
         .read(
             stream,
-            json!({"snapshot": snapshot, "path": "css/theme.css", "offset": 5, "length": 5}),
+            keyed(json!({"snapshot": snapshot, "path": "css/site.css", "offset": 21, "length": 4})),
         )
         .await;
     sample("read-range", &request, &shown);
     site.frame("read-range");
-    assert_eq!(bytes.unwrap(), b"color");
+    assert_eq!(bytes.unwrap(), b"body");
     for (name, params, expected) in [
         (
             "read-refused-not-in-snapshot",
-            json!({"snapshot": snapshot, "path": "cache.db", "offset": 0, "length": 16}),
+            keyed(json!({"snapshot": snapshot, "path": "cache.db", "offset": 0, "length": 16})),
             "not_in_snapshot",
         ),
         (
             "read-refused-bad-range",
-            json!({"snapshot": snapshot, "path": "app.js", "offset": 0, "length": 1_048_577}),
+            keyed(
+                json!({"snapshot": snapshot, "path": "app.js", "offset": 0, "length": 1_048_577}),
+            ),
             "bad_range",
         ),
         (
             "read-refused-snapshot-expired",
-            json!({"snapshot": "00000000000000000000000000000000", "path": "app.js", "offset": 0, "length": 16}),
+            keyed(
+                json!({"snapshot": "00000000000000000000000000000000", "path": "app.js", "offset": 0, "length": 16}),
+            ),
             "snapshot_expired",
         ),
     ] {
@@ -377,7 +390,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
             stream,
             CORE_CHANNEL,
             "page.release",
-            json!({"snapshot": snapshot}),
+            keyed(json!({"snapshot": snapshot})),
         )
         .await;
     sample("release", &request, &reply);
@@ -391,7 +404,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
             stream,
             CORE_CHANNEL,
             "page.release",
-            json!({"snapshot": snapshot}),
+            keyed(json!({"snapshot": snapshot})),
         )
         .await;
     sample("release-again", &request, &reply);
@@ -403,7 +416,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
     let (_, bytes, _) = site
         .read(
             stream,
-            json!({"snapshot": snapshot, "path": "app.js", "offset": 0, "length": 1}),
+            keyed(json!({"snapshot": snapshot, "path": "app.js", "offset": 0, "length": 1})),
         )
         .await;
     assert_eq!(code(&bytes.unwrap_err()), "snapshot_expired");
@@ -505,7 +518,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
                 stream,
                 CORE_CHANNEL,
                 "page.release",
-                json!({"snapshot": snapshot}),
+                keyed(json!({"snapshot": snapshot})),
             )
             .await;
         assert_eq!(reply["data"]["released"], true);
@@ -532,7 +545,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
             stream,
             CORE_CHANNEL,
             "page.release",
-            json!({"snapshot": small}),
+            keyed(json!({"snapshot": small})),
         )
         .await;
     sample("release-small-page", &request, &reply);
@@ -560,7 +573,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
         stream,
         CORE_CHANNEL,
         "page.release",
-        json!({"snapshot": tight}),
+        keyed(json!({"snapshot": tight})),
     )
     .await;
 
@@ -577,7 +590,10 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
     site.frame("collect-refused-invalid-request");
     assert_eq!(code(&reply), "invalid_request");
     let (request, bytes, shown) = site
-        .read(stream, json!({"snapshot": small, "path": "index.html"}))
+        .read(
+            stream,
+            keyed(json!({"snapshot": small, "path": "index.html"})),
+        )
         .await;
     sample("read-refused-invalid-request", &request, &shown);
     site.frame("read-refused-invalid-request");

@@ -262,42 +262,45 @@ fn css_into(source: &[u8], out: &mut Found) {
             i = next;
             continue;
         }
-        if byte == b'\\' {
-            // An escaped character outside a string is part of an identifier.
-            i = (i + 2).min(source.len());
+        if byte == b'@' {
+            // The at-rule's name, which may spell `import` with escapes.
+            let (name, after) = css_name(source, i + 1);
+            if name.eq_ignore_ascii_case("import") {
+                importing = true;
+            }
+            i = after.max(i + 1);
             continue;
         }
-        if byte == b'@' && starts_with_ignore_case(&source[i + 1..], b"import") {
-            let after = i + 1 + b"import".len();
-            if !source
-                .get(after)
-                .is_some_and(|next| next.is_ascii_alphanumeric() || *next == b'-' || *next == b'_')
-            {
-                importing = true;
-                i = after;
+        let after_name_character = i
+            .checked_sub(1)
+            .and_then(|previous| source.get(previous))
+            .is_some_and(|previous| {
+                previous.is_ascii_alphanumeric() || *previous == b'-' || *previous == b'_'
+            });
+        if !after_name_character && starts_name(source, i) {
+            // A whole name, escapes decoded: `url` followed by `(` opens a
+            // URL however it is spelled (`URL(`, `u\72l(`).
+            let (name, after) = css_name(source, i);
+            if source.get(after) == Some(&b'(') && name.eq_ignore_ascii_case("url") {
+                let (value, next) = css_url(source, after + 1);
+                if let Some(value) = value {
+                    let kind = if importing {
+                        RefKind::Stylesheet
+                    } else {
+                        RefKind::Plain
+                    };
+                    out.push(value, kind);
+                }
+                importing = false;
+                i = next;
                 continue;
             }
+            i = after.max(i + 1);
+            continue;
         }
-        if (byte == b'u' || byte == b'U')
-            && starts_with_ignore_case(&source[i..], b"url(")
-            && !i
-                .checked_sub(1)
-                .and_then(|previous| source.get(previous))
-                .is_some_and(|previous| {
-                    previous.is_ascii_alphanumeric() || *previous == b'-' || *previous == b'_'
-                })
-        {
-            let (value, next) = css_url(source, i + 4);
-            if let Some(value) = value {
-                let kind = if importing {
-                    RefKind::Stylesheet
-                } else {
-                    RefKind::Plain
-                };
-                out.push(value, kind);
-            }
-            importing = false;
-            i = next;
+        if byte == b'\\' {
+            // A backslash before a newline is no escape; skip both.
+            i = (i + 2).min(source.len());
             continue;
         }
         if byte == b';' || byte == b'{' || byte == b'}' {
@@ -315,8 +318,34 @@ fn find(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
         .map(|offset| from + offset)
 }
 
-fn starts_with_ignore_case(haystack: &[u8], prefix: &[u8]) -> bool {
-    haystack.len() >= prefix.len() && haystack[..prefix.len()].eq_ignore_ascii_case(prefix)
+/// Whether a CSS name (an identifier) starts at `at`: a letter, `_`, `-`,
+/// a non-ASCII byte, or an escape (a backslash not followed by `\n`).
+fn starts_name(source: &[u8], at: usize) -> bool {
+    match source.get(at) {
+        Some(b'\\') => source.get(at + 1).is_some_and(|next| *next != b'\n'),
+        Some(byte) => byte.is_ascii_alphabetic() || *byte == b'_' || *byte == b'-' || *byte >= 0x80,
+        None => false,
+    }
+}
+
+/// The CSS name (identifier) starting at `start`, with its escapes decoded
+/// by this scanner's byte-level rules (up to six hex digits and one
+/// following ASCII-whitespace byte, or one following byte taken literally),
+/// and the index after it. Empty when no name starts there.
+fn css_name(source: &[u8], start: usize) -> (String, usize) {
+    let mut name = Vec::new();
+    let mut i = start;
+    while let Some(&byte) = source.get(i) {
+        if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte >= 0x80 {
+            name.push(byte);
+            i += 1;
+        } else if byte == b'\\' && source.get(i + 1).is_some_and(|next| *next != b'\n') {
+            i = css_escape(source, i, &mut name, false);
+        } else {
+            break;
+        }
+    }
+    (String::from_utf8_lossy(&name).into_owned(), i)
 }
 
 /// A quoted CSS string starting at `start` (the quote). Returns its decoded

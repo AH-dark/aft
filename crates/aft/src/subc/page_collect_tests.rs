@@ -113,6 +113,14 @@ fn opened_paths(opened: &Arc<Mutex<Vec<PathBuf>>>) -> Vec<PathBuf> {
     opened.lock().unwrap().clone()
 }
 
+/// `params` for `page.read` or `page.release`, keyed by the fixture's
+/// session as core sends them.
+fn keyed(mut params: Value) -> Value {
+    params["harness"] = json!(HARNESS);
+    params["session"] = json!(SESSION);
+    params
+}
+
 fn collect_params(entry: &str) -> Value {
     json!({"harness": HARNESS, "session": SESSION, "entry": entry})
 }
@@ -232,14 +240,14 @@ fn page_collect_refuses_callers_other_than_core() {
             "{principal:?}"
         );
         let ReadReply::Refused(response) = read(
-            json!({"snapshot": "x", "path": "index.html", "offset": 0, "length": 1}),
+            keyed(json!({"snapshot": "x", "path": "index.html", "offset": 0, "length": 1})),
             principal.as_ref(),
             &store,
         ) else {
             panic!("page.read answered a refused caller");
         };
         assert_eq!(response.data["code"], "page_caller_refused");
-        let response = release(json!({"snapshot": "x"}), principal.as_ref(), &store);
+        let response = release(keyed(json!({"snapshot": "x"})), principal.as_ref(), &store);
         assert_eq!(response.data["code"], "page_caller_refused");
     }
 }
@@ -371,7 +379,7 @@ fn page_collect_snapshot_round_trip_through_the_handlers() {
     assert!(response.success, "{:?}", response.data);
     let snapshot = response.data["snapshot"].as_str().unwrap().to_string();
     let ReadReply::Bytes(bytes) = read(
-        json!({"snapshot": snapshot, "path": "ok.png", "offset": 1, "length": 10}),
+        keyed(json!({"snapshot": snapshot, "path": "ok.png", "offset": 1, "length": 10})),
         core().as_ref(),
         &store,
     ) else {
@@ -381,7 +389,7 @@ fn page_collect_snapshot_round_trip_through_the_handlers() {
     // The snapshot answers even after the project file changes.
     std::fs::write(f.root.join("ok.png"), "CHANGED").unwrap();
     let ReadReply::Bytes(bytes) = read(
-        json!({"snapshot": snapshot, "path": "ok.png", "length": 10}),
+        keyed(json!({"snapshot": snapshot, "path": "ok.png", "length": 10})),
         core().as_ref(),
         &store,
     ) else {
@@ -406,17 +414,26 @@ fn page_collect_snapshot_round_trip_through_the_handlers() {
             "snapshot_expired",
         ),
     ] {
-        let ReadReply::Refused(response) = read(params.clone(), core().as_ref(), &store) else {
+        let ReadReply::Refused(response) = read(keyed(params.clone()), core().as_ref(), &store)
+        else {
             panic!("{params}: answered");
         };
         assert_eq!(response.data["code"], code, "{params}");
     }
-    let released = release(json!({"snapshot": snapshot}), core().as_ref(), &store);
+    let released = release(
+        keyed(json!({"snapshot": snapshot})),
+        core().as_ref(),
+        &store,
+    );
     assert_eq!(
         released.data,
         json!({"snapshot": snapshot, "released": true})
     );
-    let again = release(json!({"snapshot": snapshot}), core().as_ref(), &store);
+    let again = release(
+        keyed(json!({"snapshot": snapshot})),
+        core().as_ref(),
+        &store,
+    );
     assert_eq!(again.data, json!({"snapshot": snapshot, "released": false}));
 }
 
@@ -927,4 +944,76 @@ fn page_collect_stalled_collections_free_their_snapshot_places() {
         ReadHooks::production(),
     );
     assert!(response.success, "{:?}", response.data);
+}
+
+/// `page.read` and `page.release` name the session a snapshot is for. Under
+/// any other harness or session a snapshot is answered exactly like one
+/// that does not exist, and is not released.
+#[test]
+fn page_collect_read_and_release_are_keyed_by_session() {
+    let f = fixture(BindTrust::FirstParty);
+    let store = Arc::new(SnapshotStore::open(&f.ctx.storage_dir()));
+    let mut call = call(&f, core(), collect_params("index.html"));
+    call.store = Arc::clone(&store);
+    let response = collect(call);
+    assert!(response.success, "{:?}", response.data);
+    let snapshot = response.data["snapshot"].as_str().unwrap().to_string();
+    let read_as = |harness: &str, session: &str| {
+        read(
+            json!({"harness": harness, "session": session, "snapshot": snapshot,
+                   "path": "ok.png", "offset": 0, "length": 10}),
+            core().as_ref(),
+            &store,
+        )
+    };
+    let ReadReply::Bytes(bytes) = read_as(HARNESS, SESSION) else {
+        panic!("the snapshot's own session was refused");
+    };
+    assert_eq!(bytes, b"OK");
+
+    // The unknown-snapshot refusal, for comparison.
+    let ReadReply::Refused(unknown) = read(
+        keyed(json!({"snapshot": "0".repeat(32), "path": "ok.png", "length": 10})),
+        core().as_ref(),
+        &store,
+    ) else {
+        panic!("an unknown snapshot was read");
+    };
+    for (harness, session) in [("other-harness", SESSION), (HARNESS, "other-session")] {
+        let ReadReply::Refused(refused) = read_as(harness, session) else {
+            panic!("{harness}/{session} read another session's snapshot");
+        };
+        assert_eq!(refused.data, unknown.data, "{harness}/{session}");
+        let released = release(
+            json!({"harness": harness, "session": session, "snapshot": snapshot}),
+            core().as_ref(),
+            &store,
+        );
+        assert_eq!(
+            released.data,
+            json!({"snapshot": snapshot, "released": false}),
+            "{harness}/{session}"
+        );
+    }
+    // Still there for its own session.
+    assert!(matches!(read_as(HARNESS, SESSION), ReadReply::Bytes(_)));
+
+    // Both names are required.
+    for params in [
+        json!({"session": SESSION, "snapshot": snapshot, "path": "ok.png", "length": 1}),
+        json!({"harness": HARNESS, "snapshot": snapshot, "path": "ok.png", "length": 1}),
+    ] {
+        let ReadReply::Refused(response) = read(params.clone(), core().as_ref(), &store) else {
+            panic!("{params}: answered");
+        };
+        assert_eq!(response.data["code"], "invalid_request", "{params}");
+    }
+    for params in [
+        json!({"session": SESSION, "snapshot": snapshot}),
+        json!({"harness": HARNESS, "snapshot": snapshot}),
+    ] {
+        let response = release(params.clone(), core().as_ref(), &store);
+        assert_eq!(response.data["code"], "invalid_request", "{params}");
+    }
+    assert!(matches!(read_as(HARNESS, SESSION), ReadReply::Bytes(_)));
 }

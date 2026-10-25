@@ -19,6 +19,7 @@ pub(crate) mod snapshot;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::{json, Value};
@@ -33,6 +34,10 @@ pub(crate) const CAPABILITY: &str = "page-collect/v1";
 
 /// The least time the page itself gets to be read, whatever the deadline.
 const ENTRY_READ_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Longest path, in bytes, a reference may resolve to (relative to the
+/// page's folder); Linux's `PATH_MAX`. Anything longer names no file.
+const MAX_PATH_BYTES: usize = 4096;
 
 /// Largest `page.read` length.
 pub(crate) const MAX_READ_LENGTH: u64 = 1024 * 1024;
@@ -58,7 +63,9 @@ impl Limits {
         max_files: 64,
         max_file_bytes: 8 * 1024 * 1024,
         max_total_bytes: 20 * 1024 * 1024,
-        import_depth: 4,
+        // One level: the stylesheets the page links (or imports from a
+        // `<style>` element) are scanned; their own `@import`s are not.
+        import_depth: 1,
         deadline_ms: 5_000,
     };
 
@@ -155,8 +162,9 @@ pub(crate) enum Resolved {
     Remote,
     /// Not a relative file path; see [`OmitReason::NotRelative`].
     NotRelative,
-    /// It cannot name a file: undecodable, a directory, or a decoded
-    /// segment that would change the path's shape.
+    /// It cannot name a file: undecodable, a directory, longer than the
+    /// collector's 4096-byte path limit, or a decoded segment that would
+    /// change the path's shape.
     Invalid,
     /// Path segments relative to the page's folder. Leading `..` segments
     /// mean the file is above that folder.
@@ -189,6 +197,13 @@ pub(crate) fn resolve_reference(raw: &str, base: &[String]) -> Resolved {
         .next()
         .unwrap_or_default()
         .to_string();
+    // A reference whose base plus path passes `MAX_PATH_BYTES` is refused
+    // before the base's segments are copied, so a long base is not copied
+    // per reference.
+    let base_bytes: usize = base.iter().map(|segment| segment.len() + 1).sum();
+    if base_bytes.saturating_add(path_part.len()) > MAX_PATH_BYTES {
+        return Resolved::Invalid;
+    }
     let mut segments: Vec<String> = base.to_vec();
     let raw_segments = path_part.split('/').collect::<Vec<_>>();
     let last = raw_segments.len() - 1;
@@ -472,8 +487,11 @@ pub(crate) trait SnapshotSink {
     fn bytes(&self, path: &str) -> std::io::Result<Vec<u8>>;
 }
 
-/// What relative references in a file resolve against.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// What relative references in a file resolve against. One value is shared
+/// (behind an `Arc`) by every reference queued from the same file: a page's
+/// base can be as long as the page, and a copy per reference would multiply
+/// it by the number of references.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RefBase {
     /// A folder, as segments relative to the page's folder (leading `..`
     /// segments are above it).
@@ -488,6 +506,57 @@ pub(crate) enum RefBase {
     /// percent-encoded UTF-8, or decodes to a separator, NUL or colon. Its
     /// relative references then name no file.
     Invalid,
+}
+
+impl Clone for RefBase {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        ref_base_bytes_copied::add(match self {
+            RefBase::Dir(segments) => segments.iter().map(String::len).sum(),
+            _ => 0,
+        });
+        match self {
+            RefBase::Dir(segments) => RefBase::Dir(segments.clone()),
+            RefBase::Web => RefBase::Web,
+            RefBase::Absolute => RefBase::Absolute,
+            RefBase::Invalid => RefBase::Invalid,
+        }
+    }
+}
+
+/// Bytes of folder names copied by cloning a [`RefBase`] on this thread. A
+/// test can cap it, so a collection that copies a base per reference fails
+/// at once instead of exhausting memory.
+#[cfg(test)]
+pub(crate) mod ref_base_bytes_copied {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COPIED: Cell<usize> = const { Cell::new(0) };
+        static CAP: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+
+    pub(crate) fn add(bytes: usize) {
+        let total = COPIED.with(|copied| {
+            let total = copied.get().saturating_add(bytes);
+            copied.set(total);
+            total
+        });
+        assert!(
+            total <= CAP.with(Cell::get),
+            "{total} bytes of reference bases copied, over the test's cap"
+        );
+    }
+
+    /// Start counting from zero, failing once `cap` bytes are passed.
+    pub(crate) fn reset(cap: usize) {
+        COPIED.with(|copied| copied.set(0));
+        CAP.with(|limit| limit.set(cap));
+    }
+
+    pub(crate) fn get() -> usize {
+        COPIED.with(Cell::get)
+    }
 }
 
 /// The folder a page's `<base href>` makes its relative references resolve
@@ -544,7 +613,7 @@ enum Seen {
 
 struct Pending {
     reference: Reference,
-    base: RefBase,
+    base: Arc<RefBase>,
     /// For a stylesheet: how many stylesheets deep it is (one for a
     /// stylesheet the page links or imports from a `<style>` element).
     level: u64,
@@ -618,13 +687,14 @@ pub(crate) fn collect(
     let page = scan::html_references(&html);
     collected.omitted_unlisted += page.dropped as u64;
     drop(html);
-    let page_base = page
-        .base
-        .as_deref()
-        .map_or(RefBase::Dir(Vec::new()), resolve_base);
+    let page_base = Arc::new(
+        page.base
+            .as_deref()
+            .map_or(RefBase::Dir(Vec::new()), resolve_base),
+    );
     queue.extend(page.references.into_iter().map(|reference| Pending {
         reference,
-        base: page_base.clone(),
+        base: Arc::clone(&page_base),
         level: 1,
     }));
 
@@ -641,12 +711,12 @@ pub(crate) fn collect(
                            segments: &[String],
                            bytes: &[u8],
                            level: u64| {
-        let folder = segments[..segments.len() - 1].to_vec();
+        let folder = Arc::new(RefBase::Dir(segments[..segments.len() - 1].to_vec()));
         let (references, dropped) = scan::css_references(bytes);
         collected.omitted_unlisted += dropped as u64;
         queue.extend(references.into_iter().map(|reference| Pending {
             reference,
-            base: RefBase::Dir(folder.clone()),
+            base: Arc::clone(&folder),
             level: level + 1,
         }));
     };
@@ -657,14 +727,14 @@ pub(crate) fn collect(
         level,
     }) = queue.pop_front()
     {
-        let resolved = match &base {
+        let resolved = match &*base {
             RefBase::Dir(base) => resolve_reference(&reference.raw, base),
             _ => resolve_reference(&reference.raw, &[]),
         };
         // A page base changes only references that would have named a file:
         // a fragment still names the page, and a reference with its own
         // scheme or root stays what it is.
-        let resolved = match (resolved, &base) {
+        let resolved = match (resolved, &*base) {
             (Resolved::Path(_), RefBase::Web) => Resolved::Remote,
             (Resolved::Path(_), RefBase::Absolute) => Resolved::NotRelative,
             (Resolved::Path(_), RefBase::Invalid) => Resolved::Invalid,
