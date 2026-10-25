@@ -1034,13 +1034,17 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       if (line.startsWith("h")) {
         throw new Error(`archive contains hardlink entry: ${line.trim()}`);
       }
+      if (!line.trim()) continue;
+      // Read the size column by position: the largest number on a line can be
+      // a numeric file name or a year rather than the entry's size.
+      // GNU tar: mode owner/group size date time name.
+      // bsdtar: mode links owner group size month day time/year name.
       const parts = line.trim().split(/\s+/);
-      if (parts.length >= 6) {
-        const numeric = parts
-          .map((part) => Number.parseInt(part, 10))
-          .filter((value) => Number.isFinite(value) && value >= 0);
-        if (numeric.length > 0) totalBytes += Math.max(...numeric);
+      const size = parts[1]?.includes("/") ? parts[2] : parts[4];
+      if (!size || !/^\d+$/.test(size) || !Number.isSafeInteger(Number(size))) {
+        throw new Error(`unrecognized tar size listing: ${line.trim()}`);
       }
+      totalBytes += Number(size);
     }
 
     const names = await runArchiveTool(command, ["-tf", archivePath], ARCHIVE_LIST_TIMEOUT_MS);
@@ -1890,5 +1894,6 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     // installer's exported declaration.
     _writeGithubInstalledMetaForTesting: (installDir: string, version: string, sha256: string) =>
       writeGithubInstalledMetaIn(installDir, version, sha256),
+    _precheckTarForTesting: precheckWithTar,
   };
 }

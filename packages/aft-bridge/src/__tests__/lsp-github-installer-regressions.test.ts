@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { getAftLspPackagesDir } from "../cache-paths.js";
+import { execFileSync } from "../child-process.js";
 import { createGithubInstaller } from "../lsp-github-install.js";
 import { findGithubServerById } from "../lsp-github-table.js";
 import { withEnv } from "./test-utils/env-guard.js";
@@ -73,6 +74,19 @@ async function cacheFixture(
 const config = { autoInstall: true, graceDays: 7, versions: {}, disabled: new Set<string>() };
 const clangd = findGithubServerById("clangd");
 if (!clangd) throw new Error("clangd fixture missing");
+
+describe("archive prechecks", () => {
+  test("tar size precheck reads sizes rather than numeric filenames", async () => {
+    await cacheFixture(async (root) => {
+      // A file name that parses as a number larger than the extraction cap.
+      const name = "5000000000-payload";
+      writeFileSync(join(root, name), "four");
+      const archive = join(root, "payload.tar");
+      execFileSync("tar", ["-cf", archive, "-C", root, name]);
+      expect(await installerFixture()._precheckTarForTesting(archive, "tar")).toBe(4);
+    });
+  });
+});
 
 describe("GitHub install metadata", () => {
   test("github metadata replaces rather than truncates the previous inode", async () => {
