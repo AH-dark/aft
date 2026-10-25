@@ -339,7 +339,16 @@ export function createGithubInstaller(services: GithubInstallerHost) {
         ...(layout ? { layout } : {}),
         ...(smoke ? { smoke } : {}),
       };
-      writeFileSync(join(installDir, INSTALLED_META_FILE), JSON.stringify(meta), "utf8");
+      // Rename a complete private sibling into place so a host reading the
+      // shared cache sees the old record or the new one, never a truncation.
+      const path = join(installDir, INSTALLED_META_FILE);
+      const tempPath = `${path}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+      try {
+        writeFileSync(tempPath, JSON.stringify(meta), { encoding: "utf8", flag: "wx" });
+        renameSync(tempPath, path);
+      } finally {
+        rmSync(tempPath, { force: true });
+      }
     } catch (err) {
       warn(`[lsp] failed to write github installed metadata in ${installDir}: ${err}`);
     }
@@ -1877,5 +1886,9 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     _runArchiveToolForTesting: runArchiveTool,
     _fetchReleaseByTagForTesting: fetchReleaseByTag,
     _resolveTargetTagForTesting: resolveTargetTag,
+    // A narrower wrapper keeps the private smoke-verdict type out of the
+    // installer's exported declaration.
+    _writeGithubInstalledMetaForTesting: (installDir: string, version: string, sha256: string) =>
+      writeGithubInstalledMetaIn(installDir, version, sha256),
   };
 }

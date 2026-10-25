@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { getAftLspPackagesDir } from "../cache-paths.js";
@@ -64,6 +73,25 @@ async function cacheFixture(
 const config = { autoInstall: true, graceDays: 7, versions: {}, disabled: new Set<string>() };
 const clangd = findGithubServerById("clangd");
 if (!clangd) throw new Error("clangd fixture missing");
+
+describe("GitHub install metadata", () => {
+  test("github metadata replaces rather than truncates the previous inode", async () => {
+    await cacheFixture((root) => {
+      const pkg = join(root, "lsp-binaries", "fixture");
+      mkdirSync(pkg, { recursive: true });
+      const path = join(pkg, ".aft-installed");
+      // A second name for the old inode shows whether the writer truncated
+      // the file in place (a concurrent reader's view) or renamed over it.
+      const old = join(root, "old-metadata");
+      writeFileSync(path, "old-metadata");
+      linkSync(path, old);
+      installerFixture()._writeGithubInstalledMetaForTesting(pkg, "1.0.0", "0".repeat(64));
+      expect(readFileSync(old, "utf8")).toBe("old-metadata");
+      expect(JSON.parse(readFileSync(path, "utf8")).version).toBe("1.0.0");
+      expect(readdirSync(pkg)).toEqual([".aft-installed"]);
+    });
+  });
+});
 
 describe("GitHub release lookups", () => {
   test("live release tags cannot persist unsafe path components", async () => {
