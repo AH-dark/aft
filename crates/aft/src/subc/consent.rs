@@ -688,6 +688,9 @@ impl SettlementOwner {
                         && other.session == flight.session
                         && other.binding == flight.binding
                         && other.key == flight.key
+                    // A published group belongs to calls that overlapped it; a call that
+                    // arrives after publication needs its own approval.
+                    && other.group.done.borrow().is_none()
                 })
             {
                 // Join before either receipt arrives. Looking up only settled
