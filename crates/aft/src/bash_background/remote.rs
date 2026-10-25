@@ -1704,9 +1704,7 @@ const RUNON_CD_WINDOWS_ABSOLUTE_MESSAGE: &str = "runon refused: the command chan
 #[cfg(unix)]
 fn runon_cd_refusal(command: &str, request: &RunRequest) -> Result<Option<String>, exec::Error> {
     let checkout = Path::new(&request.workspace_key);
-    let cwd = Path::new(&request.cwd)
-        .canonicalize()
-        .map_err(|error| exec::Error::Protocol(error.to_string()))?;
+    let cwd = exec::DirectoryKind::WorkingDirectory.canonicalize(Path::new(&request.cwd))?;
     // Sibling wire paths are absolute and are not rebased on Linux. A linked
     // worktree also gets a mount beside the workspace under each sibling name.
     let alias_parent = checkout
@@ -2249,6 +2247,34 @@ impl BgTaskRegistry {
         }
         if let Some((Err(RemoteRequestError::CdOutsideCheckout(message)), _)) = initial.as_ref() {
             self.refuse_cd_before_start(&task, message);
+            return Ok(());
+        }
+        if let Some((
+            Err(RemoteRequestError::Build(exec::Error::ResolveDirectory { kind, path, source })),
+            _,
+        )) = initial.as_ref().filter(|_| remote.explicit_runon)
+        {
+            // A local path error must not be hidden by a failed connection to the runner.
+            let reason = if source.kind() == io::ErrorKind::NotFound {
+                "does not exist"
+            } else {
+                "cannot be resolved"
+            };
+            let os_error = source
+                .raw_os_error()
+                .map(|code| format!("os error {code}"))
+                .unwrap_or_else(|| source.to_string());
+            self.remote_terminal(
+                &task,
+                Verdict::RunLocally {
+                    reason: RefusalReason::Unreachable,
+                    refusal_detail: None,
+                },
+                Some(format!(
+                    "runon refused: {kind} {reason}: {}; command did not run ({os_error})",
+                    path.display()
+                )),
+            );
             return Ok(());
         }
         let connection = remote
@@ -3194,8 +3220,11 @@ impl BgTaskRegistry {
         if holders.is_empty() {
             return None;
         }
-        let workspace =
-            |metadata: &PersistedTask| worktree_root_containing(&metadata.workdir).ok().flatten();
+        let workspace = |metadata: &PersistedTask| {
+            worktree_root_containing(&metadata.workdir, exec::DirectoryKind::WorkingDirectory)
+                .ok()
+                .flatten()
+        };
         let own_workspace = workspace(&task.state.lock().ok()?.metadata)?;
         let tasks: Vec<_> = self.inner.tasks.lock().ok()?.values().cloned().collect();
         tasks.into_iter().find_map(|other| {
@@ -4129,11 +4158,12 @@ fn build_remote_request(
     timeout_seconds: u64,
     preset: &exec::PresetParams,
 ) -> Result<RunRequest, exec::Error> {
-    let session_root = session_root
-        .canonicalize()
-        .map_err(|error| exec::Error::Protocol(error.to_string()))?;
-    let session_worktree = worktree_root_containing(&session_root)?.unwrap_or(session_root);
-    let Some(worktree_root) = worktree_root_containing(cwd)? else {
+    let session_root = exec::DirectoryKind::ProjectFolder.canonicalize(session_root)?;
+    let session_worktree =
+        worktree_root_containing(&session_root, exec::DirectoryKind::ProjectFolder)?
+            .unwrap_or(session_root);
+    let Some(worktree_root) = worktree_root_containing(cwd, exec::DirectoryKind::WorkingDirectory)?
+    else {
         return Err(workdir_outside_session_repository(
             cwd,
             None,
@@ -4161,17 +4191,15 @@ fn build_remote_request(
 }
 
 #[cfg(unix)]
-fn worktree_root_containing(path: &Path) -> Result<Option<PathBuf>, exec::Error> {
-    let path = path
-        .canonicalize()
-        .map_err(|error| exec::Error::Protocol(error.to_string()))?;
+fn worktree_root_containing(
+    path: &Path,
+    kind: exec::DirectoryKind,
+) -> Result<Option<PathBuf>, exec::Error> {
+    let path = kind.canonicalize(path)?;
     for ancestor in path.ancestors() {
         let git_marker = ancestor.join(".git");
         if git_marker.is_file() || git_marker.is_dir() {
-            return ancestor
-                .canonicalize()
-                .map(Some)
-                .map_err(|error| exec::Error::Protocol(error.to_string()));
+            return kind.canonicalize(ancestor).map(Some);
         }
     }
     Ok(None)
