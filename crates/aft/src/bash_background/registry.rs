@@ -1654,7 +1654,7 @@ pub(crate) struct BgTaskState {
     pub(crate) kill_in_flight: bool,
     pub(crate) buffer: BgBuffer,
     terminal_output_cache: Option<TerminalOutputCache>,
-    /// PTY-only: set for timeout kill intent before signaling the child.
+    /// PTY timeout intent or a memory stop that must survive marker finalization.
     pub(crate) pending_terminal_override: Option<BgTaskStatus>,
 }
 
@@ -4038,7 +4038,7 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn memory_limit_exceeded(&self, task: &Arc<BgTask>) -> Option<String> {
-        let state = task.lock_state().ok()?;
+        let mut state = task.lock_state().ok()?;
         if (state.metadata.remote.is_some() && !state.metadata.local_fallback_started)
             || state.metadata.is_terminal()
         {
@@ -4059,10 +4059,25 @@ impl BgTaskRegistry {
             }
         }
         let monitor = monitors.get_mut(&task.task_id)?;
-        monitor.exceeded(pgid).then(|| monitor.reason())
+        if monitor.exceeded(pgid) {
+            let reason = monitor.reason();
+            // A terminal observer can run before the stop worker gets its turn.
+            // Preserve the known cap outcome for that observer as well.
+            state.pending_terminal_override = Some(BgTaskStatus::Failed);
+            state.metadata.status_reason = Some(reason.clone());
+            Some(reason)
+        } else {
+            None
+        }
     }
 
     pub(crate) fn kill_for_memory(&self, task: &Arc<BgTask>, reason: String) {
+        if let Ok(mut state) = task.lock_state() {
+            if !state.metadata.is_terminal() {
+                state.pending_terminal_override = Some(BgTaskStatus::Failed);
+                state.metadata.status_reason = Some(reason.clone());
+            }
+        }
         if let Ok(monitors) = self.inner.memory_monitors.lock() {
             if let Some(monitor) = monitors.get(&task.task_id) {
                 monitor.terminate();
@@ -9773,7 +9788,13 @@ impl BgTaskRegistry {
             return false;
         }
         let child_exit_observed = state.child_exit_observed;
+        let memory_reason = pending_memory_stop_reason(state);
         let updated = self.update_task_metadata_locked(task, db, |metadata| {
+            if let Some(reason) = &memory_reason {
+                metadata.mark_terminal(BgTaskStatus::Failed, Some(137), Some(reason.clone()));
+                super::persistence::persist_terminal_exit(&task.paths, metadata);
+                return;
+            }
             let (status, reason) = if child_exit_observed {
                 (
                     BgTaskStatus::Failed,
@@ -11103,6 +11124,11 @@ impl BgTaskRegistry {
         let task = self
             .task_for_session(task_id, session_id)
             .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
+        let memory_kill = terminal_status == BgTaskStatus::Failed
+            && reason.is_some()
+            && task
+                .lock_state()
+                .is_ok_and(|state| state.metadata.memory_policy.is_some());
         #[cfg(unix)]
         if task.lock_state().is_ok_and(|s| s.metadata.remote.is_some()) {
             if scope_end_label(reason.as_deref()).is_some() {
@@ -11156,9 +11182,6 @@ impl BgTaskRegistry {
                     _ => KillSignalPlan::Nothing,
                 }
             } else if let Ok(Some(marker)) = read_exit_marker(&task.paths) {
-                let memory_kill = terminal_status == BgTaskStatus::Failed
-                    && state.metadata.memory_policy.is_some()
-                    && reason.is_some();
                 // A cap violation is a forced stop, not a natural exit. Polling
                 // for output here would reschedule the same memory kill before
                 // ConPTY can close, leaving the task running indefinitely.
@@ -11239,12 +11262,13 @@ impl BgTaskRegistry {
                         .map_err(|e| format!("failed to persist killing state: {e}"))?;
                 }
                 state.metadata = killing;
-                if !was_already_killing
-                    && state.metadata.mode == BgMode::Pty
-                    && matches!(
-                        terminal_status,
-                        BgTaskStatus::TimedOut | BgTaskStatus::Failed
-                    )
+                if memory_kill
+                    || (!was_already_killing
+                        && state.metadata.mode == BgMode::Pty
+                        && matches!(
+                            terminal_status,
+                            BgTaskStatus::TimedOut | BgTaskStatus::Failed
+                        ))
                 {
                     state.pending_terminal_override = Some(terminal_status.clone());
                 }
@@ -11310,7 +11334,7 @@ impl BgTaskRegistry {
                 let natural_exit_before_signal = read_exit_marker(&task.paths)
                     .ok()
                     .flatten()
-                    .filter(|marker| matches!(marker, ExitMarker::Code(_)));
+                    .filter(|marker| !memory_kill && matches!(marker, ExitMarker::Code(_)));
                 #[cfg(feature = "test-timing-hooks")]
                 if scope_diagnostic {
                     crate::slog_info!("scope diagnostic phase=signal_started task={task_id} child_pid={child_pid:?} elapsed_ms={}", diagnostic_start.elapsed().as_millis());
@@ -11387,7 +11411,7 @@ impl BgTaskRegistry {
                             }
                         };
 
-                        let exit_code = terminal_exit_code_for_status(&terminal_status);
+                        let exit_code = forced_terminal_exit_code(&terminal_status, memory_kill);
                         state
                             .metadata
                             .mark_terminal(terminal_status, exit_code, terminal_reason);
@@ -11418,11 +11442,13 @@ impl BgTaskRegistry {
                 }
                 settle_killed_process_group(&task.task_id, pid.map(|pid| pid as i32));
                 close_pty_master(master);
-                terminalized = self.finish_pty_kill(&task, terminal_status, reason)?;
+                terminalized = self.finish_pty_kill(&task, terminal_status, reason, memory_kill)?;
             }
         }
 
         if terminalized {
+            #[cfg(test)]
+            wait_on_kill_signal_gate_for_test(&format!("{task_id}:terminal-published"));
             self.post_terminal_transition(&task, true)?;
         }
         let mut snapshot = self.snapshot_with_terminal_cache(&task, RUNNING_OUTPUT_PREVIEW_BYTES);
@@ -11479,6 +11505,7 @@ impl BgTaskRegistry {
         task: &Arc<BgTask>,
         terminal_status: BgTaskStatus,
         reason: Option<String>,
+        memory_kill: bool,
     ) -> Result<bool, String> {
         #[cfg_attr(not(windows), allow(unused_mut, unused_variables))]
         let mut db = DeferredDbWrites::new(self, task);
@@ -11507,7 +11534,7 @@ impl BgTaskRegistry {
                     .map_err(|e| format!("failed to write kill marker: {e}"))?;
             }
 
-            let exit_code = terminal_exit_code_for_status(&target_status);
+            let exit_code = forced_terminal_exit_code(&target_status, memory_kill);
             state
                 .metadata
                 .mark_terminal(target_status, exit_code, reason.clone());
@@ -11523,7 +11550,7 @@ impl BgTaskRegistry {
             return Ok(true);
         }
         #[cfg(not(windows))]
-        let _ = (terminal_status, reason);
+        let _ = (terminal_status, reason, memory_kill);
         Ok(false)
     }
 
@@ -11620,26 +11647,32 @@ impl BgTaskRegistry {
                 return Ok(());
             }
 
+            let memory_reason = pending_memory_stop_reason(&state);
             let pending_override = state.pending_terminal_override.take();
             let is_pty = state.metadata.mode == BgMode::Pty;
-            // A Killing reason describes intent, not the outcome. A numeric
-            // marker is the command's own exit, so it must not inherit a claim
-            // that a timeout (or another kill request) terminated it.
+            // A numeric marker normally describes a natural exit, not the
+            // kill's intent. A recorded memory breach is already a forced
+            // outcome and must keep its cap reason even if this poll wins.
             let inherited_reason = if state.metadata.status == BgTaskStatus::Killing
                 && matches!(marker, ExitMarker::Code(_))
+                && memory_reason.is_none()
             {
                 None
             } else {
                 state.metadata.status_reason.clone()
             };
-            let reason = reason.or(inherited_reason);
+            let reason = memory_reason.clone().or(reason).or(inherited_reason);
             let reason = match (reason, output_incomplete) {
                 (Some(reason), Some(incomplete)) => Some(format!("{reason}; {incomplete}")),
                 (None, Some(incomplete)) => Some(incomplete.to_owned()),
                 (reason, None) => reason,
             };
             let transition = |metadata: &mut PersistedTask| {
-                let mut new_metadata = if is_pty && marker == ExitMarker::Killed {
+                let mut new_metadata = if memory_reason.is_some() {
+                    let mut metadata = metadata.clone();
+                    metadata.mark_terminal(BgTaskStatus::Failed, Some(137), reason.clone());
+                    metadata
+                } else if is_pty && marker == ExitMarker::Killed {
                     let mut metadata = metadata.clone();
                     let target_status = pending_override.clone().unwrap_or(BgTaskStatus::Killed);
                     let exit_code = terminal_exit_code_for_status(&target_status);
@@ -14633,6 +14666,23 @@ fn terminal_exit_code_for_status(status: &BgTaskStatus) -> Option<i64> {
         BgTaskStatus::Killed => Some(137),
         _ => None,
     }
+}
+
+fn forced_terminal_exit_code(status: &BgTaskStatus, memory_kill: bool) -> Option<i64> {
+    // A failed memory stop is still a known forced termination. Ordinary
+    // failures without an observed code must continue to report an unknown code.
+    if memory_kill {
+        Some(137)
+    } else {
+        terminal_exit_code_for_status(status)
+    }
+}
+
+fn pending_memory_stop_reason(state: &BgTaskState) -> Option<String> {
+    (state.pending_terminal_override == Some(BgTaskStatus::Failed)
+        && state.metadata.memory_policy.is_some())
+    .then(|| state.metadata.status_reason.clone())
+    .flatten()
 }
 
 fn attach_sandbox_metadata(metadata: &mut PersistedTask, spawn_plan: &SpawnPlan) {
@@ -22201,6 +22251,91 @@ mod tests {
         registry.kill(&task_id, "session").unwrap();
         assert!(completions_for(&registry, &task_id).is_empty());
         assert_eq!(pattern_match_frames(&frames).len(), 1);
+    }
+
+    #[cfg(unix)]
+    fn assert_memory_stop_publication(numeric_marker: bool) {
+        let registry = BgTaskRegistry::default();
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session".into(),
+                dir.path().into(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                Some(256),
+                dir.path().into(),
+                10,
+                true,
+                false,
+                Some(dir.path().into()),
+            )
+            .unwrap();
+        let task = registry.task_for_test(&id).unwrap();
+        let reason = "256 MiB memory cap exceeded".to_string();
+        let gate_key = if numeric_marker {
+            id.clone()
+        } else {
+            format!("{id}:terminal-published")
+        };
+        let (reached, release) = install_kill_signal_gate_for_test(&gate_key);
+        let kill_registry = registry.clone();
+        let kill_id = id.clone();
+        let kill_reason = reason.clone();
+        let killer = std::thread::spawn(move || {
+            kill_registry.kill_with_status_reason(
+                &kill_id,
+                "session",
+                BgTaskStatus::Failed,
+                Some(kill_reason),
+            )
+        });
+        reached.recv_timeout(Duration::from_secs(2)).unwrap();
+        if numeric_marker {
+            // This poll passed its cap check before the stop was recorded.
+            registry
+                .finalize_from_marker(&task, ExitMarker::Code(7), None)
+                .unwrap();
+        }
+        // Neither the kill worker nor a status poll may repair accounting
+        // before the first terminal metadata is checked.
+        let snapshot = task.snapshot(0);
+        assert_eq!(snapshot.info.status, BgTaskStatus::Failed);
+        assert_eq!(
+            snapshot.exit_code,
+            Some(137),
+            "numeric_marker={numeric_marker}"
+        );
+        assert_eq!(
+            snapshot.info.status_reason.as_deref(),
+            Some(reason.as_str())
+        );
+        release.send(()).unwrap();
+        let final_snapshot = killer.join().unwrap().unwrap();
+        assert_eq!(final_snapshot.info.status, BgTaskStatus::Failed);
+        assert_eq!(final_snapshot.exit_code, Some(137));
+        assert_eq!(
+            final_snapshot.info.status_reason.as_deref(),
+            Some(reason.as_str())
+        );
+        let metadata = read_task(&task.paths.json).unwrap();
+        assert_eq!(metadata.exit_code, Some(137));
+        assert_eq!(metadata.status_reason.as_deref(), Some(reason.as_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_stop_terminal_snapshot_precedes_accounting() {
+        assert_memory_stop_publication(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_stop_numeric_marker_during_kill_keeps_outcome() {
+        assert_memory_stop_publication(true);
     }
 
     #[cfg(unix)]
