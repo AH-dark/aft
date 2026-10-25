@@ -549,6 +549,42 @@ fn deferred_derived_index_write_is_counted_in_the_publication_io() {
 }
 
 #[test]
+fn publication_writes_a_reference_sidecar_matching_its_manifest() {
+    let (_dirs, main, _worker) = checkouts(4);
+    publish_checkout(&main).unwrap();
+    let view = ViewStore::open(&main.storage, &main.scope).unwrap();
+    let generation = view.current_generation_read_only().unwrap().unwrap();
+    let json = fs::read(view.manifest_path(&generation).unwrap()).unwrap();
+    let expected: Vec<[u8; 32]> =
+        crate::views::generation::decode_reference_keys_for_test(&generation, &json)
+            .unwrap()
+            .into_iter()
+            .collect();
+    assert!(!expected.is_empty());
+    // A policy with a long settle window still trusts the publisher's sidecar.
+    let sidecars = crate::views::reference_sidecar::ReferenceSidecars::new(
+        std::time::Duration::from_secs(3600),
+    );
+    let mut seen = Vec::new();
+    // Room is not under test here.
+    let mut unlimited = usize::MAX;
+    let source = sidecars
+        .visit(
+            view.view_dir(),
+            &generation,
+            |_| panic!("the publisher's sidecar should make decoding unnecessary"),
+            &mut |keys| {
+                seen = vec![[0_u8; 32]; keys.len()];
+                keys.read(0, &mut seen)
+            },
+            &mut unlimited,
+        )
+        .unwrap();
+    assert_eq!(source, crate::views::reference_sidecar::KeySource::Sidecar);
+    assert_eq!(seen, expected);
+}
+
+#[test]
 fn derived_index_row_of_a_superseded_publication_is_never_written() {
     let (_dirs, mut main, _worker) = checkouts(24);
     publish_checkout(&main).unwrap();

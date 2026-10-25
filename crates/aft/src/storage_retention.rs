@@ -102,6 +102,10 @@ pub(crate) struct SweepReport {
     pub stopped_early: bool,
     pub cancelled: bool,
     pub errors: Vec<String>,
+    /// View folders larger than one generation-cleanup pass examines, each
+    /// with what that pass could not prove. Cleanup still shrinks them a
+    /// bounded window at a time, keeping anything it cannot prove unshared.
+    pub oversized_views: Vec<String>,
     /// Blob families this pass left for a later pass, each with the reason,
     /// such as `blobs/v3/<family>: reservation_busy`.
     pub skipped_families: Vec<String>,
@@ -1974,6 +1978,14 @@ fn sweep_view_generations(
             }
             match store.sweep_generations_with_bytes() {
                 Ok(removed) => {
+                    if removed.over_limit && report.oversized_views.len() < 16 {
+                        report.oversized_views.push(format!(
+                            "{}: over the generation directory limit; partial cleanup removed {} generation(s) and kept {} whose derived database could be shared by an unseen reference",
+                            path.display(),
+                            removed.removed_generations,
+                            removed.kept_unproven_owners
+                        ));
+                    }
                     report.removed_generations += removed.removed_generations;
                     report.removed_bytes += removed.removed_bytes;
                     report

@@ -1,0 +1,1 @@
+- Background storage cleanup no longer decodes every project's view manifests on each pass. It reads a compact key file kept beside each manifest, so it uses far less CPU and memory with many projects and finishes passes it used to abandon at its deadline.

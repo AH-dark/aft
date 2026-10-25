@@ -20,13 +20,23 @@ use serde::{
 use super::{Result, ViewError, ViewStore};
 
 // Protection scans must finish within one common allowance before any unlink.
-const GENERATION_DIRECTORY_LIMIT: usize = 65_536;
+pub(super) const GENERATION_DIRECTORY_LIMIT: usize = 65_536;
 const MAX_CLAIM_FILES: usize = 16;
+/// In a directory over the limit, cleanup examines one window of at most the
+/// limit per pass and moves the window on each pass. Names beyond this many
+/// windows are not reached; that only delays cleanup of an extreme directory.
+const MAX_OVERSIZED_WINDOWS: usize = 16;
 
 #[derive(Debug, Default)]
 pub(crate) struct GenerationSweep {
     pub removed_generations: usize,
     pub removed_bytes: u64,
+    /// The view directory held more entries than one cleanup pass examines,
+    /// so this pass saw only part of it (see `sweep_generations_bounded`).
+    pub over_limit: bool,
+    /// Generations kept in such a pass only because a derived-owner reference
+    /// to them could sit outside the examined window.
+    pub kept_unproven_owners: usize,
 }
 
 #[derive(Default)]
@@ -71,6 +81,8 @@ impl GenerationSweep {
     fn add(&mut self, other: Self) {
         self.removed_generations += other.removed_generations;
         self.removed_bytes = self.removed_bytes.saturating_add(other.removed_bytes);
+        self.over_limit |= other.over_limit;
+        self.kept_unproven_owners += other.kept_unproven_owners;
     }
 }
 
@@ -113,9 +125,11 @@ pub(super) fn schedule_generation_sweep(view: ViewStore) {
                 Ok(removed)
             }) {
                 Ok(removed) => log::info!(
-                    "views: post-publication removed_generations={} removed_bytes={} view={}",
+                    "views: post-publication removed_generations={} removed_bytes={} over_limit={} kept_unproven_owners={} view={}",
                     removed.removed_generations,
                     removed.removed_bytes,
+                    removed.over_limit,
+                    removed.kept_unproven_owners,
                     path.display()
                 ),
                 Err(error) => log::warn!(
@@ -163,15 +177,59 @@ pub(crate) fn wait_for_generation_sweep_for_test(path: &Path) {
 }
 
 fn generation_directory_entries(directory: &Path, limit: usize) -> Result<Vec<fs::DirEntry>> {
-    let entries = fs::read_dir(directory)?
-        .take(limit.saturating_add(1))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    if entries.len() > limit {
+    let (entries, reached_end) = bounded_directory_entries(directory, 0, limit)?;
+    if !reached_end {
         return Err(ViewError::InvalidManifest(format!(
-            "generation directory scan exceeded {limit} entries"
+            "generation directory scan exceeded {limit} entries: {}",
+            directory.display()
         )));
     }
     Ok(entries)
+}
+
+/// At most `limit` entries of `directory`, starting after the first `skip`,
+/// and whether the listing ended inside this window. Names before the window
+/// are listed but not examined.
+fn bounded_directory_entries(
+    directory: &Path,
+    skip: usize,
+    limit: usize,
+) -> Result<(Vec<fs::DirEntry>, bool)> {
+    #[cfg(test)]
+    note_directory_listing(directory);
+    let mut entries = fs::read_dir(directory)?
+        .skip(skip)
+        .take(limit.saturating_add(1))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let reached_end = entries.len() <= limit;
+    entries.truncate(limit);
+    Ok((entries, reached_end))
+}
+
+/// Where the next cleanup window starts in each oversized view directory.
+static OVERSIZED_WINDOWS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    /// Listings of each view directory made on this thread, for tests that
+    /// bound how often a scan enumerates a directory.
+    static DIRECTORY_LISTINGS: std::cell::RefCell<HashMap<PathBuf, usize>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+#[cfg(test)]
+pub(super) fn note_directory_listing(directory: &Path) {
+    DIRECTORY_LISTINGS.with(|listings| {
+        *listings
+            .borrow_mut()
+            .entry(directory.to_path_buf())
+            .or_default() += 1;
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn take_directory_listings(directory: &Path) -> usize {
+    DIRECTORY_LISTINGS.with(|listings| listings.borrow_mut().remove(directory).unwrap_or(0))
 }
 
 #[derive(Deserialize)]
@@ -374,6 +432,16 @@ impl ViewStore {
         }
     }
 
+    /// Whether another generation's `derived-<other>.ref` could name this
+    /// generation. A reference always names the final owner (see
+    /// `reuse_derived`), which has its own database and no reference file, so
+    /// a generation with a reference file, or with no database, owns nothing.
+    fn could_own_derived(&self, generation: &str) -> bool {
+        let view = self.view_dir();
+        view.join(format!("derived-{generation}.sqlite")).exists()
+            && !view.join(format!("derived-{generation}.ref")).exists()
+    }
+
     pub(super) fn reuse_derived(&self, generation: &str, base: &str) -> Result<()> {
         super::validate_generation(generation)?;
         // Serialize new ownership references with sweeping across processes. The
@@ -408,7 +476,40 @@ impl ViewStore {
         &self,
     ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<[u8; 32]>>> {
         let mut result = std::collections::BTreeMap::new();
-        for entry in generation_directory_entries(self.view_dir(), GENERATION_DIRECTORY_LIMIT)? {
+        self.visit_blob_references(
+            super::reference_sidecar::global(),
+            &mut || Ok(()),
+            &mut |generation, keys| {
+                let mut all = vec![[0_u8; 32]; keys.len()];
+                keys.read(0, &mut all)?;
+                result.insert(generation.to_owned(), all.into_iter().collect());
+                Ok(())
+            },
+        )?;
+        Ok(result)
+    }
+
+    /// Show every published generation's referenced keys to `visit`, read
+    /// from each manifest's reference sidecar and derived from the JSON only
+    /// when the sidecar is missing or not valid for that manifest. `check`
+    /// runs before each directory entry so a caller's deadline or cancellation
+    /// stops the scan between files rather than after the whole view.
+    pub(crate) fn visit_blob_references(
+        &self,
+        sidecars: &super::reference_sidecar::ReferenceSidecars,
+        check: &mut dyn FnMut() -> std::io::Result<()>,
+        visit: &mut dyn FnMut(
+            &str,
+            &dyn super::reference_sidecar::SortedKeys,
+        ) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let entries = generation_directory_entries(self.view_dir(), GENERATION_DIRECTORY_LIMIT)?;
+        // The listing above is the only count of this directory in the scan:
+        // each sidecar written spends a slot, and once none are left the
+        // remaining manifests are decoded without trying to save one.
+        let mut free_slots = sidecars.scan_slots(entries.len());
+        for entry in entries {
+            check()?;
             let name = entry.file_name();
             let Some(generation) = name
                 .to_str()
@@ -417,10 +518,15 @@ impl ViewStore {
             else {
                 continue;
             };
-            let keys = manifest_reference_keys(generation, &fs::read(entry.path())?)?;
-            result.insert(generation.to_owned(), keys);
+            sidecars.visit(
+                self.view_dir(),
+                generation,
+                |bytes| manifest_reference_keys(generation, bytes),
+                &mut |keys| visit(generation, keys),
+                &mut free_slots,
+            )?;
         }
-        Ok(result)
+        Ok(())
     }
 
     /// Remove generation files only after checking both durable publication and
@@ -580,7 +686,14 @@ impl ViewStore {
 
     fn has_superseded_artifacts(&self) -> Result<bool> {
         let current = self.pointer_census()?.generation;
-        for entry in generation_directory_entries(self.view_dir(), GENERATION_DIRECTORY_LIMIT)? {
+        let (entries, reached_end) =
+            bounded_directory_entries(self.view_dir(), 0, GENERATION_DIRECTORY_LIMIT)?;
+        if !reached_end {
+            // An oversized directory always needs cleanup, which then works
+            // through it one bounded window at a time.
+            return Ok(true);
+        }
+        for entry in entries {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             let generation = name
@@ -599,6 +712,10 @@ impl ViewStore {
                 .or_else(|| {
                     name.strip_prefix("manifest-")
                         .and_then(|name| name.strip_suffix(".json"))
+                })
+                .or_else(|| {
+                    name.strip_prefix("manifest-")
+                        .and_then(|name| name.strip_suffix(".keys"))
                 })
                 .or_else(|| {
                     name.strip_prefix("trigram-")
@@ -644,9 +761,32 @@ impl ViewStore {
         let mut generations = std::collections::BTreeSet::new();
         let mut derived_owners = std::collections::BTreeSet::new();
         let mut temporaries: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        // A directory over the limit is examined one window per pass, so the
+        // leak it holds can still shrink. Each pass moves the window on.
+        let windows = OVERSIZED_WINDOWS.get_or_init(Default::default);
+        let skip = windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(self.view_dir())
+            .copied()
+            .unwrap_or(0);
+        let (entries, reached_end) = bounded_directory_entries(self.view_dir(), skip, limit)?;
+        let complete = skip == 0 && reached_end;
+        {
+            let mut windows = windows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if complete {
+                windows.remove(self.view_dir());
+            } else {
+                let next = skip.saturating_add(limit);
+                let wrap = reached_end || next >= limit.saturating_mul(MAX_OVERSIZED_WINDOWS);
+                windows.insert(self.view_dir().to_path_buf(), if wrap { 0 } else { next });
+            }
+        }
         // The directory census holds no SQLite connection or lock. A reference
         // created meanwhile bumps the pointer epoch, so every claim then yields.
-        for entry in generation_directory_entries(self.view_dir(), limit)? {
+        for entry in entries {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if let Some(generation) = name
@@ -668,6 +808,10 @@ impl ViewStore {
                         .and_then(|s| s.strip_suffix(".json"))
                 })
                 .or_else(|| {
+                    name.strip_prefix("manifest-")
+                        .and_then(|s| s.strip_suffix(".keys"))
+                })
+                .or_else(|| {
                     name.strip_prefix("trigram-")
                         .and_then(|s| s.strip_suffix(".bin"))
                 })
@@ -686,8 +830,20 @@ impl ViewStore {
             }
         }
         generations.retain(|generation| census.generation.as_deref() != Some(generation));
-        let mut removed = GenerationSweep::default();
+        let mut removed = GenerationSweep {
+            over_limit: !complete,
+            ..Default::default()
+        };
         for generation in generations {
+            // A complete census saw every derived-owner reference. A partial
+            // one cannot rule out an unseen `derived-<other>.ref` naming this
+            // generation, so any generation that could own a shared derived
+            // database keeps it (and its manifest) as if it were referenced.
+            let unproven_owner = !complete
+                && !derived_owners.contains(&generation)
+                && self.could_own_derived(&generation);
+            removed.kept_unproven_owners += usize::from(unproven_owner);
+            let keep_derived = derived_owners.contains(&generation) || unproven_owner;
             let claim = loop {
                 #[cfg(test)]
                 crate::storage_retention::test_hook(self.view_dir(), "generation-claim-wait");
@@ -696,7 +852,7 @@ impl ViewStore {
                         self.claim_generation(
                             &census,
                             &generation,
-                            derived_owners.contains(&generation),
+                            keep_derived,
                             temporaries.get(&generation),
                         )
                     })?
@@ -812,14 +968,25 @@ impl ViewStore {
                 return Ok(());
             }
             let mut paths = Vec::new();
+            let sidecar = self
+                .view_dir()
+                .join(super::reference_sidecar::sidecar_name(generation));
+            // The reference sidecar is listed before its manifest: if the
+            // claim bound stops this pass partway, the manifest may be left
+            // without its sidecar (blob GC then decodes the JSON), but the
+            // sidecar is never left behind its manifest.
             for path in [
                 self.view_dir().join(format!("derived-{generation}.sqlite")),
                 self.view_dir().join(format!("derived-{generation}.ref")),
                 self.trigram_path(generation)?,
+                sidecar.clone(),
                 self.manifest_path(generation)?,
             ] {
                 let sqlite = path.extension().is_some_and(|ext| ext == "sqlite");
-                if keep_derived && (sqlite || path == self.manifest_path(generation)?) {
+                // A kept clone-baseline manifest keeps its sidecar too.
+                if keep_derived
+                    && (sqlite || path == sidecar || path == self.manifest_path(generation)?)
+                {
                     continue;
                 }
                 let suffixes = if sqlite {
@@ -958,6 +1125,12 @@ impl ViewStore {
             Ok(self.view_dir().join(format!("derived-{generation}.sqlite"))),
             Ok(self.view_dir().join(format!("derived-{generation}.ref"))),
             self.trigram_path(generation),
+            // Before the manifest, so an interrupted removal never leaves a
+            // sidecar naming a generation whose manifest is gone.
+            super::validate_generation(generation).map(|()| {
+                self.view_dir()
+                    .join(super::reference_sidecar::sidecar_name(generation))
+            }),
             self.manifest_path(generation),
         ]
         .into_iter()
@@ -966,13 +1139,14 @@ impl ViewStore {
             if keep_derived
                 && (path
                     .extension()
-                    .is_some_and(|extension| extension == "sqlite")
+                    .is_some_and(|extension| extension == "sqlite" || extension == "keys")
                     || self
                         .manifest_path(generation)
                         .is_ok_and(|manifest| path == manifest))
             {
                 // The referenced database's manifest is the incremental clone
                 // baseline. Its trigram is not referenced and can be reclaimed.
+                // The manifest's reference sidecar stays with the manifest.
                 continue;
             }
             let suffixes = if path
@@ -1002,6 +1176,7 @@ impl ViewStore {
         GenerationSweep {
             removed_generations: usize::from(removed),
             removed_bytes,
+            ..Default::default()
         }
     }
 }
@@ -2111,15 +2286,22 @@ mod tests {
         assert_eq!(crate::views::take_manifest_decodes(), 0);
     }
 
+    /// An incomplete census cannot see every derived-owner reference, so it
+    /// must never delete a database another generation could share. (It may
+    /// still retire files it can prove unshared; see the oversized test.)
     #[test]
-    fn generation_scan_refuses_an_incomplete_census_before_unlink() {
+    fn generation_scan_with_an_incomplete_census_keeps_possible_derived_owners() {
         let storage = tempfile::tempdir().unwrap();
         let view = ViewStore::open(storage.path(), "incomplete-census").unwrap();
-        let artifact = view.trigram_path("unpublished").unwrap();
-        fs::write(&artifact, []).unwrap();
+        let database = view.view_dir().join("derived-unpublished.sqlite");
+        fs::write(&database, []).unwrap();
         fs::write(view.view_dir().join("another-entry"), []).unwrap();
-        assert!(view.sweep_generations_bounded(None, 1).is_err());
-        assert!(artifact.exists());
+        // Every window of one entry, over several laps.
+        for _ in 0..12 {
+            let removed = view.sweep_generations_bounded(None, 1).unwrap();
+            assert!(removed.over_limit);
+        }
+        assert!(database.exists());
     }
 
     #[test]
@@ -3020,4 +3202,419 @@ mod storage_retention_tests {
         assert_eq!(view.sweep_generations().unwrap(), 1);
         assert!(!path.exists());
     }
+
+    type KeyMap = std::collections::BTreeMap<String, Vec<[u8; 32]>>;
+
+    /// A sidecar policy that trusts files immediately, so a test can replace a
+    /// manifest within the same second and still exercise sidecar reads.
+    fn eager_sidecars() -> super::super::reference_sidecar::ReferenceSidecars {
+        super::super::reference_sidecar::ReferenceSidecars::new(Duration::ZERO)
+    }
+
+    fn sidecar_scan(
+        view: &ViewStore,
+        sidecars: &super::super::reference_sidecar::ReferenceSidecars,
+    ) -> KeyMap {
+        let mut result = KeyMap::new();
+        view.visit_blob_references(sidecars, &mut || Ok(()), &mut |generation, keys| {
+            let mut all = vec![[0_u8; 32]; keys.len()];
+            keys.read(0, &mut all)?;
+            result.insert(generation.to_owned(), all);
+            Ok(())
+        })
+        .unwrap();
+        result
+    }
+
+    /// The reference implementation: read and decode every manifest.
+    fn uncached_scan(view: &ViewStore) -> KeyMap {
+        let mut result = KeyMap::new();
+        for entry in fs::read_dir(view.view_dir()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            let Some(generation) = name
+                .strip_prefix("manifest-")
+                .and_then(|name| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let keys = manifest_reference_keys(generation, &fs::read(entry.path()).unwrap())
+                .unwrap()
+                .into_iter()
+                .collect();
+            result.insert(generation.to_owned(), keys);
+        }
+        result
+    }
+
+    fn source(
+        view: &ViewStore,
+        sidecars: &super::super::reference_sidecar::ReferenceSidecars,
+        generation: &str,
+    ) -> super::super::reference_sidecar::KeySource {
+        sidecars
+            .visit(
+                view.view_dir(),
+                generation,
+                |bytes| manifest_reference_keys(generation, bytes),
+                &mut |_| Ok(()),
+                &mut sidecars.scan_slots(fs::read_dir(view.view_dir()).unwrap().count()),
+            )
+            .unwrap()
+    }
+
+    /// Three entries with full-length keys: every manifest written here has
+    /// the same byte length, so only file identity can tell versions apart.
+    fn fixed_size_manifest(keys: [[u8; 32]; 3]) -> Vec<u8> {
+        let hex =
+            |key: [u8; 32]| -> String { key.iter().map(|byte| format!("{byte:02x}")).collect() };
+        crate::views::Manifest::new(["a.rs", "b.rs", "c.rs"].into_iter().zip(keys).map(
+            |(path, key)| {
+                (
+                    crate::views::RelPath::new(path.as_bytes().to_vec()).unwrap(),
+                    crate::views::ManifestEntry::Regular {
+                        mode: 0o100644,
+                        resolution_input: false,
+                        planes: crate::views::RegularPlanes {
+                            semantic: None,
+                            callgraph: Some(hex(key)),
+                        },
+                    },
+                )
+            },
+        ))
+        .unwrap()
+        .to_json_bytes()
+        .unwrap()
+    }
+
+    /// Replace through a rename, as an atomic writer would: the new file gets
+    /// a new inode while the old one still exists.
+    fn replace_manifest(view: &ViewStore, generation: &str, bytes: &[u8]) {
+        let staging = view.view_dir().join("staging.tmp");
+        fs::write(&staging, bytes).unwrap();
+        fs::rename(&staging, view.manifest_path(generation).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn reference_sidecar_follows_a_replaced_manifest_and_leaves_with_a_deleted_one() {
+        use super::super::reference_sidecar::KeySource;
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "reference-sidecar-replace").unwrap();
+        let sidecars = eager_sidecars();
+        replace_manifest(
+            &view,
+            "g",
+            &fixed_size_manifest([[1; 32], [2; 32], [3; 32]]),
+        );
+        assert_eq!(
+            source(&view, &sidecars, "g"),
+            KeySource::Decoded { written: true }
+        );
+        assert_eq!(source(&view, &sidecars, "g"), KeySource::Sidecar);
+        assert_eq!(
+            sidecar_scan(&view, &sidecars)["g"],
+            [[1; 32], [2; 32], [3; 32]]
+        );
+
+        replace_manifest(
+            &view,
+            "g",
+            &fixed_size_manifest([[4; 32], [5; 32], [6; 32]]),
+        );
+        assert_eq!(
+            sidecar_scan(&view, &sidecars)["g"],
+            [[4; 32], [5; 32], [6; 32]]
+        );
+        assert_eq!(source(&view, &sidecars, "g"), KeySource::Sidecar);
+
+        // A sidecar whose manifest is gone names no generation, and the
+        // generation sweep removes it with the rest of that generation.
+        let sidecar = view.view_dir().join("manifest-g.keys");
+        assert!(sidecar.is_file());
+        fs::remove_file(view.manifest_path("g").unwrap()).unwrap();
+        assert!(sidecar_scan(&view, &sidecars).is_empty());
+        assert!(view.has_superseded_artifacts().unwrap());
+        assert_eq!(view.sweep_generations().unwrap(), 1);
+        assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn reference_sidecar_scan_matches_uncached_decode_across_random_generation_churn() {
+        use super::super::reference_sidecar::KeySource;
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "reference-sidecar-churn").unwrap();
+        let sidecars = eager_sidecars();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut live: Vec<String> = Vec::new();
+        for round in 0..200 {
+            // Keys come from a small alphabet so generations often share sets.
+            let mut key = || [(next() % 6) as u8; 32];
+            let bytes = fixed_size_manifest([key(), key(), key()]);
+            match next() % 4 {
+                0 | 1 if live.len() < 8 => {
+                    let generation = format!("gen-{round}");
+                    replace_manifest(&view, &generation, &bytes);
+                    live.push(generation);
+                }
+                2 if !live.is_empty() => {
+                    let generation = live[next() as usize % live.len()].clone();
+                    replace_manifest(&view, &generation, &bytes);
+                }
+                _ if !live.is_empty() => {
+                    let generation = live.swap_remove(next() as usize % live.len());
+                    fs::remove_file(view.manifest_path(&generation).unwrap()).unwrap();
+                }
+                _ => {}
+            }
+            let expected = uncached_scan(&view);
+            assert_eq!(sidecar_scan(&view, &sidecars), expected, "round {round}");
+            // Every manifest now has a sidecar that the next scan reads.
+            for generation in expected.keys() {
+                assert_eq!(
+                    source(&view, &sidecars, generation),
+                    KeySource::Sidecar,
+                    "round {round} {generation}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reference_sidecar_is_not_written_into_a_directory_at_the_limit_and_cleanup_proceeds() {
+        use super::super::reference_sidecar::{KeySource, ReferenceSidecars};
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "reference-sidecar-at-limit").unwrap();
+        // A superseded generation for cleanup, and the one blob GC visits.
+        replace_manifest(&view, "old", &fixed_size_manifest([[1; 32]; 3]));
+        fs::write(view.trigram_path("old").unwrap(), b"trigram").unwrap();
+        replace_manifest(&view, "g", &fixed_size_manifest([[2; 32]; 3]));
+        let limit = 32;
+        let entries = || fs::read_dir(view.view_dir()).unwrap().count();
+        let mut filler = 0;
+        while entries() < limit - 1 {
+            fs::write(view.view_dir().join(format!("filler-{filler}")), b"").unwrap();
+            filler += 1;
+        }
+        let sidecars = ReferenceSidecars::with_directory_limit(Duration::ZERO, limit);
+        let sidecar = view.view_dir().join("manifest-g.keys");
+        // One slot left, but a write needs two (its temporary and the sidecar):
+        // the keys are still derived, and the directory stays within the limit.
+        assert_eq!(
+            source(&view, &sidecars, "g"),
+            KeySource::Decoded { written: false }
+        );
+        assert!(!sidecar.exists());
+        assert_eq!(entries(), limit - 1);
+        let removed = view.sweep_generations_bounded(None, limit).unwrap();
+        assert!(!removed.over_limit);
+        assert!(!view.manifest_path("old").unwrap().exists());
+        assert!(!view.trigram_path("old").unwrap().exists());
+        // With room for both, the sidecar is written as usual.
+        replace_manifest(&view, "g", &fixed_size_manifest([[2; 32]; 3]));
+        while entries() > limit - 2 {
+            filler -= 1;
+            fs::remove_file(view.view_dir().join(format!("filler-{filler}"))).unwrap();
+        }
+        assert_eq!(
+            source(&view, &sidecars, "g"),
+            KeySource::Decoded { written: true }
+        );
+        assert!(sidecar.is_file());
+    }
+
+    #[test]
+    fn cleanup_of_an_oversized_directory_removes_unshared_generations_and_keeps_shared_ones() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "oversized-generation-cleanup").unwrap();
+        let dir = view.view_dir().to_path_buf();
+        let manifest = |generation: &str| {
+            replace_manifest(&view, generation, &fixed_size_manifest([[3; 32]; 3]));
+            fs::write(view.trigram_path(generation).unwrap(), b"trigram").unwrap();
+        };
+        let mut markers = Vec::new();
+        for index in 0..4 {
+            // An owner of a derived database, shared by a generation a reader
+            // still holds. The reader's reference may sit outside the window
+            // a pass examines.
+            let owner = format!("owner-{index}");
+            manifest(&owner);
+            fs::write(dir.join(format!("derived-{owner}.sqlite")), b"database").unwrap();
+            let reader = format!("reader-{index}");
+            manifest(&reader);
+            fs::write(dir.join(format!("derived-{reader}.ref")), &owner).unwrap();
+            markers.push(crate::root_cache::ReadMarker::create(&dir, &reader).unwrap());
+        }
+        for index in 0..6 {
+            // Reusers own nothing; plain generations have no database at all.
+            let reuser = format!("reuser-{index}");
+            manifest(&reuser);
+            fs::write(dir.join(format!("derived-{reuser}.ref")), "gone").unwrap();
+            manifest(&format!("plain-{index}"));
+        }
+        for index in 0..10 {
+            fs::write(dir.join(format!("filler-{index}")), b"").unwrap();
+        }
+        let limit = 8;
+        assert!(fs::read_dir(&dir).unwrap().count() > limit * 4);
+        assert!(view.has_superseded_artifacts().unwrap());
+        let unshared_left = || {
+            fs::read_dir(&dir).unwrap().any(|entry| {
+                let name = entry.unwrap().file_name().into_string().unwrap();
+                name.contains("reuser-") || name.contains("plain-")
+            })
+        };
+        let mut kept_unproven = 0;
+        let mut passes = 0;
+        while unshared_left() {
+            passes += 1;
+            assert!(passes <= 200, "oversized cleanup made no progress");
+            let removed = view.sweep_generations_bounded(None, limit).unwrap();
+            assert!(removed.over_limit);
+            kept_unproven += removed.kept_unproven_owners;
+        }
+        assert!(
+            kept_unproven > 0,
+            "partial passes never reported unproven owners"
+        );
+        for index in 0..4 {
+            let owner = format!("owner-{index}");
+            let reader = format!("reader-{index}");
+            assert!(
+                dir.join(format!("derived-{owner}.sqlite")).is_file(),
+                "{owner}"
+            );
+            assert!(view.manifest_path(&owner).unwrap().is_file(), "{owner}");
+            assert!(
+                dir.join(format!("derived-{reader}.ref")).is_file(),
+                "{reader}"
+            );
+            assert!(view.manifest_path(&reader).unwrap().is_file(), "{reader}");
+            assert!(view.trigram_path(&reader).unwrap().is_file(), "{reader}");
+        }
+        drop(markers);
+    }
+
+    fn sidecar_count(view: &ViewStore) -> usize {
+        fs::read_dir(view.view_dir())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".keys")
+            })
+            .count()
+    }
+
+    fn blob_scan(
+        view: &ViewStore,
+        sidecars: &super::super::reference_sidecar::ReferenceSidecars,
+    ) -> usize {
+        let mut visited = 0;
+        view.visit_blob_references(sidecars, &mut || Ok(()), &mut |_, _| {
+            visited += 1;
+            Ok(())
+        })
+        .unwrap();
+        visited
+    }
+
+    #[test]
+    fn reference_scan_lists_each_view_directory_once_per_pass() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "reference-scan-one-listing").unwrap();
+        for index in 0..6_u8 {
+            replace_manifest(
+                &view,
+                &format!("g{index}"),
+                &fixed_size_manifest([[index; 32]; 3]),
+            );
+        }
+        let sidecars = eager_sidecars();
+        take_directory_listings(view.view_dir());
+        // Six sidecars written in one pass, from one listing.
+        assert_eq!(blob_scan(&view, &sidecars), 6);
+        assert_eq!(sidecar_count(&view), 6);
+        assert_eq!(take_directory_listings(view.view_dir()), 1);
+        // Six sidecars read in the next pass, again from one listing.
+        assert_eq!(blob_scan(&view, &sidecars), 6);
+        assert_eq!(take_directory_listings(view.view_dir()), 1);
+    }
+
+    #[test]
+    fn reference_scan_near_the_limit_writes_what_fits_and_skips_the_rest_without_rescanning() {
+        use super::super::reference_sidecar::ReferenceSidecars;
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "reference-scan-near-limit").unwrap();
+        for index in 0..6_u8 {
+            replace_manifest(
+                &view,
+                &format!("g{index}"),
+                &fixed_size_manifest([[index; 32]; 3]),
+            );
+        }
+        let limit = 40;
+        let entries = || fs::read_dir(view.view_dir()).unwrap().count();
+        let mut filler = 0;
+        while entries() < limit - 3 {
+            fs::write(view.view_dir().join(format!("filler-{filler}")), b"").unwrap();
+            filler += 1;
+        }
+        let sidecars = ReferenceSidecars::with_directory_limit(Duration::ZERO, limit);
+        take_directory_listings(view.view_dir());
+        // Three free slots: each new sidecar briefly needs two (its temporary
+        // file and itself) and keeps one, so two fit and four are skipped.
+        assert_eq!(blob_scan(&view, &sidecars), 6);
+        assert_eq!(sidecar_count(&view), 2);
+        assert_eq!(entries(), limit - 1);
+        assert_eq!(take_directory_listings(view.view_dir()), 1);
+        // One slot left is not enough for another; nothing is rescanned.
+        assert_eq!(blob_scan(&view, &sidecars), 6);
+        assert_eq!(sidecar_count(&view), 2);
+        assert_eq!(take_directory_listings(view.view_dir()), 1);
+    }
+
+    #[test]
+    fn reference_scan_checks_its_deadline_before_every_manifest() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "reference-sidecar-deadline").unwrap();
+        for generation in ["a", "b", "c"] {
+            replace_manifest(&view, generation, &fixed_size_manifest([[7; 32]; 3]));
+        }
+        let sidecars = eager_sidecars();
+        let mut calls = 0;
+        let result = view.visit_blob_references(
+            &sidecars,
+            &mut || {
+                calls += 1;
+                if calls == 2 {
+                    Err(std::io::Error::other("deadline"))
+                } else {
+                    Ok(())
+                }
+            },
+            &mut |_, _| Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
+    }
+}
+
+/// Decode a manifest's reference keys straight from its JSON, for tests that
+/// compare sidecars against the reference implementation.
+#[cfg(test)]
+pub(crate) fn decode_reference_keys_for_test(
+    generation: &str,
+    bytes: &[u8],
+) -> Result<std::collections::BTreeSet<[u8; 32]>> {
+    manifest_reference_keys(generation, bytes)
 }

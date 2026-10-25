@@ -680,9 +680,15 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "views/generation.rs",
-        enclosing_item: "generation_directory_entries, blob_references_by_generation, generation_sweep_registry, has_superseded_artifacts, sweep_generations_bounded, claim_generation, reap_generation_trash, remove_generation_files",
-        location_or_primitive: "take(limit.saturating_add(1)), take(GENERATION_DIRECTORY_LIMIT), MAX_CLAIM_FILES atomic retirement batch",
-        reason: "internal generation/protection enumeration; ownership or blob-mark overflow aborts before deletion, while an incomplete temporary-file deletion pass only leaves garbage for a later pass",
+        enclosing_item: "generation_directory_entries, bounded_directory_entries, blob_references_by_generation, generation_sweep_registry, has_superseded_artifacts, sweep_generations_bounded, claim_generation, reap_generation_trash, remove_generation_files",
+        location_or_primitive: "take(limit.saturating_add(1)), truncate(limit), take(GENERATION_DIRECTORY_LIMIT), MAX_CLAIM_FILES atomic retirement batch",
+        reason: "internal generation/protection enumeration; ownership or blob-mark overflow aborts before deletion, an oversized directory is cleaned one bounded window per pass that keeps any generation whose derived-owner reference it cannot see, and an incomplete temporary-file deletion pass only leaves garbage for a later pass",
+    },
+    ExclusionEntry {
+        file: "views/reference_sidecar.rs",
+        enclosing_item: "free_slots",
+        location_or_primitive: "take(limit.saturating_add(1))",
+        reason: "internal count of view-directory entries, taken once per blob scan or publication, that bounds how many reference sidecars may be added; counting stops just past the limit because only the free slots below it matter, and a skipped sidecar only means blob GC decodes that manifest",
     },
     ExclusionEntry {
         file: "gc/mod.rs",
