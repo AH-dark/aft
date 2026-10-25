@@ -1,0 +1,1 @@
+- Slow tool-call logs now pair each phase's wall time with thread CPU time, showing `cpu=?` when async waits or thread handoffs prevent reliable attribution.

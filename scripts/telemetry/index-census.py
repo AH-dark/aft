@@ -57,7 +57,9 @@ SEMANTIC_EMBED_RE = re.compile(r"semantic index build: embedding backend unavail
 SEARCH_BUILD_RE = re.compile(r"search index cold streaming build: (?P<files>\d+) files, (?P<trigrams>\d+) trigrams, (?P<ms>\d+) ms \(pool=(?P<pool>\d+)\)")
 # Exact sample: 2026-09-02T04:36:31Z [aft] [ses_13ae8f525ffeCnx9aTNmVDRBdR] slow tool_call name=bash_drain_completions channel=31 corr=14 total=5670ms queue=0 translate=0 exec=5670 format=0 finalize=0 egress=0 egress_enqueue=0 egress_queue=0 egress_prepare=0 egress_write=0 frame_bytes=285 writer_queue_depth=1 writer_active=false writer_queue_full=false reserve_timeouts=0 root=/Users/ufukaltinok/Work/OSS/pi-mono
 # The daemon added `session=` after `name=`; older logs lack it, so it is optional.
-SLOW_TOOL_RE = re.compile(r"slow tool_call name=(?P<tool>\S+)(?: session=\S*)? channel=\d+ corr=\d+ total=(?P<total>\d+)ms queue=(?P<queue>\d+) .*?\broot=(?P<root>\S+)")
+# New phase fields pair fractional wall milliseconds with CPU, e.g.
+# queue=300.123ms/cpu=?; also accept the older integer queue=<ms> form.
+SLOW_TOOL_RE = re.compile(r"slow tool_call name=(?P<tool>\S+)(?: session=\S*)? channel=\d+ corr=\d+ total=(?P<total>\d+)ms queue=(?P<queue>\d+)(?:\.\d+ms/cpu=(?:\?|\d+(?:\.\d+)?ms))? .*?\broot=(?P<root>\S+)")
 SLOW_WAITING_ON_RE = re.compile(r"\bwaiting_on=(?P<waiting_on>\S+)")
 # Causal waiting is a gate metric only for calls long enough to affect users.
 SLOW_WAITING_THRESHOLD_MS = 2_000
