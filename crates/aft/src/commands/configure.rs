@@ -7427,19 +7427,50 @@ pub(crate) fn open_database_runtime(
     }
 }
 
-fn replay_configure_session(ctx: &AppContext, job: &ConfigureMaintenanceJob) {
+fn claim_configure_replay_batch<'a>(
+    ctx: &'a AppContext,
+    job: &ConfigureMaintenanceJob,
+) -> Result<crate::bash_background::registry::ProjectReplayBatch<'a>, ConfigureMaintenanceUnitResult>
+{
+    wait_on_configure_replay_gate_for_test(&job.canonical_cache_root, "replay_claim");
+    // Admit exactly one replay call, not the remaining cursor. Disk scans,
+    // legacy repair and recovery must never hold up the unbind transition.
+    match ctx.run_if_subc_bound_generation(job.generation, || {
+        ctx.bash_background().claim_project_replay_batch()
+    }) {
+        Some(Some(batch)) => {
+            wait_on_configure_replay_gate_for_test(&job.canonical_cache_root, "replay_claimed");
+            Ok(batch)
+        }
+        Some(None) => Err(ConfigureMaintenanceUnitResult::Continue),
+        None if ctx.subc_unbound_quiesced() => Err(ConfigureMaintenanceUnitResult::CancelAll),
+        None => {
+            forget_configure_job_binding(ctx, job);
+            Err(ConfigureMaintenanceUnitResult::Complete)
+        }
+    }
+}
+
+fn replay_configure_session(
+    ctx: &AppContext,
+    job: &ConfigureMaintenanceJob,
+) -> Result<(), ConfigureMaintenanceUnitResult> {
+    let batch = claim_configure_replay_batch(ctx, job)?;
     replay_configure_session_parts(
         ctx,
+        batch,
         &job.storage_root,
         job.harness.clone(),
         &job.harness_dir,
         &job.session_id,
         &job.root_path,
     );
+    Ok(())
 }
 
 fn replay_configure_session_parts(
     ctx: &AppContext,
+    batch: crate::bash_background::registry::ProjectReplayBatch<'_>,
     storage_root: &Path,
     harness: Harness,
     harness_dir: &Path,
@@ -7456,10 +7487,7 @@ fn replay_configure_session_parts(
         ));
     #[cfg(test)]
     CONFIGURE_REPLAY_SESSION_CALLS.fetch_add(1, Ordering::SeqCst);
-    if let Err(error) =
-        ctx.bash_background()
-            .replay_session_for_project(harness_dir, session_id, root_path)
-    {
+    if let Err(error) = batch.replay_session_for_project(harness_dir, session_id, root_path) {
         slog_warn!("failed to replay background bash tasks: {error}");
     }
 }
@@ -8221,6 +8249,14 @@ fn wait_on_configure_tail_gate_for_test(root: &Path, label: &str, test_release_o
 #[cfg(not(test))]
 fn wait_on_configure_tail_stage_gate_for_test(_root: &Path, _stage: ConfigureMaintenanceStage) {}
 
+#[cfg(test)]
+fn wait_on_configure_replay_gate_for_test(root: &Path, label: &str) {
+    wait_on_configure_tail_gate_for_test(root, label, false);
+}
+
+#[cfg(not(test))]
+fn wait_on_configure_replay_gate_for_test(_root: &Path, _label: &str) {}
+
 /// One finished configure-tail unit, as recorded for tests: the job's root and
 /// generation, the stage that ran, and when it finished.
 #[cfg(test)]
@@ -8311,7 +8347,9 @@ fn run_configure_maintenance_unit_inner(
                     forget_configure_job_binding(ctx, job);
                     return ConfigureMaintenanceUnitResult::Complete;
                 }
-                replay_configure_session(ctx, job);
+                if let Err(result) = replay_configure_session(ctx, job) {
+                    return result;
+                }
                 if ctx
                     .bash_background()
                     .project_replay_pending(&job.harness_dir, &job.root_path)
@@ -8394,7 +8432,9 @@ fn run_configure_maintenance_unit_inner(
         }
         ConfigureMaintenanceStage::SessionReplay => {
             if job.run_bash_replay {
-                replay_configure_session(ctx, job);
+                if let Err(result) = replay_configure_session(ctx, job) {
+                    return result;
+                }
             }
             continuation.stage = ConfigureMaintenanceStage::BashRuntime;
         }
@@ -8624,8 +8664,12 @@ fn run_configure_maintenance_unit_inner(
         ConfigureMaintenanceStage::Status => {
             // The cursor belongs to the root, not one configure generation.
             // A newer tail also finishes a scan started by a superseded tail.
+            let batch = match claim_configure_replay_batch(ctx, job) {
+                Ok(batch) => batch,
+                Err(result) => return result,
+            };
             let retry_due_failures = continuation.replay_retry_at.take().is_some();
-            match ctx.bash_background().continue_project_replay(
+            match batch.continue_project_replay(
                 &job.harness_dir,
                 &job.session_id,
                 &job.root_path,
@@ -10058,6 +10102,168 @@ mod tests {
             state.jobs.is_empty(),
             "unbound maintenance must be cancelled"
         );
+    }
+
+    fn assert_replay_racing_unbind_is_rejected(stage: ConfigureMaintenanceStage) {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, ctx, mut state, task_ids) = bash_background_replay_fixture(40, Some(8));
+        let continuation = state.jobs.front_mut().unwrap();
+        continuation.stage = stage;
+        if stage == ConfigureMaintenanceStage::Admission {
+            // Exercise the equivalent-bind shortcut, which replays a new
+            // session without running the root's other configure stages.
+            let job = &mut continuation.job;
+            job.configure_database_runtime = false;
+            job.format_tool_cache_clear_needed = false;
+            job.refresh_project_runtime = false;
+            job.sync_bash_compress_flag = false;
+            job.reset_filter_registry = false;
+            job.clear_failed_spawns = false;
+            job.warm_callgraph_store = false;
+            job.search_artifact_load_start = None;
+            job.semantic_artifact_load_start = None;
+        }
+        assert!(continuation.job.run_bash_replay);
+        let registry = ctx.bash_background();
+        let before = registry.project_replay_scan_total_examined_for_test();
+        assert!(before.is_some_and(|examined| examined > 0));
+        let recovered_before = task_ids
+            .iter()
+            .filter(|id| registry.task_for_test(id).is_some())
+            .count();
+        assert!(recovered_before < task_ids.len());
+        let (_gate, reached, release) =
+            super::gate_configure_tail_stage_for_test(ctx.canonical_cache_root(), "replay_claim");
+        let ctx_ref = &*ctx;
+        let state = std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                super::drain_deferred_configure_maintenance_unit(ctx_ref, &mut state);
+                state
+            });
+            reached.recv_timeout(Duration::from_secs(10)).unwrap();
+            // The drain already passed its quiescence check. Finish the
+            // unbind before allowing the replay call to claim any work.
+            ctx.mark_subc_unbound();
+            release.send(()).unwrap();
+            worker.join().unwrap()
+        });
+        assert_eq!(
+            registry.project_replay_scan_total_examined_for_test(),
+            before,
+            "replay scanned after unbind won the admission race at {stage:?}"
+        );
+        assert_eq!(
+            task_ids
+                .iter()
+                .filter(|id| registry.task_for_test(id).is_some())
+                .count(),
+            recovered_before,
+            "unadmitted replay recovered another task"
+        );
+        assert!(
+            state.jobs.is_empty(),
+            "unbound maintenance must be cancelled"
+        );
+    }
+
+    #[test]
+    fn bash_background_replay_racing_unbind_rejects_session_only_batch() {
+        assert_replay_racing_unbind_is_rejected(ConfigureMaintenanceStage::Admission);
+    }
+
+    #[test]
+    fn bash_background_replay_racing_unbind_rejects_initial_batch() {
+        assert_replay_racing_unbind_is_rejected(ConfigureMaintenanceStage::SessionReplay);
+    }
+
+    #[test]
+    fn bash_background_replay_racing_unbind_rejects_continuation_batch() {
+        assert_replay_racing_unbind_is_rejected(ConfigureMaintenanceStage::Status);
+    }
+
+    fn assert_admitted_replay_finishes_after_unbind(stage: ConfigureMaintenanceStage) {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, ctx, mut state, _task_ids) = bash_background_replay_fixture(40, Some(8));
+        state.jobs.front_mut().unwrap().stage = stage;
+        let registry = ctx.bash_background();
+        let before = registry
+            .project_replay_scan_total_examined_for_test()
+            .unwrap();
+        let (gate, reached, release) =
+            super::gate_configure_tail_stage_for_test(ctx.canonical_cache_root(), "replay_claimed");
+        let ctx_ref = &*ctx;
+        let (mut state, unbound) = std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                super::drain_deferred_configure_maintenance_unit(ctx_ref, &mut state);
+                state
+            });
+            reached.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(
+                registry.claim_project_replay_batch().is_none(),
+                "the admitted batch must own the registry's replay reservation"
+            );
+            let (unbound_tx, unbound_rx) = mpsc::channel();
+            scope.spawn(move || {
+                ctx_ref.mark_subc_unbound();
+                unbound_tx.send(()).unwrap();
+            });
+            // Unbind must finish while disk/recovery work is still held. Release
+            // the worker even on timeout so a bad lock boundary fails, not hangs.
+            let unbound = unbound_rx.recv_timeout(Duration::from_secs(10));
+            release.send(()).unwrap();
+            (worker.join().unwrap(), unbound)
+        });
+        drop(gate);
+        unbound.expect("replay disk work held the lifecycle mutex");
+        let after = registry
+            .project_replay_scan_total_examined_for_test()
+            .unwrap();
+        assert!(after > before, "an already admitted batch may finish");
+        assert!(after <= before + 8, "only one bounded scan was admitted");
+        assert!(registry.claim_project_replay_batch().is_some());
+        assert!(!super::drain_deferred_configure_maintenance_unit(
+            &ctx, &mut state
+        ));
+        assert_eq!(
+            registry.project_replay_scan_total_examined_for_test(),
+            Some(after),
+            "the next batch needs fresh lifecycle admission"
+        );
+    }
+
+    #[test]
+    fn bash_background_admitted_initial_replay_finishes_without_blocking_unbind() {
+        assert_admitted_replay_finishes_after_unbind(ConfigureMaintenanceStage::SessionReplay);
+    }
+
+    #[test]
+    fn bash_background_admitted_continuation_replay_finishes_without_blocking_unbind() {
+        assert_admitted_replay_finishes_after_unbind(ConfigureMaintenanceStage::Status);
+    }
+
+    #[test]
+    fn bash_background_replay_busy_claim_yields_without_scanning() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, ctx, mut state, _task_ids) = bash_background_replay_fixture(40, Some(8));
+        let registry = ctx.bash_background();
+        let before = registry.project_replay_scan_total_examined_for_test();
+        let batch = registry.claim_project_replay_batch().unwrap();
+        assert!(super::drain_deferred_configure_maintenance_unit(
+            &ctx, &mut state
+        ));
+        assert_eq!(
+            registry.project_replay_scan_total_examined_for_test(),
+            before
+        );
+        assert_eq!(
+            state.jobs.front().unwrap().stage,
+            ConfigureMaintenanceStage::Status
+        );
+        drop(batch);
+        assert!(super::drain_deferred_configure_maintenance_unit(
+            &ctx, &mut state
+        ));
+        assert!(registry.project_replay_scan_total_examined_for_test() > before);
     }
 
     fn identical_bind_repairs_evicted_artifact_beside_reader(early_fast_path: bool) {

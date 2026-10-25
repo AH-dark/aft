@@ -938,6 +938,48 @@ pub struct BgTaskRegistry {
     pub(crate) inner: Arc<RegistryInner>,
 }
 
+/// Reserves one configure replay call, including at most one bounded disk scan.
+/// Claim under lifecycle admission, then consume outside the lifecycle lock.
+pub(crate) struct ProjectReplayBatch<'a> {
+    registry: &'a BgTaskRegistry,
+}
+
+impl ProjectReplayBatch<'_> {
+    pub(crate) fn replay_session_for_project(
+        self,
+        storage_dir: &Path,
+        session_id: &str,
+        project_root: &Path,
+    ) -> Result<(), String> {
+        self.registry
+            .replay_session_for_project(storage_dir, session_id, project_root)
+    }
+
+    pub(crate) fn continue_project_replay(
+        self,
+        storage_dir: &Path,
+        session_id: &str,
+        project_root: &Path,
+        retry_due_failures: bool,
+    ) -> Result<bool, String> {
+        self.registry.continue_project_replay(
+            storage_dir,
+            session_id,
+            project_root,
+            retry_due_failures,
+        )
+    }
+}
+
+impl Drop for ProjectReplayBatch<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .inner
+            .project_replay_batch_claimed
+            .store(false, Ordering::Release);
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct ScopeKilledTask {
     pub task_id: String,
@@ -1178,6 +1220,7 @@ pub(crate) struct RegistryInner {
     /// Project replay retains its iterator between bounded maintenance passes
     /// rather than restarting at the first session after every bind.
     project_replay_scan: Mutex<Option<ProjectReplayScanCursor>>,
+    project_replay_batch_claimed: AtomicBool,
     #[cfg(test)]
     project_replay_scan_budget_for_test: Mutex<Option<(usize, Duration)>>,
     /// Output compression callback. Set by `AppContext` after construction.
@@ -1754,6 +1797,7 @@ impl BgTaskRegistry {
                 persisted_gc_thread: Mutex::new(None),
                 session_recovery: Mutex::new(HashMap::new()),
                 project_replay_scan: Mutex::new(None),
+                project_replay_batch_claimed: AtomicBool::new(false),
                 #[cfg(test)]
                 project_replay_scan_budget_for_test: Mutex::new(None),
                 compressor: Mutex::new(None),
@@ -5492,6 +5536,16 @@ impl BgTaskRegistry {
         project_root: &Path,
     ) -> Result<(), String> {
         self.replay_session_inner(storage_dir, session_id, Some(project_root))
+    }
+
+    /// Reserve in memory without scanning or waiting for an earlier replay
+    /// batch while holding lifecycle admission.
+    pub(crate) fn claim_project_replay_batch(&self) -> Option<ProjectReplayBatch<'_>> {
+        self.inner
+            .project_replay_batch_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(ProjectReplayBatch { registry: self })
     }
 
     pub(crate) fn project_replay_pending(&self, storage_dir: &Path, project_root: &Path) -> bool {
