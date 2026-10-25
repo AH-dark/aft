@@ -3902,6 +3902,7 @@ mod graceful_shutdown_search_index_tests {
         assert_eq!(
             restored
                 .grep("new shutdown token", true, &[], &[], &canonical_root, 10)
+                .unwrap()
                 .matches
                 .len(),
             1,
@@ -3910,6 +3911,7 @@ mod graceful_shutdown_search_index_tests {
         assert!(
             restored
                 .grep("old shutdown token", true, &[], &[], &canonical_root, 10)
+                .unwrap()
                 .matches
                 .is_empty(),
             "without the shutdown flush this test goes red because disk still holds the old base"
@@ -3973,6 +3975,7 @@ mod graceful_shutdown_search_index_tests {
                 &canonical_root,
                 10,
             )
+            .unwrap()
             .matches
             .len();
         let old_matches = restored
@@ -3984,6 +3987,7 @@ mod graceful_shutdown_search_index_tests {
                 &canonical_root,
                 10,
             )
+            .unwrap()
             .matches
             .len();
         wait_for_search_index_build_to_finish(ctx);
@@ -5399,6 +5403,7 @@ mod watcher_filter_tests {
             );
             search_index
                 .grep("switchedFile0", true, &[], &[], &root, 10)
+                .unwrap()
                 .matches
                 .len()
         };

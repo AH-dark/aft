@@ -281,6 +281,9 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             (result, phases, Vec::new())
         }
     };
+    if result.index_sources_unavailable {
+        return Response::error(&req.id, "internal_error", result.index_read_gaps.join("; "));
+    }
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
     let scope_probe_started = std::time::Instant::now();
     let scope_presence = phases
@@ -332,7 +335,8 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             && (scope_has_files || empty_counts.is_some())
             && !result.scan_deadline_reached
             && result.skipped_foreign_mounts == 0
-            && result.missing_on_disk == 0,
+            && result.missing_on_disk == 0
+            && result.index_read_gaps.is_empty(),
         "no_files_matched_scope": !scope_has_files,
         "skipped_foreign_mounts": result.skipped_foreign_mounts,
         "matches": output.page.iter().map(|m| match_to_json(m)).collect::<Vec<_>>(),
@@ -356,6 +360,13 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         "truncated": result.truncated,
         "search_ms": (search_ms * 1000.0).round() / 1000.0,
     });
+    if !result.index_read_gaps.is_empty() {
+        body["index_read_gap"] = serde_json::json!(result.index_read_gaps);
+        if let Some(text) = body["text"].as_str() {
+            body["text"] =
+                serde_json::json!(format!("{text}\n\n{}", result.index_read_gaps.join("\n")));
+        }
+    }
     if let Some(bound) = result.walk_bound {
         body["walk_stopped_by"] = serde_json::Value::String(
             match bound {
@@ -1723,6 +1734,8 @@ mod tests {
         truncated: bool,
     ) -> GrepResult {
         GrepResult {
+            index_sources_unavailable: false,
+            index_read_gaps: Vec::new(),
             matches,
             total_matches,
             files_searched,
@@ -1908,17 +1921,19 @@ mod tests {
                 .num_threads(threads)
                 .build()
                 .unwrap();
-            let (result, _) = pool.install(|| {
-                snapshot.search_grep_profiled_with_filters_and_query_in_order(
-                    &pattern,
-                    &query,
-                    &filters,
-                    &root,
-                    1000,
-                    None,
-                    GrepScanOrder::Path,
-                )
-            });
+            let (result, _) = pool
+                .install(|| {
+                    snapshot.search_grep_profiled_with_filters_and_query_in_order(
+                        &pattern,
+                        &query,
+                        &filters,
+                        &root,
+                        1000,
+                        None,
+                        GrepScanOrder::Path,
+                    )
+                })
+                .expect("grep over a test index");
             assert!(result.truncated, "{threads} threads, reversed {reversed}");
             let mut kept: Vec<(PathBuf, u32)> = result
                 .matches
@@ -1948,15 +1963,17 @@ mod tests {
         let filters = build_path_filters(&[], &[]).unwrap();
         let max_results = 100_100;
         crate::search_index::path_order_held_rows_for_test::take(&root);
-        let (result, _) = snapshot.search_grep_profiled_with_filters_and_query_in_order(
-            &pattern,
-            &query,
-            &filters,
-            &root,
-            max_results,
-            None,
-            GrepScanOrder::Path,
-        );
+        let (result, _) = snapshot
+            .search_grep_profiled_with_filters_and_query_in_order(
+                &pattern,
+                &query,
+                &filters,
+                &root,
+                max_results,
+                None,
+                GrepScanOrder::Path,
+            )
+            .expect("grep over a test index");
         let peak = crate::search_index::path_order_held_rows_for_test::take(&root);
         assert!(
             peak <= max_results + crate::search_index::PATH_ORDER_BATCH_ROW_BUDGET,
@@ -2435,8 +2452,9 @@ mod tests {
         let pattern = compiled_literal("needle");
 
         for (include, exclude, max_results) in cases {
-            let legacy =
-                snapshot.search_grep(&pattern, &include, &exclude, project.path(), max_results);
+            let legacy = snapshot
+                .search_grep(&pattern, &include, &exclude, project.path(), max_results)
+                .unwrap();
             let filters = build_path_filters(&include, &exclude).expect("valid filters");
             let optimized = snapshot
                 .search_grep_profiled_with_filters(
@@ -2446,6 +2464,7 @@ mod tests {
                     max_results,
                     None,
                 )
+                .unwrap()
                 .0;
             assert_eq!(
                 grep_result_bytes(&optimized, project.path()),
@@ -2483,13 +2502,16 @@ mod tests {
         let legacy_once = || {
             let validated = build_path_filters(&include, &exclude).expect("valid filters");
             std::hint::black_box(&validated);
-            let result = snapshot.search_grep(&pattern, &include, &exclude, &project_root, 100);
+            let result = snapshot
+                .search_grep(&pattern, &include, &exclude, &project_root, 100)
+                .unwrap();
             std::hint::black_box(result.total_matches);
         };
         let optimized_once = || {
             let filters = build_path_filters(&include, &exclude).expect("valid filters");
             let result = snapshot
                 .search_grep_profiled_with_filters(&pattern, &filters, &project_root, 100, None)
+                .unwrap()
                 .0;
             std::hint::black_box(result.total_matches);
         };

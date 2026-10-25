@@ -7807,7 +7807,9 @@ impl SemanticIndex {
             let denom = query_norm * entry.norm;
             let mut score = if denom == 0.0 { 0.0 } else { dot / denom };
             if entry.chunk.exported {
-                score *= 1.1;
+                // Preserve nonnegative weighting; an export bonus must not
+                // lower a negative similarity.
+                score *= if score >= 0.0 { 1.1 } else { 0.9 };
             }
             scored.push((score, i));
         }
@@ -10184,7 +10186,7 @@ fn build_file_summary_chunk_with_lines_and_caps(
                     .map(|stem| stem.to_string_lossy().to_string())
                     .unwrap_or_default()
             ),
-            caps.total_chars,
+            caps.total_chars.min(EmbedTextCaps::default().total_chars),
         ),
         snippet,
     }
@@ -10555,12 +10557,13 @@ fn symbols_to_chunks_with_caps(
             .iter()
             .map(|(_, signature)| *signature)
             .collect::<Vec<_>>();
-        chunks.push(build_file_summary_chunk_with_lines(
+        chunks.push(build_file_summary_chunk_with_lines_and_caps(
             file,
             project_root,
             &line_cache,
             &top_exports,
             &top_export_signatures,
+            caps,
         ));
     }
 
@@ -18155,6 +18158,83 @@ public class Greeter {
     }
 
     #[test]
+    fn audit10_9_summary_honors_smaller_backend_budget_without_reordering_chunks() {
+        let root = PathBuf::from("/project");
+        let file = root.join("src/summary.rs");
+        let source = "//! A long module description for a small configured embedding budget.\npub fn exported() {\n}\n";
+        let mut symbol = make_symbol(SymbolKind::Function, "exported", 1, 2);
+        symbol.exported = true;
+        let default = symbols_to_chunks_with_caps(
+            &file,
+            std::slice::from_ref(&symbol),
+            source,
+            &root,
+            EmbedTextCaps::default(),
+        );
+        let small = symbols_to_chunks_with_caps(
+            &file,
+            std::slice::from_ref(&symbol),
+            source,
+            &root,
+            EmbedTextCaps {
+                total_chars: 40,
+                ..EmbedTextCaps::default()
+            },
+        );
+        assert_eq!(
+            small
+                .iter()
+                .map(|chunk| (&chunk.name, &chunk.kind))
+                .collect::<Vec<_>>(),
+            default
+                .iter()
+                .map(|chunk| (&chunk.name, &chunk.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(small[0].kind, SymbolKind::FileSummary);
+        assert_eq!(small[0].embed_text.chars().count(), 40);
+        assert_eq!(
+            small[0].embed_text,
+            "file:src/summary.rs kind:file-summary na"
+        );
+        let expanded = symbols_to_chunks_with_caps(
+            &file,
+            &[symbol],
+            source,
+            &root,
+            EmbedTextCaps {
+                total_chars: 4000,
+                ..EmbedTextCaps::default()
+            },
+        );
+        assert_eq!(
+            expanded[0].embed_text.as_bytes(),
+            default[0].embed_text.as_bytes()
+        );
+    }
+
+    #[test]
+    fn audit10_9_expanded_budget_keeps_fixed_summary_limit() {
+        let root = Path::new("/project");
+        let file = root.join("summary.rs");
+        let exports = "x".repeat(2000);
+        let lines = SourceLineCache::new("");
+        let summary = build_file_summary_chunk_with_lines_and_caps(
+            &file,
+            root,
+            &lines,
+            &[&exports],
+            &[],
+            EmbedTextCaps {
+                total_chars: 4000,
+                ..EmbedTextCaps::default()
+            },
+        );
+        assert_eq!(summary.embed_text.chars().count(), 1600);
+        assert!(summary.embed_text.ends_with('x'));
+    }
+
+    #[test]
     fn unbounded_chunk_caps_preserve_full_signature_and_body() {
         let project_root = PathBuf::from("/proj");
         let file = project_root.join("long.rs");
@@ -18799,6 +18879,53 @@ mod embedding_backend_retry_status_tests {
             valid.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
             vec![2, 4, 0, 1, 3]
         );
+    }
+
+    #[test]
+    fn audit10_3_positive_export_scores_keep_current_order_and_bits() {
+        let mut index = audit10_vector_index(vec![vec![1.0, 0.0], vec![1.0, 0.0], vec![0.0, 1.0]]);
+        index.entries[0].chunk.exported = true;
+        index.entries[2].chunk.exported = true;
+        let results = index.search(&[1.0, 0.0], 3);
+        assert_eq!(
+            results
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["audit_vector_0", "audit_vector_1", "audit_vector_2"]
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|row| row.score.to_bits())
+                .collect::<Vec<_>>(),
+            vec![0x3f8ccccd, 0x3f800000, 0]
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|row| row.rank_score.to_bits())
+                .collect::<Vec<_>>(),
+            vec![0x3f8ccccd, 0x3f800000, 0]
+        );
+    }
+
+    #[test]
+    fn audit10_3_negative_export_ranks_ahead_of_equal_non_export() {
+        let mut index = audit10_vector_index(vec![vec![-1.0, 0.0], vec![-1.0, 0.0]]);
+        index.entries[0].chunk.exported = true;
+        let results = index.search(&[1.0, 0.0], 2);
+        assert_eq!(
+            results
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["audit_vector_0", "audit_vector_1"]
+        );
+        assert_eq!(results[0].score.to_bits(), 0xbf666666);
+        assert_eq!(results[1].score.to_bits(), 0xbf800000);
+        assert_eq!(results[0].rank_score.to_bits(), 0xbf666666);
+        assert_eq!(results[1].rank_score.to_bits(), 0xbf800000);
     }
 
     #[test]

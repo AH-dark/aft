@@ -221,7 +221,7 @@ pub(crate) fn grep_fan_out(
             .par_iter()
             .map(|snapshot| {
                 let has_files = snapshot.has_file_in_scope_with_filters(search_root, filters);
-                let (result, timings) = snapshot
+                let (result, timings) = match snapshot
                     .search_grep_profiled_with_filters_and_query_in_order_with_row_budget(
                         pattern,
                         &query,
@@ -231,7 +231,13 @@ pub(crate) fn grep_fan_out(
                         params.path_exclusion,
                         order,
                         row_budget,
-                    );
+                    ) {
+                    Ok(result) => result,
+                    Err(error) => (
+                        crate::grep_executor::failed_index_grep(error),
+                        crate::search_index::GrepQueryPhaseTimings::default(),
+                    ),
+                };
                 (has_files, result, timings)
             })
             .collect::<Vec<_>>();
@@ -248,6 +254,8 @@ pub(crate) fn grep_fan_out(
     phases.indexed_scope_has_files = Some(scope_has_files || !gaps.is_empty());
     let result = if results.is_empty() {
         GrepResult {
+            index_sources_unavailable: false,
+            index_read_gaps: Vec::new(),
             matches: Vec::new(),
             total_matches: 0,
             files_searched: 0,

@@ -20766,7 +20766,9 @@ mod tests {
             if count == 0 {
                 continue;
             }
-            let result = index.grep(needle, true, &[], &[], root.path(), count + 1);
+            let result = index
+                .grep(needle, true, &[], &[], root.path(), count + 1)
+                .expect("grep over a test index");
             let found: std::collections::BTreeSet<_> = result
                 .matches
                 .iter()

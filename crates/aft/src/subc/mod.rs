@@ -14891,6 +14891,7 @@ mod tests {
         assert_eq!(
             restored1
                 .grep("new actor one token", true, &[], &[], &canonical_root1, 10)
+                .unwrap()
                 .matches
                 .len(),
             1,
@@ -14904,6 +14905,7 @@ mod tests {
         assert_eq!(
             restored2
                 .grep("new actor two token", true, &[], &[], &canonical_root2, 10)
+                .unwrap()
                 .matches
                 .len(),
             1,
@@ -15305,6 +15307,7 @@ mod tests {
                     &fixture.canonical,
                     10
                 )
+                .unwrap()
                 .matches
                 .len(),
             1,

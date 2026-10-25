@@ -685,10 +685,10 @@ impl SearchIndex {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         max_files: usize,
-    ) -> Vec<(PathBuf, f32)> {
+    ) -> std::io::Result<Vec<(PathBuf, f32)>> {
         self.snapshot()
             .lexical_rank_with_stats(query_trigrams, candidate_filter, max_files)
-            .files
+            .map(|result| result.files)
     }
 
     pub fn is_ready(&self) -> bool {
@@ -701,7 +701,7 @@ impl SearchIndex {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         depth: usize,
-    ) -> LexicalRankResult {
+    ) -> std::io::Result<LexicalRankResult> {
         self.snapshot()
             .lexical_rank_at_depth(query_trigrams, candidate_filter, depth)
     }
@@ -712,7 +712,7 @@ impl SearchIndex {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         depth: usize,
-    ) -> LexicalRankResult {
+    ) -> std::io::Result<LexicalRankResult> {
         self.snapshot()
             .lexical_rank_at_depth(query_trigrams, candidate_filter, depth)
     }
@@ -723,7 +723,7 @@ impl SearchIndex {
         query: &str,
         search_root: &Path,
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-    ) -> Vec<ExactPassMatch> {
+    ) -> std::io::Result<Vec<ExactPassMatch>> {
         self.snapshot()
             .whole_corpus_exact_pass(query, search_root, candidate_filter)
     }
@@ -735,7 +735,7 @@ impl SearchIndex {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         max_files: usize,
-    ) -> LexicalRankResult {
+    ) -> std::io::Result<LexicalRankResult> {
         self.snapshot()
             .lexical_rank_with_stats(query_trigrams, candidate_filter, max_files)
     }
@@ -804,9 +804,9 @@ impl SearchIndexSnapshot {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         max_files: usize,
-    ) -> LexicalRankResult {
+    ) -> std::io::Result<LexicalRankResult> {
         if query_trigrams.is_empty() || max_files == 0 {
-            return LexicalRankResult::default();
+            return Ok(LexicalRankResult::default());
         }
 
         let mut non_zero: Vec<(u32, usize)> = query_trigrams
@@ -817,7 +817,7 @@ impl SearchIndexSnapshot {
             })
             .collect();
         if non_zero.is_empty() {
-            return LexicalRankResult::default();
+            return Ok(LexicalRankResult::default());
         }
 
         non_zero.sort_unstable_by_key(|(_, posting_count)| *posting_count);
@@ -828,7 +828,7 @@ impl SearchIndexSnapshot {
         // needs every query trigram. Materialize all lists once per query so both
         // phases reuse the same disk-backed postings instead of rereading them for
         // every candidate. Memory remains bounded by the query's posting lists.
-        let postings_by_trigram = materialize_query_postings(self, query_trigrams);
+        let postings_by_trigram = materialize_query_postings(self, query_trigrams)?;
         let mut candidate_ids = BTreeSet::new();
         for (trigram, _) in non_zero.iter().take(selected_count) {
             if let Some(postings) = postings_by_trigram.get(trigram) {
@@ -868,10 +868,10 @@ impl SearchIndexSnapshot {
         });
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(max_files);
-        LexicalRankResult {
+        Ok(LexicalRankResult {
             files: ranked,
             engine_capped,
-        }
+        })
     }
 
     /// Evaluates lexical candidates and scores them up to the specified depth limit, applying an optional candidate filter.
@@ -880,9 +880,9 @@ impl SearchIndexSnapshot {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         depth: usize,
-    ) -> LexicalRankResult {
+    ) -> std::io::Result<LexicalRankResult> {
         if query_trigrams.is_empty() || depth == 0 {
-            return LexicalRankResult::default();
+            return Ok(LexicalRankResult::default());
         }
 
         let mut non_zero: Vec<(u32, usize)> = query_trigrams
@@ -893,11 +893,11 @@ impl SearchIndexSnapshot {
             })
             .collect();
         if non_zero.is_empty() {
-            return LexicalRankResult::default();
+            return Ok(LexicalRankResult::default());
         }
 
         non_zero.sort_unstable_by_key(|(_, posting_count)| *posting_count);
-        let postings_by_trigram = materialize_query_postings(self, query_trigrams);
+        let postings_by_trigram = materialize_query_postings(self, query_trigrams)?;
 
         let initial_selected = non_zero.len().min(3);
         let mut candidate_ids = BTreeSet::new();
@@ -952,10 +952,10 @@ impl SearchIndexSnapshot {
         });
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(depth);
-        LexicalRankResult {
+        Ok(LexicalRankResult {
             files: ranked,
             engine_capped,
-        }
+        })
     }
 
     /// Score the union of the three rarest nonempty postings without ranking
@@ -965,14 +965,14 @@ impl SearchIndexSnapshot {
         &self,
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-    ) -> Vec<(PathBuf, f32)> {
+    ) -> std::io::Result<Vec<(PathBuf, f32)>> {
         let mut seen = HashSet::with_capacity(query_trigrams.len());
         let unique = query_trigrams
             .iter()
             .copied()
             .filter(|trigram| seen.insert(*trigram))
             .collect::<Vec<_>>();
-        let postings = materialize_query_postings(self, &unique);
+        let postings = materialize_query_postings(self, &unique)?;
         let mut memberships = postings
             .iter()
             .filter(|(_, ids)| !ids.is_empty())
@@ -999,7 +999,7 @@ impl SearchIndexSnapshot {
             counts.candidates_sorted += ranked.len()
         });
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        ranked
+        Ok(ranked)
     }
 
     /// Discovers and ranks lexical candidates up to the specified depth limit, applying an optional candidate filter.
@@ -1008,7 +1008,7 @@ impl SearchIndexSnapshot {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         depth: usize,
-    ) -> LexicalRankResult {
+    ) -> std::io::Result<LexicalRankResult> {
         self.lexical_rank_at_depth(query_trigrams, candidate_filter, depth)
     }
 
@@ -1022,18 +1022,19 @@ impl SearchIndexSnapshot {
         &self,
         phrase: &str,
         search_root: &Path,
-    ) -> Option<Vec<PathBuf>> {
+    ) -> std::io::Result<Option<Vec<PathBuf>>> {
         let mut ids: Option<Vec<u32>> = None;
         for piece in phrase.split_whitespace().filter(|piece| piece.len() >= 3) {
-            let piece_ids = self.candidates(&decompose_regex(&regex::escape(piece)));
+            let piece_ids = self.candidates(&decompose_regex(&regex::escape(piece)))?;
             ids = Some(match ids {
                 Some(ids) => intersect_sorted_ids(&ids, &piece_ids),
                 None => piece_ids,
             });
         }
         let search_root_canon = canonicalize_for_search_membership(search_root);
-        Some(
-            ids?.into_iter()
+        let Some(ids) = ids else { return Ok(None) };
+        Ok(Some(
+            ids.into_iter()
                 .filter_map(|id| self.files.get(id as usize))
                 .map(|file| &file.path)
                 .filter(|path| !path.as_os_str().is_empty())
@@ -1043,7 +1044,7 @@ impl SearchIndexSnapshot {
                 })
                 .cloned()
                 .collect(),
-        )
+        ))
     }
 
     /// Whole-corpus exact pass over the trigram index in ready mode.
@@ -1054,7 +1055,7 @@ impl SearchIndexSnapshot {
         query: &str,
         search_root: &Path,
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-    ) -> Vec<ExactPassMatch> {
+    ) -> std::io::Result<Vec<ExactPassMatch>> {
         self.whole_corpus_exact_pass_scoped(
             query,
             search_root,
@@ -1072,7 +1073,7 @@ impl SearchIndexSnapshot {
         search_root: &Path,
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         scope: &ExactEvidenceScope,
-    ) -> Vec<ExactPassMatch> {
+    ) -> std::io::Result<Vec<ExactPassMatch>> {
         let phrase = exact_lane::exact_phrase(query);
         let norm_phrase = exact_lane::normalize_exact_phrase(phrase);
         let content_tokens = exact_lane::exact_verification_tokens(query);
@@ -1085,14 +1086,14 @@ impl SearchIndexSnapshot {
         // (a) Verbatim phrase trigrams
         if phrase.len() >= 3 {
             let phrase_query = decompose_regex(&regex::escape(phrase));
-            candidate_file_ids.extend(self.candidates(&phrase_query));
+            candidate_file_ids.extend(self.candidates(&phrase_query)?);
         }
 
         // (b) Content tokens trigrams (for E2 window match)
         if content_tokens.len() >= 2 {
             for token in &content_tokens {
                 if token.len() >= 3 {
-                    match self.files_possibly_containing(token, &mut literal_postings) {
+                    match self.files_possibly_containing(token, &mut literal_postings)? {
                         Some(ids) => candidate_file_ids.extend(ids.iter().copied()),
                         None => candidate_file_ids.extend(self.active_file_ids()),
                     }
@@ -1104,12 +1105,16 @@ impl SearchIndexSnapshot {
         // contain the receiver, so files holding the member name are
         // candidates too. Verification gives them definition evidence only
         // when they declare it.
-        let member_file_ids = member.as_ref().map(|member| {
+        let member_file_ids = if let Some(member) = member.as_ref() {
             let member_query = decompose_regex(&regex::escape(&member.member));
-            self.candidates(&member_query)
-                .into_iter()
-                .collect::<BTreeSet<_>>()
-        });
+            Some(
+                self.candidates(&member_query)?
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+            )
+        } else {
+            None
+        };
         if let Some(ids) = &member_file_ids {
             candidate_file_ids.extend(ids.iter().copied());
         }
@@ -1125,7 +1130,7 @@ impl SearchIndexSnapshot {
 
         let unscoped_candidates = candidate_file_ids.len();
         if let Some(bound) =
-            self.exact_evidence_bound(scope, &norm_phrase, &content_tokens, &mut literal_postings)
+            self.exact_evidence_bound(scope, &norm_phrase, &content_tokens, &mut literal_postings)?
         {
             // The evidence bound is built from the query's own words, which a
             // member's declaration does not contain, so member files stay.
@@ -1214,44 +1219,39 @@ impl SearchIndexSnapshot {
             matches.len(),
             started.elapsed()
         );
-        matches
+        Ok(matches)
     }
 
-    /// The sorted ids of every file that can hold evidence `scope` keeps, or
-    /// `None` when the index cannot rule any file out.
-    ///
-    /// Each kind of evidence needs certain words in the file, compared ASCII
-    /// case-insensitively like the trigram index: a verbatim phrase needs every
-    /// word of the phrase, a window needs every query word, and a declaration
-    /// needs the query word it is named after plus, when the scope lists
-    /// identifier words, one of those words. Phrase words are checked one by
-    /// one because the phrase is compared after collapsing whitespace, so a
-    /// hit may span a line break that the phrase's own trigrams would miss.
     fn exact_evidence_bound(
         &self,
         scope: &ExactEvidenceScope,
         norm_phrase: &str,
         content_tokens: &[String],
         literal_postings: &mut HashMap<String, Option<Vec<u32>>>,
-    ) -> Option<Vec<u32>> {
+    ) -> std::io::Result<Option<Vec<u32>>> {
         let (keeps_window, declaration_mentions) = match scope {
-            ExactEvidenceScope::All => return None,
+            ExactEvidenceScope::All => return Ok(None),
             ExactEvidenceScope::Phrase => (false, None),
             ExactEvidenceScope::PhraseAndWindow => (true, None),
             ExactEvidenceScope::DefinitionsMentioning(tokens) => (true, Some(tokens.as_slice())),
         };
-
         let mut bound = Vec::new();
         if !norm_phrase.is_empty() {
-            let phrase_files =
-                self.files_possibly_containing_all(norm_phrase.split(' '), literal_postings)?;
+            let Some(phrase_files) =
+                self.files_possibly_containing_all(norm_phrase.split(' '), literal_postings)?
+            else {
+                return Ok(None);
+            };
             bound = union_sorted_ids(&bound, &phrase_files);
         }
         if keeps_window && content_tokens.len() >= 2 {
-            let window_files = self.files_possibly_containing_all(
+            let Some(window_files) = self.files_possibly_containing_all(
                 content_tokens.iter().map(String::as_str),
                 literal_postings,
-            )?;
+            )?
+            else {
+                return Ok(None);
+            };
             bound = union_sorted_ids(&bound, &window_files);
         }
         if let Some(mentions) = declaration_mentions {
@@ -1259,32 +1259,30 @@ impl SearchIndexSnapshot {
                 let named = self.files_possibly_containing_any(
                     content_tokens.iter().map(String::as_str),
                     literal_postings,
-                );
+                )?;
                 let mentioning = self.files_possibly_containing_any(
                     mentions.iter().map(String::as_str),
                     literal_postings,
-                );
+                )?;
                 let declaration_files = match (named, mentioning) {
                     (Some(named), Some(mentioning)) => intersect_sorted_ids(&named, &mentioning),
                     (Some(files), None) | (None, Some(files)) => files,
-                    (None, None) => return None,
+                    (None, None) => return Ok(None),
                 };
                 bound = union_sorted_ids(&bound, &declaration_files);
             }
         }
-        Some(bound)
+        Ok(Some(bound))
     }
 
-    /// Files containing every one of `words`, or `None` when no word is long
-    /// enough to have a trigram.
     fn files_possibly_containing_all<'a>(
         &self,
         words: impl Iterator<Item = &'a str>,
         literal_postings: &mut HashMap<String, Option<Vec<u32>>>,
-    ) -> Option<Vec<u32>> {
+    ) -> std::io::Result<Option<Vec<u32>>> {
         let mut files: Option<Vec<u32>> = None;
         for word in words {
-            let Some(word_files) = self.files_possibly_containing(word, literal_postings) else {
+            let Some(word_files) = self.files_possibly_containing(word, literal_postings)? else {
                 continue;
             };
             files = Some(match files {
@@ -1295,41 +1293,39 @@ impl SearchIndexSnapshot {
                 break;
             }
         }
-        files
+        Ok(files)
     }
 
-    /// Files containing at least one of `words`, or `None` when some word is
-    /// too short to have a trigram and so could be in any file.
     fn files_possibly_containing_any<'a>(
         &self,
         words: impl Iterator<Item = &'a str>,
         literal_postings: &mut HashMap<String, Option<Vec<u32>>>,
-    ) -> Option<Vec<u32>> {
+    ) -> std::io::Result<Option<Vec<u32>>> {
         let mut files = Vec::new();
         for word in words {
-            let word_files = self.files_possibly_containing(word, literal_postings)?;
+            let Some(word_files) = self.files_possibly_containing(word, literal_postings)? else {
+                return Ok(None);
+            };
             files = union_sorted_ids(&files, word_files);
         }
-        Some(files)
+        Ok(Some(files))
     }
 
-    /// The sorted ids of files that may contain `literal`, ASCII
-    /// case-insensitively, from its trigram postings; `None` when the literal
-    /// has no trigram. Lookups are cached per pass because one word can serve
-    /// several kinds of evidence.
     fn files_possibly_containing<'a>(
         &self,
         literal: &str,
         literal_postings: &'a mut HashMap<String, Option<Vec<u32>>>,
-    ) -> Option<&'a Vec<u32>> {
-        literal_postings
-            .entry(literal.to_string())
-            .or_insert_with(|| {
-                let query = decompose_regex(&regex::escape(literal));
-                (!query.and_trigrams.is_empty() || !query.or_groups.is_empty())
-                    .then(|| self.candidates(&query))
-            })
-            .as_ref()
+    ) -> std::io::Result<Option<&'a Vec<u32>>> {
+        if !literal_postings.contains_key(literal) {
+            let query = decompose_regex(&regex::escape(literal));
+            let postings = if !query.and_trigrams.is_empty() || !query.or_groups.is_empty() {
+                Some(self.candidates(&query)?)
+            } else {
+                None
+            };
+            literal_postings.insert(literal.to_string(), postings);
+        }
+        Ok(literal_postings.get(literal).and_then(Option::as_ref))
     }
 }
 
@@ -1359,6 +1355,10 @@ pub struct GrepMatch {
 
 #[derive(Clone, Debug)]
 pub struct GrepResult {
+    /// Index sources whose posting evidence could not be read. Successful
+    /// sources may still supply matches, but their merged reply is incomplete.
+    pub(crate) index_sources_unavailable: bool,
+    pub index_read_gaps: Vec<String>,
     pub matches: Vec<GrepMatch>,
     pub total_matches: usize,
     pub files_searched: usize,
@@ -2294,7 +2294,7 @@ impl SearchIndex {
         exclude: &[String],
         search_root: &Path,
         max_results: usize,
-    ) -> GrepResult {
+    ) -> std::io::Result<GrepResult> {
         self.snapshot().grep(
             pattern,
             case_sensitive,
@@ -2312,7 +2312,7 @@ impl SearchIndex {
         exclude: &[String],
         search_root: &Path,
         max_results: usize,
-    ) -> GrepResult {
+    ) -> std::io::Result<GrepResult> {
         self.snapshot()
             .search_grep(pattern, include, exclude, search_root, max_results)
     }
@@ -2321,7 +2321,7 @@ impl SearchIndex {
         self.snapshot().glob(pattern, search_root)
     }
 
-    pub fn candidates(&self, query: &RegexQuery) -> Vec<u32> {
+    pub fn candidates(&self, query: &RegexQuery) -> std::io::Result<Vec<u32>> {
         self.snapshot().candidates(query)
     }
 
@@ -3210,7 +3210,11 @@ impl SearchIndex {
     }
 
     #[cfg(test)]
-    fn postings_for_trigram(&self, trigram: u32, filter: Option<PostingFilter>) -> Vec<u32> {
+    fn postings_for_trigram(
+        &self,
+        trigram: u32,
+        filter: Option<PostingFilter>,
+    ) -> std::io::Result<Vec<u32>> {
         self.snapshot().postings_for_trigram(trigram, filter)
     }
 
@@ -3358,7 +3362,7 @@ impl SearchIndexSnapshot {
         exclude: &[String],
         search_root: &Path,
         max_results: usize,
-    ) -> GrepResult {
+    ) -> std::io::Result<GrepResult> {
         match pattern_compile::compile(
             pattern,
             CompileOpts {
@@ -3370,7 +3374,7 @@ impl SearchIndexSnapshot {
                 self.search_grep(&compiled, include, exclude, search_root, max_results)
             }
             CompileResult::InvalidPattern { .. } | CompileResult::UnsupportedSyntax { .. } => {
-                self.empty_grep_result()
+                Ok(self.empty_grep_result())
             }
         }
     }
@@ -3382,9 +3386,9 @@ impl SearchIndexSnapshot {
         exclude: &[String],
         search_root: &Path,
         max_results: usize,
-    ) -> GrepResult {
+    ) -> std::io::Result<GrepResult> {
         self.search_grep_profiled(pattern, include, exclude, search_root, max_results, None)
-            .0
+            .map(|result| result.0)
     }
 
     pub(crate) fn search_grep_bounded(
@@ -3397,7 +3401,7 @@ impl SearchIndexSnapshot {
         path_exclusion: Option<GrepPathExclusion>,
         max_files: usize,
         budget: Duration,
-    ) -> GrepResult {
+    ) -> std::io::Result<GrepResult> {
         let filters = build_path_filters(include, exclude).unwrap_or_default();
         let query = decompose_grep_pattern(pattern);
         self.search_grep_profiled_with_filters_and_query_and_limits(
@@ -3412,7 +3416,7 @@ impl SearchIndexSnapshot {
             GrepScanOrder::Arrival,
             PATH_ORDER_BATCH_ROW_BUDGET,
         )
-        .0
+        .map(|result| result.0)
     }
 
     pub(crate) fn search_grep_profiled(
@@ -3423,7 +3427,7 @@ impl SearchIndexSnapshot {
         search_root: &Path,
         max_results: usize,
         path_exclusion: Option<GrepPathExclusion>,
-    ) -> (GrepResult, GrepQueryPhaseTimings) {
+    ) -> std::io::Result<(GrepResult, GrepQueryPhaseTimings)> {
         let filters = build_path_filters(include, exclude).unwrap_or_default();
         self.search_grep_profiled_with_filters(
             pattern,
@@ -3441,7 +3445,7 @@ impl SearchIndexSnapshot {
         search_root: &Path,
         max_results: usize,
         path_exclusion: Option<GrepPathExclusion>,
-    ) -> (GrepResult, GrepQueryPhaseTimings) {
+    ) -> std::io::Result<(GrepResult, GrepQueryPhaseTimings)> {
         let query_started = Instant::now();
         let query = decompose_grep_pattern(pattern);
         let query_decomposition = query_started.elapsed();
@@ -3452,9 +3456,9 @@ impl SearchIndexSnapshot {
             search_root,
             max_results,
             path_exclusion,
-        );
+        )?;
         timings.trigram_lookup += query_decomposition;
-        (result, timings)
+        Ok((result, timings))
     }
 
     /// Search with a query decomposed once by the caller and reused across roots.
@@ -3466,7 +3470,7 @@ impl SearchIndexSnapshot {
         search_root: &Path,
         max_results: usize,
         path_exclusion: Option<GrepPathExclusion>,
-    ) -> (GrepResult, GrepQueryPhaseTimings) {
+    ) -> std::io::Result<(GrepResult, GrepQueryPhaseTimings)> {
         self.search_grep_profiled_with_filters_and_query_in_order(
             pattern,
             query,
@@ -3490,7 +3494,7 @@ impl SearchIndexSnapshot {
         max_results: usize,
         path_exclusion: Option<GrepPathExclusion>,
         order: GrepScanOrder,
-    ) -> (GrepResult, GrepQueryPhaseTimings) {
+    ) -> std::io::Result<(GrepResult, GrepQueryPhaseTimings)> {
         self.search_grep_profiled_with_filters_and_query_in_order_with_row_budget(
             pattern,
             query,
@@ -3517,7 +3521,7 @@ impl SearchIndexSnapshot {
         path_exclusion: Option<GrepPathExclusion>,
         order: GrepScanOrder,
         row_budget: usize,
-    ) -> (GrepResult, GrepQueryPhaseTimings) {
+    ) -> std::io::Result<(GrepResult, GrepQueryPhaseTimings)> {
         self.search_grep_profiled_with_filters_and_query_and_limits(
             pattern,
             query,
@@ -3549,7 +3553,7 @@ impl SearchIndexSnapshot {
         scan_budget: Duration,
         order: GrepScanOrder,
         row_budget: usize,
-    ) -> (GrepResult, GrepQueryPhaseTimings) {
+    ) -> std::io::Result<(GrepResult, GrepQueryPhaseTimings)> {
         self.search_grep_profiled_with_filters_and_query_and_limits_with_deadline(
             pattern,
             query,
@@ -3578,7 +3582,7 @@ impl SearchIndexSnapshot {
         make_deadline: impl FnOnce() -> GrepScanDeadline,
         order: GrepScanOrder,
         row_budget: usize,
-    ) -> (GrepResult, GrepQueryPhaseTimings) {
+    ) -> std::io::Result<(GrepResult, GrepQueryPhaseTimings)> {
         let _io_scope = crate::bounded_io::enter_if_absent(scan_budget);
         let matcher = match pattern {
             CompiledPattern::Literal(literal) => SearchMatcher::Literal(literal.clone()),
@@ -3590,7 +3594,7 @@ impl SearchIndexSnapshot {
         let job_cancellation = crate::executor::current_job_cancellation();
         let trigram_started = Instant::now();
         let fully_degraded = query.and_trigrams.is_empty() && query.or_groups.is_empty();
-        let candidate_ids = self.candidates(query);
+        let candidate_ids = self.candidates(query)?;
         let trigram_lookup = trigram_started.elapsed();
 
         let candidate_filter_started = Instant::now();
@@ -3855,6 +3859,8 @@ impl SearchIndexSnapshot {
             .collect();
 
         let result = GrepResult {
+            index_sources_unavailable: false,
+            index_read_gaps: Vec::new(),
             total_matches: total_matches.load(Ordering::Relaxed),
             matches,
             files_searched: files_searched.load(Ordering::Relaxed),
@@ -3882,7 +3888,7 @@ impl SearchIndexSnapshot {
             candidate_count,
             bytes_verified: bytes_verified.load(Ordering::Relaxed),
         };
-        (result, phases)
+        Ok((result, phases))
     }
 
     /// Find every matching line in the candidate files the trigram index admits,
@@ -3906,7 +3912,7 @@ impl SearchIndexSnapshot {
         limits: GrepExaminationLimits,
         examine_priority: &(dyn Fn(&Path) -> u8 + Sync),
         keep_past_limit: &(dyn Fn(&GrepMatch) -> bool + Sync),
-    ) -> GrepFileCollection {
+    ) -> std::io::Result<GrepFileCollection> {
         let matcher = match pattern {
             CompiledPattern::Literal(literal) => SearchMatcher::Literal(literal.clone()),
             CompiledPattern::Regex { compiled, .. } => SearchMatcher::Regex(compiled.clone()),
@@ -3916,7 +3922,7 @@ impl SearchIndexSnapshot {
         let fully_degraded = query.and_trigrams.is_empty() && query.or_groups.is_empty();
 
         let mut candidates: Vec<(u8, &FileEntry)> = self
-            .candidates(&query)
+            .candidates(&query)?
             .into_iter()
             .filter_map(|file_id| self.files.get(file_id as usize))
             .filter(|file| !file.path.as_os_str().is_empty())
@@ -3992,7 +3998,7 @@ impl SearchIndexSnapshot {
             .filter_map(|file| file)
             .collect();
 
-        GrepFileCollection {
+        Ok(GrepFileCollection {
             files,
             candidate_files,
             files_examined: files_examined.load(Ordering::Relaxed),
@@ -4005,11 +4011,13 @@ impl SearchIndexSnapshot {
                 IndexStatus::Building
             },
             missing_on_disk: missing_on_disk.load(Ordering::Relaxed),
-        }
+        })
     }
 
     fn empty_grep_result(&self) -> GrepResult {
         GrepResult {
+            index_sources_unavailable: false,
+            index_read_gaps: Vec::new(),
             matches: Vec::new(),
             total_matches: 0,
             files_searched: 0,
@@ -4108,9 +4116,9 @@ impl SearchIndexSnapshot {
         )
     }
 
-    pub fn candidates(&self, query: &RegexQuery) -> Vec<u32> {
+    pub fn candidates(&self, query: &RegexQuery) -> std::io::Result<Vec<u32>> {
         if query.and_trigrams.is_empty() && query.or_groups.is_empty() {
-            return self.active_file_ids();
+            return Ok(self.active_file_ids());
         }
 
         let mut and_trigrams = query.and_trigrams.clone();
@@ -4122,7 +4130,7 @@ impl SearchIndexSnapshot {
 
         for trigram in and_trigrams {
             let filter = query.and_filters.get(&trigram).copied();
-            let matches = self.postings_for_trigram(trigram, filter);
+            let matches = self.postings_for_trigram(trigram, filter)?;
             current = Some(match current.take() {
                 Some(existing) => intersect_sorted_ids(&existing, &matches),
                 None => matches,
@@ -4141,7 +4149,7 @@ impl SearchIndexSnapshot {
 
             for trigram in group {
                 let filter = filters.and_then(|filters| filters.get(trigram).copied());
-                let matches = self.postings_for_trigram(*trigram, filter);
+                let matches = self.postings_for_trigram(*trigram, filter)?;
                 if group_matches.is_empty() {
                     group_matches = matches;
                 } else {
@@ -4166,7 +4174,7 @@ impl SearchIndexSnapshot {
             current = union_sorted_ids(&current, &unindexed);
         }
 
-        current
+        Ok(current)
     }
 
     fn posting_count(&self, trigram: u32) -> usize {
@@ -4199,12 +4207,14 @@ impl SearchIndexSnapshot {
             .unwrap_or(false)
     }
 
-    fn postings_for_trigram(&self, trigram: u32, filter: Option<PostingFilter>) -> Vec<u32> {
+    fn postings_for_trigram(
+        &self,
+        trigram: u32,
+        filter: Option<PostingFilter>,
+    ) -> std::io::Result<Vec<u32>> {
         #[cfg(debug_assertions)]
         POSTINGS_FOR_TRIGRAM_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
-
         let mut matches = Vec::new();
-
         if let Some(base_entry) = self
             .base
             .as_ref()
@@ -4213,7 +4223,7 @@ impl SearchIndexSnapshot {
             if let Some(base) = &self.base {
                 matches.reserve(base_entry.count as usize);
                 let mut posting_index = 0usize;
-                let _ = base.for_each_posting(base_entry, |file_id, next_mask, loc_mask| {
+                base.for_each_posting(base_entry, |file_id, next_mask, loc_mask| {
                     // Check cancellation on the same 64-record cadence as the
                     // delta loop below. Superseded files are dropped by
                     // `is_active_file`, so no separate lookup is needed here.
@@ -4238,10 +4248,12 @@ impl SearchIndexSnapshot {
                         matches.push(file_id);
                     }
                     true
-                });
+                }).map_err(|error| std::io::Error::new(error.kind(), format!(
+                    "lexical postings read failed for trigram {trigram:#08x} ({} stored file records): {error}",
+                    base_entry.count,
+                )))?;
             }
         }
-
         if let Some(postings) = self.delta.postings.get(&trigram) {
             matches.reserve(postings.len());
             for (posting_index, posting) in postings.iter().enumerate() {
@@ -4258,12 +4270,11 @@ impl SearchIndexSnapshot {
                 }
             }
         }
-
         if matches.len() > 1 {
             matches.sort_unstable();
             matches.dedup();
         }
-        matches
+        Ok(matches)
     }
 }
 
@@ -6292,30 +6303,40 @@ pub fn query_trigrams_from_tokens(tokens: &[&str]) -> Vec<u32> {
     out
 }
 
-pub fn lexical_score(index: &SearchIndex, query_trigrams: &[u32], file_id: u32) -> f32 {
+pub fn lexical_score(
+    index: &SearchIndex,
+    query_trigrams: &[u32],
+    file_id: u32,
+) -> std::io::Result<f32> {
     lexical_score_snapshot(&index.snapshot(), query_trigrams, file_id)
 }
 
 fn materialize_query_postings(
     index: &SearchIndexSnapshot,
     query_trigrams: &[u32],
-) -> HashMap<u32, Vec<u32>> {
+) -> std::io::Result<HashMap<u32, Vec<u32>>> {
     let mut postings_by_trigram = HashMap::with_capacity(query_trigrams.len());
     for &trigram in query_trigrams {
-        postings_by_trigram
-            .entry(trigram)
-            .or_insert_with(|| index.postings_for_trigram(trigram, None));
+        if let std::collections::hash_map::Entry::Vacant(entry) = postings_by_trigram.entry(trigram)
+        {
+            entry.insert(index.postings_for_trigram(trigram, None)?);
+        }
     }
-    postings_by_trigram
+    Ok(postings_by_trigram)
 }
 
 fn lexical_score_snapshot(
     index: &SearchIndexSnapshot,
     query_trigrams: &[u32],
     file_id: u32,
-) -> f32 {
-    let postings_by_trigram = materialize_query_postings(index, query_trigrams);
-    lexical_score_from_postings(index, query_trigrams, &postings_by_trigram, file_id)
+) -> std::io::Result<f32> {
+    let postings_by_trigram = materialize_query_postings(index, query_trigrams)?;
+    Ok(lexical_score_from_postings(
+        index,
+        query_trigrams,
+        &postings_by_trigram,
+        file_id,
+    ))
 }
 
 fn lexical_score_from_postings(
@@ -6381,7 +6402,7 @@ fn lexical_rank_with_stats_reference(
 
     let mut candidate_ids = BTreeSet::new();
     for (trigram, _) in non_zero.iter().take(selected_count) {
-        candidate_ids.extend(index.postings_for_trigram(*trigram, None));
+        candidate_ids.extend(index.postings_for_trigram(*trigram, None).unwrap());
     }
     let pre_filter_candidate_count = candidate_ids.len();
     let engine_capped = pre_filter_candidate_count > candidate_cap;
@@ -6428,7 +6449,7 @@ fn lexical_score_snapshot_reference(
 
     let mut hits = 0u32;
     for &trigram in query_trigrams {
-        let postings = index.postings_for_trigram(trigram, None);
+        let postings = index.postings_for_trigram(trigram, None).unwrap();
         if postings.binary_search(&file_id).is_ok() {
             hits += 1;
         }
@@ -10658,7 +10679,9 @@ fn git_diff_within_path_limit(diff: &[u8], limit: usize) -> bool {
         })
 }
 
-fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
+pub(crate) fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
+    #[cfg(test)]
+    LINE_STARTS_BUILDS.with(|count| count.set(count.get() + 1));
     let mut starts = vec![0usize];
     for (index, byte) in content.iter().copied().enumerate() {
         if byte == b'\n' {
@@ -10670,6 +10693,7 @@ fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static LINE_STARTS_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static POSTING_COUNT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SUPERSEDED_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BASE_CANCELLATION_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -10689,10 +10713,19 @@ fn grep_scan_test_now() -> Instant {
 /// holding `offset`, plus the byte offset where the next line starts (the
 /// end of `content` for the last line). The text is bounded the way grep
 /// prints it, see [`bounded_grep_line_text_bytes`].
-fn line_details_bytes(
+pub(crate) fn line_details_bytes(
     content: &[u8],
     line_starts: &[usize],
     offset: usize,
+) -> (u32, u32, String, usize) {
+    line_details_bytes_with_cr_policy(content, line_starts, offset, false)
+}
+
+pub(crate) fn line_details_bytes_with_cr_policy(
+    content: &[u8],
+    line_starts: &[usize],
+    offset: usize,
+    trim_all_cr: bool,
 ) -> (u32, u32, String, usize) {
     #[cfg(test)]
     LINE_DETAILS_PROBE.with(|probe| {
@@ -10713,8 +10746,12 @@ fn line_details_bytes(
         None => (content.len(), content.len()),
     };
     let mut line_slice = &content[line_start..line_end];
-    if line_slice.ends_with(b"\r") {
+    // Fallback trims every trailing CR; indexed grep removes only the CR in CRLF.
+    while line_slice.ends_with(b"\r") {
         line_slice = &line_slice[..line_slice.len() - 1];
+        if !trim_all_cr {
+            break;
+        }
     }
     let line_text = bounded_grep_line_text_bytes(line_slice);
     let column = String::from_utf8_lossy(&content[line_start..offset])
@@ -11809,6 +11846,7 @@ mod tests {
         assert_eq!(
             original
                 .candidates(&decompose_regex("original_marker"))
+                .expect("candidates from a test index")
                 .len(),
             1
         );
@@ -12283,6 +12321,259 @@ mod tests {
     }
 
     #[test]
+    fn audit10_7_posting_failure_is_not_a_complete_empty_grep_reply() {
+        let (_directory, context, _) = unreadable_postings_fixture();
+        let request = crate::protocol::RawRequest {
+            id: "posting-failure".to_string(),
+            command: "grep".to_string(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"pattern":"needle", "max_results":10}),
+        };
+        let response = crate::commands::grep::handle_grep(&request, &context);
+        assert!(
+            !response.success,
+            "unreadable lexical evidence was accepted: {:?}",
+            response.data
+        );
+        assert!(response.data.to_string().contains("lexical postings"));
+    }
+
+    fn unreadable_postings_fixture() -> (tempfile::TempDir, crate::context::AppContext, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let source = root.join("lib.rs");
+        fs::write(&source, "pub fn needleHandler() {}\n").unwrap();
+        let mut index = SearchIndex::build_with_limit(&root, 1024 * 1024);
+        let path = directory.path().join("unreadable-postings.bin");
+        fs::write(&path, []).unwrap();
+        let CompileResult::Ok(pattern) =
+            pattern_compile::compile("needleHandler", CompileOpts::default())
+        else {
+            panic!("literal must compile")
+        };
+        let query = decompose_grep_pattern(&pattern);
+        let mut lookup = query
+            .and_trigrams
+            .iter()
+            .copied()
+            .map(|trigram| LookupEntry {
+                trigram,
+                offset: 0,
+                count: 1,
+            })
+            .collect::<Vec<_>>();
+        lookup.sort_unstable_by_key(|entry| entry.trigram);
+        index.base = Some(Arc::new(BasePostings {
+            file: Arc::new(fs::File::open(path).unwrap()),
+            postings_blob_start: 0,
+            postings_blob_len: POSTING_BYTES as u64,
+            lookup: Arc::new(lookup),
+        }));
+        index.delta = Arc::new(DeltaState::default());
+        let context = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        *context.search_index().write().unwrap() = Some(index);
+        (directory, context, root)
+    }
+
+    #[test]
+    fn audit10_7_partial_grep_keeps_readable_sources_even_without_matches() {
+        let (_directory, context, root) = unreadable_postings_fixture();
+        let explicit = root.join("explicit.rs");
+        for content in ["no matches\n", "needle\n"] {
+            fs::write(&explicit, content).unwrap();
+            let request = crate::protocol::RawRequest {
+                id: "partial-posting-failure".to_string(),
+                command: "grep".to_string(),
+                session_id: None,
+                lsp_hints: None,
+                params: serde_json::json!({"pattern":"needle", "max_results":10, "path":[root, explicit]}),
+            };
+            let response = crate::commands::grep::handle_grep(&request, &context);
+            assert!(
+                response.success,
+                "readable explicit scope was discarded: {:?}",
+                response.data
+            );
+            assert_eq!(response.data["complete"], false);
+            assert_eq!(
+                response.data["matches"].as_array().unwrap().len(),
+                usize::from(content == "needle\n")
+            );
+            assert!(response.data["index_read_gap"]
+                .to_string()
+                .contains("lexical postings"));
+        }
+    }
+
+    #[test]
+    fn audit10_7_rank_and_exact_queries_propagate_posting_io_errors() {
+        let (_directory, context, root) = unreadable_postings_fixture();
+        let guard = context.search_index().read().unwrap();
+        let snapshot = guard.as_ref().unwrap().snapshot();
+        let query = query_trigrams_from_tokens(&["needle"]);
+        for error in [
+            snapshot
+                .lexical_rank_with_stats(&query, None, 10)
+                .unwrap_err(),
+            snapshot
+                .lexical_rank_at_depth(&query, None, 10)
+                .unwrap_err(),
+            snapshot
+                .whole_corpus_exact_pass("needle", &root, None)
+                .unwrap_err(),
+            snapshot
+                .files_possibly_holding_phrase("needle", &root)
+                .unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("lexical postings"));
+        }
+    }
+
+    #[test]
+    fn audit10_7_search_discloses_posting_failure_with_verified_exact_fallback() {
+        let (_directory, context, _) = unreadable_postings_fixture();
+        let request = crate::protocol::RawRequest {
+            id: "search-posting-failure".to_string(),
+            command: "semantic_search".to_string(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"query":"needleHandler", "topK":10}),
+        };
+        let response = crate::commands::semantic_search::handle_semantic_search(&request, &context);
+        assert!(
+            response.success,
+            "readable exact fallback discarded: {:?}",
+            response.data
+        );
+        assert_eq!(response.data["complete"], false);
+        assert!(response.data["index_read_gap"]
+            .to_string()
+            .contains("lexical postings"));
+        assert!(
+            response.data["text"].as_str().unwrap().contains("lib.rs"),
+            "{:?}",
+            response.data
+        );
+    }
+
+    #[test]
+    fn audit10_7_split_search_discloses_posting_failure() {
+        let (_directory, context, _) = unreadable_postings_fixture();
+        let request = crate::protocol::RawRequest {
+            id: "split-posting-failure".to_string(),
+            command: "semantic_search".to_string(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"query":"find handler implementation", "pattern":"needleHandler", "topK":10}),
+        };
+        let response = crate::commands::semantic_search::handle_semantic_search(&request, &context);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], false);
+        assert!(
+            response.data["index_read_gap"]
+                .to_string()
+                .contains("lexical postings"),
+            "{:?}",
+            response.data
+        );
+    }
+
+    fn audit10_7_after_regex_lock_timeout<T>(
+        context: &crate::context::AppContext,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        let (start, begin) = std::sync::mpsc::channel();
+        let (held, acquired) = std::sync::mpsc::channel();
+        let (release, finish) = std::sync::mpsc::channel();
+        let (released, dropped) = std::sync::mpsc::channel();
+        let timeouts = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = timeouts.clone();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                if begin.recv().is_ok() {
+                    let guard = context.search_index().write().unwrap();
+                    let _ = held.send(());
+                    let _ = finish.recv();
+                    drop(guard);
+                    let _ = released.send(());
+                }
+            });
+            crate::commands::semantic_search::with_regex_route_lock_hook_for_test(
+                move |timed_out| {
+                    if timed_out {
+                        observed.set(observed.get() + 1);
+                        release.send(()).unwrap();
+                        dropped.recv().unwrap();
+                    } else {
+                        start.send(()).unwrap();
+                        acquired.recv().unwrap();
+                    }
+                },
+                action,
+            )
+        });
+        assert_eq!(
+            timeouts.get(),
+            1,
+            "the ranked route must time out before fallback"
+        );
+        result
+    }
+
+    #[test]
+    fn audit10_7_pattern_lock_timeout_fallback_rejects_unreadable_postings() {
+        let (_directory, context, _) = unreadable_postings_fixture();
+        let request = crate::protocol::RawRequest {
+            id: "pattern-lock-timeout".to_string(),
+            command: "semantic_search".to_string(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"pattern":"needleHandler", "topK":10}),
+        };
+        let response = audit10_7_after_regex_lock_timeout(&context, || {
+            crate::commands::semantic_search::handle_semantic_search(&request, &context)
+        });
+        assert!(
+            !response.success,
+            "unreadable postings became a complete empty reply: {:?}",
+            response.data
+        );
+        assert!(response.data.to_string().contains("lexical postings"));
+    }
+
+    #[test]
+    fn audit10_7_split_lock_timeout_fallback_preserves_posting_read_gaps() {
+        let (_directory, context, _) = unreadable_postings_fixture();
+        let request = crate::protocol::RawRequest {
+            id: "split-lock-timeout".to_string(),
+            command: "semantic_search".to_string(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"query":"how is work scheduled", "pattern":"needleHandler", "topK":10}),
+        };
+        let response = audit10_7_after_regex_lock_timeout(&context, || {
+            crate::commands::semantic_search::handle_semantic_search(&request, &context)
+        });
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], false);
+        assert!(
+            response.data["index_read_gap"]
+                .to_string()
+                .contains("lexical postings"),
+            "{:?}",
+            response.data
+        );
+        assert_eq!(response.data["pattern_summary"]["examination_capped"], true);
+    }
+
+    #[test]
     fn audit10_search_lock_poison_recovers() {
         let poisoned = std::panic::catch_unwind(|| {
             let _guard = super::CACHE_LOCK_ACQUIRE_MUTEX
@@ -12325,7 +12616,7 @@ mod tests {
             or_filters: Vec::new(),
         };
         super::POSTING_COUNT_CALLS.with(|calls| calls.set(0));
-        assert!(index.snapshot().candidates(&query).is_empty());
+        assert!(index.snapshot().candidates(&query).unwrap().is_empty());
         super::POSTING_COUNT_CALLS.with(|calls| assert_eq!(calls.get(), 32));
     }
 
@@ -12355,7 +12646,7 @@ mod tests {
         super::BASE_CANCELLATION_CHECKS.with(|count| count.set(0));
         super::SUPERSEDED_LOOKUPS.with(|count| count.set(0));
         assert_eq!(
-            index.snapshot().postings_for_trigram(7, None),
+            index.snapshot().postings_for_trigram(7, None).unwrap(),
             (0..200).collect::<Vec<_>>()
         );
         super::BASE_CANCELLATION_CHECKS.with(|count| assert_eq!(count.get(), 4));
@@ -12501,18 +12792,29 @@ mod tests {
             "{} file slots for one live file",
             index.files.len()
         );
-        assert_eq!(before.candidates(&decompose_regex("old_marker")).len(), 1);
         assert_eq!(
-            index.candidates(&decompose_regex("new_marker_255")).len(),
+            before
+                .candidates(&decompose_regex("old_marker"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .candidates(&decompose_regex("new_marker_255"))
+                .unwrap()
+                .len(),
             1
         );
         let reference = SearchIndex::build_with_limit_serial(dir.path(), DEFAULT_MAX_FILE_SIZE);
         assert_eq!(
             index
                 .grep("new_marker_255", true, &[], &[], dir.path(), 100)
+                .unwrap()
                 .matches,
             reference
                 .grep("new_marker_255", true, &[], &[], dir.path(), 100)
+                .unwrap()
                 .matches
         );
     }
@@ -12994,7 +13296,9 @@ mod tests {
             candidate_filter,
             max_files,
         );
-        let actual = snapshot.lexical_rank_with_stats(query_trigrams, candidate_filter, max_files);
+        let actual = snapshot
+            .lexical_rank_with_stats(query_trigrams, candidate_filter, max_files)
+            .unwrap();
         assert_eq!(actual.files, expected.files);
         assert_eq!(actual.engine_capped, expected.engine_capped);
         actual
@@ -13449,7 +13753,7 @@ mod tests {
             ..RegexQuery::default()
         };
 
-        let candidates = index.candidates(&query);
+        let candidates = index.candidates(&query).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(index.files[candidates[0] as usize].path, alpha);
     }
@@ -13476,11 +13780,13 @@ mod tests {
         assert_eq!(
             index
                 .postings_for_trigram(trigram, Some(matching_filter))
+                .unwrap()
                 .len(),
             1
         );
         assert!(index
             .postings_for_trigram(trigram, Some(non_matching_filter))
+            .unwrap()
             .is_empty());
     }
 
@@ -13524,7 +13830,7 @@ mod tests {
             for filter in filters {
                 let expected =
                     postings_for_trigram_materialized_reference(&snapshot, trigram, filter);
-                let actual = snapshot.postings_for_trigram(trigram, filter);
+                let actual = snapshot.postings_for_trigram(trigram, filter).unwrap();
                 assert_eq!(
                     actual, expected,
                     "trigram={trigram:#08x}, filter={filter:?}"
@@ -13535,14 +13841,16 @@ mod tests {
             }
         }
 
-        let unfiltered = snapshot.postings_for_trigram(base_and_delta, None);
-        let loc_only = snapshot.postings_for_trigram(
-            base_and_delta,
-            Some(PostingFilter {
-                next_mask: 0,
-                loc_mask: mask_for_position(31),
-            }),
-        );
+        let unfiltered = snapshot.postings_for_trigram(base_and_delta, None).unwrap();
+        let loc_only = snapshot
+            .postings_for_trigram(
+                base_and_delta,
+                Some(PostingFilter {
+                    next_mask: 0,
+                    loc_mask: mask_for_position(31),
+                }),
+            )
+            .unwrap();
         assert_eq!(loc_only, unfiltered);
     }
 
@@ -13570,7 +13878,7 @@ mod tests {
         let new_id = *index.path_to_id.get(&a).expect("re-added file id");
         assert!(new_id >= index.base_file_count);
         let abc = pack_trigram(b'a', b'b', b'c');
-        let ids = index.postings_for_trigram(abc, None);
+        let ids = index.postings_for_trigram(abc, None).unwrap();
         assert_eq!(ids, {
             let mut expected = vec![b_id, new_id];
             expected.sort_unstable();
@@ -13664,35 +13972,36 @@ mod tests {
         let old_trigram = pack_trigram(b'o', b'l', b'd');
         let new_trigram = pack_trigram(b'n', b'e', b'w');
         assert_eq!(
-            before_edit.postings_for_trigram(old_trigram, None),
+            before_edit.postings_for_trigram(old_trigram, None).unwrap(),
             vec![old_file_id]
         );
         assert!(before_edit
             .postings_for_trigram(new_trigram, None)
+            .unwrap()
             .is_empty());
         assert!(after_edit
             .postings_for_trigram(old_trigram, None)
+            .unwrap()
             .is_empty());
         assert_eq!(
-            after_edit.postings_for_trigram(new_trigram, None),
+            after_edit.postings_for_trigram(new_trigram, None).unwrap(),
             vec![new_file_id]
         );
 
-        let dirty_result = index.read().expect("read dirty index").grep(
-            "new_generation",
-            true,
-            &[],
-            &[],
-            &project,
-            100,
-        );
+        let dirty_result = index
+            .read()
+            .expect("read dirty index")
+            .grep("new_generation", true, &[], &[], &project, 100)
+            .unwrap();
         let reference_cache = dir.path().join("reference-cache");
         let reference = SearchIndex::build_with_limit_to_cache_dir(
             &project,
             DEFAULT_MAX_FILE_SIZE,
             &reference_cache,
         );
-        let reference_result = reference.grep("new_generation", true, &[], &[], &project, 100);
+        let reference_result = reference
+            .grep("new_generation", true, &[], &[], &project, 100)
+            .unwrap();
         assert_eq!(dirty_result.matches, reference_result.matches);
         assert_eq!(dirty_result.total_matches, reference_result.total_matches);
     }
@@ -13729,7 +14038,8 @@ mod tests {
         reset_postings_for_trigram_count_for_debug();
         let result = index
             .snapshot()
-            .lexical_rank_with_stats(&query, None, 1_000);
+            .lexical_rank_with_stats(&query, None, 1_000)
+            .unwrap();
 
         assert!(result.files.len() > 1);
         assert_eq!(
@@ -13778,11 +14088,14 @@ mod tests {
         assert!(index.delta.postings.is_empty());
         assert!(index.delta.superseded.is_empty());
         assert_eq!(
-            index.postings_for_trigram(pack_trigram(b'a', b'b', b'c'), None),
+            index
+                .postings_for_trigram(pack_trigram(b'a', b'b', b'c'), None)
+                .unwrap(),
             vec![0]
         );
         assert!(index
             .postings_for_trigram(pack_trigram(b'd', b'e', b'f'), None)
+            .unwrap()
             .is_empty());
     }
 
@@ -13929,7 +14242,9 @@ mod tests {
         );
         assert_eq!(loaded.trigram_count(), index.trigram_count());
         assert_eq!(
-            loaded.postings_for_trigram(pack_trigram(b'a', b'b', b'c'), None),
+            loaded
+                .postings_for_trigram(pack_trigram(b'a', b'b', b'c'), None)
+                .unwrap(),
             vec![0]
         );
         assert_eq!(
@@ -14027,7 +14342,9 @@ mod tests {
         assert!(refreshed
             .path_to_id
             .contains_key(&canonical_project.join("untracked.txt")));
-        let matches = refreshed.grep("after local edit", true, &[], &[], &canonical_project, 10);
+        let matches = refreshed
+            .grep("after local edit", true, &[], &[], &canonical_project, 10)
+            .expect("grep over a test index");
         assert_eq!(matches.matches.len(), 1);
     }
 
@@ -14158,7 +14475,9 @@ mod tests {
         )
         .expect("each edited file must count once against the warm budget");
         assert_eq!(refreshed.git_head.as_deref(), Some(current.as_str()));
-        let result = refreshed.grep("QuotedPathNeedle", true, &[], &[], &canonical_project, 10);
+        let result = refreshed
+            .grep("QuotedPathNeedle", true, &[], &[], &canonical_project, 10)
+            .expect("grep over a test index");
         assert_eq!(result.total_matches, names.len());
     }
 
@@ -14205,7 +14524,9 @@ mod tests {
             Some(WARM_GIT_DIFF_PATH_LIMIT),
         )
         .expect("warm refresh");
-        let new = refreshed.grep("QuotedNew", true, &[], &[], &canonical_project, 10);
+        let new = refreshed
+            .grep("QuotedNew", true, &[], &[], &canonical_project, 10)
+            .expect("grep over a test index");
         let mut found: Vec<_> = new
             .matches
             .iter()
@@ -14215,7 +14536,9 @@ mod tests {
         let mut expected: Vec<_> = names.iter().map(std::ffi::OsString::from).collect();
         expected.sort();
         assert_eq!(found, expected, "every committed edit must be searchable");
-        let old = refreshed.grep("QuotedOld", true, &[], &[], &canonical_project, 10);
+        let old = refreshed
+            .grep("QuotedOld", true, &[], &[], &canonical_project, 10)
+            .expect("grep over a test index");
         assert_eq!(old.total_matches, 0, "no stale content may remain");
     }
 
@@ -14280,14 +14603,20 @@ mod tests {
                 vec![canonical_project.join("inside.rs")],
                 "{lane}: nothing outside the root may enter the index"
             );
-            let new = index.grep("SubdirNew", true, &[], &[], &canonical_project, 10);
+            let new = index
+                .grep("SubdirNew", true, &[], &[], &canonical_project, 10)
+                .expect("grep over a test index");
             assert_eq!(
                 new.total_matches, 1,
                 "{lane}: the edit under the root is searchable"
             );
-            let old = index.grep("SubdirOld", true, &[], &[], &canonical_project, 10);
+            let old = index
+                .grep("SubdirOld", true, &[], &[], &canonical_project, 10)
+                .expect("grep over a test index");
             assert_eq!(old.total_matches, 0, "{lane}: no stale content may remain");
-            let outside = index.grep("Outside", true, &[], &[], &canonical_project, 10);
+            let outside = index
+                .grep("Outside", true, &[], &[], &canonical_project, 10)
+                .expect("grep over a test index");
             assert_eq!(
                 outside.total_matches, 0,
                 "{lane}: outside content stays out"
@@ -16027,7 +16356,9 @@ mod tests {
             Some(baseline),
             None,
         );
-        let result = refreshed.grep("newtoken", true, &[], &[], &project, 10);
+        let result = refreshed
+            .grep("newtoken", true, &[], &[], &project, 10)
+            .unwrap();
 
         assert_eq!(result.total_matches, 1);
     }
@@ -16044,6 +16375,7 @@ mod tests {
         assert_eq!(
             indexed
                 .grep("unchanged-limit-token", true, &[], &[], &project, 10)
+                .unwrap()
                 .total_matches,
             1
         );
@@ -16070,6 +16402,7 @@ mod tests {
         assert_eq!(
             raised
                 .grep("unchanged-limit-token", true, &[], &[], &project, 10)
+                .unwrap()
                 .total_matches,
             1
         );
@@ -16096,6 +16429,7 @@ mod tests {
         assert_eq!(
             refreshed
                 .grep("unchangedtoken", true, &[], &[], &project, 10)
+                .unwrap()
                 .total_matches,
             1
         );
@@ -16130,7 +16464,7 @@ mod tests {
         fs::write(docs.join("guide.md"), "SearchIndex guide\n").expect("write docs file");
 
         let index = SearchIndex::build(&project);
-        let result = index.grep("SearchIndex", true, &[], &[], &src, 10);
+        let result = index.grep("SearchIndex", true, &[], &[], &src, 10).unwrap();
 
         assert_eq!(result.files_searched, 1);
         assert_eq!(result.files_with_matches, 1);
@@ -16149,7 +16483,7 @@ mod tests {
         fs::write(src.join("main.rs"), "SearchIndex SearchIndex\n").expect("write src file");
 
         let index = SearchIndex::build(&project);
-        let result = index.grep("SearchIndex", true, &[], &[], &src, 10);
+        let result = index.grep("SearchIndex", true, &[], &[], &src, 10).unwrap();
 
         assert_eq!(result.total_matches, 1);
         assert_eq!(result.matches.len(), 1);
@@ -16165,13 +16499,15 @@ mod tests {
         let index = SearchIndex::build(&project);
         assert!(index.is_ready());
 
-        let whitespace = index.grep(r"^\s+[0-9]+ pass", true, &[], &[], &project, 10);
+        let whitespace = index
+            .grep(r"^\s+[0-9]+ pass", true, &[], &[], &project, 10)
+            .unwrap();
         assert_eq!(whitespace.matches.len(), 1);
         assert_eq!(whitespace.matches[0].line, 2);
         assert_eq!(whitespace.matches[0].line_text, "  566 pass");
         assert_eq!(whitespace.matches[0].match_text, "  566 pass");
 
-        let negated_class = index.grep(r"[^x]+", true, &[], &[], &project, 10);
+        let negated_class = index.grep(r"[^x]+", true, &[], &[], &project, 10).unwrap();
         assert_eq!(negated_class.matches.len(), 1);
         assert_eq!(negated_class.matches[0].line, 2);
         assert_eq!(negated_class.matches[0].match_text, "  566 pass");
@@ -16180,7 +16516,9 @@ mod tests {
             .iter()
             .all(|matched| !matched.match_text.contains('\n')));
 
-        let explicit_newline = index.grep(r"pass\nx", true, &[], &[], &project, 10);
+        let explicit_newline = index
+            .grep(r"pass\nx", true, &[], &[], &project, 10)
+            .unwrap();
         assert!(explicit_newline.matches.is_empty());
 
         let regex = match pattern_compile::compile(r"[^x]+", CompileOpts::default()) {
@@ -16210,7 +16548,9 @@ mod tests {
             CompileResult::Ok(pattern) => pattern,
             other => panic!("compile literal newline: {other:?}"),
         };
-        let result = index.search_grep(&literal_newline, &[], &[], &project, 10);
+        let result = index
+            .search_grep(&literal_newline, &[], &[], &project, 10)
+            .unwrap();
         assert!(result.matches.is_empty());
     }
 
@@ -16223,7 +16563,9 @@ mod tests {
         std::fs::write(&file, "foo hit\nbar\nprefix foo hit\nbar\n")
             .expect("write cross-line fixture");
         let index = SearchIndex::build(&project);
-        let result = index.grep(r"foo.*\nbar|hit", true, &[], &[], &project, 10);
+        let result = index
+            .grep(r"foo.*\nbar|hit", true, &[], &[], &project, 10)
+            .unwrap();
 
         assert_eq!(result.matches.len(), 2);
         assert_eq!(result.matches[0].line, 1);
@@ -16243,7 +16585,7 @@ mod tests {
         fs::write(&file, "äbc\n").expect("write unicode file");
 
         let index = SearchIndex::build(&project);
-        let result = index.grep("Äbc", false, &[], &[], &project, 10);
+        let result = index.grep("Äbc", false, &[], &[], &project, 10).unwrap();
 
         assert_eq!(result.total_matches, 1);
         assert_eq!(result.matches.len(), 1);
@@ -16274,7 +16616,7 @@ mod tests {
             }
             other => panic!("expected literal pattern for {needle:?}, got {other:?}"),
         };
-        let result = index.search_grep(&pattern, &[], &[], &project, 10);
+        let result = index.search_grep(&pattern, &[], &[], &project, 10).unwrap();
 
         assert_eq!(result.index_status, IndexStatus::Ready);
         assert!(
@@ -16462,6 +16804,7 @@ mod tests {
                 GrepScanOrder::Arrival,
                 PATH_ORDER_BATCH_ROW_BUDGET,
             )
+            .unwrap()
             .0
     }
 
@@ -16753,7 +17096,9 @@ mod tests {
             Some(baseline),
             None,
         );
-        let result = refreshed.grep("bravo", true, &[], &[], &project, 10);
+        let result = refreshed
+            .grep("bravo", true, &[], &[], &project, 10)
+            .unwrap();
         let canonical_file = fs::canonicalize(&file).expect("canonicalize edited file");
         let refreshed_id = *refreshed
             .path_to_id
@@ -16763,9 +17108,11 @@ mod tests {
         assert_eq!(result.total_matches, 1);
         assert!(refreshed
             .postings_for_trigram(pack_trigram(b'b', b'r', b'a'), None)
+            .unwrap()
             .contains(&refreshed_id));
         assert!(!refreshed
             .postings_for_trigram(pack_trigram(b'a', b'l', b'p'), None)
+            .unwrap()
             .contains(&refreshed_id));
     }
 
@@ -16778,7 +17125,7 @@ mod tests {
         fs::write(src.join("main.rs"), "SearchIndex\nSearchIndex\n").expect("write src file");
 
         let index = SearchIndex::build(&project);
-        let result = index.grep("SearchIndex", true, &[], &[], &src, 1);
+        let result = index.grep("SearchIndex", true, &[], &[], &src, 1).unwrap();
 
         assert_eq!(result.total_matches, 2);
         assert_eq!(result.matches.len(), 1);
@@ -16919,8 +17266,12 @@ mod tests {
             assert_eq!(serial_file.content_hash, parallel_file.content_hash);
         }
 
-        let serial_grep = serial.grep("aft_perf_marker_17", true, &[], &[], &project, 10);
-        let parallel_grep = parallel.grep("aft_perf_marker_17", true, &[], &[], &project, 10);
+        let serial_grep = serial
+            .grep("aft_perf_marker_17", true, &[], &[], &project, 10)
+            .unwrap();
+        let parallel_grep = parallel
+            .grep("aft_perf_marker_17", true, &[], &[], &project, 10)
+            .unwrap();
         assert_eq!(serial_grep.matches, parallel_grep.matches);
         assert_eq!(serial_grep.total_matches, parallel_grep.total_matches);
         assert_eq!(serial_grep.files_searched, parallel_grep.files_searched);
@@ -17142,7 +17493,9 @@ mod tests {
             .expect("write");
         }
         let index = SearchIndex::build_with_limit(dir.path(), DEFAULT_MAX_FILE_SIZE);
-        let result = index.grep("needle_token", false, &[], &[], dir.path(), 1000);
+        let result = index
+            .grep("needle_token", false, &[], &[], dir.path(), 1000)
+            .unwrap();
         assert!(
             result.matches.len() >= 40,
             "expected a match per file, got {}",
@@ -17222,10 +17575,12 @@ mod tests {
             .postings
             .insert(shared_trigram, optimized);
 
-        let actual = index.candidates(&RegexQuery {
-            and_trigrams: vec![shared_trigram],
-            ..RegexQuery::default()
-        });
+        let actual = index
+            .candidates(&RegexQuery {
+                and_trigrams: vec![shared_trigram],
+                ..RegexQuery::default()
+            })
+            .unwrap();
         let expected = reference
             .into_iter()
             .map(|posting| posting.file_id)
@@ -17493,7 +17848,7 @@ mod warm_reload_verification_tests {
                         "NewAliasNeedle",
                     ] {
                         assert_eq!(
-                            refreshed.grep(needle, true, &[], &[], &scope, 10).matches.len(),
+                            refreshed.grep(needle, true, &[], &[], &scope, 10).expect("grep over a test index").matches.len(),
                             1,
                             "ready index must find {needle} through {scope:?} (persisted={persisted}, strategy={strategy:?})"
                         );
@@ -17540,6 +17895,7 @@ mod warm_reload_verification_tests {
                     assert_eq!(
                         refreshed
                             .grep("unchanged", true, &[], &[], refresh_root, 10)
+                            .expect("grep over a test index")
                             .matches
                             .len(),
                         1
@@ -17646,6 +18002,7 @@ mod warm_reload_verification_tests {
             assert_eq!(
                 refreshed
                     .grep("afterx", true, &[], &[], &root, 10)
+                    .expect("grep over a test index")
                     .matches
                     .len(),
                 1
@@ -17993,7 +18350,9 @@ mod project_ignore_rule_tests {
 
     fn indexed_needle_files(root: &Path) -> BTreeSet<String> {
         let index = SearchIndex::build(root);
-        let result = index.grep(fixture::NEEDLE, true, &[], &[], root, 1000);
+        let result = index
+            .grep(fixture::NEEDLE, true, &[], &[], root, 1000)
+            .unwrap();
         let files = result
             .matches
             .iter()

@@ -139,11 +139,13 @@ fn real_corpus_lane_work_counts() {
         let trigrams = extract_trigrams(query.as_bytes()).into_iter().map(|(trigram, _, _)| trigram).collect::<Vec<_>>();
         let lane = measure(&format!("lexical/{label}"), || CanonicalLexicalLane::from_snapshot(&snapshot, &trigrams, None, 50).unwrap());
         result_digest(&format!("lexical/{label}"), &lane.canonical_order());
-        let exact = measure(&format!("exact/{label}"), || snapshot.whole_corpus_exact_pass(query, &root, None));
+        let exact = measure(&format!("exact/{label}"), || snapshot.whole_corpus_exact_pass(query, &root, None).unwrap());
         result_digest(&format!("exact/{label}"), &exact.iter().map(|hit| (&hit.path, hit.symbol_range, &hit.evidence, &hit.content_digest)).collect::<Vec<_>>());
     }
     let anchored = measure("anchored/search.*index", || {
-        AnchoredLane::new().execute_ready_mode(&index, &root, "search.*index", true)
+        AnchoredLane::new()
+            .execute_ready_mode(&index, &root, "search.*index", true)
+            .unwrap()
     });
     result_digest("anchored/search.*index", &anchored);
 }

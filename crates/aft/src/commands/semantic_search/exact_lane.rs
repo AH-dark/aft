@@ -273,12 +273,34 @@ impl ExactLane {
         include_tests: bool,
         scope: &ExactEvidenceScope,
     ) -> VerifiedExactSet {
-        let matches = snapshot.whole_corpus_exact_pass_scoped(
+        let matches = match snapshot.whole_corpus_exact_pass_scoped(
             query,
             project_root,
             Some(&|path| super::path_allowed_by_include_tests(path, project_root, include_tests)),
             scope,
-        );
+        ) {
+            Ok(matches) => matches,
+            Err(error) => {
+                let mut fallback = self
+                    .execute_fallback_mode(
+                        project_root,
+                        query,
+                        include_tests,
+                        &FallbackExactOptions::default(),
+                    )
+                    .verified_set;
+                let reason = format!(
+                    "Exact index source unavailable: {error}; verified-source fallback used"
+                );
+                if let Some(disclosure) = &mut fallback.bound_disclosure {
+                    disclosure.push_str("; ");
+                    disclosure.push_str(&reason);
+                } else {
+                    fallback.bound_disclosure = Some(reason);
+                }
+                return fallback;
+            }
+        };
 
         let mut results = Vec::new();
         let mut file_digests = HashMap::new();
@@ -544,7 +566,7 @@ impl SearchLane for ExactLane {
         SearchLaneKind::Exact
     }
 
-    fn execute(&self, input: &LaneInput<'_>) -> LaneExecution {
+    fn execute(&self, input: &LaneInput<'_>) -> std::io::Result<LaneExecution> {
         let snapshot = input.index.snapshot();
         let keeps_definitions =
             input.shape == crate::commands::semantic_search::SearchShape::Identifier;
@@ -568,10 +590,10 @@ impl SearchLane for ExactLane {
                     != crate::commands::semantic_search::EvidenceKind::Definition
             });
         }
-        LaneExecution {
+        Ok(LaneExecution {
             kind: self.kind(),
             candidates,
-        }
+        })
     }
 }
 
@@ -793,7 +815,9 @@ fn audit01_visibility_counts(
     (
         ready.file_digests.len(),
         fallback.verified_set.file_digests.len(),
-        anchored.len(),
+        anchored
+            .expect("anchored candidates from a test index")
+            .len(),
     )
 }
 
