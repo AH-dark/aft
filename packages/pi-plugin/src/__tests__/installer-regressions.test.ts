@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { type ChildProcess, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { _runInstallForTesting as runInstall } from "../lsp-auto-install.js";
+import { lspPackageDir, writeInstalledMetaIn, writeVersionCheck } from "../lsp-cache.js";
 import { NPM_LSP_TABLE } from "../lsp-npm-table.js";
 
 /** Run `fn` with a private AFT cache and a fake `npm` first on PATH. */
@@ -33,6 +34,27 @@ function settlesWithin<T>(promise: Promise<T>, ms: number): Promise<boolean> {
     new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ms)),
   ]);
 }
+
+describe("metadata publication", () => {
+  for (const writer of ["npm", "version"] as const) {
+    test(`${writer} metadata replaces rather than truncates the previous inode`, async () => {
+      await cacheFixture((root) => {
+        const pkg = lspPackageDir("fixture");
+        mkdirSync(pkg, { recursive: true });
+        const path = join(pkg, writer === "version" ? ".aft-version-check" : ".aft-installed");
+        // A second name for the old inode shows whether the writer truncated
+        // the file in place (a concurrent reader's view) or renamed over it.
+        const old = join(root, "old-metadata");
+        writeFileSync(path, "old-metadata");
+        linkSync(path, old);
+        if (writer === "npm") writeInstalledMetaIn(pkg, "1.0.0", "0".repeat(64));
+        else writeVersionCheck("fixture", "1.0.0");
+        expect(readFileSync(old, "utf8")).toBe("old-metadata");
+        expect(JSON.parse(readFileSync(path, "utf8"))).toBeDefined();
+      });
+    });
+  }
+});
 
 describe("shutdown hooks", () => {
   test("beforeExit does not suppress later signal cleanup", () => {
