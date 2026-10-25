@@ -385,9 +385,7 @@ fn memory_limit_stops_pty_command() {
 #[test]
 fn memory_limit_cmd_waiter_contains_and_kills_powershell_tree() {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::JobObjects::{
-        IsProcessInJob, OpenJobObjectW, JOB_OBJECT_QUERY,
-    };
+    use windows_sys::Win32::System::JobObjects::{IsProcessInJob, OpenJobObjectW};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
         PROCESS_QUERY_LIMITED_INFORMATION,
@@ -498,15 +496,18 @@ fn memory_limit_cmd_waiter_contains_and_kills_powershell_tree() {
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "{form}: process did not reach its ready gate: {}",
-                    path.display()
+                    "{form}: process did not reach its ready gate: {}; status={:?}; terminal={:?}",
+                    path.display(),
+                    registry.status(&id, "memory-waiter", None, None, 4096),
+                    std::fs::read_to_string(&task.paths.pty)
                 );
                 std::thread::sleep(Duration::from_millis(20));
             }
         };
         let pids = [root, read_pid(&shell_ready), read_pid(&child_ready)];
         let name: Vec<u16> = format!("Local\\AFT-memory-{id}\0").encode_utf16().collect();
-        let job = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, name.as_ptr()) };
+        const JOB_OBJECT_QUERY_RIGHT: u32 = 0x0004;
+        let job = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY_RIGHT, 0, name.as_ptr()) };
         assert!(
             !job.is_null(),
             "open memory job: {}",

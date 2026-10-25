@@ -14755,9 +14755,11 @@ fn detached_shell_command_for(
             // The cmd root blocks on stdin before creating PowerShell. Attach
             // the Job Object to that root before the parent releases the gate.
             memory_file_gate = false;
-            shell
-                .write_wrapper(command, exit_path, &wrapper_path)
-                .map_err(|error| format!("failed to write PowerShell payload: {error}"))?;
+            if memory_gated {
+                shell
+                    .write_wrapper(command, exit_path, &wrapper_path)
+                    .map_err(|error| format!("failed to write PowerShell payload: {error}"))?;
+            }
         } else {
             shell
                 .write_direct_wrapper(command, exit_path, &wrapper_path, memory_gated)

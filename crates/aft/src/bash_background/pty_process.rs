@@ -221,15 +221,18 @@ pub(crate) fn spawn_pty_for_command(
                 (OsString::from(shell.binary().as_ref()), args)
             };
             let mut waiter_env;
+            let memory_cmd_waiter = waiter_environment.is_some();
             let env = if let Some((key, value)) = waiter_environment {
                 // The job is attached to the cmd root before its stdin gate is
                 // released. PowerShell must not wait on a second file gate.
                 memory_file_gate = false;
-                shell
-                    .write_wrapper(user_command, &paths.exit, &wrapper_path)
-                    .map_err(|error| {
-                        crate::windows_shell::PtyAttemptError::Wrapper(error.to_string())
-                    })?;
+                if memory_monitor.is_some() {
+                    shell
+                        .write_wrapper(user_command, &paths.exit, &wrapper_path)
+                        .map_err(|error| {
+                            crate::windows_shell::PtyAttemptError::Wrapper(error.to_string())
+                        })?;
+                }
                 waiter_env = env.clone();
                 waiter_env.insert(key, value);
                 &waiter_env
@@ -270,6 +273,7 @@ pub(crate) fn spawn_pty_for_command(
                 memory_monitor,
                 publish_memory_policy,
                 memory_file_gate,
+                memory_cmd_waiter,
             )
             .map_err(crate::windows_shell::PtyAttemptError::Spawn)
         });
@@ -320,6 +324,7 @@ fn try_spawn_pty(
     memory_monitor: &mut Option<super::memory_limit::Monitor>,
     publish_memory_policy: &mut dyn FnMut(&super::memory_limit::MemoryPolicy) -> Result<(), String>,
     #[cfg(windows)] memory_file_gate: bool,
+    #[cfg(windows)] memory_cmd_waiter: bool,
 ) -> Result<PtyRuntime, String> {
     let (command, profile_handle) = crate::sandbox_spawn::pty_command_for_plan(
         spawn_plan,
@@ -415,6 +420,9 @@ fn try_spawn_pty(
         #[cfg(windows)]
         let ready: &[u8] = if memory_file_gate {
             b""
+        } else if memory_cmd_waiter {
+            // cmd's console SET /P gate needs an Enter key, not a literal LF.
+            b"aft-memory-ready\r"
         } else {
             b"aft-memory-ready\n"
         };
