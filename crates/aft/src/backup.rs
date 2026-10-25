@@ -8563,11 +8563,16 @@ mod tests {
     /// an attempt that starts just before the deadline finishes its file I/O
     /// first, and a loaded host can also stall the thread right after a wait.
     /// On loaded Windows hosts one stack-lease attempt (creating its temporary
-    /// lease file) took 5.6 s, returning cleanup 5.2 s past its allowance, and
-    /// a session-gate wait returned 5.0 s past it. A wait that ignores the
-    /// allowance lasts until the test releases the held lease after
-    /// `CLEANUP_HANG_GUARD`, well beyond this margin.
+    /// lease file) took 5.6 s, and one session-stage cleanup took 6.96 s in
+    /// all, so Windows gets a wide margin. On Linux, under the same load, every
+    /// stage returned within a millisecond of its allowance, so elsewhere the
+    /// margin stays tight. A wait that ignores the allowance lasts until the
+    /// test releases the held lease after `CLEANUP_HANG_GUARD`, well beyond
+    /// either margin.
+    #[cfg(windows)]
     const CLEANUP_RETURN_MARGIN: Duration = Duration::from_secs(12);
+    #[cfg(not(windows))]
+    const CLEANUP_RETURN_MARGIN: Duration = Duration::from_secs(3);
     /// How long the test lets a cleanup worker run before it releases the held
     /// lease. It only keeps a wait that ignores the allowance from hanging the
     /// suite; the verdict is the worker's own measurement of its cleanup.
