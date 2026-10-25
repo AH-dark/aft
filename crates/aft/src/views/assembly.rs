@@ -1810,13 +1810,13 @@ impl Drop for PublicationProfile {
             .lock()
             .entry(self.root.clone())
             .or_default()
-            .push(self.outcome);
+            .push((self.outcome, self.scheduling.clone()));
     }
 }
 
 #[cfg(test)]
 static PUBLICATION_OUTCOMES: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<PathBuf, Vec<&'static str>>>,
+    parking_lot::Mutex<std::collections::HashMap<PathBuf, Vec<(&'static str, String)>>>,
 > = std::sync::LazyLock::new(Default::default);
 
 #[cfg(test)]
@@ -1824,7 +1824,21 @@ pub(crate) fn publication_outcomes_for_test(root: &Path) -> Vec<&'static str> {
     PUBLICATION_OUTCOMES
         .lock()
         .get(root)
-        .cloned()
+        .map(|profiles| profiles.iter().map(|(outcome, _)| *outcome).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) fn publication_scheduling_for_test(root: &Path) -> Vec<String> {
+    PUBLICATION_OUTCOMES
+        .lock()
+        .get(root)
+        .map(|profiles| {
+            profiles
+                .iter()
+                .map(|(_, scheduling)| scheduling.clone())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
