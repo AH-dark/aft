@@ -4109,6 +4109,27 @@ fn per_match_ack_wire_reports_settlement_only_after_last_terminal_watch() {
     assert_eq!(second["success"], true);
     drop(release_guard);
     wait_for_status(&mut aft, SESSION, &task_id, "completed");
+    // Terminal status is a snapshot, not a delivery barrier. Pattern frames
+    // follow durable match writes, so observe both watches before testing drain.
+    let mut awaiting_watch_ids = vec![
+        first["watch_id"].as_str().unwrap(),
+        second["watch_id"].as_str().unwrap(),
+    ];
+    assert_ne!(awaiting_watch_ids[0], awaiting_watch_ids[1]);
+    let started = Instant::now();
+    while !awaiting_watch_ids.is_empty() {
+        if let Some(frame) = aft.try_read_next_timeout(Duration::from_millis(200)) {
+            if frame["type"] == "bash_pattern_match" && frame["task_id"] == task_id {
+                if let Some(watch_id) = frame["watch_id"].as_str() {
+                    awaiting_watch_ids.retain(|awaiting| *awaiting != watch_id);
+                }
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "timed out waiting for persisted pattern frames for {task_id}: {awaiting_watch_ids:?}"
+        );
+    }
     let pending = drain(&mut aft, SESSION)["pending_matches"]
         .as_array()
         .unwrap()
