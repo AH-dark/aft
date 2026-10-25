@@ -10658,7 +10658,9 @@ fn git_diff_within_path_limit(diff: &[u8], limit: usize) -> bool {
         })
 }
 
-fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
+pub(crate) fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
+    #[cfg(test)]
+    LINE_STARTS_BUILDS.with(|count| count.set(count.get() + 1));
     let mut starts = vec![0usize];
     for (index, byte) in content.iter().copied().enumerate() {
         if byte == b'\n' {
@@ -10670,6 +10672,7 @@ fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static LINE_STARTS_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static POSTING_COUNT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SUPERSEDED_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BASE_CANCELLATION_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -10689,10 +10692,19 @@ fn grep_scan_test_now() -> Instant {
 /// holding `offset`, plus the byte offset where the next line starts (the
 /// end of `content` for the last line). The text is bounded the way grep
 /// prints it, see [`bounded_grep_line_text_bytes`].
-fn line_details_bytes(
+pub(crate) fn line_details_bytes(
     content: &[u8],
     line_starts: &[usize],
     offset: usize,
+) -> (u32, u32, String, usize) {
+    line_details_bytes_with_cr_policy(content, line_starts, offset, false)
+}
+
+pub(crate) fn line_details_bytes_with_cr_policy(
+    content: &[u8],
+    line_starts: &[usize],
+    offset: usize,
+    trim_all_cr: bool,
 ) -> (u32, u32, String, usize) {
     #[cfg(test)]
     LINE_DETAILS_PROBE.with(|probe| {
@@ -10713,8 +10725,12 @@ fn line_details_bytes(
         None => (content.len(), content.len()),
     };
     let mut line_slice = &content[line_start..line_end];
-    if line_slice.ends_with(b"\r") {
+    // Fallback trims every trailing CR; indexed grep removes only the CR in CRLF.
+    while line_slice.ends_with(b"\r") {
         line_slice = &line_slice[..line_slice.len() - 1];
+        if !trim_all_cr {
+            break;
+        }
     }
     let line_text = bounded_grep_line_text_bytes(line_slice);
     let column = String::from_utf8_lossy(&content[line_start..offset])

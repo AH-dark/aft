@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -780,7 +780,7 @@ fn execute_root_profiled(
     // Explicit single-file scope: search the named file directly, bypassing the
     // trigram index and the gitignore/.aftignore-aware walk. Matches ripgrep,
     // where naming a file explicitly searches it even when it is gitignored,
-    // .aftignored, or not yet indexed. Binary + UTF-8 guards still apply.
+    // .aftignored, or not yet indexed. Binary detection still applies.
     if crate::bounded_io::metadata(&root.search_root).is_ok_and(|m| m.is_file()) {
         if root.use_index && !crate::context::confinement::active() {
             crate::commands::configure::trigger_search_index_reload_if_evicted(ctx);
@@ -965,8 +965,8 @@ fn empty_grep_result(index_status: IndexStatus, fully_degraded: bool) -> GrepRes
 /// and the gitignore/.aftignore-aware walk. Used when the caller's `path`
 /// resolves to one existing file — ripgrep semantics: an explicitly-named file
 /// is searched even when it is gitignored, `.aftignore`d, or not yet indexed.
-/// Binary detection and UTF-8 guards still apply (via `read_searchable_text`
-/// inside `fallback_search_file`).
+/// Binary detection still applies; matched text is rendered lossily by
+/// `fallback_search_file`.
 #[cfg(test)]
 fn grep_explicit_file(
     file: &Path,
@@ -1036,6 +1036,16 @@ pub fn merge_grep_results(
     project_root: &Path,
     max_results: usize,
 ) -> GrepResult {
+    merge_grep_results_with_canonicalizer(results, project_root, max_results, canonical_key)
+}
+
+fn merge_grep_results_with_canonicalizer(
+    results: Vec<GrepResult>,
+    project_root: &Path,
+    max_results: usize,
+    mut canonicalize: impl FnMut(&Path) -> PathBuf,
+) -> GrepResult {
+    let mut canonical_files = HashMap::new();
     let mut matches = Vec::new();
     let mut total_matches = 0usize;
     let mut files_searched = 0usize;
@@ -1051,8 +1061,10 @@ pub fn merge_grep_results(
     let mut files_read_directly = 0usize;
     let mut walk_bound = None;
     let mut seen_match_keys = HashSet::new();
+    let mut seen_files_with_matches = HashSet::new();
 
     for result in results {
+        let mut child_files = HashSet::new();
         total_matches += result.total_matches;
         files_searched += result.files_searched;
         files_with_matches += result.files_with_matches;
@@ -1068,10 +1080,22 @@ pub fn merge_grep_results(
         walk_bound = walk_bound.or(result.walk_bound);
 
         for grep_match in result.matches {
-            let file_key = canonical_key(&grep_match.file);
+            let file_key = canonical_files
+                .entry(grep_match.file.clone())
+                .or_insert_with(|| Arc::new(canonicalize(&grep_match.file)))
+                .clone();
+            if child_files.insert(file_key.clone())
+                && !seen_files_with_matches.insert(file_key.clone())
+            {
+                files_with_matches = files_with_matches.saturating_sub(1);
+            }
             let match_key = (file_key, grep_match.line, grep_match.column);
             if seen_match_keys.insert(match_key) {
                 matches.push(grep_match);
+            } else {
+                // A truncated child can omit matching locations, so the merged
+                // total may still count duplicates. Subtract only visible ones.
+                total_matches = total_matches.saturating_sub(1);
             }
         }
     }
@@ -2223,12 +2247,11 @@ fn fallback_search_file(
     if crate::search_index::is_binary_bytes(&bytes) {
         return Vec::new();
     }
-    let Ok(content) = String::from_utf8(bytes) else {
-        return Vec::new();
-    };
+    let content = bytes;
     files_searched.fetch_add(1, Ordering::Relaxed);
 
-    let line_starts = line_starts(&content);
+    let mut line_starts = None;
+    let mut valid_utf8 = None;
     // Start of the line after the last reported one; see `search_literal_in_text`.
     let mut reported_line_end = 0usize;
     let mut matched_this_file = false;
@@ -2238,7 +2261,8 @@ fn fallback_search_file(
         CompiledPattern::Literal(literal) => search_literal_in_text(
             file,
             &content,
-            &line_starts,
+            &mut line_starts,
+            &mut valid_utf8,
             literal,
             max_results,
             stop_after,
@@ -2254,7 +2278,7 @@ fn fallback_search_file(
         CompiledPattern::Regex { compiled, .. } => {
             crate::pattern_compile::for_each_line_match(
                 compiled,
-                content.as_bytes(),
+                &content,
                 |match_start, match_end| {
                     if deadline.is_some_and(|deadline| Instant::now() >= deadline)
                         || should_stop_fallback_search(
@@ -2274,8 +2298,14 @@ fn fallback_search_file(
                     if match_start < reported_line_end {
                         return true;
                     }
-                    let (line, column, line_text, next_line_start) =
-                        line_details_with_next(&content, &line_starts, match_start);
+                    let (line, column, line_text, next_line_start) = fallback_line_details_bytes(
+                        &content,
+                        line_starts.get_or_insert_with(|| {
+                            crate::search_index::line_starts_bytes(&content)
+                        }),
+                        match_start,
+                        &mut valid_utf8,
+                    );
                     reported_line_end = next_line_start;
 
                     matched_this_file = true;
@@ -2290,10 +2320,8 @@ fn fallback_search_file(
                         line,
                         column,
                         line_text,
-                        match_text: String::from_utf8_lossy(
-                            &content.as_bytes()[match_start..match_end],
-                        )
-                        .into_owned(),
+                        match_text: String::from_utf8_lossy(&content[match_start..match_end])
+                            .into_owned(),
                     });
                     true
                 },
@@ -2308,10 +2336,24 @@ fn fallback_search_file(
     matches
 }
 
-fn search_literal_in_text(
+fn fallback_line_details_bytes<'a>(
+    content: &'a [u8],
+    starts: &[usize],
+    offset: usize,
+    valid_utf8: &mut Option<Option<&'a str>>,
+) -> (u32, u32, String, usize) {
+    // Byte regexes can start inside a Unicode character. Preserve character
+    // columns for valid UTF-8, validating only once after the first match.
+    let text = valid_utf8.get_or_insert_with(|| std::str::from_utf8(content).ok());
+    let column_offset = text.map_or(offset, |text| text.floor_char_boundary(offset));
+    crate::search_index::line_details_bytes_with_cr_policy(content, starts, column_offset, true)
+}
+
+fn search_literal_in_text<'a>(
     file: &Path,
-    content: &str,
-    line_starts: &[usize],
+    content: &'a [u8],
+    line_starts: &mut Option<Vec<usize>>,
+    valid_utf8: &mut Option<Option<&'a str>>,
     literal: &LiteralSearch,
     max_results: usize,
     stop_after: usize,
@@ -2328,7 +2370,7 @@ fn search_literal_in_text(
         return;
     }
 
-    let content_bytes = content.as_bytes();
+    let content_bytes = content;
     let search_content;
     let haystack = if literal.case_insensitive_ascii {
         search_content = content_bytes.to_ascii_lowercase();
@@ -2356,8 +2398,12 @@ fn search_literal_in_text(
             start = offset + 1;
             continue;
         }
-        let (line, column, line_text, next_line_start) =
-            line_details_with_next(content, line_starts, offset);
+        let (line, column, line_text, next_line_start) = fallback_line_details_bytes(
+            content,
+            line_starts.get_or_insert_with(|| crate::search_index::line_starts_bytes(content)),
+            offset,
+            valid_utf8,
+        );
         *reported_line_end = next_line_start;
         start = next_line_start.max(offset + 1);
 
@@ -2486,6 +2532,157 @@ fn line_details_with_next(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn audit10_fallback_matches(bytes: &[u8], pattern: CompiledPattern) -> Vec<GrepMatch> {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("text.txt");
+        std::fs::write(&file, bytes).unwrap();
+        assert!(!crate::search_index::is_binary_bytes(bytes));
+        fallback_search_file(
+            &file,
+            &pattern,
+            10,
+            11,
+            &AtomicUsize::new(0),
+            &AtomicUsize::new(0),
+            &AtomicUsize::new(0),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            None,
+            None,
+            false,
+        )
+    }
+
+    #[test]
+    fn audit10_fallback_literal_accepts_non_utf8_text() {
+        let pattern = CompiledPattern::Literal(LiteralSearch {
+            needle: b"needle".to_vec(),
+            case_insensitive_ascii: false,
+        });
+        let matches = audit10_fallback_matches(b"caf\xe9 needle\r\nneedle\n", pattern);
+        assert_eq!(matches.len(), 2);
+        assert_eq!((matches[0].line, matches[0].column), (1, 6));
+        assert_eq!(matches[0].line_text, "caf\u{fffd} needle");
+        assert_eq!(matches[0].match_text, "needle");
+        assert_eq!((matches[1].line, matches[1].column), (2, 1));
+    }
+
+    #[test]
+    fn audit10_fallback_regex_accepts_non_utf8_text() {
+        let crate::pattern_compile::CompileResult::Ok(pattern) = crate::pattern_compile::compile(
+            "n[e]+dle",
+            crate::pattern_compile::CompileOpts::default(),
+        ) else {
+            panic!("regex must compile")
+        };
+        let matches = audit10_fallback_matches(b"caf\xe9 needle\r\nneedle\n", pattern);
+        assert_eq!(matches.len(), 2);
+        assert_eq!((matches[0].line, matches[0].column), (1, 6));
+        assert_eq!(matches[0].line_text, "caf\u{fffd} needle");
+        assert_eq!(matches[0].match_text, "needle");
+    }
+
+    #[test]
+    fn audit10_fallback_builds_line_table_only_on_match() {
+        for pattern in ["needle", "n[e]+dle"] {
+            let crate::pattern_compile::CompileResult::Ok(pattern) =
+                crate::pattern_compile::compile(
+                    pattern,
+                    crate::pattern_compile::CompileOpts::default(),
+                )
+            else {
+                panic!("pattern must compile")
+            };
+            crate::search_index::LINE_STARTS_BUILDS.with(|count| count.set(0));
+            assert!(audit10_fallback_matches(b"no match\nsecond line\n", pattern).is_empty());
+            crate::search_index::LINE_STARTS_BUILDS.with(|count| assert_eq!(count.get(), 0));
+        }
+    }
+
+    #[test]
+    fn audit10_fallback_preserves_utf8_line_rendering() {
+        let pattern = CompiledPattern::Literal(LiteralSearch {
+            needle: b"needle".to_vec(),
+            case_insensitive_ascii: false,
+        });
+        let matches = audit10_fallback_matches("caf\u{e9} needle\r\r\n".as_bytes(), pattern);
+        assert_eq!(matches.len(), 1);
+        assert_eq!((matches[0].line, matches[0].column), (1, 6));
+        assert_eq!(matches[0].line_text, "caf\u{e9} needle");
+    }
+
+    #[test]
+    fn audit10_fallback_byte_regex_preserves_utf8_character_columns() {
+        let crate::pattern_compile::CompileResult::Ok(pattern) = crate::pattern_compile::compile(
+            r"(?-u:\xA9)",
+            crate::pattern_compile::CompileOpts::default(),
+        ) else {
+            panic!("byte regex must compile")
+        };
+        let matches = audit10_fallback_matches("caf\u{e9} needle\n".as_bytes(), pattern);
+        assert_eq!(matches.len(), 1);
+        assert_eq!((matches[0].line, matches[0].column), (1, 4));
+        assert_eq!(matches[0].line_text, "caf\u{e9} needle");
+        assert_eq!(matches[0].match_text, "\u{fffd}");
+    }
+
+    #[test]
+    fn audit10_merge_canonicalizes_once_per_raw_file() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("one.rs");
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+        let mut calls = 0;
+        let merged = merge_grep_results_with_canonicalizer(
+            vec![
+                result(
+                    vec![grep_match(&file, 1, 1), grep_match(&file, 2, 1)],
+                    false,
+                    IndexStatus::Ready,
+                ),
+                result(vec![grep_match(&file, 1, 1)], false, IndexStatus::Ready),
+            ],
+            root.path(),
+            10,
+            |path| {
+                calls += 1;
+                canonical_key(path)
+            },
+        );
+        assert_eq!(merged.matches.len(), 2);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn audit10_merge_duplicate_scopes_do_not_inflate_match_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("one.rs");
+        std::fs::write(&file, "needle\n").unwrap();
+        let merged = merge_grep_results(
+            vec![
+                result(vec![grep_match(&file, 1, 1)], false, IndexStatus::Ready),
+                result(vec![grep_match(&file, 1, 1)], false, IndexStatus::Ready),
+            ],
+            root.path(),
+            1,
+        );
+        assert_eq!(merged.matches.len(), 1);
+        assert_eq!(merged.total_matches, 1);
+        assert_eq!(merged.files_with_matches, 1);
+        assert!(!merged.truncated);
+        let mut incomplete = result(vec![grep_match(&file, 1, 1)], true, IndexStatus::Ready);
+        incomplete.total_matches = 5;
+        let merged = merge_grep_results(
+            vec![
+                result(vec![grep_match(&file, 1, 1)], false, IndexStatus::Ready),
+                incomplete,
+            ],
+            root.path(),
+            10,
+        );
+        assert_eq!(merged.total_matches, 5);
+        assert!(merged.truncated);
+    }
 
     fn grep_io_fixture() -> (tempfile::TempDir, AppContext) {
         let dir = tempfile::tempdir().unwrap();
