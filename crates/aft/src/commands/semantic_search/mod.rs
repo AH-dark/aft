@@ -2027,16 +2027,27 @@ impl SearchLaneStatus {
         let Some(data) = response.data.as_object_mut() else {
             return;
         };
-        // These labels are observed after the reply was built. A reply that
-        // opens by saying its results came from a bounded walk because the
-        // trigram index was still loading must not end with `trigram: ready`
-        // because the load finished while the walk ran.
-        let walked_while_trigram_loading = data
+        // The lanes are observed after the answer was built, so on their own
+        // they say whether an index is usable now, not what served this
+        // answer. The answer records that itself: results read from files
+        // directly (`fully_degraded`) and a semantic lane that failed for this
+        // query. A lane label never calls a lane ready that did not serve.
+        let read_files_directly = data
+            .get("fully_degraded")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        // A reply that opens with the bounded-walk disclosure says it read
+        // files directly because the trigram index was still loading.
+        let walk_disclosed = data
             .get("text")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|text| text.starts_with(TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE));
+        // An answer read from files directly did not use the trigram index,
+        // even when its load finished while the files were read: report the
+        // lane as still building, in the labels and in `lanes` alike.
+        let trigram_unused = (read_files_directly || walk_disclosed) && self.trigram.is_ready();
         let relabelled;
-        let lanes = if walked_while_trigram_loading && self.trigram.is_ready() {
+        let lanes = if trigram_unused {
             relabelled = Self {
                 trigram: IndexObservation::building(),
                 semantic: self.semantic.clone(),
@@ -2045,14 +2056,25 @@ impl SearchLaneStatus {
         } else {
             self
         };
+        // The disclosure already says why the index was not used; any other
+        // such reply says it in the trigram label.
+        let trigram_label =
+            (trigram_unused && !walk_disclosed).then_some(TRIGRAM_READ_FILES_DIRECTLY);
+        let semantic_query_failure = data
+            .get(SEMANTIC_QUERY_FAILURE_KEY)
+            .and_then(serde_json::Value::as_str)
+            .filter(|_| self.semantic.is_ready())
+            .map(|reason| SEMANTIC_UNAVAILABLE_FOR_QUERY.replace("{reason}", reason));
         // Runtime readiness means the resident index can be queried, not that
         // this query covered the checkout. Do not contradict its named gaps
         // with a later, generic `semantic: ready` footer.
-        let semantic_label = data.get("semantic_gap").map(|gap| {
-            gap.get("unavailable")
-                .and_then(serde_json::Value::as_str)
-                .map(|reason| format!("semantic: unavailable: {reason}"))
-                .unwrap_or_else(|| "semantic: partial (checkout coverage gaps)".to_string())
+        let semantic_label = semantic_query_failure.or_else(|| {
+            data.get("semantic_gap").map(|gap| {
+                gap.get("unavailable")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|reason| format!("semantic: unavailable: {reason}"))
+                    .unwrap_or_else(|| "semantic: partial (checkout coverage gaps)".to_string())
+            })
         });
         let labels = lanes.text(ctx);
         let labels = labels
@@ -2060,6 +2082,8 @@ impl SearchLaneStatus {
             .map(|line| {
                 if line.starts_with("semantic:") {
                     semantic_label.as_deref().unwrap_or(line)
+                } else if line.starts_with("trigram:") {
+                    trigram_label.unwrap_or(line)
                 } else {
                     line
                 }
@@ -2507,6 +2531,9 @@ fn handle_external_search(
             page_request,
             extensions,
             engine_plan,
+            disk_check
+                .as_ref()
+                .is_none_or(|(check, _)| check.verified()),
         ),
     };
     if let Some((check, age)) = &disk_check {
@@ -3169,6 +3196,7 @@ fn handle_external_semantic_or_hybrid_search(
     page_request: paging::ValidatedPageRequest,
     extensions: &dyn extensions::SearchExtensions,
     engine_plan: &extensions::LanePlan<'_>,
+    disk_checked_in_full: bool,
 ) -> Response {
     let mut semantic_status = "ready";
     let semantic_index = match semantic_artifact {
@@ -3330,12 +3358,21 @@ fn handle_external_semantic_or_hybrid_search(
     let snippets_incomplete =
         enrich_snippets_from_source_with_context(&mut ranked.results, &external_root, Some(ctx));
     let display_root = absolute_display_root(&external_root);
-    let mut text = format_semantic_text_with_display_root(
+    let mut text = format_ranked_text(
         &ranked.results,
         &display_root,
         more_available,
         snippets_incomplete,
         Some(ctx),
+        // "No file contains" holds only when the saved index was compared
+        // with every file on disk. A check cut short by its budget leaves
+        // files whose current text the index may not hold; the reply then
+        // says how far the check got (see `disclose_checked_saved_index`)
+        // and makes no claim that the literal is absent.
+        ranked
+            .literal_absent
+            .as_deref()
+            .filter(|_| disk_checked_in_full),
     );
     if let Some(answer) = &ranked.not_found {
         text = answer.render(&display_root);
@@ -3734,6 +3771,7 @@ fn handle_grep_search(
         );
     }
 
+    let ranked_total = ranked_files.as_ref().map(Vec::len);
     let interval_end = offset.saturating_add(top_k);
     let interval_has_more = if ranked_files.is_some() {
         // Every ranked file is already in hand, one result each; a deeper page
@@ -3809,9 +3847,17 @@ fn handle_grep_search(
         }
         extras.insert("lexical_only_fallback".to_string(), serde_json::json!(true));
         extras.insert("semantic_unavailable".to_string(), serde_json::json!(true));
-    } else if let Some(envelope) =
-        search_cut_envelope(result_values.len(), interval_has_more, result.engine_capped)
-    {
+    } else if let Some(envelope) = match &ranked_total {
+        // Every matching file was ranked before the page was cut, so the
+        // total number of results (one per file) is known exactly.
+        Some(total) if interval_has_more && !result.engine_capped => {
+            crate::list_surfaces::search::build_exact_total_search_envelope(
+                result_values.len(),
+                *total,
+            )
+        }
+        _ => search_cut_envelope(result_values.len(), interval_has_more, result.engine_capped),
+    } {
         crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, &envelope);
     }
     search_response(
@@ -4092,6 +4138,10 @@ struct EngineRanking {
     /// the index. Its nearest names are then the results, and its rendering
     /// replaces the rendered result list.
     not_found: Option<nearest_names::NotFoundAnswer>,
+    /// Set when a code-literal query occurs in no indexed file: the literal
+    /// as the reply names it. The results are then only similar, and are
+    /// rendered as such.
+    literal_absent: Option<String>,
 }
 
 /// `source` of a result that is a nearest name in a not-found answer.
@@ -4102,6 +4152,207 @@ const NEAREST_NAME_SOURCE: &str = "nearest_name";
 fn snippet_set_by_engine(result: &HybridResult) -> bool {
     (result.source == "lexical" && matches!(result.kind, SymbolKind::FileSummary))
         || result.source == NEAREST_NAME_SOURCE
+}
+
+/// Most files the presence check reads for one query before it gives up.
+const LITERAL_PRESENCE_MAX_READS: usize = 256;
+
+/// How long the presence check may read files for one query before it
+/// gives up.
+const LITERAL_PRESENCE_BUDGET: Duration = Duration::from_millis(250);
+
+#[cfg(test)]
+thread_local! {
+    /// Files the presence check read on this thread.
+    static LITERAL_PRESENCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Times the presence check went past the exact candidates to the
+    /// corpus on this thread.
+    static LITERAL_PRESENCE_CORPUS_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Replaces `LITERAL_PRESENCE_MAX_READS` on this thread.
+    static LITERAL_PRESENCE_MAX_READS_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The presence check's counters on this thread, as (files read, corpus
+/// scans), reset to zero.
+#[cfg(test)]
+fn take_literal_presence_counts() -> (usize, usize) {
+    (
+        LITERAL_PRESENCE_READS.with(|count| count.replace(0)),
+        LITERAL_PRESENCE_CORPUS_SCANS.with(|count| count.replace(0)),
+    )
+}
+
+fn literal_presence_max_reads() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = LITERAL_PRESENCE_MAX_READS_OVERRIDE.with(std::cell::Cell::get) {
+        return limit;
+    }
+    LITERAL_PRESENCE_MAX_READS
+}
+
+fn file_stamp(path: &Path) -> memo::FileStamp {
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.len(), metadata.modified().ok()))
+}
+
+/// Whether some file holds the whole of `phrase`, for the missing-literal
+/// notice; only `Absent` lets the reply say no file contains it.
+///
+/// The answer is settled once per query (root, index generation, literal)
+/// and kept in the exact memo, so later pages of the same query reuse it:
+/// they only check, from file metadata and the index's postings, that the
+/// files it rests on are unchanged and that no new file may hold the
+/// literal.
+fn literal_presence(
+    ctx: &AppContext,
+    snapshot: &crate::search_index::SearchIndexSnapshot,
+    project_root: &Path,
+    generation: &GenerationToken,
+    phrase: &str,
+    exact_candidates: &[CandidateResult],
+) -> memo::LiteralPresence {
+    let normalized = exact_lane::normalize_exact_phrase(phrase);
+    let key = (
+        project_root.to_path_buf(),
+        generation.clone(),
+        normalized.clone(),
+    );
+    let store = ctx.search_exact_memo();
+    if let Some(entry) = store.literal_presence(&key) {
+        if literal_presence_still_holds(&entry, snapshot, phrase, project_root) {
+            return entry.presence;
+        }
+    }
+    let entry = settle_literal_presence(
+        snapshot,
+        project_root,
+        phrase,
+        &normalized,
+        exact_candidates,
+    );
+    let presence = entry.presence;
+    store.store_literal_presence(key, entry);
+    presence
+}
+
+/// Whether a kept answer still describes the files: the files it read are
+/// the same size and age, and for an absence the index offers the same
+/// possible holders (a file that gained the literal would join them).
+fn literal_presence_still_holds(
+    entry: &memo::LiteralPresenceEntry,
+    snapshot: &crate::search_index::SearchIndexSnapshot,
+    phrase: &str,
+    project_root: &Path,
+) -> bool {
+    let unchanged = entry
+        .read
+        .iter()
+        .all(|(path, stamp)| stamp.is_some() && file_stamp(path) == *stamp);
+    match entry.presence {
+        // Making no claim is always safe, and repeating the same bounded
+        // check on every page would cost each page what the first one did.
+        memo::LiteralPresence::Undetermined => true,
+        memo::LiteralPresence::Present => unchanged,
+        memo::LiteralPresence::Absent => {
+            unchanged
+                && snapshot
+                    .files_possibly_holding_phrase(phrase, project_root)
+                    .as_ref()
+                    == Some(&entry.candidates)
+        }
+    }
+}
+
+/// Files read by one presence check, within its bounds.
+struct PresenceReads {
+    normalized: String,
+    deadline: Instant,
+    max_reads: usize,
+    read: Vec<(PathBuf, memo::FileStamp)>,
+    seen: HashSet<PathBuf>,
+}
+
+impl PresenceReads {
+    /// `Some(true)` when `path` holds the literal, `Some(false)` when it does
+    /// not (or was already read), `None` when the check cannot tell: its
+    /// bounds ran out or the file could not be read.
+    fn holds(&mut self, path: &Path) -> Option<bool> {
+        if !self.seen.insert(path.to_path_buf()) {
+            return Some(false);
+        }
+        if self.read.len() >= self.max_reads || Instant::now() >= self.deadline {
+            return None;
+        }
+        #[cfg(test)]
+        LITERAL_PRESENCE_READS.with(|count| count.set(count.get() + 1));
+        let stamp = file_stamp(path);
+        let text = crate::search_index::read_searchable_text(path)?;
+        self.read.push((path.to_path_buf(), stamp));
+        Some(exact_lane::normalize_exact_phrase(&text).contains(&self.normalized))
+    }
+
+    fn entry(
+        self,
+        presence: memo::LiteralPresence,
+        candidates: Vec<PathBuf>,
+    ) -> memo::LiteralPresenceEntry {
+        let read = match presence {
+            // A presence rests on its holder alone, the last file read.
+            memo::LiteralPresence::Present => self.read.into_iter().last().into_iter().collect(),
+            memo::LiteralPresence::Absent => self.read,
+            memo::LiteralPresence::Undetermined => Vec::new(),
+        };
+        memo::LiteralPresenceEntry {
+            presence,
+            read,
+            candidates,
+        }
+    }
+}
+
+/// Settle whether some file holds the literal, reading as little as
+/// possible: the exact candidates first, in rank order, stopping at the first
+/// that holds it (the common case reads one file); only when none does, the
+/// other files the index says may hold it, again stopping at the first
+/// holder. Running out of reads or time, or meeting an unreadable file,
+/// settles nothing: that is never an absence.
+fn settle_literal_presence(
+    snapshot: &crate::search_index::SearchIndexSnapshot,
+    project_root: &Path,
+    phrase: &str,
+    normalized: &str,
+    exact_candidates: &[CandidateResult],
+) -> memo::LiteralPresenceEntry {
+    use memo::LiteralPresence::{Absent, Present, Undetermined};
+    let mut reads = PresenceReads {
+        normalized: normalized.to_string(),
+        deadline: Instant::now() + LITERAL_PRESENCE_BUDGET,
+        max_reads: literal_presence_max_reads(),
+        read: Vec::new(),
+        seen: HashSet::new(),
+    };
+    for candidate in exact_candidates {
+        match reads.holds(&candidate.path) {
+            Some(true) => return reads.entry(Present, Vec::new()),
+            Some(false) => {}
+            None => return reads.entry(Undetermined, Vec::new()),
+        }
+    }
+    #[cfg(test)]
+    LITERAL_PRESENCE_CORPUS_SCANS.with(|count| count.set(count.get() + 1));
+    let Some(candidates) = snapshot.files_possibly_holding_phrase(phrase, project_root) else {
+        return reads.entry(Undetermined, Vec::new());
+    };
+    for path in &candidates {
+        match reads.holds(path) {
+            Some(true) => return reads.entry(Present, Vec::new()),
+            Some(false) => {}
+            None => return reads.entry(Undetermined, Vec::new()),
+        }
+    }
+    reads.entry(Absent, candidates)
 }
 
 /// What a request carrying both `query` and `pattern` adds to an engine run.
@@ -4744,6 +4995,34 @@ fn run_engine_ranking(
             ),
         }
     });
+    // A code literal that no indexed file contains (tests included) gets the
+    // same kind of answer: the reply says so first, and the files that only
+    // share its words are labelled similar rather than presented as matches.
+    // Phrases shorter than a trigram cannot be checked, so they get no claim.
+    //
+    // Exact evidence alone does not show the literal is present: a
+    // declaration or mention of one of its words (`bash_wait_detach = true`
+    // for `bash_wait_detach(`) is exact evidence too. A file counts only when
+    // its text holds the whole literal, punctuation included, compared the way
+    // the exact lane compares phrases (case and runs of whitespace ignored).
+    // Only a settled absence makes the claim; see `literal_presence`.
+    let literal_absent = (not_found.is_none()
+        && plan.shape == SearchShape::CodeLiteral
+        && exact_disclosures.is_empty()
+        && index.is_ready())
+    .then(|| exact_lane::exact_phrase(exact_input))
+    .filter(|phrase| phrase.len() >= 3)
+    .filter(|phrase| {
+        literal_presence(
+            ctx,
+            &snapshot,
+            project_root,
+            &generation,
+            phrase,
+            &exact_candidates,
+        ) == memo::LiteralPresence::Absent
+    })
+    .map(str::to_string);
 
     let path_lookup_candidates = if plan.contains(SearchLaneKind::PathLookup) {
         let query_path_tokens = query
@@ -5498,6 +5777,7 @@ fn run_engine_ranking(
             prose_found,
             split_placements,
             not_found: not_found.clone(),
+            literal_absent: None,
         });
     }
     Ok(EngineRanking {
@@ -5521,6 +5801,7 @@ fn run_engine_ranking(
         prose_found,
         split_placements,
         not_found: None,
+        literal_absent,
     })
 }
 
@@ -5572,12 +5853,13 @@ fn handle_engine_only_search(
     }
     let snippets_incomplete =
         enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
-    let mut text = format_semantic_text(
+    let mut text = format_ranked_text(
         &ranked.results,
         project_root,
         ranked.more_available,
         snippets_incomplete,
         Some(ctx),
+        ranked.literal_absent.as_deref(),
     );
     if let Some(answer) = &ranked.not_found {
         text = answer.render(project_root);
@@ -5814,7 +6096,8 @@ fn handle_semantic_or_hybrid_search(
                 return cancelled_search_response(req);
             }
             let gap = semantic_embed_gap(&error);
-            return semantic_unavailable_or_fallback_response(
+            let reason = query_embedding_failure_reason(&error, gap.footer_reason);
+            let response = semantic_unavailable_or_fallback_response(
                 req,
                 ctx,
                 &params,
@@ -5832,6 +6115,7 @@ fn handle_semantic_or_hybrid_search(
                 extensions,
                 engine_plan,
             );
+            return with_semantic_query_failure(response, reason);
         }
     };
     if search_cancellation_requested() {
@@ -5870,7 +6154,8 @@ fn handle_semantic_or_hybrid_search(
                 .unwrap_or_default(),
             None => {
                 let gap = semantic_artifacts_busy_gap();
-                return semantic_unavailable_or_fallback_response(
+                let reason = gap.footer_reason.to_string();
+                let response = semantic_unavailable_or_fallback_response(
                     req,
                     ctx,
                     &params,
@@ -5888,6 +6173,7 @@ fn handle_semantic_or_hybrid_search(
                     extensions,
                     engine_plan,
                 );
+                return with_semantic_query_failure(response, reason);
             }
         }
     };
@@ -5977,12 +6263,13 @@ fn handle_semantic_or_hybrid_search(
     let snippets_incomplete =
         enrich_snippets_from_source_with_context(&mut results, project_root, Some(ctx));
 
-    let mut text = format_semantic_text(
+    let mut text = format_ranked_text(
         &results,
         project_root,
         more_available,
         snippets_incomplete,
         Some(ctx),
+        engine_ranking.literal_absent.as_deref(),
     );
     if let Some(answer) = &engine_ranking.not_found {
         text = answer.render(project_root);
@@ -6127,12 +6414,13 @@ fn zero_result_escalation_response(
     }
     let snippets_incomplete =
         enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
-    let mut text = format_semantic_text_with_display_root(
+    let mut text = format_ranked_text(
         &ranked.results,
         display_root,
         ranked.more_available,
         snippets_incomplete,
         Some(ctx),
+        ranked.literal_absent.as_deref(),
     );
     if let Some(answer) = &ranked.not_found {
         text = answer.render(display_root);
@@ -6317,8 +6605,13 @@ fn semantic_unavailable_or_fallback_response(
         };
         let snippets_incomplete =
             enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
-        let mut text =
-            format_lexical_unavailable_text(&detail, &ranked.results, project_root, footer_reason);
+        let mut text = format_lexical_unavailable_text(
+            &detail,
+            &ranked.results,
+            project_root,
+            footer_reason,
+            ranked.literal_absent.as_deref(),
+        );
         if let Some(answer) = &ranked.not_found {
             text = answer.render(project_root);
         }
@@ -7381,6 +7674,7 @@ fn format_lexical_unavailable_text(
     results: &[HybridResult],
     project_root: &Path,
     footer_reason: &str,
+    literal_absent: Option<&str>,
 ) -> String {
     if results.is_empty() {
         let retry = retry_nudge_for_unavailable_detail(detail);
@@ -7389,9 +7683,19 @@ fn format_lexical_unavailable_text(
         );
     }
 
+    // A literal no file contains opens the list with that fact, and the
+    // list's files are labelled similar rather than matches.
+    let sections = match literal_absent {
+        Some(literal) => format!(
+            "{}\n\n{}",
+            absent_literal_line(literal),
+            format_result_sections_labelled(results, project_root, None, TextualHits::Similar)
+        ),
+        None => format_result_sections(results, project_root),
+    };
     format!(
         "{detail}\nSemantic search unavailable; returning lexical-only fallback results.\n\n{}\n\nFound {} lexical fallback result(s). [semantic: {footer_reason}]",
-        format_result_sections(results, project_root),
+        sections,
         results.len()
     )
 }
@@ -7535,6 +7839,54 @@ fn semantic_not_loaded_gap(ctx: &AppContext) -> SemanticLaneGap {
         .to_string(),
         footer_reason: "not_ready",
     }
+}
+
+/// Response key naming why this request's semantic lane failed although the
+/// lane itself stayed loaded, for example a failed query embedding. The lane
+/// footer reads it so it never calls that lane ready for this answer.
+const SEMANTIC_QUERY_FAILURE_KEY: &str = "semantic_query_failure";
+
+/// Lane footer for a semantic lane that is loaded but failed this query.
+const SEMANTIC_UNAVAILABLE_FOR_QUERY: &str = "semantic: unavailable for this query ({reason})";
+
+/// Lane footer for a trigram index that was not used because this answer's
+/// results were read from files directly.
+const TRIGRAM_READ_FILES_DIRECTLY: &str =
+    "trigram: loading (this answer read files directly, no index)";
+
+/// Reason a query embedding failed, for the semantic lane footer.
+const QUERY_EMBEDDING_FAILED: &str = "query embedding failed";
+
+/// The footer reason for a failed query embedding: the classified reason
+/// when the failure has a specific one (a timeout, a busy or warming-up
+/// embedder), otherwise that the embedding failed, with the HTTP status when
+/// the embedding client reported one (it words those `request failed (HTTP
+/// <code> ...`).
+fn query_embedding_failure_reason(error: &str, footer_reason: &str) -> String {
+    if footer_reason != "unavailable" {
+        return footer_reason.to_string();
+    }
+    let status = error
+        .split_once("request failed (HTTP ")
+        .and_then(|(_, rest)| rest.get(..3))
+        .filter(|code| code.bytes().all(|byte| byte.is_ascii_digit()));
+    match status {
+        Some(code) => format!("{QUERY_EMBEDDING_FAILED}: HTTP {code}"),
+        None => QUERY_EMBEDDING_FAILED.to_string(),
+    }
+}
+
+/// Record on a successful fallback reply why its semantic lane failed.
+fn with_semantic_query_failure(mut response: Response, reason: String) -> Response {
+    if response.success {
+        if let Some(data) = response.data.as_object_mut() {
+            data.insert(
+                SEMANTIC_QUERY_FAILURE_KEY.to_string(),
+                serde_json::json!(reason),
+            );
+        }
+    }
+    response
 }
 
 /// The gap for a query embedding that failed or timed out.
@@ -7749,6 +8101,7 @@ fn results_are_low_confidence(results: &[HybridResult]) -> bool {
         .is_some_and(|cosine| cosine < WEAK_MATCH_COSINE_FLOOR)
 }
 
+#[cfg(test)]
 fn format_semantic_text(
     results: &[HybridResult],
     project_root: &Path,
@@ -7772,15 +8125,49 @@ fn format_semantic_text_with_display_root(
     snippets_incomplete: bool,
     ctx: Option<&AppContext>,
 ) -> String {
+    format_ranked_text(
+        results,
+        display_root,
+        more_available,
+        snippets_incomplete,
+        ctx,
+        None,
+    )
+}
+
+/// The reply text for ranked results. `literal_absent` names a code literal
+/// that occurs in no indexed file: the reply then opens by saying so and
+/// calls its results similar, never matches.
+fn format_ranked_text(
+    results: &[HybridResult],
+    display_root: &Path,
+    more_available: bool,
+    snippets_incomplete: bool,
+    ctx: Option<&AppContext>,
+    literal_absent: Option<&str>,
+) -> String {
     if results.is_empty() {
         return "Found 0 results.".to_string();
     }
 
-    let mut text = format_result_sections_with_context(results, display_root, ctx);
+    let mut text = match literal_absent {
+        Some(literal) => format!(
+            "{}\n\n{}",
+            absent_literal_line(literal),
+            format_result_sections_labelled(results, display_root, ctx, TextualHits::Similar)
+        ),
+        None => format_result_sections_with_context(results, display_root, ctx),
+    };
     // Drop the unconditional "[index: ready]" tag — it was pure per-call tax on
     // the common path. Degraded/building/unavailable paths carry their own
     // distinct "[semantic: ...]" labels, so absence of a label means ready.
-    text.push_str(&format!("\n\nFound {} result(s).", results.len()));
+    match literal_absent {
+        Some(_) => text.push_str(&format!(
+            "\n\n{}",
+            SIMILAR_RESULTS_FOOTER.replace("{count}", &results.len().to_string())
+        )),
+        None => text.push_str(&format!("\n\nFound {} result(s).", results.len())),
+    }
     if more_available {
         text.push_str(" More results available; raise topK to see more.");
     }
@@ -8391,16 +8778,48 @@ fn format_result_sections(results: &[HybridResult], project_root: &Path) -> Stri
     format_result_sections_with_context(results, project_root, None)
 }
 
+/// Whether textual (lexical) hits may be called matches. They may not when
+/// the query's literal occurs in no file: they only share words with it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextualHits {
+    Matches,
+    Similar,
+}
+
+/// Label of a file holding a lexical hit for a literal that occurs nowhere.
+const SIMILAR_LABEL: &str = " [similar]";
+
+/// First line of a reply whose code literal occurs in no indexed file.
+const ABSENT_LITERAL_LINE: &str =
+    "No file contains `{literal}`. The files below only share words with it; none of them is a match.";
+
+/// Count line of a reply whose results only share words with the literal.
+const SIMILAR_RESULTS_FOOTER: &str = "Found {count} similar result(s).";
+
+fn absent_literal_line(literal: &str) -> String {
+    ABSENT_LITERAL_LINE.replace("{literal}", literal)
+}
+
 fn format_result_sections_with_context(
     results: &[HybridResult],
     project_root: &Path,
     ctx: Option<&AppContext>,
 ) -> String {
-    format_result_sections_within_budget(
+    format_result_sections_labelled(results, project_root, ctx, TextualHits::Matches)
+}
+
+fn format_result_sections_labelled(
+    results: &[HybridResult],
+    project_root: &Path,
+    ctx: Option<&AppContext>,
+    textual_hits: TextualHits,
+) -> String {
+    format_result_sections_within_budget_labelled(
         results,
         project_root,
         ctx,
         snippet_bounds::SEARCH_MAX_OUTPUT_BYTES,
+        textual_hits,
     )
 }
 
@@ -8408,11 +8827,30 @@ fn format_result_sections_with_context(
 /// The budget is checked before each path, symbol header and snippet line is
 /// appended, so nothing past the cut is rendered. A cut reply ends with a note
 /// saying how many results were shown and how to narrow the search.
+#[cfg(test)]
 fn format_result_sections_within_budget(
     results: &[HybridResult],
     project_root: &Path,
     ctx: Option<&AppContext>,
     max_bytes: usize,
+) -> String {
+    format_result_sections_within_budget_labelled(
+        results,
+        project_root,
+        ctx,
+        max_bytes,
+        TextualHits::Matches,
+    )
+}
+
+/// [`format_result_sections_within_budget`], labelling each file that holds
+/// a lexical hit as a match or, for an absent literal, as similar.
+fn format_result_sections_within_budget_labelled(
+    results: &[HybridResult],
+    project_root: &Path,
+    ctx: Option<&AppContext>,
+    max_bytes: usize,
+    textual_hits: TextualHits,
 ) -> String {
     // Results arrive sorted by fused score desc. Group by file preserving
     // first-appearance order so the most relevant file's group renders first.
@@ -8462,14 +8900,26 @@ fn format_result_sections_within_budget(
             )),
             None => header.push_str(file),
         }
-        if groups[file].iter().any(|(_, result)| result.exact) {
-            header.push_str(" [exact]");
-        }
-        if groups[file]
+        let exact = groups[file].iter().any(|(_, result)| result.exact);
+        let lexical = groups[file]
             .iter()
-            .any(|(_, result)| result.source == "lexical")
-        {
-            header.push_str(" [lexical match]");
+            .any(|(_, result)| result.source == "lexical");
+        match textual_hits {
+            TextualHits::Matches => {
+                if exact {
+                    header.push_str(" [exact]");
+                }
+                if lexical {
+                    header.push_str(" [lexical match]");
+                }
+            }
+            // The literal occurs in no file, so exact-tier evidence here is
+            // only a declaration or mention of one of its words: similar too.
+            TextualHits::Similar => {
+                if exact || lexical {
+                    header.push_str(SIMILAR_LABEL);
+                }
+            }
         }
         if !out.push(&header) {
             break;
@@ -8887,6 +9337,228 @@ mod tests {
                 ..Config::default()
             },
         )
+    }
+
+    /// A project holding `files`, with a ready trigram index, semantic
+    /// search off and the presence-check counters reset.
+    fn presence_project(files: &[(&str, &str)]) -> (tempfile::TempDir, AppContext) {
+        let project = tempfile::tempdir().expect("project");
+        let root = fs::canonicalize(project.path()).expect("canonical root");
+        for (relative, text) in files {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+            fs::write(path, text).expect("write fixture");
+        }
+        let ctx = test_context(&root);
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Disabled;
+        *ctx.search_index().write().unwrap() = Some(SearchIndex::build(&root));
+        take_literal_presence_counts();
+        (project, ctx)
+    }
+
+    fn presence_search(ctx: &AppContext, query: &str, top_k: usize, offset: usize) -> String {
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "literal-presence-test",
+            "command": "semantic_search",
+            "query": query,
+            "top_k": top_k,
+            "offset": offset,
+        }))
+        .expect("request");
+        let response = response_value(handle_semantic_search(&request, ctx));
+        assert_eq!(response["success"], true, "{response}");
+        response["text"].as_str().expect("text").to_string()
+    }
+
+    const BASH_WAIT_DETACH_ABSENT: &str = "No file contains `bash_wait_detach(`.";
+
+    /// The common case: the first exact candidate holds the literal. One file
+    /// is read and the corpus is never scanned.
+    #[test]
+    fn literal_held_by_the_first_exact_candidate_reads_one_file_and_no_corpus() {
+        let (_project, ctx) = presence_project(&[(
+            "src/run.rs",
+            "pub fn bash_wait_detach(task: u32) {\n    drop(task);\n}\n",
+        )]);
+        let text = presence_search(&ctx, "bash_wait_detach(", 10, 0);
+        assert!(!text.contains("No file contains"), "{text}");
+        assert_eq!(
+            take_literal_presence_counts(),
+            (1, 0),
+            "(files read, corpus scans): {text}"
+        );
+    }
+
+    /// The literal is held only by a test file, which the request's exact
+    /// candidates leave out: the candidates do not hold it, so the corpus is
+    /// scanned exactly once and finds it.
+    #[test]
+    fn literal_held_only_outside_the_candidates_scans_the_corpus_once() {
+        let (_project, ctx) = presence_project(&[
+            (
+                "src/config.rs",
+                "pub fn defaults() {\n    let bash_wait_detach = true;\n    drop(bash_wait_detach);\n}\n",
+            ),
+            ("tests/run_test.rs", "fn runs() {\n    bash_wait_detach(1);\n}\n"),
+        ]);
+        let text = presence_search(&ctx, "bash_wait_detach(", 10, 0);
+        assert!(!text.contains("No file contains"), "{text}");
+        let (_, corpus_scans) = take_literal_presence_counts();
+        assert_eq!(corpus_scans, 1, "{text}");
+    }
+
+    /// Running out of reads before the check finishes settles nothing, so
+    /// the reply makes no absence claim; with room to finish, the same
+    /// project gets the claim.
+    #[test]
+    fn exhausted_presence_bound_makes_no_absence_claim() {
+        let files = [(
+            "src/config.rs",
+            "pub fn defaults() {\n    let bash_wait_detach = true;\n    drop(bash_wait_detach);\n}\n",
+        )];
+        let (_project, ctx) = presence_project(&files);
+        LITERAL_PRESENCE_MAX_READS_OVERRIDE.with(|limit| limit.set(Some(0)));
+        let bounded = presence_search(&ctx, "bash_wait_detach(", 10, 0);
+        LITERAL_PRESENCE_MAX_READS_OVERRIDE.with(|limit| limit.set(None));
+        assert!(!bounded.contains("No file contains"), "{bounded}");
+        assert!(!bounded.contains("[similar]"), "{bounded}");
+
+        let (_project, ctx) = presence_project(&files);
+        let unbounded = presence_search(&ctx, "bash_wait_detach(", 10, 0);
+        assert!(
+            unbounded.starts_with(BASH_WAIT_DETACH_ABSENT),
+            "{unbounded}"
+        );
+    }
+
+    /// The answer is settled once per query: a later page reuses it and
+    /// reads no file and scans no corpus, while still saying the same thing.
+    #[test]
+    fn later_pages_reuse_the_presence_answer() {
+        let (_project, ctx) = presence_project(&[
+            (
+                "src/config.rs",
+                "pub fn defaults() {\n    let bash_wait_detach = true;\n    drop(bash_wait_detach);\n}\n",
+            ),
+            ("config/settings.toml", "bash_wait_detach = true\n"),
+            ("docs/bash.md", "Use bash to wait for a task, then detach it.\n"),
+        ]);
+        let first = presence_search(&ctx, "bash_wait_detach(", 1, 0);
+        assert!(first.starts_with(BASH_WAIT_DETACH_ABSENT), "{first}");
+        let (first_reads, first_scans) = take_literal_presence_counts();
+        assert!(
+            first_reads > 0 && first_scans == 1,
+            "{first_reads} {first_scans}"
+        );
+
+        let second = presence_search(&ctx, "bash_wait_detach(", 1, 1);
+        assert!(second.starts_with(BASH_WAIT_DETACH_ABSENT), "{second}");
+        assert_eq!(take_literal_presence_counts(), (0, 0), "{second}");
+    }
+
+    /// Files that hold every trigram of `bash_wait_detach(` (the call `each(`
+    /// supplies `ch(`) without holding the literal. They sit under `tests/`,
+    /// so the request's exact candidates leave them out and only the corpus
+    /// stage reads them.
+    const NEAR_HOLDER_TEST_FILE: &str =
+        "fn near() {\n    let bash_wait_detach = 1;\n    each(bash_wait_detach);\n}\n";
+
+    const ONLY_NAMES_IT: (&str, &str) = (
+        "src/config.rs",
+        "pub fn defaults() {\n    let bash_wait_detach = true;\n    drop(bash_wait_detach);\n}\n",
+    );
+
+    /// Running out of reads in the corpus stage, after every exact candidate
+    /// was read and none held the literal, settles nothing: no absence claim.
+    #[test]
+    fn presence_bound_exhausted_in_the_corpus_stage_makes_no_absence_claim() {
+        let files = [
+            ONLY_NAMES_IT,
+            ("tests/near_a_test.rs", NEAR_HOLDER_TEST_FILE),
+            ("tests/near_b_test.rs", NEAR_HOLDER_TEST_FILE),
+        ];
+        // One read for the exact candidate and one corpus file; the second
+        // corpus file is past the bound.
+        let (_project, ctx) = presence_project(&files);
+        LITERAL_PRESENCE_MAX_READS_OVERRIDE.with(|limit| limit.set(Some(2)));
+        let bounded = presence_search(&ctx, "bash_wait_detach(", 10, 0);
+        LITERAL_PRESENCE_MAX_READS_OVERRIDE.with(|limit| limit.set(None));
+        assert_eq!(take_literal_presence_counts(), (2, 1), "{bounded}");
+        assert!(!bounded.contains("No file contains"), "{bounded}");
+        assert!(!bounded.contains("[similar]"), "{bounded}");
+
+        // With room to read every possible holder, none holds it.
+        let (_project, ctx) = presence_project(&files);
+        let unbounded = presence_search(&ctx, "bash_wait_detach(", 10, 0);
+        assert!(
+            unbounded.starts_with(BASH_WAIT_DETACH_ABSENT),
+            "{unbounded}"
+        );
+    }
+
+    /// A possible holder the corpus stage cannot read (gone from disk since
+    /// it was indexed) might hold the literal: no absence claim.
+    #[test]
+    fn unreadable_corpus_holder_makes_no_absence_claim() {
+        let (project, ctx) = presence_project(&[
+            ONLY_NAMES_IT,
+            (
+                "tests/gone_test.rs",
+                "fn gone() {\n    bash_wait_detach(1);\n}\n",
+            ),
+        ]);
+        let root = fs::canonicalize(project.path()).unwrap();
+        fs::remove_file(root.join("tests/gone_test.rs")).unwrap();
+        let text = presence_search(&ctx, "bash_wait_detach(", 10, 0);
+        let (_, corpus_scans) = take_literal_presence_counts();
+        assert_eq!(corpus_scans, 1, "{text}");
+        assert!(!text.contains("No file contains"), "{text}");
+        assert!(!text.contains("[similar]"), "{text}");
+    }
+
+    /// The watcher updates the resident trigram index in place, which keeps
+    /// the index generation, so a kept absence is still found under the same
+    /// key on the next page. The possible-holder set it was settled against
+    /// changes when a file that may hold the literal is indexed, so the next
+    /// page settles again and finds it.
+    #[test]
+    fn kept_absence_is_settled_again_when_a_new_file_may_hold_the_literal() {
+        let (project, ctx) = presence_project(&[
+            ONLY_NAMES_IT,
+            ("config/settings.toml", "bash_wait_detach = true\n"),
+        ]);
+        let root = fs::canonicalize(project.path()).unwrap();
+        let first = presence_search(&ctx, "bash_wait_detach(", 1, 0);
+        assert!(first.starts_with(BASH_WAIT_DETACH_ABSENT), "{first}");
+        take_literal_presence_counts();
+
+        let generation = ctx.search_index_rx_generation();
+        let added = root.join("src/run.rs");
+        fs::write(
+            &added,
+            "fn run(task: u32) {\n    bash_wait_detach(task);\n}\n",
+        )
+        .unwrap();
+        ctx.search_index()
+            .write()
+            .unwrap()
+            .as_mut()
+            .expect("resident index")
+            .update_file(&added);
+        assert_eq!(
+            ctx.search_index_rx_generation(),
+            generation,
+            "an in-place index update keeps the generation, so the key is unchanged"
+        );
+
+        let second = presence_search(&ctx, "bash_wait_detach(", 1, 1);
+        assert!(
+            !second.starts_with("Found 0 results"),
+            "page 2 has a result: {second}"
+        );
+        assert!(!second.contains("No file contains"), "{second}");
+        let (reads, _) = take_literal_presence_counts();
+        assert!(reads > 0, "the absence must be settled again: {second}");
     }
 
     /// A readiness sample runs on the search path, so it reports the views-on
@@ -10308,6 +10980,7 @@ mod tests {
             &[],
             Path::new("/fixture"),
             "loading",
+            None,
         );
 
         assert!(text.contains("0 lexical matches"));
@@ -11202,7 +11875,7 @@ mod tests {
         // the hook, 2 in each component, 2 in each document.
         let text = response["text"].as_str().expect("text");
         assert!(
-            text.contains("Found 75 match across 37 file") && !text.contains("(capped)"),
+            text.contains("37 files match (75 matching lines);") && !text.contains("(capped)"),
             "footer must count every match exactly: {text}"
         );
     }
@@ -14742,6 +15415,49 @@ mod split_request_tests {
                 }
             }
         }
+    }
+
+    /// The missing-literal notice claims no file contains the literal, so it
+    /// may appear only when the check against the files on disk covered every
+    /// file. A check its walk budget cut short says how far it got instead,
+    /// and the reply makes no not-found claim.
+    #[test]
+    fn external_missing_literal_notice_needs_a_complete_disk_check() {
+        let session = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (_dir, root) = project();
+        git_init(&root);
+        save_external_index(&root, storage.path());
+        let ctx = external_context(session.path(), storage.path(), false);
+        let params = serde_json::json!({"query": "load_settings(", "path": root, "topK": 10});
+        let notice = "No file contains `load_settings(`.";
+
+        let full = external_disk_check::with_budgets_for_test(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            || search(&ctx, params.clone()),
+        );
+        assert_eq!(full["success"], true, "{full}");
+        assert_eq!(full["saved_index_check"]["complete"], true, "{full}");
+        let text = full["text"].as_str().unwrap();
+        assert!(text.contains(notice), "{text}");
+
+        let stopped = external_disk_check::with_budgets_for_test(
+            Duration::ZERO,
+            Duration::from_secs(5),
+            || search(&ctx, params.clone()),
+        );
+        assert_eq!(stopped["success"], true, "{stopped}");
+        assert_eq!(stopped["saved_index_check"]["complete"], false, "{stopped}");
+        assert_eq!(stopped["complete"], false, "{stopped}");
+        let text = stopped["text"].as_str().unwrap();
+        assert!(!text.contains("No file contains"), "{text}");
+        assert!(!text.contains("[similar]"), "{text}");
+        assert!(!text.contains("not found"), "{text}");
+        assert!(
+            text.contains("only 0 files on disk were compared with it before the time limit"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -1012,6 +1012,40 @@ impl SearchIndexSnapshot {
         self.lexical_rank_at_depth(query_trigrams, candidate_filter, depth)
     }
 
+    /// Indexed files under `search_root` that may hold `phrase`, compared
+    /// ASCII case-insensitively with runs of whitespace treated alike. A file
+    /// holding the phrase holds each of its whitespace-separated pieces, so
+    /// the trigram postings of those pieces bound the set; no file is read.
+    /// `None` when no piece is long enough to have a trigram, so any file
+    /// could hold it.
+    pub fn files_possibly_holding_phrase(
+        &self,
+        phrase: &str,
+        search_root: &Path,
+    ) -> Option<Vec<PathBuf>> {
+        let mut ids: Option<Vec<u32>> = None;
+        for piece in phrase.split_whitespace().filter(|piece| piece.len() >= 3) {
+            let piece_ids = self.candidates(&decompose_regex(&regex::escape(piece)));
+            ids = Some(match ids {
+                Some(ids) => intersect_sorted_ids(&ids, &piece_ids),
+                None => piece_ids,
+            });
+        }
+        let search_root_canon = canonicalize_for_search_membership(search_root);
+        Some(
+            ids?.into_iter()
+                .filter_map(|id| self.files.get(id as usize))
+                .map(|file| &file.path)
+                .filter(|path| !path.as_os_str().is_empty())
+                .filter(|path| {
+                    is_within_search_root(search_root, path)
+                        || is_within_search_root(&search_root_canon, path)
+                })
+                .cloned()
+                .collect(),
+        )
+    }
+
     /// Whole-corpus exact pass over the trigram index in ready mode.
     /// Intersects trigrams for the verbatim phrase (E1) and for content tokens within a 3-line window (E2),
     /// verifies matches against file content, and records content digests.
