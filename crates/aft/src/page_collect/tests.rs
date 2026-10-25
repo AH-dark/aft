@@ -1060,8 +1060,9 @@ fn page_collect_default_import_depth_follows_one_level() {
 
 /// A page whose `<base href>` is a megabyte long, followed by thousands of
 /// short references, shares that one base across every queued reference
-/// instead of copying it per reference. References whose base plus path
-/// passes the collector's 4096-byte path limit are omitted as missing.
+/// instead of copying it per reference. References whose base plus path is
+/// too long as written to resolve within the collector's 4096-byte path
+/// limit are omitted as missing.
 #[test]
 fn page_collect_long_base_is_shared_not_copied() {
     let root = root();
@@ -1086,6 +1087,37 @@ fn page_collect_long_base_is_shared_not_copied() {
         4000
     );
     assert_eq!(source.reads, vec![root.join("index.html")]);
+}
+
+/// The path limit applies to the path that would be opened, after percent
+/// decoding, not to the reference as written: eight 200-byte folder names
+/// spelled as `%61` escapes (over 4,800 bytes written, about 1,600
+/// resolved) are collected, while a plain path that resolves past 4,096
+/// bytes is omitted as missing without being read.
+#[test]
+fn page_collect_path_limit_applies_after_decoding() {
+    let root = root();
+    let folder = "a".repeat(200);
+    let resolved = format!("{}/x.png", vec![folder.as_str(); 8].join("/"));
+    let encoded_folder = "%61".repeat(200);
+    let written = format!("{}/x.png", vec![encoded_folder.as_str(); 8].join("/"));
+    assert!(written.len() > 4096 && resolved.len() < 4096);
+    let too_long = format!("{}/y.png", vec![folder.as_str(); 21].join("/"));
+    assert!(too_long.len() > 4096);
+    let page = format!(r#"<img src="{written}"><img src="{too_long}">"#);
+    let mut source = FakeSource::with(
+        &root,
+        &[
+            ("index.html", page.as_bytes()),
+            (resolved.as_str(), b"X"),
+            (too_long.as_str(), b"Y"),
+        ],
+    );
+    let collected = run(&mut source, Limits::DEFAULT).unwrap();
+    assert_eq!(names(&collected), vec!["index.html", resolved.as_str()]);
+    assert_eq!(collected.omitted.len(), 1);
+    assert_eq!(collected.omitted[0].reason, OmitReason::Missing);
+    assert!(!source.reads.contains(&root.join(&too_long)));
 }
 
 /// CSS names may be written with escapes; `url(` and `@import` are found

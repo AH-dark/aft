@@ -39,6 +39,12 @@ const ENTRY_READ_MIN: std::time::Duration = std::time::Duration::from_secs(1);
 /// page's folder); Linux's `PATH_MAX`. Anything longer names no file.
 const MAX_PATH_BYTES: usize = 4096;
 
+/// Longest a reference may be as written (base plus path, before decoding).
+/// A percent escape spells one byte in three, so any reference that can
+/// resolve within [`MAX_PATH_BYTES`] fits; longer ones are refused before
+/// the base is copied or any segment is decoded.
+const MAX_ENCODED_PATH_BYTES: usize = 3 * MAX_PATH_BYTES;
+
 /// Largest `page.read` length.
 pub(crate) const MAX_READ_LENGTH: u64 = 1024 * 1024;
 
@@ -197,11 +203,12 @@ pub(crate) fn resolve_reference(raw: &str, base: &[String]) -> Resolved {
         .next()
         .unwrap_or_default()
         .to_string();
-    // A reference whose base plus path passes `MAX_PATH_BYTES` is refused
-    // before the base's segments are copied, so a long base is not copied
-    // per reference.
+    // A reference too long as written to resolve within `MAX_PATH_BYTES` is
+    // refused before the base's segments are copied, so a long base is not
+    // copied per reference. The resolved path is checked against
+    // `MAX_PATH_BYTES` itself after decoding, below.
     let base_bytes: usize = base.iter().map(|segment| segment.len() + 1).sum();
-    if base_bytes.saturating_add(path_part.len()) > MAX_PATH_BYTES {
+    if base_bytes.saturating_add(path_part.len()) > MAX_ENCODED_PATH_BYTES {
         return Resolved::Invalid;
     }
     let mut segments: Vec<String> = base.to_vec();
@@ -230,6 +237,11 @@ pub(crate) fn resolve_reference(raw: &str, base: &[String]) -> Resolved {
         }
     }
     if segments.is_empty() || segments.last().is_some_and(|last| last == "..") {
+        return Resolved::Invalid;
+    }
+    // The path as it will be opened: decoded, dot segments removed.
+    let resolved_bytes = segments.iter().map(String::len).sum::<usize>() + segments.len() - 1;
+    if resolved_bytes > MAX_PATH_BYTES {
         return Resolved::Invalid;
     }
     Resolved::Path(segments)
