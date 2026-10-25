@@ -698,7 +698,7 @@ fn saved_policy_fixture() -> (Fixture, tempfile::TempDir, Arc<AppContext>) {
     (f, storage, Arc::new(ctx))
 }
 
-fn save_policy(ctx: &AppContext, identity: &RouteIdentity, params: Value, older_epoch: bool) {
+fn policy_identity(identity: &RouteIdentity) -> RouteIdentity {
     let mut saved = route(
         &identity.root,
         &identity.session,
@@ -710,12 +710,13 @@ fn save_policy(ctx: &AppContext, identity: &RouteIdentity, params: Value, older_
     data.harness = identity.harness.clone();
     data.trust = identity.trust;
     data.spawn_principal = identity.spawn_principal.clone();
-    if older_epoch {
-        data.scope.as_mut().unwrap().scope_epoch -= 1;
-    }
+    saved
+}
+
+fn save_policy(ctx: &AppContext, identity: &RouteIdentity, params: Value) {
     remote_policy::catalog(
         json!({"op":"tool.catalog", "preset":"worker", "params":params}),
-        &saved,
+        identity,
         ctx,
     )
     .unwrap();
@@ -741,32 +742,117 @@ fn admit_saved(f: &Fixture, ctx: &Arc<AppContext>) -> Admission {
 }
 
 #[test]
-fn codemode_head_routes_with_different_saved_policies_are_ambiguous() {
+fn codemode_head_worker_preflight_does_not_save_policy() {
     for params in [
-        json!({"confine":"root"}),
-        json!({"remote_exec":{"enabled":true}}),
+        json!({"remote_exec":{"enabled":true}, "siblings":[]}),
+        json!({"confine":"root", "siblings":[]}),
     ] {
-        for saved_channel in [1, 3] {
-            for older_epoch in [false, true] {
-                let (f, _storage, ctx) = saved_policy_fixture();
-                save_policy(
-                    &ctx,
-                    &f.routes[&channel(saved_channel)],
-                    params.clone(),
-                    older_epoch,
+        let (f, _storage, ctx) = saved_policy_fixture();
+        remote_policy::catalog(
+            json!({"op":"tool.catalog", "preset":"worker", "params":params}),
+            &f.routes[&channel(3)],
+            &ctx,
+        )
+        .unwrap();
+        let effective = owner(admit_saved(&f, &ctx));
+        assert_eq!(effective.session, "head-a-session");
+        let count: i64 = ctx
+            .db()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM remote_exec_policies", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "head preflight must not persist a worker policy");
+    }
+}
+
+#[test]
+fn codemode_head_routes_ignore_preexisting_worker_policies() {
+    for params in [
+        json!({"remote_exec":{"enabled":true}}),
+        json!({"confine":"root"}),
+    ] {
+        for older_epoch in [false, true] {
+            let (f, _storage, ctx) = saved_policy_fixture();
+            let head = &f.routes[&channel(3)];
+            let scope = head.scope.as_ref().unwrap();
+            let key = crate::db::remote_exec::PolicyKey {
+                project_root: head.project_root.display().to_string(),
+                harness: head.harness.clone(),
+                session: head.session.clone(),
+                principal: "reserved:prefrontal-core".into(),
+                owner: serde_json::to_string(&scope.owner).unwrap(),
+                scope_ref: scope.scope_ref.clone(),
+                epoch: scope.scope_epoch - u64::from(older_epoch),
+                preset: "worker".into(),
+            };
+            let policy =
+                crate::exec_remote::FrozenParams::decode(params.as_object().unwrap()).unwrap();
+            let db = ctx.db().unwrap();
+            crate::db::remote_exec::freeze(
+                &db.lock().unwrap(),
+                &key,
+                &policy,
+                crate::bash_background::persistence::unix_millis(),
+                || {},
+            )
+            .unwrap();
+            for unreadable in [false, true] {
+                if unreadable {
+                    db.lock()
+                        .unwrap()
+                        .execute("DROP TABLE remote_exec_policies", [])
+                        .unwrap();
+                }
+                assert!(!remote_policy::confined(&ctx, head).unwrap());
+                let effective = owner(admit_saved(&f, &ctx));
+                assert_eq!(effective.session, "head-a-session");
+                assert!(remote_policy::key(head, Some("worker")).is_none());
+                assert!(remote_policy::key(&effective, Some("worker")).is_none());
+                assert!(
+                    remote_policy::lookup(&ctx, &remote_policy::source(head, Some("worker")))
+                        .is_none()
                 );
-                let error = refusal(admit_saved(&f, &ctx));
-                assert_eq!(
-                    error.detail.as_ref().unwrap()["reason"],
-                    "head_route_ambiguous"
-                );
-                assert_eq!(
-                    error.detail.as_ref().unwrap()["fields"],
-                    json!(["saved_policy"])
-                );
-                assert_eq!(error.detail.as_ref().unwrap()["channels"], json!([1, 3]));
-                assert!(error.message.contains("saved_policy"));
             }
+        }
+    }
+}
+
+#[test]
+fn codemode_head_routes_with_different_saved_policies_are_ambiguous() {
+    for params in [None, Some(json!({"remote_exec":{"enabled":true}}))] {
+        for saved_channel in [1, 3] {
+            let (f, _storage, _ctx) = saved_policy_fixture();
+            let error = refusal(super::admit(
+                &f.routes,
+                channel(9),
+                Some(&call("read", json!({"path":"notes.txt"}))),
+                |identity| {
+                    Some(Ok(
+                        if Arc::ptr_eq(&identity.0, &f.routes[&channel(saved_channel)].0) {
+                            EffectiveSavedPolicy {
+                                confined: params.is_none(),
+                                params: params.clone(),
+                            }
+                        } else {
+                            EffectiveSavedPolicy::default()
+                        },
+                    ))
+                },
+            ));
+            assert_eq!(
+                error.detail.as_ref().unwrap()["reason"],
+                "head_route_ambiguous"
+            );
+            assert_eq!(
+                error.detail.as_ref().unwrap()["fields"],
+                json!(["saved_policy"])
+            );
+            assert_eq!(error.detail.as_ref().unwrap()["channels"], json!([1, 3]));
+            assert!(error.message.contains("saved_policy"));
         }
     }
 }
@@ -777,14 +863,18 @@ fn codemode_head_routes_with_identical_saved_policies_keep_first_owner() {
         json!({"confine":"root"}),
         json!({"remote_exec":{"enabled":true}}),
     ] {
-        let (f, _storage, ctx) = saved_policy_fixture();
-        assert_ne!(
-            remote_policy::key(&f.routes[&channel(1)], Some("worker")),
-            remote_policy::key(&f.routes[&channel(3)], Some("worker"))
-        );
-        save_policy(&ctx, &f.routes[&channel(1)], params.clone(), true);
-        save_policy(&ctx, &f.routes[&channel(3)], params, false);
-        let effective = owner(admit_saved(&f, &ctx));
+        let (f, _storage, _ctx) = saved_policy_fixture();
+        let effective = owner(super::admit(
+            &f.routes,
+            channel(9),
+            Some(&call("read", json!({"path":"notes.txt"}))),
+            |_| {
+                Some(Ok(EffectiveSavedPolicy {
+                    confined: false,
+                    params: Some(params.clone()),
+                }))
+            },
+        ));
         assert!(Arc::ptr_eq(
             &effective.run_owner.as_ref().unwrap().head.0,
             &f.routes[&channel(1)].0
@@ -803,34 +893,51 @@ fn codemode_saved_policy_reads_do_not_outlive_catalog_save() {
         json!({"remote_exec":{"enabled":true}}),
     ] {
         let (f, _storage, ctx) = saved_policy_fixture();
-        let policies = SavedPolicies::read(
-            [1, 3]
-                .into_iter()
-                .map(|ch| (f.routes[&channel(ch)].clone(), Arc::clone(&ctx)))
-                .collect(),
-        );
-        assert!(policies.get(&ctx, &f.routes[&channel(1)]).unwrap().is_ok());
-        save_policy(&ctx, &f.routes[&channel(3)], params, false);
-        assert!(policies.get(&ctx, &f.routes[&channel(1)]).is_none());
+        let mut worker = policy_identity(&f.routes[&channel(3)]);
+        Arc::get_mut(&mut worker.0)
+            .unwrap()
+            .scope
+            .as_mut()
+            .unwrap()
+            .kind = subc_protocol::scope::ScopeKind::Worker;
+        let policies = SavedPolicies::read(vec![(worker.clone(), Arc::clone(&ctx))]);
+        assert!(policies.get(&ctx, &worker).unwrap().is_ok());
+        save_policy(&ctx, &worker, params);
+        assert!(policies.get(&ctx, &worker).is_none());
     }
 }
 
 #[test]
-fn codemode_head_routes_with_unreadable_saved_policy_refuse() {
+fn codemode_worker_with_unreadable_saved_policy_refuses() {
     let (f, _storage, ctx) = saved_policy_fixture();
-    save_policy(
-        &ctx,
-        &f.routes[&channel(3)],
-        json!({"confine":"root"}),
-        false,
-    );
+    let mut worker = policy_identity(&f.routes[&channel(3)]);
+    Arc::get_mut(&mut worker.0)
+        .unwrap()
+        .scope
+        .as_mut()
+        .unwrap()
+        .kind = subc_protocol::scope::ScopeKind::Worker;
+    save_policy(&ctx, &worker, json!({"confine":"root"}));
     ctx.db()
         .unwrap()
         .lock()
         .unwrap()
         .execute("UPDATE remote_exec_policies SET params='not-json'", [])
         .unwrap();
-    let error = refusal(admit_saved(&f, &ctx));
+    let policies = SavedPolicies::read(vec![(worker.clone(), Arc::clone(&ctx))]);
+    let error = policies.get(&ctx, &worker).unwrap().unwrap_err();
+    assert_eq!(error.code, remote_policy::policy_unavailable().code);
+}
+
+#[test]
+fn codemode_saved_policy_read_errors_refuse() {
+    let (f, _storage, _ctx) = saved_policy_fixture();
+    let error = refusal(super::admit(
+        &f.routes,
+        channel(9),
+        Some(&call("read", json!({"path":"notes.txt"}))),
+        |_| Some(Err(remote_policy::policy_unavailable())),
+    ));
     assert_eq!(error.code, remote_policy::policy_unavailable().code);
 }
 

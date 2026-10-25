@@ -270,6 +270,8 @@ fn resolve_owner(
             ));
         };
         let policies = policies.into_iter().collect::<Result<Vec<_>, _>>()?;
+        // Keep comparing saved policies: genuinely different access settings
+        // must refuse admission rather than select a more permissive route.
         for ((other_channel, _), policy) in heads.iter().zip(&policies) {
             if policy != &policies[0] {
                 return Err(ambiguous_head(
