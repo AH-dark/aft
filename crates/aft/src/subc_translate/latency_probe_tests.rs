@@ -5,7 +5,7 @@
 //! with:
 //!
 //! ```text
-//! cargo test -p agent-file-tools --lib -- --ignored --nocapture edit_translate
+//! cargo test -p agent-file-tools --lib -- --ignored --nocapture latency_probe_tests
 //! ```
 //!
 //! The recorded results live in
@@ -180,7 +180,11 @@ fn edit_translate_timing_probe() {
     }
 }
 
+/// A store rooted at `root/backups`, the layout the daemon uses. Each timing
+/// sample gets its own store so an earlier sample's history cannot carry into
+/// the depth a later one starts from.
 fn backup_store(root: &Path) -> crate::backup::BackupStore {
+    std::fs::create_dir_all(root).expect("create store root");
     let mut store = crate::backup::BackupStore::new();
     // The production layout: one storage directory holding per-session stacks.
     store.set_storage_dir(root.join("backups"), 24);
@@ -188,27 +192,30 @@ fn backup_store(root: &Path) -> crate::backup::BackupStore {
     store
 }
 
-fn snapshot_samples(
-    store: &mut crate::backup::BackupStore,
-    session: &str,
-    path: &Path,
-    depth: usize,
-) -> f64 {
-    // `depth` names the stack length the sample starts from, so the numbers
-    // separate the first snapshot of a file from a later one that already has
-    // history to rewrite.
-    for index in 0..depth {
-        store
-            .snapshot_with_op(session, path, &format!("warm {index}"), None)
-            .expect("warm snapshot");
-    }
+/// Time `SAMPLES` snapshots of one file, each starting from the same stack
+/// depth. Every sample gets a fresh store and session prepared to `depth`
+/// entries outside the timed section, because `BackupStore` appends to the
+/// per-file stack: reusing one store would carry the previous samples' history
+/// forward and the 50 calls alone would reach the undo depth cap.
+fn snapshot_samples(root: &Path, fixture: &Path, label: &str, depth: usize) -> f64 {
     let mut samples = Vec::new();
     for _ in 0..SAMPLES {
+        let store_root = root.join(format!("store-{label}-{}", samples.len()));
+        let mut store = backup_store(&store_root);
+        let session = "probe-session";
+        for index in 0..depth {
+            store
+                .snapshot_with_op(session, fixture, &format!("warm {index}"), None)
+                .expect("warm snapshot");
+        }
         let started = Instant::now();
         store
-            .snapshot_with_op(session, path, "probe", None)
+            .snapshot_with_op(session, fixture, "probe", None)
             .expect("snapshot");
         samples.push(started.elapsed());
+        // Only the undo history is thrown away; the file under test lives in
+        // the parent fixture directory.
+        let _ = std::fs::remove_dir_all(&store_root);
     }
     pair(samples).0
 }
@@ -221,25 +228,25 @@ fn backup_snapshot_cost_probe() {
     let five_files: Vec<PathBuf> = (0..5)
         .map(|index| fixture_file(&root, &format!("five_{index}.ts"), 2000, "TOKEN_A"))
         .collect();
-    let mut store = backup_store(&root);
-    let session = "probe-session";
-
-    let empty = snapshot_samples(&mut store, session, &file, 0);
+    let empty = snapshot_samples(&root, &file, "empty", 0);
     println!("first snapshot of a 2,000-line file: p50 {empty:.3} ms");
-    let warm = snapshot_samples(&mut store, session, &file, 3);
+    let warm = snapshot_samples(&root, &file, "three", 3);
     println!("snapshot on a stack of 3 entries:     p50 {warm:.3} ms");
-    let deep = snapshot_samples(&mut store, session, &file, 10);
+    let deep = snapshot_samples(&root, &file, "ten", 10);
     println!("snapshot on a stack of 10 entries:    p50 {deep:.3} ms");
 
     let mut batch = Vec::new();
-    for _ in 0..SAMPLES {
+    for sample in 0..SAMPLES {
+        let store_root = root.join(format!("store-batch-{sample}"));
+        let mut store = backup_store(&store_root);
         let started = Instant::now();
         for path in &five_files {
             store
-                .snapshot_with_op(session, path, "batch", Some("probe-op"))
+                .snapshot_with_op("probe-session", path, "batch", Some("probe-op"))
                 .expect("batch snapshot");
         }
         batch.push(started.elapsed());
+        let _ = std::fs::remove_dir_all(&store_root);
     }
     let batch_p50 = pair(batch).0;
     println!(
