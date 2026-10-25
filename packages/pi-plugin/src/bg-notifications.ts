@@ -146,6 +146,7 @@ const LOG_PREFIX = "[aft-pi] bg-notifications:";
 const SUBC_NUDGE_LOG_INTERVAL_MS = 60_000;
 const FOREIGN_SESSION_DROP_INTERVAL_MS = 60_000;
 const foreignSessionDropLogState = new Map<string, { lastEmittedAt: number; suppressed: number }>();
+let lastLogStateSweepAt = 0;
 let activeSessionId: string | undefined;
 
 export function setActiveSessionId(sessionId: string | undefined): void {
@@ -164,6 +165,7 @@ function logDroppedForeignSessionFrame(
   liveSessionId?: string,
 ): void {
   const now = Date.now();
+  cleanupIdleLogStates(now);
   const state = foreignSessionDropLogState.get(droppedSessionId);
   if (state && now - state.lastEmittedAt < FOREIGN_SESSION_DROP_INTERVAL_MS) {
     state.suppressed += 1;
@@ -591,6 +593,7 @@ function logDeliveryHop(
         : "";
   const key = `${kind}\u0000${taskKey}\u0000${drainContext.directory}\u0000${sessionID}`;
   const now = Date.now();
+  cleanupIdleLogStates(now);
   const state = subcNudgeLogState.get(key);
   if (state && now - state.lastEmittedAt < SUBC_NUDGE_LOG_INTERVAL_MS) {
     state.suppressed += 1;
@@ -826,6 +829,7 @@ export function __resetBgNotificationStateForTests(): void {
   subcNudgesInFlight.clear();
   subcNudgeLogState.clear();
   foreignSessionDropLogState.clear();
+  lastLogStateSweepAt = 0;
   activeSessionId = undefined;
   bgHopTimeoutMs = DEFAULT_BG_HOP_TIMEOUT_MS;
 }
@@ -1244,7 +1248,20 @@ function ingestDrainedBgCompletions(
   return accepted;
 }
 
+function cleanupIdleLogStates(now: number): void {
+  if (now - lastLogStateSweepAt < 60_000) return;
+  lastLogStateSweepAt = now;
+  const cutoff = now - SESSION_BG_STATE_IDLE_TTL_MS;
+  // Foreign frames and failed nudges can create log keys without session state.
+  for (const map of [foreignSessionDropLogState, subcNudgeLogState]) {
+    for (const [key, state] of map) {
+      if (state.lastEmittedAt < cutoff) map.delete(key);
+    }
+  }
+}
+
 export function cleanupIdleSessionStates(now: number = Date.now()): void {
+  cleanupIdleLogStates(now);
   const cutoff = now - SESSION_BG_STATE_IDLE_TTL_MS;
   for (const [sessionID, state] of sessionBgStates) {
     if (state.outstandingTaskIds.size > 0) continue;
@@ -1477,3 +1494,9 @@ function formatDurationMs(ms: number): string {
 function shorten(value: string, limit: number): string {
   return value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
 }
+
+export const __bgLogSuppressionForTests = {
+  foreign: logDroppedForeignSessionFrame,
+  hop: logDeliveryHop,
+  sizes: () => ({ foreign: foreignSessionDropLogState.size, hop: subcNudgeLogState.size }),
+};

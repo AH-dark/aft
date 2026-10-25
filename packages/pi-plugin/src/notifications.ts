@@ -3,7 +3,7 @@ import {
   markAnnouncementSeen,
   shouldShowAnnouncement,
 } from "@cortexkit/aft-bridge";
-import { log, sessionLog } from "./logger.js";
+import { log, warn } from "./logger.js";
 
 const WARNING_MARKER = "🔧 AFT: ⚠️";
 const FEATURE_MARKER = "🔧 AFT: ✨";
@@ -30,28 +30,30 @@ export interface ConfigureWarningOptions {
   storageDir: string;
   pluginVersion: string;
   projectRoot?: string;
+  onDeferred?: (warning: ConfigureWarning) => void;
 }
 
 type PiNotificationClient = {
+  hasUI?: boolean;
   ui?: {
     notify?: (message: string, type?: "info" | "warning" | "error") => void;
   };
 };
 
-function sendIgnoredMessage(client: unknown, sessionId: string, text: string): boolean {
-  const typedClient = client as PiNotificationClient;
-  if (typeof typedClient.ui?.notify !== "function") return false;
-
+function notifyPi(client: unknown, message: string, type: "info" | "warning"): boolean {
   try {
-    typedClient.ui.notify(text, "warning");
+    const typed = client as PiNotificationClient | undefined;
+    if (!typed || typed.hasUI === false || typeof typed.ui?.notify !== "function") return false;
+    typed.ui.notify(message, type);
     return true;
-  } catch (err) {
-    sessionLog(
-      sessionId,
-      `[aft-pi] notification send failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
+  } catch (error) {
+    log(`[notifications] UI delivery failed: ${error}`);
     return false;
   }
+}
+
+function sendIgnoredMessage(client: unknown, _sessionId: string, text: string): boolean {
+  return notifyPi(client, text, "warning");
 }
 
 /**
@@ -186,9 +188,14 @@ export async function deliverConfigureWarnings(
     // "warned" → already shown once; "unknown" → dedup state unreadable
     // (bridge not configured yet), so do NOT deliver — delivering on unknown
     // is what re-fired the warning every session. Only "fresh" delivers.
-    if ((await warnedStatus(opts.bridge, key)) !== "fresh") continue;
+    const status = await warnedStatus(opts.bridge, key);
+    if (status === "unknown") opts.onDeferred?.(warning);
+    if (status !== "fresh") continue;
 
-    if (!sendIgnoredMessage(opts.client, opts.sessionId, formatConfigureWarning(warning))) continue;
+    if (!sendIgnoredMessage(opts.client, opts.sessionId, formatConfigureWarning(warning))) {
+      opts.onDeferred?.(warning);
+      continue;
+    }
 
     await recordWarning(opts.bridge, key);
   }
@@ -199,12 +206,13 @@ export function sendFeatureAnnouncement(
   features: string[],
   footer: string,
   storageDir: string,
-): void {
+  client?: unknown,
+): boolean {
   // shouldShowAnnouncement silently seeds the marker on first-install /
   // ephemeral-sandbox launches, so Docker/CI/disposable-VM users don't get
   // changelog bullets spammed on every boot (per magic-context#99). Real
   // upgrades from a persisted older version still surface here.
-  if (!shouldShowAnnouncement(storageDir, "pi", version)) return;
+  if (!shouldShowAnnouncement(storageDir, "pi", version)) return true;
 
   // Blank-line separator pins the persistent footer (Discord invite, etc.)
   // below the version-specific bullets so the footer reads as "always here"
@@ -218,5 +226,31 @@ export function sendFeatureAnnouncement(
   }
   log(sections.join("\n"));
 
+  if (!notifyPi(client, sections.join("\n"), "info")) return false;
   markAnnouncementSeen(storageDir, "pi", version);
+  return true;
+}
+
+export function sendLspInstallSummary(
+  skipped: readonly { id: string; reason: string }[],
+  client?: unknown,
+): boolean {
+  const actionable = skipped.filter(
+    (item) =>
+      ![
+        "auto_install: false",
+        "disabled by config",
+        "not relevant to project",
+        "already installed",
+        "another install in progress",
+      ].includes(item.reason.toLowerCase()),
+  );
+  if (!actionable.length) return true;
+  const lines = actionable.map((item) => `  • ${item.id}: ${item.reason}`).join("\n");
+  const message =
+    `[lsp] skipped or failed to install ${actionable.length} server(s):\n${lines}\n` +
+    'Pin a working version with `lsp.versions: { "<package>": "<version>" }` if grace is blocking, ' +
+    "or set `lsp.auto_install: false` to suppress.";
+  warn(message);
+  return notifyPi(client, message, "warning");
 }
