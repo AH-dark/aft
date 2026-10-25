@@ -875,6 +875,17 @@ fn callgraph_store_ready_for_dead_code(
     }
 }
 
+fn callgraph_store_busy_for_dead_code(inspect_dir: &Path, project_root: &Path) -> bool {
+    for dir in callgraph_store_dirs_from_inspect_dir(inspect_dir, project_root) {
+        match callgraph_store_ready_for_dead_code(dir, project_root.to_path_buf()) {
+            Ok(true) => return false,
+            Err(_) => return true,
+            Ok(false) => {}
+        }
+    }
+    false
+}
+
 /// Completes the builder registration and sends `Failed` to leftover waiters
 /// if a reuse worker returns, panics, or is cancelled without going through the
 /// completion router. Admission and exit must be paired; a leftover registration
@@ -3784,14 +3795,9 @@ impl InspectManager {
         if job.category == InspectCategory::DeadCode
             && job.config.indexes.callgraph
             && !job.config.views.enabled
+            && callgraph_store_busy_for_dead_code(&job.inspect_dir, &job.project_root)
         {
-            for dir in callgraph_store_dirs_from_inspect_dir(&job.inspect_dir, &job.project_root) {
-                match callgraph_store_ready_for_dead_code(dir, job.project_root.clone()) {
-                    Ok(true) => break,
-                    Err(_) => return callgraph_pending_result(&job, started.elapsed()),
-                    Ok(false) => {}
-                }
-            }
+            return callgraph_pending_result(&job, started.elapsed());
         }
 
         let project_scope = JobScope::for_project(job.project_root.clone());
@@ -7348,6 +7354,16 @@ fn filter_outcome_for_scope_with_contributions(
     cache: &(impl InspectCacheRead + ?Sized),
     scope: &JobScope,
 ) -> JobOutcome {
+    // Fresh source files do not establish graph liveness while its store is busy.
+    if category == InspectCategory::DeadCode
+        && snapshot.config.indexes.callgraph
+        && !snapshot.config.views.enabled
+        && callgraph_store_busy_for_dead_code(&snapshot.inspect_dir, &snapshot.project_root)
+    {
+        return JobOutcome::Fresh {
+            payload: callgraph_pending_payload(),
+        };
+    }
     if !category.is_tier2() || scope.is_project_wide() {
         return filter_outcome_for_scope(outcome, scope);
     }
@@ -8672,7 +8688,6 @@ mod guard_tests {
         assert_eq!(payload["complete"], false, "{outcome:?}");
         assert!(payload.get("count").is_none(), "{outcome:?}");
         assert!(payload.get("items").is_none(), "{outcome:?}");
-        blocker.execute_batch("ROLLBACK").unwrap();
         let snapshot = InspectSnapshot::new(
             root.clone(),
             inspect_dir,
@@ -8680,6 +8695,23 @@ mod guard_tests {
             Arc::clone(&job.symbol_cache),
         );
         let cache = manager.cache_for_snapshot(&snapshot).unwrap();
+        let cached = filter_outcome_for_scope_with_contributions(
+            Some(&manager),
+            JobOutcome::Fresh {
+                payload: json!({"count": 0, "items": [], "complete": true}),
+            },
+            &snapshot,
+            InspectCategory::DeadCode,
+            cache.as_ref(),
+            &JobScope::for_project(root.clone()),
+        );
+        assert_eq!(
+            cached.payload().unwrap()["status"],
+            "pending",
+            "a cached project-wide zero cannot bypass a busy graph: {cached:?}"
+        );
+        assert!(cached.payload().unwrap().get("count").is_none());
+        blocker.execute_batch("ROLLBACK").unwrap();
         let scoped = filter_outcome_for_scope_with_contributions(
             Some(&manager),
             outcome,
