@@ -155,6 +155,7 @@ jobs:
         with:
           name: linux-nextest-archive
           path: ${{ runner.temp }}
+          verify-zstd: linux-nextest.tar.zst
       - name: Run Linux unit archive partition
         run: ./scripts/rust-test-gate.sh
         env:
@@ -843,6 +844,7 @@ jobs:
         with:
           name: macos-nextest-archive
           path: ${{ runner.temp }}
+          verify-zstd: macos-nextest.tar.zst
 
       - uses: ./.github/actions/download-artifact-retry
         with:
@@ -1330,6 +1332,7 @@ jobs:
         with:
           name: windows-nextest-archive
           path: ${{ runner.temp }}
+          verify-zstd: windows-nextest.tar.zst
 
       - name: Rust libtest shard (nextest archive)
         # The gate writes AFT_GATE_LOG itself; do not pipe it through `tee`.
