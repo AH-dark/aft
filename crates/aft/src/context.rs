@@ -4534,6 +4534,8 @@ pub struct AppContext {
     lazy_callgraph: LazyCallgraph,
     #[cfg(test)]
     view_publication_attempts: AtomicUsize,
+    #[cfg(test)]
+    view_publication_attempt_starts: parking_lot::Mutex<Vec<Instant>>,
     checkout_driver: crate::views::first_load::InstalledDriver,
     /// The views-on semantic lane of this root (see `views::semantic_runtime`).
     checkout_semantic: Arc<crate::views::semantic_runtime::CheckoutSemanticSlot>,
@@ -5379,6 +5381,8 @@ impl AppContext {
             lazy_callgraph: LazyCallgraph::default(),
             #[cfg(test)]
             view_publication_attempts: AtomicUsize::new(0),
+            #[cfg(test)]
+            view_publication_attempt_starts: parking_lot::Mutex::new(Vec::new()),
             checkout_driver: crate::views::first_load::InstalledDriver::default(),
             checkout_semantic: Arc::default(),
             view_disk_limits_next_ms,
@@ -9576,6 +9580,17 @@ impl AppContext {
         self.view_publication_attempts.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn view_publication_attempt_started_for_test(
+        &self,
+        attempt: usize,
+    ) -> Option<Instant> {
+        self.view_publication_attempt_starts
+            .lock()
+            .get(attempt)
+            .copied()
+    }
+
     pub(crate) fn clear_view_runtime(&self) {
         self.release_view_publication_cache();
         if let Some(root) = self.canonical_cache_root_opt() {
@@ -9792,8 +9807,13 @@ impl AppContext {
         phase: &mut impl FnMut(&str) -> crate::views::Result<()>,
     ) -> Result<PreparedViewUpdate, String> {
         #[cfg(test)]
-        self.view_publication_attempts
-            .fetch_add(1, Ordering::AcqRel);
+        {
+            let mut starts = self.view_publication_attempt_starts.lock();
+            // Capture the producer clock before observers can see the new attempt.
+            starts.push(Instant::now());
+            self.view_publication_attempts
+                .fetch_add(1, Ordering::AcqRel);
+        }
         let content_generation = self.configure_content_generation();
         phase("manifest").map_err(|error| error.to_string())?;
         if self.retire_deleted_view_root() {

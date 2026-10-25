@@ -288,6 +288,8 @@ struct Running {
     paths: BTreeSet<Vec<u8>>,
     rescan: bool,
     pending: Option<Submission>,
+    #[cfg(test)]
+    completion_outcome: Option<tests::CompletionOutcome>,
 }
 
 struct Submission {
@@ -467,7 +469,21 @@ impl Lifecycle {
         let job = jobs.remove(&self.0);
         #[cfg(test)]
         if let Some(job) = job.as_ref() {
-            tests::settled(self.0, &job.root);
+            let outcome = if std::thread::panicking() {
+                tests::CompletionOutcome::Failed {
+                    reason: format!("publication worker panicked during {}", job.phase),
+                }
+            } else {
+                job.completion_outcome
+                    .clone()
+                    .unwrap_or_else(|| tests::CompletionOutcome::Failed {
+                        reason: format!(
+                            "publication worker exited during {} without a terminal outcome",
+                            job.phase
+                        ),
+                    })
+            };
+            tests::settled(self.0, &job.root, outcome);
         }
         drop(job);
     }
@@ -487,6 +503,10 @@ impl Lifecycle {
             self.remove(&mut jobs);
             return false;
         }
+        #[cfg(test)]
+        {
+            job.completion_outcome = None;
+        }
         job.context = Arc::as_ptr(&current.target.ctx) as usize;
         job.content_generation = current.content_generation;
         job.paths = current.paths.clone();
@@ -496,6 +516,14 @@ impl Lifecycle {
             .with_lifecycle(current.target.ctx.subc_lifecycle_admission());
         job.token.mark_running();
         true
+    }
+
+    #[cfg(test)]
+    fn outcome(&self, outcome: tests::CompletionOutcome) {
+        JOBS.lock()
+            .get_mut(&self.0)
+            .expect("live view publication")
+            .completion_outcome = Some(outcome);
     }
 
     fn phase(&self, phase: &str) -> crate::views::Result<()> {
@@ -721,6 +749,8 @@ pub(crate) fn schedule(
                 paths: current.paths.clone(),
                 rescan: current.rescan,
                 pending: None,
+                #[cfg(test)]
+                completion_outcome: None,
             },
         );
     }
@@ -739,11 +769,22 @@ pub(crate) fn schedule(
                 let _cancellation = super::install_job_cancellation(token.clone());
                 let content_generation = current.content_generation;
                 let paths = &current.paths;
-                if target.ctx.retire_deleted_view_root()
-                    || token.cancel_requested_before_commit()
-                    || target.ctx.configure_content_generation() != content_generation
-                    || !target.ctx.config().views.enabled
-                {
+                let stop_reason = if target.ctx.retire_deleted_view_root() {
+                    Some("view root was retired")
+                } else if token.cancel_requested_before_commit() {
+                    Some("publication cancellation was requested")
+                } else if target.ctx.configure_content_generation() != content_generation {
+                    Some("view configuration was replaced")
+                } else if !target.ctx.config().views.enabled {
+                    Some("views were disabled")
+                } else {
+                    None
+                };
+                if let Some(_reason) = stop_reason {
+                    #[cfg(test)]
+                    lifecycle.outcome(tests::CompletionOutcome::Cancelled {
+                        reason: _reason.to_owned(),
+                    });
                     if lifecycle.advance(&mut current, false) {
                         continue;
                     }
@@ -822,6 +863,12 @@ pub(crate) fn schedule(
                     report.pending_paths.len(),
                     target.ctx.canonical_cache_root().display()
                 );
+                    #[cfg(test)]
+                    lifecycle.outcome(if report.published {
+                        tests::CompletionOutcome::Published
+                    } else {
+                        tests::CompletionOutcome::Noop
+                    });
                     Ok::<(), PublicationFailure>(())
                 })();
                 match result {
@@ -838,9 +885,22 @@ pub(crate) fn schedule(
                         // Root deletion also cancels its token. Retire the view
                         // before testing cancellation, or the short circuit
                         // would leave readers attached to a vanished checkout.
-                        if target.ctx.retire_deleted_view_root() || target.ctx.view_runtime_snapshot().is_none()
-                            || token.cancel_requested_before_commit()
-                            || target.ctx.configure_content_generation() != content_generation {
+                        let stop_reason = if target.ctx.retire_deleted_view_root() {
+                            Some("view root was retired")
+                        } else if target.ctx.view_runtime_snapshot().is_none() {
+                            Some("view runtime was removed")
+                        } else if token.cancel_requested_before_commit() {
+                            Some("publication cancellation was requested")
+                        } else if target.ctx.configure_content_generation() != content_generation {
+                            Some("view configuration was replaced")
+                        } else {
+                            None
+                        };
+                        if let Some(_reason) = stop_reason {
+                            #[cfg(test)]
+                            lifecycle.outcome(tests::CompletionOutcome::Cancelled {
+                                reason: format!("{_reason}: {error}"),
+                            });
                             if !lifecycle.advance(&mut current, false) {
                                 break;
                             }
@@ -850,6 +910,10 @@ pub(crate) fn schedule(
                         // scheduling acknowledgement is not publication completion.
                         let root = target.ctx.canonical_cache_root();
                         target.ctx.view_publication_retry().lock().failed_publication(&root, &error);
+                        #[cfg(test)]
+                        lifecycle.outcome(tests::CompletionOutcome::Failed {
+                            reason: error.to_string(),
+                        });
                         if !lifecycle.advance(&mut current, true) {
                             break;
                         }
@@ -878,6 +942,9 @@ pub(crate) fn schedule(
 #[cfg(test)]
 #[path = "view_publication_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::{CompletionOutcome, Completions};
 
 #[cfg(test)]
 thread_local! {

@@ -111,8 +111,23 @@ pub(super) fn record_cas(root: PathBuf, elapsed: Duration) {
     CAS_TIMINGS.lock().entry(root).or_default().push(elapsed);
 }
 
-static SETTLED: LazyLock<Mutex<HashMap<PathBuf, Sender<u64>>>> =
+static SETTLED: LazyLock<Mutex<HashMap<PathBuf, Sender<Completion>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CompletionOutcome {
+    Published,
+    Noop,
+    Failed { reason: String },
+    Cancelled { reason: String },
+}
+
+#[derive(Debug)]
+pub(crate) struct Completion {
+    pub(crate) root: PathBuf,
+    pub(crate) id: u64,
+    pub(crate) outcome: CompletionOutcome,
+}
 
 type Failure = (Instant, Duration, usize, bool);
 
@@ -181,32 +196,100 @@ impl Drop for Failures {
     }
 }
 
-pub(super) fn settled(id: u64, root: &Path) {
+pub(super) fn settled(id: u64, root: &Path, outcome: CompletionOutcome) {
     if let Some(tx) = SETTLED.lock().get(root) {
-        let _ = tx.send(id);
+        let _ = tx.send(Completion {
+            root: root.to_owned(),
+            id,
+            outcome,
+        });
     }
 }
 
-struct Completions {
+pub(crate) struct Completions {
     root: PathBuf,
-    rx: Receiver<u64>,
+    rx: Receiver<Completion>,
 }
 impl Completions {
-    fn new(root: PathBuf) -> Self {
+    pub(crate) fn new(root: PathBuf) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         SETTLED.lock().insert(root.clone(), tx);
         Self { root, rx }
     }
     fn next(&self) -> u64 {
+        self.next_event().id
+    }
+    pub(crate) fn next_event(&self) -> Completion {
         self.rx
             .recv_timeout(Duration::from_secs(60))
-            .expect("publication completion")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "missing publication-settled event for root {} within 60s: {error}",
+                    self.root.display()
+                )
+            })
     }
 }
 impl Drop for Completions {
     fn drop(&mut self) {
         SETTLED.lock().remove(&self.root);
     }
+}
+
+#[test]
+fn publication_completion_reports_a_worker_panic_as_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_owned();
+    let completions = Completions::new(root.clone());
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let token = JobCancellation::new().with_root(&root);
+    token.mark_running();
+    JOBS.lock().insert(
+        id,
+        Running {
+            root: root.clone(),
+            context: 0,
+            content_generation: 0,
+            token,
+            phase: "manifest".into(),
+            started: Instant::now(),
+            phase_started: Instant::now(),
+            paths: BTreeSet::new(),
+            rescan: false,
+            pending: None,
+            completion_outcome: Some(CompletionOutcome::Published),
+        },
+    );
+    let lifecycle = Lifecycle(id);
+    assert!(std::thread::spawn(move || {
+        let _lifecycle = lifecycle;
+        panic!("injected publication worker panic");
+    })
+    .join()
+    .is_err());
+    let event = completions.next_event();
+    assert_eq!(event.root, root);
+    assert_eq!(event.id, id);
+    assert_eq!(
+        event.outcome,
+        CompletionOutcome::Failed {
+            reason: "publication worker panicked during manifest".into()
+        }
+    );
+}
+
+#[test]
+fn publication_completion_distinguishes_a_noop() {
+    let fixture = Fixture::new();
+    let completions = Completions::new(fixture.job_root());
+    fixture.schedule();
+    let event = completions.next_event();
+    assert_eq!(event.root, fixture.job_root());
+    assert_eq!(event.outcome, CompletionOutcome::Noop);
+    assert_eq!(
+        fixture.ctx.view_runtime_snapshot().unwrap().generation,
+        Some(fixture.initial.clone())
+    );
 }
 
 struct GateEntry {
@@ -452,6 +535,7 @@ impl Fixture {
 #[test]
 fn publication_burst_is_single_flight_and_converges() {
     let fixture = Fixture::with_files(20);
+    let completions = Completions::new(fixture.job_root());
     fixture.change("first");
     let gate = Gate::new(&fixture.job_root(), "derived");
     fixture.schedule();
@@ -473,6 +557,9 @@ fn publication_burst_is_single_flight_and_converges() {
         .count();
     drop(gate);
     fixture.wait_idle_for(Duration::from_secs(60));
+    let event = completions.next_event();
+    assert_eq!(event.root, fixture.job_root());
+    assert_eq!(event.outcome, CompletionOutcome::Published);
     assert_eq!(CAS_TIMINGS.lock()[&fixture.job_root()].len(), 2);
     assert_eq!(in_flight, 1, "edits must not start competing publications");
     assert_eq!(
@@ -485,6 +572,7 @@ fn publication_burst_is_single_flight_and_converges() {
 #[test]
 fn publication_failed_batch_is_included_in_follow_up() {
     let fixture = Fixture::with_files(1);
+    let completions = Completions::new(fixture.job_root());
     fixture.change("failed_batch");
     let failures = Failures::new(fixture.job_root());
     let gate = Gate::new(&fixture.job_root(), "working_tree_read");
@@ -507,6 +595,9 @@ fn publication_failed_batch_is_included_in_follow_up() {
     std::fs::write(&tracked, "pub fn failed_batch() {}\n").unwrap();
     drop(retry_gate);
     fixture.wait_idle_for(Duration::from_secs(60));
+    let event = completions.next_event();
+    assert_eq!(event.root, fixture.job_root());
+    assert_eq!(event.outcome, CompletionOutcome::Published);
     assert_eq!(CAS_TIMINGS.lock()[&fixture.job_root()].len(), 1);
     assert_eq!(
         crate::views::assembly::publication_outcomes_for_test(&fixture.job_root()),
@@ -559,6 +650,7 @@ fn publication_rescan_only_promotes_its_first_follow_up_to_full_read() {
 #[test]
 fn publication_unbind_abandons_in_flight_and_pending_work() {
     let fixture = Fixture::new();
+    let completions = Completions::new(fixture.job_root());
     fixture
         .ctx
         .set_unbound_build_abandon_grace_for_test(Duration::ZERO);
@@ -570,6 +662,12 @@ fn publication_unbind_abandons_in_flight_and_pending_work() {
     fixture.ctx.mark_subc_unbound();
     drop(gate);
     fixture.wait_idle_for(Duration::from_secs(60));
+    let event = completions.next_event();
+    assert_eq!(event.root, fixture.job_root());
+    assert!(
+        matches!(event.outcome, CompletionOutcome::Cancelled { reason } if !reason.is_empty()),
+        "an abandoned publication must report cancellation with its reason"
+    );
     assert_eq!(
         fixture.view.current_generation().unwrap().as_deref(),
         Some(fixture.initial.as_str())

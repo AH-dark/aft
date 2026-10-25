@@ -17163,6 +17163,7 @@ mod tests {
             .generation;
         runtime_drain::drain_build_completions(&ctx);
         runtime_drain::drain_inspect_events(&ctx);
+        let publications = crate::executor::view_publication::Completions::new(root_path.clone());
         let (tx, rx) = crossbeam_channel::unbounded();
         *ctx.watcher_rx().lock() = Some(rx);
         let executor = Arc::new(Executor::new());
@@ -17350,21 +17351,56 @@ mod tests {
             jobs(false).await;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        let start_diagnostics = |observer: Instant| {
+            let producer = ctx.view_publication_attempt_started_for_test(baseline);
+            let relative = |stamp: Option<Instant>, origin: Instant| match stamp {
+                Some(stamp) if stamp >= origin => format!("+{:?}", stamp.duration_since(origin)),
+                Some(stamp) => format!("-{:?}", origin.duration_since(stamp)),
+                None => "not recorded".to_owned(),
+            };
+            format!(
+                "root={} producer_since_edit={} producer_after_due={} observer_since_edit={} observer_after_due={}",
+                root_path.display(),
+                relative(producer, last_edit),
+                relative(producer, due),
+                relative(Some(observer), last_edit),
+                relative(Some(observer), due),
+            )
+        };
         assert_eq!(
             ctx.view_publication_attempts_for_test() - baseline,
             1,
-            "view publication did not start within 2s of the edit without other maintenance due"
+            "view publication did not start within 2s of the edit without other maintenance due; {}",
+            start_diagnostics(Instant::now())
         );
         let started = Instant::now();
-        assert!(started >= due, "publication must respect the quiet window");
-        assert!(started <= due + Duration::from_secs(1));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while ctx.view_runtime_snapshot().unwrap().generation == initial {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the started publication must install its generation");
+        assert!(
+            started >= due,
+            "publication must respect the quiet window; {}",
+            start_diagnostics(started)
+        );
+        assert!(
+            started <= due + Duration::from_secs(1),
+            "publication start exceeded the quiet deadline + 1s; {}",
+            start_diagnostics(started)
+        );
+        // Building a generation can take longer under CPU or I/O contention.
+        // Wait for this root's terminal event before checking its installation.
+        let publication = tokio::task::spawn_blocking(move || publications.next_event())
+            .await
+            .expect("publication-settled observer must not panic");
+        assert_eq!(publication.root, root_path);
+        assert_eq!(
+            publication.outcome,
+            crate::executor::view_publication::CompletionOutcome::Published,
+            "publication did not succeed: {:?}",
+            publication.outcome
+        );
+        assert_ne!(
+            ctx.view_runtime_snapshot().unwrap().generation,
+            initial,
+            "a successful publication completion must follow generation installation"
+        );
         runtime_drain::drain_build_completions(&ctx);
         runtime_drain::drain_inspect_events(&ctx);
         let slice = ctx.watcher_drain_slice().lock();
