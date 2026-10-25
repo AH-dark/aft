@@ -2547,6 +2547,11 @@ pub enum CallGraphStoreBuildEvent {
         fulfilled_force_token: Option<u64>,
         publication_epoch: u64,
     },
+    /// The build published successfully; only installing its reader remains.
+    Reopen {
+        fulfilled_force_token: Option<u64>,
+        publication_epoch: u64,
+    },
     Denied {
         reason: String,
     },
@@ -11031,6 +11036,9 @@ impl AppContext {
                             return CallgraphStoreAccess::Unavailable;
                         }
                     }
+                    Err(error) if error.is_transient_lock_contention() => {
+                        return CallgraphStoreAccess::Error(error);
+                    }
                     Err(error) => {
                         if !self.callgraph_writer() {
                             return CallgraphStoreAccess::Unavailable;
@@ -11124,8 +11132,10 @@ impl AppContext {
                     // release it before reopening the published generation.
                     remove_callgraph_pointer_before_inline_reopen_for_test(&callgraph_dir, &store);
                     drop(store);
-                    let reopened =
-                        CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone());
+                    let reopened = CallGraphStore::reopen_readonly(
+                        callgraph_dir.clone(),
+                        project_root.clone(),
+                    );
                     let mut replay = None;
                     let outcome = self.with_current_callgraph_store_rx(
                         receiver_generation,
@@ -11152,6 +11162,14 @@ impl AppContext {
                                     CallgraphStoreAccess::Ready(ready)
                                 }
                                 Ok(None) => CallgraphStoreAccess::Building,
+                                Err(error) if error.is_transient_lock_contention() => {
+                                    self.defer_callgraph_store_reopen(
+                                        receiver,
+                                        fulfilled_force_token,
+                                        publication_epoch,
+                                    );
+                                    CallgraphStoreAccess::Error(error)
+                                }
                                 Err(error) => CallgraphStoreAccess::Error(error),
                             }
                         },
@@ -11178,6 +11196,24 @@ impl AppContext {
                         let _ = self.request_tier2_refresh_pull();
                     }
                     return outcome;
+                }
+                Ok(CallGraphStoreBuildEvent::Reopen {
+                    fulfilled_force_token,
+                    publication_epoch,
+                }) => {
+                    self.with_current_callgraph_store_rx(
+                        receiver_generation,
+                        receiver_epoch,
+                        |receiver| {
+                            self.defer_callgraph_store_reopen(
+                                receiver,
+                                fulfilled_force_token,
+                                publication_epoch,
+                            );
+                        },
+                    );
+                    crate::runtime_drain::drain_callgraph_store_events(self);
+                    return CallgraphStoreAccess::Building;
                 }
                 Ok(CallGraphStoreBuildEvent::Suspended { suspension }) => {
                     let suspended = self.with_current_callgraph_store_rx(
@@ -11590,6 +11626,26 @@ impl AppContext {
     #[doc(hidden)]
     pub fn callgraph_store_rx_generation(&self) -> u64 {
         self.callgraph_store_rx_generation.load(Ordering::SeqCst)
+    }
+
+    /// Keep a consumed publication retryable without leaving a writer lease open.
+    /// The caller holds the receiver slot; advancing its identity prevents a
+    /// waiter on the disconnected old channel from clearing the replacement.
+    #[doc(hidden)]
+    pub fn defer_callgraph_store_reopen(
+        &self,
+        receiver: &mut Option<crossbeam_channel::Receiver<CallGraphStoreBuildEvent>>,
+        fulfilled_force_token: Option<u64>,
+        publication_epoch: u64,
+    ) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(CallGraphStoreBuildEvent::Reopen {
+            fulfilled_force_token,
+            publication_epoch,
+        })
+        .expect("new reopen channel");
+        self.next_callgraph_store_rx_epoch();
+        *receiver = Some(rx);
     }
 
     pub(crate) fn next_callgraph_store_rx_epoch(&self) -> u64 {
@@ -17934,6 +17990,53 @@ mod callgraph_store_for_ops_tests {
         )
         .unwrap();
         store.sqlite_path().to_path_buf()
+    }
+
+    #[test]
+    fn callgraph_busy_readiness_query_reports_building() {
+        for read_only in [true, false] {
+            let (_dirs, ctx) = cold_build_context();
+            let root = ctx.callgraph_project_root().unwrap();
+            ctx.set_canonical_cache_root(root.clone());
+            let key = crate::search_index::artifact_cache_key(&root);
+            crate::root_cache::configure_artifact_access(&root, &key, false);
+            let store = CallGraphStore::open(ctx.callgraph_store_dir(), root.clone()).unwrap();
+            store.cold_build(&[]).unwrap();
+            let blocker = store.lock_readiness_for_test();
+            drop(store);
+            crate::root_cache::configure_artifact_access(&root, &key, read_only);
+            ctx.set_cache_role(read_only, None);
+            let _wait = force_async_callgraph_builds(&ctx);
+            let response = crate::commands::callers::handle_callers(
+                &RawRequest {
+                    id: "busy-callers".into(),
+                    command: "callers".into(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: json!({"file": root.join("src/lib.rs"), "symbol": "callee"}),
+                },
+                &ctx,
+            );
+            assert_eq!(response.data["code"], "callgraph_building", "{response:?}");
+            assert!(
+                response.data["message"].as_str().unwrap().contains("busy"),
+                "{response:?}"
+            );
+            let access = ctx.callgraph_store_for_ops();
+            assert_eq!(
+                crate::feature_status::callgraph_access_observation(&ctx, &access).effective,
+                crate::feature_status::IndexEffective::Building
+            );
+            assert!(
+                ctx.callgraph_store_rx().lock().is_none(),
+                "busy must not start a cold build"
+            );
+            blocker.execute_batch("ROLLBACK").unwrap();
+            assert!(matches!(
+                ctx.callgraph_store_for_ops(),
+                CallgraphStoreAccess::Ready(_)
+            ));
+        }
     }
 
     fn capture_cold_build_decision(ctx: &AppContext) -> String {
