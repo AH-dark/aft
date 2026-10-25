@@ -9580,6 +9580,13 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn poll_task(&self, task: &Arc<BgTask>) -> Result<(), String> {
+        // Terminal tasks can stay in the watchdog index until their surviving
+        // process group releases scratch. Only cleanup needs retrying; reading
+        // their written marker again cannot change the observed outcome.
+        if task.is_terminal() {
+            super::watchdog::record_terminal_marker_skip();
+            return Ok(());
+        }
         if let Some(reason) = self.memory_limit_exceeded(task) {
             super::watchdog::schedule_memory_kill(self, task, reason);
             return Ok(());
@@ -9634,7 +9641,10 @@ impl BgTaskRegistry {
         }
         let polled = match task.exit_marker_probe.lock() {
             Ok(mut probe) => super::persistence::poll_exit_marker(&task.paths, &mut probe),
-            Err(_) => read_exit_marker(&task.paths),
+            Err(_) => super::persistence::read_exit_marker_with_reason(
+                &task.paths,
+                super::watchdog::MarkerReadReason::PoisonedProbe,
+            ),
         };
         let marker = match polled {
             Ok(Some(marker)) => marker,
