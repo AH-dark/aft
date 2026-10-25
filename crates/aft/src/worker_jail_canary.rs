@@ -37,6 +37,13 @@ pub const CANARY_FILE: &str = "canary";
 const CANARY_CONTENTS: &[u8] =
     b"AFT worker-jail canary. Worker shells cannot read this file; the gh shim uses that to recognize them.\n";
 
+/// Public only so integration tests use the same account-home lookup as the sandbox.
+#[doc(hidden)]
+#[cfg(unix)]
+pub fn account_home() -> std::io::Result<PathBuf> {
+    crate::production_storage::account_home()
+}
+
 /// The canary directory for one account home.
 pub fn dir_for_home(home: &Path) -> PathBuf {
     home.join(CANARY_DIR_FROM_HOME)

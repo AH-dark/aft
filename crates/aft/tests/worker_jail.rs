@@ -2253,6 +2253,9 @@ async fn worker_jail_spawns_with_dangling_socket_deny() {
 
 #[tokio::test]
 async fn worker_jail_shell_runs_without_any_packed_refs_files() {
+    if !native_available() {
+        return;
+    }
     let mut jail = Jail::start_with_options(None, None, false).await;
     let common = jail.main.join(".git");
     for name in ["packed-refs", "packed-refs.lock", "packed-refs.new"] {
@@ -2468,7 +2471,77 @@ fn native_available() -> bool {
         eprintln!("Landlock probe skipped: mandatory ABI unavailable");
         return false;
     }
+    #[cfg(target_os = "linux")]
+    {
+        let home = aft::worker_jail_canary::account_home()
+            .expect("resolve account home for worker canary probe");
+        if let Err(error) = account_home_canary_writable(&home) {
+            let reason = format!(
+                "account home {} cannot hold the worker canary: {error}",
+                home.display()
+            );
+            assert_ne!(
+                std::env::var("AFT_REQUIRE_LANDLOCK").as_deref(),
+                Ok("1"),
+                "{reason}"
+            );
+            eprintln!("{reason}");
+            return false;
+        }
+    }
     true
+}
+
+#[cfg(target_os = "linux")]
+fn account_home_canary_writable(home: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let canary = aft::worker_jail_canary::dir_for_home(home);
+    // Canary preparation creates missing parents; probe the nearest existing
+    // directory without creating anything in the account's real home.
+    for ancestor in canary.ancestors() {
+        match std::fs::metadata(ancestor) {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+                }
+                let path = std::ffi::CString::new(ancestor.as_os_str().as_bytes())?;
+                // SAFETY: path is a live, NUL-terminated string for this call.
+                if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_canary_preflight_accepts_missing_and_existing_directories_without_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    account_home_canary_writable(&home).unwrap();
+    assert!(!home.exists());
+
+    let canary = aft::worker_jail_canary::dir_for_home(&home);
+    std::fs::create_dir_all(&canary).unwrap();
+    account_home_canary_writable(&home).unwrap();
+    assert!(std::fs::read_dir(&canary).unwrap().next().is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_canary_preflight_rejects_a_file_ancestor() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::write(&home, "not a directory").unwrap();
+    let error = account_home_canary_writable(&home).unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+    assert_eq!(std::fs::read_to_string(&home).unwrap(), "not a directory");
 }
 
 fn executable(path: &Path, contents: &str) {
