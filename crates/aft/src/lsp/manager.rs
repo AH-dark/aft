@@ -2945,7 +2945,7 @@ impl LspManager {
         extra_config_markers: &[String],
     ) -> Vec<(ServerKey, Vec<PathBuf>)> {
         let mut rust_manifest_changes = Vec::new();
-        if events.is_empty() {
+        if events.is_empty() || self.clients.is_empty() {
             return rust_manifest_changes;
         }
         // A server's root and globs may spell a path either the way the
@@ -2953,7 +2953,11 @@ impl LspManager {
         // `/var/...` and `/private/var/...`), so both spellings are matched.
         let events: Vec<(&Path, PathBuf, FileChangeType)> = events
             .iter()
-            .map(|(path, typ)| (path.as_path(), resolve_for_lsp_uri(path), *typ))
+            .map(|(path, typ)| {
+                #[cfg(test)]
+                watcher_work_tests::record_uri_resolution();
+                (path.as_path(), resolve_for_lsp_uri(path), *typ)
+            })
             .collect();
         let keys: Vec<ServerKey> = self.clients.keys().cloned().collect();
         for key in keys {
@@ -8031,10 +8035,17 @@ impl WatcherForwardBacklog {
     /// released. Change kinds are read from disk now, not when queued, so a
     /// file created and deleted while waiting is reported as deleted.
     pub(crate) fn apply(self, lsp: &mut LspManager) -> Vec<(ServerKey, Vec<PathBuf>)> {
+        // No notification or reload can be delivered without a current client.
+        // Check while holding the manager lock, before probing queued paths.
+        if lsp.clients.is_empty() {
+            return Vec::new();
+        }
         let events: Vec<(PathBuf, FileChangeType)> = self
             .paths
             .into_iter()
             .map(|path| {
+                #[cfg(test)]
+                watcher_work_tests::record_kind_probe();
                 let typ = if path.exists() {
                     FileChangeType::CHANGED
                 } else {
@@ -8598,6 +8609,10 @@ fn env_binary_override_from(
 #[cfg(test)]
 #[path = "manager_regression_tests.rs"]
 mod regression_tests;
+
+#[cfg(test)]
+#[path = "watcher_work_tests.rs"]
+mod watcher_work_tests;
 
 #[cfg(test)]
 mod env_binary_override_tests {
