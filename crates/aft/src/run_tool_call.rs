@@ -1324,9 +1324,6 @@ mod tests {
         }
     }
 
-    /// The slow-call line names what an edit was asked to do (target kind,
-    /// match and replacement sizes, outcome) and how long each pipeline step
-    /// took, and never carries the edit text or the file's path.
     /// A plain edit target is a file from its spelling, so a prepare never
     /// spends a filesystem validation (canonicalising every ancestor, asking
     /// the storage floor) on it; that validation belongs to the handler. The
@@ -1376,6 +1373,9 @@ mod tests {
         }
     }
 
+    /// The slow-call line names what an edit was asked to do (target kind,
+    /// match and replacement sizes, outcome) and how long each pipeline step
+    /// took, and never carries the edit text or the file's path.
     #[test]
     fn slow_edit_line_carries_argument_shape_and_phase_times_but_never_text() {
         let temp = tempfile::tempdir().unwrap();
