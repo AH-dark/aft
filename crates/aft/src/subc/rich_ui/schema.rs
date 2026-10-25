@@ -6,13 +6,13 @@
 //! against them, so the checker is the one place that decides two separate
 //! questions:
 //!
-//! - **Is a published schema well formed?** [`check_schema`] accepts only the
+//! - **Is a published schema well formed?** `check_schema` accepts only the
 //!   constructs design 2.2 lists — `null`, `boolean`, `integer`, `decimal`,
 //!   `string`, `list` and `record` — with depth at most 8 and no unions,
-//!   references or patterns. A construct outside that set is a
-//!   [`SchemaError`], so a published schema can never smuggle in a shape the
-//!   phone would not understand.
-//! - **Does a reply fit a schema?** [`validate`] checks a JSON value against a
+//!   references or patterns. A construct outside that set is a `SchemaError`,
+//!   so a published schema can never smuggle in a shape the phone would not
+//!   understand.
+//! - **Does a reply fit a schema?** `validate` checks a JSON value against a
 //!   well-formed schema, and reports the deepest failing path. Records are
 //!   closed: a key the schema does not list is a failure, not something to
 //!   forward.
@@ -30,6 +30,8 @@ use std::fmt;
 
 use serde_json::Value;
 
+use super::jcs_number::canonical_number_text;
+
 /// The deepest nesting design 2.2 allows ("Depth ≤8"). A record that holds a
 /// list of records reaches depth 3.
 pub(crate) const MAX_DEPTH: usize = 8;
@@ -38,8 +40,6 @@ pub(crate) const MAX_DEPTH: usize = 8;
 /// `record.fields` and are not constructs of their own, so a schema that
 /// carries one outside `fields` was written for a language this is not.
 pub(crate) const FIELD_FLAGS: [&str; 2] = ["nullable", "optional"];
-
-use super::jcs_number::canonical_number_text;
 
 /// The constructs design 2.2's schema language has, one per published `type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,9 +110,9 @@ impl fmt::Display for Construct {
 /// Why a schema is not a well-formed design 2.2 schema, or why a value does
 /// not fit one.
 ///
-/// Both answers name the path they apply to, in the JSON-pointer-like form the
-/// manifest itself uses (`operations[0].result.fields.exitCode`), so a failing
-/// test or a refusal message points at the exact spot.
+/// Both answers name the path they apply to in the form
+/// `schema.fields.exitCode` (or `value.items[1].text` for a reply), so a
+/// failing test or a refusal message points at the exact spot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SchemaError {
     /// The schema is not a JSON object.
@@ -255,12 +255,6 @@ impl std::error::Error for SchemaError {}
 pub(crate) fn check_schema(schema: &Value) -> Result<Construct, SchemaError> {
     let path = String::from("schema");
     check_schema_at(schema, &path, 1)
-}
-
-/// Check a schema the caller knows by name, so a failure names its place in
-/// the manifest or in the reply it validates against.
-pub(crate) fn check_schema_named(schema: &Value, path: &str) -> Result<Construct, SchemaError> {
-    check_schema_at(schema, path, 1)
 }
 
 fn check_schema_at(schema: &Value, path: &str, depth: usize) -> Result<Construct, SchemaError> {
@@ -504,11 +498,6 @@ fn check_bound_order(
 /// reply-validating hot path pays one pass, not two.
 pub(crate) fn validate(schema: &Value, value: &Value) -> Result<(), SchemaError> {
     validate_at(schema, value, &String::from("value"))
-}
-
-/// Validate `value` against `schema`, naming the root `path` in failures.
-pub(crate) fn validate_named(schema: &Value, value: &Value, path: &str) -> Result<(), SchemaError> {
-    validate_at(schema, value, &path.to_string())
 }
 
 fn validate_at(schema: &Value, value: &Value, path: &String) -> Result<(), SchemaError> {

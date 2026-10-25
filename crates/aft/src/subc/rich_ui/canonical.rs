@@ -35,9 +35,6 @@ pub(crate) const MAX_SAFE_INTEGER: i128 = 9_007_199_254_740_991;
 pub(crate) enum CanonicalError {
     /// NaN and the infinities are not JSON numbers (RFC 8785 section 3.2.2.3).
     NonFiniteNumber,
-    /// A value outside the closed set of JSON types, which `serde_json` does
-    /// not have, cannot be canonicalized.
-    UnsupportedValue(&'static str),
     /// The caller rejected a number the canonicalizer itself accepts. This
     /// slice refuses fractional and out-of-range numbers in manifest and
     /// template objects (deliverable 2, "Numbers").
@@ -49,9 +46,6 @@ impl fmt::Display for CanonicalError {
         match self {
             CanonicalError::NonFiniteNumber => {
                 write!(f, "NaN and the infinities have no JSON form")
-            }
-            CanonicalError::UnsupportedValue(kind) => {
-                write!(f, "{kind} has no JSON Canonicalization Scheme form")
             }
             CanonicalError::NumberOutOfRange { value } => write!(
                 f,

@@ -13,10 +13,15 @@
 //!
 //! The manifest builder and the operation table arrive in later slices; this
 //! module is the foundation they build on. Nothing here touches the daemon,
-//! the database or the wire.
+//! the database or the wire, and until those slices call in, the only user of
+//! the module is its own test suite: the crate compiles with `-D warnings` in
+//! CI, so the dead-code lint is told exactly that rather than left to fire.
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod canonical;
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod jcs_number;
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod schema;
 #[cfg(test)]
 mod vectors;
