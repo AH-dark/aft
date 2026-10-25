@@ -17,9 +17,40 @@ pub(crate) use request::denied_environment_name;
 pub use request::{build_request, FrozenParams, PresetParams, RootConfinement};
 pub use stream::{GapRecovery, OutputSink, ResumePoint, StreamConsumer};
 
+#[derive(Debug, Clone, Copy)]
+pub enum DirectoryKind {
+    WorkingDirectory,
+    ProjectFolder,
+}
+
+impl DirectoryKind {
+    pub fn canonicalize(self, path: &std::path::Path) -> Result<std::path::PathBuf, Error> {
+        path.canonicalize()
+            .map_err(|source| Error::ResolveDirectory {
+                kind: self,
+                path: path.to_path_buf(),
+                source,
+            })
+    }
+}
+
+impl std::fmt::Display for DirectoryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::WorkingDirectory => "working directory",
+            Self::ProjectFolder => "project folder",
+        })
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     Protocol(String),
+    ResolveDirectory {
+        kind: DirectoryKind,
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
     Sink(std::io::Error),
     Transport(subc_client_rs::CallError),
     Connection(subc_client_rs::ConsumerError),
@@ -35,6 +66,9 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Protocol(message) => write!(f, "remote execution protocol: {message}"),
+            Self::ResolveDirectory { kind, path, source } => {
+                write!(f, "could not resolve {kind} {}: {source}", path.display())
+            }
             Self::Sink(error) => write!(f, "remote execution output sink: {error}"),
             Self::Transport(error) => write!(f, "remote execution route: {error}"),
             Self::Connection(error) => write!(f, "remote execution connection: {error}"),

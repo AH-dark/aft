@@ -130,12 +130,8 @@ pub fn build_request(
     let key = absolute(worktree_root)?;
     let repository = absolute(repository_root)?;
     let cwd_string = absolute(cwd)?;
-    let resolved_key = worktree_root
-        .canonicalize()
-        .map_err(|e| Error::Protocol(e.to_string()))?;
-    let resolved_cwd = cwd
-        .canonicalize()
-        .map_err(|e| Error::Protocol(e.to_string()))?;
+    let resolved_key = super::DirectoryKind::ProjectFolder.canonicalize(worktree_root)?;
+    let resolved_cwd = super::DirectoryKind::WorkingDirectory.canonicalize(cwd)?;
     if !resolved_cwd.starts_with(&resolved_key) {
         return Err(Error::Protocol(
             "cwd resolves outside the workspace key".into(),

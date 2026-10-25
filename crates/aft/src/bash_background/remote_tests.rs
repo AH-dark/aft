@@ -5796,7 +5796,11 @@ fn remote_request_refuses_unrelated_repositories_and_non_git_directories() {
         .prefix("aft-runon-plain-outside-")
         .tempdir_in("/var/tmp")
         .unwrap();
-    assert!(worktree_root_containing(outside.path()).unwrap().is_none());
+    assert!(
+        worktree_root_containing(outside.path(), exec::DirectoryKind::WorkingDirectory)
+            .unwrap()
+            .is_none()
+    );
     let error = build_remote_request(
         &main,
         outside.path(),
@@ -9138,6 +9142,127 @@ async fn assert_blocking_runon_limit_before_acceptance(timeout_ms: u64, cap_ms: 
 }
 
 #[tokio::test]
+async fn runon_missing_workdir_is_refused_by_name_before_dispatch() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let project = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(project.path());
+    let missing_workdir = project.path().join("does-not-exist");
+    let marker = project.path().join("must-not-run-locally");
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({
+            "command": format!("printf local-proof > '{}'", marker.display()),
+            "runon": "linux",
+            "workdir": missing_workdir,
+            "compressed": false,
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap();
+    let done = terminal(ctx.bash_background(), task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    let expected = format!(
+        "runon refused: working directory does not exist: {}; command did not run (os error 2)",
+        missing_workdir.display()
+    );
+    assert_eq!(
+        done.info.status_reason.as_deref(),
+        Some(expected.as_str()),
+        "{done:?}"
+    );
+    assert_eq!(done.child_pid, None);
+    assert_eq!(done.remote_job_id, None);
+    let task = ctx.bash_background().task(task_id).unwrap();
+    assert!(!task.state.lock().unwrap().metadata.local_fallback_started);
+    assert!(!marker.exists(), "a refused runon must never spawn locally");
+    assert!(
+        exec_runs(&daemon).is_empty(),
+        "a missing cwd must never dispatch"
+    );
+}
+
+#[tokio::test]
+async fn runon_missing_project_folder_is_refused_before_connecting() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let missing_root = project.path().join("does-not-exist");
+    let marker = project.path().join("must-not-run-locally");
+    let registry = registry();
+    let mut policy = launch(daemon.connection.with_extension("missing"));
+    policy.explicit_runon = true;
+    let task_id = registry
+        .spawn_remote(
+            policy,
+            SpawnPlan::Unsandboxed,
+            &format!("printf local-proof > '{}'", marker.display()),
+            PathBuf::from("/bin/sh"),
+            "session".into(),
+            project.path().to_path_buf(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
+            storage.path().to_path_buf(),
+            crate::bash_background::TaskSlot::Foreground,
+            false,
+            false,
+            Some(missing_root.clone()),
+        )
+        .unwrap();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    let expected = format!(
+        "runon refused: project folder does not exist: {}; command did not run (os error 2)",
+        missing_root.display()
+    );
+    assert_eq!(
+        done.info.status_reason.as_deref(),
+        Some(expected.as_str()),
+        "{done:?}"
+    );
+    assert_eq!(done.child_pid, None);
+    assert_eq!(done.remote_job_id, None);
+    let task = registry.task(&task_id).unwrap();
+    assert!(!task.state.lock().unwrap().metadata.local_fallback_started);
+    assert!(!marker.exists());
+    assert!(exec_runs(&daemon).is_empty());
+}
+
+#[tokio::test]
+async fn runon_transport_failure_still_reports_remote_unavailable() {
+    let daemon = daemon(Script::Plain, "exec.remote/v1").await;
+    let project = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(project.path());
+    let marker = project.path().join("must-not-run-locally");
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({
+            "command": format!("printf local-proof > '{}'", marker.display()),
+            "runon": "linux",
+            "compressed": false,
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap();
+    let done = terminal(ctx.bash_background(), task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    assert!(
+        done.info
+            .status_reason
+            .as_deref()
+            .unwrap()
+            .starts_with("runon refused: remote execution is unavailable; command did not run: remote execution route: "),
+        "{done:?}"
+    );
+    let task = ctx.bash_background().task(task_id).unwrap();
+    assert!(!task.state.lock().unwrap().metadata.local_fallback_started);
+    assert!(!marker.exists(), "a refused runon must never spawn locally");
+    assert!(exec_runs(&daemon).is_empty());
+}
+
+#[tokio::test]
 async fn runon_non_git_workdir_is_refused_by_name_before_dispatch() {
     let daemon = daemon(Script::Plain, "exec-remote/v1").await;
     let project = tempfile::tempdir().unwrap();
@@ -9148,7 +9273,11 @@ async fn runon_non_git_workdir_is_refused_by_name_before_dispatch() {
         .prefix("aft-runon-non-git-")
         .tempdir_in("/var/tmp")
         .unwrap();
-    assert!(worktree_root_containing(workdir.path()).unwrap().is_none());
+    assert!(
+        worktree_root_containing(workdir.path(), exec::DirectoryKind::WorkingDirectory)
+            .unwrap()
+            .is_none()
+    );
     let marker = workdir.path().join("must-not-run-locally");
     let response = handle_with_policy(
         &ctx,
