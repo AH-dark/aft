@@ -19,6 +19,9 @@ impl Compressor for CargoCompressor {
         output: &str,
         exit_code: Option<i64>,
     ) -> CompressionResult {
+        if let Some(raw) = short_output_passthrough(output) {
+            return raw;
+        }
         match cargo_subcommand(command).as_deref() {
             Some("build" | "check" | "clippy") => compress_build_like(output),
             Some("test") => compress_test(output, exit_code),
@@ -35,8 +38,22 @@ impl Compressor for CargoCompressor {
         output: &str,
         exit_code: Option<i64>,
     ) -> CompressionResult {
+        if let Some(raw) = short_output_passthrough(output) {
+            return raw;
+        }
         compress_test(output, exit_code)
     }
+}
+
+/// Output this short goes back exactly as the command printed it. A summary
+/// saves almost nothing at this size, and every line it leaves out is one the
+/// reader may need. 1 KiB is the size below which `git status` output is
+/// already passed through raw (`git::STATUS_SHORT_LIMIT`), and the byte window
+/// `line_cut::ensure_final_lines` keeps verbatim at the end of any output.
+const SHORT_OUTPUT_BYTES: usize = 1024;
+
+fn short_output_passthrough(output: &str) -> Option<CompressionResult> {
+    (output.len() <= SHORT_OUTPUT_BYTES).then(|| CompressionResult::new(output.to_string()))
 }
 
 fn is_cargo_test_signature_line(line: &str) -> bool {
@@ -642,7 +659,7 @@ error: could not compile `demo` (lib test) due to 1 previous error
         let output = "runner: cargo test\nrunning 2 tests\ntest result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out\nrunning 1 test\ntest result: FAILED. 1 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out\n";
 
         assert!(CargoCompressor.matches_output(output));
-        let result = CargoCompressor.compress_output_match_with_exit_code(output, Some(101));
+        let result = compress_test(output, Some(101));
 
         assert!(result
             .text
@@ -783,8 +800,10 @@ error: could not compile `demo` (lib test) due to 1 previous error
 
     #[test]
     fn cargo_build_like_summaries_keep_lines_they_do_not_read() {
-        // Eleven warnings: one more than the warning cap, so the last warning
-        // block is dropped. The verdict printed after it is not part of it.
+        // Eleven diagnostic warnings and cargo's own `generated 11 warnings`
+        // line make twelve warning blocks, two over the cap of ten, so the
+        // last two are dropped. The verdict printed between them belongs to
+        // neither block and must stay.
         let mut output = String::from("fmt-ok\n    Checking demo v0.1.0 (/tmp/demo)\n");
         for index in 0..11 {
             output.push_str(&format!(
@@ -793,6 +812,7 @@ error: could not compile `demo` (lib test) due to 1 previous error
             ));
         }
         output.push_str("win-check rc=101\nwarning: `demo` (lib) generated 11 warnings\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.50s\n");
+        assert!(output.len() > SHORT_OUTPUT_BYTES);
 
         for command in ["cargo build", "cargo check", "cargo clippy"] {
             let result = CargoCompressor.compress_with_exit_code(command, &output, Some(0));
@@ -844,10 +864,19 @@ error: could not compile `demo` (lib test) due to 1 previous error
     #[test]
     fn cargo_nextest_output_keeps_lines_it_does_not_read() {
         // `cargo nextest` has no extractor of its own and falls back to
-        // generic dedup, which must not lose a mixed-in verdict either.
-        let output = "fmt-ok\nwin-check rc=101\n    Starting 2 tests across 1 binary\n        PASS [   0.004s] demo tests::a\n        PASS [   0.004s] demo tests::b\n     Summary [   0.010s] 2 tests run: 2 passed, 0 skipped\n";
+        // generic dedup, which must not lose a mixed-in verdict either. Forty
+        // tests put the fixture past the 1 KiB raw passthrough.
+        let mut output =
+            String::from("fmt-ok\nwin-check rc=101\n    Starting 40 tests across 1 binary\n");
+        for index in 0..40 {
+            output.push_str(&format!(
+                "        PASS [   0.004s] demo tests::case_{index}\n"
+            ));
+        }
+        output.push_str("     Summary [   0.010s] 40 tests run: 40 passed, 0 skipped\n");
+        assert!(output.len() > SHORT_OUTPUT_BYTES);
 
-        let result = CargoCompressor.compress_with_exit_code("cargo nextest run", output, Some(0));
+        let result = CargoCompressor.compress_with_exit_code("cargo nextest run", &output, Some(0));
 
         assert_eq!(result.text, output);
     }
