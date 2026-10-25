@@ -848,11 +848,13 @@ jobs:
         with:
           name: macos-libtest-archive
           path: ${{ runner.temp }}
+          verify-zstd: macos-libtest-nextest.tar.zst
 
       - uses: ./.github/actions/download-artifact-retry
         with:
           name: macos-bin-archive
           path: ${{ runner.temp }}
+          verify-zstd: macos-bin-nextest.tar.zst
 
       - uses: ./.github/actions/download-artifact-retry
         with:
@@ -991,11 +993,13 @@ jobs:
         with:
           name: macos-libtest-archive
           path: ${{ runner.temp }}
+          verify-zstd: macos-libtest-nextest.tar.zst
 
       - uses: ./.github/actions/download-artifact-retry
         with:
           name: macos-bin-archive
           path: ${{ runner.temp }}
+          verify-zstd: macos-bin-nextest.tar.zst
 
       - name: Rust libtest shard (nextest archive)
         run: ./scripts/rust-test-gate.sh
