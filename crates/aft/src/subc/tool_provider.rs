@@ -3009,7 +3009,31 @@ fn admit_as(
         .arguments
         .as_object()
         .ok_or_else(|| errors::invalid_request("arguments", "arguments must be an object"))?;
-    let legacy = legacy_file_path_arguments(&call.name, arguments)?;
+    let properties = tool
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .expect("embedded schemas have properties");
+    let legacy = if call.name == "zoom" {
+        // Keep the existing refusal for mixed batch and top-level forms, even
+        // though the translator can combine them into a single batch.
+        if arguments.contains_key("batch") {
+            if let Some(key) = arguments.keys().find(|key| !properties.contains_key(*key)) {
+                return Err(errors::invalid_request(
+                    key,
+                    "argument is absent from the served schema",
+                ));
+            }
+        }
+        // Legacy zoom spellings are runtime aliases, not catalog properties.
+        // Check a normalized copy; dispatch still translates the original call.
+        let mut normalized = arguments.clone();
+        crate::subc_translate::normalize_zoom_aliases(&mut normalized)
+            .map_err(|error| errors::invalid_request("arguments", error.message))?;
+        Some(Value::Object(normalized))
+    } else {
+        legacy_file_path_arguments(&call.name, arguments)?
+    };
     let (arguments, checked) = match &legacy {
         Some(renamed) => (
             renamed
@@ -3019,11 +3043,6 @@ fn admit_as(
         ),
         None => (arguments, &call.arguments),
     };
-    let properties = tool
-        .input_schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .expect("embedded schemas have properties");
     for key in arguments.keys() {
         if !properties.contains_key(key) {
             return Err(errors::invalid_request(
@@ -6447,6 +6466,114 @@ mod route_tests {
         )
         .await;
         assert_eq!(known.header.ty, FrameType::Response);
+    }
+
+    async fn assert_v1_zoom_alias_dispatch_matches_batch(target: &str, arguments: Value) {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let canonical = exchange(
+            json!({"name":"zoom", "arguments":{
+                "batch":[{"target":target,"symbols":"parse"}],
+                "contextLines":2,"callgraph":true
+            }}),
+            RouteRole::ToolProviderV1,
+            "session",
+            vec![],
+        )
+        .await;
+        assert_eq!(canonical.header.ty, FrameType::Response);
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 1);
+        let expected = LAST_DISPATCH.lock().unwrap().clone().unwrap();
+        assert_eq!(expected["command"], "zoom");
+
+        let reply = exchange(
+            json!({"name":"zoom", "arguments":arguments}),
+            RouteRole::ToolProviderV1,
+            "session",
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Response,
+            "legacy zoom arguments {arguments} were refused: {}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 2);
+        assert_eq!(*LAST_DISPATCH.lock().unwrap(), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn v1_zoom_path_alias_dispatch_matches_batch() {
+        let target = std::env::current_dir().unwrap().join("zoom-alias.ts");
+        let target = target.to_str().unwrap();
+        assert_v1_zoom_alias_dispatch_matches_batch(
+            target,
+            json!({"path":target,"symbols":"parse","contextLines":2,"callgraph":true}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn v1_zoom_targets_alias_dispatch_matches_batch() {
+        let target = std::env::current_dir().unwrap().join("zoom-alias.ts");
+        let target = target.to_str().unwrap();
+        assert_v1_zoom_alias_dispatch_matches_batch(
+            target,
+            json!({"targets":[{"path":target,"symbols":"parse"}],"contextLines":2,"callgraph":true}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn v1_zoom_mixed_batch_and_path_keeps_refusal() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let reply = exchange(
+            json!({"name":"zoom", "arguments":{
+                "batch":[{"target":"module.ts","symbols":"parse"}],
+                "path":"other.ts","symbols":"parse"
+            }}),
+            RouteRole::ToolProviderV1,
+            "session",
+            vec![],
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Error);
+        assert_eq!(
+            serde_json::to_value(error_body(&reply)).unwrap(),
+            serde_json::to_value(errors::invalid_request(
+                "path",
+                "argument is absent from the served schema"
+            ))
+            .unwrap()
+        );
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn v1_zoom_alias_with_unknown_field_keeps_refusal() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let reply = exchange(
+            json!({"name":"zoom", "arguments":{
+                "bogus":true,"path":"module.ts","symbols":"parse"
+            }}),
+            RouteRole::ToolProviderV1,
+            "session",
+            vec![],
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Error);
+        assert_eq!(
+            serde_json::to_value(error_body(&reply)).unwrap(),
+            serde_json::to_value(errors::invalid_request(
+                "bogus",
+                "argument is absent from the served schema"
+            ))
+            .unwrap()
+        );
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
