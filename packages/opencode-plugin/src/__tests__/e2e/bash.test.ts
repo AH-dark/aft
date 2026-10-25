@@ -192,7 +192,10 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(launched.status).toBe("running");
     const taskId = launched.task_id as string;
     const started = Date.now();
-    while (Date.now() - started < 5_000) {
+    // A positive wait for a short command to finish. Windows runners start
+    // PowerShell slowly and can run git several times slower under load, so a
+    // 5 s bound failed there (git status took over 5 s); a hang still fails here.
+    while (Date.now() - started < 20_000) {
       const status = await h.bridge.send("bash_status", { task_id: taskId });
       if (status.status !== "running") return status;
       await new Promise((resolve) => setTimeout(resolve, 50));
