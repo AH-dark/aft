@@ -245,6 +245,8 @@ pub(crate) struct ReferenceSidecars {
     /// reasoning as the settle window for manifests, and it does not depend on
     /// that policy, which tests set to zero.
     memo_settle: Duration,
+    /// The view-directory size sidecar writes must stay within.
+    directory_limit: usize,
 }
 
 pub(crate) fn global() -> &'static ReferenceSidecars {
@@ -268,6 +270,17 @@ fn encode(stamp: &FileStamp, origin: u32, derived_at: i128, keys: &[[u8; 32]]) -
     bytes
 }
 
+/// Whether `view` can take `needed` more entries without exceeding `limit`,
+/// the directory size that blob scans and generation cleanup examine in one
+/// pass. Counting stops just past the limit.
+fn directory_has_room(view: &Path, needed: usize, limit: usize) -> bool {
+    let Ok(entries) = fs::read_dir(view) else {
+        return false;
+    };
+    let present = entries.take(limit.saturating_add(1)).count();
+    present.saturating_add(needed) <= limit
+}
+
 /// Write `keys` (sorted, unique) as the sidecar of the manifest at
 /// `view/manifest-<generation>.json` whose stamp is `stamp`.
 fn write_sidecar(
@@ -277,9 +290,20 @@ fn write_sidecar(
     origin: u32,
     derived_at: i128,
     keys: &[[u8; 32]],
+    directory_limit: usize,
 ) -> std::io::Result<()> {
     let path = view.join(sidecar_name(generation));
     crate::production_storage::refuse_write(&path)?;
+    // The write briefly adds a temporary file and, the first time, the
+    // sidecar itself. A sidecar must never be what pushes a view directory
+    // over the limit: blob marking would then refuse the whole directory.
+    // Without one, blob GC decodes this manifest's JSON instead.
+    let needed = if path.exists() { 1 } else { 2 };
+    if !directory_has_room(view, needed, directory_limit) {
+        return Err(std::io::Error::other(
+            "view directory is at the generation directory limit; sidecar not written",
+        ));
+    }
     // The sidecar is rebuildable from the manifest, so it needs a synced file
     // before the rename but not a directory sync of its own.
     crate::durability::atomic_write(
@@ -324,6 +348,7 @@ pub(crate) fn write_published(
         ORIGIN_PUBLISHER,
         derived_at,
         &keys,
+        super::generation::GENERATION_DIRECTORY_LIMIT,
     )
 }
 
@@ -333,6 +358,15 @@ impl ReferenceSidecars {
             settle,
             verified: Mutex::new(HashMap::new()),
             memo_settle: SETTLE,
+            directory_limit: super::generation::GENERATION_DIRECTORY_LIMIT,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_directory_limit(settle: Duration, directory_limit: usize) -> Self {
+        Self {
+            directory_limit,
+            ..Self::new(settle)
         }
     }
 
@@ -393,7 +427,15 @@ impl ReferenceSidecars {
         if !unchanged || !stamp.settled_by(now, self.settle) {
             return Ok(KeySource::Decoded { written: false });
         }
-        let written = match write_sidecar(view, generation, &stamp, ORIGIN_DERIVED, now, &keys) {
+        let written = match write_sidecar(
+            view,
+            generation,
+            &stamp,
+            ORIGIN_DERIVED,
+            now,
+            &keys,
+            self.directory_limit,
+        ) {
             Ok(()) => true,
             Err(error) => {
                 log::debug!(

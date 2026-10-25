@@ -15,11 +15,12 @@
 //! count drawn from the given range. The sweep visits every manifest path
 //! independently, as it would separate files.
 //!
-//! For each pass the bench prints wall time, process CPU time, bytes read
-//! through read(2) (Linux `rchar`), heap traffic from a counting allocator
-//! (total bytes allocated, allocation count, peak live heap above the start of
-//! the pass), and the pass's peak resident set size (Linux `VmHWM`, reset
-//! before each pass). At the end it prints the total size of the reference
+//! For each pass the bench prints wall time, process CPU time (Unix only),
+//! bytes read through read(2) (Linux `rchar`), heap traffic from a counting
+//! allocator (total bytes allocated, allocation count, peak live heap above
+//! the start of the pass), and the pass's peak resident set size (Linux
+//! `VmHWM`, reset before each pass). A figure the platform cannot provide is
+//! printed as `n/a`. At the end it prints the total size of the reference
 //! sidecars on disk.
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -81,13 +82,23 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-fn cpu_seconds() -> f64 {
+/// Process CPU time (user plus system). Read with getrusage on Unix; other
+/// platforms report it as not measured.
+#[cfg(unix)]
+fn cpu_seconds() -> Option<f64> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: getrusage fills the provided struct for the calling process.
-    unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
     let usage = unsafe { usage.assume_init() };
     let seconds = |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1e6;
-    seconds(usage.ru_utime) + seconds(usage.ru_stime)
+    Some(seconds(usage.ru_utime) + seconds(usage.ru_stime))
+}
+
+#[cfg(not(unix))]
+fn cpu_seconds() -> Option<f64> {
+    None
 }
 
 fn bytes_read() -> Option<u64> {
@@ -285,7 +296,10 @@ fn main() {
             references: SweepReferences::default(),
         });
         let wall_ms = wall.elapsed().as_secs_f64() * 1e3;
-        let cpu_ms = (cpu_seconds() - cpu) * 1e3;
+        let cpu_ms = match (cpu, cpu_seconds()) {
+            (Some(before), Some(after)) => format!("{:.0}", (after - before) * 1e3),
+            _ => "n/a".into(),
+        };
         let read_mb = match (read, bytes_read()) {
             (Some(before), Some(after)) => format!("{:.1}", (after - before) as f64 / 1e6),
             _ => "n/a".into(),
@@ -299,7 +313,7 @@ fn main() {
             Err(error) => (0, 0, format!("err: {error}")),
         };
         println!(
-            "{pass}\t{wall_ms:.0}\t{cpu_ms:.0}\t{read_mb}\t{alloc_mb:.1}\t{allocs}\t{peak_mb:.1}\t{rss}\t{examined}\t{deleted}\t{outcome}"
+            "{pass}\t{wall_ms:.0}\t{cpu_ms}\t{read_mb}\t{alloc_mb:.1}\t{allocs}\t{peak_mb:.1}\t{rss}\t{examined}\t{deleted}\t{outcome}"
         );
     }
     let (sidecars, sidecar_bytes) = file_bytes(&storage, "keys");
