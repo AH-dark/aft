@@ -2748,6 +2748,31 @@ describe("registerBashTool registers companions only while bash.background is on
     expect((calls[1] as [string, Record<string, unknown>])[0]).toBe("bash_kill");
     expect((calls[1] as [string, Record<string, unknown>])[1]).toEqual({ task_id: "bash-123" });
   });
+
+  test("bash_kill reports the runner answer without claiming a known task outcome", async () => {
+    for (const remote_cancel of [
+      "runner confirmed cancellation",
+      "runner reports job already ended",
+      "remote cancellation unconfirmed; outcome is still unknown: runner unavailable",
+    ]) {
+      const tools = new Map<string, MockToolDef>();
+      const { bridge } = makeTrackableMockBridge({ status: "fate_unknown", remote_cancel });
+      const ctx: PluginContext = {
+        pool: { getBridge: () => bridge } as unknown as PluginContext["pool"],
+        config: { bash: { background: true } } as PluginContext["config"],
+        storageDir: "/tmp/test",
+      };
+      registerBashTool(makeMockApi(tools), ctx);
+      const result = await tools
+        .get("bash_kill")!
+        .execute("kill-call", { task_id: "bash-unknown" }, undefined, undefined, {
+          cwd: projectRoot,
+        });
+      expect(result.content).toEqual([
+        { type: "text", text: `Task bash-unknown: fate_unknown · ${remote_cancel}` },
+      ]);
+    }
+  });
 });
 
 describe("bash tool description (agent-facing wording)", () => {
