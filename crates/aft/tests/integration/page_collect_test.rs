@@ -129,9 +129,16 @@ fn keyed(mut params: Value) -> Value {
 
 /// `page.collect` params as core sends them.
 fn collect_params(entry: &str) -> Value {
+    collect_params_for_session(SESSION, entry)
+}
+
+/// `page.collect` params as core sends them, for another session. Refusals that
+/// happen before the limits are read still carry core's full request, so the
+/// captured request bytes match what core sends.
+fn collect_params_for_session(session: &str, entry: &str) -> Value {
     json!({
         "harness": HARNESS,
-        "session": SESSION,
+        "session": session,
         "entry": entry,
         "limits": {
             "entry_max_bytes": 2_097_152, "max_files": 64, "max_file_bytes": 8_388_608,
@@ -447,7 +454,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
         ),
         (
             "collect-refused-session-not-bound",
-            json!({"harness": HARNESS, "session": "no-such-session", "entry": "site/index.html"}),
+            collect_params_for_session("no-such-session", "site/index.html"),
             "session_not_bound",
         ),
     ] {
@@ -467,7 +474,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
             stream,
             CORE_CHANNEL,
             "page.collect",
-            json!({"harness": HARNESS, "session": "split-session", "entry": "site/index.html"}),
+            collect_params_for_session("split-session", "site/index.html"),
         )
         .await;
     sample("collect-refused-session-route-ambiguous", &request, &reply);
