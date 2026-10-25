@@ -445,9 +445,9 @@ impl ViewStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut removed = self.reap_generation_trash()?;
-        // Most passes find nothing superseded. This read-only preflight takes
-        // no admission barrier and opens no writable handle, so it leaves a
-        // quiescent view's files exactly as they were.
+        // Most passes find nothing superseded. This read-only check then
+        // returns without taking the admission barrier, opening a writable
+        // pointer connection, or creating SQLite sidecar files.
         if !self.has_superseded_artifacts()? {
             return Ok(removed);
         }
@@ -633,8 +633,9 @@ impl ViewStore {
         registry: Option<&super::registry::FamilyRegistry>,
         limit: usize,
     ) -> Result<GenerationSweep> {
-        // Read under the same admission as every claim, so no cleanup
-        // connection on this view is ever open outside that barrier.
+        // Read the census under the same admission as every claim. Its
+        // read-only connection closes before the directory scan, so cleanup
+        // holds no view connection while it waits for a barrier.
         let Some(census) = self.with_cleanup_admission(registry, || self.pointer_census())? else {
             return Ok(GenerationSweep::default());
         };
