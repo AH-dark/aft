@@ -18,3 +18,5 @@
 pub(crate) mod canonical;
 pub(crate) mod jcs_number;
 pub(crate) mod schema;
+#[cfg(test)]
+mod vectors;

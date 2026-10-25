@@ -32,3 +32,11 @@ benchmarks/aft-search/manifest.sha256 text eol=lf
 # Published exec-remote run-report vectors are pinned by SHA-256 of their
 # exact bytes; line endings must never be converted.
 crates/aft/src/exec_remote/fixtures/reports/** -text
+# Rich-UI canonicalization vectors and templates are digested byte-for-byte:
+# the published manifest's digest is the SHA-256 of the bytes, and the phone
+# refuses the manifest when its own digest disagrees. They are read with
+# include_bytes!, so a Windows checkout with core.autocrlf=true must not
+# rewrite them into CRLF. The directory is covered as a whole so the template
+# files, which arrive with the slice that ships them, are byte-pinned before
+# they exist.
+crates/aft/tests/fixtures/rich_ui/** -text
