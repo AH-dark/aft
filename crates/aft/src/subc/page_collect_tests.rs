@@ -470,29 +470,64 @@ fn read_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
 }
 
 /// The routes the parity test compares on: a first-party route whose
-/// questions go to a plugin prompt, an untrusted route, and a confined
-/// scoped worker of each trust.
-#[derive(Clone, Copy, Debug)]
+/// questions go to a plugin prompt, an untrusted route, a confined scoped
+/// worker of each trust, and a route of each trust whose scope saved the
+/// full-access approval mode. Full access lets a first-party route read
+/// outside its root without asking; an untrusted route's forced root
+/// restriction still refuses those paths.
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ParityRoute {
     FirstPartyPlugin,
     Untrusted,
     ConfinedFirstParty,
     ConfinedUntrusted,
+    FirstPartyFullAccess,
+    UntrustedFullAccess,
 }
+
+const PARITY_ROUTES: [ParityRoute; 6] = [
+    ParityRoute::FirstPartyPlugin,
+    ParityRoute::Untrusted,
+    ParityRoute::ConfinedFirstParty,
+    ParityRoute::ConfinedUntrusted,
+    ParityRoute::FirstPartyFullAccess,
+    ParityRoute::UntrustedFullAccess,
+];
 
 struct ParityFixture {
     _dirs: Vec<tempfile::TempDir>,
     _temp: crate::access_policy::temp::RootsOverride,
+    root_id: ProjectRootId,
+    /// The file outside the root, as the page spells it.
+    outside_path: String,
+    outside: PathBuf,
     ctx: Arc<AppContext>,
     executor: Arc<Executor>,
     identity: RouteIdentity,
     paths: Vec<String>,
 }
 
+/// Register `identity`'s grant scope in the context's database, as a route
+/// bind does, and save the full-access approval mode for it when asked.
+fn register_scope(ctx: &AppContext, identity: &RouteIdentity, full_access: bool) {
+    access_grants::register(identity, ctx).unwrap();
+    if full_access {
+        let db = ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        crate::db::access_grants::set_mode(
+            &conn,
+            &access_grants::policy_scope_key(identity),
+            crate::access_policy::ApprovalMode::FullAccess,
+        )
+        .unwrap();
+    }
+}
+
 /// One project root and the paths its page names: an allowed file, a
 /// read_deny folder, symlinks inside and out of the root, a file outside
-/// the root that the policy would ask about, and a file in a directory the
-/// policy treats as system temp (exempt for a plugin host's own reads).
+/// the root (asked about, or allowed under full access), and a file in a
+/// directory the policy treats as system temp (exempt for a plugin host's
+/// own reads).
 fn parity_fixture(route: ParityRoute) -> ParityFixture {
     let (root_dir, root_id) = test_root("page-parity-root");
     let outside_dir = tempfile::tempdir().unwrap();
@@ -510,6 +545,12 @@ fn parity_fixture(route: ParityRoute) -> ParityFixture {
         Box::new(crate::parser::TreeSitterProvider::new()),
         config,
     ));
+    // Saved grant scopes and approval modes live in the context's database.
+    let storage = ctx.storage_dir();
+    std::fs::create_dir_all(&storage).unwrap();
+    ctx.set_db(Arc::new(std::sync::Mutex::new(
+        crate::db::open(&storage.join("aft.db")).unwrap(),
+    )));
     std::fs::write(root.join("ok.txt"), "ok").unwrap();
     std::fs::create_dir(root.join("secret")).unwrap();
     std::fs::write(root.join("secret/key.txt"), "key").unwrap();
@@ -543,6 +584,8 @@ fn parity_fixture(route: ParityRoute) -> ParityFixture {
         ParityRoute::Untrusted => (BindTrust::Untrusted, HARNESS, false),
         ParityRoute::ConfinedFirstParty => (BindTrust::FirstParty, HARNESS, true),
         ParityRoute::ConfinedUntrusted => (BindTrust::Untrusted, HARNESS, true),
+        ParityRoute::FirstPartyFullAccess => (BindTrust::FirstParty, HARNESS, false),
+        ParityRoute::UntrustedFullAccess => (BindTrust::Untrusted, HARNESS, false),
     };
     let mut identity = route_identity_with_harness(&root_id, SESSION, trust, harness);
     if confined {
@@ -556,11 +599,22 @@ fn parity_fixture(route: ParityRoute) -> ParityFixture {
         );
         ctx.remember_confined_policy_key(remote_policy::key(&identity, Some("worker")).unwrap());
     }
+    register_scope(
+        &ctx,
+        &identity,
+        matches!(
+            route,
+            ParityRoute::FirstPartyFullAccess | ParityRoute::UntrustedFullAccess
+        ),
+    );
     let executor = Arc::new(Executor::new());
-    executor.register_actor(root_id, Arc::clone(&ctx));
+    executor.register_actor(root_id.clone(), Arc::clone(&ctx));
     ParityFixture {
         _dirs: vec![root_dir, outside_dir, scratch_dir],
         _temp: temp,
+        root_id,
+        outside_path: relative(&outside, "outside.txt"),
+        outside,
         ctx,
         executor,
         identity,
@@ -571,6 +625,16 @@ fn parity_fixture(route: ParityRoute) -> ParityFixture {
 /// Whether the `read` tool, run through the real tool-call job with the
 /// route's own ask route, reads `path`.
 async fn read_tool_allows(f: &ParityFixture, path: &str, request: usize) -> bool {
+    read_tool_allows_on(f, &f.identity, path, request).await
+}
+
+/// [`read_tool_allows`] on another route of the same root.
+async fn read_tool_allows_on(
+    f: &ParityFixture,
+    identity: &RouteIdentity,
+    path: &str,
+    request: usize,
+) -> bool {
     let request_id = format!("parity-read-{request}");
     let arguments = json!({ "path": path });
     let run = PlainToolRun {
@@ -578,8 +642,8 @@ async fn read_tool_allows(f: &ParityFixture, path: &str, request: usize) -> bool
         arguments: arguments.clone(),
         format_context: Default::default(),
         tool_call_context: ToolCallContext {
-            project_root: f.identity.project_root.clone(),
-            session_id: Some(f.identity.session.clone()),
+            project_root: identity.project_root.clone(),
+            session_id: Some(identity.session.clone()),
             request_id: request_id.clone(),
             diagnostics_on_edit: false,
             preview: false,
@@ -591,8 +655,8 @@ async fn read_tool_allows(f: &ParityFixture, path: &str, request: usize) -> bool
             host_tool_names: None,
         },
         dispatch: read_dispatch,
-        bind_trust: f.identity.trust,
-        identity: f.identity.clone(),
+        bind_trust: identity.trust,
+        identity: identity.clone(),
         request_id,
         ledger_key: None,
         io_budget: crate::bounded_io::Budget::after(Duration::from_secs(30)),
@@ -601,7 +665,7 @@ async fn read_tool_allows(f: &ParityFixture, path: &str, request: usize) -> bool
     };
     let (done, completion) = oneshot::channel();
     let job = run.job(
-        access_grants::ask_route_for_call(&f.identity, "read", &arguments),
+        access_grants::ask_route_for_call(identity, "read", &arguments),
         PhaseTrace::new(Instant::now()),
         done,
     );
@@ -640,12 +704,7 @@ fn page_collect_verdicts(f: &ParityFixture) -> HashMap<String, bool> {
 #[tokio::test]
 async fn page_collect_reads_exactly_what_the_read_tool_reads() {
     let mut request = 0;
-    for route in [
-        ParityRoute::FirstPartyPlugin,
-        ParityRoute::Untrusted,
-        ParityRoute::ConfinedFirstParty,
-        ParityRoute::ConfinedUntrusted,
-    ] {
+    for route in PARITY_ROUTES {
         let f = parity_fixture(route);
         let mut read = Vec::new();
         for path in &f.paths {
@@ -669,5 +728,69 @@ async fn page_collect_reads_exactly_what_the_read_tool_reads() {
             read.iter().any(|(_, allowed)| !*allowed),
             "{route:?}: {read:?}"
         );
+        // Full access reaches outside the root only without forced root
+        // restriction, so the comparison covers that restriction too.
+        if matches!(
+            route,
+            ParityRoute::FirstPartyFullAccess | ParityRoute::UntrustedFullAccess
+        ) {
+            let outside = read.iter().find(|(path, _)| *path == f.outside_path);
+            assert_eq!(
+                outside.map(|(_, allowed)| *allowed),
+                Some(route == ParityRoute::FirstPartyFullAccess),
+                "{route:?}: {read:?}"
+            );
+        }
     }
+}
+
+/// An untrusted bind's root restriction is forced: a page reference that
+/// leaves the project root is denied and never opened, even when the
+/// session's saved approval mode is full access and a first-party session
+/// of the same root reads that file.
+#[tokio::test]
+async fn page_collect_untrusted_session_never_reaches_outside_its_root() {
+    let f = parity_fixture(ParityRoute::UntrustedFullAccess);
+    assert_eq!(f.identity.trust, BindTrust::Untrusted);
+
+    // A first-party session of the same root, also with full access, reads
+    // the outside file.
+    let first_party =
+        route_identity_with_harness(&f.root_id, "first-party", BindTrust::FirstParty, HARNESS);
+    register_scope(&f.ctx, &first_party, true);
+    assert!(read_tool_allows_on(&f, &first_party, &f.outside_path, 1).await);
+
+    // The untrusted session's read tool refuses it.
+    assert!(!read_tool_allows(&f, &f.outside_path, 2).await);
+
+    // And page.collect leaves it out, without opening it.
+    let opened = Mutex::new(Vec::new());
+    let open = |root: &Path, target: &Path| {
+        opened.lock().unwrap().push(target.to_path_buf());
+        file_read_exact::open_no_follow(root, target)
+    };
+    let response = collect_with_hooks(
+        CollectCall {
+            params: json!({"harness": HARNESS, "session": SESSION, "entry": "index.html"}),
+            principal: core(),
+            routes: HashMap::from([(route_key(1, 1), f.identity.clone())]),
+            executor: Arc::clone(&f.executor),
+            store: Arc::new(SnapshotStore::open(&f.ctx.storage_dir())),
+        },
+        ReadHooks {
+            open: &open,
+            after_check: None,
+        },
+    );
+    assert!(response.success, "{:?}", response.data);
+    assert!(
+        omitted(&response).contains(&(f.outside_path.clone(), "denied".to_string())),
+        "{:?}",
+        response.data
+    );
+    let opened = opened.into_inner().unwrap();
+    assert!(
+        !opened.iter().any(|path| path.starts_with(&f.outside)),
+        "a file outside the untrusted session's root was opened: {opened:?}"
+    );
 }
