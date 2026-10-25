@@ -215,6 +215,7 @@ fn with_search_index_load_wait_hook_for_test<T>(
     let _reset = Reset;
     action()
 }
+
 const BORROWED_SEARCH_LOAD_WARNING: &str = "Borrowed search index loading stopped at the interactive budget; returning a bounded lexical scan (no semantic ranking).";
 const BORROWED_SEARCH_LOAD_FOOTER: &str = "[Degraded: borrowed search index loading stopped at the interactive budget; bounded lexical scan only.]";
 const BORROWED_SEMANTIC_LOADING: &str = "Semantic lane is loading the shared index";
@@ -2154,6 +2155,10 @@ fn attach_search_execution_metadata(
     if let (Some(structured_plan), Some(extension_plan)) =
         (structured_plan.as_object_mut(), extension_plan.as_object())
     {
+        structured_plan.insert(
+            "selected_lanes".to_string(),
+            serde_json::json!(plan.selected_lanes),
+        );
         for (key, value) in extension_plan {
             structured_plan
                 .entry(key.clone())
@@ -6998,6 +7003,8 @@ fn collect_degraded_grep_files(
     include_tests: bool,
     started: Instant,
 ) -> (Vec<PathBuf>, bool, bool, usize) {
+    #[cfg(test)]
+    grep_executor::note_fallback_walk_for_test();
     // Keep degraded semantic search on the root filesystem: ReadDir::drop can
     // abort the daemon if a disappearing child mount reports ENXIO.
     let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
@@ -11160,7 +11167,7 @@ mod tests {
             "export const fresh_root_needle = 'fresh_root_needle';\n",
         )
         .expect("write source file");
-        let ctx = test_context(project.path());
+        let ctx = Arc::new(test_context(project.path()));
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
@@ -11172,16 +11179,35 @@ mod tests {
         let (_tx, rx) = crossbeam_channel::unbounded::<SearchIndex>();
         ctx.install_search_index_rx(rx, ctx.configure_generation());
 
+        // The search runs on its own thread so a hang fails this test instead
+        // of stalling the suite. Whether it refused rather than walked is read
+        // from the reply and the walk counter, never from how long it took: a
+        // loaded Windows runner has stretched this 0.3 s request past 3 s.
         let wait_budget = Duration::from_millis(40);
-        let started = Instant::now();
-        let response = response_value(with_first_search_index_load_wait_budget_for_test(
-            wait_budget,
-            || handle_semantic_search(&semantic_request("fresh_root_needle", 5), &ctx),
-        ));
+        let search_ctx = Arc::clone(&ctx);
+        let (completed_tx, completed_rx) = crossbeam_channel::bounded(1);
+        let search = std::thread::spawn(move || {
+            let walks_before = grep_executor::fallback_walks_for_test();
+            let started = Instant::now();
+            let response = response_value(with_first_search_index_load_wait_budget_for_test(
+                wait_budget,
+                || handle_semantic_search(&semantic_request("fresh_root_needle", 5), &search_ctx),
+            ));
+            let waited = started.elapsed();
+            let walks = grep_executor::fallback_walks_for_test() - walks_before;
+            completed_tx
+                .send((response, waited, walks))
+                .expect("publish search response");
+        });
+        let (response, waited, walks) = completed_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a search while both lanes build must finish");
+        search.join().expect("search joins");
 
         // The request still gives an in-flight trigram load its wait budget.
-        assert!(started.elapsed() >= wait_budget);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // The wait runs until its deadline, so this lower bound cannot flake.
+        assert!(waited >= wait_budget, "waited only {waited:?}");
+        assert_eq!(walks, 0, "the refusal must not start a filesystem walk");
         assert_eq!(response["success"], false);
         assert_eq!(response["code"], "search_lanes_unavailable");
         assert_eq!(response["results"], serde_json::json!([]));
@@ -11545,9 +11571,15 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         ctx.install_search_index_rx(rx, ctx.configure_generation());
 
+        // The publisher waits until the search is inside its trigram-load wait,
+        // so the index is always published while the search is waiting on it.
+        // A fixed sleep raced the wait budget on loaded runners.
+        let (waiting_tx, waiting_rx) = crossbeam_channel::bounded::<()>(1);
         let publish_file = source_file.clone();
         let publisher = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(40));
+            waiting_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("search enters its trigram-load wait");
             let mut index = SearchIndex::new();
             index.index_file(&publish_file, source.as_bytes());
             index.ready = true;
@@ -11556,13 +11588,23 @@ mod tests {
         let search_ctx = Arc::clone(&ctx);
         let (completed_tx, completed_rx) = crossbeam_channel::bounded(1);
         let search = std::thread::spawn(move || {
-            let response = with_first_search_index_load_wait_budget_for_test(
-                Duration::from_millis(200),
+            // The publisher sends the index as soon as this search enters its
+            // load wait, so a healthy run ends long before this 30 s budget,
+            // which only ends the wait if publication stalls.
+            let response = with_search_index_load_wait_hook_for_test(
+                move || {
+                    let _ = waiting_tx.try_send(());
+                },
                 || {
-                    response_value(handle_semantic_search(
-                        &semantic_request("no_deadlock_borrowed_artifact", 5),
-                        &search_ctx,
-                    ))
+                    with_first_search_index_load_wait_budget_for_test(
+                        Duration::from_secs(30),
+                        || {
+                            response_value(handle_semantic_search(
+                                &semantic_request("no_deadlock_borrowed_artifact", 5),
+                                &search_ctx,
+                            ))
+                        },
+                    )
                 },
             );
             completed_tx
@@ -11570,8 +11612,10 @@ mod tests {
                 .expect("publish search response");
         });
 
+        // Liveness, not speed: a deadlock never completes, while a slow but
+        // live run on a loaded machine finishes well inside this watchdog.
         let response = completed_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(30))
             .expect("search and artifact publication must not deadlock");
         assert!(response["results"]
             .as_array()

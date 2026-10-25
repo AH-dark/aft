@@ -691,7 +691,11 @@ fn bash_status_reports_running_task_after_its_row_is_erased() {
         .contains("row was erased"));
 
     drop(release_guard);
-    let child_deadline = Instant::now() + Duration::from_secs(3);
+    // A positive liveness wait: the gated child polls for the release file and
+    // then exits. On a loaded Windows runner, PowerShell can take several
+    // seconds to notice and exit, so the bound is generous; a child that never
+    // exits still fails here.
+    let child_deadline = Instant::now() + Duration::from_secs(30);
     while aft::bash_background::process::is_process_alive(child_pid)
         && Instant::now() < child_deadline
     {

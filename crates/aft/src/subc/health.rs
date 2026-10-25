@@ -511,7 +511,7 @@ impl BindAckLatencies {
 #[derive(Default)]
 struct FrameOperation {
     corr: u64,
-    op: String,
+    op: &'static str,
     root: String,
     session: String,
     awaited: &'static str,
@@ -532,6 +532,7 @@ pub(super) struct DispatchPathMetrics {
     /// Best-effort header context; no locks are taken by the watchdog reader.
     frame_loop_frame_header: AtomicU64,
     frame_loop_frame_corr: AtomicU64,
+    frame_loop_step: super::work_step::WorkStep,
     /// Kept separate from scheduler and bash-registry locks. Publishers and the
     /// watchdog use try_lock so evidence collection cannot block either thread.
     frame_operation: StdMutex<FrameOperation>,
@@ -559,6 +560,7 @@ pub(super) struct DispatchPathMetrics {
     pub(super) bg_wake_unacked_total: AtomicUsize,
     bg_wake_rearm_total: AtomicU64,
     stuck_pending_watch_next_scan_ms: AtomicU64,
+    stuck_pending_watch_scan_running: AtomicBool,
     stuck_pending_watch_logs: StdMutex<HashMap<String, Instant>>,
     bg_events: StdMutex<HashMap<BgEventKey, BgEventRecord>>,
     bg_event_rates: BgEventRates,
@@ -583,6 +585,7 @@ impl DispatchPathMetrics {
             frame_loop_phase: AtomicUsize::new(0),
             frame_loop_frame_header: AtomicU64::new(0),
             frame_loop_frame_corr: AtomicU64::new(0),
+            frame_loop_step: super::work_step::WorkStep::default(),
             frame_operation: StdMutex::new(FrameOperation::default()),
             stall_stats: Arc::default(),
             writer_queued: AtomicUsize::new(0),
@@ -606,6 +609,7 @@ impl DispatchPathMetrics {
             bg_wake_unacked_total: AtomicUsize::new(0),
             bg_wake_rearm_total: AtomicU64::new(0),
             stuck_pending_watch_next_scan_ms: AtomicU64::new(0),
+            stuck_pending_watch_scan_running: AtomicBool::new(false),
             stuck_pending_watch_logs: StdMutex::new(HashMap::new()),
             bg_events: StdMutex::new(HashMap::new()),
             bg_event_rates: BgEventRates::new(),
@@ -860,9 +864,16 @@ impl DispatchPathMetrics {
             .store(self.now_ms(), Ordering::Relaxed);
     }
 
+    pub(super) fn mark_frame_loop_step(&self, entry: &'static str, command: &str, request_id: u64) {
+        self.frame_loop_step
+            .enter(entry, command, request_id, self.now_ms());
+        self.frame_loop_phase.store(0, Ordering::Relaxed);
+    }
+
     /// Records that the frame loop is about to park and will wake again within
     /// `within` because its drain-tick timer fires then.
     pub(super) fn publish_frame_loop_wake_deadline(&self, within: Duration) {
+        self.frame_loop_step.clear();
         self.frame_loop_phase.store(1, Ordering::Relaxed);
         let deadline = self
             .now_ms()
@@ -875,6 +886,7 @@ impl DispatchPathMetrics {
     /// Called when the frame loop exits, so a finished loop never reads as a
     /// stalled one.
     pub(super) fn clear_frame_loop_wake_deadline(&self) {
+        self.frame_loop_step.clear();
         self.frame_loop_wake_deadline_ms_plus_one
             .store(0, Ordering::Relaxed);
     }
@@ -899,7 +911,47 @@ impl DispatchPathMetrics {
         deadline != 0 && self.now_ms() >= deadline
     }
 
+    pub(super) fn mark_frame_loop_entry(&self, entry: &'static str, frame: &Frame) {
+        let command = match frame.header.ty {
+            super::FrameType::Ping => "ping",
+            super::FrameType::Pong => "pong",
+            _ => "",
+        };
+        self.frame_loop_step
+            .enter(entry, command, frame.header.corr, self.now_ms());
+    }
+
+    pub(super) fn mark_frame_loop_command(&self, entry: &'static str, name: &str, request_id: u64) {
+        self.frame_loop_step
+            .enter(entry, name, request_id, self.now_ms());
+    }
+
+    pub(super) fn mark_frame_loop_tool(&self, name: &str, request_id: u64) {
+        self.mark_frame_loop_command("handle_tool_call", name, request_id);
+    }
+
+    pub(super) fn mark_frame_loop_control(
+        &self,
+        request: &super::ModuleControlRequest,
+        frame: &Frame,
+    ) {
+        let (name, awaited) = match request {
+            super::ModuleControlRequest::RouteBind { .. } => ("route_bind", "control_validation"),
+            super::ModuleControlRequest::HealthCheck {} => ("health_check", "cached_health"),
+        };
+        self.mark_frame_loop_command("handle_control_request", name, frame.header.corr);
+        if let Ok(mut operation) = self.frame_operation.try_lock() {
+            operation.op = name;
+            operation.awaited = awaited;
+            if let super::ModuleControlRequest::RouteBind { identity, .. } = request {
+                operation.root = identity.project_root.to_string_lossy().into_owned();
+                operation.session.clone_from(&identity.session);
+            }
+        }
+    }
+
     pub(super) fn mark_frame_loop_frame(&self, frame: &Frame) {
+        self.mark_frame_loop_entry("run_module_loop/handle_frame", frame);
         self.frame_loop_frame_header.store(
             (frame.header.ty as u64)
                 | (u64::from(frame.header.channel) << 8)
@@ -911,25 +963,20 @@ impl DispatchPathMetrics {
         if let Ok(mut operation) = self.frame_operation.try_lock() {
             *operation = FrameOperation {
                 corr: frame.header.corr,
-                op: format!("{:?}", frame.header.ty).to_lowercase(),
+                op: match frame.header.ty {
+                    super::FrameType::Request => "request",
+                    super::FrameType::Response => "response",
+                    super::FrameType::Ping => "ping",
+                    super::FrameType::Pong => "pong",
+                    super::FrameType::Error => "error",
+                    super::FrameType::Cancel => "cancel",
+                    super::FrameType::Goodbye => "goodbye",
+                    super::FrameType::Push => "push",
+                    _ => "frame",
+                },
                 awaited: "none",
                 ..FrameOperation::default()
             };
-            if frame.header.channel == 0 && frame.header.ty == super::FrameType::Request {
-                match serde_json::from_slice::<super::ModuleControlRequest>(&frame.body) {
-                    Ok(super::ModuleControlRequest::RouteBind { identity, .. }) => {
-                        operation.op = "route_bind".to_string();
-                        operation.root = identity.project_root.to_string_lossy().into_owned();
-                        operation.session = identity.session;
-                        operation.awaited = "control_validation";
-                    }
-                    Ok(super::ModuleControlRequest::HealthCheck {}) => {
-                        operation.op = "health_check".to_string();
-                        operation.awaited = "cached_health";
-                    }
-                    Err(_) => operation.op = "invalid_control_request".to_string(),
-                }
-            }
         }
         self.frame_loop_phase.store(2, Ordering::Release);
     }
@@ -960,7 +1007,7 @@ impl DispatchPathMetrics {
     }
 
     pub(super) fn frame_loop_context(&self) -> String {
-        match self.frame_loop_phase.load(Ordering::Acquire) {
+        let context = match self.frame_loop_phase.load(Ordering::Acquire) {
             0 => "phase=turn_work frame=none".to_string(),
             1 => "phase=select_wait frame=none".to_string(),
             _ => {
@@ -996,7 +1043,8 @@ impl DispatchPathMetrics {
                     corr,
                 )
             }
-        }
+        };
+        format!("{context} {}", self.frame_loop_step.snapshot(self.now_ms()))
     }
 
     /// Returns whether the retained-roots summary changed since the last sweep.
@@ -1051,8 +1099,8 @@ impl DispatchPathMetrics {
     }
 
     pub(super) fn warn_stuck_pending_watches(
-        &self,
-        executor: &Executor,
+        self: &Arc<Self>,
+        executor: &Arc<Executor>,
         subscriptions: &BgSubsBySession,
     ) {
         let now_ms = self.now_ms();
@@ -1071,8 +1119,36 @@ impl DispatchPathMetrics {
             return;
         }
 
+        self.prune_bg_event_records(subscriptions, Instant::now());
+        if subscriptions.is_empty()
+            || self
+                .stuck_pending_watch_scan_running
+                .swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let metrics = Arc::clone(self);
+        let executor = Arc::clone(executor);
+        let subscriptions = subscriptions.clone();
+        // Watch rows live in the shared SQLite database. Even acquiring its
+        // mutex can wait behind a disk-bound retention worker. One outstanding
+        // scan suffices; never queue more scans behind a stalled database.
+        tokio::task::spawn_blocking(move || {
+            struct ScanFinished(Arc<DispatchPathMetrics>);
+            impl Drop for ScanFinished {
+                fn drop(&mut self) {
+                    self.0
+                        .stuck_pending_watch_scan_running
+                        .store(false, Ordering::Relaxed);
+                }
+            }
+            let _finished = ScanFinished(Arc::clone(&metrics));
+            metrics.scan_stuck_pending_watches(&executor, &subscriptions);
+        });
+    }
+
+    fn scan_stuck_pending_watches(&self, executor: &Executor, subscriptions: &BgSubsBySession) {
         let now = Instant::now();
-        self.prune_bg_event_records(subscriptions, now);
         let Ok(mut logged) = self.stuck_pending_watch_logs.lock() else {
             return;
         };

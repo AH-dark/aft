@@ -827,6 +827,9 @@ fn group_bytes(pgid: i32) -> Option<u64> {
 #[path = "memory_limit_windows.rs"]
 mod windows;
 
+#[cfg(all(test, windows))]
+pub(super) use windows::test_trace;
+
 #[cfg(test)]
 mod agent_text_tests {
     use super::MemoryPolicy;

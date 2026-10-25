@@ -17,6 +17,7 @@ pub mod registry;
 mod temp_cleanup;
 pub mod watchdog;
 pub mod watches;
+pub(crate) mod windows_waiter;
 pub(crate) mod worker_thread;
 
 use crate::bash_permissions::PermissionAsk;

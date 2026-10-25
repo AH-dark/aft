@@ -3,7 +3,23 @@ use super::*;
 use crate::db::remote_exec::{self as store, PolicyKey};
 
 pub(super) fn key(identity: &RouteIdentity, preset: Option<&str>) -> Option<PolicyKey> {
+    // A requested worker preset cannot turn a head scope into a worker or
+    // make an old head-scoped row an enforceable routing policy.
+    if head_scope(identity) {
+        return None;
+    }
     policy_key(identity, preset).ok()
+}
+
+fn head_scope(identity: &RouteIdentity) -> bool {
+    let identity = identity
+        .run_owner
+        .as_ref()
+        .map_or(identity, |owner| &owner.head);
+    identity
+        .scope
+        .as_ref()
+        .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Head)
 }
 
 fn policy_key(identity: &RouteIdentity, preset: Option<&str>) -> Result<PolicyKey, &'static str> {
@@ -62,7 +78,7 @@ pub(super) fn catalog(
                 "params.confine accepts only \"root\"",
             ));
         }
-        if key(identity, Some(&preset)).is_none() {
+        if policy_key(identity, Some(&preset)).is_err() {
             return Err(subc_protocol::ErrorBody::new(
                 "confine_requires_scoped_worker",
                 "params.confine requires a scoped worker with an authenticated principal",
@@ -70,7 +86,7 @@ pub(super) fn catalog(
         }
     }
     // Routing params also support unscoped plan preflights. Confinement is
-    // different: it requires a persistable scoped worker, checked above.
+    // different: it requires a scoped, authenticated worker plan, checked above.
     // Remove recognized params before the generic catalog validator runs.
     if let Some(args) = body.get_mut("params").and_then(Value::as_object_mut) {
         for (name, value) in &original {
@@ -153,8 +169,13 @@ pub(super) fn catalog(
             cortexkit_role_tool_provider::errors::invalid_request("params.mode", e.to_string())
         })?;
     }
-    if let Some(key) = key(identity, Some(&preset)) {
-        if let Some(policy) = routing_policy {
+    // Head routes may preview a worker plan, but only the worker's own scope
+    // can save its routing and confinement policy.
+    if let Some(key) = policy_key(identity, Some(&preset))
+        .ok()
+        .filter(|_| !head_scope(identity))
+    {
+        if let Some(policy) = routing_policy.as_ref() {
             let Some(db) = ctx.db() else {
                 return Err(cortexkit_role_tool_provider::errors::invalid_request(
                     "params",
@@ -174,7 +195,7 @@ pub(super) fn catalog(
             store::freeze(
                 &conn,
                 &key,
-                &policy,
+                policy,
                 crate::bash_background::persistence::unix_millis(),
                 || ctx.remember_confined_policy_key(key.clone()),
             )
@@ -187,13 +208,20 @@ pub(super) fn catalog(
             drop(conn);
         }
     }
-    // Render from the policy available to this session, including on a
-    // paramless refetch after its worker plan has already been persisted.
-    // Head sessions use the user setting; worker sessions cannot borrow it.
+    // A head previews the requested plan without a saved worker policy. Actual
+    // workers render their frozen plan, including on a paramless refetch.
+    // Head-preset catalogs use the user setting; workers cannot borrow it.
     let runon_enabled = ctx.config().bash.runon_enabled;
     let project_off = ctx.config().remote_exec.project_off;
-    let runon = catalog_runon_policy(ctx, identity, &preset, runon_enabled, project_off);
-    let is_confined = confined(ctx, identity)?;
+    let preview = routing_policy
+        .as_ref()
+        .filter(|_| head_scope(identity) && policy_key(identity, Some(&preset)).is_ok());
+    let runon = catalog_runon_policy(ctx, identity, &preset, runon_enabled, project_off, preview);
+    let is_confined = if let Some(policy) = preview {
+        policy.confine.is_some()
+    } else {
+        confined(ctx, identity)?
+    };
     let render = if is_confined {
         tool_provider::catalog_for_confined_request
     } else {
@@ -267,6 +295,7 @@ fn catalog_runon_policy(
     preset: &str,
     runon_enabled: bool,
     project_off: bool,
+    preview: Option<&crate::exec_remote::FrozenParams>,
 ) -> Result<(), &'static str> {
     if !cfg!(unix) {
         return Err("platform");
@@ -280,17 +309,25 @@ fn catalog_runon_policy(
     if !matches!(identity.trust, BindTrust::FirstParty) {
         return Err("bind");
     }
-    let source = source(identity, Some(preset));
-    if matches!(source, RemoteSource::Worker(None)) {
-        return Err("key");
-    }
-    if !lookup(ctx, &source).is_some_and(|launch| {
-        launch
-            .params
+    let enabled = if let Some(policy) = preview {
+        policy
             .remote_exec
             .as_ref()
             .is_some_and(|policy| policy.enabled)
-    }) {
+    } else {
+        let source = source(identity, Some(preset));
+        if matches!(source, RemoteSource::Worker(None)) {
+            return Err("key");
+        }
+        lookup(ctx, &source).is_some_and(|launch| {
+            launch
+                .params
+                .remote_exec
+                .as_ref()
+                .is_some_and(|policy| policy.enabled)
+        })
+    };
+    if !enabled {
         return Err("remote_exec");
     }
     Ok(())

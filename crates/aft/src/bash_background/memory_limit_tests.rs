@@ -129,7 +129,27 @@ fn memory_limit_allocator_child() {
     else {
         return;
     };
+    #[cfg(windows)]
+    let trace = std::env::var_os("AFT_TEST_MEMORY_TRACE_FILE").map(PathBuf::from);
+    #[cfg(windows)]
+    if let Some(base) = &trace {
+        super::super::memory_limit::test_trace::hog_start(base);
+    }
+    #[cfg(windows)]
+    if let Some(ready) = std::env::var_os("AFT_TEST_MEMORY_CHILD_READY") {
+        std::fs::write(ready, std::process::id().to_string()).unwrap();
+        let release = PathBuf::from(std::env::var_os("AFT_TEST_MEMORY_CHILD_RELEASE").unwrap());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !release.exists() {
+            assert!(Instant::now() < deadline, "allocator was not released");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     let allocation = vec![0x5a_u8; mib * 1024 * 1024];
+    #[cfg(windows)]
+    if let Some(base) = &trace {
+        super::super::memory_limit::test_trace::hog_allocated(base);
+    }
     std::hint::black_box(&allocation);
     std::thread::park_timeout(Duration::from_secs(12));
     std::hint::black_box(&allocation);
@@ -143,6 +163,10 @@ fn allocate_past_cap(
     attach_error: Option<i32>,
 ) {
     let temp = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    let trace_path = temp.path().join("memory-trace");
+    #[cfg(windows)]
+    let diagnostic = super::super::memory_limit::test_trace::Guard::new(trace_path.clone(), pty);
     #[cfg(target_os = "linux")]
     let attach_fault = attach_error.map(|errno| {
         super::super::memory_limit::AttachFaultGuard::for_thread(
@@ -160,8 +184,8 @@ fn allocate_past_cap(
     let command = format!("'{}' --exact {ALLOCATOR} --nocapture", executable.display());
     #[cfg(windows)]
     let command = format!(
-        "& '{}' --exact {ALLOCATOR} --nocapture",
-        executable.display()
+        "[IO.File]::WriteAllText('{}', ([string]$PID + ' ' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())); & '{}' --exact {ALLOCATOR} --nocapture",
+        trace_path.with_extension("pwsh").display().to_string().replace('\'', "''"), executable.display()
     );
     #[cfg(unix)]
     let command = if aggregate {
@@ -175,6 +199,11 @@ fn allocate_past_cap(
         "AFT_TEST_ALLOCATE_MIB".into(),
         if aggregate { "40" } else { "192" }.into(),
     )]);
+    #[cfg(windows)]
+    env.insert(
+        "AFT_TEST_MEMORY_TRACE_FILE".into(),
+        trace_path.display().to_string(),
+    );
     for key in ["PATH", "SystemRoot", "WINDIR", "USERPROFILE", "TEMP", "TMP"] {
         if let Ok(value) = std::env::var(key) {
             env.insert(key.into(), value);
@@ -298,6 +327,14 @@ fn allocate_past_cap(
         let snapshot = registry
             .status(&id, "memory-test", None, None, 4096)
             .unwrap();
+        #[cfg(windows)]
+        {
+            diagnostic.observe(&format!(
+                "task={id} status={:?} {}",
+                snapshot.info.status,
+                windows_memory_job_diagnostic(&id)
+            ));
+        }
         if snapshot.info.status.is_terminal() {
             assert_eq!(snapshot.info.status, BgTaskStatus::Failed, "{snapshot:?}");
             let reason = snapshot.info.status_reason.clone().unwrap_or_default();
@@ -349,11 +386,78 @@ fn allocate_past_cap(
             break;
         }
         if Instant::now() >= deadline {
+            #[cfg(windows)]
+            diagnostic.observe(&format!(
+                "phase=test_timeout_before_cleanup task={id} snapshot={snapshot:?} {}",
+                windows_memory_job_diagnostic(&id)
+            ));
             let _ = registry.kill(&id, "memory-test");
             panic!("memory cap did not stop the command before its timeout");
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+#[cfg(windows)]
+fn windows_memory_job_diagnostic(id: &str) -> String {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::*;
+    let name: Vec<u16> = format!("Local\\AFT-memory-{id}\0").encode_utf16().collect();
+    let job = unsafe { OpenJobObjectW(0x0004, 0, name.as_ptr()) };
+    if job.is_null() {
+        return format!("job_query_error={}", std::io::Error::last_os_error());
+    }
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    let peak_ok = unsafe {
+        QueryInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of_val(&limits) as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    let mut list = [0usize; 66];
+    let list_ok = unsafe {
+        QueryInformationJobObject(
+            job,
+            JobObjectBasicProcessIdList,
+            list.as_mut_ptr().cast(),
+            std::mem::size_of_val(&list) as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    let count = if list_ok != 0 {
+        unsafe {
+            (*(list.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST)).NumberOfProcessIdsInList
+                as usize
+        }
+    } else {
+        0
+    };
+    assert!(
+        count <= 64,
+        "unexpected memory-test process tree size: {count}"
+    );
+    let pids = if list_ok != 0 {
+        unsafe {
+            std::slice::from_raw_parts(
+                (*(list.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST))
+                    .ProcessIdList
+                    .as_ptr(),
+                count,
+            )
+        }
+    } else {
+        &[]
+    };
+    unsafe {
+        CloseHandle(job);
+    }
+    format!(
+        "job_peak_bytes={} limit_bytes={} peak_ok={peak_ok} members={pids:?} list_ok={list_ok}",
+        limits.PeakJobMemoryUsed, limits.JobMemoryLimit
+    )
 }
 
 #[test]
@@ -369,6 +473,203 @@ fn memory_limit_stops_foreground_command() {
 #[test]
 fn memory_limit_stops_pty_command() {
     allocate_past_cap(true, false, false, false, None);
+}
+
+#[cfg(windows)]
+#[test]
+fn memory_limit_cmd_waiter_contains_and_kills_powershell_tree() {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::JobObjects::{IsProcessInJob, OpenJobObjectW};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    struct Handles(Vec<HANDLE>);
+    impl Drop for Handles {
+        fn drop(&mut self) {
+            for handle in self.0.drain(..) {
+                unsafe {
+                    CloseHandle(handle);
+                }
+            }
+        }
+    }
+    struct TaskGuard<'a>(&'a BgTaskRegistry, String);
+    impl Drop for TaskGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.kill(&self.1, "memory-waiter");
+        }
+    }
+
+    for form in ["foreground", "background", "pty"] {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let shell_ready = temp.path().join("powershell-pid");
+        let child_ready = temp.path().join("allocator-pid");
+        let release = temp.path().join("allocate");
+        let quote = |path: &Path| path.display().to_string().replace('\'', "''");
+        let command = format!(
+            "[IO.File]::WriteAllText('{}', [string]$PID); & '{}' --exact {ALLOCATOR} --nocapture",
+            quote(&shell_ready),
+            quote(&std::env::current_exe().unwrap())
+        );
+        let mut env = HashMap::from([
+            ("AFT_TEST_ALLOCATE_MIB".into(), "512".into()),
+            (
+                "AFT_TEST_MEMORY_CHILD_READY".into(),
+                child_ready.display().to_string(),
+            ),
+            (
+                "AFT_TEST_MEMORY_CHILD_RELEASE".into(),
+                release.display().to_string(),
+            ),
+        ]);
+        for key in ["PATH", "SystemRoot", "WINDIR", "USERPROFILE", "TEMP", "TMP"] {
+            if let Ok(value) = std::env::var(key) {
+                env.insert(key.into(), value);
+            }
+        }
+        let shell = super::super::BashShell::Powershell;
+        let timeout = super::super::HardKill::After(Duration::from_secs(45));
+        let id = if form == "pty" {
+            registry
+                .spawn_pty_with_shell(
+                    SpawnPlan::Unsandboxed,
+                    &command,
+                    shell,
+                    "pwsh.exe".into(),
+                    "memory-waiter".into(),
+                    temp.path().into(),
+                    env,
+                    timeout,
+                    Some(256),
+                    temp.path().into(),
+                    4,
+                    true,
+                    false,
+                    None,
+                    24,
+                    80,
+                )
+                .unwrap()
+        } else {
+            registry
+                .spawn_with_shell_in_slot_typed(
+                    SpawnPlan::Unsandboxed,
+                    &command,
+                    shell,
+                    "pwsh.exe".into(),
+                    "memory-waiter".into(),
+                    temp.path().into(),
+                    env,
+                    timeout,
+                    Some(256),
+                    temp.path().into(),
+                    if form == "foreground" {
+                        super::super::TaskSlot::Foreground
+                    } else {
+                        super::super::TaskSlot::Background { max: 4 }
+                    },
+                    true,
+                    false,
+                    None,
+                )
+                .unwrap()
+        };
+        let _cleanup = TaskGuard(&registry, id.clone());
+        let task = registry.task_for_test(&id).unwrap();
+        let root = task.lock_state().unwrap().metadata.child_pid.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let read_pid = |path: &Path| -> u32 {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    if let Ok(pid) = text.parse() {
+                        return pid;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{form}: process did not reach its ready gate: {}; status={:?}; terminal={:?}",
+                    path.display(),
+                    registry.status(&id, "memory-waiter", None, None, 4096),
+                    std::fs::read_to_string(&task.paths.pty)
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let pids = [root, read_pid(&shell_ready), read_pid(&child_ready)];
+        let name: Vec<u16> = format!("Local\\AFT-memory-{id}\0").encode_utf16().collect();
+        const JOB_OBJECT_QUERY_RIGHT: u32 = 0x0004;
+        let job = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY_RIGHT, 0, name.as_ptr()) };
+        assert!(
+            !job.is_null(),
+            "open memory job: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut handles = Handles(vec![job]);
+        for pid in pids {
+            const SYNCHRONIZE_RIGHT: u32 = 0x0010_0000;
+            let process = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_RIGHT,
+                    0,
+                    pid,
+                )
+            };
+            assert!(
+                !process.is_null(),
+                "open PID {pid}: {}",
+                std::io::Error::last_os_error()
+            );
+            handles.0.push(process);
+            let mut included = 0;
+            assert_ne!(unsafe { IsProcessInJob(process, job, &mut included) }, 0);
+            assert_ne!(
+                included, 0,
+                "{form}: PID {pid} escaped the task's memory job"
+            );
+        }
+        let mut image = [0u16; 1024];
+        let mut length = image.len() as u32;
+        assert_ne!(
+            unsafe { QueryFullProcessImageNameW(handles.0[1], 0, image.as_mut_ptr(), &mut length) },
+            0
+        );
+        assert!(String::from_utf16_lossy(&image[..length as usize])
+            .to_ascii_lowercase()
+            .ends_with("\\cmd.exe"));
+        std::fs::write(&release, b"allocate").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let snapshot = registry
+                .status(&id, "memory-waiter", None, None, 4096)
+                .unwrap();
+            if snapshot.info.status.is_terminal() {
+                assert_eq!(snapshot.info.status, BgTaskStatus::Failed, "{snapshot:?}");
+                let reason = snapshot.info.status_reason.unwrap_or_default();
+                assert!(
+                    reason.contains("256 MiB memory cap")
+                        && reason.contains("Windows job-object memory limit"),
+                    "{reason}"
+                );
+                assert!(!reason.contains("timeout"), "{reason}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{form}: memory cap did not stop the process tree"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        for process in &handles.0[1..] {
+            assert_eq!(
+                unsafe { WaitForSingleObject(*process, 5000) },
+                WAIT_OBJECT_0,
+                "{form}: a capped process survived"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]

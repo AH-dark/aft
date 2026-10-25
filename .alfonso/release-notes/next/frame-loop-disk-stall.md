@@ -1,0 +1,1 @@
+- Keep background-watch diagnostics off the shared frame loop during slow database reads, and include the active step, command, request ID and elapsed time in stall snapshots.

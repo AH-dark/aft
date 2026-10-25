@@ -636,6 +636,7 @@ pub fn run_tool_call(
                 .is_some()
                 .then(|| tool_call_arg_shape(&prepared.request));
             let reports_outcome = is_edit_command(&prepared.request.command);
+            let reports_search_plan = prepared.request.command == "semantic_search";
             let skipped_before = app_ctx.backup().lock().latest_skipped_order(
                 ctx.session_id
                     .as_deref()
@@ -676,6 +677,10 @@ pub fn run_tool_call(
             if let Some(trace) = phase_trace.as_mut() {
                 trace.mark_execute_done();
                 if let Some(mut shape) = arg_shape {
+                    if reports_search_plan {
+                        shape.push(' ');
+                        shape.push_str(&search_plan_summary(&response));
+                    }
                     if reports_outcome {
                         shape.push_str(" outcome=");
                         shape.push_str(&response_outcome(&response));
@@ -718,6 +723,28 @@ fn is_edit_command(command: &str) -> bool {
         command,
         "edit_match" | "batch" | "edit_symbol" | "write" | "apply_patch" | "append"
     )
+}
+
+fn search_plan_summary(response: &Response) -> String {
+    use crate::commands::semantic_search::plan_table::{SearchLaneKind, SearchShape};
+    // Log only parsed shape and selected_lanes labels from the search plan,
+    // never its input or other fields that may contain query text.
+    let labels = (|| {
+        let plan = response.data.get("structuredContent")?.get("plan")?;
+        let shape = SearchShape::from_str(plan.get("shape")?.as_str()?)?;
+        let lanes = plan
+            .get("selected_lanes")?
+            .as_array()?
+            .iter()
+            .map(|lane| SearchLaneKind::from_str(lane.as_str()?).map(|lane| lane.as_str()))
+            .collect::<Option<Vec<_>>>()?;
+        Some(format!(
+            "shape={} lanes={}",
+            shape.as_str(),
+            lanes.join(",")
+        ))
+    })();
+    labels.unwrap_or_else(|| "shape=unavailable lanes=unavailable".to_string())
 }
 
 /// `ok`, or the response's error code reduced to a plain token.
@@ -917,7 +944,27 @@ mod tests {
     /// Run one agent `edit` call through `run_tool_call` with a phase trace,
     /// as the subc transport does, and return the slow-call line it would log.
     fn slow_edit_line(ctx: &AppContext, root: &std::path::Path, args: Value) -> String {
-        let format = crate::subc_format::FormatContext::from_tool_call("edit", &args, root);
+        slow_tool_line(
+            ctx,
+            root,
+            "edit",
+            args,
+            &|request, ctx| match request.command.as_str() {
+                "edit_match" => crate::commands::edit_match::handle_edit_match(&request, ctx),
+                "batch" => crate::commands::batch::handle_batch(&request, ctx),
+                other => panic!("unexpected dispatch of {other}"),
+            },
+        )
+    }
+
+    fn slow_tool_line(
+        ctx: &AppContext,
+        root: &std::path::Path,
+        name: &str,
+        args: Value,
+        dispatch: &DispatchFn<'_>,
+    ) -> String {
+        let format = crate::subc_format::FormatContext::from_tool_call(name, &args, root);
         let tool_ctx = ToolCallContext {
             project_root: root.to_path_buf(),
             session_id: Some("slow-shape".into()),
@@ -935,16 +982,12 @@ mod tests {
         trace.mark_executor_submitted();
         trace.mark_job_admitted();
         let ToolCallOutcome::Unary(_) = run_tool_call(
-            "edit",
+            name,
             args,
             &format,
             &tool_ctx,
             ctx,
-            &|request, ctx| match request.command.as_str() {
-                "edit_match" => crate::commands::edit_match::handle_edit_match(&request, ctx),
-                "batch" => crate::commands::batch::handle_batch(&request, ctx),
-                other => panic!("unexpected dispatch of {other}"),
-            },
+            dispatch,
             Some(&|_response: &mut Response, _text: &mut String| {}),
             Some(&mut trace),
         );
@@ -965,7 +1008,7 @@ mod tests {
         phases.total = crate::logging::SLOW_TOOL_CALL_THRESHOLD + Duration::from_millis(1);
         let _ = crate::logging::take_slow_tool_call_logs_for_test();
         crate::logging::note_tool_call_trace(
-            "edit",
+            name,
             "slow-shape",
             std::path::Path::new("/repo"),
             1,
@@ -976,6 +1019,77 @@ mod tests {
         let mut lines = crate::logging::take_slow_tool_call_logs_for_test();
         assert_eq!(lines.len(), 1, "{lines:?}");
         lines.remove(0)
+    }
+
+    #[test]
+    fn slow_search_summary_rejects_content_bearing_plan_labels() {
+        for plan in [
+            serde_json::json!({"shape": "identifier SECRET_QUERY", "selected_lanes": ["exact"]}),
+            serde_json::json!({"shape": "identifier", "selected_lanes": ["exact", "SECRET_QUERY"]}),
+            serde_json::json!({"shape": "identifier", "selected_lanes": [7]}),
+        ] {
+            let response = Response::success(
+                "private",
+                serde_json::json!({
+                    "structuredContent": {"plan": plan},
+                }),
+            );
+            assert_eq!(
+                search_plan_summary(&response),
+                "shape=unavailable lanes=unavailable"
+            );
+        }
+        let response = Response::success(
+            "private",
+            serde_json::json!({
+                "structuredContent": {"plan": {
+                    "shape": "identifier", "selected_lanes": ["exact", "lexical", "semantic"],
+                    "lanes_run": ["lexical"], "exact_input": "SECRET_QUERY", "variants": ["SECRET_VARIANT"],
+                }},
+            }),
+        );
+        assert_eq!(
+            search_plan_summary(&response),
+            "shape=identifier lanes=exact,lexical,semantic"
+        );
+    }
+
+    #[test]
+    fn slow_search_line_carries_planner_shape_and_lanes_without_query_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        std::fs::write(root.join("private.rs"), "pub fn secret_needle() {}\n").unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::build(&root));
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::Disabled;
+        for (query, expected) in [
+            (
+                "secret_needle",
+                "shape=identifier lanes=exact,lexical,variants",
+            ),
+            ("private.rs", "shape=path lanes=path_lookup,exact,lexical"),
+        ] {
+            let line = slow_tool_line(
+                &ctx,
+                &root,
+                "search",
+                serde_json::json!({"query": query}),
+                &|request, ctx| {
+                    crate::commands::semantic_search::handle_semantic_search(&request, ctx)
+                },
+            );
+            assert!(line.contains(expected), "expected {expected:?}: {line}");
+            for private in ["secret_needle", "private.rs", "pub fn"] {
+                assert!(!line.contains(private), "{private:?} leaked into {line}");
+            }
+        }
     }
 
     /// The slow-call line names what an edit was asked to do (target kind,

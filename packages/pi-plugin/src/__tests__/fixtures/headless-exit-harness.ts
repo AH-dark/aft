@@ -110,6 +110,29 @@ function makeFakeInnerPool() {
 }
 
 const mode = process.env.HARNESS_MODE;
+if (
+  mode === "notification-summary" ||
+  mode === "notification-retry" ||
+  mode === "notification-log-retry"
+) {
+  const { mock } = await import("bun:test");
+  const npmModule = new URL("../../lsp-auto-install.ts", import.meta.url).pathname;
+  const realNpm = await import(npmModule);
+  mock.module(npmModule, () => ({
+    ...realNpm,
+    runAutoInstall: () => ({
+      cachedBinDirs: [],
+      installsStarted: 0,
+      installingBinaries: [],
+      skipped: [
+        { id: "routine-server", reason: "already installed" },
+        { id: "fixture-server", reason: "fixture install failed" },
+      ],
+      installsComplete: Promise.resolve(),
+      getCachedBinDirs: () => [],
+    }),
+  }));
+}
 let resolveOnnx: (dir: string | null) => void = () => undefined;
 const onnxReady = new Promise<string | null>((resolve) => {
   resolveOnnx = resolve;
@@ -173,7 +196,11 @@ emit("plugin-ready");
 
 const sessionCtx = (sessionId: string) => ({
   cwd: process.cwd(),
-  hasUI: false,
+  hasUI: mode === "notification-upgrade" || mode === "notification-summary",
+  ui: {
+    notify: (message: string, type?: string) =>
+      emit("ui-toast", JSON.stringify({ sessionId, message, type })),
+  },
   sessionManager: { getSessionId: () => sessionId },
 });
 
@@ -193,6 +220,44 @@ if (mode === "plugin-validate") {
 
 if (mode === "plugin-validate") {
   // Nothing more: the script ends here, like the OMP CLI command does.
+} else if (mode?.startsWith("notification-")) {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const { readFileSync } = await import("node:fs");
+  if (mode === "notification-log-retry") {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      for (const event of ["before_agent_start", "turn_end"]) {
+        for (const handler of handlers.get(event) ?? []) {
+          await handler({}, sessionCtx("headless-session"));
+        }
+      }
+    }
+    emit("headless-turns-done");
+    for (let attempt = 0; attempt < 2; attempt++) {
+      for (const event of ["before_agent_start", "turn_end"]) {
+        for (const handler of handlers.get(event) ?? []) {
+          await handler({}, { ...sessionCtx("retry-session"), hasUI: true });
+        }
+      }
+    }
+    emit("ui-turns-done");
+  }
+  if (mode === "notification-retry") {
+    emit(
+      "pending-marker",
+      readFileSync(`${process.env.AFT_STORAGE_DIR}/pi/last_announced_version`, "utf8"),
+    );
+    for (let attempt = 0; attempt < 2; attempt++) {
+      for (const handler of handlers.get("before_agent_start") ?? []) {
+        await handler({}, { ...sessionCtx("retry-session"), hasUI: true });
+      }
+    }
+  }
+  emit(
+    "announcement-marker",
+    readFileSync(`${process.env.AFT_STORAGE_DIR}/pi/last_announced_version`, "utf8"),
+  );
+  for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, {});
+  emit("shutdown-done");
 } else if (mode === "session-warmup") {
   // A real session still gets its warmup bridge at session start, before any
   // tool call, so deferring it out of the factory costs no first-call latency.

@@ -2282,6 +2282,81 @@ fn bash_properties(answer: &Value, tool: &str) -> Vec<String> {
 
 #[cfg(unix)]
 #[test]
+fn head_worker_preflight_catalog_matches_worker_catalog() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    for params in [
+        json!({"remote_exec":{"enabled":true}, "siblings":[]}),
+        json!({"remote_exec":{"enabled":false}}),
+        json!({"confine":"root", "remote_exec":{"enabled":true}}),
+    ] {
+        let mut head = identity(root.path(), &format!("head-preflight-{params}"), 7, true);
+        Arc::get_mut(&mut head.0)
+            .unwrap()
+            .scope
+            .as_mut()
+            .unwrap()
+            .kind = subc_protocol::scope::ScopeKind::Head;
+        let worker = identity(root.path(), &format!("worker-{params}"), 7, true);
+        let request = json!({"op":"tool.catalog", "preset":"worker", "params":params});
+        let preview = catalog(request.clone(), &head, &ctx).unwrap();
+        let actual = catalog(request, &worker, &ctx).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&preview).unwrap(),
+            serde_json::to_vec(&actual).unwrap()
+        );
+        if params.get("confine").is_some() {
+            assert!(preview["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| tool["name"] != "bash"));
+        } else {
+            assert_eq!(
+                bash_properties(&preview, "bash").contains(&"runon".to_string()),
+                params["remote_exec"]["enabled"] == true
+            );
+        }
+    }
+}
+
+#[test]
+fn head_worker_preflight_validates_routing_without_a_policy_store() {
+    let root = tempfile::tempdir().unwrap();
+    let ctx = AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.path().into()),
+            ..Default::default()
+        },
+    );
+    let mut head = identity(root.path(), "head-preflight", 7, true);
+    Arc::get_mut(&mut head.0)
+        .unwrap()
+        .scope
+        .as_mut()
+        .unwrap()
+        .kind = subc_protocol::scope::ScopeKind::Head;
+    for params in [
+        json!({"remote_exec":{"enabled":true}}),
+        json!({"siblings":[root.path()]}),
+        json!({"confine":"root"}),
+    ] {
+        catalog(json!({"preset":"worker", "params":params}), &head, &ctx).unwrap();
+    }
+    for params in [
+        json!({"remote_exec":{"enabled":"yes"}}),
+        json!({"siblings":["relative/path"]}),
+        json!({"confine":"none"}),
+    ] {
+        assert!(catalog(json!({"preset":"worker", "params":params}), &head, &ctx).is_err());
+    }
+    assert!(!confined(&ctx, &head).unwrap());
+}
+
+#[cfg(unix)]
+#[test]
 fn worker_catalog_offers_runon_only_with_an_enabled_frozen_plan() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();

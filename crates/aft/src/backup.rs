@@ -1067,6 +1067,10 @@ pub struct BackupStore {
     discovery_deadline_override: Option<Instant>,
     #[cfg(test)]
     discard_outcome_for_tests: Option<Result<(), String>>,
+    /// When the last operation discard's cleanup allowance began, so tests can
+    /// time the cleanup from its own start rather than from the caller's.
+    #[cfg(test)]
+    discard_started_for_tests: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -1142,6 +1146,8 @@ impl BackupStore {
             discovery_deadline_override: None,
             #[cfg(test)]
             discard_outcome_for_tests: None,
+            #[cfg(test)]
+            discard_started_for_tests: None,
         }
     }
 
@@ -3348,11 +3354,13 @@ impl BackupStore {
     }
 
     pub fn discard_operation_entries(&mut self, session: &str, op_id: &str) {
+        let budget = BackupIoBudget::rollback_cleanup();
         #[cfg(test)]
         {
             self.discard_outcome_for_tests = None;
+            self.discard_started_for_tests =
+                budget.deadline.checked_sub(ROLLBACK_CLEANUP_ALLOWANCE);
         }
-        let budget = BackupIoBudget::rollback_cleanup();
         if let Some(skips) = self.skipped_backups.get_mut(session) {
             skips.retain(|skip| skip.op_id.as_deref() != Some(op_id));
             if skips.is_empty() {
@@ -8550,8 +8558,30 @@ mod tests {
         }
     }
 
+    /// Time cleanup may take, beyond its allowance, to return after giving up
+    /// on a held lease. A lease wait checks its deadline between attempts, so
+    /// an attempt that starts just before the deadline finishes its file I/O
+    /// first, and a loaded host can also stall the thread right after a wait.
+    /// On loaded Windows hosts one stack-lease attempt (creating its temporary
+    /// lease file) took 5.6 s, and one session-stage cleanup took 6.96 s in
+    /// all, so Windows gets a wide margin. On Linux, under the same load, every
+    /// stage returned within a millisecond of its allowance, so elsewhere the
+    /// margin stays tight. A wait that ignores the allowance lasts until the
+    /// test releases the held lease after `CLEANUP_HANG_GUARD`, well beyond
+    /// either margin.
+    #[cfg(windows)]
+    const CLEANUP_RETURN_MARGIN: Duration = Duration::from_secs(12);
+    #[cfg(not(windows))]
+    const CLEANUP_RETURN_MARGIN: Duration = Duration::from_secs(3);
+    /// How long the test lets a cleanup worker run before it releases the held
+    /// lease. It only keeps a wait that ignores the allowance from hanging the
+    /// suite; the verdict is the worker's own measurement of its cleanup.
+    const CLEANUP_HANG_GUARD: Duration = Duration::from_secs(30);
+
     #[test]
     fn backup_rollback_cleanup_bounds_namespace_session_and_stack_waits() {
+        // Stage 0 holds the backup namespace, stage 1 the session gate and
+        // stage 2 the per-file stack lease that cleanup takes last.
         for (held_stage, released) in [(0, false), (1, false), (2, false), (2, true)] {
             let (mut store, storage, _project, original_path) = durability_store();
             // Keep a noncanonical spelling even on hosts whose temp directory
@@ -8600,11 +8630,18 @@ mod tests {
             let (resume_tx, resume_rx) = std::sync::mpsc::channel();
             let (tx, rx) = std::sync::mpsc::channel();
             let worker = std::thread::spawn(move || {
+                // The stack-stage rendezvous runs inside cleanup's allowance
+                // but is the test's own pause, so it is excluded from the
+                // cleanup time measured below.
+                let paused = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
                 if held_stage == 2 {
+                    let paused = std::rc::Rc::clone(&paused);
                     BEFORE_BACKUP_STACK_LEASE.with(|slot| {
                         *slot.borrow_mut() = Some(Box::new(move |attempted| {
+                            let pause_started = Instant::now();
                             ready_tx.send(attempted.to_path_buf()).unwrap();
                             resume_rx.recv().unwrap();
+                            paused.set(pause_started.elapsed());
                         }));
                     });
                 }
@@ -8615,16 +8652,23 @@ mod tests {
                     Some(crate::bounded_io::Budget::after(Duration::ZERO)),
                     || {
                         store.discard_operation_entries(session, "failed");
+                        let returned = Instant::now();
                         assert!(crate::executor::current_job_cancelled());
-                        tx.send(store).unwrap();
+                        let started = store
+                            .discard_started_for_tests
+                            .take()
+                            .expect("discard did not record when its allowance began");
+                        let cleanup_time = returned
+                            .saturating_duration_since(started)
+                            .saturating_sub(paused.get());
+                        tx.send((store, cleanup_time)).unwrap();
                     },
                 );
             });
             // The worker reports the exact production lease it is about to
             // acquire. Check that lease while its held guard is still alive,
             // then release the rendezvous, not the held lease.
-            let attempted =
-                (held_stage == 2).then(|| ready_rx.recv_timeout(Duration::from_secs(5)));
+            let attempted = (held_stage == 2).then(|| ready_rx.recv_timeout(CLEANUP_HANG_GUARD));
             let held_lease_is_busy = attempted.as_ref().is_some_and(|attempted| {
                 attempted.as_ref().is_ok_and(|attempted| {
                     held_stack_path.as_ref() == Some(attempted)
@@ -8635,21 +8679,27 @@ mod tests {
                 })
             });
             let _ = resume_tx.send(());
-            let result = rx.recv_timeout(Duration::from_secs(5));
+            let early = rx.recv_timeout(CLEANUP_HANG_GUARD);
             // Release guards and join before asserting even when a rendezvous
             // or bounded wait regresses, so no blocked test worker is abandoned.
+            // A wait that ignores the allowance ends here, and the worker still
+            // reports how long its cleanup took.
             drop((namespace, session_gate, stack));
+            let result = early.or_else(|_| rx.recv());
             worker.join().unwrap();
+            let (mut store, cleanup_time) =
+                result.expect("cleanup worker exited without reporting");
             assert!(
-                result.is_ok(),
-                "cleanup waited past its allowance at stage {held_stage}"
+                cleanup_time <= ROLLBACK_CLEANUP_ALLOWANCE + CLEANUP_RETURN_MARGIN,
+                "cleanup waited past its allowance at stage {held_stage}: it returned \
+                 {cleanup_time:?} after its allowance began (allowance \
+                 {ROLLBACK_CLEANUP_ALLOWANCE:?}, margin {CLEANUP_RETURN_MARGIN:?})"
             );
-            let mut store = result.unwrap();
             let outcome = store
                 .discard_outcome_for_tests
                 .take()
                 .expect("discard did not report an outcome");
-            eprintln!("cleanup stage={held_stage} released={released} raw={original_path:?} requested={path:?} canonical={key:?} held={held_stack_path:?} attempted={attempted:?} busy={held_lease_is_busy} outcome={outcome:?}");
+            eprintln!("cleanup stage={held_stage} released={released} cleanup_time={cleanup_time:?} raw={original_path:?} requested={path:?} canonical={key:?} held={held_stack_path:?} attempted={attempted:?} busy={held_lease_is_busy} outcome={outcome:?}");
             if held_stage == 2 {
                 let attempted = attempted
                     .unwrap()
