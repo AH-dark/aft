@@ -324,11 +324,14 @@ impl PatternList {
         }
         // A scan stopped by its match bound, its walk bound or grep's
         // deadline left files unread.
+        // Unreadable index sources also leave the examined set incomplete.
         let capped = result.truncated
             || result.walk_truncated
             || result.scan_deadline_reached
-            || result.walk_bound.is_some();
-        Self::from_collection(
+            || result.walk_bound.is_some()
+            || result.index_sources_unavailable
+            || !result.index_read_gaps.is_empty();
+        let mut list = Self::from_collection(
             GrepFileCollection {
                 files,
                 candidate_files: result.files_searched,
@@ -340,7 +343,9 @@ impl PatternList {
             },
             project_root,
             pattern,
-        )
+        );
+        list.index_read_gaps = result.index_read_gaps;
+        list
     }
 
     pub(crate) fn len(&self) -> usize {

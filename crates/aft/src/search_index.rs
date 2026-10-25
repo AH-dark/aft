@@ -12485,6 +12485,94 @@ mod tests {
         );
     }
 
+    fn audit10_7_after_regex_lock_timeout<T>(
+        context: &crate::context::AppContext,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        let (start, begin) = std::sync::mpsc::channel();
+        let (held, acquired) = std::sync::mpsc::channel();
+        let (release, finish) = std::sync::mpsc::channel();
+        let (released, dropped) = std::sync::mpsc::channel();
+        let timeouts = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = timeouts.clone();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                if begin.recv().is_ok() {
+                    let guard = context.search_index().write().unwrap();
+                    let _ = held.send(());
+                    let _ = finish.recv();
+                    drop(guard);
+                    let _ = released.send(());
+                }
+            });
+            crate::commands::semantic_search::with_regex_route_lock_hook_for_test(
+                move |timed_out| {
+                    if timed_out {
+                        observed.set(observed.get() + 1);
+                        release.send(()).unwrap();
+                        dropped.recv().unwrap();
+                    } else {
+                        start.send(()).unwrap();
+                        acquired.recv().unwrap();
+                    }
+                },
+                action,
+            )
+        });
+        assert_eq!(
+            timeouts.get(),
+            1,
+            "the ranked route must time out before fallback"
+        );
+        result
+    }
+
+    #[test]
+    fn audit10_7_pattern_lock_timeout_fallback_rejects_unreadable_postings() {
+        let (_directory, context, _) = unreadable_postings_fixture();
+        let request = crate::protocol::RawRequest {
+            id: "pattern-lock-timeout".to_string(),
+            command: "semantic_search".to_string(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"pattern":"needleHandler", "topK":10}),
+        };
+        let response = audit10_7_after_regex_lock_timeout(&context, || {
+            crate::commands::semantic_search::handle_semantic_search(&request, &context)
+        });
+        assert!(
+            !response.success,
+            "unreadable postings became a complete empty reply: {:?}",
+            response.data
+        );
+        assert!(response.data.to_string().contains("lexical postings"));
+    }
+
+    #[test]
+    fn audit10_7_split_lock_timeout_fallback_preserves_posting_read_gaps() {
+        let (_directory, context, _) = unreadable_postings_fixture();
+        let request = crate::protocol::RawRequest {
+            id: "split-lock-timeout".to_string(),
+            command: "semantic_search".to_string(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"query":"how is work scheduled", "pattern":"needleHandler", "topK":10}),
+        };
+        let response = audit10_7_after_regex_lock_timeout(&context, || {
+            crate::commands::semantic_search::handle_semantic_search(&request, &context)
+        });
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], false);
+        assert!(
+            response.data["index_read_gap"]
+                .to_string()
+                .contains("lexical postings"),
+            "{:?}",
+            response.data
+        );
+        assert_eq!(response.data["pattern_summary"]["examination_capped"], true);
+    }
+
     #[test]
     fn audit10_search_lock_poison_recovers() {
         let poisoned = std::panic::catch_unwind(|| {

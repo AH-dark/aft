@@ -3760,12 +3760,19 @@ fn handle_grep_search(
             None,
         )
     };
+    if result.index_sources_unavailable {
+        return Response::error(&req.id, "internal_error", result.index_read_gaps.join("; "));
+    }
     if result.fully_degraded {
         warnings.push(degraded_warning(ctx));
     }
 
     let result_source = if literal { "literal" } else { "regex" };
-    if result.matches.is_empty() && search_index_ready(ctx) && !explicit_pattern {
+    if result.matches.is_empty()
+        && result.index_read_gaps.is_empty()
+        && search_index_ready(ctx)
+        && !explicit_pattern
+    {
         return zero_result_escalation_response(
             req,
             ctx,
@@ -3833,7 +3840,11 @@ fn handle_grep_search(
         text.push('\n');
         text.push_str(note);
     }
-    if explicit_pattern && result_values.is_empty() && offset == 0 {
+    if explicit_pattern
+        && result_values.is_empty()
+        && offset == 0
+        && result.index_read_gaps.is_empty()
+    {
         text.push('\n');
         text.push_str(if result.engine_capped {
             "[pattern: no match in the files examined; files not examined were not searched]"
@@ -3842,6 +3853,7 @@ fn handle_grep_search(
         });
     }
     let mut extras = serde_json::Map::new();
+    disclose_index_gaps(&result.index_read_gaps, &mut text, &mut extras);
     if trigram_index_building {
         let envelope = fallback_search_envelope(
             result_values.len(),
@@ -3881,12 +3893,14 @@ fn handle_grep_search(
             interpreted_as,
             query_kind: query_kind_label(shape.kind),
             semantic_status,
-            status: if trigram_index_building {
+            status: if trigram_index_building || !result.index_read_gaps.is_empty() {
                 "partial"
             } else {
                 "ready"
             },
-            complete: !trigram_index_building && !(explicit_pattern && result.engine_capped),
+            complete: !trigram_index_building
+                && !(explicit_pattern && result.engine_capped)
+                && result.index_read_gaps.is_empty(),
             text,
             results: result_values,
             more_available: interval_has_more,
@@ -3935,6 +3949,39 @@ fn rank_regex_collection(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static REGEX_ROUTE_LOCK_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(bool)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The hook runs before the index read with `false`, and after a lock timeout
+/// with `true`, so tests can release a contended writer before the fallback.
+#[cfg(test)]
+pub(crate) fn with_regex_route_lock_hook_for_test<T>(
+    hook: impl FnMut(bool) + 'static,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REGEX_ROUTE_LOCK_HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    REGEX_ROUTE_LOCK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    let _reset = Reset;
+    action()
+}
+
+#[cfg(test)]
+fn regex_route_lock_hook(timed_out: bool) {
+    REGEX_ROUTE_LOCK_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(timed_out);
+        }
+    });
+}
+
 /// Every file the ready trigram index admits for `compiled`, verified within
 /// the regex route's bounds. `None` when no ready index snapshot can be read
 /// within the interactive budget.
@@ -3944,7 +3991,15 @@ fn regex_route_collection(
     include_tests: bool,
 ) -> Option<std::io::Result<crate::search_index::GrepFileCollection>> {
     let snapshot = {
-        let guard = try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)?;
+        #[cfg(test)]
+        regex_route_lock_hook(false);
+        let Some(guard) =
+            try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
+        else {
+            #[cfg(test)]
+            regex_route_lock_hook(true);
+            return None;
+        };
         let index = guard.as_ref()?;
         if !index.ready {
             return None;
