@@ -1,0 +1,1 @@
+- aft_search path and filename lookups answer faster in large projects: unrelated files are filtered out before sorting (20,000 files: median 262 ms to 42 ms), with the same results.
