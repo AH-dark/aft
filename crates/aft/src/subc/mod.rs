@@ -200,6 +200,7 @@ type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>
 mod access_grants;
 mod bash;
 mod bind_log;
+mod call_policy;
 #[cfg(test)]
 mod content_v1_tests;
 // The grant tests run real shell commands, which need a POSIX shell.
@@ -9115,9 +9116,6 @@ impl PlainToolRun {
                 reply_deadline,
             } = run_spec;
             if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
-                ctx.mark_standalone_plugin_host();
-            }
-            if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
                 if let Some(args) = arguments.as_object_mut() {
                     args.remove("permissions_granted");
                 }
@@ -9139,52 +9137,45 @@ impl PlainToolRun {
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             phase_trace.mark_job_admitted();
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
-                let run = || {
-                    let finalizer = |response: &mut Response, text: &mut String| {
-                        crate::response_finalize::finalize_tool_response(
-                            response,
-                            text,
-                            ctx,
-                            &identity_for_run.session,
-                            &bare_name,
-                            bind_trust.allows_bash_observation()
-                                && !crate::context::confinement::active(),
-                        );
-                    };
-                    let outcome = remote_policy::with_call_policy(
+                // Both the tool's run and the reply's finishing use the trace.
+                let phase_trace = std::cell::RefCell::new(Some(phase_trace));
+                let finalizer = |response: &mut Response, text: &mut String| {
+                    crate::response_finalize::finalize_tool_response(
+                        response,
+                        text,
                         ctx,
-                        &identity_for_run,
-                        &request_id_for_force,
+                        &identity_for_run.session,
                         &bare_name,
-                        arguments,
-                        |arguments| {
-                            let tool_policy = (!tool_call_context.preview
-                                && manifest::tool_call_is_mutating(&bare_name, &arguments))
-                            .then(|| {
-                                crate::sandbox_spawn::ToolLaunchPolicy::for_session(
-                                    ctx,
-                                    identity_for_run.spawn_principal.clone(),
-                                    access_grants::alfonso_worker(&identity_for_run),
-                                )
-                            });
-                            crate::sandbox_spawn::ToolLaunchPolicy::with_current(
-                                tool_policy,
-                                || {
-                                    run_tool_call(
-                                        &bare_name,
-                                        arguments,
-                                        &format_context,
-                                        &tool_call_context,
-                                        ctx,
-                                        &dispatch,
-                                        Some(&finalizer),
-                                        Some(&mut phase_trace),
-                                    )
-                                },
-                            )
-                        },
-                    )
-                    .unwrap_or_else(|response| {
+                        bind_trust.allows_bash_observation()
+                            && !crate::context::confinement::active(),
+                    );
+                };
+                let work = |arguments: Value| {
+                    let tool_policy = (!tool_call_context.preview
+                        && manifest::tool_call_is_mutating(&bare_name, &arguments))
+                    .then(|| {
+                        crate::sandbox_spawn::ToolLaunchPolicy::for_session(
+                            ctx,
+                            identity_for_run.spawn_principal.clone(),
+                            access_grants::alfonso_worker(&identity_for_run),
+                        )
+                    });
+                    crate::sandbox_spawn::ToolLaunchPolicy::with_current(tool_policy, || {
+                        let mut trace = phase_trace.borrow_mut();
+                        run_tool_call(
+                            &bare_name,
+                            arguments,
+                            &format_context,
+                            &tool_call_context,
+                            ctx,
+                            &dispatch,
+                            Some(&finalizer),
+                            trace.as_mut(),
+                        )
+                    })
+                };
+                let finish = |outcome: Result<ToolCallOutcome, Response>| {
+                    let outcome = outcome.unwrap_or_else(|response| {
                         ToolCallOutcome::Unary(ToolCallResult {
                             text: crate::subc_format::format_response_with_context(
                                 &bare_name,
@@ -9239,7 +9230,10 @@ impl PlainToolRun {
                             let response = result.response;
                             let _ = done.send(ToolCallCompletion {
                                 text: result.text,
-                                phase_trace,
+                                phase_trace: phase_trace
+                                    .borrow_mut()
+                                    .take()
+                                    .expect("the phase trace is taken once"),
                             });
                             response
                         }
@@ -9253,21 +9247,21 @@ impl PlainToolRun {
                     .run_owner
                     .as_ref()
                     .map(|owner| owner.run_id.clone());
-                let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
-                crate::access_policy::with_scope(
-                    Some(access_grants::policy_scope_key(&identity_for_run)),
-                    || {
-                        crate::backup::with_request_harness(&harness, || {
-                            crate::backup::with_request_run(run_id.as_deref(), || {
-                                if matches!(bind_trust, BindTrust::Untrusted) {
-                                    ctx.with_force_restrict(&request_id_for_force, run)
-                                } else {
-                                    run()
-                                }
-                            })
-                        })
-                    },
-                )
+                crate::backup::with_request_harness(&harness, || {
+                    crate::backup::with_request_run(run_id.as_deref(), || {
+                        call_policy::with_tool_call_policy(
+                            ctx,
+                            &identity_for_run,
+                            &request_id_for_force,
+                            ask_route,
+                            bind_trust,
+                            &bare_name,
+                            arguments,
+                            work,
+                            finish,
+                        )
+                    })
+                })
             })
         })
     }

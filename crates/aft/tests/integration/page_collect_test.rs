@@ -4,7 +4,10 @@
 //!
 //! With `PAGE_COLLECT_PRINT_SAMPLES=1` the test prints every request and
 //! reply as `PAGE_COLLECT_SAMPLE <name> <json>` lines; those are the
-//! samples core and the phone app are built against.
+//! samples core and the phone app are built against. With
+//! `PAGE_COLLECT_PRINT_FRAMES=1` it prints the reply frames themselves as
+//! `PAGE_COLLECT_FRAME <name> <json>` lines: flags byte, body length, and
+//! the body (hex when the frame is binary, parsed JSON otherwise).
 
 use super::*;
 use base64::Engine;
@@ -25,9 +28,59 @@ fn sample(name: &str, request: &Value, reply: &Value) {
 
 struct Site {
     corr: u64,
+    /// The last request body sent and the reply frame it got.
+    last: Option<(Value, Frame)>,
 }
 
 impl Site {
+    /// Print the last reply frame as a capture named `name`.
+    fn frame(&self, name: &str) {
+        if std::env::var_os("PAGE_COLLECT_PRINT_FRAMES").is_none() {
+            return;
+        }
+        let (request, frame) = self.last.as_ref().expect("a reply frame");
+        let flags = frame.header.flags;
+        let body = if flags.is_binary() {
+            json!({"body_hex": frame.body.iter().map(|byte| format!("{byte:02x}")).collect::<String>()})
+        } else {
+            json!({"body_json": serde_json::from_slice::<Value>(&frame.body).unwrap()})
+        };
+        let mut captured = json!({
+            "request_body": request,
+            "frame": {
+                "type": format!("{:?}", frame.header.ty),
+                "channel": frame.header.channel,
+                "epoch": frame.header.epoch,
+                "corr": frame.header.corr,
+                "flags": flags.0,
+                "flags_binary": flags.is_binary(),
+                "body_len": frame.body.len(),
+            },
+        });
+        captured["frame"]
+            .as_object_mut()
+            .unwrap()
+            .extend(body.as_object().unwrap().clone());
+        println!("PAGE_COLLECT_FRAME {name} {captured}");
+    }
+
+    async fn exchange(
+        &mut self,
+        stream: &mut tokio::net::TcpStream,
+        channel: u16,
+        request: Value,
+    ) -> Frame {
+        self.corr += 1;
+        send_management_request(stream, channel, self.corr, request.clone()).await;
+        let frame = read_frame_timeout(stream, "page operation reply").await;
+        assert_eq!(frame.header.ty, FrameType::Response);
+        assert_eq!(frame.header.channel, channel);
+        assert_eq!(frame.header.epoch, 1);
+        assert_eq!(frame.header.corr, self.corr);
+        self.last = Some((request, frame.clone()));
+        frame
+    }
+
     async fn call(
         &mut self,
         stream: &mut tokio::net::TcpStream,
@@ -35,10 +88,11 @@ impl Site {
         op: &str,
         params: Value,
     ) -> (Value, Value) {
-        self.corr += 1;
         let request = json!({"op": op, "params": params});
-        send_management_request(stream, channel, self.corr, request.clone()).await;
-        let reply = read_management_response(stream, channel, self.corr, op).await;
+        let frame = self.exchange(stream, channel, request.clone()).await;
+        assert!(!frame.header.flags.is_binary(), "{op} answered with bytes");
+        let reply: Value = serde_json::from_slice(&frame.body).expect("management reply body");
+        assert_eq!(reply["op"], op);
         (request, reply)
     }
 
@@ -49,13 +103,8 @@ impl Site {
         stream: &mut tokio::net::TcpStream,
         params: Value,
     ) -> (Value, Result<Vec<u8>, Value>, Value) {
-        self.corr += 1;
         let request = json!({"op": "page.read", "params": params});
-        send_management_request(stream, CORE_CHANNEL, self.corr, request.clone()).await;
-        let frame = read_frame_timeout(stream, "page.read reply").await;
-        assert_eq!(frame.header.ty, FrameType::Response);
-        assert_eq!(frame.header.channel, CORE_CHANNEL);
-        assert_eq!(frame.header.corr, self.corr);
+        let frame = self.exchange(stream, CORE_CHANNEL, request.clone()).await;
         if frame.header.flags.is_binary() {
             let shown = json!({
                 "frame_flags_binary": true,
@@ -121,6 +170,16 @@ fn write_site(root: &std::path::Path) {
     std::fs::write(root.parent().unwrap().join("outside.html"), "<html>").unwrap();
     std::fs::write(site.join("notes.txt"), "not a page").unwrap();
     std::fs::write(
+        site.join("limits.html"),
+        "<link rel=stylesheet href=css/theme.css><img src=app.js><img src=img/bg.png><img src=img/icon.png>\n",
+    )
+    .unwrap();
+    std::fs::write(
+        site.join("small.html"),
+        "<!doctype html><img src=\"img/bg.png\"><img src=\"cache.db\">\n",
+    )
+    .unwrap();
+    std::fs::write(
         site.join("big.html"),
         format!("<html>{}</html>", "x".repeat(64)),
     )
@@ -168,6 +227,8 @@ fn file_hashes(reply: &Value) -> Vec<(String, String)> {
 }
 
 async fn drive_page_collect_daemon(input: FakeDaemonInput) {
+    // The daemon's storage root: the harness keeps the user config file there.
+    let storage = input.user_config_path.parent().unwrap().to_path_buf();
     let FakeDaemonSession {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
@@ -199,7 +260,10 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
     )
     .await;
     expect_route_bind_ack(&mut stream, 21).await;
-    let mut site = Site { corr: 1000 };
+    let mut site = Site {
+        corr: 1000,
+        last: None,
+    };
     let stream = &mut stream;
 
     // A bundle with omissions.
@@ -212,6 +276,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
         )
         .await;
     sample("collect-bundle-with-omitted", &request, &first);
+    site.frame("collect-bundle-with-omitted");
     assert_eq!(first["status"], "ok", "{first}");
     let data = &first["data"];
     assert_eq!(data["entry"], "index.html");
@@ -255,6 +320,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
         )
         .await;
     sample("collect-same-page-again", &request, &second);
+    site.frame("collect-same-page-again");
     assert_eq!(file_hashes(&first), file_hashes(&second));
     let second_snapshot = second["data"]["snapshot"].as_str().unwrap().to_string();
     assert_ne!(snapshot, second_snapshot);
@@ -267,6 +333,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
         )
         .await;
     sample("read-bytes", &request, &shown);
+    site.frame("read-bytes");
     assert_eq!(bytes.unwrap(), b"\x89PNG logo");
     let (request, bytes, shown) = site
         .read(
@@ -275,6 +342,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
         )
         .await;
     sample("read-range", &request, &shown);
+    site.frame("read-range");
     assert_eq!(bytes.unwrap(), b"color");
     for (name, params, expected) in [
         (
@@ -295,6 +363,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
     ] {
         let (request, bytes, shown) = site.read(stream, params).await;
         sample(name, &request, &shown);
+        site.frame(name);
         assert_eq!(code(&bytes.unwrap_err()), expected);
     }
 
@@ -308,6 +377,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
         )
         .await;
     sample("release", &request, &reply);
+    site.frame("release");
     assert_eq!(
         reply["data"],
         json!({"snapshot": snapshot, "released": true})
@@ -321,6 +391,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
         )
         .await;
     sample("release-again", &request, &reply);
+    site.frame("release-again");
     assert_eq!(
         reply["data"],
         json!({"snapshot": snapshot, "released": false})
@@ -367,6 +438,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
             .call(stream, CORE_CHANNEL, "page.collect", params)
             .await;
         sample(name, &request, &reply);
+        site.frame(name);
         assert_eq!(code(&reply), expected, "{name}");
     }
 
@@ -382,6 +454,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
         )
         .await;
     sample("collect-refused-session-route-ambiguous", &request, &reply);
+    site.frame("collect-refused-session-route-ambiguous");
     assert_eq!(code(&reply), "session_route_ambiguous");
 
     // A caller other than core.
@@ -394,6 +467,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
         )
         .await;
     sample("collect-refused-not-core", &request, &reply);
+    site.frame("collect-refused-not-core");
     assert_eq!(code(&reply), "page_caller_refused");
 
     // At most four live snapshots: the second collection above is live.
@@ -418,6 +492,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
         )
         .await;
     sample("collect-refused-busy", &request, &reply);
+    site.frame("collect-refused-busy");
     assert_eq!(code(&reply), "busy");
     assert!(reply["data"]["detail"]["retry_after_ms"].as_u64().unwrap() > 0);
     for snapshot in live {
@@ -431,6 +506,96 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
             .await;
         assert_eq!(reply["data"]["released"], true);
     }
+
+    // A small page with one denied file.
+    let (request, reply) = site
+        .call(
+            stream,
+            CORE_CHANNEL,
+            "page.collect",
+            collect_params("site/small.html"),
+        )
+        .await;
+    sample("collect-small-page-one-denied", &request, &reply);
+    site.frame("collect-small-page-one-denied");
+    assert_eq!(
+        reply["data"]["omitted"],
+        json!([{"path": "cache.db", "reason": "denied"}])
+    );
+    let small = reply["data"]["snapshot"].as_str().unwrap().to_string();
+    let (request, reply) = site
+        .call(
+            stream,
+            CORE_CHANNEL,
+            "page.release",
+            json!({"snapshot": small}),
+        )
+        .await;
+    sample("release-small-page", &request, &reply);
+    site.frame("release-small-page");
+
+    // Limits never refuse: a file past a limit is listed in `omitted`.
+    let mut tight = collect_params("site/limits.html");
+    tight["limits"]["max_files"] = json!(2);
+    tight["limits"]["max_file_bytes"] = json!(8);
+    tight["limits"]["import_depth"] = json!(0);
+    let (request, reply) = site.call(stream, CORE_CHANNEL, "page.collect", tight).await;
+    sample("collect-over-limits-omitted", &request, &reply);
+    site.frame("collect-over-limits-omitted");
+    let reasons = reply["data"]["omitted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|omitted| omitted["reason"].as_str().unwrap())
+        .collect::<HashSet<_>>();
+    for reason in ["depth_limit", "over_file_limit", "over_count_limit"] {
+        assert!(reasons.contains(reason), "{reason}: {reply}");
+    }
+    let tight = reply["data"]["snapshot"].as_str().unwrap().to_string();
+    site.call(
+        stream,
+        CORE_CHANNEL,
+        "page.release",
+        json!({"snapshot": tight}),
+    )
+    .await;
+
+    // Malformed parameters.
+    let (request, reply) = site
+        .call(
+            stream,
+            CORE_CHANNEL,
+            "page.collect",
+            json!({"harness": HARNESS, "session": SESSION}),
+        )
+        .await;
+    sample("collect-refused-invalid-request", &request, &reply);
+    site.frame("collect-refused-invalid-request");
+    assert_eq!(code(&reply), "invalid_request");
+    let (request, bytes, shown) = site
+        .read(stream, json!({"snapshot": small, "path": "index.html"}))
+        .await;
+    sample("read-refused-invalid-request", &request, &shown);
+    site.frame("read-refused-invalid-request");
+    assert_eq!(code(&bytes.unwrap_err()), "invalid_request");
+
+    // The snapshot folder cannot be created: a plain file stands where it
+    // belongs under the daemon's storage.
+    let snapshots = storage.join("page-snapshots");
+    let _ = std::fs::remove_dir_all(&snapshots);
+    std::fs::write(&snapshots, "not a folder").unwrap();
+    let (request, reply) = site
+        .call(
+            stream,
+            CORE_CHANNEL,
+            "page.collect",
+            collect_params("site/small.html"),
+        )
+        .await;
+    sample("collect-refused-snapshot-unavailable", &request, &reply);
+    site.frame("collect-refused-snapshot-unavailable");
+    assert_eq!(code(&reply), "snapshot_unavailable");
+    std::fs::remove_file(&snapshots).unwrap();
 
     send_connection_goodbye(stream).await;
 }

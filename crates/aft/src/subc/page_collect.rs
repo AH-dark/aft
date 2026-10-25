@@ -4,9 +4,12 @@
 //! Only core (`prefrontal-core`) may call them. A collection reads under
 //! the read policy of one agent session's live tool route: the same bind
 //! root, trust class, config read_deny and protected paths, AFT storage
-//! floor, saved grants and confinement its `read` tool applies right now,
-//! through [`AppContext::validate_read_path`] itself. A question the policy
-//! would ask the user is never asked here; such a path counts as denied.
+//! floor, saved grants and confinement its `read` tool applies right now:
+//! the per-call setup comes from `call_policy::with_tool_call_policy`, the
+//! same function the tool-call path uses, and every path is judged by
+//! [`AppContext::validate_read_path`], the check `read` itself makes. A
+//! question the policy would ask the user is never asked here; such a path
+//! counts as denied.
 
 use super::*;
 use crate::commands::file_read_exact::{self, OpenedFile, ReadExactRefusal};
@@ -141,61 +144,27 @@ pub(super) fn choose_route(
     Ok(first)
 }
 
-/// Run `work` with the read policy `identity`'s `read` tool would get:
-/// its ask route (never asked here: a question is a refusal), its saved
-/// grants' scope, forced root restriction for an untrusted bind, and the
-/// root confinement fence of a confined scoped worker.
-fn with_session_read_policy<R>(
-    ctx: &AppContext,
-    identity: &RouteIdentity,
-    request_id: &str,
-    budget: crate::bounded_io::Budget,
-    work: impl FnOnce() -> R,
-) -> Result<R, subc_protocol::ErrorBody> {
-    let ask_route = access_grants::ask_route(identity);
-    if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
-        ctx.mark_standalone_plugin_host();
-    }
-    let _io = crate::bounded_io::enter(Some(budget));
-    let confined = remote_policy::confined(ctx, identity)?;
-    let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
-    crate::access_policy::with_scope(Some(access_grants::policy_scope_key(identity)), || {
-        let fenced = || {
-            if confined {
-                crate::context::confinement::with_root(ctx, request_id, || Ok(work())).map_err(
-                    |response| {
-                        subc_protocol::ErrorBody::new(
-                            response.data["code"]
-                                .as_str()
-                                .unwrap_or("confine_policy_unavailable"),
-                            response.data["message"].as_str().unwrap_or_default(),
-                        )
-                    },
-                )
-            } else {
-                Ok(work())
-            }
-        };
-        if matches!(identity.trust, BindTrust::Untrusted) {
-            ctx.with_force_restrict(request_id, fenced)
-        } else {
-            fenced()
-        }
-    })
-}
-
 /// How a session reader opens a checked file: below `walk_root`, never
 /// following a symlink component.
 pub(super) type OpenFile<'a> = &'a dyn Fn(&Path, &Path) -> Result<OpenedFile, ReadExactRefusal>;
 
+/// How a session reader opens files, and a test's view into its checks.
+#[derive(Clone, Copy)]
+pub(super) struct ReadHooks<'a> {
+    pub(super) open: OpenFile<'a>,
+    /// Runs with each spelled path after its policy check and before it is
+    /// resolved, so a test can swap what the spelling points at in between.
+    pub(super) after_check: Option<&'a dyn Fn(&Path)>,
+}
+
 /// Reads page files as one agent session's `read` tool may. Must run inside
-/// [`with_session_read_policy`].
+/// `call_policy::with_tool_call_policy` for that session's route.
 pub(super) struct SessionReader<'a> {
     pub(super) ctx: &'a AppContext,
     pub(super) session: &'a str,
     pub(super) request_id: &'a str,
     pub(super) deadline: Instant,
-    pub(super) open: OpenFile<'a>,
+    pub(super) hooks: ReadHooks<'a>,
 }
 
 impl SessionReader<'_> {
@@ -207,30 +176,37 @@ impl SessionReader<'_> {
         }
     }
 
-    fn allowed(&self, path: &Path) -> bool {
-        // The storage floor: never AFT's storage, SQLite files, or a file a
-        // live database connection in this process holds. Decided by name
-        // and stat alone, before anything is opened.
-        !crate::project_content::is_excluded(path)
-            && self
-                .ctx
-                .validate_read_path(self.request_id, self.session, path)
-                .is_ok()
+    fn policy_allows(&self, path: &Path) -> bool {
+        self.ctx
+            .validate_read_path(self.request_id, self.session, path)
+            .is_ok()
     }
+}
+
+/// The storage floor: AFT's storage, SQLite files, and any file a live
+/// database connection in this process holds are never opened. Decided by
+/// name and stat alone: opening and then closing a descriptor on a live
+/// SQLite file drops this process's SQLite locks on it.
+fn storage_floor(path: &Path) -> bool {
+    crate::project_content::is_excluded(path)
 }
 
 impl PageSource for SessionReader<'_> {
     fn read(&mut self, path: &Path, limit: u64) -> Result<Vec<u8>, ReadFailure> {
         use std::io::Read;
-        if crate::project_content::is_excluded(path) {
+        if storage_floor(path) {
             return Err(ReadFailure::Denied);
         }
         let checked = self
             .ctx
             .validate_read_path(self.request_id, self.session, path)
             .map_err(|_| self.denied_or_deadline())?;
-        // The policy judged the fully resolved location; open exactly that
-        // location, refusing any symlink swapped into it since.
+        if let Some(after_check) = self.hooks.after_check {
+            after_check(path);
+        }
+        // Resolve again, now: a symlink in the spelling may have been
+        // re-pointed since the check. The location about to be opened is the
+        // one judged below, and the open refuses any symlink swapped in after.
         let resolved = match crate::bounded_io::canonicalize(&checked) {
             Ok(resolved) => crate::inspect::job::normalize_path(&resolved),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -238,10 +214,14 @@ impl PageSource for SessionReader<'_> {
             }
             Err(_) => return Err(self.denied_or_deadline()),
         };
-        if resolved != crate::inspect::job::normalize_path(&checked) && !self.allowed(&resolved) {
+        // The spelled-path floor check above cannot see where a re-pointed
+        // symlink now leads; this one guards the open itself.
+        if storage_floor(&resolved) {
             return Err(ReadFailure::Denied);
         }
-        if crate::project_content::is_excluded(&resolved) {
+        if resolved != crate::inspect::job::normalize_path(&checked)
+            && !self.policy_allows(&resolved)
+        {
             return Err(ReadFailure::Denied);
         }
         // The walk starts at the filesystem root: the resolved path has no
@@ -252,7 +232,7 @@ impl PageSource for SessionReader<'_> {
             .last()
             .unwrap_or(&resolved)
             .to_path_buf();
-        let mut file = match (self.open)(&walk_root, &resolved) {
+        let mut file = match (self.hooks.open)(&walk_root, &resolved) {
             Ok(file) => file,
             Err(ReadExactRefusal::NotFound) => return Err(ReadFailure::Missing),
             Err(ReadExactRefusal::AccessDenied) => return Err(ReadFailure::Denied),
@@ -266,10 +246,7 @@ impl PageSource for SessionReader<'_> {
         let opened = file_read_exact::opened_location(&file)
             .map(|opened| crate::inspect::job::normalize_path(&opened))
             .map_err(|_| ReadFailure::Denied)?;
-        if opened != resolved && !self.allowed(&opened) {
-            return Err(ReadFailure::Denied);
-        }
-        if crate::project_content::is_excluded(&opened) {
+        if storage_floor(&opened) || (opened != resolved && !self.policy_allows(&opened)) {
             return Err(ReadFailure::Denied);
         }
         if !metadata.is_file() {
@@ -316,12 +293,16 @@ pub(super) struct CollectCall {
 
 /// Handle `page.collect` on a blocking thread.
 pub(super) fn collect(call: CollectCall) -> Response {
-    collect_with_open(call, &|root, target| {
-        file_read_exact::open_no_follow(root, target)
-    })
+    collect_with_hooks(
+        call,
+        ReadHooks {
+            open: &|root, target| file_read_exact::open_no_follow(root, target),
+            after_check: None,
+        },
+    )
 }
 
-pub(super) fn collect_with_open(call: CollectCall, open: OpenFile<'_>) -> Response {
+pub(super) fn collect_with_hooks(call: CollectCall, hooks: ReadHooks<'_>) -> Response {
     const OP: &str = page::COLLECT_OPERATION;
     let started = Instant::now();
     if !caller_is_core(call.principal.as_ref()) {
@@ -419,18 +400,46 @@ pub(super) fn collect_with_open(call: CollectCall, open: OpenFile<'_>) -> Respon
         "page-collect-{}",
         NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    let collected = with_session_read_policy(&ctx, &identity, &request_id, budget, || {
-        let mut reader = SessionReader {
-            ctx: &ctx,
-            session: &identity.session,
-            request_id: &request_id,
-            deadline,
-            open,
-        };
-        page::collect(&entry, &limits, started, &mut reader, &mut builder)
-    });
+    // The page is read exactly as the session's `read` tool reads: through
+    // the same per-call policy setup, as a `read` of the page's spelling.
+    let arguments = json!({ "path": params.entry });
+    let ask_route = access_grants::ask_route_for_call(&identity, "read", &arguments);
+    let _io = crate::bounded_io::enter(Some(budget));
+    let collected = call_policy::with_tool_call_policy(
+        &ctx,
+        &identity,
+        &request_id,
+        ask_route,
+        identity.trust,
+        "read",
+        arguments,
+        |_| {
+            let mut reader = SessionReader {
+                ctx: &ctx,
+                session: &identity.session,
+                request_id: &request_id,
+                deadline,
+                hooks,
+            };
+            page::collect(&entry, &limits, started, &mut reader, &mut builder)
+        },
+        |collected| collected,
+    );
     match collected {
-        Err(error) => refusal(OP, error),
+        // The confinement admission refused before any page file was
+        // read: its policy could not be read, or the page's spelling is
+        // outside the confined root.
+        Err(response) if response.data["code"] == "confine_policy_unavailable" => refusal(
+            OP,
+            subc_protocol::ErrorBody::new(
+                "confine_policy_unavailable",
+                response.data["message"].as_str().unwrap_or_default(),
+            ),
+        ),
+        Err(_) => refusal(
+            OP,
+            page::CollectRefusal::EntryUnreadable { reason: "denied" }.into_error(),
+        ),
         Ok(Err(error)) => refusal(OP, error.into_error()),
         Ok(Ok(collected)) => {
             let (snapshot, expires_at_ms) = builder.commit();

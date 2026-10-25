@@ -94,6 +94,14 @@ fn call(f: &Fixture, principal: Option<Principal>, params: Value) -> CollectCall
     }
 }
 
+/// Hooks whose open is `open` and that swap nothing.
+fn no_open<'a>(open: OpenFile<'a>) -> ReadHooks<'a> {
+    ReadHooks {
+        open,
+        after_check: None,
+    }
+}
+
 fn collect_params(entry: &str) -> Value {
     json!({"harness": HARNESS, "session": SESSION, "entry": entry})
 }
@@ -105,7 +113,13 @@ fn collect_recording(f: &Fixture) -> (Response, Vec<PathBuf>) {
         opened.lock().unwrap().push(target.to_path_buf());
         file_read_exact::open_no_follow(root, target)
     };
-    let response = collect_with_open(call(f, core(), collect_params("index.html")), &open);
+    let response = collect_with_hooks(
+        call(f, core(), collect_params("index.html")),
+        ReadHooks {
+            open: &open,
+            after_check: None,
+        },
+    );
     (response, opened.into_inner().unwrap())
 }
 
@@ -174,9 +188,10 @@ fn page_collect_entry_refusals_name_no_denied_contents() {
         ("absent.html", "entry_unreadable", "missing"),
         ("ok.png", "entry_not_html", "extension"),
     ] {
-        let response = collect_with_open(call(&f, core(), collect_params(entry)), &|_, _| {
-            panic!("{entry}: nothing may be opened")
-        });
+        let response = collect_with_hooks(
+            call(&f, core(), collect_params(entry)),
+            no_open(&|_, _| panic!("{entry}: nothing may be opened")),
+        );
         assert!(!response.success);
         assert_eq!(response.data["code"], code, "{entry}");
         assert_eq!(
@@ -202,9 +217,9 @@ fn page_collect_refuses_callers_other_than_core() {
             module_id: "aft".into(),
         }),
     ] {
-        let response = collect_with_open(
+        let response = collect_with_hooks(
             call(&f, principal.clone(), collect_params("index.html")),
-            &|_, _| panic!("a refused caller opened a file"),
+            no_open(&|_, _| panic!("a refused caller opened a file")),
         );
         assert_eq!(
             response.data["code"], "page_caller_refused",
@@ -226,13 +241,13 @@ fn page_collect_refuses_callers_other_than_core() {
 #[test]
 fn page_collect_unbound_session_is_refused() {
     let f = fixture(BindTrust::FirstParty);
-    let response = collect_with_open(
+    let response = collect_with_hooks(
         call(
             &f,
             core(),
             json!({"harness": HARNESS, "session": "other", "entry": "index.html"}),
         ),
-        &|_, _| panic!("opened a file for an unbound session"),
+        no_open(&|_, _| panic!("opened a file for an unbound session")),
     );
     assert_eq!(response.data["code"], SESSION_NOT_BOUND);
 }
@@ -395,4 +410,262 @@ fn page_collect_snapshot_round_trip_through_the_handlers() {
     );
     let again = release(json!({"snapshot": snapshot}), core().as_ref(), &store);
     assert_eq!(again.data, json!({"snapshot": snapshot, "released": false}));
+}
+
+/// A symlink the page names is re-pointed at a database after its policy
+/// check and before it is resolved. The resolved-path storage floor must
+/// refuse it before the open: opening and closing a descriptor on a live
+/// SQLite file drops this process's locks on it.
+#[cfg(unix)]
+#[test]
+fn page_collect_symlink_swapped_to_a_database_after_the_check_is_never_opened() {
+    use std::os::unix::fs::symlink;
+    let f = fixture(BindTrust::FirstParty);
+    let storage_db = f.ctx.storage_dir().join("aft.db");
+    for target in [f.root.join("cache.db"), storage_db] {
+        let link = f.root.join("swap.png");
+        let _ = std::fs::remove_file(&link);
+        symlink(f.root.join("ok.png"), &link).unwrap();
+        std::fs::write(f.root.join("swap.html"), r#"<img src="swap.png">"#).unwrap();
+        let swapped = Mutex::new(false);
+        let swap = |path: &Path| {
+            if path.ends_with("swap.png") {
+                std::fs::remove_file(path).unwrap();
+                symlink(&target, path).unwrap();
+                *swapped.lock().unwrap() = true;
+            }
+        };
+        let opened = Mutex::new(Vec::new());
+        let open = |root: &Path, path: &Path| {
+            opened.lock().unwrap().push(path.to_path_buf());
+            file_read_exact::open_no_follow(root, path)
+        };
+        let response = collect_with_hooks(
+            call(&f, core(), collect_params("swap.html")),
+            ReadHooks {
+                open: &open,
+                after_check: Some(&swap),
+            },
+        );
+        assert!(*swapped.lock().unwrap(), "the swap hook never ran");
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(
+            omitted(&response),
+            vec![("swap.png".to_string(), "denied".to_string())],
+            "{}",
+            target.display()
+        );
+        assert_eq!(
+            opened.into_inner().unwrap(),
+            vec![f.root.join("swap.html")],
+            "a database was opened through the swapped link {}",
+            target.display()
+        );
+    }
+}
+
+/// The real `read` tool handler, as production dispatch runs it.
+fn read_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
+    crate::commands::read::handle_read(&request, ctx)
+}
+
+/// The routes the parity test compares on: a first-party route whose
+/// questions go to a plugin prompt, an untrusted route, and a confined
+/// scoped worker of each trust.
+#[derive(Clone, Copy, Debug)]
+enum ParityRoute {
+    FirstPartyPlugin,
+    Untrusted,
+    ConfinedFirstParty,
+    ConfinedUntrusted,
+}
+
+struct ParityFixture {
+    _dirs: Vec<tempfile::TempDir>,
+    _temp: crate::access_policy::temp::RootsOverride,
+    ctx: Arc<AppContext>,
+    executor: Arc<Executor>,
+    identity: RouteIdentity,
+    paths: Vec<String>,
+}
+
+/// One project root and the paths its page names: an allowed file, a
+/// read_deny folder, symlinks inside and out of the root, a file outside
+/// the root that the policy would ask about, and a file in a directory the
+/// policy treats as system temp (exempt for a plugin host's own reads).
+fn parity_fixture(route: ParityRoute) -> ParityFixture {
+    let (root_dir, root_id) = test_root("page-parity-root");
+    let outside_dir = tempfile::tempdir().unwrap();
+    let scratch_dir = tempfile::tempdir().unwrap();
+    let root = root_id.as_path().to_path_buf();
+    let outside = outside_dir.path().canonicalize().unwrap();
+    let scratch = scratch_dir.path().canonicalize().unwrap();
+    // Only the scratch directory counts as temp, so the outside file is a
+    // real outside-the-root path, not a temp exemption.
+    let temp = crate::access_policy::temp::override_roots_for_test(vec![scratch.clone()]);
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(root.clone());
+    config.sandbox.read_deny = vec![root.join("secret")];
+    let ctx = Arc::new(AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        config,
+    ));
+    std::fs::write(root.join("ok.txt"), "ok").unwrap();
+    std::fs::create_dir(root.join("secret")).unwrap();
+    std::fs::write(root.join("secret/key.txt"), "key").unwrap();
+    std::fs::write(outside.join("outside.txt"), "outside").unwrap();
+    std::fs::write(scratch.join("scratch.txt"), "scratch").unwrap();
+    let relative = |dir: &Path, file: &str| {
+        format!("../{}/{file}", dir.file_name().unwrap().to_str().unwrap())
+    };
+    let mut paths = vec![
+        "ok.txt".to_string(),
+        "secret/key.txt".to_string(),
+        relative(&outside, "outside.txt"),
+        relative(&scratch, "scratch.txt"),
+    ];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(root.join("ok.txt"), root.join("in-link.txt")).unwrap();
+        std::os::unix::fs::symlink(outside.join("outside.txt"), root.join("out-link.txt")).unwrap();
+        paths.extend(["in-link.txt".to_string(), "out-link.txt".to_string()]);
+    }
+    let page = paths
+        .iter()
+        .map(|path| format!(r#"<img src="{path}">"#))
+        .collect::<String>();
+    std::fs::write(root.join("index.html"), format!("<!doctype html>{page}")).unwrap();
+
+    let (trust, harness, confined) = match route {
+        ParityRoute::FirstPartyPlugin => (BindTrust::FirstParty, "opencode", false),
+        ParityRoute::Untrusted => (BindTrust::Untrusted, HARNESS, false),
+        ParityRoute::ConfinedFirstParty => (BindTrust::FirstParty, HARNESS, true),
+        ParityRoute::ConfinedUntrusted => (BindTrust::Untrusted, HARNESS, true),
+    };
+    let mut identity = route_identity_with_harness(&root_id, SESSION, trust, harness);
+    if confined {
+        // A scoped worker whose saved policy is the root confinement fence.
+        Arc::get_mut(&mut identity.0).unwrap().scope = Some(
+            serde_json::from_value(json!({
+                "owner": {"kind": "direct"}, "ref": "parity-worker", "scope_epoch": 1,
+                "kind": "worker", "owner_authorized": true,
+            }))
+            .unwrap(),
+        );
+        ctx.remember_confined_policy_key(remote_policy::key(&identity, Some("worker")).unwrap());
+    }
+    let executor = Arc::new(Executor::new());
+    executor.register_actor(root_id, Arc::clone(&ctx));
+    ParityFixture {
+        _dirs: vec![root_dir, outside_dir, scratch_dir],
+        _temp: temp,
+        ctx,
+        executor,
+        identity,
+        paths,
+    }
+}
+
+/// Whether the `read` tool, run through the real tool-call job with the
+/// route's own ask route, reads `path`.
+async fn read_tool_allows(f: &ParityFixture, path: &str, request: usize) -> bool {
+    let request_id = format!("parity-read-{request}");
+    let arguments = json!({ "path": path });
+    let run = PlainToolRun {
+        bare_name: "read".into(),
+        arguments: arguments.clone(),
+        format_context: Default::default(),
+        tool_call_context: ToolCallContext {
+            project_root: f.identity.project_root.clone(),
+            session_id: Some(f.identity.session.clone()),
+            request_id: request_id.clone(),
+            diagnostics_on_edit: false,
+            preview: false,
+            edit_slot_survives: None,
+            report_registration_downgrade: false,
+            standard_edit_grammar: true,
+            disabled_tools: None,
+            worker_session: false,
+            host_tool_names: None,
+        },
+        dispatch: read_dispatch,
+        bind_trust: f.identity.trust,
+        identity: f.identity.clone(),
+        request_id,
+        ledger_key: None,
+        io_budget: crate::bounded_io::Budget::after(Duration::from_secs(30)),
+        approved_io_window: None,
+        reply_deadline: Instant::now() + Duration::from_secs(30),
+    };
+    let (done, completion) = oneshot::channel();
+    let job = run.job(
+        access_grants::ask_route_for_call(&f.identity, "read", &arguments),
+        PhaseTrace::new(Instant::now()),
+        done,
+    );
+    let response = job(&f.ctx);
+    completion.await.unwrap();
+    response.success
+}
+
+/// Whether `page.collect` of the fixture's page puts `path` in the bundle.
+fn page_collect_verdicts(f: &ParityFixture) -> HashMap<String, bool> {
+    let call = CollectCall {
+        params: json!({
+            "harness": f.identity.harness, "session": SESSION, "entry": "index.html",
+        }),
+        principal: core(),
+        routes: HashMap::from([(route_key(1, 1), f.identity.clone())]),
+        executor: Arc::clone(&f.executor),
+        store: Arc::new(SnapshotStore::open(&f.ctx.storage_dir())),
+    };
+    let response = collect(call);
+    assert!(response.success, "{:?}", response.data);
+    let mut verdicts = HashMap::new();
+    for file in response.data["files"].as_array().unwrap() {
+        verdicts.insert(file["path"].as_str().unwrap().to_string(), true);
+    }
+    for omitted in response.data["omitted"].as_array().unwrap() {
+        assert_eq!(omitted["reason"], "denied", "{omitted}");
+        verdicts.insert(omitted["path"].as_str().unwrap().to_string(), false);
+    }
+    verdicts
+}
+
+/// For every path of one fixture, on each route, `page.collect` includes
+/// exactly the files the session's `read` tool reads: both take their
+/// per-call policy from `call_policy::with_tool_call_policy`.
+#[tokio::test]
+async fn page_collect_reads_exactly_what_the_read_tool_reads() {
+    let mut request = 0;
+    for route in [
+        ParityRoute::FirstPartyPlugin,
+        ParityRoute::Untrusted,
+        ParityRoute::ConfinedFirstParty,
+        ParityRoute::ConfinedUntrusted,
+    ] {
+        let f = parity_fixture(route);
+        let mut read = Vec::new();
+        for path in &f.paths {
+            request += 1;
+            read.push((path.clone(), read_tool_allows(&f, path, request).await));
+        }
+        let collected = page_collect_verdicts(&f);
+        let collected = f
+            .paths
+            .iter()
+            .map(|path| (path.clone(), collected[path.as_str()]))
+            .collect::<Vec<_>>();
+        println!("{route:?}: {read:?}");
+        assert_eq!(read, collected, "{route:?}: read tool vs page.collect");
+        // The fixture separates allowed from denied on every route.
+        assert!(
+            read.iter().any(|(_, allowed)| *allowed),
+            "{route:?}: {read:?}"
+        );
+        assert!(
+            read.iter().any(|(_, allowed)| !*allowed),
+            "{route:?}: {read:?}"
+        );
+    }
 }
