@@ -792,6 +792,12 @@ mod tests {
             .prefix("aft %NO_SUCH%!&^' héllo ")
             .tempdir()
             .unwrap();
+        // TEMP may use an 8.3 alias while PowerShell reports a long spelling.
+        // Request a canonical fixture path; alias handling is checked separately
+        // by directory identity rather than by presentation strings.
+        let cwd = crate::windows_path::normalize_windows_path(
+            &std::fs::canonicalize(temp.path()).unwrap(),
+        );
         let layout = crate::bash_background::windows_waiter::test_task_layout(
             temp.path(),
             "wrapper-test",
@@ -813,7 +819,7 @@ mod tests {
             binary.as_os_str(),
             &args,
             paths,
-            temp.path(),
+            &cwd,
             &std::collections::HashMap::new(),
             false,
             false,
@@ -826,9 +832,9 @@ mod tests {
             .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
             .env("AFT_EXIT_TEST_VALUE", "héllo ! '")
-            .env("AFT_EXPECTED_CWD", temp.path())
+            .env("AFT_EXPECTED_CWD", &cwd)
             .env("ERRORLEVEL", "999")
-            .current_dir(temp.path())
+            .current_dir(&cwd)
             .output()
             .unwrap();
         assert_eq!(
@@ -972,6 +978,242 @@ mod tests {
                 expected == actual,
                 "{shell:?}: waiter changed environment keys {different_keys:?}"
             );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_waiter_preserves_long_environment_values() {
+        use sha2::{Digest, Sha256};
+        use std::collections::HashMap;
+        use std::ffi::OsString;
+        use std::os::windows::process::CommandExt;
+
+        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let path_prefix = std::env::join_paths([
+            system.join("System32"),
+            system.join("System32/WindowsPowerShell/v1.0"),
+        ])
+        .unwrap()
+        .into_string()
+        .unwrap();
+        let mut long_path = path_prefix + ";";
+        long_path.push_str(&"Z".repeat(9000 - long_path.len()));
+        let mut cases = vec![("MASON_LONG_ENV_VALUE", "normal".to_string())];
+        for length in [8191, 8192, 16000, 32000] {
+            cases.push(("MASON_LONG_ENV_VALUE", "a".repeat(length)));
+        }
+        cases.push(("MASON_LONG_ENV_VALUE", "λ".repeat(16000)));
+        cases.push(("PATH", long_path));
+
+        for shell in [WindowsShell::Pwsh, WindowsShell::Powershell] {
+            let binary =
+                which::which(shell.binary().as_ref()).expect("native PowerShell installed");
+            let temp = tempfile::tempdir().unwrap();
+            for (key, value) in &cases {
+                let command = format!("$v=[Environment]::GetEnvironmentVariable('{key}'); $h=[Security.Cryptography.SHA256]::Create(); Write-Output (([string]$v.Length) + ':' + [BitConverter]::ToString($h.ComputeHash([Text.Encoding]::UTF8.GetBytes($v))).Replace('-','').ToLowerInvariant()); exit 0");
+                let layout = crate::bash_background::windows_waiter::test_task_layout(
+                    temp.path(),
+                    "long-environment",
+                    &command,
+                );
+                let paths = &layout.paths;
+                let wrapper = paths.dir.join("wrapper.ps1");
+                crate::private_storage::write(&paths.exit, b"").unwrap();
+                shell
+                    .write_wrapper(&command, &paths.exit, &wrapper)
+                    .unwrap();
+                let mut args = vec![OsString::from("-ExecutionPolicy"), "Bypass".into()];
+                args.extend(
+                    shell
+                        .wrapper_file_args(&wrapper)
+                        .into_iter()
+                        .map(OsString::from),
+                );
+                let environment = HashMap::from([(key.to_string(), value.clone())]);
+                let waiter = crate::bash_background::windows_waiter::wrap(
+                    binary.as_os_str(),
+                    &args,
+                    paths,
+                    temp.path(),
+                    &environment,
+                    false,
+                    false,
+                )
+                .unwrap()
+                .expect("long values must be tested through the cmd waiter, not a direct fallback");
+                assert_eq!(
+                    Path::new(&waiter.program)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_ascii_lowercase(),
+                    "cmd.exe"
+                );
+                let mut direct = Command::new(&binary);
+                direct.args(&args);
+                let mut waited = Command::new(waiter.program);
+                waited
+                    .args(waiter.args)
+                    .env(waiter.environment.0, waiter.environment.1);
+                for process in [&mut direct, &mut waited] {
+                    process
+                        .envs(&environment)
+                        .current_dir(temp.path())
+                        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+                }
+                let direct = direct.output().unwrap();
+                let waited = waited.output().unwrap();
+                assert_eq!(direct.status.code(), Some(0), "{shell:?} direct {key}");
+                assert_eq!(waited.status.code(), Some(0), "{shell:?} cmd {key}");
+                assert!(
+                    waited.stderr == direct.stderr,
+                    "{shell:?}: cmd added an environment-probe diagnostic"
+                );
+                let expected = if *key == "PATH" {
+                    // PowerShell can add its installation directory to PATH.
+                    // The direct host is the baseline for that normalization.
+                    let observed = String::from_utf8_lossy(&direct.stdout).trim().to_owned();
+                    assert!(
+                        observed
+                            .split(':')
+                            .next()
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap()
+                            >= 9000
+                    );
+                    observed
+                } else {
+                    format!(
+                        "{}:{:x}",
+                        value.encode_utf16().count(),
+                        Sha256::digest(value.as_bytes())
+                    )
+                };
+                assert_eq!(
+                    String::from_utf8_lossy(&direct.stdout).trim(),
+                    expected,
+                    "{shell:?} direct {key}"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&waited.stdout).trim(),
+                    expected,
+                    "{shell:?} cmd {key}"
+                );
+                assert_eq!(std::fs::read_to_string(&paths.exit).unwrap().trim(), "0");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_waiter_preserves_directory_identity_for_short_paths() {
+        use std::collections::HashMap;
+        use std::ffi::OsString;
+        use std::os::windows::{
+            ffi::{OsStrExt, OsStringExt},
+            process::CommandExt,
+        };
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+        let temp = tempfile::Builder::new()
+            .prefix("aft directory spelling long name ")
+            .tempdir()
+            .unwrap();
+        let long = crate::windows_path::normalize_windows_path(
+            &std::fs::canonicalize(temp.path()).unwrap(),
+        );
+        let wide: Vec<u16> = long.as_os_str().encode_wide().chain(Some(0)).collect();
+        let required = unsafe { GetShortPathNameW(wide.as_ptr(), std::ptr::null_mut(), 0) };
+        assert_ne!(
+            required,
+            0,
+            "short-path query: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut buffer = vec![0u16; required as usize];
+        let length = unsafe { GetShortPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), required) };
+        assert!(length > 0 && length < required);
+        let short = PathBuf::from(OsString::from_wide(&buffer[..length as usize]));
+        let (directory, expected_identity) = crate::file_identity::metadata(&long).unwrap();
+        assert!(directory.is_dir());
+        assert!(matches!(
+            expected_identity,
+            crate::file_identity::FileIdentity::Known { .. }
+        ));
+        println!(
+            "CWD_ALIAS long={} short={} distinct={}",
+            long.display(),
+            short.display(),
+            long != short
+        );
+
+        for shell in [WindowsShell::Pwsh, WindowsShell::Powershell] {
+            let binary = which::which(shell.binary().as_ref()).unwrap();
+            for cwd in [&long, &short] {
+                let command = "Write-Output ('version:' + $PSVersionTable.PSVersion); Write-Output ('expected:' + $env:AFT_CWD_PROBE); Write-Output ('native:' + [Environment]::CurrentDirectory); Write-Output ('powershell:' + (Get-Location).Path); Write-Output ('literal:' + (((Get-Location).Path -eq $env:AFT_CWD_PROBE) -and ([Environment]::CurrentDirectory -eq $env:AFT_CWD_PROBE))); exit 0";
+                let layout = crate::bash_background::windows_waiter::test_task_layout(
+                    temp.path(),
+                    "cwd-alias",
+                    command,
+                );
+                let paths = &layout.paths;
+                let wrapper = paths.dir.join("wrapper.ps1");
+                crate::private_storage::write(&paths.exit, b"").unwrap();
+                shell.write_wrapper(command, &paths.exit, &wrapper).unwrap();
+                let mut args = vec![OsString::from("-ExecutionPolicy"), "Bypass".into()];
+                args.extend(
+                    shell
+                        .wrapper_file_args(&wrapper)
+                        .into_iter()
+                        .map(OsString::from),
+                );
+                let waiter = crate::bash_background::windows_waiter::wrap(
+                    binary.as_os_str(),
+                    &args,
+                    paths,
+                    cwd,
+                    &HashMap::new(),
+                    false,
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+                let mut direct = Command::new(&binary);
+                direct.args(&args);
+                let mut waited = Command::new(waiter.program);
+                waited
+                    .args(waiter.args)
+                    .env(waiter.environment.0, waiter.environment.1);
+                for (route, process) in [("direct", &mut direct), ("cmd", &mut waited)] {
+                    let output = process
+                        .current_dir(cwd)
+                        .env("AFT_CWD_PROBE", cwd)
+                        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+                        .output()
+                        .unwrap();
+                    assert_eq!(output.status.code(), Some(0), "{shell:?} {route}");
+                    let text = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+                    println!(
+                        "CWD_PROBE shell={shell:?} route={route} requested={} output={text:?}",
+                        cwd.display()
+                    );
+                    for prefix in ["native:", "powershell:"] {
+                        let actual = text
+                            .lines()
+                            .find_map(|line| line.strip_prefix(prefix))
+                            .unwrap();
+                        let (metadata, identity) =
+                            crate::file_identity::metadata(Path::new(actual)).unwrap();
+                        assert!(metadata.is_dir());
+                        assert_eq!(
+                            identity, expected_identity,
+                            "{shell:?} {route} {prefix} named another directory"
+                        );
+                    }
+                }
+            }
         }
     }
 
