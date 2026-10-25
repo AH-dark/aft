@@ -587,6 +587,92 @@ fn synapse_request_timeout_does_not_reset_another_roots_inflight_request() {
     daemon.finish();
 }
 
+/// Sets the per-attempt transport deadline for this thread until dropped.
+struct AttemptTimeout;
+
+impl AttemptTimeout {
+    fn set(timeout: Duration) -> Self {
+        ATTEMPT_TIMEOUT_FOR_TEST.with(|slot| slot.set(Some(timeout)));
+        Self
+    }
+}
+
+impl Drop for AttemptTimeout {
+    fn drop(&mut self) {
+        ATTEMPT_TIMEOUT_FOR_TEST.with(|slot| slot.set(None));
+    }
+}
+
+#[test]
+fn synapse_attempt_deadlines_inside_one_call_count_one_timeout() {
+    let daemon = Daemon::start(1, false);
+    let mut client = SynapseEmbeddingClient::from_config(&daemon.config(0)).unwrap();
+    let attempts = AttemptTimeout::set(Duration::from_millis(50));
+    // Every attempt reaches the transport's own deadline, well inside the
+    // call's budget, so the call retries until its attempts run out.
+    let result = client.embed_query("timeout", Duration::from_secs(10));
+    drop(attempts);
+    assert!(
+        matches!(result, Err(SynapseEmbeddingError::Timeout(_))),
+        "{result:?}"
+    );
+    assert_eq!(
+        daemon.counts.0.lock().unwrap().queries,
+        MAX_CALL_ATTEMPTS,
+        "every attempt of the call must have timed out on the wire"
+    );
+    assert_eq!(client.state.consecutive_timeouts, 1);
+    assert!(client.state.circuit_open_until.is_none());
+    assert_eq!(
+        client
+            .embed_query("healthy", Duration::from_secs(5))
+            .unwrap(),
+        vec![1.0, 0.0],
+        "one slow call must not refuse the next one"
+    );
+    drop(client);
+    daemon.wait_closed();
+    daemon.finish();
+}
+
+#[test]
+fn synapse_threshold_many_slow_calls_still_open_the_circuit() {
+    let daemon = Daemon::start(1, false);
+    let mut client = SynapseEmbeddingClient::from_config(&daemon.config(0)).unwrap();
+    let attempts = AttemptTimeout::set(Duration::from_millis(50));
+    for call in 0..CIRCUIT_TIMEOUT_THRESHOLD {
+        let result = client.embed_query("timeout", Duration::from_secs(10));
+        if call + 1 < CIRCUIT_TIMEOUT_THRESHOLD {
+            assert!(
+                matches!(result, Err(SynapseEmbeddingError::Timeout(_))),
+                "call {call}: {result:?}"
+            );
+            assert!(client.state.circuit_open_until.is_none());
+        } else {
+            assert!(
+                matches!(result, Err(SynapseEmbeddingError::CircuitOpen)),
+                "call {call}: {result:?}"
+            );
+        }
+        assert_eq!(client.state.consecutive_timeouts, call + 1);
+    }
+    drop(attempts);
+    assert!(client.state.circuit_open_until.is_some());
+    let queries = daemon.counts.0.lock().unwrap().queries;
+    assert!(matches!(
+        client.embed_query("healthy", Duration::from_secs(5)),
+        Err(SynapseEmbeddingError::CircuitOpen)
+    ));
+    assert_eq!(
+        daemon.counts.0.lock().unwrap().queries,
+        queries,
+        "an open circuit refuses the call before it reaches the wire"
+    );
+    drop(client);
+    daemon.wait_closed();
+    daemon.finish();
+}
+
 #[test]
 fn synapse_module_and_application_errors_leave_shared_connection_up() {
     let daemon = Daemon::start(1, false);

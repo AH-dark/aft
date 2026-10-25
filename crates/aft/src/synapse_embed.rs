@@ -1163,6 +1163,27 @@ impl SynapseEmbeddingClient {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only transport deadline for each request attempt on this thread,
+    /// so a test can make every attempt of one call time out well inside the
+    /// call's own budget without waiting for the SDK's default deadline.
+    pub(crate) static ATTEMPT_TIMEOUT_FOR_TEST: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Options for one request attempt. Production uses the SDK defaults.
+fn attempt_call_options() -> CallOptions {
+    #[cfg(test)]
+    if let Some(timeout) = ATTEMPT_TIMEOUT_FOR_TEST.with(std::cell::Cell::get) {
+        return CallOptions {
+            timeout,
+            ..CallOptions::default()
+        };
+    }
+    CallOptions::default()
+}
+
 fn typed_timeout_cause(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut cause = Some(error);
     while let Some(error) = cause {
@@ -1248,15 +1269,20 @@ impl SynapseState {
     ) -> Result<Vec<u8>, SynapseEmbeddingError> {
         // Routing, request retries and backoff share the caller's one budget.
         // A per-attempt timeout alone would restart it after each failure.
-        let timeouts_before = self.consecutive_timeouts;
-        match tokio::time::timeout(timeout, self.call_with_retries(operation, params)).await {
+        let mut timeout_counted = false;
+        let outcome = tokio::time::timeout(
+            timeout,
+            self.call_with_retries(operation, params, &mut timeout_counted),
+        )
+        .await;
+        match outcome {
             Ok(result) => result,
             Err(_) => {
                 // One logical call counts at most one timeout toward the
                 // circuit, even when an attempt inside it already saw the
                 // transport's own deadline. The shared route is not reset:
                 // other callers may still be multiplexed on it.
-                if self.consecutive_timeouts == timeouts_before {
+                if !timeout_counted {
                     self.note_timeout();
                 }
                 if self.circuit_open_until.is_some() {
@@ -1268,10 +1294,15 @@ impl SynapseState {
         }
     }
 
+    /// Runs the attempts of one logical call. `timeout_counted` records
+    /// whether this call has already counted its one timeout toward the
+    /// circuit breaker, so later attempts and the caller's own deadline do
+    /// not count it again.
     async fn call_with_retries(
         &mut self,
         operation: &str,
         params: Value,
+        timeout_counted: &mut bool,
     ) -> Result<Vec<u8>, SynapseEmbeddingError> {
         if self
             .circuit_open_until
@@ -1292,7 +1323,7 @@ impl SynapseState {
                     let request = connection.consumer.request(
                         &connection.route,
                         body.clone(),
-                        CallOptions::default(),
+                        attempt_call_options(),
                     );
                     match request.await {
                         Ok(response) => {
@@ -1331,7 +1362,13 @@ impl SynapseState {
                             }
                             if connection_is_gone(&error) {
                                 self.connection.reset(&connection).await;
-                            } else if error.outcome_cause() == Some(OutcomeUnknownCause::Deadline) {
+                            } else if error.outcome_cause() == Some(OutcomeUnknownCause::Deadline)
+                                && !*timeout_counted
+                            {
+                                // Only this call's first attempt deadline
+                                // counts. Its later attempts are the same slow
+                                // call, so they must not open the circuit.
+                                *timeout_counted = true;
                                 self.note_timeout();
                                 if self.circuit_open_until.is_some() {
                                     return Err(SynapseEmbeddingError::CircuitOpen);
@@ -1912,7 +1949,7 @@ mod tests {
             circuit_open_until: None,
         };
         let error = state
-            .call_with_retries("embed.query", json!({}))
+            .call_with_retries("embed.query", json!({}), &mut false)
             .await
             .unwrap_err();
         assert!(
