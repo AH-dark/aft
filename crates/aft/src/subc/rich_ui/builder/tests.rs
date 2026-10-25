@@ -76,6 +76,26 @@ fn manifest() -> Manifest {
 #[test]
 fn golden_manifest_and_digest_are_platform_independent() {
     let built = manifest();
+    for (profile, bytes) in [
+        (
+            "tool_row",
+            &include_bytes!("../../../../tests/fixtures/rich_ui/placeholder-row.json")[..],
+        ),
+        (
+            "tool_page",
+            &include_bytes!("../../../../tests/fixtures/rich_ui/placeholder-page.json")[..],
+        ),
+    ] {
+        assert_eq!(
+            built
+                .templates
+                .iter()
+                .find(|t| t.value["profile"] == profile)
+                .unwrap()
+                .bytes,
+            bytes
+        );
+    }
     if std::env::var_os("AFT_RICH_UI_PRINT_FREEZE").is_some() {
         println!(
             "FREEZE_MANIFEST={}",
@@ -570,6 +590,7 @@ fn transport_contract_pins_chunk_carrier_frame_key_and_stamp_binding() {
 fn terminal_view_record_schema_vectors_and_provenance_are_frozen() {
     use crate::bash_background::BgTaskStatus;
     let record = fixture("view-record.json");
+    assert_eq!(record["schema"], operations::view_record_schema());
     schema::check_schema(&record["schema"]).unwrap();
     assert_eq!(
         record["identity"],
@@ -609,6 +630,21 @@ fn terminal_view_record_schema_vectors_and_provenance_are_frozen() {
     );
     for vector in record["vectors"].as_array().unwrap() {
         schema::validate(&record["schema"], vector).unwrap();
+        operations::validate_view_record(vector, true).unwrap();
+        assert_eq!(
+            vector["templates"],
+            json!({"row":manifest().value["views"][0]["row"]["template"], "page":manifest().value["views"][0]["page"]["template"]})
+        );
+        assert_eq!(vector["phase"], "finished");
+        for key in ["task_id", "schema_pin", "endReason"] {
+            assert!(!vector[key].is_null());
+            let mut invalid = vector.clone();
+            invalid[key] = Value::Null;
+            assert_eq!(
+                operations::validate_view_record(&invalid, true),
+                Err("result_schema_mismatch")
+            );
+        }
         for (field, wrong) in [
             ("phase", json!("running")),
             ("durationMs", json!(-1)),
@@ -620,10 +656,33 @@ fn terminal_view_record_schema_vectors_and_provenance_are_frozen() {
             let mut invalid = vector.clone();
             invalid[field] = wrong;
             assert!(
-                schema::validate(&record["schema"], &invalid).is_err(),
+                operations::validate_view_record(&invalid, true).is_err(),
                 "{field}"
             );
         }
+    }
+    let running = &record["hostRunningVector"];
+    schema::validate(&record["schema"], running).unwrap();
+    operations::validate_view_record(running, false).unwrap();
+    assert_eq!(
+        operations::validate_view_record(running, true),
+        Err("result_schema_mismatch")
+    );
+    for key in [
+        "task_id",
+        "schema_pin",
+        "endReason",
+        "exitCode",
+        "durationMs",
+        "outputBytes",
+    ] {
+        assert!(running[key].is_null());
+        let mut invalid = running.clone();
+        invalid[key] = record["vectors"][0][key].clone();
+        assert_eq!(
+            operations::validate_view_record(&invalid, false),
+            Err("result_schema_mismatch")
+        );
     }
 }
 
@@ -744,5 +803,72 @@ fn shell_projection_keeps_wide_windows_remote_exit_codes() {
         let result = operations::project_reply(op, &source);
         assert_eq!(result["exitCode"], 4294967295_i64);
         schema::validate(&op["result"], &result).unwrap();
+    }
+}
+
+#[test]
+fn view_template_digests_are_exact_lowercase_file_sha256_values() {
+    let record = fixture("view-record.json");
+    let valid = record["vectors"][0]["templates"]["row"].as_str().unwrap();
+    assert_eq!(valid.len(), 71);
+    assert!(operations::valid_template_digest(valid));
+    let bad = [
+        String::new(),
+        format!("sha256:{}", "a".repeat(63)),
+        format!("sha256:{}", "a".repeat(65)),
+        format!("sha256:{}", "A".repeat(64)),
+        format!("sha256:{}", "g".repeat(64)),
+        format!("SHA256:{}", "a".repeat(64)),
+        format!("sha256:{}é", "a".repeat(62)),
+    ];
+    for digest in bad {
+        assert!(!operations::valid_template_digest(&digest), "{digest}");
+        for key in ["row", "page"] {
+            let mut value = record["vectors"][0].clone();
+            value["templates"][key] = json!(digest);
+            assert_eq!(
+                operations::validate_view_record(&value, true),
+                Err("result_schema_mismatch")
+            );
+        }
+    }
+}
+
+#[test]
+fn output_cursor_contract_increments_on_no_progress_and_requires_task_binding() {
+    let contract = fixture("bash-output.json");
+    assert_eq!(contract["cursorContract"]["opaque"], true);
+    assert_eq!(
+        contract["cursorContract"]["refusalCode"],
+        "malformed_cursor"
+    );
+    assert_eq!(
+        contract["cursorContract"]["fixedMessage"],
+        operations::fixed_message("malformed_cursor")
+    );
+    for vector in contract["cursorVectors"].as_array().unwrap() {
+        if vector.get("refusal").is_some() {
+            assert_eq!(vector["refusal"], "malformed_cursor");
+            continue;
+        }
+        let request = &vector["request"];
+        let response = &vector["response"];
+        if vector["name"] == "terminal-drained" {
+            assert!(response["next"].is_null());
+            continue;
+        }
+        assert_ne!(request["cursor"], response["next"]);
+        assert_eq!(
+            response["readSequence"].as_u64().unwrap(),
+            request["readSequence"].as_u64().unwrap() + 1
+        );
+        if vector["name"] == "no-progress" {
+            assert_eq!(request["positions"], response["positions"]);
+        } else {
+            assert!(
+                response["positions"]["stdout"].as_u64().unwrap()
+                    > request["positions"]["stdout"].as_u64().unwrap()
+            );
+        }
     }
 }
