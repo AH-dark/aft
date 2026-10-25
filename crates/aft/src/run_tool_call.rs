@@ -1327,12 +1327,11 @@ mod tests {
     /// The slow-call line names what an edit was asked to do (target kind,
     /// match and replacement sizes, outcome) and how long each pipeline step
     /// took, and never carries the edit text or the file's path.
-    /// One edit call asks whether its target is a glob at most once, through
-    /// the probe `run_tool_call` installs (not a test-local substitute), and
-    /// that probe is a spelling check for a path without glob characters: the
-    /// filesystem validation belongs to the handler, which runs it once for
-    /// the real request. A prepare that started validating every target would
-    /// add canonicalisation of every ancestor to each edit.
+    /// A plain edit target is a file from its spelling, so a prepare never
+    /// spends a filesystem validation (canonicalising every ancestor, asking
+    /// the storage floor) on it; that validation belongs to the handler. The
+    /// call runs through `run_tool_call`, so this sees the probe the translator
+    /// is really handed, and a plain target records none.
     #[test]
     fn plain_edit_target_never_reaches_path_validation_during_prepare() {
         let temp = tempfile::tempdir().unwrap();
@@ -1342,15 +1341,15 @@ mod tests {
             !crate::commands::edit_match::is_glob_pattern(&file.display().to_string()),
             "test path {file:?} has glob characters"
         );
-        let original: String = (0..40)
-            .map(|index| format!("const value_{index} = 1;\n"))
-            .collect();
-        std::fs::write(&file, &original).unwrap();
-        let hunks: Vec<Value> = (0..10)
+        // Line-range items make this a multi-item batch, the one edit shape
+        // that consults the probe; their content defines the new file, so the
+        // prepare succeeds without the handler being able to find old text.
+        let items: Vec<Value> = (0..10)
             .map(|index| {
                 json!({
-                    "oldString": format!("const value_{index} = 1;"),
-                    "newString": format!("const value_{index} = 2;"),
+                    "startLine": index * 3 + 1,
+                    "endLine": index * 3 + 1,
+                    "content": format!("const value_{index} = 2;\n"),
                 })
             })
             .collect();
@@ -1365,36 +1364,13 @@ mod tests {
                 },
             ),
             &root,
-            // A multi-item batch is the shape that consults the probe at all:
-            // the single find/replace spelling is routed before it.
-            json!({ "path": file, "edits": hunks }),
-        );
-        let _ = take_edit_target_probes_for_test();
-
-        // A target spelled with glob characters reaches the probe: a
-        // multi-item batch first asks whether `[id]` is a directory-name
-        // character in a real file or a pattern over many.
-        let bracket_path = root.join("app").join("[id]").join("page.ts");
-        std::fs::create_dir_all(bracket_path.parent().unwrap()).unwrap();
-        std::fs::write(&bracket_path, &original).unwrap();
-        let two_items: Vec<Value> = hunks.iter().take(2).cloned().collect();
-        let _ = slow_edit_line(
-            &AppContext::new(
-                Box::new(crate::parser::TreeSitterProvider::new()),
-                crate::config::Config {
-                    project_root: Some(root.clone()),
-                    ..Default::default()
-                },
-            ),
-            &root,
-            json!({ "path": bracket_path, "edits": two_items }),
+            json!({ "path": file, "edits": items }),
         );
 
-        let probes = take_edit_target_probes_for_test();
         assert_eq!(
-            probes,
-            vec![bracket_path.display().to_string()],
-            "a glob-spelled multi-item batch asks once whether its target is one file"
+            take_edit_target_probes_for_test(),
+            Vec::<String>::new(),
+            "a target without glob characters must not reach path validation"
         );
     }
 
