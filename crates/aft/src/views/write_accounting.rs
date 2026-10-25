@@ -56,6 +56,15 @@ impl Drop for Scope {
     }
 }
 impl Publication {
+    pub(crate) fn current_or_default() -> Self {
+        ACTIVE.with(|active| {
+            active
+                .borrow()
+                .as_ref()
+                .map(|active| active.publication.clone())
+                .unwrap_or_default()
+        })
+    }
     pub(crate) fn enter(&self) -> Scope {
         Scope(ACTIVE.with(|active| {
             active.replace(Some(Active {
@@ -65,7 +74,24 @@ impl Publication {
         }))
     }
     pub(crate) fn snapshot(&self) -> Snapshot {
-        *self.0.lock().unwrap_or_else(|p| p.into_inner())
+        let mut snapshot = *self.0.lock().unwrap_or_else(|p| p.into_inner());
+        ACTIVE.with(|active| {
+            if let Some(active) = active
+                .borrow()
+                .as_ref()
+                .filter(|active| Arc::ptr_eq(&active.publication.0, &self.0))
+            {
+                for (total, writes) in snapshot.0.iter_mut().zip(active.writes.0) {
+                    total.main_bytes += writes.main_bytes;
+                    total.wal_bytes += writes.wal_bytes;
+                    total.journal_bytes += writes.journal_bytes;
+                    total.write_calls += writes.write_calls;
+                    total.checkpoints += writes.checkpoints;
+                    total.backfilled_pages += writes.backfilled_pages;
+                }
+            }
+        });
+        snapshot
     }
     pub(crate) fn fields(&self) -> String {
         let mut fields = String::from("store_io_scope=publication_thread_logical store_io_source=sqlite_vfs_and_manifest_writer");
@@ -302,6 +328,25 @@ unsafe extern "C" fn close(file: *mut ffi::sqlite3_file) -> c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assembly_inherits_semantic_handoff_accounting() {
+        let publication = Publication::default();
+        let scope = publication.enter();
+        manifest_bytes(12);
+        let inherited = Publication::current_or_default();
+        {
+            let _assembly = inherited.enter();
+            manifest_bytes(3);
+        }
+        assert_eq!(inherited.snapshot().0[3].main_bytes, 15);
+        drop(scope);
+        assert_eq!(publication.snapshot().0[3].main_bytes, 15);
+        assert_eq!(
+            Publication::current_or_default().snapshot(),
+            Snapshot::default()
+        );
+    }
 
     #[test]
     fn checkpoint_pages_and_publication_scopes_are_local() {

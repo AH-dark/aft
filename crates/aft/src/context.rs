@@ -9808,6 +9808,10 @@ impl AppContext {
         allow_semantic_blob_put: bool,
         phase: &mut impl FnMut(&str) -> crate::views::Result<()>,
     ) -> Result<PreparedViewUpdate, String> {
+        // store_live_semantic_blobs copies semantic-index payloads into databases
+        // shared by this repository's worktrees before checkout assembly starts.
+        let store_writes = crate::views::write_accounting::Publication::default();
+        let _store_writes = store_writes.enter();
         #[cfg(test)]
         {
             let mut starts = self.view_publication_attempt_starts.lock();

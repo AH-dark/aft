@@ -1717,7 +1717,7 @@ impl PublicationProfile {
         Self {
             root: root.to_owned(),
             scheduling: String::new(),
-            store_writes: super::write_accounting::Publication::default(),
+            store_writes: super::write_accounting::Publication::current_or_default(),
             io: super::io::PublicationIo::new(root),
             overlap: super::io::Overlap::new(true),
             concurrent_publications: 0,
