@@ -165,8 +165,120 @@ fn is_final_cargo_summary(line: &str) -> bool {
         || trimmed.starts_with("test result:")
 }
 
+/// Cargo status verbs. Cargo right-aligns them in a 12-column field, so a real
+/// status line is indented; an unindented "Running checks" from a script is not
+/// one.
+const CARGO_STATUS_VERBS: &[&str] = &[
+    "Adding",
+    "Blocking",
+    "Building",
+    "Checking",
+    "Compiling",
+    "Doc-tests",
+    "Documenting",
+    "Downloaded",
+    "Downloading",
+    "Executable",
+    "Finished",
+    "Fresh",
+    "Locking",
+    "Running",
+    "Updating",
+];
+
+fn is_cargo_status_line(line: &str) -> bool {
+    if is_ignored_progress(line) {
+        return true;
+    }
+    let trimmed = line.trim_start();
+    line.starts_with(' ')
+        && CARGO_STATUS_VERBS.iter().any(|verb| {
+            trimmed
+                .strip_prefix(verb)
+                .is_some_and(|rest| rest.starts_with(' '))
+        })
+}
+
+/// libtest's per-test progress (`test name ... ok`, `... ignored`,
+/// `... FAILED`) and its slow-test notice. The `test result:` line and the
+/// failure list already account for every one of them.
+fn is_test_progress_line(trimmed: &str) -> bool {
+    trimmed.strip_prefix("test ").is_some_and(|rest| {
+        rest.contains(" ... ") || rest.ends_with(" has been running for over 60 seconds")
+    }) || is_nextest_progress_line(trimmed)
+}
+
+/// cargo nextest's per-test progress for tests that did not fail, which its
+/// `Summary [` line accounts for: `PASS [   0.004s] name`, `SLOW [> 60.000s]
+/// name`, `SKIP [ ] name` and `Starting N tests across M binaries`. `FAIL [`
+/// and `TIMEOUT [` lines are not progress: they name the failures and are kept.
+fn is_nextest_progress_line(trimmed: &str) -> bool {
+    let bracketed = |status: &str| {
+        trimmed
+            .strip_prefix(status)
+            .and_then(|rest| rest.trim_start().strip_prefix('['))
+            .and_then(|rest| rest.split_once(']'))
+            .map(|(inside, _)| inside.trim().trim_start_matches("> "))
+    };
+    let timed = |inside: &str| {
+        inside
+            .strip_suffix('s')
+            .is_some_and(|seconds| seconds.parse::<f64>().is_ok())
+    };
+    bracketed("PASS").is_some_and(timed)
+        || bracketed("SLOW").is_some_and(timed)
+        || bracketed("SKIP").is_some()
+        || trimmed
+            .strip_prefix("Starting ")
+            .is_some_and(|rest| rest.contains(" tests across "))
+}
+
+/// A line that continues the rustc diagnostic above it: the `-->` location,
+/// the source gutter (`   |`, `12 |`), `= note:` lines and elided-source dots.
+fn is_diagnostic_continuation(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    line.starts_with(char::is_whitespace)
+        || trimmed.starts_with("= ")
+        || trimmed.starts_with("...")
+        || trimmed.starts_with("help:")
+        || trimmed.starts_with("note:")
+        || trimmed.split_once('|').is_some_and(|(gutter, _)| {
+            let gutter = gutter.trim();
+            !gutter.is_empty() && gutter.chars().all(|char| char.is_ascii_digit())
+        })
+}
+
+/// Mark the lines of a `cargo test` run that its summary may leave out because
+/// the summary already accounts for them: blank lines, per-test progress,
+/// cargo's status lines and compiler warning blocks. Every other line is
+/// somebody's report (a test's printed output, another check's verdict in a
+/// gate script) and must be kept verbatim and in order.
+fn test_noise_mask(lines: &[&str]) -> Vec<bool> {
+    let mut in_warning = false;
+    lines
+        .iter()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                in_warning = false;
+                return true;
+            }
+            if trimmed.starts_with("warning:") {
+                in_warning = true;
+                return true;
+            }
+            if in_warning && is_diagnostic_continuation(line) {
+                return true;
+            }
+            in_warning = false;
+            is_test_progress_line(trimmed) || is_cargo_status_line(line)
+        })
+        .collect()
+}
+
 fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
     let lines: Vec<&str> = output.lines().collect();
+    let noise = test_noise_mask(&lines);
     let has_failures = lines.iter().any(|line| line.trim() == "failures:");
     let total = cargo_test_total_line(&lines);
     if !has_failures {
@@ -182,13 +294,15 @@ fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
 
         let result: Vec<String> = lines
             .iter()
-            .filter(|line| {
+            .zip(&noise)
+            .filter(|(line, noise)| {
                 let trimmed = line.trim_start();
                 trimmed.starts_with("running ")
                     || trimmed.starts_with("test result:")
                     || is_final_cargo_summary(trimmed)
+                    || !**noise
             })
-            .map(|line| (*line).to_string())
+            .map(|(line, _)| (*line).to_string())
             .collect();
         return append_cargo_test_total(
             CompressionResult::new(ensure_final_lines(
@@ -254,6 +368,9 @@ fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
             continue;
         }
 
+        if !noise[index] {
+            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
+        }
         index += 1;
     }
 
@@ -572,6 +689,88 @@ error: could not compile `demo` (lib test) due to 1 previous error
             .text
             .contains("error: test failed, to rerun pass `--lib`"));
         assert!(result.text.ends_with("wrapper finished"));
+    }
+
+    /// A gate script's output, verbatim: two verdicts from other tools, then
+    /// four cargo test binaries.
+    const GATE_SCRIPT_OUTPUT: &str = "fmt-ok\nwin-check rc=0\ntest result: ok. 803 passed; 0 failed; 19 ignored; 0 measured; 8977 filtered out; finished in 23.38s\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2592 filtered out; finished in 0.12s\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2592 filtered out; finished in 0.16s\ntest result: ok. 114 passed; 0 failed; 3 ignored; 0 measured; 2476 filtered out; finished in 11.74s\n";
+
+    #[test]
+    fn cargo_test_summary_keeps_gate_script_verdicts_it_does_not_read() {
+        let result = compress_test(GATE_SCRIPT_OUTPUT, Some(0));
+
+        assert_eq!(
+            result.text,
+            format!(
+                "{}\ncargo test total: 919 passed, 0 failed, 22 ignored across 4 binaries",
+                GATE_SCRIPT_OUTPUT.trim_end()
+            )
+        );
+    }
+
+    #[test]
+    fn cargo_test_summary_keeps_a_failed_verdict_it_does_not_read() {
+        let output = GATE_SCRIPT_OUTPUT.replace("win-check rc=0", "win-check rc=101");
+
+        let result = compress_test(&output, Some(0));
+
+        assert!(
+            result
+                .text
+                .starts_with("fmt-ok\nwin-check rc=101\ntest result: ok. 803 passed"),
+            "{}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn cargo_test_summary_drops_progress_but_keeps_printed_lines_in_order() {
+        let output = "   Compiling demo v0.1.0 (/tmp/demo)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.50s\n     Running unittests src/lib.rs (target/debug/deps/demo-0123)\n\nrunning 2 tests\ntest a ... ok\nfmt-ok\ntest b ... ok\nwin-check rc=101\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+
+        let result = compress_test(output, Some(0));
+
+        assert_eq!(
+            result.text,
+            "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.50s\nrunning 2 tests\nfmt-ok\nwin-check rc=101\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+        );
+    }
+
+    #[test]
+    fn cargo_test_summary_drops_nextest_progress_but_keeps_its_failures() {
+        let output = "running 1 test\ntest a ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n    Starting 3 tests across 1 binary\n        PASS [   0.004s] demo tests::a\n        SKIP [         ] demo tests::c\n        FAIL [   0.010s] demo tests::b\nPASS [lint] rc=0\n     Summary [   0.020s] 3 tests run: 1 passed, 1 failed, 1 skipped\n";
+
+        let result = compress_test(output, Some(0));
+
+        assert_eq!(
+            result.text,
+            "running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n        FAIL [   0.010s] demo tests::b\nPASS [lint] rc=0\n     Summary [   0.020s] 3 tests run: 1 passed, 1 failed, 1 skipped"
+        );
+    }
+
+    #[test]
+    fn cargo_test_failure_summary_keeps_lines_it_does_not_read() {
+        let output = "fmt-ok\nwin-check rc=101\nrunning 2 tests\ntest a ... ok\ntest case ... FAILED\n\nfailures:\n\n---- case stdout ----\nthread 'case' panicked at src/lib.rs:1:1\n\nfailures:\n    case\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\nlint-check rc=0\n";
+
+        let result = compress_test(output, Some(101));
+
+        assert!(
+            result
+                .text
+                .starts_with("fmt-ok\nwin-check rc=101\nrunning 2 tests\n"),
+            "{}",
+            result.text
+        );
+        assert!(
+            result.text.contains("---- case stdout ----"),
+            "{}",
+            result.text
+        );
+        assert!(
+            result.text.ends_with("\nlint-check rc=0"),
+            "{}",
+            result.text
+        );
+        assert!(!result.text.contains("test a ... ok"), "{}", result.text);
     }
 
     #[test]
