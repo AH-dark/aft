@@ -1830,7 +1830,25 @@ fn generation_sweep_waits_for_the_last_query_handle() {
     // The initial publication also owns a deferred checkpoint connection. Settle
     // it before replacing the view, so the old query handle is the only keeper
     // of the obsolete database whose lifetime this test asserts.
-    crate::views::wait_for_derived_checkpoint_for_test(fixture.view.view_dir());
+    crate::views::wait_for_generation_maintenance_for_test(fixture.view.view_dir());
+    // The replacing publication schedules its own generation cleanup, which
+    // would reclaim the old generation as soon as the reader drops, racing the
+    // explicit sweeps below. Park that worker at the start of each lap until
+    // they have run, so these sweeps alone decide what is removed.
+    let (release_cleanup, parked) = std::sync::mpsc::channel::<()>();
+    let parked = Mutex::new(parked);
+    let parked_laps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&parked_laps);
+    let parking = crate::storage_retention::observe_test_hook(
+        fixture.view.view_dir(),
+        std::sync::Arc::new(move |step| {
+            if step == "post-publication-sweep" {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Returns once the sender is dropped.
+                let _ = parked.lock().recv_timeout(Duration::from_secs(60));
+            }
+        }),
+    );
     fixture.change("next");
     fixture.schedule();
     fixture.wait_idle();
@@ -1856,6 +1874,20 @@ fn generation_sweep_waits_for_the_last_query_handle() {
     assert!(!fixture
         .view
         .manifest_path(&fixture.initial)
+        .unwrap()
+        .exists());
+    // Let the parked cleanup run. It must find nothing more to remove, and it
+    // must actually have been parked, or the explicit sweeps above raced it.
+    drop(release_cleanup);
+    crate::views::wait_for_generation_maintenance_for_test(fixture.view.view_dir());
+    drop(parking);
+    assert!(
+        parked_laps.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the replacing publication's cleanup was never parked"
+    );
+    assert!(!fixture
+        .view
+        .derived_path(&fixture.initial)
         .unwrap()
         .exists());
 }

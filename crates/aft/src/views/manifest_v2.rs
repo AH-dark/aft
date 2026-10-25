@@ -572,6 +572,7 @@ impl ViewStore {
                 super::checkpoint_pointer_after_cas(&self.pointer_path())?;
                 sync_directory(self.view_dir())?;
                 observe(observer, DurabilityStep::PointerSynced);
+                super::generation::schedule_generation_sweep(self.clone());
                 Ok(PublishV2::Published)
             }
             super::PublishOutcome::Conflict { current_generation } => {
@@ -741,6 +742,178 @@ mod tests {
             )
             .unwrap();
         manifest
+    }
+
+    #[test]
+    fn v2_publication_burst_reclaims_superseded_generations() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        let registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "0123456789abcdef")
+                .unwrap();
+        let registration = registry
+            .register_view_with_storage(storage.path(), "burst", &root)
+            .unwrap();
+        let view = registration.view_store().unwrap();
+        let mut previous = None;
+        let mut generations = Vec::new();
+        for index in 0..8 {
+            let mut manifest = manifest();
+            manifest.header_mut().head_tree = Some(format!("tree-{index}"));
+            let name = GenerationName::for_manifest(&manifest).unwrap();
+            let pin =
+                crate::pins::AssemblyPin::create_v2(&registration, name.to_string(), &[]).unwrap();
+            let prepared = view
+                .prepare_v2(&name, previous.as_deref(), &manifest, None)
+                .unwrap();
+            let database = view.derived_path(&name.to_string()).unwrap();
+            let connection = crate::db::file_identity::IdentityConnection::open(
+                &database,
+                "V2 publication test",
+            )
+            .unwrap();
+            connection
+                .execute_batch("CREATE TABLE state (value TEXT);")
+                .unwrap();
+            drop(connection);
+            // A caller may still own the family barrier at commit. The worker
+            // must acquire it before the pointer, not re-enter it on this thread.
+            let outcome = registry
+                .with_barrier(|_| {
+                    view.commit_v2(prepared, None)
+                        .map_err(crate::views::registry::RegistryError::View)
+                })
+                .unwrap();
+            assert_eq!(outcome, PublishV2::Published);
+            previous = Some(name.to_string());
+            generations.push(name.to_string());
+            drop(pin);
+        }
+        crate::views::generation::wait_for_generation_sweep_for_test(view.view_dir());
+        for generation in &generations[..generations.len() - 1] {
+            assert!(
+                !view.manifest_path(generation).unwrap().exists(),
+                "superseded V2 manifest survived: {generation}"
+            );
+            assert!(
+                !view.derived_path(generation).unwrap().exists(),
+                "superseded V2 database survived: {generation}"
+            );
+        }
+        assert!(view
+            .manifest_path(generations.last().unwrap())
+            .unwrap()
+            .exists());
+        assert!(view
+            .derived_path(generations.last().unwrap())
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
+    fn v2_inflight_commit_protects_private_and_equivalent_generations() {
+        struct Pause {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl DurabilityObserver for Pause {
+            fn reached(&self, step: DurabilityStep) {
+                if step == DurabilityStep::PointerCas {
+                    self.entered.send(()).unwrap();
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .unwrap();
+                }
+            }
+        }
+        let storage = tempfile::tempdir().unwrap();
+        let registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
+        let registration = registry
+            .register_view_with_storage(
+                storage.path(),
+                "inflight",
+                &storage.path().join("absent-root"),
+            )
+            .unwrap();
+        let view = registration.view_store().unwrap();
+        let first_manifest = manifest();
+        let first = GenerationName::for_manifest(&first_manifest).unwrap();
+        view.commit_v2(
+            view.prepare_v2(&first, None, &first_manifest, None)
+                .unwrap(),
+            None,
+        )
+        .unwrap();
+        crate::views::generation::wait_for_generation_sweep_for_test(view.view_dir());
+        let private = GenerationName::for_manifest(&first_manifest).unwrap();
+        let prepared = view
+            .prepare_v2(&private, None, &first_manifest, None)
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let committing_view = view.clone();
+        let commit = std::thread::spawn(move || {
+            committing_view
+                .commit_v2(
+                    prepared,
+                    Some(&Pause {
+                        entered: entered_tx,
+                        release: std::sync::Mutex::new(release_rx),
+                    }),
+                )
+                .unwrap()
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let mut replacement_manifest = first_manifest;
+        replacement_manifest.header_mut().head_tree = Some("replacement".into());
+        let replacement = GenerationName::for_manifest(&replacement_manifest).unwrap();
+        view.commit_v2(
+            view.prepare_v2(
+                &replacement,
+                Some(&first.to_string()),
+                &replacement_manifest,
+                None,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        crate::views::generation::wait_for_generation_sweep_for_test(view.view_dir());
+        let private_kept = view.manifest_path(&private.to_string()).unwrap().is_file();
+        let equivalent_kept = view.manifest_path(&first.to_string()).unwrap().is_file();
+        release_tx.send(()).unwrap();
+        let outcome = commit.join().unwrap();
+        assert!(
+            private_kept,
+            "cleanup deleted a private generation while its commit was in flight"
+        );
+        assert!(
+            equivalent_kept,
+            "cleanup deleted the EquivalentWinner target before commit returned"
+        );
+        assert_eq!(
+            outcome,
+            PublishV2::EquivalentWinner {
+                current: first.to_string()
+            }
+        );
+        assert_eq!(
+            view.current_generation().unwrap(),
+            Some(replacement.to_string())
+        );
+        view.sweep_generations().unwrap();
+        assert!(!view.manifest_path(&private.to_string()).unwrap().exists());
+        assert!(!view.manifest_path(&first.to_string()).unwrap().exists());
+        assert!(view
+            .manifest_path(&replacement.to_string())
+            .unwrap()
+            .is_file());
     }
 
     #[test]

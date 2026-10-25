@@ -2007,7 +2007,13 @@ mod reader_marker_tests {
             .exists());
     }
 
-    fn reader_only_generation(fixture: &crate::gc::family_read_tests::Fixture) -> String {
+    fn reader_only_generation(
+        fixture: &crate::gc::family_read_tests::Fixture,
+    ) -> (String, ParkedViewCleanup) {
+        // Hold the view's post-publication cleanup first: an unprotected
+        // superseded generation is exactly what it reclaims, and these tests
+        // need that generation to exist when the family sweep starts.
+        let parked = ParkedViewCleanup::start(fixture.view.view_dir());
         publish_marks(&fixture.view, 0..5);
         let generation = fixture
             .view
@@ -2018,7 +2024,47 @@ mod reader_marker_tests {
             .unwrap();
         publish_marks(&fixture.view, 0..4);
         metadata_cleanup_completed(&fixture.registry);
-        generation
+        (generation, parked)
+    }
+
+    /// Parks the view's post-publication generation cleanup at the start of
+    /// each lap until dropped. Dropping it lets the cleanup run and waits for
+    /// it to settle; by then each test has finished observing the family sweep.
+    struct ParkedViewCleanup {
+        view_dir: PathBuf,
+        release: Option<std::sync::mpsc::Sender<()>>,
+        _hook: crate::storage_retention::TestHookGuard,
+    }
+
+    impl ParkedViewCleanup {
+        fn start(view_dir: &Path) -> Self {
+            let (release, parked) = std::sync::mpsc::channel::<()>();
+            let parked = std::sync::Mutex::new(parked);
+            let hook = crate::storage_retention::observe_test_hook(
+                view_dir,
+                std::sync::Arc::new(move |step| {
+                    if step == "post-publication-sweep" {
+                        // Returns once the sender is dropped.
+                        let _ = parked
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(std::time::Duration::from_secs(60));
+                    }
+                }),
+            );
+            Self {
+                view_dir: view_dir.to_path_buf(),
+                release: Some(release),
+                _hook: hook,
+            }
+        }
+    }
+
+    impl Drop for ParkedViewCleanup {
+        fn drop(&mut self) {
+            self.release.take();
+            crate::views::wait_for_generation_maintenance_for_test(&self.view_dir);
+        }
     }
 
     #[test]
@@ -2040,7 +2086,7 @@ mod reader_marker_tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let fixture = build(dir.path(), 6, |_| true);
-        let generation = reader_only_generation(&fixture);
+        let (generation, _parked_cleanup) = reader_only_generation(&fixture);
         let markers = crate::root_cache::read_marker_dir(fixture.view.view_dir(), &generation);
         fs::create_dir_all(&markers).unwrap();
         fs::write(markers.join("stale"), b"malformed marker").unwrap();
@@ -2082,7 +2128,7 @@ mod reader_marker_tests {
     fn protected_generation_is_censused_once_in_a_collecting_pass() {
         let dir = tempfile::tempdir().unwrap();
         let fixture = build(dir.path(), 6, |_| true);
-        let generation = reader_only_generation(&fixture);
+        let (generation, _parked_cleanup) = reader_only_generation(&fixture);
         let marker = ReadMarker::create(fixture.view.view_dir(), &generation).unwrap();
         let probe = ReaderCensusProbe::start();
         let report = sweep_family(
