@@ -643,6 +643,7 @@ fn trigger_callgraph_warm(ctx: &AppContext) -> Option<SubsystemState> {
         ))),
         // Read-only worktree or not configured: nothing to build here.
         CallgraphStoreAccess::Unavailable => Some(SubsystemState::Ready),
+        CallgraphStoreAccess::Error(error) if error.is_transient_lock_contention() => None,
         CallgraphStoreAccess::Error(error) => Some(SubsystemState::Failed(error.to_string())),
     }
 }
@@ -661,6 +662,7 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
         fulfilled_force_token,
         receiver_generation,
         receiver_epoch,
+        reopen_epoch,
     ) = {
         let rx_ref = ctx.callgraph_store_rx().lock();
         let Some(rx) = rx_ref.as_ref() else {
@@ -672,6 +674,7 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
         let mut settled = false;
         let mut fulfilled_force_token = None;
         let mut disconnected = false;
+        let mut reopen_epoch = None;
         loop {
             match rx.try_recv() {
                 Ok(CallGraphStoreBuildEvent::Ready {
@@ -682,8 +685,20 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
                     if ctx.callgraph_persist_epoch_flag().current() == publication_epoch {
                         latest = Some(store);
                         fulfilled_force_token = token;
+                        reopen_epoch = Some(publication_epoch);
                     } else {
                         drop(store);
+                        settled = true;
+                    }
+                }
+                Ok(CallGraphStoreBuildEvent::Reopen {
+                    fulfilled_force_token: token,
+                    publication_epoch,
+                }) => {
+                    if ctx.callgraph_persist_epoch_flag().current() == publication_epoch {
+                        reopen_epoch = Some(publication_epoch);
+                        fulfilled_force_token = token;
+                    } else {
                         settled = true;
                     }
                 }
@@ -708,22 +723,27 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
             fulfilled_force_token,
             ctx.callgraph_store_rx_generation(),
             ctx.callgraph_store_rx_epoch(),
+            reopen_epoch,
         )
     };
 
-    let terminal =
-        latest.is_some() || denied.is_some() || suspended.is_some() || settled || disconnected;
+    let terminal = reopen_epoch.is_some()
+        || denied.is_some()
+        || suspended.is_some()
+        || settled
+        || disconnected;
     if !terminal {
         return;
     }
     let mut reopened = None;
-    if let Some(store) = latest {
-        drop(store);
+    let mut busy_reopen = false;
+    if reopen_epoch.is_some() {
+        drop(latest);
         if let Some(project_root) = ctx.callgraph_project_root() {
-            if let Ok(Some(store)) =
-                CallGraphStore::open_readonly(ctx.callgraph_store_dir(), project_root)
-            {
-                reopened = Some(std::sync::Arc::new(store));
+            match CallGraphStore::reopen_readonly(ctx.callgraph_store_dir(), project_root) {
+                Ok(Some(store)) => reopened = Some(std::sync::Arc::new(store)),
+                Err(error) if error.is_transient_lock_contention() => busy_reopen = true,
+                _ => {}
             }
         }
     }
@@ -748,6 +768,13 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
                 ctx.record_callgraph_store_build_suspension(receiver_generation, suspension);
             }
             *receiver = None;
+            if busy_reopen {
+                ctx.defer_callgraph_store_reopen(
+                    receiver,
+                    fulfilled_force_token,
+                    reopen_epoch.expect("completed publication"),
+                );
+            }
             if installed {
                 if let Some(force_token) = fulfilled_force_token {
                     ctx.fulfill_callgraph_store_force_token(force_token);

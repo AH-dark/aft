@@ -923,6 +923,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
         fulfilled_force_token,
         receiver_generation,
         receiver_epoch,
+        reopen_epoch,
     ) = {
         let rx_ref = ctx.callgraph_store_rx().lock();
         let Some(rx) = rx_ref.as_ref() else {
@@ -935,6 +936,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
         let mut settled = false;
         let mut fulfilled_force_token = None;
         let mut disconnected = false;
+        let mut reopen_epoch = None;
         loop {
             match rx.try_recv() {
                 Ok(CallGraphStoreBuildEvent::Ready {
@@ -945,12 +947,24 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
                     if ctx.callgraph_persist_epoch_flag().current() == publication_epoch {
                         latest = Some(store);
                         fulfilled_force_token = token;
+                        reopen_epoch = Some(publication_epoch);
                     } else {
                         // A newer configure advanced the persist epoch after this
                         // build published; its generation is already superseded on
                         // disk, so treat the event as settled instead of installing
                         // the stale handle in RAM.
                         drop(store);
+                        settled = true;
+                    }
+                }
+                Ok(CallGraphStoreBuildEvent::Reopen {
+                    fulfilled_force_token: token,
+                    publication_epoch,
+                }) => {
+                    if ctx.callgraph_persist_epoch_flag().current() == publication_epoch {
+                        reopen_epoch = Some(publication_epoch);
+                        fulfilled_force_token = token;
+                    } else {
                         settled = true;
                     }
                 }
@@ -975,10 +989,11 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
             fulfilled_force_token,
             ctx.callgraph_store_rx_generation(),
             ctx.callgraph_store_rx_epoch(),
+            reopen_epoch,
         )
     };
 
-    let ready_received = latest.is_some();
+    let ready_received = reopen_epoch.is_some();
     let terminal =
         ready_received || denied.is_some() || suspended.is_some() || settled || disconnected;
     if !terminal {
@@ -993,18 +1008,20 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
     wait_on_artifact_drain_commit_gate_for_test(ctx);
 
     let mut reopened = None;
-    if let Some(store) = latest {
+    let mut busy_reopen = false;
+    if ready_received {
         // Release the cold-build writer lease before opening the published
         // generation through its read-only pointer.
-        drop(store);
+        drop(latest);
         if let Some(project_root) = ctx.callgraph_project_root() {
-            match CallGraphStore::open_readonly(ctx.callgraph_store_dir(), project_root) {
+            match CallGraphStore::reopen_readonly(ctx.callgraph_store_dir(), project_root) {
                 Ok(Some(store)) => reopened = Some(Arc::new(store)),
                 Ok(None) => {
                     crate::slog_warn!(
                         "callgraph store build completed without a readable published generation"
                     );
                 }
+                Err(error) if error.is_transient_lock_contention() => busy_reopen = true,
                 Err(error) => {
                     crate::slog_warn!("failed to install read-only callgraph store: {}", error);
                 }
@@ -1058,6 +1075,13 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
             }
             if terminal {
                 *receiver = None;
+            }
+            if busy_reopen {
+                ctx.defer_callgraph_store_reopen(
+                    receiver,
+                    fulfilled_force_token,
+                    reopen_epoch.expect("completed publication"),
+                );
             }
             if installed {
                 if let Some(force_token) = fulfilled_force_token {
@@ -6326,6 +6350,77 @@ mod tests {
             vec![pending],
             "failed reopen must preserve pending watcher paths for the retry"
         );
+    }
+
+    #[test]
+    fn callgraph_busy_completed_reopen_retries_and_serves() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("main.rs");
+        std::fs::write(&source, "fn leaf() {}\npub fn entry() { leaf(); }\n").unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(root.path()).unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root_path.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root_path.clone());
+        let key = crate::search_index::artifact_cache_key(&root_path);
+        crate::root_cache::configure_artifact_access(&root_path, &key, false);
+        let store = CallGraphStore::open(ctx.callgraph_store_dir(), root_path).unwrap();
+        store.cold_build(&[source]).unwrap();
+        let blocker = store.lock_readiness_for_test();
+        let token = ctx.mark_callgraph_store_force_rebuild("retry published store");
+        let pending = root.path().join("pending.rs");
+        ctx.add_pending_callgraph_store_paths([pending.clone()]);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        {
+            let mut receiver = ctx.callgraph_store_rx().lock();
+            ctx.note_callgraph_store_rx_generation(ctx.configure_generation());
+            ctx.next_callgraph_store_rx_epoch();
+            *receiver = Some(rx);
+        }
+        tx.send(CallGraphStoreBuildEvent::Ready {
+            store,
+            fulfilled_force_token: Some(token),
+            publication_epoch: ctx.callgraph_persist_epoch_flag().current(),
+        })
+        .unwrap();
+        drop(tx);
+        let original_epoch = ctx.callgraph_store_rx_epoch();
+        drain_callgraph_store_events(&ctx);
+        assert!(
+            ctx.callgraph_store_rx().lock().is_some(),
+            "busy reopen must retain retry ownership"
+        );
+        assert_ne!(ctx.callgraph_store_rx_epoch(), original_epoch);
+        assert!(ctx
+            .with_current_callgraph_store_rx(ctx.configure_generation(), original_epoch, |rx| *rx =
+                None)
+            .is_none());
+        assert_eq!(ctx.pending_callgraph_store_force_token(), Some(token));
+        assert_eq!(
+            ctx.take_pending_callgraph_store_paths(),
+            vec![pending.clone()]
+        );
+        ctx.add_pending_callgraph_store_paths([pending]);
+        drain_callgraph_store_events(&ctx);
+        assert!(ctx.callgraph_store_rx().lock().is_some());
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drain_callgraph_store_events(&ctx);
+        assert!(ctx.callgraph_store_rx().lock().is_none());
+        assert!(ctx.callgraph_store().read().unwrap().is_some());
+        assert_eq!(ctx.pending_callgraph_store_force_token(), None);
+        let resident = ctx.callgraph_store().read().unwrap();
+        let tree = resident
+            .as_ref()
+            .unwrap()
+            .call_tree(Path::new("main.rs"), "entry", 1)
+            .unwrap();
+        assert_eq!(tree.children[0].name, "leaf");
     }
 
     #[test]

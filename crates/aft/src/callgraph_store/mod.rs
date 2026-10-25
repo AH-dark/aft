@@ -831,8 +831,11 @@ mod write_amplification_tests {
         let source = root.join("src/lib.rs");
         let dir = root.join(".store");
         let project_key = crate::search_index::artifact_cache_key(&root);
-        let published_path =
-            |dir: &Path| resolve_ready_target(dir, &project_key).map(|(path, _generation)| path);
+        let published_path = |dir: &Path| {
+            resolve_ready_target(dir, &project_key)
+                .unwrap()
+                .map(|(path, _generation)| path)
+        };
 
         let store = CallGraphStore::open(dir.clone(), root.clone()).unwrap();
         store.cold_build(std::slice::from_ref(&source)).unwrap();
@@ -856,7 +859,7 @@ mod write_amplification_tests {
             .unwrap();
 
         assert!(
-            !db_path_ready(&path),
+            !db_path_ready(&path).unwrap(),
             "an old-fingerprint store is not ready"
         );
         assert!(
@@ -894,6 +897,7 @@ mod write_amplification_tests {
         fs::create_dir_all(&root).unwrap();
         let store_dir = temp.path().join("store");
         let store = CallGraphStore::open(store_dir.clone(), root.clone()).unwrap();
+        store.cold_build(&[]).unwrap();
         let path = store.sqlite_path.clone();
         drop(store);
         let writer = Connection::open(&path).unwrap();
@@ -901,14 +905,18 @@ mod write_amplification_tests {
             .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
             .unwrap();
         let started = std::time::Instant::now();
-        assert!(CallGraphStore::open_readonly(store_dir, root)
-            .unwrap()
-            .is_none());
+        assert!(
+            matches!(CallGraphStore::open_readonly(store_dir.clone(), root.clone()),
+            Err(error) if error.is_transient_lock_contention())
+        );
         // Request readers use an expired busy deadline, so they must not wait
         // for the writer. A regression would wait for a 5 s busy timeout; 2 s
         // tells that apart from a slow open on a loaded CI runner.
         assert!(started.elapsed() < Duration::from_secs(2));
         writer.execute_batch("ROLLBACK").unwrap();
+        assert!(CallGraphStore::open_readonly(store_dir, root)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -5827,6 +5835,18 @@ fn project_key_for_store(callgraph_dir: &Path, project_root: &Path) -> Result<St
 }
 
 impl CallGraphStore {
+    #[cfg(test)]
+    pub(crate) fn lock_readiness_for_test(&self) -> Connection {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=DELETE;")
+            .unwrap();
+        let blocker = Connection::open(self.sqlite_path()).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        blocker
+    }
+
     pub fn open_if_enabled(
         options: CallGraphStoreOptions,
         callgraph_dir: PathBuf,
@@ -5851,7 +5871,7 @@ impl CallGraphStore {
         // Resolve the current generation via the pointer (falling back to the
         // legacy single-file DB). If nothing is published yet, open the legacy
         // path so a brand-new store still gets a writable DB + schema.
-        let (sqlite_path, generation) = resolve_ready_target(&callgraph_dir, &project_key)
+        let (sqlite_path, generation) = resolve_ready_target(&callgraph_dir, &project_key)?
             .unwrap_or_else(|| (legacy_sqlite_path(&callgraph_dir, &project_key), None));
         let OpenedStore { store, root_repair } = Self::open_at_path(
             project_root.clone(),
@@ -5930,10 +5950,10 @@ impl CallGraphStore {
         // reported as not built (which would send callers to a cold build) or
         // served from an older legacy partition.
         refuse_newer_published_format(&callgraph_dir, &project_key)?;
-        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
+        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)?
         {
             let conn = open_readonly_connection(&sqlite_path)?;
-            if !database_ready(&conn).unwrap_or(false) {
+            if !readonly_readiness(database_ready(&conn))? {
                 return Ok(None);
             }
             let marker_label = generation.as_deref().unwrap_or("legacy");
@@ -5962,7 +5982,7 @@ impl CallGraphStore {
             target.sqlite_path.display()
         );
         let conn = open_readonly_connection(&target.sqlite_path)?;
-        if !database_ready(&conn).unwrap_or(false) {
+        if !readonly_readiness(database_ready(&conn))? {
             return Ok(None);
         }
         let marker_label =
@@ -5981,6 +6001,24 @@ impl CallGraphStore {
                 conn,
             ),
         )))
+    }
+
+    /// A drain makes at most three fail-fast probes before yielding. Continued
+    /// contention stays owned by the completion receiver for a later drain.
+    pub fn reopen_readonly(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+    ) -> Result<Option<ReadonlyCallGraphStore>> {
+        for attempt in 0..3 {
+            let result = Self::open_readonly(callgraph_dir.clone(), project_root.clone());
+            if attempt == 2
+                || !matches!(&result, Err(error) if error.is_transient_lock_contention())
+            {
+                return result;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        unreachable!("bounded reopen probes return on the final attempt")
     }
 
     /// Open the currently-published ready store with write access so moved-root
@@ -6053,7 +6091,7 @@ impl CallGraphStore {
             return Ok(None);
         };
         refuse_newer_published_format(&callgraph_dir, &project_key)?;
-        let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
+        let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)?
         else {
             return Ok(None);
         };
@@ -6194,7 +6232,7 @@ impl CallGraphStore {
         // metadata in-place while still holding the build lease. If data rows
         // contain absolute paths, publish a fresh generation under this lease
         // rather than recursively reacquiring the same lock.
-        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
+        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)?
         {
             let OpenedStore { store, root_repair } = Self::open_at_path(
                 project_root.clone(),
@@ -6279,7 +6317,7 @@ impl CallGraphStore {
         // Another writer may have completed the migration while this worker was
         // waiting for the lease. Adopt its root-keyed generation rather than
         // copying the legacy source a second time.
-        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
+        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)?
         {
             let OpenedStore { store, root_repair } = Self::open_at_path(
                 project_root,
@@ -6576,7 +6614,7 @@ impl CallGraphStore {
         let project_key = project_key_for_store(callgraph_dir, project_root)?;
         // A cold build is needed unless a ready generation (or ready legacy DB)
         // is currently published.
-        Ok(resolve_ready_target(callgraph_dir, &project_key).is_none())
+        Ok(resolve_ready_target(callgraph_dir, &project_key)?.is_none())
     }
 
     /// Check the durable callgraph-domain breaker before a query starts a cold
@@ -10808,7 +10846,7 @@ fn open_legacy_fallback_store(
         target.sqlite_path.display()
     );
     let conn = open_readonly_connection(&target.sqlite_path)?;
-    if !database_ready(&conn).unwrap_or(false) {
+    if !readonly_readiness(database_ready(&conn))? {
         return Ok(None);
     }
     let marker_label = legacy_read_marker_label(&target.sqlite_path, target.generation.as_deref());
@@ -10957,7 +10995,7 @@ fn newest_superseded_legacy_generation(
             continue;
         }
         let path = entry.path();
-        if !db_path_ready(&path) {
+        if !db_path_ready(&path)? {
             continue;
         }
         let modified = entry
@@ -11017,7 +11055,7 @@ fn ready_legacy_target(
 ) -> Result<Option<LegacyCallgraphTarget>> {
     if let Some(generation) = read_pointer(&partition.dir, &partition.key) {
         let sqlite_path = partition.dir.join(&generation);
-        if sqlite_path.is_file() && db_path_ready(&sqlite_path) {
+        if sqlite_path.is_file() && db_path_ready(&sqlite_path)? {
             let source_bytes = sqlite_file_set_size(&sqlite_path)?;
             return Ok(Some(LegacyCallgraphTarget {
                 partition: partition.clone(),
@@ -11030,7 +11068,7 @@ fn ready_legacy_target(
     }
 
     let sqlite_path = legacy_sqlite_path(&partition.dir, &partition.key);
-    if sqlite_path.is_file() && db_path_ready(&sqlite_path) {
+    if sqlite_path.is_file() && db_path_ready(&sqlite_path)? {
         let source_bytes = sqlite_file_set_size(&sqlite_path)?;
         return Ok(Some(LegacyCallgraphTarget {
             partition: partition.clone(),
@@ -12668,12 +12706,19 @@ fn read_pointer(callgraph_dir: &Path, project_key: &str) -> Option<String> {
 
 /// True if the DB at `path` opens and reports ready (schema + fingerprint + the
 /// `ready` flag). Uses a throwaway read-only connection.
-fn db_path_ready(path: &Path) -> bool {
-    (|| -> Result<bool> {
+fn db_path_ready(path: &Path) -> Result<bool> {
+    readonly_readiness((|| {
         let conn = open_readonly_connection(path)?;
         database_ready(&conn)
-    })()
-    .unwrap_or(false)
+    })())
+}
+
+fn readonly_readiness(result: Result<bool>) -> Result<bool> {
+    match result {
+        Err(error) if error.is_transient_lock_contention() => Err(error),
+        // Invalid databases remain not ready; contention cannot establish absence.
+        other => Ok(other.unwrap_or(false)),
+    }
 }
 
 /// Resolve the DB file a reader/opener should use, returning `(path, generation)`
@@ -12686,14 +12731,14 @@ fn db_path_ready(path: &Path) -> bool {
 fn resolve_ready_target(
     callgraph_dir: &Path,
     project_key: &str,
-) -> Option<(PathBuf, Option<String>)> {
+) -> Result<Option<(PathBuf, Option<String>)>> {
     for _ in 0..5 {
         if let Some(generation) = read_pointer(callgraph_dir, project_key) {
             let gen_path = callgraph_dir.join(&generation);
             if gen_path.is_file() {
-                return (migration_manifest_valid(callgraph_dir, &generation)
-                    && db_path_ready(&gen_path))
-                .then_some((gen_path, Some(generation)));
+                return Ok((migration_manifest_valid(callgraph_dir, &generation)
+                    && db_path_ready(&gen_path)?)
+                .then_some((gen_path, Some(generation))));
             }
             // Pointer names a missing generation (a GC/publish race): re-read the
             // pointer and retry rather than failing the reader.
@@ -12702,9 +12747,9 @@ fn resolve_ready_target(
         }
         // No pointer: fall back to the legacy single-file DB if it is ready.
         let legacy = legacy_sqlite_path(callgraph_dir, project_key);
-        return (legacy.is_file() && db_path_ready(&legacy)).then_some((legacy, None));
+        return Ok((legacy.is_file() && db_path_ready(&legacy)?).then_some((legacy, None)));
     }
-    None
+    Ok(None)
 }
 
 /// Schema version recorded in the published generation (or, with no pointer,
@@ -24680,9 +24725,10 @@ mod refresh_worker_tests {
         idle_writer_rx
             .recv_timeout(Duration::from_secs(12))
             .unwrap();
-        assert!(CallGraphStore::open_readonly(dir.clone(), root.clone())
-            .unwrap()
-            .is_none());
+        assert!(
+            matches!(CallGraphStore::open_readonly(dir.clone(), root.clone()),
+            Err(error) if error.is_transient_lock_contention())
+        );
         // Queue idle proves the replay committed, not that idle maintenance has
         // closed its writer. Request readers deliberately fail fast on a locked
         // generation, so join this fixture's worker before asserting a fresh open.
