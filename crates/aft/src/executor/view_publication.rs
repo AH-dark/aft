@@ -803,6 +803,12 @@ pub(crate) fn schedule(
                 ran_deferred = target.ctx.defer_callgraph_build();
                 let result = (|| {
                     lifecycle.phase("manifest")?;
+                    if target.ctx.can_skip_irrelevant_view_paths(paths) {
+                        log::info!("view publication skipped reason=non_manifest_paths paths={} root={}", paths.len(), target.ctx.canonical_cache_root().display());
+                        #[cfg(test)]
+                        lifecycle.outcome(tests::CompletionOutcome::Noop);
+                        return Ok(());
+                    }
                     let mut slot = PublicationSlot::acquire(
                         &target.ctx.cold_build_limiter(),
                         &target.ctx.canonical_cache_root(),

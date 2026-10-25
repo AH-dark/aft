@@ -9800,6 +9800,36 @@ impl AppContext {
         Ok(report)
     }
 
+    pub(crate) fn can_skip_irrelevant_view_paths(&self, paths: &BTreeSet<Vec<u8>>) -> bool {
+        let Some(snapshot) = self.view_runtime_snapshot() else {
+            return false;
+        };
+        let config = self.config();
+        if paths.is_empty()
+            || !snapshot.pending_paths.is_empty()
+            || !snapshot.pending_inputs.is_empty()
+            || self.lazy_callgraph_build_outstanding()
+            || (config.indexes.semantic && !self.checkout_semantic.active())
+        {
+            return false;
+        }
+        crate::views::assembly::can_skip_irrelevant_paths(
+            &crate::views::assembly::AssemblyRequest {
+                storage: snapshot.storage,
+                project_root: self.canonical_cache_root(),
+                family: snapshot.family,
+                scope: snapshot.scope,
+                desired_head: snapshot.head_fingerprint,
+                changed_paths: paths.clone(),
+                semantic_keys: BTreeMap::new(),
+                require_semantic: false,
+                allow_blob_put: true,
+                callgraph: config.indexes.callgraph,
+            },
+            self.defer_callgraph_build(),
+        )
+    }
+
     pub(crate) fn prepare_view_paths(
         &self,
         changed_paths: BTreeSet<Vec<u8>>,

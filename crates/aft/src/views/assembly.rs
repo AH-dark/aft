@@ -42,6 +42,51 @@ pub(crate) fn full_verification_due(view_dir: &Path) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) fn precheck_path_builds_for_test() -> usize {
+    manifest_incremental::precheck_path_builds_for_test()
+}
+
+/// Avoid build admission for notifications outside committed membership. This
+/// does not replace rescans, semantic handoffs, artifact repair or graph builds.
+pub(crate) fn can_skip_irrelevant_paths(request: &AssemblyRequest, defer_derived: bool) -> bool {
+    let check = || -> Result<bool> {
+        let Some(view) =
+            ViewStore::existing_dir(ViewStore::cache_key(&request.storage, &request.scope)?)
+        else {
+            return Ok(false);
+        };
+        manifest_incremental::irrelevant_delta(request, &view, || {
+            if settle_gate(view.view_dir())
+                .outstanding
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+            {
+                return Ok(false);
+            }
+            let status = PathStatusStore::open(view.view_dir())
+                .and_then(|status| status.summary())
+                .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+            if status.pending_count != 0 || status.failed_count != 0 {
+                return Ok(false);
+            }
+            let Some(generation) = view.current_generation_read_only()? else {
+                return Ok(false);
+            };
+            if defer_derived && !super::read::derived_built(view.view_dir(), &generation) {
+                return Ok(true);
+            }
+            crate::callgraph_store::manifest_view_database_ready(
+                view.view_dir(),
+                &generation,
+                Instant::now() + crate::db::STEADY_BUSY_TIMEOUT,
+            )
+            .map_err(|error| ViewError::InvalidManifest(error.to_string()))
+        })
+    };
+    check().unwrap_or(false)
+}
+
+#[cfg(test)]
 pub(crate) fn expire_verification_for_test(view_dir: &Path) {
     manifest_incremental::expire_verification_for_test(view_dir);
 }
