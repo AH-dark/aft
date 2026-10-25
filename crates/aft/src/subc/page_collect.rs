@@ -6,10 +6,10 @@
 //! root, trust class, config read_deny and protected paths, AFT storage
 //! floor, saved grants and confinement its `read` tool applies right now:
 //! the per-call setup comes from `call_policy::with_tool_call_policy`, the
-//! same function the tool-call path uses, and every path is judged by
-//! [`AppContext::validate_read_path`], the check `read` itself makes. A
-//! question the policy would ask the user is never asked here; such a path
-//! counts as denied.
+//! same function the tool-call path uses, and every path that passes the
+//! storage floor is then judged by [`AppContext::validate_read_path`], the
+//! check `read` itself makes. A question the policy would ask the user is
+//! never asked here; such a path counts as denied.
 
 use super::*;
 use crate::commands::file_read_exact::{self, OpenedFile, ReadExactRefusal};
@@ -183,10 +183,13 @@ impl SessionReader<'_> {
     }
 }
 
-/// The storage floor: AFT's storage, SQLite files, and any file a live
-/// database connection in this process holds are never opened. Decided by
-/// name and stat alone: opening and then closing a descriptor on a live
-/// SQLite file drops this process's SQLite locks on it.
+/// The storage floor, checked before any open: whether `path` is in AFT's
+/// storage, is named like a SQLite file, or is a path a live database
+/// connection in this process registered. Decided by name and stat alone,
+/// because opening and then closing a descriptor on a live SQLite file
+/// drops this process's SQLite locks on it. (A handle that turns out to be
+/// a live SQLite file anyway, such as an unregistered hard link, is refused
+/// after the open and kept open rather than closed; see `OpenedFile`.)
 fn storage_floor(path: &Path) -> bool {
     crate::project_content::is_excluded(path)
 }
