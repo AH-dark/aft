@@ -7639,6 +7639,18 @@ mod tests {
         assert!(health["dropped_lines_total"].is_u64(), "{health}");
         assert!(health.get("last_write_error").is_some(), "{health}");
         assert!(health.get("failing_since").is_some(), "{health}");
+        assert!(
+            health["stderr_mirror"]["dropped_lines_total"].is_u64(),
+            "{health}"
+        );
+        assert!(
+            health["stderr_mirror"]["dropped_flushes_total"].is_u64(),
+            "{health}"
+        );
+        assert!(
+            health["stderr_mirror"]["best_effort"].is_boolean(),
+            "{health}"
+        );
     }
 
     #[test]

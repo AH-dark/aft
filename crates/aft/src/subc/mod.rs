@@ -22662,6 +22662,35 @@ mod compile_fence_tests {
     }
 
     #[test]
+    fn frame_loop_contains_no_direct_stderr_io() {
+        let source = include_str!("mod.rs");
+        let body = source
+            .split_once("async fn run_module_loop<")
+            .unwrap()
+            .1
+            .split_once("fn classify_connection_end(")
+            .unwrap()
+            .0;
+        assert!(body.contains("tokio::select!"));
+        assert!(body.contains("mark_frame_loop_tick"));
+        for primitive in [
+            "eprintln!",
+            "eprint!",
+            "io::stderr",
+            "libc::write",
+            "write_stderr_once",
+            "write_stderr_diagnostic",
+            "write_terminal_log_sync",
+            "flush_durable_log",
+        ] {
+            assert!(
+                !body.contains(primitive),
+                "frame loop bypasses its nonblocking log path: {primitive}"
+            );
+        }
+    }
+
+    #[test]
     fn cancelled_admission_errors_cannot_bypass_connection_teardown() {
         let source = include_str!("mod.rs");
         let branch = source

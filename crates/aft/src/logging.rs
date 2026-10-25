@@ -13,11 +13,18 @@ use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+
+mod stderr_mirror;
+
+static SUBC_LOGGING: AtomicBool = AtomicBool::new(false);
+static STDERR_MIRROR: OnceLock<stderr_mirror::Mirror> = OnceLock::new();
+static STDERR_MIRROR_HEALTH: LazyLock<Arc<stderr_mirror::MirrorHealth>> =
+    LazyLock::new(|| Arc::new(stderr_mirror::MirrorHealth::default()));
 
 /// Maximum size of an active Rust or plugin log before its single backup rotates in.
 const LOG_FILE_BYTES: u64 = 32 * 1024 * 1024;
@@ -880,6 +887,28 @@ pub(crate) fn capture_index_events<R>(f: impl FnOnce() -> R) -> (R, Vec<String>)
 
 /// Initialize the `RUST_LOG`-filtered stderr logger and its additive file sink.
 pub fn init() {
+    init_with_stderr_mode(false);
+}
+
+/// Initialize logging before the supervised module starts its frame runtime.
+/// Stderr is a bounded best-effort mirror; the independent file sink is unchanged.
+pub fn init_subc() {
+    init_with_stderr_mode(true);
+}
+
+fn init_with_stderr_mode(subc: bool) {
+    SUBC_LOGGING.store(subc, Ordering::Relaxed);
+    if subc {
+        STDERR_MIRROR.get_or_init(|| {
+            stderr_mirror::Mirror::spawn(
+                io::stderr(),
+                stderr_mirror::QUEUE_CAPACITY,
+                Arc::clone(&STDERR_MIRROR_HEALTH),
+            )
+            .map(|(mirror, _worker)| mirror)
+            .unwrap_or_else(|_| stderr_mirror::Mirror::disabled(Arc::clone(&STDERR_MIRROR_HEALTH)))
+        });
+    }
     let storage_root = crate::bash_background::storage_dir(None);
     let logs_dir = storage_root.join("logs");
     let file_name = format!("aft-{}.log", std::process::id());
@@ -915,7 +944,7 @@ pub fn init() {
         });
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .target(env_logger::Target::Pipe(Box::new(TeeWriter { file_tx })))
+        .target(env_logger::Target::Pipe(Box::new(TeeWriter::new(file_tx))))
         .format(|buf, record| {
             // Wall-clock stamp so post-hoc log forensics can correlate
             // lines with external events (health probes, module bounces).
@@ -936,6 +965,11 @@ pub fn init() {
     if let Some(summary) = startup_sweep {
         log_sweep_summary(summary);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn subc_stderr_tee_for_test() -> impl Write + Send {
+    TeeWriter::new(None)
 }
 
 /// Log before delegating to the previous hook. Do not change RUST_BACKTRACE:
@@ -1161,7 +1195,11 @@ static LOG_WRITE_HEALTH: LazyLock<Arc<LogWriteHealth>> =
 /// recovery markers count the latter over each write outage. Partial writes
 /// cannot confirm a record, so an errored batch is counted in full.
 pub fn durable_log_health() -> serde_json::Value {
-    LOG_WRITE_HEALTH.snapshot()
+    let mut health = LOG_WRITE_HEALTH.snapshot();
+    let mut mirror = STDERR_MIRROR_HEALTH.snapshot();
+    mirror["best_effort"] = SUBC_LOGGING.load(Ordering::Relaxed).into();
+    health["stderr_mirror"] = mirror;
+    health
 }
 
 impl LogWriteHealth {
@@ -1326,13 +1364,62 @@ static FILE_CONTROL: LazyLock<Mutex<FileControl>> =
 
 struct TeeWriter {
     file_tx: Option<SyncSender<LogMessage>>,
+    stderr: StderrOutput,
+}
+
+impl TeeWriter {
+    fn new(file_tx: Option<SyncSender<LogMessage>>) -> Self {
+        Self {
+            file_tx,
+            stderr: StderrOutput::for_process(),
+        }
+    }
+}
+
+enum StderrOutput {
+    Standalone,
+    Subc(stderr_mirror::Mirror),
+}
+
+impl StderrOutput {
+    fn for_process() -> Self {
+        if SUBC_LOGGING.load(Ordering::Relaxed) {
+            Self::Subc(STDERR_MIRROR.get().cloned().unwrap_or_else(|| {
+                stderr_mirror::Mirror::disabled(Arc::clone(&STDERR_MIRROR_HEALTH))
+            }))
+        } else {
+            Self::Standalone
+        }
+    }
+}
+
+impl Write for StderrOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Standalone => {
+                let _ = io::stderr().write_all(bytes);
+            }
+            Self::Subc(mirror) => mirror.record(bytes),
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Standalone => {
+                let _ = io::stderr().flush();
+            }
+            Self::Subc(mirror) => mirror.flush(),
+        }
+        Ok(())
+    }
 }
 
 impl Write for TeeWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // Mask credentials once, before either copy is written. The stderr copy
-        // is durable too: in standalone mode the plugin relays it into its own
-        // log file.
+        // Mask credentials before either copy. Standalone writes stderr
+        // synchronously so the plugin can save it in its log; subc uses the
+        // best-effort mirror.
         let line = crate::log_redact::aft_redact_bytes(buf);
         // The durable file copy goes first and does not depend on stderr: in
         // subc mode stderr is a pipe the daemon reads, and once the daemon is
@@ -1340,12 +1427,12 @@ impl Write for TeeWriter {
         // return early here and drop the file copy too, which is how a module
         // exit could leave no line explaining it.
         enqueue_file_line(&mut self.file_tx, &line, &LOG_WRITE_HEALTH);
-        let _ = io::stderr().write_all(&line);
+        let _ = self.stderr.write_all(&line);
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let _ = io::stderr().flush();
+        let _ = self.stderr.flush();
         Ok(())
     }
 }
@@ -1464,7 +1551,14 @@ fn run_file_writer<S: FileLogSink>(
 }
 
 fn write_stderr_once(message: &str) {
-    let _ = io::stderr().write_all(message.as_bytes());
+    write_stderr_diagnostic(message);
+}
+
+/// Emit a process diagnostic without making subc callers wait on its stderr pipe.
+/// Standalone retains its synchronous stderr behavior.
+pub fn write_stderr_diagnostic(message: &str) {
+    let line = crate::log_redact::aft_redact_bytes(message.as_bytes());
+    let _ = StderrOutput::for_process().write_all(&line);
 }
 
 /// Wait, at most `timeout`, until the durable log writer has written every line
@@ -1513,7 +1607,7 @@ pub fn write_terminal_log_sync(message: &str) -> io::Result<()> {
     if let Some(mut writer) = sink.writer.take() {
         writer.flush()?;
     }
-    write_terminal_line(&sink, &mut io::stderr(), message)
+    write_terminal_line(&sink, &mut StderrOutput::for_process(), message)
 }
 
 fn write_terminal_line(
@@ -2559,6 +2653,255 @@ mod tests {
     use filetime::{set_file_mtime, FileTime};
     use tempfile::TempDir;
 
+    fn isolated_subc_stderr(test_name: &str, body: impl FnOnce()) {
+        // libtest's exact names omit the crate prefix from module_path!().
+        let test_name = test_name.split_once("::").unwrap().1;
+        const PROBE: &str = "AFT_TEST_LOGGING_STDERR_CHILD";
+        if std::env::var(PROBE).ok().as_deref() == Some(test_name) {
+            super::init_subc();
+            body();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture", "--color=never"])
+            .env(PROBE, test_name)
+            .env("RUST_LOG", "off")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "stderr child failed: stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn hold_stderr() -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let stderr = io::stderr();
+            let _held = stderr.lock();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        (release_tx, holder)
+    }
+
+    #[test]
+    fn subc_file_writer_warning_does_not_wait_for_stderr() {
+        isolated_subc_stderr(
+            concat!(
+                module_path!(),
+                "::subc_file_writer_warning_does_not_wait_for_stderr"
+            ),
+            || {
+                struct ReconfigureFault(Arc<Mutex<Vec<u8>>>);
+                impl FileLogSink for ReconfigureFault {
+                    fn write_batch(&mut self, lines: &[Vec<u8>]) -> io::Result<()> {
+                        for line in lines {
+                            self.0.lock().unwrap().extend_from_slice(line);
+                        }
+                        Ok(())
+                    }
+                    fn reopen(&mut self) -> io::Result<()> {
+                        Ok(())
+                    }
+                    fn discard_buffer(&mut self) {}
+                    fn reconfigure(&mut self, _: &Path) -> io::Result<SweepSummary> {
+                        Err(io::Error::other("injected reconfigure failure"))
+                    }
+                }
+                let output = Arc::new(Mutex::new(Vec::new()));
+                let sink = Arc::new(Mutex::new(Some(ReconfigureFault(Arc::clone(&output)))));
+                let (tx, rx) = mpsc::sync_channel(4);
+                let (release, holder) = hold_stderr();
+                let worker = thread::spawn(move || {
+                    run_file_writer(
+                        sink,
+                        rx,
+                        Arc::new(LogWriteHealth::default()),
+                        Duration::ZERO,
+                    )
+                });
+                tx.send(LogMessage::Reconfigure(PathBuf::from("injected-log-root")))
+                    .unwrap();
+                tx.send(LogMessage::Write(b"after warning\n".to_vec()))
+                    .unwrap();
+                let (done, completed) = mpsc::sync_channel(1);
+                tx.send(LogMessage::Flush(done)).unwrap();
+                let progressed = completed.recv_timeout(Duration::from_secs(1));
+                let _ = release.send(());
+                holder.join().unwrap();
+                drop(tx);
+                worker.join().unwrap();
+                assert_eq!(
+                    progressed.ok(),
+                    Some(true),
+                    "file writer warning waited on stderr"
+                );
+                assert_eq!(&*output.lock().unwrap(), b"after warning\n");
+            },
+        );
+    }
+
+    #[test]
+    fn subc_terminal_mirror_does_not_wait_for_stderr() {
+        isolated_subc_stderr(
+            concat!(
+                module_path!(),
+                "::subc_terminal_mirror_does_not_wait_for_stderr"
+            ),
+            || {
+                let directory = tempfile::tempdir().unwrap();
+                let tx = FILE_CONTROL.lock().unwrap().tx.clone().unwrap();
+                tx.send(LogMessage::Reconfigure(directory.path().to_path_buf()))
+                    .unwrap();
+                assert!(writer_barrier(&tx));
+                let (release, holder) = hold_stderr();
+                let (done, completed) = mpsc::channel();
+                let caller = thread::spawn(move || {
+                    let _ = done.send(write_terminal_log_sync("held-terminal-stderr-probe"));
+                });
+                let result = completed.recv_timeout(Duration::from_secs(1));
+                let _ = release.send(());
+                holder.join().unwrap();
+                caller.join().unwrap();
+                assert!(
+                    matches!(result, Ok(Ok(()))),
+                    "terminal stderr blocked persistence: {result:?}"
+                );
+                let file = directory
+                    .path()
+                    .join("logs")
+                    .join(format!("aft-{}.log", std::process::id()));
+                assert!(fs::read_to_string(file)
+                    .unwrap()
+                    .contains("held-terminal-stderr-probe"));
+            },
+        );
+    }
+
+    #[test]
+    fn tee_and_process_diagnostics_cannot_bypass_transport_stderr_policy() {
+        let source = include_str!("logging.rs");
+        let tee = source
+            .split_once("impl Write for TeeWriter {")
+            .unwrap()
+            .1
+            .split_once("fn enqueue_file_line(")
+            .unwrap()
+            .0;
+        assert!(tee.contains("self.stderr.write_all"));
+        assert!(tee.contains("self.stderr.flush"));
+        assert!(!tee.contains("io::stderr"));
+        let diagnostics = source
+            .split_once("fn write_stderr_once(")
+            .unwrap()
+            .1
+            .split_once("pub fn flush_durable_log(")
+            .unwrap()
+            .0;
+        assert!(diagnostics.contains("StderrOutput::for_process()"));
+        assert!(!diagnostics.contains("io::stderr"));
+        let terminal = source
+            .split_once("pub fn write_terminal_log_sync(")
+            .unwrap()
+            .1
+            .split_once("fn write_terminal_line(")
+            .unwrap()
+            .0;
+        assert!(terminal.contains("StderrOutput::for_process()"));
+        assert!(!terminal.contains("io::stderr"));
+    }
+
+    #[test]
+    fn blocked_stderr_does_not_stop_redacted_file_logging_or_health() {
+        struct Gate {
+            entered: Option<mpsc::Sender<()>>,
+            release: mpsc::Receiver<()>,
+            bytes: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Write for Gate {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).unwrap();
+                    let _ = self.release.recv_timeout(Duration::from_secs(5));
+                }
+                self.bytes.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mirror-independent.log");
+        let sink = RotatingFile::open(path.clone(), 1024 * 1024, 1, 1).unwrap();
+        let (file_tx, file_rx) = mpsc::sync_channel(8);
+        let file_worker = thread::spawn(move || {
+            run_file_writer(
+                Arc::new(Mutex::new(Some(sink))),
+                file_rx,
+                Arc::new(LogWriteHealth::default()),
+                Duration::ZERO,
+            )
+        });
+        let health = Arc::new(stderr_mirror::MirrorHealth::default());
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (mirror, stderr_worker) = stderr_mirror::Mirror::spawn(
+            Gate {
+                entered: Some(entered_tx),
+                release: release_rx,
+                bytes: Arc::clone(&bytes),
+            },
+            1,
+            Arc::clone(&health),
+        )
+        .unwrap();
+        let mut tee = TeeWriter {
+            file_tx: Some(file_tx.clone()),
+            stderr: StderrOutput::Subc(mirror),
+        };
+        tee.write_all(b"Authorization: Bearer mirror-secret-value\n")
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let start = Instant::now();
+        tee.write_all(b"Authorization: Bearer second-secret-value\n")
+            .unwrap();
+        tee.write_all(b"third\n").unwrap();
+        tee.flush().unwrap();
+        let snapshot = health.snapshot();
+        let elapsed = start.elapsed();
+        let file_progressed = writer_barrier(&file_tx);
+        let file = fs::read(&path).unwrap();
+        let _ = release_tx.send(());
+        drop(tee);
+        drop(file_tx);
+        stderr_worker.join().unwrap();
+        file_worker.join().unwrap();
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(file_progressed, "file writer waited on stderr");
+        assert_eq!(snapshot["dropped_lines_total"], 1);
+        assert_eq!(snapshot["dropped_flushes_total"], 1);
+        let file = String::from_utf8(file).unwrap();
+        let mirrored = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        for output in [&file, &mirrored] {
+            assert!(!output.contains("mirror-secret-value"), "{output}");
+            assert!(!output.contains("second-secret-value"), "{output}");
+            assert!(
+                output.contains(crate::log_redact::SECRET_PLACEHOLDER),
+                "{output}"
+            );
+        }
+        assert!(file.ends_with("third\n"));
+        assert!(!mirrored.contains("third"));
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum SinkFault {
         None,
@@ -3155,7 +3498,7 @@ mod tests {
                 LOG_WRITE_RETRY_MIN,
             )
         });
-        let mut tee = TeeWriter { file_tx: Some(tx) };
+        let mut tee = TeeWriter::new(Some(tx));
         let token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
         tee.write_all(
             format!("[aft] fetch https://bob:pw123@host.example/x?access_token=zz9 {token}\n")
