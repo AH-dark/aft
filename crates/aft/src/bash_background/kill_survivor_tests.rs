@@ -779,6 +779,16 @@ fn a_task_record_at_the_identity_cap_stays_bounded() {
     assert!(round_trip.group_member_identities_truncated);
 }
 
+/// The incomplete-listing sentence is fixed text that was approved as
+/// written; a change to it must be deliberate.
+#[test]
+fn incomplete_listing_note_is_the_approved_sentence() {
+    assert_eq!(
+        INCOMPLETE_LISTING_NOTE,
+        "AFT could not read every process in the task's group, so others may also be running."
+    );
+}
+
 /// A pseudoterminal task's group is checked after AFT kills it, which it was
 /// not before: a TERM-ignoring survivor is named, not left unreported.
 #[test]
