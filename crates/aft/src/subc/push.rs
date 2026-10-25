@@ -1901,6 +1901,7 @@ mod tests {
                 trust: BindTrust::FirstParty,
                 spawn_principal: AuthenticatedPrincipal::FirstParty,
                 consumer_elicitation_capable: false,
+                tool_result_body: false,
                 disabled_tools: Arc::default(),
                 run_scope: OnceLock::new(),
                 call_mode: subc_protocol::call_mode::CallMode::Classic,

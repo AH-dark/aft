@@ -335,6 +335,7 @@ fn identity(root: &Path, scope: Option<subc_protocol::scope::ScopeStamp>) -> Rou
             principal_id: Some("reserved:broca".into()),
         },
         consumer_elicitation_capable: false,
+        tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         scope,
         call_mode: subc_protocol::call_mode::CallMode::Classic,
@@ -3743,7 +3744,7 @@ async fn access_pending_renderer_wire_matches_golden_vector_without_consent() {
         BindTrust::FirstParty,
     )
     .unwrap();
-    let wire = String::from_utf8(frame.body).unwrap();
+    let wire = String::from_utf8(frame.frame.body).unwrap();
     let body: Value = serde_json::from_str(&wire).unwrap();
     assert_eq!(body["content"][0]["type"], "text");
     assert_eq!(body["isError"], true);

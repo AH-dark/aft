@@ -120,6 +120,54 @@ fn owner(admission: Admission) -> RouteIdentity {
 }
 
 #[test]
+fn codemode_reply_format_belongs_to_run_while_access_belongs_to_head() {
+    for head_format in [false, true] {
+        let mut f = fixture(run_stamp("agent-a", "head-a", Some("linked")));
+        let head = Arc::get_mut(&mut f.routes.get_mut(&channel(1)).unwrap().0).unwrap();
+        head.tool_result_body = head_format;
+        head.trust = BindTrust::Untrusted;
+        head.consumer_elicitation_capable = true;
+        let run_format = !head_format;
+        Arc::get_mut(&mut f.routes.get_mut(&channel(9)).unwrap().0)
+            .unwrap()
+            .tool_result_body = run_format;
+        let effective = owner(admit(
+            &f.routes,
+            channel(9),
+            Some(&call("read", json!({"path":"notes.txt"}))),
+        ));
+        assert_eq!(effective.project_root, f.routes[&channel(1)].project_root);
+        assert_eq!(effective.session, "head-a-session");
+        assert_eq!(effective.trust, BindTrust::Untrusted);
+        assert_eq!(
+            effective.disabled_tools.as_ref(),
+            &["disabled-by-head-a-session".to_owned()]
+        );
+        assert!(effective.consumer_elicitation_capable);
+        assert_eq!(
+            effective.tool_result_body, run_format,
+            "the receiving run negotiates its own reply format"
+        );
+        let result = ToolCallResult {
+            text: "outside".into(),
+            response: Response::error("id", "path_outside_root", "outside"),
+        };
+        let mut reply = wire::build_tool_response_frame(
+            PROTOCOL_VERSION,
+            channel(9),
+            1,
+            control_flags(),
+            &result,
+            effective.reply_policy(),
+        )
+        .unwrap();
+        reply.project_tool_result().unwrap();
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body.get("errorCode").is_some(), run_format);
+    }
+}
+
+#[test]
 fn codemode_call_to_tool_without_codemode_is_refused_call_mode_unsupported() {
     let f = fixture(run_stamp("agent-a", "head-a", Some("linked")));
     let body = call("bash_watch", json!({"taskId": "absent"}));

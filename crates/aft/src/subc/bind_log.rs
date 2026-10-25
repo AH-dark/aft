@@ -6,9 +6,9 @@ pub(super) fn consumer_capabilities(
     capabilities: &[String],
 ) {
     crate::slog_info!(
-        "subc bind consumer capabilities: principal={} harness={harness} content_v1={} held_reply_v1={} consumer_capabilities={:?} consumer_capabilities_total={}",
+        "subc bind consumer capabilities: principal={} harness={harness} tool_result_v1={} held_reply_v1={} consumer_capabilities={:?} consumer_capabilities_total={}",
         super::principal_label(principal),
-        capabilities.iter().any(|capability| capability == "content/v1"),
+        capabilities.iter().any(|capability| capability == super::result_body::RESULT_FORMAT),
         capabilities.iter().any(|capability| capability == "held-reply/v1"),
         &capabilities[..capabilities.len().min(8)],
         capabilities.len(),
@@ -122,10 +122,10 @@ mod tests {
             bind(
                 &principal,
                 "opencode",
-                &["content/v1".into(), "held-reply/v1".into()],
+                &["tool-result/v1".into(), "held-reply/v1".into()],
             );
             bind(&None, "mcp", &[]);
-            bind(&Some(Principal::Direct), "pi", &["content/v1".into()]);
+            bind(&Some(Principal::Direct), "pi", &["tool-result/v1".into()]);
             bind(
                 &principal,
                 "opencode",
@@ -139,7 +139,7 @@ mod tests {
                     "g".into(),
                     "h".into(),
                     "held-reply/v1".into(),
-                    "content/v1".into(),
+                    "tool-result/v1".into(),
                 ],
             );
         });
@@ -148,9 +148,9 @@ mod tests {
             .filter(|line| line.starts_with("INFO subc bind consumer capabilities:"))
             .collect();
         assert_eq!(lines.len(), 4, "one INFO line per bind: {lines:?}");
-        assert_eq!(lines[0], "INFO subc bind consumer capabilities: principal=reserved:opencode harness=opencode content_v1=true held_reply_v1=true consumer_capabilities=[\"content/v1\", \"held-reply/v1\"] consumer_capabilities_total=2");
-        assert_eq!(lines[1], "INFO subc bind consumer capabilities: principal=absent harness=mcp content_v1=false held_reply_v1=false consumer_capabilities=[] consumer_capabilities_total=0");
-        assert_eq!(lines[2], "INFO subc bind consumer capabilities: principal=direct harness=pi content_v1=true held_reply_v1=false consumer_capabilities=[\"content/v1\"] consumer_capabilities_total=1");
-        assert_eq!(lines[3], "INFO subc bind consumer capabilities: principal=reserved:opencode harness=opencode content_v1=true held_reply_v1=true consumer_capabilities=[\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\"] consumer_capabilities_total=10");
+        assert_eq!(lines[0], "INFO subc bind consumer capabilities: principal=reserved:opencode harness=opencode tool_result_v1=true held_reply_v1=true consumer_capabilities=[\"tool-result/v1\", \"held-reply/v1\"] consumer_capabilities_total=2");
+        assert_eq!(lines[1], "INFO subc bind consumer capabilities: principal=absent harness=mcp tool_result_v1=false held_reply_v1=false consumer_capabilities=[] consumer_capabilities_total=0");
+        assert_eq!(lines[2], "INFO subc bind consumer capabilities: principal=direct harness=pi tool_result_v1=true held_reply_v1=false consumer_capabilities=[\"tool-result/v1\"] consumer_capabilities_total=1");
+        assert_eq!(lines[3], "INFO subc bind consumer capabilities: principal=reserved:opencode harness=opencode tool_result_v1=true held_reply_v1=true consumer_capabilities=[\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\"] consumer_capabilities_total=10");
     }
 }

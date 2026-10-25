@@ -931,6 +931,7 @@ fn render_catalog(
     // Last, once the served names are final: every description names the
     // tools of this catalog and no other.
     render_tool_references(&mut answer.tools);
+    declare_result_format(&mut answer.tools, super::result_body::DECLARE_RESULT_FORMAT);
     // Every preset can settle a keyed call after its reply (a held shell
     // call, or a scoped call whose end was never observed), so every catalog
     // declares the session capability that lets a custodian pull those
@@ -1007,6 +1008,14 @@ fn render_catalog(
         return Ok(json!({"generation": digest, "catalog_digest": digest}));
     }
     Ok(serde_json::to_value(answer).expect("catalog is JSON"))
+}
+
+pub(super) fn declare_result_format(tools: &mut [CatalogTool], enabled: bool) {
+    if enabled {
+        for tool in tools {
+            tool.result_format = Some(super::result_body::RESULT_FORMAT.to_string().into());
+        }
+    }
 }
 
 /// Admit a v1 `tool.call` before anything runs, and resolve the role it runs
@@ -1819,7 +1828,7 @@ impl LedgerEdge {
                     decoded.frame.header.corr,
                     decoded.frame.header.flags,
                     &result,
-                    identity.trust,
+                    identity.reply_policy(),
                 ) {
                     let _ = send_reliable_writer_frame(&writer, &metrics, frame, "ledger refusal")
                         .await;
@@ -1840,6 +1849,7 @@ impl LedgerEdge {
         let metrics = metrics.clone();
         let root = identity.root.clone();
         let request_id = format!("ledger-{}-{}", route.channel, decoded.frame.header.corr);
+        let include_tool_result_body = identity.tool_result_body;
         let response_key = key.clone();
         let cancel = PersistentCancelSignal::new();
         let terminal_claim = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1893,7 +1903,7 @@ impl LedgerEdge {
                     }
                     ledger::reduce_expired(&conn, &key, now)
                         .and_then(|_| {
-                            ledger::admit(
+                            ledger::admit_with_tool_result_source(
                                 &conn,
                                 &key,
                                 &digest,
@@ -1903,6 +1913,7 @@ impl LedgerEdge {
                                 } else {
                                     State::DispatchStarted
                                 },
+                                include_tool_result_body,
                             )
                         })
                         .map_err(|error| {
@@ -1995,9 +2006,15 @@ impl LedgerEdge {
                             "ledger-attach".into(),
                             Box::new(move |ctx| {
                                 let row = ctx.db().and_then(|db| {
-                                    db.lock()
+                                    db.lock().ok().and_then(|conn| {
+                                        if include_tool_result_body {
+                                            ledger::get_for_replay(&conn, &key)
+                                        } else {
+                                            ledger::get(&conn, &key)
+                                        }
                                         .ok()
-                                        .and_then(|conn| ledger::get(&conn, &key).ok().flatten())
+                                        .flatten()
+                                    })
                                 });
                                 let _ = row_tx.send(row);
                                 Response::success("ledger-attach", json!({}))
@@ -2020,7 +2037,12 @@ impl LedgerEdge {
                                     let _ = send_reliable_writer_frame(
                                         &writer,
                                         &metrics,
-                                        frame,
+                                        WriterFrame::retained_tool_response_with_source(
+                                            frame,
+                                            identity.reply_policy(),
+                                            call.arguments.get("path").and_then(Value::as_str),
+                                            row.tool_result_source,
+                                        ),
                                         "attached ledger result",
                                     )
                                     .await;
@@ -2060,9 +2082,18 @@ impl LedgerEdge {
                         &response_key,
                         row.frame.as_ref(),
                     ) {
-                        let _ =
-                            send_reliable_writer_frame(&writer, &metrics, frame, "ledger replay")
-                                .await;
+                        let _ = send_reliable_writer_frame(
+                            &writer,
+                            &metrics,
+                            WriterFrame::retained_tool_response_with_source(
+                                frame,
+                                identity.reply_policy(),
+                                call.arguments.get("path").and_then(Value::as_str),
+                                row.tool_result_source,
+                            ),
+                            "ledger replay",
+                        )
+                        .await;
                     }
                 }
                 Ok(Admission::Conflict) => {
@@ -2094,10 +2125,10 @@ impl LedgerEdge {
                         decoded.frame.header.corr,
                         decoded.frame.header.flags,
                         &result,
-                        identity.trust,
+                        identity.reply_policy(),
                     ) {
                         if edge.finish_waiting(&decoded.frame) {
-                            frame = Self::cancelled_frame(&decoded.frame).unwrap();
+                            frame = Self::cancelled_frame(&decoded.frame).unwrap().into();
                         }
                         let _ =
                             send_reliable_writer_frame(&writer, &metrics, frame, "ledger refusal")
@@ -2637,6 +2668,11 @@ impl LedgerEdge {
                     continue;
                 }
                 let actual = actual.clone();
+                let (tool_body_for_job, projection_error) =
+                    match outgoing.tool_result_source_for_retention() {
+                        Ok(body) => (body, None),
+                        Err(error) => (None, Some(error.to_string())),
+                    };
                 let recorded = RecordedFrame {
                     ty: outgoing.header.ty,
                     body: copy_terminal_body(&outgoing.body),
@@ -2647,6 +2683,9 @@ impl LedgerEdge {
                     Lane::Mutating,
                     "ledger-settle".into(),
                     Box::new(move |ctx| {
+                        if let Some(error) = projection_error {
+                            return Response::error("ledger-settle", "database_unavailable", error);
+                        }
                         let Some(db) = ctx.db() else {
                             return Response::error(
                                 "ledger-settle",
@@ -2683,23 +2722,27 @@ impl LedgerEdge {
                         } else {
                             inferred
                         };
-                        match ledger::settle(
+                        match ledger::settle_with_tool_result_source(
                             &conn,
                             &call.key,
                             &record_for_job,
                             &outcome,
                             reason,
                             ledger::now_ms(),
+                            tool_body_for_job.as_deref(),
                         ) {
                             Ok(true) => {}
                             Ok(false)
-                                if ledger::get(&conn, &call.key)
+                                if ledger::get_for_replay(&conn, &call.key)
                                     .ok()
                                     .flatten()
-                                    .and_then(|row| row.frame)
-                                    .is_some_and(|frame| {
-                                        frame.ty == record_for_job.ty
-                                            && frame.body == record_for_job.body
+                                    .is_some_and(|row| {
+                                        row.tool_result_source.as_deref()
+                                            == tool_body_for_job.as_deref()
+                                            && row.frame.is_some_and(|frame| {
+                                                frame.ty == record_for_job.ty
+                                                    && frame.body == record_for_job.body
+                                            })
                                     }) => {}
                             result => {
                                 return Response::error(
@@ -4868,6 +4911,7 @@ mod route_tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::new(disabled),
             scope,
             run_scope: OnceLock::new(),
@@ -5334,6 +5378,7 @@ mod route_tests {
             trust: BindTrust::FirstParty,
             spawn_principal: runner_restore_principal(&project),
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::default(),
             scope: None,
             run_scope: OnceLock::new(),
@@ -5821,6 +5866,7 @@ mod route_tests {
                 principal_id: Some("reserved:broca".into()),
             },
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             scope: Some(stamp("worker")),
             run_scope: OnceLock::new(),

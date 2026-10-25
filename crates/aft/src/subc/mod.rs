@@ -202,7 +202,7 @@ mod bash;
 mod bind_log;
 mod call_policy;
 #[cfg(test)]
-mod content_v1_tests;
+mod tool_result_tests;
 // The grant tests run real shell commands, which need a POSIX shell.
 #[cfg(all(test, unix))]
 mod bash_grant_tests;
@@ -228,6 +228,8 @@ mod persistence;
 mod push;
 mod readiness;
 mod remote_policy;
+pub(crate) mod result_body;
+mod retained_result;
 mod run_scope;
 mod scope_describe;
 #[cfg(test)]
@@ -1289,11 +1291,16 @@ pub(crate) fn recovered_bash_frame(
     snapshot: crate::bash_background::registry::BgTaskSnapshot,
     key: &crate::db::call_ledger::Key,
     project_root: &Path,
-) -> Option<(crate::db::call_ledger::RecordedFrame, String)> {
+) -> Option<(
+    crate::db::call_ledger::RecordedFrame,
+    String,
+    Option<Vec<u8>>,
+)> {
     if snapshot.info.status == crate::bash_background::BgTaskStatus::FateUnknown {
         return Some((
             crate::db::call_ledger::not_retained(key, "unknown"),
             "unknown".into(),
+            None,
         ));
     }
     let now = Instant::now();
@@ -1330,12 +1337,39 @@ pub(crate) fn recovered_bash_frame(
         BindTrust::Untrusted,
     )
     .ok()?;
+    // Recovery no longer has the vanished consumer's format declaration. Keep
+    // its legacy bytes, plus a bounded complete result for a future opt-in replay.
+    let mut projected = build_tool_response_frame(
+        PROTOCOL_VERSION,
+        route_key(1, 1),
+        1,
+        control_flags(),
+        &result,
+        wire::ToolResponsePolicy {
+            trust: BindTrust::FirstParty,
+            tool_result_body: true,
+        },
+    )
+    .ok()?;
+    projected.frame = Frame::build_with_version(
+        frame.header.ver,
+        frame.header.ty,
+        frame.header.flags,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+        frame.frame.body.clone(),
+    )
+    .ok()?;
+    let tool_result_body = projected.tool_result_source_for_retention().ok()?;
+    drop(projected);
     Some((
         crate::db::call_ledger::RecordedFrame {
             ty: frame.header.ty,
-            body: frame.body,
+            body: frame.frame.body,
         },
         outcome,
+        tool_result_body,
     ))
 }
 
@@ -1417,6 +1451,12 @@ struct RouteBindCompletion {
 #[derive(Debug, Clone)]
 struct RouteIdentity(Arc<RouteIdentityData>);
 
+impl RouteIdentity {
+    fn reply_policy(&self) -> wire::ToolResponsePolicy {
+        self.into()
+    }
+}
+
 #[derive(Debug)]
 struct RouteIdentityData {
     root: ProjectRootId,
@@ -1427,6 +1467,7 @@ struct RouteIdentityData {
     trust: BindTrust,
     spawn_principal: AuthenticatedPrincipal,
     consumer_elicitation_capable: bool,
+    tool_result_body: bool,
     /// `disabled_tools` resolved from the config files when this route bound.
     /// Every tool call on the route is checked against this snapshot, so a
     /// config edit applies to the next bind, not mid-session.
@@ -6466,6 +6507,9 @@ where
                 continue;
             };
             prefer_pong = !control;
+            queued.project_tool_result().map_err(|error| {
+                subc_transport::FrameIoError::Io(io::Error::other(error.to_string()))
+            })?;
             let measure = queued.tool_response_trace.is_some();
             let dequeued = measure.then(Instant::now);
             metrics.writer_active.store(true, Ordering::Relaxed);
@@ -7722,6 +7766,7 @@ async fn handle_control_request(
             let consumer_elicitation_capable = consumer_capabilities
                 .as_ref()
                 .is_some_and(|capabilities| capabilities.iter().any(|c| c == "elicitation"));
+            let tool_result_body = result_body::accepts(consumer_capabilities.as_deref());
             log::info!(
                 "subc attach: route {} harness={} principal={} trust={} elicitation={}",
                 route_channel,
@@ -7793,6 +7838,7 @@ async fn handle_control_request(
                     principal_id: bind_principal_id,
                 },
                 consumer_elicitation_capable,
+                tool_result_body,
                 disabled_tools: bind_disabled_tools,
                 run_scope: OnceLock::new(),
                 call_mode: call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic),
@@ -9137,6 +9183,7 @@ impl PlainToolRun {
                 io_budget
             };
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
+            let _result_body = result_body::enter(identity_for_run.tool_result_body);
             phase_trace.mark_job_admitted();
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
                 // Both the tool's run and the reply's finishing use the trace.
@@ -9907,7 +9954,7 @@ async fn handle_tool_call(
             frame.header.corr,
             frame.header.flags,
             &result,
-            bind_trust,
+            identity.reply_policy(),
             tool_response_body_limit,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
@@ -9941,7 +9988,7 @@ async fn handle_tool_call(
             frame.header.corr,
             frame.header.flags,
             &result,
-            bind_trust,
+            identity.reply_policy(),
             tool_response_body_limit,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
@@ -9965,7 +10012,7 @@ async fn handle_tool_call(
             frame.header.corr,
             frame.header.flags,
             &result,
-            bind_trust,
+            identity.reply_policy(),
             tool_response_body_limit,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
@@ -10004,7 +10051,7 @@ async fn handle_tool_call(
             frame.header.corr,
             frame.header.flags,
             &result,
-            bind_trust,
+            identity.reply_policy(),
             tool_response_body_limit,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
@@ -10040,7 +10087,7 @@ async fn handle_tool_call(
                 frame.header.corr,
                 frame.header.flags,
                 &result,
-                bind_trust,
+                identity.reply_policy(),
                 tool_response_body_limit,
             )?;
             return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
@@ -10075,7 +10122,7 @@ async fn handle_tool_call(
                         frame.header.corr,
                         frame.header.flags,
                         &result,
-                        bind_trust,
+                        identity.reply_policy(),
                         tool_response_body_limit,
                     )?;
                     return send_reliable_writer_frame(
@@ -10272,7 +10319,7 @@ async fn handle_tool_call(
                 frame.header.corr,
                 frame.header.flags,
                 &result,
-                bind_trust,
+                identity.reply_policy(),
                 tool_response_body_limit,
             )?;
             return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
@@ -10595,7 +10642,7 @@ async fn handle_tool_call(
                         corr,
                         flags,
                         &result,
-                        bind_trust,
+                        identity.reply_policy(),
                         tool_response_body_limit,
                     ) {
                         Ok(response_frame) => {
@@ -10656,7 +10703,7 @@ async fn handle_tool_call(
                         corr,
                         flags,
                         &result,
-                        bind_trust,
+                        identity.reply_policy(),
                         tool_response_body_limit,
                     ) {
                         let _ = send_reliable_writer_frame(
@@ -10780,7 +10827,7 @@ async fn handle_tool_call(
             corr,
             flags,
             &result,
-            bind_trust,
+            identity.reply_policy(),
             tool_response_body_limit,
         ) {
             Ok(response_frame) => {
@@ -11203,7 +11250,7 @@ async fn deliver_resolved_subc_response(
         entry.corr,
         entry.flags,
         &result,
-        identity.trust,
+        identity.reply_policy(),
         tool_response_body_limit,
     )?;
     let trace = ToolResponseWriteTrace::new(
@@ -12151,6 +12198,7 @@ pub(crate) mod test_support {
                 principal_id: Some("reserved:broca".into()),
             },
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             run_scope: OnceLock::new(),
             call_mode: subc_protocol::call_mode::CallMode::Classic,
@@ -13420,6 +13468,7 @@ pub(crate) mod test_support {
                 }),
             },
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
             call_mode: subc_protocol::call_mode::CallMode::Classic,
@@ -18659,6 +18708,7 @@ mod tests {
                 trust,
             )
             .expect("tool response frame")
+            .frame
             .body
         };
         let harness_body = frame_for(harness_module);
@@ -18852,6 +18902,7 @@ mod tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
             call_mode: subc_protocol::call_mode::CallMode::Classic,
@@ -18937,6 +18988,7 @@ mod tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
             call_mode: subc_protocol::call_mode::CallMode::Classic,
