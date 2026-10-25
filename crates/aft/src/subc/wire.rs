@@ -90,6 +90,7 @@ impl ToolResponseWriteTrace {
         write_started: std::time::Instant,
         write_finished: std::time::Instant,
         frame_bytes: usize,
+        prepare_cpu: Option<std::time::Duration>,
     ) -> Option<CompletedToolResponseTrace> {
         let phases = self.phase_trace.finish(ToolCallEgressTiming {
             enqueued: self.enqueued_at?,
@@ -101,6 +102,7 @@ impl ToolResponseWriteTrace {
             writer_active_at_enqueue: self.writer_active_at_enqueue,
             writer_queue_was_full: self.writer_queue_was_full,
             reserve_timeouts: self.reserve_timeouts,
+            prepare_cpu,
         })?;
         Some(CompletedToolResponseTrace {
             name: self.name,
