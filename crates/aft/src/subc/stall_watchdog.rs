@@ -1127,6 +1127,128 @@ mod tests {
         }
     }
 
+    fn stderr_ping_probe(test_name: &str, action: &'static str, subc: bool) {
+        const PROBE: &str = "AFT_TEST_SUBC_STDERR_PROBE";
+        // libtest's exact names omit the crate prefix from module_path!().
+        let test_name = test_name.split_once("::").unwrap().1;
+        if std::env::var(PROBE).ok().as_deref() != Some(test_name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture", "--color=never"])
+                .env(PROBE, test_name)
+                .env("RUST_LOG", "off")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "stderr probe failed: stdout={:?} stderr={:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use super::super::*;
+            use std::io::Write;
+            if subc {
+                crate::logging::init_subc();
+            } else {
+                crate::logging::init();
+            }
+            let tee = Arc::new(Mutex::new(crate::logging::subc_stderr_tee_for_test()));
+            let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let before_frame_armed = Arc::clone(&armed);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let mut fixture = FrameLoopFixture::start(Arc::new(move || {
+                if !before_frame_armed.swap(false, Ordering::Relaxed) {
+                    return;
+                }
+                let mut tee = tee.lock().unwrap();
+                entered_tx.send(()).unwrap();
+                match action {
+                    "write" => tee.write_all(b"[aft] WARN held stderr probe\n").unwrap(),
+                    "flush" => tee.flush().unwrap(),
+                    _ => unreachable!(),
+                }
+            }))
+            .await;
+            fixture.ping(90).await;
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder = thread::spawn(move || {
+                let stderr = std::io::stderr();
+                let _held = stderr.lock();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+            held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            armed.store(true, Ordering::Relaxed);
+            fixture.send_ping(891).await;
+            let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+            let pong =
+                tokio::time::timeout(Duration::from_secs(1), read_frame(&mut fixture.daemon)).await;
+            let _ = release_tx.send(());
+            holder.join().unwrap();
+            fixture.finish();
+            entered.expect("stderr probe callback never entered");
+            if subc {
+                let pong = pong
+                    .expect("stderr callback blocked frame-loop Ping")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!((pong.header.ty, pong.header.corr), (FrameType::Pong, 891));
+            } else {
+                assert!(pong.is_err(), "standalone stderr stopped being synchronous");
+            }
+        });
+    }
+
+    #[test]
+    fn subc_stderr_write_keeps_ping_live() {
+        stderr_ping_probe(
+            concat!(module_path!(), "::subc_stderr_write_keeps_ping_live"),
+            "write",
+            true,
+        );
+    }
+
+    #[test]
+    fn subc_stderr_flush_keeps_ping_live() {
+        stderr_ping_probe(
+            concat!(module_path!(), "::subc_stderr_flush_keeps_ping_live"),
+            "flush",
+            true,
+        );
+    }
+
+    #[test]
+    fn standalone_stderr_write_preserves_synchronous_delivery() {
+        stderr_ping_probe(
+            concat!(
+                module_path!(),
+                "::standalone_stderr_write_preserves_synchronous_delivery"
+            ),
+            "write",
+            false,
+        );
+    }
+
+    #[test]
+    fn standalone_stderr_flush_preserves_synchronous_delivery() {
+        stderr_ping_probe(
+            concat!(
+                module_path!(),
+                "::standalone_stderr_flush_preserves_synchronous_delivery"
+            ),
+            "flush",
+            false,
+        );
+    }
+
     #[tokio::test]
     async fn frame_loop_answers_ping_while_watch_diagnostic_database_is_locked() {
         use super::super::*;

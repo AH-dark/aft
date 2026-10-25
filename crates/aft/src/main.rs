@@ -76,6 +76,24 @@ fn parse_subc_arg(
     None
 }
 
+fn uses_subc_stderr(first_arg: Option<&str>, has_connection_file: bool) -> bool {
+    has_connection_file && !matches!(first_arg, Some("profile" | "warmup"))
+}
+
+#[cfg(test)]
+mod stderr_mode_tests {
+    use super::uses_subc_stderr;
+
+    #[test]
+    fn logger_mode_follows_transport_and_preserves_early_cli_precedence() {
+        assert!(uses_subc_stderr(Some("--subc"), true));
+        assert!(uses_subc_stderr(Some("--subc=connection.json"), true));
+        assert!(!uses_subc_stderr(None, false));
+        assert!(!uses_subc_stderr(Some("profile"), true));
+        assert!(!uses_subc_stderr(Some("warmup"), true));
+    }
+}
+
 /// Upper bound on how long an exit waits for the durable log to catch up.
 const DURABLE_LOG_EXIT_FLUSH: Duration = Duration::from_secs(2);
 
@@ -288,7 +306,15 @@ fn main() {
     // keeps its legitimate read of these markers.
     aft::agent_child_env::scrub_inherited_process_markers();
 
-    aft::logging::init();
+    let subc_connection_file = parse_subc_arg(std::env::args_os().skip(1));
+    if uses_subc_stderr(
+        std::env::args().nth(1).as_deref(),
+        subc_connection_file.is_some(),
+    ) {
+        aft::logging::init_subc();
+    } else {
+        aft::logging::init();
+    }
     aft::effective_path::log_startup_probe_result();
 
     if std::env::args().nth(1).as_deref() == Some("profile") {
@@ -322,7 +348,7 @@ fn main() {
     // Presence of --subc => subc mode; absence => standalone (the dormancy gate).
     // Fail-loud on connect/auth failure — never silently downgrade to standalone
     // (split-brain index state). tokio runs ONLY inside run_subc_mode.
-    if let Some(connection_file) = parse_subc_arg(std::env::args_os().skip(1)) {
+    if let Some(connection_file) = subc_connection_file {
         aft::slog_info!("subc mode, pid {}", std::process::id());
         aft::launch_nonce::log_capture_outcome();
         // The supervised module holds the secret it authenticates to the
@@ -396,7 +422,9 @@ fn main() {
                     aft::subc::exit_elapsed().as_millis()
                 );
                 if let Err(error) = aft::logging::write_terminal_log_sync(&terminal) {
-                    eprintln!("[aft] terminal log persistence failed: {error}; {terminal}");
+                    aft::logging::write_stderr_diagnostic(&format!(
+                        "[aft] terminal log persistence failed: {error}; {terminal}\n"
+                    ));
                 }
                 #[cfg(debug_assertions)]
                 storage_lease_exit_probe();
