@@ -3809,7 +3809,9 @@ mod trace_to_tests {
     fn reverse_replies_batch_all_boundary_symbols_once() {
         for width in [2, 20] {
             for depth in [1, 5, 100] {
+                let temp = tempfile::tempdir().unwrap();
                 let (mut store, target) = layered_store(width, depth + 1);
+                store.root = temp.path().to_path_buf();
                 let first = store.nodes[&("layer_1_0.ts".into(), "layer_1_0".into())].clone();
                 // The layered fanout supplies diamond joins; this back edge
                 // makes revisiting an already expanded symbol unavoidable.
@@ -3865,7 +3867,9 @@ mod trace_to_tests {
 
     #[test]
     fn reverse_replies_preserve_diamond_cycle_and_hidden_test_json() {
+        let temp = tempfile::tempdir().unwrap();
         let mut store = CountingStore::new();
+        store.root = temp.path().to_path_buf();
         let target = node("target", false);
         let alpha = node("alpha", false);
         let beta = node("beta", false);
@@ -3926,7 +3930,9 @@ mod trace_to_tests {
 
     #[test]
     fn callers_and_impact_count_callers_omitted_at_the_depth_limit() {
+        let temp = tempfile::tempdir().unwrap();
         let mut store = CountingStore::new();
+        store.root = temp.path().to_path_buf();
         let target = node("target", false);
         let boundary = node("boundary", false);
         let upstream_a = node("upstreamA", true);
@@ -3976,7 +3982,9 @@ mod trace_to_tests {
     #[test]
     // At depth one hubCaller is listed, but upstreamA and upstreamB are not.
     fn batched_boundary_counts_preserve_serialized_callers_and_impact_contract() {
+        let temp = tempfile::tempdir().unwrap();
         let mut store = CountingStore::new();
+        store.root = temp.path().to_path_buf();
         let target = node("target", false);
         let boundary = node("hubCaller", false);
         let upstream_a = node("upstreamA", true);
