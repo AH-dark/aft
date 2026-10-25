@@ -60,11 +60,10 @@ mechanism. Each implementation slice rebases on current main before merging.
 
 ## Four required implementation conditions
 
-These conditions adopt the third review of the revision-2.2 design
-(`.cortexkit/internal-docs/designs/views-default-athena-review-3.md`,
-Recommendation and start decision) and the corrected contracts in
-`.cortexkit/internal-docs/designs/views-default.md`, sections 2.2–2.3 and 11.
-The 3a exit artifact overrides older design spellings and paths.
+These conditions adopt the third design review of the revision-2.2 views design
+(its recommendation and start decision) and that design's corrected contracts
+for shared bases, references and durability. The 3a exit artifact overrides
+older design spellings and paths.
 
 ### C3 — terminal cleanup and generation-aware base edges
 
@@ -184,14 +183,11 @@ all-plane parity, cross-platform performance or a verified-bind protocol.
 
 The **chair family-limit ruling of 2026-10-25** keeps each repository family's
 **2 GiB target and 4 GiB hard limit**. After the landed #698 shrink and #870
-in-place derived writes, the 01:50Z measurement with
-`.cortexkit/scripts/measure-views-working-sets.sh` found the largest family
-referenced 1.0 GiB (about 1.26 GiB on disk across 21 checkouts), with every
-family within target. The source is
-`.cortexkit/prefrontal/specs/ct_00000000-0000-44eb-98e0-a97d57cf4aa0.md`,
-“recorded supplied ruling 6” and “Family limits” (lines 136–144 and 174).
-The values are reproduced here because that internal source is not a published
-design document; this is not a new measurement.
+in-place derived writes, the 01:50Z measurement of the live store found the
+largest family referenced 1.0 GiB (about 1.26 GiB on disk across 21
+checkouts), with every family within target. These values come from the
+maintainers' internal measurement and are reproduced here so the published
+design is self-contained; this is not a new measurement.
 
 No slice changes a family-limit or budget constant. The 3a namespace budget is
 4 GiB per family, and the device free-space floor is **max(4 GiB, 5% of device
@@ -201,11 +197,9 @@ hard-limit breach with the named G4c storage gap, never a legacy fallback.
 
 ## Pre-slice-4 ruling (2026-10-25)
 
-Ufuk approved the recorded chair ruling in
-`.cortexkit/internal-docs/designs/views-pre-slice4-ruling.md` on 2026-10-25,
-including the 1 GiB reservation-cap amendment. That ignored internal document
-is not available through the published design docs, so its binding values are
-reproduced below. They apply to slices 4–7d. **Judgment** identifies a frozen
+The maintainers approved the pre-slice-4 chair ruling on 2026-10-25, including
+the 1 GiB reservation-cap amendment. Its binding values are reproduced below
+so the published design is self-contained. They apply to slices 4–7d. **Judgment** identifies a frozen
 chair choice, not an achieved measurement or passing gate; the “measured by”
 obligations remain with the implementing slices.
 
