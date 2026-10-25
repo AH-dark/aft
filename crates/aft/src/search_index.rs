@@ -4223,7 +4223,7 @@ impl SearchIndexSnapshot {
             if let Some(base) = &self.base {
                 matches.reserve(base_entry.count as usize);
                 let mut posting_index = 0usize;
-                let _ = base.for_each_posting(base_entry, |file_id, next_mask, loc_mask| {
+                base.for_each_posting(base_entry, |file_id, next_mask, loc_mask| {
                     // Check cancellation on the same 64-record cadence as the
                     // delta loop below. Superseded files are dropped by
                     // `is_active_file`, so no separate lookup is needed here.
@@ -4248,7 +4248,10 @@ impl SearchIndexSnapshot {
                         matches.push(file_id);
                     }
                     true
-                });
+                }).map_err(|error| std::io::Error::new(error.kind(), format!(
+                    "lexical postings read failed for trigram {trigram:#08x} ({} stored file records): {error}",
+                    base_entry.count,
+                )))?;
             }
         }
         if let Some(postings) = self.delta.postings.get(&trigram) {
@@ -12315,6 +12318,171 @@ mod tests {
         assert!(parse_git_name_status_z(b"R100\0old.rs\0").is_none());
         assert!(parse_git_name_status_z(b"M\0file.rs").is_none());
         assert!(!git_diff_within_path_limit(b"R100\0old.rs\0", 512));
+    }
+
+    #[test]
+    fn audit10_7_posting_failure_is_not_a_complete_empty_grep_reply() {
+        let (_directory, context, _) = unreadable_postings_fixture();
+        let request = crate::protocol::RawRequest {
+            id: "posting-failure".to_string(),
+            command: "grep".to_string(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"pattern":"needle", "max_results":10}),
+        };
+        let response = crate::commands::grep::handle_grep(&request, &context);
+        assert!(
+            !response.success,
+            "unreadable lexical evidence was accepted: {:?}",
+            response.data
+        );
+        assert!(response.data.to_string().contains("lexical postings"));
+    }
+
+    fn unreadable_postings_fixture() -> (tempfile::TempDir, crate::context::AppContext, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let source = root.join("lib.rs");
+        fs::write(&source, "pub fn needleHandler() {}\n").unwrap();
+        let mut index = SearchIndex::build_with_limit(&root, 1024 * 1024);
+        let path = directory.path().join("unreadable-postings.bin");
+        fs::write(&path, []).unwrap();
+        let CompileResult::Ok(pattern) =
+            pattern_compile::compile("needleHandler", CompileOpts::default())
+        else {
+            panic!("literal must compile")
+        };
+        let query = decompose_grep_pattern(&pattern);
+        let mut lookup = query
+            .and_trigrams
+            .iter()
+            .copied()
+            .map(|trigram| LookupEntry {
+                trigram,
+                offset: 0,
+                count: 1,
+            })
+            .collect::<Vec<_>>();
+        lookup.sort_unstable_by_key(|entry| entry.trigram);
+        index.base = Some(Arc::new(BasePostings {
+            file: Arc::new(fs::File::open(path).unwrap()),
+            postings_blob_start: 0,
+            postings_blob_len: POSTING_BYTES as u64,
+            lookup: Arc::new(lookup),
+        }));
+        index.delta = Arc::new(DeltaState::default());
+        let context = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        *context.search_index().write().unwrap() = Some(index);
+        (directory, context, root)
+    }
+
+    #[test]
+    fn audit10_7_partial_grep_keeps_readable_sources_even_without_matches() {
+        let (_directory, context, root) = unreadable_postings_fixture();
+        let explicit = root.join("explicit.rs");
+        for content in ["no matches\n", "needle\n"] {
+            fs::write(&explicit, content).unwrap();
+            let request = crate::protocol::RawRequest {
+                id: "partial-posting-failure".to_string(),
+                command: "grep".to_string(),
+                session_id: None,
+                lsp_hints: None,
+                params: serde_json::json!({"pattern":"needle", "max_results":10, "path":[root, explicit]}),
+            };
+            let response = crate::commands::grep::handle_grep(&request, &context);
+            assert!(
+                response.success,
+                "readable explicit scope was discarded: {:?}",
+                response.data
+            );
+            assert_eq!(response.data["complete"], false);
+            assert_eq!(
+                response.data["matches"].as_array().unwrap().len(),
+                usize::from(content == "needle\n")
+            );
+            assert!(response.data["index_read_gap"]
+                .to_string()
+                .contains("lexical postings"));
+        }
+    }
+
+    #[test]
+    fn audit10_7_rank_and_exact_queries_propagate_posting_io_errors() {
+        let (_directory, context, root) = unreadable_postings_fixture();
+        let guard = context.search_index().read().unwrap();
+        let snapshot = guard.as_ref().unwrap().snapshot();
+        let query = query_trigrams_from_tokens(&["needle"]);
+        for error in [
+            snapshot
+                .lexical_rank_with_stats(&query, None, 10)
+                .unwrap_err(),
+            snapshot
+                .lexical_rank_at_depth(&query, None, 10)
+                .unwrap_err(),
+            snapshot
+                .whole_corpus_exact_pass("needle", &root, None)
+                .unwrap_err(),
+            snapshot
+                .files_possibly_holding_phrase("needle", &root)
+                .unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("lexical postings"));
+        }
+    }
+
+    #[test]
+    fn audit10_7_search_discloses_posting_failure_with_verified_exact_fallback() {
+        let (_directory, context, _) = unreadable_postings_fixture();
+        let request = crate::protocol::RawRequest {
+            id: "search-posting-failure".to_string(),
+            command: "semantic_search".to_string(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"query":"needleHandler", "topK":10}),
+        };
+        let response = crate::commands::semantic_search::handle_semantic_search(&request, &context);
+        assert!(
+            response.success,
+            "readable exact fallback discarded: {:?}",
+            response.data
+        );
+        assert_eq!(response.data["complete"], false);
+        assert!(response.data["index_read_gap"]
+            .to_string()
+            .contains("lexical postings"));
+        assert!(
+            response.data["text"].as_str().unwrap().contains("lib.rs"),
+            "{:?}",
+            response.data
+        );
+    }
+
+    #[test]
+    fn audit10_7_split_search_discloses_posting_failure() {
+        let (_directory, context, _) = unreadable_postings_fixture();
+        let request = crate::protocol::RawRequest {
+            id: "split-posting-failure".to_string(),
+            command: "semantic_search".to_string(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"query":"find handler implementation", "pattern":"needleHandler", "topK":10}),
+        };
+        let response = crate::commands::semantic_search::handle_semantic_search(&request, &context);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], false);
+        assert!(
+            response.data["index_read_gap"]
+                .to_string()
+                .contains("lexical postings"),
+            "{:?}",
+            response.data
+        );
     }
 
     #[test]
