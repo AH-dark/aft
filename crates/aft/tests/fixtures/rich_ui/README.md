@@ -17,7 +17,7 @@ The Bash page's reads equal the placeholder page template's reads.
 | Operation | Target | Result |
 |---|---|---|
 | bash_status | bash_status | `{running, exitCode}` |
-| bash_output | bash_status | `{items: [{stream, text, bytes}], next}`; never total |
+| bash_output | bash_status | `{items: [{stream, text, bytes, continued, firstAvailableOffset, prefixDropped}], next}`; never total |
 | bash_watch | bash_watch | `{running, exitCode, waited: {reason, limit_ms}}` |
 | read | read | `{text}` |
 | outline | outline | `{text}` |
@@ -103,16 +103,27 @@ in any carrier reply.
   compact JSON array `[owner principal_id,scope_ref,epoch decimal string]`;
   ledger scope is None. S's policy-route principal is never the ledger carrier,
   and the ledger row's scope is never S's scope.
-- **Bind-label equality.** On S's scope, the carrier route's project_root,
-  harness and session must exactly equal S's policy route labels. Any mismatch
-  makes **every** carrier call refuse `session_not_bound`, reads included.
-  S is found by stamped owner/ref/epoch, never by opener-supplied labels.
-  Unscoped and self-owned scoped routes serve provider reads only.
+- **Stamp equality, not label equality.** A carrier route serves S only when
+  its daemon-stamped `(owner, ref, epoch)` equals S's policy-route stamp. The
+  daemon attests the same stamp on both routes. Route labels (`project_root`,
+  `harness`, `session`) are always the opener's own unattested claims.
+  Occipital sends neutral labels of its own; AFT ignores those labels and the
+  carrier's project_root, so there is no label comparison.
+- **Policy-route source.** S's project, read rules, harness and session come
+  only from S's own live policy route: core's relay for a head, Broca's tool
+  route for a worker. The project is checked against the stamp's
+  `workdir`/`project_id` under `scope-workdir/v1`. The Bash task table uses S's
+  harness and session from that policy route. No live policy route under S's
+  stamp means `session_not_bound`. Unscoped and self-owned scoped Occipital
+  routes serve provider reads only.
 
-**CKIOS confirmation requested:** where does Occipital learn S's exact project
-root, harness and session labels? The bind contract depends on that source.
-CKIOS should write the real row/page templates against this freeze, then hand
-over unchanged canonical template files, their SHA-256s and the catalog digest.
+**CKIOS accepted the freeze** in Rich UI room seq 105, following handoff seq
+104 (review/rich-ui-s02-freeze at d10f0710b5). The label-source acceptance item
+is **resolved by stamp equality**, agreed in SUBC seq 109, CKIOS seq 107 and AFT
+seq 110. That rule supersedes the original bind-label equality handoff: no
+source of S's labels is needed by Occipital. CKIOS supplies the real row/page
+templates against this freeze as canonical files with SHA-256s and catalog
+digest; the promised handover is 2026-10-26T02:00Z.
 Publication also waits for CKIOS canonicalization vectors, all carrier operations
 and validation, approval of agent-visible refusal wording, SUBC capability
 confirmation and the pinned daemon's HELLO test. This handoff does not attach a
@@ -150,3 +161,115 @@ integers only. The remaining cases pin member sorting by UTF-16 code unit,
 string escaping, preserved array order, the manifest number rule's exact
 ±(2^53-1) bounds, and its refusals for a fractional and an out-of-range
 number.
+
+## Terminal `aft.bash.view` v1 record
+
+`view-record.json` freezes the full closed record schema, field provenance and
+vectors; future record-builder tests must validate their results against it.
+The manifest deliberately keeps only `viewRecord: {schema, version}`: the
+closed manifest language has no member for an embedded view-record schema.
+The original task id, original Bash pin and stored template digests remain in
+the record. All fields below are required; nullable means an explicit null is
+allowed, not that the key may be omitted. Counts are bounded safe integers.
+
+| Field | Type / values | Source |
+|---|---|---|
+| schema / version | `"aft.bash.view"` / `1` | fixed record identity |
+| task_id | string ≤1,024 bytes | `PersistedTask.task_id`; snapshot `info.task_id` |
+| schema_pin | string ≤1,024 bytes | original Bash `ToolCallRequest.schema_pin`, threaded into the task by the later view-record writer, not the observing status/watch pin |
+| phase | `"finished"` only | terminal-state guard; host supplies running state before any record |
+| exitCode | integer ±(2^53−1), nullable | snapshot / persisted `exit_code`; unknown stays null |
+| durationMs | integer 0…2^53−1, nullable | snapshot / persisted `duration_ms`; unknown stays null |
+| outputBytes | integer 0…2^53−1, nullable | task-row `output_bytes`: retained stdout + stderr file lengths, or PTY file length; null if neither length is readable |
+| endReason | `completed`, `failed`, `killed`, `timed_out`, `fate_unknown` | terminal `BgTaskStatus`, not free-text status_reason |
+| templates | `{row: string ≤71 bytes, page: string ≤71 bytes}` | first-write-wins stored template digests selected with the original Bash pin |
+
+Code sources: `crates/aft/src/bash_background/mod.rs:908-943` defines snapshot
+info and terminal states; `registry.rs:687-755` defines the snapshot;
+`persistence.rs:1549-1673` defines persisted task data, and
+`persistence.rs:1804-1842,1932-1946` captures retained byte lengths into the task
+row. Windows remote exit codes may exceed i32::MAX
+(`persistence.rs:1581-1583`), so the status/watch/view schemas preserve those
+values within the manifest's safe-integer range.
+
+There is **no foreground/background/promoted mode field**: persisted capture
+mode is only `pipes` or `pty` (`persistence.rs:1534-1540,1565`). It is not a
+three-way launch history, and a terminal observer cannot reconstruct that
+history reliably after restart. Every record observes a terminal task, even
+if that task originally ran in the background; its actual exit code is not
+blanked merely because of its launch style. Running/background presentation
+and start time come from the host's display state before a terminal record,
+not from invented fields on the record. Memory-cap narratives and
+`scope_revoked` status reasons are not additional `BgTaskStatus` variants;
+`endReason` deliberately exposes only the closed terminal-state codes, without
+parsing or forwarding free text. No command, output, preview, match text or
+arbitrary reason text appears in the record.
+
+## Bash input fields for CKIOS
+
+`bash-inputs.json` is checked against Head/Worker definitions with and without
+runon. `input.command` exists and is required in all four; `input.description`
+and `input.workdir` exist but are optional in all four. `input.runon` exists
+only in the two runon-enabled variants, where it is optional. It is absent
+from both no-runon variants. The page must not unconditionally access it for
+those pins: omit the runon label or show field-unavailable/no explicit target,
+and never synthesize a runner. An absent input field is not evidence of a
+particular execution host. The source is the embedded catalog assembled by
+`tool_provider.rs::build_tools/tools_for_session`; the unit test checks the
+actual served definitions and the golden Bash pin list.
+
+## Line-oriented `bash_output` and retention dependency
+
+CKIOS's page polls status every two seconds and uses output pages of up to 200
+items. It does not need `bash_watch`; that operation remains in the manifest.
+`bash-output.json` freezes line, cursor and retention rules plus source-byte
+vectors. These rules supersede the earlier whole-unit chunk-run item sketch,
+before publication. Each output item now has:
+
+| Field | Type | Meaning |
+|---|---|---|
+| stream | stdout / stderr / pty | source artifact |
+| text | string ≤8,192 UTF-8 bytes | one line, or one part of an oversized line, without LF/CRLF terminator; bare CR is text |
+| bytes | integer 1…8,192 | original bytes consumed; final part includes the line terminator's bytes |
+| continued | boolean | true on every non-final part of that physical line; false on the final part |
+| firstAvailableOffset | integer 0…2^53−1, nullable | original byte offset of the first retained byte of this stream; repeated per item |
+| prefixDropped | boolean | whether any original prefix was dropped |
+
+Lines are split only at whole UTF-8/lossy-decode unit boundaries, under both
+text and source-byte caps. A running unterminated suffix is held until a
+terminator/terminal EOF is known or lookahead proves another nonempty part
+follows; no zero-byte closing items are invented. The table can display items
+directly and mark continuation parts without re-splitting text.
+
+Only **per-stream** byte order is recoverable. The backend stores stdout and
+stderr separately (`commands/bash_status.rs:244-305`); each poll reads at most
+one 64 KiB backend page per stream, emits stdout parts then stderr parts and
+leaves a deferred stream's offset unchanged. This is not chronological
+stdout/stderr interleaving. PTY has one combined stream in capture order.
+
+A running page always has a cursor, even at the current end or while holding
+an unclosed line. Reading it later can return appended output; `next` is null
+only after terminal status and full drain of both streams. There is never a
+`total`. The existing backend re-samples artifact length for each read and
+advances by returned bytes (`commands/bash_status.rs:403-430`); the later
+carrier output layer, not `output_has_more` alone, decides terminal drain.
+
+**The beginning is not retained indefinitely.** At terminal handling,
+`bash_background/buffer.rs:14,356-369` trims each artifact to a 100 MiB tail.
+`persistence.rs:4380-4398` atomically replaces it with a UTF-8-aligned tail.
+The returned prefix-loss count currently enters transient recovery text
+(`registry.rs:13018,13145-13149`), not a durable per-stream original-offset
+base. Thus current retained-file offset zero is not always original byte zero.
+
+**Explicit dependency for the later output/storage slice:** persist a cumulative
+per-stream dropped-prefix base in the task record whenever a trim runs, and
+retain it across restarts. New untrimmed streams use base 0 and
+`prefixDropped:false`; tracked trimmed streams use their exact positive base
+and `prefixDropped:true`. Only tasks trimmed before tracking existed may use
+`firstAvailableOffset:null`, always with `prefixDropped:true`; never report
+zero for a trimmed stream. Cursors use original offsets once tracked; positions
+older than the retained base advance to that base. Legacy unknown-origin
+cursors must remain explicitly unknown/retained-relative rather than claim
+original zero. A first page starts at original byte 0 only when untrimmed,
+otherwise at the first retained byte. The page must label a tail/unknown origin
+and never pretend that it starts at original line 1.

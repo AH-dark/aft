@@ -35,10 +35,13 @@
   "binding": {
     "principal": "reserved:occipital",
     "role": "ToolProviderV1",
-    "sessionIdentity": ["owner", "scope_ref", "scope_epoch"],
-    "equalLabels": ["project_root", "harness", "session"],
-    "mismatchCode": "session_not_bound",
-    "rule": "Labels must exactly equal S policy route labels for every carrier call, including reads; labels do not discover S. Unscoped and self-owned scoped Occipital routes admit provider reads only.",
-    "labelSource": "Awaiting CKIOS confirmation of where Occipital learns S labels."
+    "sessionIdentity": ["owner", "ref", "epoch"],
+    "equalStamp": ["owner", "ref", "epoch"],
+    "noPolicyRouteCode": "session_not_bound",
+    "rule": "A carrier route serves S only when its daemon-stamped owner/ref/epoch equals S policy route stamp. Unscoped and self-owned scoped Occipital routes admit provider reads only.",
+    "carrierLabels": "Occipital sends neutral labels of its own. All route labels (project_root, harness, session) are opener claims, not daemon attestations. AFT ignores carrier labels and project_root; there is no label comparison.",
+    "policySource": "Use S own live policy route: core relay for a head, Broca tool route for a worker. Take S project, read rules, harness and session only from that policy route. Bash task lookup uses that harness and session.",
+    "projectCheck": "Check the policy-route project against the stamp workdir/project_id under scope-workdir/v1.",
+    "labelSource": "Resolved by stamp equality, agreed in Rich UI room SUBC seq 109, CKIOS seq 107 and AFT seq 110; supersedes the seq 104/105 label-equality handoff."
   }
 }
