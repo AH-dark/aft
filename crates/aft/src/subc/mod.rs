@@ -785,12 +785,23 @@ impl PendingSubcResponses {
             if let Some(cancellation) = &entry.pending.cancellation {
                 cancellation.request_cancel();
             }
-            if let Some(ctx) = executor.actor_context(&entry.root) {
-                if let Some(on_shutdown) = entry.pending.on_shutdown.as_mut() {
-                    let response = on_shutdown(&ctx);
-                    resolved.push(ResolvedSubcResponse { entry, response });
-                }
-            }
+            let shutdown_terminal = executor.actor_context(&entry.root).and_then(|ctx| {
+                entry
+                    .pending
+                    .on_shutdown
+                    .as_mut()
+                    .map(|on_shutdown| on_shutdown(&ctx))
+            });
+            // Removing a deferred entry must settle its credit even when the
+            // producer has no shutdown callback or its actor is already gone.
+            let response = shutdown_terminal.unwrap_or_else(|| {
+                Response::error(
+                    &entry.pending.request_id,
+                    "request_cancelled",
+                    "request cancelled because the connection is shutting down",
+                )
+            });
+            resolved.push(ResolvedSubcResponse { entry, response });
         }
         self.entries = waiting;
         self.refresh_poll_interval();
@@ -11260,13 +11271,13 @@ async fn deliver_resolved_subc_response(
         );
         return Ok(());
     };
-    let Some(ctx) = executor.actor_context(&entry.root) else {
-        return Ok(());
-    };
+    // A missing actor only prevents context-dependent finalization. The route
+    // still needs its terminal, including the actor_not_registered poll result.
+    let ctx = executor.actor_context(&entry.root);
     resolved.response = crate::bounded_io::with_budget(entry.io_budget.clone(), || {
         crate::bounded_io::finish_response(resolved.response)
     });
-    if let (Some(db), Some(budget)) = (ctx.db(), &entry.io_budget) {
+    if let (Some(db), Some(budget)) = (ctx.as_ref().and_then(|ctx| ctx.db()), &entry.io_budget) {
         let mut observations = budget.permissions();
         if resolved.response.data["code"] != "macos_permission_denied" {
             observations.retain(|observation| observation.readable);
@@ -11282,14 +11293,16 @@ async fn deliver_resolved_subc_response(
     }
     entry.phase_trace.mark_execute_done();
     let finalizer = |response: &mut Response, text: &mut String| {
-        crate::response_finalize::finalize_tool_response(
-            response,
-            text,
-            &ctx,
-            &entry.session_id,
-            &entry.bare_name,
-            entry.bind_trust.allows_bash_observation(),
-        );
+        if let Some(ctx) = &ctx {
+            crate::response_finalize::finalize_tool_response(
+                response,
+                text,
+                ctx,
+                &entry.session_id,
+                &entry.bare_name,
+                entry.bind_trust.allows_bash_observation(),
+            );
+        }
     };
     let result = finish_tool_call_response(
         &entry.bare_name,
@@ -11299,7 +11312,7 @@ async fn deliver_resolved_subc_response(
         Some(&finalizer),
         Some(&mut entry.phase_trace),
     );
-    if let Some(key) = entry.ledger_key.clone() {
+    if let (Some(_), Some(key)) = (&ctx, entry.ledger_key.clone()) {
         let outcome = if result.response.success {
             "ok".to_string()
         } else {
@@ -11346,6 +11359,8 @@ async fn deliver_resolved_subc_response(
         entry.route.channel,
         entry.corr,
     );
+    // A closed writer means the transport is gone and no terminal can be sent;
+    // propagate that failure rather than treating an unanswered call as success.
     send_traced_tool_response_frame(tx, metrics, response_frame, trace).await?;
     if fatal {
         signal_fatal_teardown(
