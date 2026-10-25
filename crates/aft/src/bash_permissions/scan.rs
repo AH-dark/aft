@@ -279,8 +279,15 @@ pub(crate) struct DirectoryTarget {
 /// invalid. Shell behavior the check cannot follow continues to run as before.
 /// Follow reachable outer-shell folder and physical-mode alternatives, keeping
 /// successful and failed commands separate so `&&` and `||` stay correlated.
+/// `known_directory` identifies existing directories copied to the runner. Treat
+/// those changes as successful so hypothetical failures cannot make later
+/// commands appear to leave the checkout from a stale working directory.
 #[cfg(any(unix, test))]
-pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<DirectoryTarget> {
+pub(crate) fn top_level_directory_targets(
+    command: &str,
+    cwd: &Path,
+    known_directory: &dyn Fn(&Path) -> bool,
+) -> Vec<DirectoryTarget> {
     const MAX_CWD_PATHS: usize = 8;
 
     #[derive(Clone, PartialEq, Eq)]
@@ -593,6 +600,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
         parts: &[Part],
         incoming: Paths,
         targets: &mut Vec<DirectoryTarget>,
+        known_directory: &dyn Fn(&Path) -> bool,
     ) -> Flow {
         if head == "pushd" && !followable_pushd(parts) {
             // Stack rotation or an unmodeled stack edit cannot establish a
@@ -603,6 +611,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
             };
         }
         let mut success = Paths::empty();
+        let mut failure = Paths::empty();
         let mut emitted: Vec<DirectoryTarget> = Vec::new();
         let mut resolve = |cwd, mode| {
             let resolved = match mode {
@@ -621,6 +630,11 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                     }),
             };
             if let Some((target, next_cwd)) = resolved {
+                let known_success = known_directory(&target.path)
+                    && target
+                        .alternate_path
+                        .as_ref()
+                        .is_none_or(|path| known_directory(path));
                 if let Some(next_cwd) = next_cwd {
                     success.insert(ShellState {
                         cwd: next_cwd,
@@ -632,33 +646,45 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                 if !emitted.contains(&target) {
                     emitted.push(target);
                 }
+                known_success
             } else {
                 success = success.clone().union(Paths::Unknown(mode));
+                false
             }
         };
         match &incoming {
             Paths::Known(paths) => {
                 for state in paths {
-                    resolve(Some(state.cwd.as_path()), state.physical);
+                    if !resolve(Some(state.cwd.as_path()), state.physical) {
+                        failure.insert(state.clone());
+                    }
                 }
             }
-            Paths::Unknown(mode) => resolve(None, *mode),
+            Paths::Unknown(mode) => {
+                if !resolve(None, *mode) {
+                    failure = incoming.clone();
+                }
+            }
         }
         targets.extend(emitted);
-        // A failed cd/pushd leaves its incoming directory unchanged.
-        Flow {
-            success,
-            failure: incoming,
-        }
+        // Missing or unresolved destinations may still fail and leave the cwd unchanged.
+        Flow { success, failure }
     }
     fn inspect_independent_children(
         node: Node<'_>,
         source: &str,
         targets: &mut Vec<DirectoryTarget>,
+        known_directory: &dyn Fn(&Path) -> bool,
     ) {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            let _ = evaluate(child, source, Paths::Unknown(None), targets);
+            let _ = evaluate(
+                child,
+                source,
+                Paths::Unknown(None),
+                targets,
+                known_directory,
+            );
         }
     }
     fn evaluate(
@@ -666,6 +692,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
         source: &str,
         incoming: Paths,
         targets: &mut Vec<DirectoryTarget>,
+        known_directory: &dyn Fn(&Path) -> bool,
     ) -> Flow {
         if incoming.is_empty() {
             return Flow::success(incoming);
@@ -682,12 +709,12 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
             | "pipeline" => {
                 // Unsupported control flow loses cwd precision; independently
                 // resolvable targets remain inspectable without choosing a branch.
-                inspect_independent_children(node, source, targets);
+                inspect_independent_children(node, source, targets, known_directory);
                 return Flow::either(Paths::Unknown(None));
             }
             "negated_command" => {
                 if let Some(body) = node.named_child(0) {
-                    let inner = evaluate(body, source, incoming, targets);
+                    let inner = evaluate(body, source, incoming, targets, known_directory);
                     return Flow {
                         success: inner.failure,
                         failure: inner.success,
@@ -702,7 +729,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                         .find(|child| !child.kind().contains("redirect"))
                 });
                 let inner = body
-                    .map(|body| evaluate(body, source, incoming.clone(), targets))
+                    .map(|body| evaluate(body, source, incoming.clone(), targets, known_directory))
                     .unwrap_or_else(|| Flow::either(incoming.clone()));
                 // Redirection can fail before the body changes directory.
                 return Flow {
@@ -715,7 +742,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                 let head = parts.first().and_then(|part| literal_word(&part.text));
                 return match head.as_deref() {
                     Some(head @ ("cd" | "pushd")) => {
-                        directory_change(head, &parts, incoming, targets)
+                        directory_change(head, &parts, incoming, targets, known_directory)
                     }
                     Some("popd") => Flow {
                         success: Paths::Unknown(incoming.mode()),
@@ -788,21 +815,27 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                 _ => {}
             }
             flow = Some(match flow.take() {
-                None => evaluate(child, source, incoming.clone(), targets),
+                None => evaluate(child, source, incoming.clone(), targets, known_directory),
                 Some(left) => match operator {
                     Operator::Sequence => {
                         asynchronous_entry = left.all();
-                        evaluate(child, source, asynchronous_entry.clone(), targets)
+                        evaluate(
+                            child,
+                            source,
+                            asynchronous_entry.clone(),
+                            targets,
+                            known_directory,
+                        )
                     }
                     Operator::And => {
-                        let right = evaluate(child, source, left.success, targets);
+                        let right = evaluate(child, source, left.success, targets, known_directory);
                         Flow {
                             success: right.success,
                             failure: left.failure.union(right.failure),
                         }
                     }
                     Operator::Or => {
-                        let right = evaluate(child, source, left.failure, targets);
+                        let right = evaluate(child, source, left.failure, targets, known_directory);
                         Flow {
                             success: left.success.union(right.success),
                             failure: right.failure,
@@ -822,6 +855,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
             command,
             Paths::one(cwd.to_path_buf(), false),
             &mut targets,
+            known_directory,
         );
     }
     targets
@@ -1322,7 +1356,7 @@ mod tests {
     use super::*;
 
     fn directory_paths(command: &str, cwd: &Path) -> Vec<PathBuf> {
-        top_level_directory_targets(command, cwd)
+        top_level_directory_targets(command, cwd, &|_| false)
             .into_iter()
             .map(|target| target.path)
             .collect()
@@ -1341,7 +1375,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let absolute = dir.path().canonicalize().unwrap();
         let command = format!("cd '{}' && cd nested && cd '~/literal'", absolute.display());
-        let targets = top_level_directory_targets(&command, &absolute);
+        let targets = top_level_directory_targets(&command, &absolute, &|_| false);
         assert_eq!(
             targets
                 .iter()
@@ -1427,6 +1461,45 @@ mod tests {
             directory_paths("true >/not-writable && cd nested; cd ..", &cwd),
             vec![cwd.join("nested"), cwd.clone(), parent]
         );
+    }
+
+    #[test]
+    fn directory_targets_only_drop_failures_for_known_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(cwd.join("a")).unwrap();
+        std::fs::create_dir(cwd.join("b")).unwrap();
+        let known_directory = |path: &Path| path.starts_with(&cwd) && path.is_dir();
+        for (command, expected) in [
+            ("cd a; cd ../b", vec![cwd.join("a"), cwd.join("b")]),
+            (
+                "maybe && cd a; cd ../b",
+                vec![
+                    cwd.join("a"),
+                    cwd.join("b"),
+                    cwd.parent().unwrap().join("b"),
+                ],
+            ),
+            (
+                "cd missing; cd ../b",
+                vec![
+                    cwd.join("missing"),
+                    cwd.join("b"),
+                    cwd.parent().unwrap().join("b"),
+                ],
+            ),
+            ("cd a || cd ..", vec![cwd.join("a")]),
+            (
+                "cd a >/not-writable || cd ..",
+                vec![cwd.join("a"), cwd.parent().unwrap().to_path_buf()],
+            ),
+        ] {
+            let paths: Vec<_> = top_level_directory_targets(command, &cwd, &known_directory)
+                .into_iter()
+                .map(|target| target.path)
+                .collect();
+            assert_eq!(paths, expected, "{command}");
+        }
     }
 
     #[test]
@@ -1850,17 +1923,30 @@ mod tests {
             directory_paths("set \"$OPTS\"; cd .. && cd ..", &deep),
             vec![root.clone(), root.parent().unwrap().to_path_buf()]
         );
-        let paired = top_level_directory_targets("set \"$OPTS\"; cd link/.. && cd ../..", &deep);
+        let paired =
+            top_level_directory_targets("set \"$OPTS\"; cd link/.. && cd ../..", &deep, &|_| false);
         assert_eq!(paired.len(), 1);
         assert_eq!(paired[0].path, deep);
         assert_eq!(
             paired[0].alternate_path,
             Some(root.parent().unwrap().to_path_buf())
         );
-        let explicit = top_level_directory_targets("set \"$OPTS\"; cd -P link/..", &deep);
+        let explicit =
+            top_level_directory_targets("set \"$OPTS\"; cd -P link/..", &deep, &|_| false);
         assert_eq!(explicit.len(), 1);
         assert_eq!(explicit[0].path, root.parent().unwrap());
         assert_eq!(explicit[0].alternate_path, None);
+        for (both_known, expected_count) in [(false, 2), (true, 1)] {
+            let targets = top_level_directory_targets(
+                "set \"$OPTS\"; cd link/.. || cd fallback",
+                &deep,
+                &|path| both_known || path.starts_with(&root),
+            );
+            assert_eq!(targets.len(), expected_count);
+            if !both_known {
+                assert_eq!(targets[1].path, deep.join("fallback"));
+            }
+        }
         for command in ["set -- \"$X\"; cd ..", "set value \"$X\"; cd .."] {
             assert_eq!(
                 directory_paths(command, &deep),

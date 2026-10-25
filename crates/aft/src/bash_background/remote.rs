@@ -1736,16 +1736,18 @@ fn runon_cd_refusal(command: &str, request: &RunRequest) -> Result<Option<String
         );
     }
     let windows = request.platform == Some(Platform::Windows);
+    let copied = |path: &Path| {
+        path.starts_with(checkout) || siblings.iter().any(|sibling| path.starts_with(sibling))
+    };
+    let known_directory = |path: &Path| copied(path) && path.is_dir();
     Ok(
-        crate::bash_permissions::scan::top_level_directory_targets(command, &cwd)
+        crate::bash_permissions::scan::top_level_directory_targets(command, &cwd, &known_directory)
             .into_iter()
             .find_map(|target| {
                 let template = if windows && target.literal_absolute {
                     RUNON_CD_WINDOWS_ABSOLUTE_MESSAGE
                 } else {
                     let invalid = |path: &Path| {
-                        let copied = path.starts_with(checkout)
-                            || siblings.iter().any(|sibling| path.starts_with(sibling));
                         // System and unknown paths may exist on the runner. Reject
                         // only local home content or another checkout.
                         let local_only = homes.iter().any(|home| path.starts_with(home))
@@ -1753,7 +1755,7 @@ fn runon_cd_refusal(command: &str, request: &RunRequest) -> Result<Option<String
                                 .ok()
                                 .flatten()
                                 .is_some();
-                        !copied && local_only
+                        !copied(path) && local_only
                     };
                     // An unknown shell mode gives mutually exclusive candidates,
                     // unlike separate reachable command branches: both must fail.
