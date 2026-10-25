@@ -546,9 +546,19 @@ export function createGithubInstaller(services: GithubInstallerHost) {
   ): Promise<Response> {
     const maxRedirects = 5;
     let currentUrl = url;
+    const requestHeaders = { ...headers };
     for (let i = 0; i <= maxRedirects; i += 1) {
       assertAllowedDownloadUrl(currentUrl);
-      const res = await fetchImpl(currentUrl, { headers, redirect: "manual", signal });
+      // The GitHub token is for the API origin only. A redirect to another
+      // allowed host (release storage, a CDN) must not receive it.
+      if (new URL(currentUrl).origin !== "https://api.github.com") {
+        delete requestHeaders.authorization;
+      }
+      const res = await fetchImpl(currentUrl, {
+        headers: { ...requestHeaders },
+        redirect: "manual",
+        signal,
+      });
       if (res.status >= 300 && res.status < 400) {
         const location = res.headers.get("location");
         if (!location) throw new Error(`redirect status ${res.status} without Location`);
@@ -1849,5 +1859,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     _extractArchiveSafelyForTesting: extractArchiveSafely,
     _precheckArchiveSizeForTesting: precheckArchiveContents,
     _runArchiveToolForTesting: runArchiveTool,
+    _fetchReleaseByTagForTesting: fetchReleaseByTag,
+    _resolveTargetTagForTesting: resolveTargetTag,
   };
 }
