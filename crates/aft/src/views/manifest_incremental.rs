@@ -390,11 +390,12 @@ struct IndexStamp {
     path: PathBuf,
     len: u64,
     modified: std::time::SystemTime,
+    content_hash: [u8; 32],
 }
 
-fn index_stamp(request: &AssemblyRequest) -> Option<IndexStamp> {
+fn index_stamp(project_root: &Path) -> Option<IndexStamp> {
     let output = std::process::Command::new("git")
-        .current_dir(&request.project_root)
+        .current_dir(project_root)
         .args(["rev-parse", "--git-path", "index"])
         .output()
         .ok()?;
@@ -403,9 +404,12 @@ fn index_stamp(request: &AssemblyRequest) -> Option<IndexStamp> {
     }
     let bytes = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
     let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
-    let path = request.project_root.join(path_from_bytes(bytes));
+    let path = project_root.join(path_from_bytes(bytes));
     let metadata = fs::metadata(&path).ok()?;
     Some(IndexStamp {
+        // Hashing index contents also detects replacements that preserve both
+        // size and timestamp, including changes to cached Git attributes.
+        content_hash: *blake3::hash(&fs::read(&path).ok()?).as_bytes(),
         path,
         len: metadata.len(),
         modified: metadata.modified().ok()?,
@@ -600,7 +604,7 @@ pub(super) fn head(request: &AssemblyRequest, view: &ViewStore) -> Result<HeadRe
         ));
     }
     let tree = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let index = index_stamp(request);
+    let index = index_stamp(&request.project_root);
     let eligible = !request.changed_paths.is_empty()
         && index.is_some()
         && !request.changed_paths.iter().any(|path| {
@@ -646,6 +650,152 @@ pub(super) fn head(request: &AssemblyRequest, view: &ViewStore) -> Result<HeadRe
         snapshot,
         paths,
     })
+}
+
+/// Only a successful publication can supply the HEAD and artifact evidence for
+/// discarding an irrelevant notification. Unknown state keeps the normal scan.
+pub(super) fn irrelevant_delta(
+    request: &AssemblyRequest,
+    view: &ViewStore,
+    complete: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
+    if request.changed_paths.is_empty() || request.require_semantic {
+        return Ok(false);
+    }
+    let proof = {
+        let mut caches = caches().lock().unwrap_or_else(|e| e.into_inner());
+        caches.get_mut(view.view_dir()).and_then(|cache| {
+            cache.last_used = Instant::now();
+            let previous = cache.previous.as_ref()?;
+            let state = cache.verification.lock().unwrap_or_else(|e| e.into_inner());
+            if !cache.domain.active()
+                || state.active_preparations != 0
+                || full_verification_required(&state, Instant::now())
+                || (request.callgraph && manifest_lacks_callgraph(&previous.manifest))
+            {
+                return None;
+            }
+            Some((
+                previous.generation.clone(),
+                previous.head.clone()?,
+                previous.stamps.clone(),
+                previous.admission.clone(),
+                previous.metadata.clone(),
+                cache.verification.clone(),
+                (state.epoch, state.publications, state.last_full),
+            ))
+        })
+    };
+    let Some((generation, head, stamps, admission, metadata, state, revision)) = proof else {
+        return Ok(false);
+    };
+    if !super::super::generation_matches_head(&generation, &request.desired_head) {
+        return Ok(false);
+    }
+    // Case-fold ASCII names even on case-sensitive hosts: the same watcher
+    // batches can come from case-insensitive checkouts. Non-ASCII spellings,
+    // host path aliases and control files are uncertain, never evidence for a skip.
+    let mut relevant = BTreeSet::new();
+    for entry in head.entries.iter() {
+        if !entry.rel_path.is_ascii() {
+            return Ok(false);
+        }
+        let path = entry.rel_path.to_ascii_lowercase();
+        for (index, byte) in path.iter().enumerate() {
+            if *byte == b'/' {
+                relevant.insert(path[..index].to_vec());
+            }
+        }
+        relevant.insert(path);
+    }
+    if request.changed_paths.iter().any(|path| {
+        let lower = path.to_ascii_lowercase();
+        !path.is_ascii()
+            || RelPath::new(path.clone()).is_err()
+            || path.iter().any(|byte| matches!(byte, b'\\' | b':' | b'~'))
+            || path
+                .split(|byte| *byte == b'/')
+                .any(|part| part.last().is_some_and(|byte| matches!(byte, b'.' | b' ')))
+            || is_resolution_input(path)
+            || is_resolution_input(&lower)
+            || matches!(
+                lower.rsplit(|byte| *byte == b'/').next(),
+                Some(b".gitattributes" | b".aftignore" | b".ignore")
+            )
+            || relevant.contains(&path.to_ascii_lowercase())
+    }) {
+        return Ok(false);
+    }
+    let tree = std::process::Command::new("git")
+        .current_dir(&request.project_root)
+        .args(["rev-parse", "HEAD^{tree}"])
+        .output()?;
+    if !tree.status.success()
+        || String::from_utf8_lossy(&tree.stdout).trim() != head.tree
+        || index_stamp(&request.project_root).as_ref() != Some(&head.index)
+        || view.current_generation_read_only()?.as_deref() != Some(&generation)
+    {
+        return Ok(false);
+    }
+    let callgraph = BlobStore::open(
+        &request.storage,
+        request.family.clone(),
+        BlobPlane::Callgraph,
+    )
+    .map_err(store_error)?;
+    let semantic = BlobStore::open(
+        &request.storage,
+        request.family.clone(),
+        BlobPlane::Semantic,
+    )
+    .map_err(store_error)?;
+    if StoreStamps::read(&callgraph, &semantic)? != stamps {
+        return Ok(false);
+    }
+    // Other roots open and close databases too. A global admission change
+    // requires fresh identity checks for this HEAD, not a manifest rebuild for
+    // every root. Recheck live registrations even when cached identities suffice.
+    let admission_changed = admission_snapshot(&request.storage) != admission;
+    for entry in head.entries.iter() {
+        let absolute = request.project_root.join(path_from_bytes(&entry.rel_path));
+        let Some(cached) = metadata
+            .get(&entry.rel_path)
+            .filter(|metadata| metadata.is_file())
+        else {
+            return Ok(false);
+        };
+        let fresh;
+        let current = if admission_changed {
+            let Ok(value) = crate::db::file_identity::candidate_metadata(&absolute) else {
+                return Ok(false);
+            };
+            fresh = value;
+            if !fresh.is_file()
+                || fresh.len() != cached.len()
+                || fresh.modified().ok() != cached.modified().ok()
+            {
+                return Ok(false);
+            }
+            &fresh
+        } else {
+            cached
+        };
+        if crate::project_content::is_excluded_event(&absolute)
+            || crate::db::file_identity::is_live_sqlite_file_with_metadata(&absolute, Some(current))
+        {
+            return Ok(false);
+        }
+    }
+    if !complete()? || view.current_generation_read_only()?.as_deref() != Some(&generation) {
+        return Ok(false);
+    }
+    // A preparation overlapping this probe revokes its conclusion. Only hold
+    // the per-view lock for the final decision, never across filesystem I/O.
+    let state = state.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(state.active_preparations == 0
+        && state.domain.active()
+        && (state.epoch, state.publications, state.last_full) == revision
+        && !full_verification_required(&state, Instant::now()))
 }
 
 pub(super) struct PreparationVerification {
