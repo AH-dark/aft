@@ -9456,6 +9456,111 @@ mod tests {
         assert_eq!(take_literal_presence_counts(), (0, 0), "{second}");
     }
 
+    /// Files that hold every trigram of `bash_wait_detach(` (the call `each(`
+    /// supplies `ch(`) without holding the literal. They sit under `tests/`,
+    /// so the request's exact candidates leave them out and only the corpus
+    /// stage reads them.
+    const NEAR_HOLDER_TEST_FILE: &str =
+        "fn near() {\n    let bash_wait_detach = 1;\n    each(bash_wait_detach);\n}\n";
+
+    const ONLY_NAMES_IT: (&str, &str) = (
+        "src/config.rs",
+        "pub fn defaults() {\n    let bash_wait_detach = true;\n    drop(bash_wait_detach);\n}\n",
+    );
+
+    /// Running out of reads in the corpus stage, after every exact candidate
+    /// was read and none held the literal, settles nothing: no absence claim.
+    #[test]
+    fn presence_bound_exhausted_in_the_corpus_stage_makes_no_absence_claim() {
+        let files = [
+            ONLY_NAMES_IT,
+            ("tests/near_a_test.rs", NEAR_HOLDER_TEST_FILE),
+            ("tests/near_b_test.rs", NEAR_HOLDER_TEST_FILE),
+        ];
+        // One read for the exact candidate and one corpus file; the second
+        // corpus file is past the bound.
+        let (_project, ctx) = presence_project(&files);
+        LITERAL_PRESENCE_MAX_READS_OVERRIDE.with(|limit| limit.set(Some(2)));
+        let bounded = presence_search(&ctx, "bash_wait_detach(", 10, 0);
+        LITERAL_PRESENCE_MAX_READS_OVERRIDE.with(|limit| limit.set(None));
+        assert_eq!(take_literal_presence_counts(), (2, 1), "{bounded}");
+        assert!(!bounded.contains("No file contains"), "{bounded}");
+        assert!(!bounded.contains("[similar]"), "{bounded}");
+
+        // With room to read every possible holder, none holds it.
+        let (_project, ctx) = presence_project(&files);
+        let unbounded = presence_search(&ctx, "bash_wait_detach(", 10, 0);
+        assert!(
+            unbounded.starts_with(BASH_WAIT_DETACH_ABSENT),
+            "{unbounded}"
+        );
+    }
+
+    /// A possible holder the corpus stage cannot read (gone from disk since
+    /// it was indexed) might hold the literal: no absence claim.
+    #[test]
+    fn unreadable_corpus_holder_makes_no_absence_claim() {
+        let (project, ctx) = presence_project(&[
+            ONLY_NAMES_IT,
+            (
+                "tests/gone_test.rs",
+                "fn gone() {\n    bash_wait_detach(1);\n}\n",
+            ),
+        ]);
+        let root = fs::canonicalize(project.path()).unwrap();
+        fs::remove_file(root.join("tests/gone_test.rs")).unwrap();
+        let text = presence_search(&ctx, "bash_wait_detach(", 10, 0);
+        let (_, corpus_scans) = take_literal_presence_counts();
+        assert_eq!(corpus_scans, 1, "{text}");
+        assert!(!text.contains("No file contains"), "{text}");
+        assert!(!text.contains("[similar]"), "{text}");
+    }
+
+    /// The watcher updates the resident trigram index in place, which keeps
+    /// the index generation, so a kept absence is still found under the same
+    /// key on the next page. The possible-holder set it was settled against
+    /// changes when a file that may hold the literal is indexed, so the next
+    /// page settles again and finds it.
+    #[test]
+    fn kept_absence_is_settled_again_when_a_new_file_may_hold_the_literal() {
+        let (project, ctx) = presence_project(&[
+            ONLY_NAMES_IT,
+            ("config/settings.toml", "bash_wait_detach = true\n"),
+        ]);
+        let root = fs::canonicalize(project.path()).unwrap();
+        let first = presence_search(&ctx, "bash_wait_detach(", 1, 0);
+        assert!(first.starts_with(BASH_WAIT_DETACH_ABSENT), "{first}");
+        take_literal_presence_counts();
+
+        let generation = ctx.search_index_rx_generation();
+        let added = root.join("src/run.rs");
+        fs::write(
+            &added,
+            "fn run(task: u32) {\n    bash_wait_detach(task);\n}\n",
+        )
+        .unwrap();
+        ctx.search_index()
+            .write()
+            .unwrap()
+            .as_mut()
+            .expect("resident index")
+            .update_file(&added);
+        assert_eq!(
+            ctx.search_index_rx_generation(),
+            generation,
+            "an in-place index update keeps the generation, so the key is unchanged"
+        );
+
+        let second = presence_search(&ctx, "bash_wait_detach(", 1, 1);
+        assert!(
+            !second.starts_with("Found 0 results"),
+            "page 2 has a result: {second}"
+        );
+        assert!(!second.contains("No file contains"), "{second}");
+        let (reads, _) = take_literal_presence_counts();
+        assert!(reads > 0, "the absence must be settled again: {second}");
+    }
+
     /// A readiness sample runs on the search path, so it reports the views-on
     /// checkout index the worker last built and never builds one, even when
     /// that index is out of date for the installed snapshot.
