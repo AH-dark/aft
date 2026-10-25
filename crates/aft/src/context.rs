@@ -6868,14 +6868,15 @@ impl AppContext {
 
     /// Cheap emptiness probes for the maintenance scheduler: a drain kind with
     /// no pending work is not enqueued at all, so idle roots stop paying a
-    /// dispatch cycle per kind per tick. Every probe is lock-free or try-lock
-    /// (a contended source reports "maybe work" and the kind is enqueued —
-    /// fail-open keeps the skip an optimization, never a correctness gate).
+    /// dispatch cycle per kind per tick. Subsystem probes are lock-free or
+    /// try-lock (a contended source reports "maybe work" and the kind is
+    /// enqueued). The view verification registry waits only for map metadata,
+    /// so unrelated views' registry lookups do not count as pending work.
     ///
     /// These probes run on the subc frame loop, which also answers health
-    /// checks and routes every request. A blocking `lock()` here parks the
-    /// whole module for as long as any other thread holds the source, so
-    /// never add one: use `try_lock` and treat contention as pending work.
+    /// checks and routes every request. Never wait for subsystem work here:
+    /// use `try_lock` and treat contention as pending work. The verification
+    /// registry lock must never cover per-view locks or I/O.
     pub fn watcher_drain_has_work(&self) -> bool {
         let cleanup_pending = self.deleted_root_cleanup.try_lock().is_none_or(|cleanup| {
             matches!(
@@ -6908,7 +6909,8 @@ impl AppContext {
     }
 
     /// The idle maintenance pump also enforces the view's full-read deadline.
-    /// Use nonblocking probes because this runs on the dispatch frame loop.
+    /// Probe subsystem state without blocking the dispatch frame loop; only
+    /// the verification registry's short map lookup may wait.
     pub(crate) fn view_full_verification_due(&self) -> bool {
         if !self.config().views.enabled {
             return false;
