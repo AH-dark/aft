@@ -1898,6 +1898,10 @@ function mergeSandboxConfig(
 function mergeBashConfig(
   baseBash: AftConfig["bash"],
   overrideBash: AftConfig["bash"],
+  // `"tier"` is a harness block over the same file's base: it overrides, as
+  // before. `"project"` is the project tier over the user tier: the memory cap
+  // may only tighten, so the lower value wins.
+  mode: "tier" | "project" = "tier",
 ): AftConfig["bash"] {
   if (baseBash === undefined && overrideBash === undefined) return undefined;
   if (baseBash === undefined) return overrideBash;
@@ -1912,7 +1916,11 @@ function mergeBashConfig(
   const base = expand(baseBash);
   const override = expand(overrideBash);
   const merged = { ...base, ...override };
-  if (typeof base.memory_limit_mib === "number" && typeof override.memory_limit_mib === "number") {
+  if (
+    mode === "project" &&
+    typeof base.memory_limit_mib === "number" &&
+    typeof override.memory_limit_mib === "number"
+  ) {
     merged.memory_limit_mib = Math.min(base.memory_limit_mib, override.memory_limit_mib);
   }
   return merged;
@@ -2136,7 +2144,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     delete projectBash.runon_env;
     delete projectBash.env;
   }
-  const bash = mergeBashConfig(base.bash, projectBash);
+  const bash = mergeBashConfig(base.bash, projectBash, "project");
   if (projectEnv !== undefined && Object.keys(projectEnv).length > 0 && bash !== undefined) {
     (bash as Record<string, unknown>).project_env = projectEnv;
   }
