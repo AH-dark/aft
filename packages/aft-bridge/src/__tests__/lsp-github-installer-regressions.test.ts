@@ -66,6 +66,30 @@ const clangd = findGithubServerById("clangd");
 if (!clangd) throw new Error("clangd fixture missing");
 
 describe("GitHub release lookups", () => {
+  test("live release tags cannot persist unsafe path components", async () => {
+    await cacheFixture(async () => {
+      const versionChecks = new Map<string, VersionCheck>();
+      const fakeFetch = (async () =>
+        new Response(
+          JSON.stringify([
+            {
+              tag_name: "../../outside",
+              published_at: "2020-01-01T00:00:00Z",
+              assets: [],
+              draft: false,
+              prerelease: false,
+            },
+          ]),
+        )) as typeof fetch;
+      const result = await installerFixture(versionChecks)._resolveTargetTagForTesting(
+        clangd,
+        config,
+        fakeFetch,
+      );
+      expect(result.tag).toBeNull();
+      expect(versionChecks.has(clangd.githubRepo)).toBe(false);
+    });
+  });
   test("tag lookup strips credentials on cross-origin redirects", async () => {
     await cacheFixture(
       async () => {

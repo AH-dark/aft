@@ -670,6 +670,11 @@ export function createGithubInstaller(services: GithubInstallerHost) {
         reason: "github releases probe failed",
       };
     }
+    // The chosen tag becomes a URL path, a cache directory name and a
+    // persisted version record; refuse one that could escape those.
+    if (probe.tag !== null && !isSafeVersion(probe.tag)) {
+      return { tag: null, assets: [], blockedByGrace: false, reason: "invalid GitHub release tag" };
+    }
     writeVersionCheck(spec.githubRepo, probe.tag);
     return { tag: probe.tag, assets: probe.assets, blockedByGrace: probe.blockedByGrace };
   }
