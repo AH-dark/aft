@@ -25,9 +25,10 @@ use std::time::{Duration, Instant};
 
 const SAMPLES: usize = 50;
 
-/// Counts allocations for the whole process. Tests run in parallel in one
-/// binary, and each measurement trades one small allocation for the trusting
-/// read, so noise only ever makes a count larger.
+/// Counts allocations for the whole process, so one translate call can be
+/// priced in allocator calls. Tests in one binary share the counter and run in
+/// parallel, so another test's allocations can only make a count larger, never
+/// smaller.
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
@@ -207,6 +208,9 @@ fn edit_translate_timing_probe() {
 
         let before = allocations();
         translate(tool, &args, &project_root, &app_ctx);
+        // `allocations()` takes a snapshot that may itself allocate once
+        // (test-harness bookkeeping around the load), so drop one from the
+        // delta; the printed count is then the translate call's own.
         let used = allocations() - before - 1;
         println!("{tool:12} {label:28} {p50:10.3} {p95:10.3} {used:12}");
     }
