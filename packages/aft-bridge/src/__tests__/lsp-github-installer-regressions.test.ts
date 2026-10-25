@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
+  existsSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
@@ -92,6 +94,95 @@ describe("archive prechecks", () => {
       const archive = join(root, "payload.tar");
       execFileSync("tar", ["-cf", archive, "-C", root, name]);
       expect(await installerFixture()._precheckTarForTesting(archive, "tar")).toBe(4);
+    });
+  });
+});
+
+describe("cache publication already on main", () => {
+  test.skipIf(process.platform === "win32")(
+    "executable upgrade leaves the previous executable inode intact",
+    async () => {
+      await cacheFixture(async (root) => {
+        const texlab = findGithubServerById("texlab");
+        if (!texlab) throw new Error("texlab fixture missing");
+        const oldScript = "#!/bin/sh\n# old\nexit 0\n";
+        const newScript = "#!/bin/sh\n# new\nexit 0\n";
+        const binary = join(root, "lsp-binaries", "texlab", "bin", "texlab");
+        mkdirSync(dirname(binary), { recursive: true });
+        writeFileSync(binary, oldScript, { mode: 0o755 });
+        writeFileSync(
+          join(dirname(binary), "..", ".aft-installed"),
+          JSON.stringify({
+            version: "0.9.0",
+            binarySha256: createHash("sha256").update(oldScript).digest("hex"),
+          }),
+        );
+        // A second name for the old inode: an in-place overwrite would change it.
+        const oldLink = join(root, "old-binary");
+        linkSync(binary, oldLink);
+        const tree = join(root, "tree");
+        mkdirSync(tree);
+        writeFileSync(join(tree, "texlab"), newScript, { mode: 0o755 });
+        const archive = join(root, "texlab.tar.gz");
+        execFileSync("tar", ["-czf", archive, "-C", tree, "texlab"]);
+        const arch = process.arch === "arm64" ? "arm64" : "x64";
+        const platform = process.platform === "darwin" ? "darwin" : "linux";
+        const asset = texlab.resolveAsset(platform, arch, "1.0.0");
+        if (!asset) throw new Error("texlab asset fixture missing");
+        const fakeFetch = (async (url: unknown) =>
+          String(url).includes("/releases/tags/")
+            ? Response.json({
+                tag_name: "1.0.0",
+                assets: [
+                  {
+                    name: asset.name,
+                    browser_download_url: `https://github.com/latex-lsp/texlab/releases/download/1.0.0/${asset.name}`,
+                  },
+                ],
+              })
+            : new Response(readFileSync(archive))) as typeof fetch;
+        const installer = installerFixture();
+        const result = installer.runGithubAutoInstall(
+          new Set(["texlab"]),
+          { ...config, versions: { [texlab.githubRepo]: "1.0.0" } },
+          fakeFetch,
+        );
+        await result.installsComplete;
+        await installer.abortInFlightGithubInstalls();
+        expect(readFileSync(binary, "utf8")).toBe(newScript);
+        expect(readFileSync(oldLink, "utf8")).toBe(oldScript);
+        expect(existsSync(join(root, "lsp-binaries", ".quarantine"))).toBe(false);
+      });
+    },
+  );
+
+  test("cache validation cannot quarantine a leased GitHub installation", async () => {
+    await cacheFixture(async (root) => {
+      const pkg = join(root, "lsp-binaries", "clangd");
+      mkdirSync(join(pkg, "bin"), { recursive: true });
+      writeFileSync(join(pkg, "bin", "clangd"), "partially published");
+      writeFileSync(
+        join(pkg, ".aft-installed"),
+        JSON.stringify({ version: "1.0.0", binarySha256: "0".repeat(64) }),
+      );
+      const lease = acquireInstallLock(clangd.githubRepo);
+      expect(lease).not.toBeNull();
+      const installer = installerFixture();
+      try {
+        const result = installer.runGithubAutoInstall(
+          new Set(),
+          { ...config, autoInstall: false },
+          fetch,
+          { __lockWaitTimeoutMsForTests: 50, __lockPollIntervalMsForTests: 10 },
+        );
+        expect(result.cachedBinDirs).toEqual([]);
+        await result.installsComplete;
+        expect(existsSync(pkg)).toBe(true);
+        expect(existsSync(join(root, "lsp-binaries", ".quarantine"))).toBe(false);
+      } finally {
+        lease?.release();
+        await installer.abortInFlightGithubInstalls();
+      }
     });
   });
 });
