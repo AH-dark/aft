@@ -574,14 +574,11 @@ fn validate_at(schema: &Value, value: &Value, path: &String) -> Result<(), Schem
                 }
             }
             if let Some(scale) = object.get("scale").and_then(Value::as_u64) {
-                // The fraction is counted in the value's canonical text, so
-                // it is checked against the same spelling a reader compares:
-                // a longer fraction than the schema promises is refused.
-                let fraction_digits = text
-                    .split_once('.')
-                    .map(|(_, fraction)| fraction.split(['e', 'E']).next().unwrap_or("").len())
-                    .unwrap_or(0);
-                if fraction_digits as u64 > scale {
+                // The places are counted from the value's decimal expansion,
+                // not from one spelling of it: the canonical text of a small
+                // value is in exponent form (`1e-7`) and carries no decimal
+                // point, yet that value has seven fractional places.
+                if fractional_places(&text) > scale {
                     return Err(SchemaError::ValueMismatch {
                         path: path.clone(),
                         expected: format!("decimal with at most {scale} fractional digits"),
@@ -692,6 +689,35 @@ fn validate_at(schema: &Value, value: &Value, path: &String) -> Result<(), Schem
             Ok(())
         }
     }
+}
+
+/// The number of decimal places a canonical number text shows once written
+/// out in full, ignoring trailing zeros.
+///
+/// The text is the ECMAScript form `canonical_number_text` produces, which
+/// switches to exponents at `1e-7` and `1e21`. Counting the digits after a
+/// decimal point would therefore report no fraction for `1e-7` and a fraction
+/// for `0.000001`; both have six or seven places, and `1e21` has none.
+fn fractional_places(text: &str) -> u64 {
+    let (mantissa, exponent) = match text.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            exponent
+                .parse::<i64>()
+                .expect("a canonical number's exponent is an integer"),
+        ),
+        None => (text, 0),
+    };
+    let fraction = mantissa
+        .split_once('.')
+        .map(|(_, fraction)| fraction)
+        .unwrap_or("");
+    // Every digit after the point in the mantissa is a place, leading zeros
+    // included: `0.000001` has six, and only its trailing zeros can be
+    // dropped. A negative exponent moves the point further left and adds that
+    // many places; a positive one moves it right and cancels them.
+    let places = fraction.trim_end_matches('0').len() as i64 - exponent;
+    places.max(0) as u64
 }
 
 fn mismatch(path: &str, expected: &str, found: &Value) -> SchemaError {
@@ -1031,6 +1057,68 @@ mod tests {
         ));
         assert!(matches!(
             validate(&schema, &json!(-1)),
+            Err(SchemaError::ValueMismatch { .. })
+        ));
+    }
+
+    /// `scale` counts decimal places in the value itself, not in one spelling
+    /// of it. A small value is written in exponent form (`1e-7`), which has no
+    /// decimal point at all, and it has seven fractional places anyway; a
+    /// whole value written with an exponent (`1e21`) has none.
+    #[test]
+    fn decimal_scale_counts_fractional_places_not_spelling_punctuation() {
+        let two_places = json!({"type": "decimal", "scale": 2});
+
+        // Around ECMAScript's switch to exponent form: 0.000001 and 1e-7 are
+        // both past two places, one spelled with a decimal point and one with
+        // an exponent, and both must be refused. A check that read the
+        // exponent form as having no fraction would accept 1e-7 here.
+        assert!(matches!(
+            validate(&two_places, &json!(0.000001)),
+            Err(SchemaError::ValueMismatch { .. })
+        ));
+        assert!(matches!(
+            validate(&two_places, &json!(1e-7)),
+            Err(SchemaError::ValueMismatch { .. })
+        ));
+
+        // Controls that pin each value's own place count: six places admits
+        // 0.000001 and refuses 1e-7; seven admits both. A check that treated
+        // the exponent form as zero places could not refuse 1e-7 at six.
+        let six_places = json!({"type": "decimal", "scale": 6});
+        assert!(validate(&six_places, &json!(0.000001)).is_ok());
+        assert!(matches!(
+            validate(&six_places, &json!(1e-7)),
+            Err(SchemaError::ValueMismatch { .. })
+        ));
+        let seven_places = json!({"type": "decimal", "scale": 7});
+        assert!(validate(&seven_places, &json!(1e-7)).is_ok());
+
+        // Values that lose their exponent when written out: 1.5e-6 is
+        // 0.0000015 (seven places) and 1.5e-2 is 0.015 (three).
+        assert_eq!(canonical_number_text(1.5e-6).as_deref(), Some("0.0000015"));
+        assert_eq!(canonical_number_text(1.5e-2).as_deref(), Some("0.015"));
+        assert!(matches!(
+            validate(&two_places, &json!(1.5e-6)),
+            Err(SchemaError::ValueMismatch { .. })
+        ));
+        assert!(matches!(
+            validate(&two_places, &json!(1.5e-2)),
+            Err(SchemaError::ValueMismatch { .. })
+        ));
+        let three_places = json!({"type": "decimal", "scale": 3});
+        assert!(validate(&three_places, &json!(1.5e-2)).is_ok());
+
+        // A whole value has no fractional places however it is spelled,
+        // including the exponent form 1e21 that ECMAScript uses for it.
+        assert_eq!(canonical_number_text(1e21).as_deref(), Some("1e+21"));
+        assert!(validate(&two_places, &json!(1e21)).is_ok());
+        assert!(validate(&two_places, &json!(100)).is_ok());
+
+        // The exact limit still passes, and one place past it is refused.
+        assert!(validate(&two_places, &json!(0.01)).is_ok());
+        assert!(matches!(
+            validate(&two_places, &json!(0.001)),
             Err(SchemaError::ValueMismatch { .. })
         ));
     }

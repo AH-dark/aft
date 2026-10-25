@@ -141,18 +141,15 @@ fn write_value<R: NumberRule>(
         Value::Bool(true) => out.push_str("true"),
         Value::Bool(false) => out.push_str("false"),
         Value::Number(number) => {
-            let text = if let Some(integer) = number.as_i64() {
-                // An `i64` prints exactly, and every integer JCS can carry
-                // through a double is far inside that range.
-                integer.to_string()
-            } else if let Some(integer) = number.as_u64() {
-                integer.to_string()
-            } else {
-                let float = number
-                    .as_f64()
-                    .expect("a JSON number is representable as f64");
-                canonical_number_text(float).ok_or(CanonicalError::NonFiniteNumber)?
-            };
+            // Every number, integer or not, takes the form ECMAScript prints
+            // for the double a reader parses it as. Printing an integer's
+            // digits as written would diverge from the reader for values a
+            // double cannot hold exactly (`9007199254740993` is read back as
+            // 9007199254740992), and the reader hashes what it prints.
+            let float = number
+                .as_f64()
+                .expect("a JSON number is representable as f64");
+            let text = canonical_number_text(float).ok_or(CanonicalError::NonFiniteNumber)?;
             rule.check(number, &text)?;
             out.push_str(&text);
         }
@@ -353,5 +350,20 @@ mod tests {
             canonicalize_manifest(&value),
             Err(CanonicalError::NumberOutOfRange { .. })
         ));
+    }
+
+    /// A JSON integer the RFC rule accepts is still a double on the reading
+    /// side: an ECMAScript reader parses `9007199254740993` as
+    /// 9007199254740992, so printing the digits as written would make the
+    /// reader hash different bytes than the writer did. -0 is the other side
+    /// of the same rule: it is a double whose canonical text is `0`.
+    #[test]
+    fn the_rfc_rule_spells_integers_as_the_doubles_a_reader_parses() {
+        assert_eq!(
+            canonical_text(json!(9007199254740993_u64)),
+            "9007199254740992"
+        );
+        assert_eq!(canonical_text(json!(-0.0)), "0");
+        assert_eq!(canonical_text(json!([-0.0, 0.0])), "[0,0]");
     }
 }
