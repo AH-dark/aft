@@ -790,6 +790,7 @@ mod tests {
             .await
             .expect("catalog reply")
             .unwrap()
+            .frame
     }
 
     #[tokio::test]
