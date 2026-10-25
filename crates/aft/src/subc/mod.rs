@@ -230,6 +230,7 @@ mod readiness;
 mod remote_policy;
 pub(crate) mod result_body;
 mod retained_result;
+mod rich_ui;
 mod run_scope;
 mod scope_describe;
 #[cfg(test)]
