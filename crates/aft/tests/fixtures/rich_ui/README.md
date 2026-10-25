@@ -175,14 +175,24 @@ allowed, not that the key may be omitted. Counts are bounded safe integers.
 | Field | Type / values | Source |
 |---|---|---|
 | schema / version | `"aft.bash.view"` / `1` | fixed record identity |
-| task_id | string ≤1,024 bytes | `PersistedTask.task_id`; snapshot `info.task_id` |
-| schema_pin | string ≤1,024 bytes | original Bash `ToolCallRequest.schema_pin`, threaded into the task by the later view-record writer, not the observing status/watch pin |
-| phase | `"finished"` only | terminal-state guard; host supplies running state before any record |
+| task_id | string ≤1,024 bytes, nullable | `PersistedTask.task_id`; snapshot `info.task_id`; non-null when emitted by AFT |
+| schema_pin | string ≤1,024 bytes, nullable | original Bash `ToolCallRequest.schema_pin`, carried with the task, not the observing status/watch pin; non-null when emitted by AFT |
+| phase | `running` / `finished` | host may supply running placeholders; AFT emits finished only |
 | exitCode | integer ±(2^53−1), nullable | snapshot / persisted `exit_code`; unknown stays null |
 | durationMs | integer 0…2^53−1, nullable | snapshot / persisted `duration_ms`; unknown stays null |
 | outputBytes | integer 0…2^53−1, nullable | task-row `output_bytes`: retained stdout + stderr file lengths, or PTY file length; null if neither length is readable |
-| endReason | `completed`, `failed`, `killed`, `timed_out`, `fate_unknown` | terminal `BgTaskStatus`, not free-text status_reason |
-| templates | `{row: string ≤71 bytes, page: string ≤71 bytes}` | first-write-wins stored template digests selected with the original Bash pin |
+| endReason | `completed`, `failed`, `killed`, `timed_out`, `fate_unknown`, nullable | terminal `BgTaskStatus`, not free-text status_reason; non-null when emitted by AFT |
+| templates | `{row, page}`, each exactly `sha256:` plus 64 lowercase hex digits (71 ASCII bytes) | first-write-wins stored digests of canonical published template files selected with the original Bash pin |
+
+The interchange schema admits a host running value with task_id, schema_pin,
+endReason, exitCode, durationMs and outputBytes all null. **AFT-emitted records
+are still finished only**, with task_id, schema_pin and endReason non-null.
+`operations::validate_view_record` enforces that emission rule and phase-dependent
+nulls in addition to the bounded schema. It also checks both template digests
+with `valid_template_digest`: wrong length, prefix, uppercase or non-hex text
+refuses `result_schema_mismatch`. Digest spelling cannot be expressed by the
+bounded language (which has no patterns), so this explicit check is mandatory.
+The vectors' digests equal the builder's published template-file hashes.
 
 Code sources: `crates/aft/src/bash_background/mod.rs:908-943` defines snapshot
 info and terminal states; `registry.rs:687-755` defines the snapshot;
@@ -247,12 +257,21 @@ one 64 KiB backend page per stream, emits stdout parts then stderr parts and
 leaves a deferred stream's offset unchanged. This is not chronological
 stdout/stderr interleaving. PTY has one combined stream in capture order.
 
-A running page always has a cursor, even at the current end or while holding
-an unclosed line. Reading it later can return appended output; `next` is null
-only after terminal status and full drain of both streams. There is never a
-`total`. The existing backend re-samples artifact length for each read and
-advances by returned bytes (`commands/bash_status.rs:403-430`); the later
-carrier output layer, not `output_has_more` alone, decides terminal drain.
+A running page always has a task-bound opaque cursor, even at the current end
+or while holding an unclosed line. The cursor authenticates per-stream positions
+and a monotonic read sequence (keyed MAC or task-bound encoding, bound to the
+viewed task and session). Each successful read increments that sequence, so
+**next differs from the request even when positions have not changed**. There
+is no sequence wrap or per-read database counter. Reading next later can return
+appended output; it is null only after terminal status and full drain of both
+streams. Tampered, foreign-task or malformed cursors refuse `malformed_cursor`
+with the fixed message in operations.rs. No `total` is emitted. Symbolic
+no-progress, progress, terminal-drained and refusal vectors in bash-output.json
+pin the contract, not a particular future cursor encoding. Frame-key replay
+still reuses the stored body/cursor; fresh evaluation needs a fresh frame key.
+The existing backend re-samples artifact length for each read and advances by
+returned bytes (`commands/bash_status.rs:403-430`); the later carrier output
+layer, not `output_has_more` alone, decides terminal drain.
 
 **The beginning is not retained indefinitely.** At terminal handling,
 `bash_background/buffer.rs:14,356-369` trims each artifact to a 100 MiB tail.

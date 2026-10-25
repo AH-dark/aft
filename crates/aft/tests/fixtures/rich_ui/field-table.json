@@ -103,7 +103,7 @@
       },
       {
         "key": "next",
-        "source": "authenticated cursor or null at terminal drain",
+        "source": "task/session-bound opaque cursor of per-stream positions plus incremented monotonic read sequence; changes even without position progress; null only at terminal drain",
         "required": true,
         "nullable": true,
         "placement": "next"
