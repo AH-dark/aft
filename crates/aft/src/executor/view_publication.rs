@@ -293,6 +293,7 @@ struct Running {
 }
 
 struct Submission {
+    reason: crate::views::publication_reason::Reason,
     target: Target,
     content_generation: u64,
     paths: BTreeSet<Vec<u8>>,
@@ -315,6 +316,7 @@ impl Submission {
     }
 
     fn merge(&mut self, other: &Self) {
+        self.reason.merge(other.reason);
         union_paths(&mut self.paths, &other.paths);
         self.allow_semantic_blob_put |= other.allow_semantic_blob_put;
         self.rescan |= other.rescan;
@@ -668,6 +670,24 @@ pub(crate) fn schedule(
     paths: BTreeSet<Vec<u8>>,
     allow_semantic_blob_put: bool,
 ) -> Result<(), String> {
+    schedule_with_reason(
+        ctx,
+        paths,
+        allow_semantic_blob_put,
+        crate::views::publication_reason::Reason {
+            events: crate::views::publication_reason::Reason::CONFIGURE,
+            ..Default::default()
+        },
+    )
+}
+
+pub(crate) fn schedule_with_reason(
+    ctx: &AppContext,
+    paths: BTreeSet<Vec<u8>>,
+    allow_semantic_blob_put: bool,
+    reason: crate::views::publication_reason::Reason,
+) -> Result<(), String> {
+    let _reason = reason.enter();
     if ctx.retire_deleted_view_root() {
         return Ok(());
     }
@@ -699,6 +719,7 @@ pub(crate) fn schedule(
         return Err("view root is unbound or missing".to_owned());
     }
     let mut current = Submission {
+        reason,
         target,
         content_generation: ctx.configure_content_generation(),
         rescan: paths.is_empty(),
@@ -802,6 +823,7 @@ pub(crate) fn schedule(
                 }
                 ran_deferred = target.ctx.defer_callgraph_build();
                 let result = (|| {
+                    let _reason = current.reason.enter();
                     lifecycle.phase("manifest")?;
                     let mut slot = PublicationSlot::acquire(
                         &target.ctx.cold_build_limiter(),

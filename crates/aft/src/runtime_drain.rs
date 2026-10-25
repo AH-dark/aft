@@ -1360,7 +1360,15 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
             ctx.view_runtime_snapshot()
                 .map(|snapshot| snapshot.pending_paths),
         ) {
-            if let Err(error) = crate::executor::view_publication::schedule(ctx, pending, true) {
+            if let Err(error) = crate::executor::view_publication::schedule_with_reason(
+                ctx,
+                pending,
+                true,
+                crate::views::publication_reason::Reason {
+                    events: crate::views::publication_reason::Reason::SEMANTIC,
+                    ..Default::default()
+                },
+            ) {
                 aft::slog_warn!("semantic-ready view publication failed: {}", error);
             }
         }
@@ -2109,8 +2117,15 @@ fn publish_semantic_ready_view(ctx: &AppContext) {
     let Some(root) = ctx.canonical_cache_root_opt() else {
         return;
     };
-    match crate::executor::view_publication::schedule(ctx, paths, !ctx.shared_artifacts_read_only())
-    {
+    match crate::executor::view_publication::schedule_with_reason(
+        ctx,
+        paths,
+        !ctx.shared_artifacts_read_only(),
+        crate::views::publication_reason::Reason {
+            events: crate::views::publication_reason::Reason::SEMANTIC,
+            ..Default::default()
+        },
+    ) {
         Ok(()) => crate::slog_info!(
             "content-addressed view publication scheduled after semantic refresh root={}",
             root.display()
@@ -3492,6 +3507,7 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
         // A quiet root still needs verification after ten minutes or restart.
         // The full request remains sticky through retries and later events.
         state.view_publication_full = true;
+        state.view_publication_reason.periodic = true;
         state.view_publication_due = Some(Instant::now());
     }
     if !ctx.config().views.enabled
@@ -3509,12 +3525,14 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
         state.view_publication_due = None;
         state.view_publication_paths.clear();
         state.view_publication_full = false;
+        state.view_publication_reason = Default::default();
         return;
     }
     if ctx.view_runtime_snapshot().is_none() {
         state.view_publication_due = None;
         state.view_publication_paths.clear();
         state.view_publication_full = false;
+        state.view_publication_reason = Default::default();
         return;
     }
     if let Some(due) = ctx
@@ -3542,10 +3560,11 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
             .collect::<Option<BTreeSet<_>>>()
             .unwrap_or_default()
     };
-    match crate::executor::view_publication::schedule(
+    match crate::executor::view_publication::schedule_with_reason(
         ctx,
         changed,
         !ctx.shared_artifacts_read_only(),
+        state.view_publication_reason,
     ) {
         Ok(()) => {
             aft::slog_info!(
@@ -3554,6 +3573,7 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
             );
             state.view_publication_paths.clear();
             state.view_publication_full = false;
+            state.view_publication_reason = Default::default();
             state.view_publication_due = None;
         }
         Err(error) => {
@@ -3561,6 +3581,7 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
                 state.view_publication_due = None;
                 state.view_publication_paths.clear();
                 state.view_publication_full = false;
+                state.view_publication_reason = Default::default();
                 return;
             }
             // Inline publication records and logs the failure in the same retry
@@ -3672,15 +3693,30 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     // TypeScript server a file gets.
                     ctx.lsp_note_watcher_batch(&paths, content_only);
                     if !state.rescan_required {
-                        state.pending_paths.extend(paths.into_iter().filter(|path| {
-                            !crate::watcher_filter::queued_path_is_ignored_by_matcher(
-                                &ctx.shared_gitignore(),
-                                path,
-                            )
-                        }));
+                        let mut accepted = false;
+                        state.pending_paths.extend(
+                            paths
+                                .into_iter()
+                                .filter(|path| {
+                                    !crate::watcher_filter::queued_path_is_ignored_by_matcher(
+                                        &ctx.shared_gitignore(),
+                                        path,
+                                    )
+                                })
+                                .inspect(|_| accepted = true),
+                        );
+                        if accepted {
+                            state.view_publication_reason.events |= if content_only {
+                                crate::views::publication_reason::Reason::CONTENT
+                            } else {
+                                crate::views::publication_reason::Reason::PATHS
+                            };
+                        }
                     }
                 }
                 Ok(WatcherDispatchEvent::RescanRequired(reason)) => {
+                    state.view_publication_reason.events |=
+                        crate::views::publication_reason::Reason::RESCAN;
                     state.view_publication_full = true;
                     dispatch_events_received += 1;
                     // A rescan means the watcher dropped the individual
@@ -3702,6 +3738,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     state.scheduler_changed_path_count = 0;
                 }
                 Ok(WatcherDispatchEvent::IgnoreRulesChanged { paths }) => {
+                    state.view_publication_reason.events |=
+                        crate::views::publication_reason::Reason::IGNORE;
                     dispatch_events_received += 1;
                     ctx.lsp_note_watcher_ignore_change();
                     if state.rescan_required {
@@ -3995,6 +4033,10 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 } else {
                     BTreeSet::new()
                 };
+                if !git_head_paths.is_empty() {
+                    state.view_publication_reason.events |=
+                        crate::views::publication_reason::Reason::HEAD_METADATA;
+                }
                 paths.retain(|path| !git_head_paths.contains(path));
                 if ctx.config().views.enabled {
                     // An edit or a HEAD move: the main checkout's call graph no

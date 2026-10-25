@@ -433,6 +433,7 @@ impl PreparedAssembly {
     }
 
     pub fn commit(&mut self) -> Result<AssemblyReport> {
+        let _store_writes = self.profile.store_writes.enter();
         if let Some(publication) = self.publication.take() {
             let retires_legacy_plane = publication.base_generation.is_none();
             let attempted_generation = publication.generation.clone();
@@ -658,9 +659,19 @@ pub fn prepare_checkout_deferring(
     // rather than only where the scheduler happened to compute it.
     super::cache_head_fingerprint(request.project_root.clone(), request.desired_head.clone());
     let mut profile = PublicationProfile::new(&request.project_root);
+    profile.scheduling =
+        super::publication_reason::Reason::current().fields(&request.changed_paths);
+    let _store_writes = profile.store_writes.enter();
     profile.enter(0, phase)?;
     let view = ViewStore::open(&request.storage, &request.scope)?;
     let current_generation = view.current_generation()?;
+    if current_generation.as_deref().is_some_and(|generation| {
+        !super::generation_matches_head(generation, &request.desired_head)
+    }) {
+        let mut reason = super::publication_reason::Reason::current();
+        reason.head = true;
+        profile.scheduling = reason.fields(&request.changed_paths);
+    }
     let base_pin = current_generation
         .as_deref()
         .map(|generation| crate::pins::QueryPin::acquire(view.view_dir(), generation))
@@ -1662,6 +1673,8 @@ pub fn prepare_checkout_deferring(
 /// prepared generation leaves the actor barrier (including failed attempts).
 struct PublicationProfile {
     root: PathBuf,
+    scheduling: String,
+    store_writes: super::write_accounting::Publication,
     io: super::io::PublicationIo,
     overlap: super::io::Overlap,
     concurrent_publications: u64,
@@ -1703,6 +1716,8 @@ impl PublicationProfile {
         let now = Instant::now();
         Self {
             root: root.to_owned(),
+            scheduling: String::new(),
+            store_writes: super::write_accounting::Publication::default(),
             io: super::io::PublicationIo::new(root),
             overlap: super::io::Overlap::new(true),
             concurrent_publications: 0,
@@ -1814,8 +1829,17 @@ pub(crate) fn publication_outcomes_for_test(root: &Path) -> Vec<&'static str> {
 }
 
 fn log_publication_profile(profile: &PublicationProfile) {
-    crate::slog_info!("{}", publication_profile_line(profile));
+    crate::slog_info!(
+        "{} {} {}",
+        publication_profile_line(profile),
+        profile.store_writes.fields(),
+        profile.scheduling
+    );
 }
+
+#[cfg(test)]
+#[path = "write_accounting_tests.rs"]
+mod write_accounting_tests;
 
 fn publication_profile_line(profile: &PublicationProfile) -> String {
     // Retain the existing drill fields alongside the shared phase names. The

@@ -2166,6 +2166,7 @@ pub(crate) struct WatcherDrainSliceState {
     /// Lost events require a whole-checkout read until a full request is handed
     /// to the publisher. Later path batches must not dilute that obligation.
     pub(crate) view_publication_full: bool,
+    pub(crate) view_publication_reason: crate::views::publication_reason::Reason,
     pub(crate) view_publication_due: Option<Instant>,
     pub(crate) path_slice_count: usize,
 }
@@ -2494,6 +2495,7 @@ impl WatcherDrainSliceState {
             semantic_refresh_paths: Vec::new(),
             view_publication_paths: BTreeSet::new(),
             view_publication_full: false,
+            view_publication_reason: Default::default(),
             view_publication_due: None,
             path_slice_count: 0,
         }
@@ -10691,10 +10693,14 @@ impl AppContext {
             "callgraph on-demand build scheduled root={}",
             root.display()
         );
-        if let Err(error) = crate::executor::view_publication::schedule(
+        if let Err(error) = crate::executor::view_publication::schedule_with_reason(
             self,
             BTreeSet::new(),
             !self.shared_artifacts_read_only(),
+            crate::views::publication_reason::Reason {
+                query: true,
+                ..Default::default()
+            },
         ) {
             crate::slog_warn!(
                 "callgraph on-demand build failed to schedule root={}: {}",

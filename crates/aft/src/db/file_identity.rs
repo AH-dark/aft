@@ -408,7 +408,10 @@ impl IdentityConnection {
             rusqlite::OpenFlags::default(),
         )?;
         #[cfg(not(test))]
-        let connection = rusqlite::Connection::open(path)?;
+        let connection = crate::views::write_accounting::open_connection(
+            path.as_ref(),
+            rusqlite::OpenFlags::default(),
+        )?;
         Ok(Self::new(connection, seam))
     }
 
@@ -426,7 +429,7 @@ impl IdentityConnection {
         let connection =
             crate::views::materialization::open_probe_connection(path.as_ref(), flags)?;
         #[cfg(not(test))]
-        let connection = rusqlite::Connection::open_with_flags(path, flags)?;
+        let connection = crate::views::write_accounting::open_connection(path.as_ref(), flags)?;
         Ok(Self::new(connection, seam))
     }
 
