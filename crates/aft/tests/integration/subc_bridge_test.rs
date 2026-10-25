@@ -5155,8 +5155,13 @@ async fn drive_bash_repeat_breaker_daemon(input: FakeDaemonInput) {
             ),
         ] {
             let corr = 900 + offset + index as u64;
-            let response =
-                call_tool_response(&mut stream, 1, corr, "bash", arguments, "repeated bash").await;
+            let response = {
+                // Allow slow shell startup for the positive foreground-finish
+                // assertion without lengthening the promotion-path wait.
+                let _foreground_wait =
+                    (kind == "finished").then(|| set_test_foreground_wait_ms(30_000));
+                call_tool_response(&mut stream, 1, corr, "bash", arguments, "repeated bash").await
+            };
             assert_tool_success(&response, kind);
             let text = response["text"].as_str().unwrap_or_default().to_string();
             match kind {
