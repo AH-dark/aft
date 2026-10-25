@@ -187,7 +187,7 @@ fn parse_stringified_collection(
     Ok(())
 }
 
-fn normalize_zoom_aliases(map: &mut Map<String, Value>) -> Result<(), TranslateError> {
+pub(crate) fn normalize_zoom_aliases(map: &mut Map<String, Value>) -> Result<(), TranslateError> {
     let mut batch = Vec::new();
     if let Some(mut value) = map.remove("batch") {
         parse_stringified_collection(&mut value, "batch", "an array of {target, symbols}", false)?;

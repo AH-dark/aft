@@ -1,0 +1,1 @@
+The V1 tool provider now quietly accepts legacy zoom arguments, including top-level `path` and `symbols` or `targets`, just like the tool translator. The catalog still advertises only `batch`; mixed batch/top-level calls and unknown arguments remain refused.
