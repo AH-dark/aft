@@ -192,6 +192,41 @@ mod tests {
         assert!(forwarded_names(&plan, &project).is_empty());
     }
 
+    /// The four notices are approved user-facing copy. This pins their exact
+    /// text, so a wording change has to be a deliberate edit here too.
+    #[test]
+    fn the_four_notices_keep_their_approved_wording() {
+        let applied = vec![
+            ConfiguredBashEnv {
+                names: [("TZ".to_string(), "UTC".to_string())]
+                    .into_iter()
+                    .collect(),
+                tier: crate::bash_env::BashEnvTier::User,
+            },
+            ConfiguredBashEnv {
+                names: [("IBToolNeverDeque".to_string(), "1".to_string())]
+                    .into_iter()
+                    .collect(),
+                tier: crate::bash_env::BashEnvTier::Project,
+            },
+        ];
+        let mut plan = RemoteEnvPlan::default();
+        plan.withheld = vec!["BUILD_ONLY".to_string()];
+        let disclosure = Disclosure::build(&applied, &["TZ".to_string()], true, &plan);
+        assert_eq!(
+            disclosure.lines,
+            vec![
+                "Configured bash.env keys applied (values not shown): IBToolNeverDeque (project), TZ (user)."
+                    .to_string(),
+                "Project bash.env ignored: project not trusted (run npx @cortexkit/aft@latest doctor filters trust)."
+                    .to_string(),
+                "Project value for TZ ignored: user value wins.".to_string(),
+                "The runon build-server job does not receive these bash.env values: BUILD_ONLY (list a user-tier name in bash.runon_env to send it; project values are never sent)."
+                    .to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn disclosure_names_what_the_job_does_not_receive() {
         let config = config(&[("TZ", "UTC")], &[("IBToolNeverDeque", "1")], &[]);
