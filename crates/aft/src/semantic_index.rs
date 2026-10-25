@@ -10186,7 +10186,7 @@ fn build_file_summary_chunk_with_lines_and_caps(
                     .map(|stem| stem.to_string_lossy().to_string())
                     .unwrap_or_default()
             ),
-            caps.total_chars,
+            caps.total_chars.min(EmbedTextCaps::default().total_chars),
         ),
         snippet,
     }
@@ -10557,12 +10557,13 @@ fn symbols_to_chunks_with_caps(
             .iter()
             .map(|(_, signature)| *signature)
             .collect::<Vec<_>>();
-        chunks.push(build_file_summary_chunk_with_lines(
+        chunks.push(build_file_summary_chunk_with_lines_and_caps(
             file,
             project_root,
             &line_cache,
             &top_exports,
             &top_export_signatures,
+            caps,
         ));
     }
 
@@ -18154,6 +18155,83 @@ public class Greeter {
             .find(|chunk| chunk.kind == SymbolKind::FileSummary)
             .expect("expanded file summary");
         assert_eq!(legacy_summary.embed_text, expanded_summary.embed_text);
+    }
+
+    #[test]
+    fn audit10_9_summary_honors_smaller_backend_budget_without_reordering_chunks() {
+        let root = PathBuf::from("/project");
+        let file = root.join("src/summary.rs");
+        let source = "//! A long module description for a small configured embedding budget.\npub fn exported() {\n}\n";
+        let mut symbol = make_symbol(SymbolKind::Function, "exported", 1, 2);
+        symbol.exported = true;
+        let default = symbols_to_chunks_with_caps(
+            &file,
+            std::slice::from_ref(&symbol),
+            source,
+            &root,
+            EmbedTextCaps::default(),
+        );
+        let small = symbols_to_chunks_with_caps(
+            &file,
+            std::slice::from_ref(&symbol),
+            source,
+            &root,
+            EmbedTextCaps {
+                total_chars: 40,
+                ..EmbedTextCaps::default()
+            },
+        );
+        assert_eq!(
+            small
+                .iter()
+                .map(|chunk| (&chunk.name, &chunk.kind))
+                .collect::<Vec<_>>(),
+            default
+                .iter()
+                .map(|chunk| (&chunk.name, &chunk.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(small[0].kind, SymbolKind::FileSummary);
+        assert_eq!(small[0].embed_text.chars().count(), 40);
+        assert_eq!(
+            small[0].embed_text,
+            "file:src/summary.rs kind:file-summary na"
+        );
+        let expanded = symbols_to_chunks_with_caps(
+            &file,
+            &[symbol],
+            source,
+            &root,
+            EmbedTextCaps {
+                total_chars: 4000,
+                ..EmbedTextCaps::default()
+            },
+        );
+        assert_eq!(
+            expanded[0].embed_text.as_bytes(),
+            default[0].embed_text.as_bytes()
+        );
+    }
+
+    #[test]
+    fn audit10_9_expanded_budget_keeps_fixed_summary_limit() {
+        let root = Path::new("/project");
+        let file = root.join("summary.rs");
+        let exports = "x".repeat(2000);
+        let lines = SourceLineCache::new("");
+        let summary = build_file_summary_chunk_with_lines_and_caps(
+            &file,
+            root,
+            &lines,
+            &[&exports],
+            &[],
+            EmbedTextCaps {
+                total_chars: 4000,
+                ..EmbedTextCaps::default()
+            },
+        );
+        assert_eq!(summary.embed_text.chars().count(), 1600);
+        assert!(summary.embed_text.ends_with('x'));
     }
 
     #[test]
