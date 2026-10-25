@@ -864,24 +864,16 @@ fn memory_limit_pty_job_kill_finishes_before_conpty_eof() {
         ));
 
         // Handle the memory stop only after the waiter has written its exit marker.
+        let (published, release_accounting) =
+            install_kill_signal_gate_for_test(&format!("{id}:terminal-published"));
         let kill_registry = registry.clone();
         let kill_task = task.clone();
         let killer = std::thread::spawn(move || kill_registry.kill_for_memory(&kill_task, reason));
-        let terminal_deadline = Instant::now() + Duration::from_secs(2);
-        let snapshot = loop {
-            let snapshot = registry
-                .status(&id, "memory-held", None, None, 4096)
-                .unwrap();
-            if snapshot.info.status.is_terminal() {
-                break snapshot;
-            }
-            assert!(
-                Instant::now() < terminal_deadline,
-                "job-killed PTY stayed {:?} while ConPTY was held open; keep_marker={keep_marker}",
-                snapshot.info.status
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        published
+            .recv_timeout(Duration::from_secs(2))
+            .expect("job-killed PTY did not publish terminal state while ConPTY was held open");
+        // A later accounting pass must not be needed to repair a terminal snapshot.
+        let snapshot = task.snapshot(4096);
         assert_eq!(snapshot.info.status, BgTaskStatus::Failed);
         assert_eq!(snapshot.exit_code, Some(137));
         assert!(snapshot
@@ -891,6 +883,7 @@ fn memory_limit_pty_job_kill_finishes_before_conpty_eof() {
             .unwrap_or_default()
             .contains("Windows job-object memory limit"));
         assert!(!reader_done.load(Ordering::SeqCst));
+        release_accounting.send(()).unwrap();
         killer.join().unwrap();
         drop(held_master);
     }
