@@ -58,8 +58,7 @@ runs:
         path: ${{ runner.temp }}
         # A transfer that passes the artifact digest can still leave a truncated
         # zstd frame on this runner; test the archive and download again if so.
-        # Windows runners have no zstd on PATH, so they skip the check.
-        verify-zstd: ${{ inputs.platform != 'windows' && format('{0}-nextest.tar.zst', inputs.platform) || '' }}
+        verify-zstd: ${{ inputs.platform }}-nextest.tar.zst
 
     - name: Require the real Linux rust-analyzer
       if: inputs.platform == 'linux'

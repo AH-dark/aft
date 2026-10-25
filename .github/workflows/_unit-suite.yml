@@ -1332,6 +1332,7 @@ jobs:
         with:
           name: windows-nextest-archive
           path: ${{ runner.temp }}
+          verify-zstd: windows-nextest.tar.zst
 
       - name: Rust libtest shard (nextest archive)
         # The gate writes AFT_GATE_LOG itself; do not pipe it through `tee`.
