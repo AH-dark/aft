@@ -12,10 +12,30 @@ use std::collections::BTreeMap;
 use crate::config::Config;
 use crate::config_resolve::ConfiguredBashEnv;
 
+// The four once-per-session notices are user-facing copy that was reviewed and
+// approved as written. Each lives here, in one place, and a test asserts its
+// exact text, so a wording change is a deliberate edit in a single spot.
+
+/// What the notice says before the applied names. Each name follows as
+/// `NAME (tier)`, joined with `, `.
+pub(crate) const APPLIED_NOTICE_PREFIX: &str =
+    "Configured bash.env keys applied (values not shown):";
+
+/// What the notice says before the names a user value shadows, joined with
+/// `, `.
+pub(crate) const SHADOWED_PROJECT_NOTICE_PREFIX: &str = "Project value for";
+
 /// The note that says a project's `bash.env` did not apply because the project
 /// is not on the trust list, with the documented command for trusting it.
 pub(crate) const PROJECT_UNTRUSTED_NOTICE: &str =
     "Project bash.env ignored: project not trusted (run npx @cortexkit/aft@latest doctor filters trust).";
+
+/// What the notice says after the shadowed names.
+pub(crate) const SHADOWED_PROJECT_NOTICE_SUFFIX: &str = "ignored: user value wins.";
+
+/// What the notice says about a `runon` build-server job. `{}` takes the
+/// comma-joined names the job does not receive.
+pub(crate) const RUNON_WITHHELD_NOTICE: &str = "The runon build-server job does not receive these bash.env values: {} (list a user-tier name in bash.runon_env to send it; project values are never sent).";
 
 /// The user-tier names a runon job may receive, and the configuration this
 /// decision was made from. The same modules used to be read directly from
@@ -92,16 +112,14 @@ impl Disclosure {
         let mut lines = Vec::new();
         let applied_names = format_applied(applied);
         if !applied_names.is_empty() {
-            lines.push(format!(
-                "Configured bash.env keys applied (values not shown): {applied_names}."
-            ));
+            lines.push(format!("{APPLIED_NOTICE_PREFIX} {applied_names}."));
         }
         if project_untrusted {
             lines.push(PROJECT_UNTRUSTED_NOTICE.to_string());
         }
         if !shadowed_project_names.is_empty() {
             lines.push(format!(
-                "Project value for {} ignored: user value wins.",
+                "{SHADOWED_PROJECT_NOTICE_PREFIX} {} {SHADOWED_PROJECT_NOTICE_SUFFIX}",
                 shadowed_project_names.join(", ")
             ));
         }
@@ -109,10 +127,7 @@ impl Disclosure {
             let mut sorted = remote.withheld.clone();
             sorted.sort();
             sorted.dedup();
-            lines.push(format!(
-                "The runon build-server job does not receive these bash.env values: {} (list a user-tier name in bash.runon_env to send it; project values are never sent).",
-                sorted.join(", ")
-            ));
+            lines.push(RUNON_WITHHELD_NOTICE.replace("{}", &sorted.join(", ")));
         }
         Self { lines }
     }
