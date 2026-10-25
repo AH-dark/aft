@@ -16,6 +16,7 @@ import { dirname, join } from "node:path";
 import { getAftLspPackagesDir } from "../cache-paths.js";
 import { execFileSync } from "../child-process.js";
 import { createGithubInstaller } from "../lsp-github-install.js";
+import { fetchGithubApiFollowingRedirects, probeGithubReleases } from "../lsp-github-probe.js";
 import { findGithubServerById } from "../lsp-github-table.js";
 import { withEnv } from "./test-utils/env-guard.js";
 
@@ -289,4 +290,102 @@ describe("GitHub release lookups", () => {
       });
     });
   }
+});
+
+describe("GitHub release probe redirects", () => {
+  const token = "fixture-token-not-a-secret";
+  const releasesUrl = "https://api.github.com/repos/owner/repo/releases?per_page=30";
+
+  /** A fetch that answers the first request with `firstResponse` and later ones with an empty release list. */
+  function recordingFetch(firstResponse: () => Response) {
+    const requests: Array<{ url: string; authorization: string | null }> = [];
+    const fakeFetch = (async (url: unknown, init?: RequestInit) => {
+      requests.push({
+        url: String(url),
+        authorization: new Headers(init?.headers).get("authorization"),
+      });
+      return requests.length === 1 ? firstResponse() : Response.json([]);
+    }) as typeof fetch;
+    return { requests, fakeFetch };
+  }
+
+  const redirectTo = (location: string) => () =>
+    new Response(null, { status: 302, headers: { location } });
+
+  test("probe strips credentials on a cross-origin redirect", async () => {
+    await cacheFixture(
+      async () => {
+        const { requests, fakeFetch } = recordingFetch(
+          redirectTo("https://objects.githubusercontent.com/releases.json"),
+        );
+        const result = await probeGithubReleases("owner/repo", 7, fakeFetch, () => {});
+        expect(result).not.toBeNull();
+        expect(requests).toEqual([
+          { url: releasesUrl, authorization: `Bearer ${token}` },
+          { url: "https://objects.githubusercontent.com/releases.json", authorization: null },
+        ]);
+      },
+      { GITHUB_TOKEN: token },
+    );
+  });
+
+  test("probe keeps credentials on a same-origin redirect", async () => {
+    await cacheFixture(
+      async () => {
+        const moved = "https://api.github.com/repositories/1/releases?per_page=30";
+        const { requests, fakeFetch } = recordingFetch(redirectTo(moved));
+        const result = await probeGithubReleases("owner/repo", 7, fakeFetch, () => {});
+        expect(result).not.toBeNull();
+        expect(requests).toEqual([
+          { url: releasesUrl, authorization: `Bearer ${token}` },
+          { url: moved, authorization: `Bearer ${token}` },
+        ]);
+      },
+      { GITHUB_TOKEN: token },
+    );
+  });
+
+  test("probe refuses a redirect to a host outside the GitHub allowlist", async () => {
+    await cacheFixture(
+      async () => {
+        const { requests, fakeFetch } = recordingFetch(
+          redirectTo("https://evil.example/releases.json"),
+        );
+        expect(await probeGithubReleases("owner/repo", 7, fakeFetch, () => {})).toBeNull();
+        expect(requests.map((request) => request.url)).toEqual([releasesUrl]);
+      },
+      { GITHUB_TOKEN: token },
+    );
+  });
+
+  test("a capitalised Authorization header is stripped on a cross-origin redirect", async () => {
+    const { requests, fakeFetch } = recordingFetch(
+      redirectTo("https://objects.githubusercontent.com/release.json"),
+    );
+    await fetchGithubApiFollowingRedirects(
+      "https://api.github.com/repos/owner/repo/releases/tags/1.0.0",
+      { Authorization: `Bearer ${token}` },
+      fakeFetch,
+    );
+    expect(requests.map((request) => request.authorization)).toEqual([`Bearer ${token}`, null]);
+  });
+
+  test("redirect following stops after five redirects", async () => {
+    let requests = 0;
+    const loop = (async () => {
+      requests += 1;
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://api.github.com/repos/owner/repo/releases" },
+      });
+    }) as unknown as typeof fetch;
+    await expect(
+      fetchGithubApiFollowingRedirects(
+        "https://api.github.com/repos/owner/repo/releases",
+        {},
+        loop,
+      ),
+    ).rejects.toThrow("too many redirects");
+    expect(requests).toBe(6);
+  });
 });

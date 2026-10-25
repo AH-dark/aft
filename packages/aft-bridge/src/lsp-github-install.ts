@@ -57,7 +57,9 @@ import { cachedFileSha256Sync, writeStampedFileDigest } from "./binary-identity.
 import { getAftLspBinariesDir } from "./cache-paths.js";
 import { execFile, spawn } from "./child-process.js";
 import {
+  assertAllowedDownloadUrl,
   assertSafeVersion,
+  fetchGithubApiFollowingRedirects,
   isSafeVersion,
   probeGithubReleases,
   stripTagV,
@@ -511,7 +513,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       const url = `https://api.github.com/repos/${githubRepo}/releases/tags/${encodeURIComponent(candidate)}`;
       const timeout = controlledTimeoutSignal(15_000, signal);
       try {
-        const res = await fetchJsonFollowingRedirects(url, headers, fetchImpl, timeout.signal);
+        const res = await fetchGithubApiFollowingRedirects(url, headers, fetchImpl, timeout.signal);
         if (res.status === 404) continue; // try next candidate
         if (!res.ok) {
           warn(`[lsp] github release-by-tag ${githubRepo}@${candidate}: HTTP ${res.status}`);
@@ -545,38 +547,6 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       }
     }
     return null;
-  }
-
-  async function fetchJsonFollowingRedirects(
-    url: string,
-    headers: Record<string, string>,
-    fetchImpl: typeof fetch,
-    signal?: AbortSignal,
-  ): Promise<Response> {
-    const maxRedirects = 5;
-    let currentUrl = url;
-    const requestHeaders = { ...headers };
-    for (let i = 0; i <= maxRedirects; i += 1) {
-      assertAllowedDownloadUrl(currentUrl);
-      // The GitHub token is for the API origin only. A redirect to another
-      // allowed host (release storage, a CDN) must not receive it.
-      if (new URL(currentUrl).origin !== "https://api.github.com") {
-        delete requestHeaders.authorization;
-      }
-      const res = await fetchImpl(currentUrl, {
-        headers: { ...requestHeaders },
-        redirect: "manual",
-        signal,
-      });
-      if (res.status >= 300 && res.status < 400) {
-        const location = res.headers.get("location");
-        if (!location) throw new Error(`redirect status ${res.status} without Location`);
-        currentUrl = new URL(location, currentUrl).toString();
-        continue;
-      }
-      return res;
-    }
-    throw new Error(`too many redirects (>${maxRedirects})`);
   }
 
   /* ─────────────────────────── orchestrator ─────────────────────────── */
@@ -726,49 +696,6 @@ export function createGithubInstaller(services: GithubInstallerHost) {
    * `assetSize` is the size hint from GitHub's release JSON. When provided
    * we sanity-check it against the cap before even starting the download.
    */
-  /**
-   * Hosts we will download GitHub release artifacts from. The GitHub API
-   * returns `browser_download_url` values that almost always live on
-   * `github.com` (the canonical URL), but the actual blob is served from
-   * `objects.githubusercontent.com` after redirect. We allow both.
-   *
-   * Without this allowlist, a compromised or malicious
-   * GitHub API response could swap `browser_download_url` to an attacker-
-   * controlled host (e.g. `evil.example/payload.zip`) and we would happily
-   * follow the redirect chain. The download size cap and SHA-256 TOFU help
-   * but cannot stop the very first install on a tag we have never seen.
-   *
-   * We handle redirects manually so every hop is checked before any bytes are
-   * accepted. A compromised release URL may start on github.com and redirect to
-   * an attacker-controlled host; `redirect: "follow"` would hide that hop.
-   */
-  const ALLOWED_DOWNLOAD_HOSTS = new Set([
-    "github.com",
-    "api.github.com",
-    "objects.githubusercontent.com",
-    "release-assets.githubusercontent.com",
-    "raw.githubusercontent.com",
-    "codeload.github.com",
-  ]);
-
-  function assertAllowedDownloadUrl(rawUrl: string): URL {
-    let parsed: URL;
-    try {
-      parsed = new URL(rawUrl);
-    } catch {
-      throw new Error(`download url is not a valid URL: ${rawUrl}`);
-    }
-    if (parsed.protocol !== "https:") {
-      throw new Error(`download url must be https (got ${parsed.protocol}): ${rawUrl}`);
-    }
-    if (!ALLOWED_DOWNLOAD_HOSTS.has(parsed.hostname.toLowerCase())) {
-      throw new Error(
-        `download url host ${parsed.hostname} is not in the GitHub allowlist: ${rawUrl}`,
-      );
-    }
-    return parsed;
-  }
-
   async function downloadFile(
     url: string,
     destPath: string,
@@ -1883,7 +1810,9 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     abortInFlightGithubInstalls,
     runGithubAutoInstall,
     discoverRelevantGithubServers,
-    _assertAllowedDownloadUrlForTesting: assertAllowedDownloadUrl,
+    // A local wrapper keeps the plugins' inferred export types free of a
+    // reference to the bridge's internal probe module.
+    _assertAllowedDownloadUrlForTesting: (rawUrl: string): URL => assertAllowedDownloadUrl(rawUrl),
     _downloadFileForTesting: downloadFile,
     _extractArchiveSafelyForTesting: extractArchiveSafely,
     _precheckArchiveSizeForTesting: precheckArchiveContents,
