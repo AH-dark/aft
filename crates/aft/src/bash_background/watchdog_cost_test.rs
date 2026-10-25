@@ -411,6 +411,162 @@ fn gc_until_lap(registry: &BgTaskRegistry, storage: &Path, laps: u64) {
     panic!("the sweep never completed lap {laps}");
 }
 
+#[test]
+fn watchdog_cost_persisted_gc_selects_newly_eligible_history() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let mut paths = Vec::new();
+    for _ in 0..4_000 {
+        paths.push(fixture(storage.path(), "session", false, 2).1);
+    }
+    work_counts::reset();
+    let start = Instant::now();
+    registry.maybe_gc_persisted(storage.path()).unwrap();
+    eprintln!(
+        "4000-task cold invocation: {:?}, {:?}",
+        start.elapsed(),
+        work_counts::get()
+    );
+    gc_until_lap(&registry, storage.path(), 2);
+    work_counts::reset();
+    let start = Instant::now();
+    registry.maybe_gc_persisted(storage.path()).unwrap();
+    eprintln!(
+        "4000-task warm invocation: {:?}, {:?}",
+        start.elapsed(),
+        work_counts::get()
+    );
+    for path in paths.iter().step_by(397).take(10) {
+        rewrite_fixture(path, |metadata| metadata.completion_delivered = true);
+    }
+    work_counts::reset();
+    let deleted = registry.maybe_gc_persisted(storage.path()).unwrap();
+    let counts = work_counts::get();
+    eprintln!("4000 tasks / 10 newly eligible: deleted={deleted}, {counts:?}");
+    assert_eq!(
+        deleted, 10,
+        "newly eligible tasks waited behind unrelated history"
+    );
+    assert!(
+        counts.metadata_reads <= 40,
+        "unrelated metadata was reread: {counts:?}"
+    );
+    assert!(
+        counts.gc_entries <= 128,
+        "discovery exceeded its iterator budget: {counts:?}"
+    );
+}
+
+#[test]
+fn watchdog_cost_persisted_gc_deadlines_bypass_paced_validation() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let wall = SystemTime::now();
+    let tick = Instant::now();
+    let mut paths = Vec::new();
+    for index in 0..4_000 {
+        let (_, path) = fixture(storage.path(), "session", true, 2);
+        let modified = if index < 10 {
+            wall - Duration::from_secs(23 * 60 * 60)
+        } else {
+            wall
+        };
+        filetime::set_file_mtime(&path.json, filetime::FileTime::from_system_time(modified))
+            .unwrap();
+        paths.push(path);
+    }
+    gc_until_lap(&registry, storage.path(), 1);
+    registry
+        .scheduled_gc_persisted(storage.path(), tick, wall)
+        .unwrap();
+    work_counts::reset();
+    let start = Instant::now();
+    let sqlite_opens = crate::db::lifecycle::thread_counts::total_opens_on_this_thread(
+        crate::db::lifecycle::SqliteStore::AftDb,
+    );
+    assert_eq!(
+        registry
+            .scheduled_gc_persisted(
+                storage.path(),
+                tick + Duration::from_secs(1),
+                wall + Duration::from_secs(2 * 60 * 60)
+            )
+            .unwrap(),
+        10
+    );
+    let counts = work_counts::get();
+    assert_eq!(
+        crate::db::lifecycle::thread_counts::total_opens_on_this_thread(
+            crate::db::lifecycle::SqliteStore::AftDb
+        ),
+        sqlite_opens,
+        "retention work opened an independent SQLite connection"
+    );
+    eprintln!(
+        "4000 deadlines / 10 expired, validation paced: {:?}, {counts:?}",
+        start.elapsed()
+    );
+    assert!(
+        counts.gc_deadlines <= 11,
+        "scanned future deadlines: {counts:?}"
+    );
+    assert_eq!(
+        counts.gc_entries, 0,
+        "validation ran before its next minute: {counts:?}"
+    );
+    assert!(
+        counts.metadata_reads <= 40,
+        "only ten due tasks may be opened: {counts:?}"
+    );
+    assert!(counts.stats < 500, "all history was statted: {counts:?}");
+    assert!(paths[..10].iter().all(|path| !path.dir.exists()));
+    assert!(paths[10..].iter().all(|path| path.json.exists()));
+    work_counts::reset();
+    registry
+        .scheduled_gc_persisted(storage.path(), tick + Duration::from_secs(59), wall)
+        .unwrap();
+    assert_eq!(work_counts::get().gc_entries, 0);
+    work_counts::reset();
+    registry
+        .scheduled_gc_persisted(storage.path(), tick + Duration::from_secs(60), wall)
+        .unwrap();
+    let entries = work_counts::get().gc_entries;
+    assert!(
+        entries > 0 && entries <= 128,
+        "validation did not resume at its bounded minute rate: {entries}"
+    );
+}
+
+#[test]
+fn watchdog_cost_persisted_gc_many_roots_share_one_store_sweep() {
+    let storage = tempfile::tempdir().unwrap();
+    for _ in 0..4_000 {
+        fixture(storage.path(), "session", false, 2);
+    }
+    let registries: Vec<_> = (0..170).map(|_| BgTaskRegistry::default()).collect();
+    let start = Instant::now();
+    for registry in &registries {
+        registry.request_persisted_gc(storage.path());
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while registries
+        .iter()
+        .any(|registry| registry.persisted_gc_thread().is_none())
+    {
+        assert!(Instant::now() < deadline, "shared sweep did not finish");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let runs: u64 = registries
+        .iter()
+        .map(|registry| registry.inner.persisted_gc_runs.load(Ordering::SeqCst))
+        .sum();
+    eprintln!(
+        "170 roots / one 4000-task store: {runs} sweeps in {:?}",
+        start.elapsed()
+    );
+    assert_eq!(runs, 1, "project roots multiplied shared-store work");
+}
+
 /// Remembering undeletable tasks must not delay or prevent deletion: a pass
 /// that runs out of budget says so and the next resumes where it stopped,
 /// deletable tasks are all removed within one lap, and a remembered task that
