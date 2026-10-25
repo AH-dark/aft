@@ -518,6 +518,8 @@ fn parity_fixture(route: ParityRoute) -> ParityFixture {
     let relative = |dir: &Path, file: &str| {
         format!("../{}/{file}", dir.file_name().unwrap().to_str().unwrap())
     };
+    // Symlinks are added on Unix only.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut paths = vec![
         "ok.txt".to_string(),
         "secret/key.txt".to_string(),
