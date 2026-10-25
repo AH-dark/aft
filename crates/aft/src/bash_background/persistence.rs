@@ -584,6 +584,7 @@ impl PinnedDir {
         #[cfg(unix)]
         let file = openat_file(
             self.file.as_raw_fd(),
+            &self.path,
             name,
             libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
@@ -793,6 +794,7 @@ impl PinnedDir {
         {
             let file = openat_file(
                 self.file.as_raw_fd(),
+                &self.path,
                 name,
                 libc::O_RDWR
                     | libc::O_CREAT
@@ -1113,6 +1115,7 @@ impl PinnedDir {
         work_counts::record_open();
         let file = openat_file(
             self.file.as_raw_fd(),
+            &self.path,
             name,
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
@@ -1166,6 +1169,7 @@ impl PinnedDir {
         #[cfg(unix)]
         let file = openat_file(
             self.file.as_raw_fd(),
+            &self.path,
             name,
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             crate::private_storage::FILE_MODE as libc::mode_t,
@@ -1191,6 +1195,7 @@ impl PinnedDir {
         #[cfg(unix)]
         let file = openat_file(
             self.file.as_raw_fd(),
+            &self.path,
             name,
             (if write {
                 libc::O_RDWR
@@ -3400,6 +3405,22 @@ pub(crate) fn resolve_configured_root(configured: &Path) -> io::Result<PathBuf> 
 thread_local! { pub(crate) static REPAIR_READDIR_FAIL_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
 #[cfg(all(unix, test))]
 thread_local! { pub(crate) static REPAIR_SYMLINK_ELOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(all(unix, test))]
+type OpenatFileHook = Box<dyn FnMut(RawFd, &OsStr, i32) -> Option<io::Result<File>>>;
+#[cfg(all(unix, test))]
+thread_local! { static OPENAT_FILE_HOOK: std::cell::RefCell<Option<OpenatFileHook>> = const { std::cell::RefCell::new(None) }; }
+
+#[cfg(all(unix, test))]
+pub(crate) fn with_openat_file_hook<T>(hook: OpenatFileHook, action: impl FnOnce() -> T) -> T {
+    struct Reset(Option<OpenatFileHook>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            OPENAT_FILE_HOOK.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(OPENAT_FILE_HOOK.with(|slot| slot.borrow_mut().replace(hook)));
+    action()
+}
 
 /// Fail closed instead of allocating, recursing or holding repair locks without
 /// a bound. A later attempt may finish after the oversized tree is inspected.
@@ -4628,7 +4649,91 @@ fn open_validated_path(path: &Path, write: bool) -> io::Result<File> {
 }
 
 #[cfg(unix)]
-fn openat_file(dirfd: RawFd, name: &OsStr, flags: i32, mode: libc::mode_t) -> io::Result<File> {
+#[derive(Debug)]
+pub(crate) struct CoordinationCreateContended {
+    path: PathBuf,
+    attempts: usize,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for CoordinationCreateContended {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: {}",
+            crate::root_cache::CACHE_DIR_BUSY,
+            crate::root_cache::CACHE_DIR_BUSY_MESSAGE
+        )
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for CoordinationCreateContended {}
+
+#[cfg(all(unix, test))]
+impl CoordinationCreateContended {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(unix)]
+fn openat_file(
+    dirfd: RawFd,
+    parent: &Path,
+    name: &OsStr,
+    flags: i32,
+    mode: libc::mode_t,
+) -> io::Result<File> {
+    // On macOS 27.0.1, two fresh-entry runs of concurrent openat(O_CREAT)
+    // returned ENOENT in 597/800 and 569/800 attempts even though the winning
+    // creator's file was present afterward. Preexisting-entry and absolute-path
+    // open controls each failed 0/800 times. Without O_NOFOLLOW, fresh-entry
+    // failures were 472/800. Reopen through the same
+    // pinned parent, retaining every safety flag. Alternate a bounded number
+    // of creates and noncreating opens if the winner has not published yet.
+    // Exclusive creation must keep its create-new contract, never adopt a rival.
+    let retry_create = flags & libc::O_CREAT != 0 && flags & libc::O_EXCL == 0;
+    let attempts = if retry_create { 6 } else { 1 };
+    for attempt in 0..attempts {
+        let attempt_flags = if attempt % 2 == 0 {
+            flags
+        } else {
+            flags & !libc::O_CREAT
+        };
+        match openat_file_once(dirfd, name, attempt_flags, mode) {
+            Err(error) if retry_create && error.kind() == io::ErrorKind::NotFound => continue,
+            result => return result,
+        }
+    }
+    let contention = CoordinationCreateContended {
+        path: parent.join(name),
+        attempts,
+    };
+    // The agent-facing text names no path; the operator log keeps it.
+    log::debug!(
+        "cache coordination create stayed contended: path={} attempts={}",
+        contention.path.display(),
+        contention.attempts
+    );
+    Err(io::Error::new(io::ErrorKind::WouldBlock, contention))
+}
+
+#[cfg(unix)]
+fn openat_file_once(
+    dirfd: RawFd,
+    name: &OsStr,
+    flags: i32,
+    mode: libc::mode_t,
+) -> io::Result<File> {
+    #[cfg(test)]
+    if let Some(result) = OPENAT_FILE_HOOK.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .and_then(|hook| hook(dirfd, name, flags))
+    }) {
+        return result;
+    }
     let name = os_cstring(name)?;
     let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags, libc::c_uint::from(mode)) };
     if fd < 0 {
@@ -5449,6 +5554,126 @@ extern "system" {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "native Darwin syscall probe; run explicitly with --ignored --nocapture"]
+    fn darwin_openat_concurrent_first_create_probe() {
+        // Run on macOS: nice -n 19 cargo test -p agent-file-tools --lib
+        // darwin_openat_concurrent_first_create_probe -- --ignored --nocapture
+        use super::*;
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut counts = Vec::new();
+        for mode in ["raw-missing", "raw-existing", "protected-missing"] {
+            let mut missing = 0;
+            for round in 0..100 {
+                let parent = temp.path().join(format!("{mode}-{round}"));
+                fs::create_dir(&parent).unwrap();
+                if mode == "raw-existing" {
+                    File::create(parent.join(".aft-in-use.lock")).unwrap();
+                }
+                let directory = Arc::new(File::open(&parent).unwrap());
+                let barrier = Arc::new(Barrier::new(8));
+                missing += std::thread::scope(|scope| {
+                    let handles = (0..8)
+                        .map(|_| {
+                            let directory = Arc::clone(&directory);
+                            let barrier = Arc::clone(&barrier);
+                            let parent = &parent;
+                            scope.spawn(move || {
+                                let flags = libc::O_RDWR
+                                    | libc::O_CREAT
+                                    | libc::O_NOFOLLOW
+                                    | libc::O_CLOEXEC
+                                    | libc::O_NONBLOCK;
+                                barrier.wait();
+                                let result = if mode == "protected-missing" {
+                                    openat_file(
+                                        directory.as_raw_fd(),
+                                        parent,
+                                        OsStr::new(".aft-in-use.lock"),
+                                        flags,
+                                        0o600,
+                                    )
+                                } else {
+                                    let fd = unsafe {
+                                        libc::openat(
+                                            directory.as_raw_fd(),
+                                            c".aft-in-use.lock".as_ptr(),
+                                            flags,
+                                            0o600 as libc::c_uint,
+                                        )
+                                    };
+                                    if fd < 0 {
+                                        Err(io::Error::last_os_error())
+                                    } else {
+                                        Ok(unsafe { File::from_raw_fd(fd) })
+                                    }
+                                };
+                                barrier.wait();
+                                match result {
+                                    Ok(_) => 0,
+                                    Err(error) => {
+                                        assert_ne!(mode, "protected-missing", "{error}");
+                                        assert_eq!(
+                                            error.kind(),
+                                            io::ErrorKind::NotFound,
+                                            "{error}"
+                                        );
+                                        assert!(parent.join(".aft-in-use.lock").is_file());
+                                        1
+                                    }
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    handles
+                        .into_iter()
+                        .map(|handle| handle.join().unwrap())
+                        .sum::<usize>()
+                });
+            }
+            eprintln!("{mode}: {missing}/800 ENOENT results");
+            counts.push(missing);
+        }
+        assert_eq!(counts[1], 0, "preexisting-file control");
+        assert_eq!(counts[2], 0, "bounded create/reopen helper");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openat_create_retry_preserves_exclusive_creation_and_other_errors() {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = PinnedDir::repair_open_path(temp.path()).unwrap();
+        for (exclusive, kind) in [
+            (true, io::ErrorKind::NotFound),
+            (false, io::ErrorKind::PermissionDenied),
+        ] {
+            let calls = Arc::new(Mutex::new(0));
+            let observed = Arc::clone(&calls);
+            let error = with_openat_file_hook(
+                Box::new(move |_, _, _| {
+                    *observed.lock().unwrap() += 1;
+                    Some(Err(io::Error::from(kind)))
+                }),
+                || {
+                    if exclusive {
+                        parent.open_new_file(OsStr::new("exclusive"))
+                    } else {
+                        parent.repair_coordination_file(OsStr::new("denied"))
+                    }
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(*calls.lock().unwrap(), 1);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn refused_task_layout_creation_leaves_storage_root_untouched() {

@@ -422,12 +422,11 @@ impl AppContext {
         // surface the reason so users know why and can decide whether to open a
         // project subdirectory. Empty list = full-featured mode.
         let mut degraded_reasons = self.degraded_reasons();
-        if self.cache_unavailable_reason().is_some()
-            && !degraded_reasons
-                .iter()
-                .any(|reason| reason == crate::root_cache::CACHE_DIR_UNAVAILABLE)
-        {
-            degraded_reasons.push(crate::root_cache::CACHE_DIR_UNAVAILABLE.into());
+        if let Some(reason) = self.cache_unavailable_reason() {
+            let code = crate::root_cache::cache_status_code(&reason);
+            if !degraded_reasons.iter().any(|reason| reason == code) {
+                degraded_reasons.push(code.into());
+            }
         }
         // Everything under the storage root that this build refused because a
         // newer build wrote it (or the reader floor requires a newer reader).

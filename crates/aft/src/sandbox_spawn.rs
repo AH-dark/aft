@@ -3238,13 +3238,7 @@ impl GitPolicyInputs {
         let target = match path.canonicalize() {
             Ok(target) => target,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return (!path.ancestors().any(|ancestor| {
-                    self.files
-                        .get(ancestor)
-                        .and_then(Option::as_ref)
-                        .is_some_and(|identity| identity.symlink)
-                }))
-                .then_some(());
+                return self.watch_absent(path);
             }
             Err(_) => return None,
         };
@@ -3254,6 +3248,61 @@ impl GitPolicyInputs {
                     .entry(ancestor.to_path_buf())
                     .or_insert(git_input_identity(ancestor).ok()?);
             }
+            let resolved = (path.to_path_buf(), target);
+            if !self.resolved_paths.contains(&resolved) {
+                self.resolved_paths.push(resolved);
+            }
+        }
+        Some(())
+    }
+
+    /// Watch a config input that does not exist yet, such as Git's compiled-in
+    /// system config `/etc/gitconfig` on macOS, where `/etc` is a symlink to
+    /// `private/etc` and the file is usually absent.
+    ///
+    /// Sandbox invariant: a cached policy may be reused only while every input
+    /// Git would read is provably unchanged; anything this cannot prove leaves
+    /// the policy uncached, so the next spawn resolves it again from Git.
+    ///
+    /// An absent path is provable. `watch` already recorded `None` as the
+    /// path's own identity, and the identity check uses `lstat`, which follows
+    /// every symlink before the last component when it runs. So creating the
+    /// file, or retargeting a symlinked ancestor at a directory that holds
+    /// it, turns that `None` into `Some` and invalidates the entry. The
+    /// resolved location is also recorded so revalidation re-resolves it.
+    ///
+    /// The one case `lstat` cannot see is a dangling symlink in the path: the
+    /// link's own identity stays the same when its target is created later.
+    /// Return `None` (do not cache) when the first missing component exists
+    /// as such a link, or when the existing prefix cannot be resolved.
+    fn watch_absent(&mut self, path: &Path) -> Option<()> {
+        let mut prefix = path.to_path_buf();
+        let mut tail = Vec::new();
+        let resolved_prefix = loop {
+            tail.push(prefix.file_name()?.to_owned());
+            if !prefix.pop() {
+                return None;
+            }
+            match prefix.canonicalize() {
+                Ok(resolved) => break resolved,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+        };
+        match std::fs::symlink_metadata(resolved_prefix.join(tail.last()?)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+        for ancestor in resolved_prefix.ancestors() {
+            self.files
+                .entry(ancestor.to_path_buf())
+                .or_insert(git_input_identity(ancestor).ok()?);
+        }
+        let mut target = resolved_prefix;
+        for component in tail.iter().rev() {
+            target.push(component);
+        }
+        if target != path {
             let resolved = (path.to_path_buf(), target);
             if !self.resolved_paths.contains(&resolved) {
                 self.resolved_paths.push(resolved);
@@ -3599,10 +3648,16 @@ thread_local! {
     static GIT_POLICY_BENCH_OLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Every Git subprocess the policy resolver starts, for tests that measure
+/// whether a resolution reused the cache.
+#[cfg(all(test, unix))]
+static GIT_POLICY_SPAWNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(unix)]
 fn git_policy_output(project_root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
     #[cfg(test)]
     {
+        GIT_POLICY_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let delay = with_git_policy_test_state(project_root, |state| {
             state.calls += 1;
             state.delay_ms
@@ -8409,6 +8464,246 @@ mod git_policy_cache_tests {
             fixture.resolve().1 > 0,
             "redirected Git config inputs are not tracked"
         );
+    }
+
+    fn set_system_config(fixture: &Fixture, path: &Path) {
+        fixture.state(|state| {
+            for (key, value) in &mut state.environment {
+                if key == "GIT_CONFIG_SYSTEM" {
+                    *value = path.as_os_str().to_owned();
+                }
+            }
+        });
+    }
+
+    fn has_original_hooks(policy: &GitPolicy, path: PathBuf) -> bool {
+        policy
+            .configured_paths
+            .contains(&("mason.originalHooksPath".into(), path))
+    }
+
+    /// macOS Git reads `/etc/gitconfig` through the `/etc -> private/etc`
+    /// symlink, and that file is normally absent. Such an input must not stop
+    /// the policy from being cached, yet creating the file must still be seen.
+    #[test]
+    fn git_policy_cache_absent_config_behind_symlinked_directory_is_cached() {
+        let fixture = Fixture::new();
+        let real_etc = fixture.root.join("private-etc");
+        std::fs::create_dir(&real_etc).unwrap();
+        std::os::unix::fs::symlink("private-etc", fixture.root.join("etc")).unwrap();
+        set_system_config(&fixture, &fixture.root.join("etc/gitconfig"));
+        assert!(fixture.resolve().1 > 0);
+        assert_eq!(
+            fixture.resolve().1,
+            0,
+            "an absent config behind a symlinked directory must not defeat the cache"
+        );
+
+        // Created through the real directory: neither the symlink nor the
+        // directory inode changes, only the configured path's own lstat.
+        std::fs::write(
+            real_etc.join("gitconfig"),
+            "[mason]\n originalHooksPath = system-hooks\n",
+        )
+        .unwrap();
+        let (policy, calls) = fixture.resolve();
+        assert!(calls > 0, "creating the absent config must invalidate");
+        assert!(has_original_hooks(
+            &policy,
+            fixture.root.join("system-hooks")
+        ));
+        assert_eq!(fixture.resolve().1, 0);
+
+        std::fs::remove_file(real_etc.join("gitconfig")).unwrap();
+        assert!(
+            fixture.resolve().1 > 0,
+            "removing the config must invalidate"
+        );
+        assert_eq!(fixture.resolve().1, 0);
+
+        let other_etc = fixture.root.join("other-etc");
+        std::fs::create_dir(&other_etc).unwrap();
+        std::fs::write(
+            other_etc.join("gitconfig"),
+            "[mason]\n originalHooksPath = retargeted-hooks\n",
+        )
+        .unwrap();
+        std::fs::remove_file(fixture.root.join("etc")).unwrap();
+        std::os::unix::fs::symlink("other-etc", fixture.root.join("etc")).unwrap();
+        let (policy, calls) = fixture.resolve();
+        assert!(
+            calls > 0,
+            "retargeting the symlinked directory must invalidate"
+        );
+        assert!(has_original_hooks(
+            &policy,
+            fixture.root.join("retargeted-hooks")
+        ));
+    }
+
+    /// Retarget the symlinked directory that holds an absent system config at
+    /// a directory where that config already exists. Git then reads the new
+    /// file, so the cached policy must be resolved again. Then retarget it at
+    /// a missing directory: a dangling link must never be cached.
+    #[test]
+    fn git_policy_cache_retargeted_config_directory_symlink_invalidates() {
+        let fixture = Fixture::new();
+        // Leave core.hooksPath unset locally so the system config decides it.
+        std::fs::write(
+            fixture.root.join(".git/config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+        )
+        .unwrap();
+        let dir_a = fixture.root.join("dir-a");
+        let dir_b = fixture.root.join("dir-b");
+        let b_hooks = fixture.root.join("b-hooks");
+        std::fs::create_dir(&dir_a).unwrap();
+        std::fs::create_dir(&dir_b).unwrap();
+        std::fs::create_dir(&b_hooks).unwrap();
+        std::fs::write(
+            dir_b.join("gitconfig"),
+            format!("[core]\n hooksPath = {}\n", b_hooks.display()),
+        )
+        .unwrap();
+        let link = fixture.root.join("link");
+        std::os::unix::fs::symlink("dir-a", &link).unwrap();
+        set_system_config(&fixture, &link.join("gitconfig"));
+        let retarget = |target: &str| {
+            let staged = fixture.root.join("link.next");
+            std::os::unix::fs::symlink(target, &staged).unwrap();
+            std::fs::rename(&staged, &link).unwrap();
+        };
+
+        let (first, cold) = fixture.resolve();
+        assert!(cold > 0);
+        assert_ne!(first.hooks, vec![b_hooks.clone()]);
+        assert_eq!(fixture.resolve().1, 0, "the absent config must be cached");
+
+        retarget("dir-b");
+        let (policy, calls) = fixture.resolve();
+        assert!(
+            calls > 0,
+            "retargeting the config directory must invalidate"
+        );
+        assert_eq!(policy.hooks, vec![b_hooks.clone()]);
+        assert_eq!(fixture.resolve().1, 0);
+
+        retarget("dir-missing");
+        let (policy, calls) = fixture.resolve();
+        assert!(
+            calls > 0,
+            "retargeting to a dangling directory must invalidate"
+        );
+        assert_ne!(policy.hooks, vec![b_hooks.clone()]);
+        assert!(
+            fixture.resolve().1 > 0,
+            "a config behind a dangling directory symlink must not be cached"
+        );
+    }
+
+    /// A dangling symlink keeps its own identity when its target is created,
+    /// so a policy that depends on one is never reused.
+    #[test]
+    fn git_policy_cache_dangling_config_symlink_is_never_cached() {
+        let fixture = Fixture::new();
+        std::os::unix::fs::symlink("missing-system", fixture.root.join("system-link")).unwrap();
+        set_system_config(&fixture, &fixture.root.join("system-link"));
+        assert!(fixture.resolve().1 > 0);
+        assert!(
+            fixture.resolve().1 > 0,
+            "a dangling config symlink must not be cached"
+        );
+        std::fs::write(
+            fixture.root.join("missing-system"),
+            "[mason]\n originalHooksPath = dangling-hooks\n",
+        )
+        .unwrap();
+        assert!(has_original_hooks(
+            &fixture.resolve().0,
+            fixture.root.join("dangling-hooks")
+        ));
+    }
+
+    #[test]
+    fn git_policy_cache_replaced_git_directory_invalidates() {
+        let fixture = Fixture::new();
+        fixture.resolve();
+        assert_eq!(fixture.resolve().1, 0);
+        let replacement = fixture.root.join("replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        assert!(git_policy_output(&replacement, &["init", "--quiet"])
+            .unwrap()
+            .status
+            .success());
+        std::fs::write(
+            replacement.join(".git/config"),
+            "[core]\n bare = false\n hooksPath = replaced-hooks\n",
+        )
+        .unwrap();
+        std::fs::rename(fixture.root.join(".git"), fixture.root.join("old-git")).unwrap();
+        std::fs::rename(replacement.join(".git"), fixture.root.join(".git")).unwrap();
+        let (policy, calls) = fixture.resolve();
+        assert!(calls > 0, "a replaced .git directory must invalidate");
+        assert_eq!(policy.hooks, vec![fixture.root.join("replaced-hooks")]);
+        assert_eq!(fixture.resolve().1, 0);
+    }
+
+    /// Measure policy resolution on a real checkout named by
+    /// AFT_GIT_POLICY_BENCH_ROOT: cold (cache cleared) against warm (cached).
+    #[test]
+    #[ignore = "manual measurement against a real checkout; run alone with --nocapture"]
+    fn real_checkout_git_policy_cost() {
+        crate::effective_path::initialize_process_path();
+        let root = PathBuf::from(std::env::var_os("AFT_GIT_POLICY_BENCH_ROOT").unwrap());
+        for worker in [true, false] {
+            let environment = git_policy_environment(&root);
+            let key = git_policy_cache_key(&root, &environment, worker);
+            eprintln!("worker={worker} cacheable_key={}", key.is_some());
+            let mut cold = Vec::new();
+            let mut warm = Vec::new();
+            for _ in 0..10 {
+                if let Some(key) = &key {
+                    git_policy_cache().lock().unwrap().remove(key);
+                }
+                let spawns = GIT_POLICY_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
+                let started = Instant::now();
+                with_worker_jail(worker, || resolve_git_policy(&root)).unwrap();
+                cold.push((
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    GIT_POLICY_SPAWNS.load(std::sync::atomic::Ordering::SeqCst) - spawns,
+                ));
+                let spawns = GIT_POLICY_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
+                let started = Instant::now();
+                with_worker_jail(worker, || resolve_git_policy(&root)).unwrap();
+                warm.push((
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    GIT_POLICY_SPAWNS.load(std::sync::atomic::Ordering::SeqCst) - spawns,
+                ));
+            }
+            if let Some(cached) = key
+                .as_ref()
+                .and_then(|key| git_policy_cache().lock().unwrap().get(key))
+            {
+                eprintln!(
+                    "worker={worker} revalidation: lstat_inputs={} re_resolved_paths={}",
+                    cached.inputs.files.len(),
+                    cached.inputs.resolved_paths.len()
+                );
+            }
+            for (label, samples) in [("cold", cold), ("warm", warm)] {
+                let mut times = samples.iter().map(|(ms, _)| *ms).collect::<Vec<_>>();
+                times.sort_by(f64::total_cmp);
+                eprintln!(
+                    "worker={worker} {label}: median_ms={:.3} max_ms={:.3} git_spawns={:?}",
+                    times[5],
+                    times[9],
+                    samples
+                        .iter()
+                        .map(|(_, spawns)| *spawns)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     /// Compare the old explicit-PATH fork with inherited-PATH helper launches.
