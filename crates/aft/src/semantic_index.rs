@@ -1622,7 +1622,7 @@ impl SemanticIndexLock {
         crate::private_storage::open_dir(storage_dir, &dir)?;
         let _acquire_guard = SEMANTIC_LOCK_ACQUIRE_MUTEX
             .lock()
-            .map_err(|_| std::io::Error::other("semantic cache lock acquisition mutex poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         fs_lock::try_acquire(&path, Duration::from_secs(2))
             .map(|guard| Self {
                 _guard: Some(guard),
@@ -2115,7 +2115,6 @@ fn validate_embedding_batch(
             "{context} returned no vectors for {expected_count} inputs"
         ));
     }
-
     if vectors.len() != expected_count {
         return Err(format!(
             "{context} returned {} vectors for {} inputs",
@@ -2123,7 +2122,6 @@ fn validate_embedding_batch(
             expected_count
         ));
     }
-
     let Some(first_vector) = vectors.first() else {
         return Ok(());
     };
@@ -2131,6 +2129,8 @@ fn validate_embedding_batch(
     validate_embedding_dimension(expected_dimension)
         .map_err(|error| format!("{context} returned {error}"))?;
     for (index, vector) in vectors.iter().enumerate() {
+        validate_finite_embedding(vector)
+            .map_err(|error| format!("{context} vector {index}: {error}"))?;
         if vector.len() != expected_dimension {
             return Err(format!(
                 "{context} returned inconsistent embedding dimensions: vector 0 has length {expected_dimension}, vector {index} has length {}",
@@ -2139,6 +2139,13 @@ fn validate_embedding_batch(
         }
     }
 
+    Ok(())
+}
+
+fn validate_finite_embedding(vector: &[f32]) -> Result<(), String> {
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err("embedding contains non-finite components".to_string());
+    }
     Ok(())
 }
 
@@ -4571,6 +4578,7 @@ where
 
         validate_embedding_dimension(vector.len())
             .map_err(|error| format!("embedding backend returned {error}"))?;
+        validate_finite_embedding(&vector)?;
         match expected_dimension {
             None => expected_dimension = Some(vector.len()),
             Some(expected) if expected != vector.len() => {
@@ -5059,7 +5067,9 @@ impl Clone for SemanticIndex {
             shared_base: self.shared_base.clone(),
             tombstones: self.tombstones.clone(),
             view_runs: self.view_runs.clone(),
-            dirty_paths: Arc::clone(&self.dirty_paths),
+            // Cloned payloads can mutate independently. Sharing their dirty set
+            // lets one writer erase changes that only the other payload holds.
+            dirty_paths: Arc::new(Mutex::new(self.dirty_paths_snapshot())),
             persistence: Arc::clone(&self.persistence),
             last_append_read_bytes: Arc::clone(&self.last_append_read_bytes),
             skipped_rows: self.skipped_rows,
@@ -5074,6 +5084,13 @@ impl Clone for SemanticIndex {
         clone.materialize_view_runs();
         clone
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SHARED_PATH_JOINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PERSIST_DIRTY_SNAPSHOT_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -5102,9 +5119,32 @@ impl SemanticCollectPhaseTimings {
     }
 }
 
+#[derive(Debug)]
+enum SemanticCollectError {
+    UnsupportedExtension,
+    Io(std::io::Error),
+    Parse(String),
+}
+
+impl SemanticCollectError {
+    fn is_expected_non_code(&self) -> bool {
+        matches!(self, Self::UnsupportedExtension)
+    }
+}
+
+impl std::fmt::Display for SemanticCollectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedExtension => formatter.write_str("unsupported file extension"),
+            Self::Io(error) => std::fmt::Display::fmt(error, formatter),
+            Self::Parse(message) => formatter.write_str(message),
+        }
+    }
+}
+
 type CollectedSemanticFile = (
     PathBuf,
-    Result<(IndexedFileMetadata, Vec<SemanticChunk>), String>,
+    Result<(IndexedFileMetadata, Vec<SemanticChunk>), SemanticCollectError>,
     SemanticCollectPhaseTimings,
 );
 
@@ -5625,6 +5665,14 @@ impl SemanticIndex {
         })
     }
 
+    /// Absolute path of a root-relative base or view-run chunk path. Tests
+    /// count the calls to prove refresh joins only the paths it needs.
+    fn join_shared_path(&self, file: &Path) -> PathBuf {
+        #[cfg(test)]
+        SHARED_PATH_JOINS.with(|count| count.set(count.get() + 1));
+        self.project_root.join(file)
+    }
+
     // Base paths are relative; delta paths are absolute. Iteration preserves the
     // old retain-then-append order, including the score comparator's index ties.
     // A view overlay's shared replacement runs read between the two, where its
@@ -5637,7 +5685,7 @@ impl SemanticIndex {
             .chain(self.view_run_entries())
             .map(|entry| {
                 (
-                    std::borrow::Cow::Owned(self.project_root.join(&entry.chunk.file)),
+                    std::borrow::Cow::Owned(self.join_shared_path(&entry.chunk.file)),
                     entry,
                 )
             })
@@ -6020,12 +6068,10 @@ impl SemanticIndex {
                     chunks.extend(file_chunks);
                 }
                 Err(error) => {
-                    // "unsupported file extension" is expected for non-code files
-                    // (json, xml, .gitignore, etc.) that get included in the
-                    // project walk. Pre-fix this was swallowed by .unwrap_or_default();
-                    // we now skip silently to keep the log clean. Only real read/parse
-                    // errors are worth surfacing.
-                    if error == "unsupported file extension" {
+                    // Project walks include non-code files. Only the typed
+                    // extension exclusion is expected; read/parse failures
+                    // must still be surfaced even if their wording is similar.
+                    if error.is_expected_non_code() {
                         continue;
                     }
                     slog_warn!(
@@ -6082,13 +6128,50 @@ impl SemanticIndex {
         let requested: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
         let mut reuse_map: ChunkReuseMap = HashMap::new();
 
-        for (path, entry) in self.live_entries() {
-            #[cfg(test)]
-            crate::search_hot_path_measurements::record(|counts| counts.refresh_entry_visits += 1);
-            if !requested.contains(path.as_ref()) {
-                continue;
-            }
-
+        // Base and view-run chunks carry root-relative paths. Match them
+        // against the requested files in that relative form, so only the
+        // chunks actually reused pay for an absolute path allocation. The
+        // visit order and visit count are the same as `live_entries`.
+        let requested_relative: HashSet<&Path> = files
+            .iter()
+            .filter_map(|path| path.strip_prefix(&self.project_root).ok())
+            .collect();
+        let shared_entries = self
+            .shared_base
+            .iter()
+            .flat_map(|base| base.entries())
+            .filter(|entry| !self.tombstones.contains(&entry.chunk.file))
+            .chain(self.view_run_entries())
+            .inspect(|_| {
+                #[cfg(test)]
+                crate::search_hot_path_measurements::record(|counts| {
+                    counts.refresh_entry_visits += 1
+                });
+            })
+            .filter(|entry| requested_relative.contains(entry.chunk.file.as_path()))
+            .map(|entry| {
+                (
+                    std::borrow::Cow::Owned(self.join_shared_path(&entry.chunk.file)),
+                    entry,
+                )
+            });
+        let local_entries = self
+            .entries
+            .iter()
+            .inspect(|_| {
+                #[cfg(test)]
+                crate::search_hot_path_measurements::record(|counts| {
+                    counts.refresh_entry_visits += 1
+                });
+            })
+            .filter(|entry| requested.contains(entry.chunk.file.as_path()))
+            .map(|entry| {
+                (
+                    std::borrow::Cow::Borrowed(entry.chunk.file.as_path()),
+                    entry,
+                )
+            });
+        for (path, entry) in shared_entries.chain(local_entries) {
             // `embed_text` is already persisted in the current on-disk format,
             // so refresh-time reuse can hash it in memory and confirm the exact
             // string without bumping `SEMANTIC_INDEX_VERSION` and forcing every
@@ -6947,6 +7030,7 @@ impl SemanticIndex {
         let indexed_paths: Vec<PathBuf> = indexed_paths.into_iter().collect();
         let mut checks: Vec<Option<IndexedFileCheck>> = Vec::with_capacity(indexed_paths.len());
         let mut strict_verify_inputs: Vec<(usize, PathBuf, FileFreshness)> = Vec::new();
+        let mut skipped_verify_inputs = Vec::new();
 
         for indexed_path in indexed_paths {
             let check_index = checks.len();
@@ -6967,7 +7051,16 @@ impl SemanticIndex {
                 _ => None,
             };
             if let Some(freshness) = cached {
-                strict_verify_inputs.push((check_index, indexed_path, freshness));
+                // Oversized semantic files have deliberately empty rows and a
+                // zero hash. Equal stat metadata keeps that exclusion valid;
+                // indexable zero-hash files still require strict verification.
+                if freshness.size > MAX_SEMANTIC_FILE_BYTES
+                    && freshness.content_hash == cache_freshness::zero_hash()
+                {
+                    skipped_verify_inputs.push((check_index, indexed_path, freshness));
+                } else {
+                    strict_verify_inputs.push((check_index, indexed_path, freshness));
+                }
                 checks.push(None);
             } else {
                 checks.push(Some(IndexedFileCheck::MissingMetadata(indexed_path)));
@@ -6986,6 +7079,12 @@ impl SemanticIndex {
         for (check_index, path, verdict) in verified {
             checks[check_index] = Some(IndexedFileCheck::Verified(path, verdict));
         }
+        for (check_index, path, verdict) in cache_freshness::verify_files_bounded(
+            skipped_verify_inputs,
+            cache_freshness::VerifyStrategy::StatFirst,
+        ) {
+            checks[check_index] = Some(IndexedFileCheck::Verified(path, verdict));
+        }
 
         for check in checks {
             match check.expect("freshness check should be populated") {
@@ -7000,7 +7099,8 @@ impl SemanticIndex {
                     },
                 ) => {
                     self.file_mtimes.insert(path.clone(), new_mtime);
-                    self.file_sizes.insert(path, new_size);
+                    self.file_sizes.insert(path.clone(), new_size);
+                    self.extend_dirty_paths(std::iter::once(path));
                 }
                 IndexedFileCheck::Verified(
                     path,
@@ -7648,6 +7748,9 @@ impl SemanticIndex {
     where
         F: Fn(&Path) -> bool,
     {
+        if validate_finite_embedding(query_vector).is_err() {
+            return Vec::new();
+        }
         // `true` marks a path relative to the root (base and shared view
         // runs); `false` an absolute own-entry path.
         let entries = self
@@ -7759,7 +7862,14 @@ impl SemanticIndex {
         let Some(cached) = self.recorded_file_freshness(file) else {
             return true;
         };
-        match cache_freshness::verify_file_strict(file, &cached) {
+        let verdict = if cached.size > MAX_SEMANTIC_FILE_BYTES
+            && cached.content_hash == cache_freshness::zero_hash()
+        {
+            cache_freshness::verify_file(file, &cached)
+        } else {
+            cache_freshness::verify_file_strict(file, &cached)
+        };
+        match verdict {
             FreshnessVerdict::HotFresh => false,
             FreshnessVerdict::ContentFresh { .. } => false,
             FreshnessVerdict::Stale | FreshnessVerdict::Deleted => true,
@@ -8466,6 +8576,13 @@ impl SemanticIndex {
                 }
             };
 
+            #[cfg(test)]
+            PERSIST_DIRTY_SNAPSHOT_PROBE.with(|probe| {
+                let callback = probe.borrow_mut().take();
+                if let Some(callback) = callback {
+                    callback();
+                }
+            });
             self.last_append_read_bytes
                 .store(layout.bytes_read, Ordering::Relaxed);
             if layout.torn_tail {
@@ -9513,9 +9630,9 @@ impl SemanticIndex {
                 || version == SEMANTIC_INDEX_VERSION_V6
                 || version == SEMANTIC_INDEX_VERSION_V7
             {
-                read_u64_stream(&mut reader)?
+                Some(read_u64_stream(&mut reader)?)
             } else {
-                0
+                None
             };
             let content_hash =
                 if version == SEMANTIC_INDEX_VERSION_V6 || version == SEMANTIC_INDEX_VERSION_V7 {
@@ -9562,7 +9679,9 @@ impl SemanticIndex {
                     PathBuf::from(path)
                 };
             file_mtimes.insert(path.clone(), mtime);
-            file_sizes.insert(path.clone(), size);
+            if let Some(size) = size {
+                file_sizes.insert(path.clone(), size);
+            }
             file_hashes.insert(path, content_hash);
         }
 
@@ -9599,7 +9718,7 @@ impl SemanticIndex {
                 None
             };
 
-            let kind = u8_to_symbol_kind(read_u8_stream(&mut reader, "unexpected end of data")?);
+            let kind = u8_to_symbol_kind(read_u8_stream(&mut reader, "unexpected end of data")?)?;
 
             let start_line = read_u32_stream(&mut reader)?;
             let end_line = read_u32_stream(&mut reader)?;
@@ -9622,6 +9741,7 @@ impl SemanticIndex {
                 .chunks_exact(F32_BYTES)
                 .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect::<Arc<[f32]>>();
+            validate_finite_embedding(&vector)?;
 
             entries.push(EmbeddingEntry::new(
                 SemanticChunk {
@@ -10169,7 +10289,7 @@ fn collect_semantic_file(
     file: &Path,
     embed_text_caps: EmbedTextCaps,
     phases: &mut SemanticCollectPhaseTimings,
-) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), String> {
+) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), SemanticCollectError> {
     if let Some(job) = prepared_pause_job() {
         let key = FileCheckpointKey {
             root: project_root.to_path_buf(),
@@ -10200,20 +10320,22 @@ fn collect_semantic_file_uncached(
     file: &Path,
     embed_text_caps: EmbedTextCaps,
     phases: &mut SemanticCollectPhaseTimings,
-) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), String> {
+) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), SemanticCollectError> {
     let read_hash_started = Instant::now();
     let read_result = (|| {
-        let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
+        let metadata = fs::metadata(file).map_err(SemanticCollectError::Io)?;
         if !metadata.is_file() {
-            return Err("not a regular file".to_string());
+            return Err(SemanticCollectError::Parse(
+                "not a regular file".to_string(),
+            ));
         }
-        let mtime = metadata.modified().map_err(|error| error.to_string())?;
+        let mtime = metadata.modified().map_err(SemanticCollectError::Io)?;
         let size = metadata.len();
 
         if !is_semantic_indexed_extension(file) {
-            return Err("unsupported file extension".to_string());
+            return Err(SemanticCollectError::UnsupportedExtension);
         }
-        let lang = detect_language(file).ok_or_else(|| "unsupported file extension".to_string())?;
+        let lang = detect_language(file).ok_or(SemanticCollectError::UnsupportedExtension)?;
 
         let mut indexed_metadata = IndexedFileMetadata {
             mtime,
@@ -10230,7 +10352,7 @@ fn collect_semantic_file_uncached(
         #[cfg(test)]
         crate::search_hot_path_measurements::record_file_read();
         let source =
-            crate::project_content::read_to_string(file).map_err(|error| error.to_string())?;
+            crate::project_content::read_to_string(file).map_err(SemanticCollectError::Io)?;
         indexed_metadata.content_hash = if size <= cache_freshness::CONTENT_HASH_SIZE_CAP {
             cache_freshness::hash_bytes(source.as_bytes())
         } else {
@@ -10251,7 +10373,8 @@ fn collect_semantic_file_uncached(
         &source,
         embed_text_caps,
         phases,
-    )?;
+    )
+    .map_err(SemanticCollectError::Parse)?;
     Ok((indexed_metadata, chunks))
 }
 
@@ -10632,7 +10755,7 @@ impl SemanticVectors {
         for _ in 0..count {
             let name = take_view_string(payload, &mut cursor)?;
             let qualified_name = take_view_string(payload, &mut cursor)?;
-            let kind = u8_to_symbol_kind(take_view_slice(payload, &mut cursor, 1)?[0]);
+            let kind = u8_to_symbol_kind(take_view_slice(payload, &mut cursor, 1)?[0])?;
             let start_line = take_view_u32(payload, &mut cursor)?;
             let end_line = take_view_u32(payload, &mut cursor)?;
             let exported = take_view_slice(payload, &mut cursor, 1)?[0] != 0;
@@ -10651,6 +10774,8 @@ impl SemanticVectors {
                 .chunks_exact(4)
                 .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
                 .collect::<Arc<[f32]>>();
+            validate_embedding_dimension(vector.len())?;
+            validate_finite_embedding(&vector)?;
             match dimension {
                 None => dimension = Some(vector.len()),
                 Some(expected) if expected != vector.len() => {
@@ -10939,9 +11064,23 @@ impl SemanticIndex {
 }
 
 fn semantic_score_order(a: &(f32, usize), b: &(f32, usize)) -> std::cmp::Ordering {
-    b.0.partial_cmp(&a.0)
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| a.1.cmp(&b.1))
+    // Preserve equal-score ties, including signed zero, while giving corrupt
+    // scores a consistent position after finite similarities.
+    let score_a = if a.0.is_finite() {
+        a.0
+    } else {
+        f32::NEG_INFINITY
+    };
+    let score_b = if b.0.is_finite() {
+        b.0
+    } else {
+        f32::NEG_INFINITY
+    };
+    if score_a == score_b {
+        a.1.cmp(&b.1)
+    } else {
+        score_b.total_cmp(&score_a)
+    }
 }
 
 /// Compute an embedding's L2 norm for its in-memory search cache.
@@ -10995,8 +11134,8 @@ fn symbol_kind_to_u8(kind: &SymbolKind) -> u8 {
     }
 }
 
-fn u8_to_symbol_kind(v: u8) -> SymbolKind {
-    match v {
+fn u8_to_symbol_kind(v: u8) -> Result<SymbolKind, String> {
+    Ok(match v {
         0 => SymbolKind::Function,
         1 => SymbolKind::Class,
         2 => SymbolKind::Method,
@@ -11008,8 +11147,8 @@ fn u8_to_symbol_kind(v: u8) -> SymbolKind {
         8 => SymbolKind::Heading,
         9 => SymbolKind::FileSummary,
         10 => SymbolKind::Kernel,
-        _ => SymbolKind::Heading,
-    }
+        _ => return Err(format!("invalid semantic symbol kind: {v}")),
+    })
 }
 
 #[cfg(test)]
@@ -13746,6 +13885,127 @@ Connection: close
     }
 
     #[test]
+    fn audit10_oversized_semantic_refresh_stays_clean() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let file = project.path().join("large.rs");
+        fs::File::create(&file)
+            .unwrap()
+            .set_len(MAX_SEMANTIC_FILE_BYTES + 1)
+            .unwrap();
+        let mut index = build_test_index(project.path(), std::slice::from_ref(&file));
+        assert_eq!(index.len(), 0);
+        assert!(index.write_to_disk(storage.path(), "large"));
+        let summary = index
+            .refresh_stale_files(
+                project.path(),
+                std::slice::from_ref(&file),
+                &mut |_| -> Result<Vec<Vec<f32>>, String> {
+                    panic!("excluded files must not embed")
+                },
+                8,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert!(summary.is_noop());
+        assert!(!index.is_file_stale(&file));
+        assert!(index.dirty_paths_snapshot().unwrap().is_empty());
+        fs::write(&file, "pub fn now_indexable() {}\n").unwrap();
+        assert!(index.is_file_stale(&file));
+        let small = cache_freshness::collect(&file).unwrap();
+        index.file_mtimes.insert(file.clone(), small.mtime);
+        index.file_sizes.insert(file.clone(), small.size);
+        index
+            .file_hashes
+            .insert(file.clone(), cache_freshness::zero_hash());
+        assert!(index.is_file_stale(&file));
+    }
+
+    #[test]
+    fn audit10_contentfresh_metadata_survives_persistence() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let file = project.path().join("fresh.rs");
+        fs::write(&file, "pub fn fresh() {}\n").unwrap();
+        let mut index = build_test_index(project.path(), std::slice::from_ref(&file));
+        assert!(index.write_to_disk(storage.path(), "fresh"));
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        let summary = index
+            .refresh_stale_files(
+                project.path(),
+                std::slice::from_ref(&file),
+                &mut |_| -> Result<Vec<Vec<f32>>, String> {
+                    panic!("unchanged content must be reused")
+                },
+                8,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(summary.changed, 0);
+        assert!(index.write_to_disk(storage.path(), "fresh"));
+        let bytes = fs::read(storage.path().join("semantic/fresh/semantic.bin")).unwrap();
+        let restored = SemanticIndex::from_bytes(&bytes, project.path()).unwrap();
+        assert_eq!(restored.file_mtimes.get(&file), Some(&mtime));
+    }
+
+    #[test]
+    fn audit10_47_collection_category_not_error_words_controls_skipping() {
+        assert!(SemanticCollectError::UnsupportedExtension.is_expected_non_code());
+        let parse = SemanticCollectError::Parse("unsupported file extension".to_string());
+        let io = SemanticCollectError::Io(std::io::Error::other("unsupported file extension"));
+        assert_eq!(parse.to_string(), "unsupported file extension");
+        assert!(!parse.is_expected_non_code());
+        assert!(!io.is_expected_non_code());
+    }
+
+    #[test]
+    fn audit10_plain_clone_dirty_updates_survive_another_writer() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let files = (0..64)
+            .map(|i| project.path().join(format!("file_{i}.rs")))
+            .collect::<Vec<_>>();
+        for file in &files {
+            fs::write(file, "pub fn symbol() {}\n").unwrap();
+        }
+        let mut first = build_test_index(project.path(), &files);
+        assert!(first.write_to_disk(storage.path(), "overlap"));
+        let second = std::rc::Rc::new(std::cell::RefCell::new(first.clone()));
+        first
+            .file_mtimes
+            .insert(files[0].clone(), SystemTime::UNIX_EPOCH);
+        first.extend_dirty_paths(std::iter::once(files[0].clone()));
+        let second_at_snapshot = second.clone();
+        let path = files[1].clone();
+        let updated_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(50);
+        PERSIST_DIRTY_SNAPSHOT_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move || {
+                let mut second = second_at_snapshot.borrow_mut();
+                second.file_mtimes.insert(path.clone(), updated_mtime);
+                second.extend_dirty_paths(std::iter::once(path));
+            }));
+        });
+        assert!(first.write_to_disk(storage.path(), "overlap"));
+        assert_eq!(
+            second.borrow().file_mtimes.get(&files[1]),
+            Some(&updated_mtime)
+        );
+        assert!(first.last_append_read_bytes.load(Ordering::Relaxed) > 0);
+        assert!(second.borrow().write_to_disk(storage.path(), "overlap"));
+        let bytes = fs::read(storage.path().join("semantic/overlap/semantic.bin")).unwrap();
+        let restored = SemanticIndex::from_bytes(&bytes, project.path()).unwrap();
+        assert_eq!(restored.file_mtimes.get(&files[1]), Some(&updated_mtime));
+        let fork = first.fork_for_refresh();
+        assert!(!Arc::ptr_eq(&fork.dirty_paths, &first.dirty_paths));
+    }
+
+    #[test]
     fn empty_snapshot_replaces_nonempty_and_loads_as_valid_tombstone() {
         let project = tempfile::tempdir().expect("create project");
         let storage = tempfile::tempdir().expect("create storage");
@@ -15473,7 +15733,7 @@ Connection: close
 
         for (kind, encoded) in cases {
             assert_eq!(symbol_kind_to_u8(&kind), encoded);
-            assert_eq!(u8_to_symbol_kind(encoded), kind);
+            assert_eq!(u8_to_symbol_kind(encoded).unwrap(), kind);
         }
     }
 
@@ -18366,6 +18626,228 @@ public class Greeter {
 #[cfg(test)]
 mod embedding_backend_retry_status_tests {
     use super::*;
+
+    #[test]
+    fn audit10_semantic_lock_poison_recovers() {
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = SEMANTIC_LOCK_ACQUIRE_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("simulate acquisition panic");
+        });
+        assert!(poisoned.is_err());
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let lock = SemanticIndexLock::acquire(storage.path(), "poison", project.path()).unwrap();
+        assert!(lock._guard.is_some());
+    }
+
+    #[test]
+    fn audit10_reuse_map_joins_only_requested_shared_paths() {
+        let mut index = audit10_vector_index(vec![vec![1.0, 0.0]; 64]);
+        for (i, entry) in index.entries.iter_mut().enumerate() {
+            entry.chunk.file = index.project_root.join(format!("file_{i}.rs"));
+            index
+                .file_mtimes
+                .insert(entry.chunk.file.clone(), SystemTime::UNIX_EPOCH);
+            index.file_sizes.insert(entry.chunk.file.clone(), 0);
+        }
+        let requested = index.entries[0].chunk.file.clone();
+        let mut worker = index.fork_for_refresh();
+        assert!(worker.shared_base.is_some());
+        SHARED_PATH_JOINS.with(|count| count.set(0));
+        let reuse = worker.build_chunk_reuse_map(std::slice::from_ref(&requested));
+        assert_eq!(reuse.len(), 1);
+        let rows = reuse[&requested].values().next().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(&*rows[0].vector, &[1.0, 0.0]);
+        SHARED_PATH_JOINS.with(|count| assert_eq!(count.get(), 1));
+        worker.tombstones.insert(
+            requested
+                .strip_prefix(&worker.project_root)
+                .unwrap()
+                .to_path_buf(),
+        );
+        SHARED_PATH_JOINS.with(|count| count.set(0));
+        assert!(worker.build_chunk_reuse_map(&[requested]).is_empty());
+        SHARED_PATH_JOINS.with(|count| assert_eq!(count.get(), 0));
+    }
+
+    fn audit10_vector_index(vectors: Vec<Vec<f32>>) -> SemanticIndex {
+        let root = std::env::current_dir().unwrap();
+        let file = root.join("vectors.rs");
+        let mut index = SemanticIndex::new(root, 2);
+        index
+            .file_mtimes
+            .insert(file.clone(), SystemTime::UNIX_EPOCH);
+        index.file_sizes.insert(file.clone(), 0);
+        for (i, vector) in vectors.into_iter().enumerate() {
+            index.entries.push(EmbeddingEntry::new(
+                SemanticChunk {
+                    file: file.clone(),
+                    name: format!("audit_vector_{i}"),
+                    qualified_name: None,
+                    kind: SymbolKind::Function,
+                    start_line: i as u32 + 1,
+                    end_line: i as u32 + 1,
+                    exported: false,
+                    snippet: String::new(),
+                    embed_text: String::new(),
+                },
+                vector,
+            ));
+        }
+        index
+    }
+
+    #[test]
+    fn audit10_embedding_rejects_nonfinite_batch() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(validate_embedding_batch(&[vec![value, 1.0]], 1, "test").is_err());
+        }
+        assert!(validate_embedding_batch(&[vec![1.0, 0.0]], 1, "test").is_ok());
+    }
+
+    #[test]
+    fn audit10_embedding_rejects_nonfinite_build_rows() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                execute_build_embedding_batch(vec!["input".to_string()], &mut |_| {
+                    Ok(vec![vec![value, 1.0]])
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn audit10_semantic_cache_rejects_nonfinite_vectors() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let index = audit10_vector_index(vec![vec![value, 1.0]]);
+            let error =
+                SemanticIndex::from_bytes(&index.to_bytes(), &index.project_root).unwrap_err();
+            assert!(error.contains("non-finite"), "{error}");
+        }
+    }
+
+    #[test]
+    fn audit10_semantic_view_rejects_nonfinite_vectors() {
+        let producer = ViewPayloadProducer {
+            chunker_version: "1",
+            template_version: "1",
+            model_fingerprint: "test",
+        };
+        let run = SemanticVectors {
+            entries: audit10_vector_index(vec![vec![f32::NAN, 1.0]]).entries,
+        };
+        let bytes = run.encode_view_payload(&producer);
+        assert!(
+            SemanticVectors::decode_view_payload(&bytes, Path::new("vectors.rs"), &producer)
+                .is_err()
+        );
+        let valid = SemanticVectors {
+            entries: audit10_vector_index(vec![vec![1.0, 0.0]]).entries,
+        };
+        let bytes = valid.encode_view_payload(&producer);
+        let decoded =
+            SemanticVectors::decode_view_payload(&bytes, Path::new("vectors.rs"), &producer)
+                .unwrap();
+        assert_eq!(decoded.encode_view_payload(&producer), bytes);
+    }
+
+    #[test]
+    fn audit10_semantic_view_rejects_unknown_kind() {
+        let producer = ViewPayloadProducer {
+            chunker_version: "1",
+            template_version: "1",
+            model_fingerprint: "test",
+        };
+        let run = SemanticVectors {
+            entries: audit10_vector_index(vec![vec![1.0, 0.0]]).entries,
+        };
+        let mut bytes = run.encode_view_payload(&producer);
+        let name = b"audit_vector_0";
+        let offset = bytes.windows(name.len()).position(|w| w == name).unwrap();
+        bytes[offset + name.len() + 4] = 255;
+        assert!(
+            SemanticVectors::decode_view_payload(&bytes, Path::new("vectors.rs"), &producer)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn audit10_semantic_query_rejects_nonfinite_vectors() {
+        let index = audit10_vector_index(vec![vec![1.0, 0.0]]);
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(index.search(&[value, 1.0], 10).is_empty());
+        }
+        assert!(index.search(&[1.0], 10).is_empty());
+        assert_eq!(index.search(&[1.0, 0.0], 10).len(), 1);
+    }
+
+    #[test]
+    fn audit10_score_order_handles_corrupt_scores() {
+        let mut scores = [(f32::NAN, 0), (0.5, 1), (-0.5, 2), (f32::INFINITY, 3)];
+        scores.sort_by(semantic_score_order);
+        assert_eq!(
+            scores.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
+            vec![1, 2, 0, 3]
+        );
+        let mut valid = [(0.0, 0), (-0.0, 1), (0.5, 2), (-0.5, 3), (0.5, 4)];
+        valid.sort_by(semantic_score_order);
+        assert_eq!(
+            valid.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
+            vec![2, 4, 0, 1, 3]
+        );
+    }
+
+    #[test]
+    fn audit10_valid_input_order_and_cache_bytes_unchanged() {
+        let index = audit10_vector_index(vec![vec![0.0, 1.0], vec![1.0, 0.0], vec![-1.0, 0.0]]);
+        let bytes = index.to_bytes();
+        let restored = SemanticIndex::from_bytes(&bytes, &index.project_root).unwrap();
+        assert_eq!(restored.to_bytes(), bytes);
+        let results = restored.search(&[1.0, 0.0], 3);
+        assert_eq!(
+            results.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["audit_vector_1", "audit_vector_0", "audit_vector_2"]
+        );
+        assert_eq!(
+            results.iter().map(|r| r.score).collect::<Vec<_>>(),
+            vec![1.0, 0.0, -1.0]
+        );
+    }
+
+    #[test]
+    fn audit10_semantic_cache_rejects_unknown_kind() {
+        let index = audit10_vector_index(vec![vec![1.0, 0.0]]);
+        let mut bytes = index.to_bytes();
+        let name = b"audit_vector_0";
+        let offset = bytes.windows(name.len()).position(|w| w == name).unwrap();
+        let kind_offset = offset + name.len() + 4;
+        assert_eq!(bytes[kind_offset], symbol_kind_to_u8(&SymbolKind::Function));
+        bytes[kind_offset] = 255;
+        let error = SemanticIndex::from_bytes(&bytes, &index.project_root).unwrap_err();
+        assert!(error.contains("invalid semantic symbol kind"), "{error}");
+        assert_eq!(u8_to_symbol_kind(8).unwrap(), SymbolKind::Heading);
+    }
+
+    #[test]
+    fn audit10_legacy_decoder_marks_missing_sizes() {
+        let root = std::env::current_dir().unwrap();
+        let file = root.join("legacy.rs");
+        let path = file.to_str().unwrap().as_bytes();
+        let mut bytes = vec![SEMANTIC_INDEX_VERSION_V1];
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(path);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let restored = SemanticIndex::from_bytes(&bytes, &root).unwrap();
+        assert!(restored.any_missing_sizes);
+        assert!(!restored.file_sizes.contains_key(&file));
+    }
 
     fn unique_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("aft-backend-status-{name}-{}", std::process::id()))

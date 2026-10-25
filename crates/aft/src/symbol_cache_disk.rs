@@ -75,7 +75,7 @@ impl SymbolCacheLock {
         crate::private_storage::open_dir(storage_dir, &dir)?;
         let _acquire_guard = SYMBOL_LOCK_ACQUIRE_MUTEX
             .lock()
-            .map_err(|_| std::io::Error::other("symbol cache lock acquisition mutex poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(test)]
         LOCK_ACQUIRE_OBSERVER.with(|slot| {
             if let Some(observer) = slot.borrow_mut().take() {
@@ -582,6 +582,22 @@ fn write_u64<W: Write>(writer: &mut W, value: u64) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit10_symbol_lock_poison_recovers() {
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = SYMBOL_LOCK_ACQUIRE_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("simulate acquisition panic");
+        });
+        assert!(poisoned.is_err());
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let lock = SymbolCacheLock::acquire(storage.path(), "poison", project.path()).unwrap();
+        assert!(lock._guard.is_some());
+    }
+
     #[test]
     fn durability_symbol_cache_write_count() {
         let project = tempfile::tempdir().unwrap();
