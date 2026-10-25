@@ -5152,6 +5152,7 @@ fn adopt_resident_semantic_index_if_available(
             return true;
         }
     };
+    index.note_borrowed_summary_format();
     index.invalidate_files(&refresh_paths);
     *ctx.semantic_index()
         .write()
@@ -6390,13 +6391,28 @@ fn schedule_artifact_loads_admitted(
                             VerifyArtifact::Semantic,
                             verified_artifact_generation,
                         );
-                        if let Some(cached) = SemanticIndex::read_from_disk(
-                            dir,
-                            &semantic_project_key,
-                            &root_clone,
-                            is_worktree_bridge_for_semantic,
-                            Some(&fingerprint_key),
-                        ) {
+                        let cached = {
+                            let mut repair = |texts| {
+                                let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
+                                    &semantic_cold_build_limiter,
+                                    SEMANTIC_REFRESH_LIMITER_KIND,
+                                    &root_clone,
+                                    || semantic_lifecycle.is_current(semantic_generation_flag.as_ref(), semantic_generation)
+                                        && semantic_build_epoch_flag.load(Ordering::SeqCst) == semantic_build_epoch,
+                                ) else { return Err(SUPERSEDED_SEMANTIC_BUILD.to_string()); };
+                                model.embed(texts)
+                            };
+                            SemanticIndex::read_from_disk_with_summary_repair(
+                                dir,
+                                &semantic_project_key,
+                                &root_clone,
+                                is_worktree_bridge_for_semantic,
+                                Some(&fingerprint_key),
+                                &mut repair,
+                                semantic_config.max_batch_size.max(1),
+                            )?
+                        };
+                        if let Some((cached, summaries_repaired)) = cached {
                             clear_cold_seed_gate_and_notify();
                             if verify_plan == WarmVerifyPlan::Skip {
                                 slog_info!(
@@ -6406,7 +6422,7 @@ fn schedule_artifact_loads_admitted(
                                 return Ok(SemanticBuildReady {
                                     index: cached,
                                     model,
-                                    persist_to_disk: false,
+                                    persist_to_disk: summaries_repaired,
                                     record_verify_completion: false,
                                     verified_artifact_generation,
                                 });
@@ -6580,7 +6596,7 @@ fn schedule_artifact_loads_admitted(
                                         );
                                         cached.set_fingerprint(fingerprint);
                                     }
-                                    let persist_to_disk = !summary.is_noop();
+                                    let persist_to_disk = summaries_repaired || !summary.is_noop();
                                     let _ = tx_progress.send(SemanticIndexEvent::Progress {
                                         stage: "loaded_cached_index".to_string(),
                                         files: None,
@@ -6629,7 +6645,7 @@ fn schedule_artifact_loads_admitted(
                                         return Ok(SemanticBuildReady {
                                             index: cached,
                                             model,
-                                            persist_to_disk: false,
+                                            persist_to_disk: summaries_repaired,
                                             record_verify_completion: false,
                                             verified_artifact_generation,
                                         });

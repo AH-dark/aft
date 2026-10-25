@@ -27,7 +27,7 @@
 //!
 //! Registration is opt-in: constructing a plane changes no routing.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -116,6 +116,27 @@ impl SemanticProducer {
     }
 
     fn full_key(&self, bytes: &[u8], rel_path: &RelPath) -> FullKey {
+        self.full_key_for_summary_format(
+            bytes,
+            rel_path,
+            crate::semantic_index::FILE_SUMMARY_BUDGET_KEY_FORMAT,
+        )
+    }
+
+    fn summary_key_format(&self, summary_format: u32) -> u32 {
+        if self.caps.total_chars < EmbedTextCaps::default().total_chars {
+            summary_format
+        } else {
+            0
+        }
+    }
+
+    fn full_key_for_summary_format(
+        &self,
+        bytes: &[u8],
+        rel_path: &RelPath,
+        summary_format: u32,
+    ) -> FullKey {
         SemanticKey::from_bytes(
             bytes,
             rel_path.as_bytes(),
@@ -123,7 +144,29 @@ impl SemanticProducer {
             self.template_version.as_str(),
             self.model_fingerprint.as_str(),
         )
-        .full_key()
+        .file_key_for_summary_format(self.summary_key_format(summary_format))
+    }
+
+    fn key_for_content(
+        &self,
+        content: ContentHash,
+        rel_path: &RelPath,
+        summary_format: u32,
+    ) -> FamilyKey {
+        FamilyKey::from(
+            &SemanticKey::from_source_hash(
+                *content.as_bytes(),
+                rel_path.as_bytes(),
+                self.chunker_version.as_str(),
+                self.template_version.as_str(),
+                self.model_fingerprint.as_str(),
+            )
+            .file_key_for_summary_format(self.summary_key_format(summary_format)),
+        )
+    }
+
+    pub(crate) fn legacy_key(&self, bytes: &[u8], rel_path: &RelPath) -> FamilyKey {
+        FamilyKey::from(&self.full_key_for_summary_format(bytes, rel_path, 0))
     }
 
     /// The input-addressed family key of `bytes` at `rel_path` under this
@@ -440,6 +483,8 @@ struct Resident {
     members: BTreeMap<RelPath, ContentHash>,
     /// Failures the generation records for this producer.
     failed: BTreeMap<RelPath, ContentHash>,
+    /// Kept readable by borrowers, but queued for the owning view to repair.
+    legacy_summaries: BTreeSet<RelPath>,
 }
 
 type CacheKey = (String, [u8; 32], u64, bool);
@@ -463,6 +508,7 @@ type ResidentKey = (String, String, String);
 pub struct SemanticPlane {
     storage: PathBuf,
     producer: SemanticProducer,
+    file_summary_format: u32,
     views: Mutex<BTreeMap<ViewKey, Arc<Mutex<ViewState>>>>,
     residents: Mutex<BTreeMap<ResidentKey, Arc<Resident>>>,
     arenas: Mutex<BTreeMap<String, Arc<super::semantic_arena::SemanticArena>>>,
@@ -521,6 +567,7 @@ impl SemanticPlane {
         Self {
             storage,
             producer,
+            file_summary_format: crate::semantic_index::FILE_SUMMARY_BUDGET_KEY_FORMAT,
             views: Mutex::new(BTreeMap::new()),
             residents: Mutex::new(BTreeMap::new()),
             arenas: Mutex::new(BTreeMap::new()),
@@ -614,6 +661,7 @@ impl SemanticPlane {
         let mut runs = Vec::new();
         let mut members = BTreeMap::new();
         let mut failed = BTreeMap::new();
+        let mut legacy_summaries = BTreeSet::new();
         if compatible {
             let arena = self.arena(access.family());
             let store = Self::store_reader(access)?;
@@ -647,6 +695,14 @@ impl SemanticPlane {
                         // Only a missing run is a cache miss. A failed read
                         // must not silently turn into new embedding work.
                         if let Some(run) = loaded {
+                            if self.producer.summary_key_format(self.file_summary_format) > 0
+                                && crate::blob_store::v2::parse_hex32(key)
+                                    == Some(
+                                        *self.producer.key_for_content(content, path, 0).as_bytes(),
+                                    )
+                            {
+                                legacy_summaries.insert(path.clone());
+                            }
                             runs.push(run);
                             members.insert(path.clone(), content);
                         }
@@ -665,6 +721,7 @@ impl SemanticPlane {
             base: ViewSemanticBase::new(runs),
             members,
             failed,
+            legacy_summaries,
         })
     }
 
@@ -675,11 +732,15 @@ impl SemanticPlane {
         snapshot: &Snapshot,
         path: &RelPath,
         content: ContentHash,
+        repair_summaries: bool,
     ) -> VectorSource {
         // A live entry supersedes the generation: its base run, if any, holds
         // other content and must never be scored.
         let live = matches!(snapshot.source(path), Source::Live(_));
-        if !live && resident.members.get(path) == Some(&content) {
+        if !live
+            && resident.members.get(path) == Some(&content)
+            && !(repair_summaries && resident.legacy_summaries.contains(path))
+        {
             return VectorSource::Base;
         }
         if let Some(key) = state.fill.get(path, &content, FamilyPlane::Semantic) {
@@ -700,6 +761,7 @@ impl SemanticPlane {
         state: &ViewState,
         resident: &Resident,
         snapshot: &Snapshot,
+        repair_summaries: bool,
     ) -> Vec<WorkItem> {
         let producer = self.producer.id();
         snapshot
@@ -711,7 +773,14 @@ impl SemanticPlane {
                 };
                 (applies_to(&path)
                     && matches!(
-                        Self::vector_source(state, resident, snapshot, &path, content),
+                        Self::vector_source(
+                            state,
+                            resident,
+                            snapshot,
+                            &path,
+                            content,
+                            repair_summaries
+                        ),
                         VectorSource::Pending
                     ))
                 .then(|| WorkItem {
@@ -790,7 +859,7 @@ impl SemanticPlane {
                         .map_err(|error| plane_error(error.to_string()))?,
                 );
             }
-            self.work_items(&state, &resident, snapshot)
+            self.work_items(&state, &resident, snapshot, true)
         };
         report.queued = items.len();
         super::io::WORK
@@ -845,7 +914,11 @@ impl SemanticPlane {
                 Ok(bytes) if ContentHash::of(&bytes) == item.content => {
                     prepared.push(PreparedWork {
                         rel_path: item.rel_path.as_bytes().to_vec(),
-                        full_key: self.producer.full_key(&bytes, &item.rel_path),
+                        full_key: self.producer.full_key_for_summary_format(
+                            &bytes,
+                            &item.rel_path,
+                            self.file_summary_format,
+                        ),
                         payload: bytes,
                     });
                     by_path.insert(item.rel_path.as_bytes().to_vec(), (item, relative));
@@ -932,15 +1005,45 @@ impl SemanticPlane {
         let mut to_embed = Vec::new();
         let mut chunks = Vec::new();
         let mut failures = Vec::new();
+        let repairing = self.producer.caps.total_chars < EmbedTextCaps::default().total_chars
+            && self.file_summary_format > 0;
+        let mut legacy_reuse = repairing.then(VecDeque::new);
         for (item, relative, group, claim) in claimed {
-            match crate::semantic_index::chunk_view_file(
-                &root,
-                &relative,
-                &group.payload,
-                self.producer.caps,
-            ) {
-                Ok(file_chunks) => {
-                    let file_chunks = file_chunks.unwrap_or_default();
+            let mut legacy_run = None;
+            if repairing {
+                let old_key = self.producer.legacy_key(&group.payload, &item.rel_path);
+                if let Some(payload) = store
+                    .get(&old_key)
+                    .map_err(|error| plane_error(error.to_string()))?
+                {
+                    let run = crate::semantic_index::SemanticVectors::decode_view_payload_for_summary_repair(
+                        &payload, &relative, &payload_producer,
+                    ).map_err(plane_error)?;
+                    legacy_run = Some(run);
+                }
+            }
+            let collected = if let Some(run) = legacy_run {
+                let (chunks, reuse) = run.into_summary_repair_chunks(self.producer.caps);
+                Ok((chunks, Some(reuse)))
+            } else {
+                crate::semantic_index::chunk_view_file(
+                    &root,
+                    &relative,
+                    &group.payload,
+                    self.producer.caps,
+                )
+                .map(|chunks| (chunks.unwrap_or_default(), None))
+            };
+            match collected {
+                Ok((file_chunks, reuse)) => {
+                    if let Some(plan) = legacy_reuse.as_mut() {
+                        let mut reuse = reuse.unwrap_or_default().into_iter();
+                        plan.extend(
+                            file_chunks
+                                .iter()
+                                .map(|chunk| (chunk.embed_text.clone(), reuse.next().flatten())),
+                        );
+                    }
                     report.chunks += file_chunks.len();
                     chunks.push(file_chunks);
                     to_embed.push((item, relative, group.full_key, claim));
@@ -990,15 +1093,62 @@ impl SemanticPlane {
             let mut canonical_chunks = Vec::new();
             let embedded = {
                 let mut rows = |batch: Vec<String>| {
-                    self.embed_chunks(
-                        &arena,
-                        &store,
-                        batch,
-                        embed,
-                        &mut report,
-                        before_embed,
-                        &mut canonical_chunks,
-                    )
+                    let Some(plan) = legacy_reuse.as_mut() else {
+                        return self.embed_chunks(
+                            &arena,
+                            &store,
+                            batch,
+                            embed,
+                            &mut report,
+                            before_embed,
+                            &mut canonical_chunks,
+                        );
+                    };
+                    let mut rows = Vec::with_capacity(batch.len());
+                    let mut missing = Vec::new();
+                    for text in batch {
+                        let (expected, reuse) = plan
+                            .pop_front()
+                            .ok_or("summary repair row plan exhausted")?;
+                        if expected != text {
+                            return Err("summary repair row plan changed".to_string());
+                        }
+                        if let Some(vector) = reuse {
+                            // Keep legacy vectors local; never seed unvouched
+                            // file data into the global canonical chunk cache.
+                            rows.push(Some(crate::semantic_index::BuildEmbeddingRow::Embedded {
+                                embedded_text: text,
+                                vector: vector.to_vec(),
+                            }));
+                            canonical_chunks.push(vector);
+                            report.chunk_reused += 1;
+                        } else {
+                            missing.push(text);
+                            rows.push(None);
+                        }
+                    }
+                    let mut embedded = if missing.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.embed_chunks(
+                            &arena,
+                            &store,
+                            missing,
+                            embed,
+                            &mut report,
+                            before_embed,
+                            &mut canonical_chunks,
+                        )?
+                    }
+                    .into_iter();
+                    Ok(rows
+                        .into_iter()
+                        .map(|row| {
+                            row.unwrap_or_else(|| {
+                                embedded.next().expect("validated summary repair row count")
+                            })
+                        })
+                        .collect())
                 };
                 crate::semantic_index::embed_view_files_with_rows(
                     chunks,
@@ -1561,6 +1711,9 @@ impl SemanticPlane {
         let intent = snapshot.pending_intent().cloned().collect::<BTreeSet<_>>();
         let mut via_base = HashSet::new();
         let mut replacements = Vec::new();
+        let mut budget_limited = self.producer.caps.total_chars
+            >= EmbedTextCaps::default().total_chars
+            || self.file_summary_format > 0;
         let mut shape = blake3::Hasher::new();
         for (path, disk) in &members {
             let DiskState::Present { content, .. } = disk else {
@@ -1575,8 +1728,18 @@ impl SemanticPlane {
                 pending.insert(path.clone());
                 continue;
             }
-            match Self::vector_source(&state, &resident, snapshot, path, *content) {
+            match Self::vector_source(
+                &state,
+                &resident,
+                snapshot,
+                path,
+                *content,
+                matches!(access, ViewAccess::Owner(_)),
+            ) {
                 VectorSource::Base => {
+                    if resident.legacy_summaries.contains(path) {
+                        budget_limited = false;
+                    }
                     via_base.insert(path.clone());
                 }
                 VectorSource::Fill(key) => match arena.get(&key) {
@@ -1622,12 +1785,14 @@ impl SemanticPlane {
             _ => {
                 self.overlay_builds
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let index = Arc::new(SemanticIndex::for_view(
+                let mut index = SemanticIndex::for_view(
                     root.to_path_buf(),
                     &resident.base,
                     tombstones,
                     &replacements,
-                ));
+                );
+                index.set_summary_budget_limited(budget_limited);
+                let index = Arc::new(index);
                 state.cache = Some((cache_key, Arc::clone(&index)));
                 index
             }
@@ -1698,7 +1863,12 @@ impl SemanticPlane {
         };
         let view = self.view(access);
         let state = lock(&view);
-        self.work_items(&state, &resident, snapshot)
+        self.work_items(
+            &state,
+            &resident,
+            snapshot,
+            matches!(access, ViewAccess::Owner(_)),
+        )
     }
 
     /// Forgets everything this process holds for a checkout that unbinds:
@@ -1741,9 +1911,15 @@ impl PlaneAdapter for SemanticPlane {
             access.scope().to_owned(),
             generation.name().to_owned(),
         );
-        if !lock(&self.residents).contains_key(&key) {
+        let existing = lock(&self.residents).get(&key).cloned();
+        let resident = if let Some(resident) = existing {
+            resident
+        } else {
             let resident = Arc::new(self.admit(access, generation)?);
-            lock(&self.residents).entry(key).or_insert(resident);
+            Arc::clone(lock(&self.residents).entry(key).or_insert(resident))
+        };
+        if matches!(access, ViewAccess::Reader { .. }) && !resident.legacy_summaries.is_empty() {
+            log::info!("semantic borrower loaded {} legacy small-budget summary runs; serving published vectors until owner repair", resident.legacy_summaries.len());
         }
         if let ViewAccess::Owner(_) = access {
             let view = self.view(access);
@@ -1776,12 +1952,23 @@ impl PlaneAdapter for SemanticPlane {
     }
 
     fn readiness(&self, access: &ViewAccess, snapshot: &Snapshot) -> PlaneReadiness {
-        self.readiness_for(access.family(), access.scope(), snapshot)
+        self.readiness_for(
+            access.family(),
+            access.scope(),
+            snapshot,
+            matches!(access, ViewAccess::Owner(_)),
+        )
     }
 }
 
 impl SemanticPlane {
-    fn readiness_for(&self, family: &str, scope: &str, snapshot: &Snapshot) -> PlaneReadiness {
+    fn readiness_for(
+        &self,
+        family: &str,
+        scope: &str,
+        snapshot: &Snapshot,
+        repair_summaries: bool,
+    ) -> PlaneReadiness {
         let key = (
             family.to_owned(),
             scope.to_owned(),
@@ -1804,7 +1991,14 @@ impl SemanticPlane {
             if !applies_to(&path) {
                 continue;
             }
-            match Self::vector_source(&state, &resident, snapshot, &path, content) {
+            match Self::vector_source(
+                &state,
+                &resident,
+                snapshot,
+                &path,
+                content,
+                repair_summaries,
+            ) {
                 VectorSource::Pending => pending += 1,
                 VectorSource::Failed => failed += 1,
                 VectorSource::Base | VectorSource::Fill(_) => {}
@@ -1831,7 +2025,11 @@ impl super::first_load::CompositePlane for SemanticPlane {
         Ok(Arc::new(SemanticAttachment {
             content: ContentHash::of(bytes),
             producer: self.producer.id(),
-            key: self.producer.key(bytes, rel_path),
+            key: FamilyKey::from(&self.producer.full_key_for_summary_format(
+                bytes,
+                rel_path,
+                self.file_summary_format,
+            )),
         }))
     }
 
@@ -1873,7 +2071,13 @@ impl super::first_load::CompositePlane for SemanticPlane {
                 planes.semantic = None;
                 continue;
             }
-            if matches!(planes.semantic, Some(PlaneState::Ready { .. })) {
+            // A completed small-cap repair replaces the old Ready file-run key.
+            let repaired = self.producer.caps.total_chars < EmbedTextCaps::default().total_chars
+                && state
+                    .fill
+                    .get(path, content, FamilyPlane::Semantic)
+                    .is_some();
+            if matches!(planes.semantic, Some(PlaneState::Ready { .. })) && !repaired {
                 continue;
             }
             let stored = observed
@@ -2118,6 +2322,10 @@ mod tests {
             let owner = registry
                 .register_view_with_storage(registry.storage(), scope, root)
                 .unwrap();
+            Self::with_owner(root, owner, plane)
+        }
+
+        fn with_owner(root: &Path, owner: ViewRegistration, plane: &Arc<SemanticPlane>) -> Self {
             let composite: Arc<dyn CompositePlane> = plane.clone();
             let adapter: Arc<dyn PlaneAdapter> = plane.clone();
             let driver = Arc::new(
@@ -2182,6 +2390,346 @@ mod tests {
                 )
                 .unwrap()
         }
+    }
+
+    fn legacy_summary_checkout(
+        storage: &Path,
+        root: &Path,
+        caps: EmbedTextCaps,
+    ) -> (Checkout, String, Vec<f32>) {
+        let source = "//! A long module description that deliberately exceeds the configured small embedding budget.\npub fn exported() {\n    42;\n}\n";
+        let relative = Path::new("src").join("summary.rs");
+        write_tree(root, &[("src/summary.rs", source)]);
+        let producer = SemanticProducer::current("model-a", caps);
+        let mut plane = SemanticPlane::new(storage.to_path_buf(), producer.clone());
+        plane.file_summary_format = 0;
+        assert_eq!(plane.file_summary_format, 0);
+        let plane = Arc::new(plane);
+        let checkout = Checkout::open(storage, "summary-scope", root, &plane);
+        let mut chunks =
+            crate::semantic_index::chunk_view_file(root, &relative, source.as_bytes(), caps)
+                .unwrap()
+                .unwrap();
+        let old = crate::semantic_index::build_file_summary_chunk(
+            &root.join(&relative),
+            root,
+            source,
+            &["exported"],
+            &[Some("pub fn exported()")],
+        );
+        chunks
+            .iter_mut()
+            .find(|chunk| chunk.kind == crate::symbols::SymbolKind::FileSummary)
+            .unwrap()
+            .embed_text = old.embed_text;
+        let symbol_text = chunks
+            .iter()
+            .find(|chunk| chunk.name == "exported")
+            .unwrap()
+            .embed_text
+            .clone();
+        let symbol = vector("model-a", &symbol_text);
+        let mut runs = crate::semantic_index::embed_view_files(
+            vec![chunks],
+            &mut |texts| Model::default().embed("model-a", texts),
+            64,
+        )
+        .unwrap();
+        let path = RelPath::new(b"src/summary.rs".to_vec()).unwrap();
+        let key = FamilyKey::from(
+            &SemanticKey::from_bytes(
+                source.as_bytes(),
+                path.as_bytes(),
+                &producer.chunker_version,
+                &producer.template_version,
+                &producer.model_fingerprint,
+            )
+            .full_key(),
+        );
+        checkout
+            .owner
+            .open_store(FamilyPlane::Semantic)
+            .unwrap()
+            .put_or_touch(
+                &key,
+                &runs.remove(0).encode_view_payload(&producer.payload()),
+            )
+            .unwrap();
+        let snapshot = checkout.load();
+        assert!(!checkout
+            .query(&snapshot, "model-a", "module")
+            .results
+            .is_empty());
+        (checkout, symbol_text, symbol)
+    }
+
+    #[test]
+    fn audit10_9_views_small_cap_load_repairs_only_summaries_and_borrowers_adopt() {
+        for reader_first in [true, false] {
+            let storage = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let caps = EmbedTextCaps {
+                total_chars: 70,
+                ..EmbedTextCaps::default()
+            };
+            let (legacy, symbol_text, symbol) =
+                legacy_summary_checkout(storage.path(), root.path(), caps);
+            let plane = Arc::new(SemanticPlane::new(
+                storage.path().to_path_buf(),
+                SemanticProducer::current("model-a", caps),
+            ));
+            assert_eq!(plane.producer.id(), legacy.plane.producer.id());
+            assert_eq!(
+                plane.producer.chunk_identity(),
+                legacy.plane.producer.chunk_identity()
+            );
+            let checkout = Checkout::with_owner(root.path(), legacy.owner.clone(), &plane);
+            if !reader_first {
+                checkout.load();
+            }
+            let chunk_key = plane.producer.chunk_key(&symbol_text);
+            let canonical = symbol.iter().map(|value| value * 0.99).collect::<Vec<_>>();
+            let canonical_payload =
+                encode_chunk_vector(&plane.producer.chunk_identity(), &symbol_text, &canonical)
+                    .unwrap();
+            let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
+            store.put_or_touch(&chunk_key, &canonical_payload).unwrap();
+            let reader = FamilyRegistry::open(storage.path(), "family")
+                .unwrap()
+                .register_reader("summary-reader")
+                .unwrap();
+            let access = ViewAccess::Reader {
+                registration: Arc::new(reader),
+                scope: "summary-scope".to_string(),
+            };
+            let before = checkout.loader.load(&access).unwrap().snapshot;
+            let query = plane
+                .search(
+                    &access,
+                    root.path(),
+                    &before,
+                    &vector("model-a", "module"),
+                    100,
+                    &|_| true,
+                )
+                .unwrap();
+            assert!(query.complete());
+            assert!(!query.results.is_empty());
+            let old_summary = plane
+                .cached_index(&access)
+                .unwrap()
+                .entry_vectors_for_test()
+                .into_iter()
+                .find(|(_, name, _)| name == "summary")
+                .unwrap()
+                .2;
+            let snapshot = checkout.load();
+            let current = snapshot.clone();
+            let mut embedded = Vec::new();
+            let report = plane
+                .fill(
+                    &checkout.owner,
+                    &snapshot,
+                    FillBudget::default(),
+                    &mut |texts| {
+                        embedded.extend(texts.clone());
+                        Ok(texts.iter().map(|text| vector("model-a", text)).collect())
+                    },
+                    &move || current.clone(),
+                )
+                .unwrap();
+            assert_eq!(
+                embedded.len(),
+                1,
+                "only the legacy file summary may be embedded: {report:?}"
+            );
+            assert!(embedded[0].contains("kind:file-summary"));
+            assert_eq!(embedded[0].chars().count(), 70);
+            let published = checkout.load();
+            assert!(!checkout
+                .query(&published, "model-a", "module")
+                .results
+                .is_empty());
+            let index = plane.cached_index(&checkout.access).unwrap();
+            assert_eq!(
+                index
+                    .entry_vectors_for_test()
+                    .into_iter()
+                    .find(|(_, name, _)| name == "exported")
+                    .unwrap()
+                    .2,
+                symbol
+            );
+            assert_eq!(store.get(&chunk_key).unwrap().unwrap(), canonical_payload);
+            let after = checkout.loader.load(&access).unwrap().snapshot;
+            let query = plane
+                .search(
+                    &access,
+                    root.path(),
+                    &after,
+                    &vector("model-a", "module"),
+                    100,
+                    &|_| true,
+                )
+                .unwrap();
+            assert!(query.complete());
+            assert!(!query.results.is_empty());
+            let new_summary = plane
+                .cached_index(&access)
+                .unwrap()
+                .entry_vectors_for_test()
+                .into_iter()
+                .find(|(_, name, _)| name == "summary")
+                .unwrap()
+                .2;
+            assert_ne!(old_summary, new_summary);
+            assert_eq!(new_summary, vector("model-a", &embedded[0]));
+            assert_ne!(before.generation().name(), after.generation().name());
+            assert!(plane.pending_work(&checkout.access, &published).is_empty());
+            let current = published.clone();
+            plane
+                .fill(
+                    &checkout.owner,
+                    &published,
+                    FillBudget::default(),
+                    &mut |_| panic!("repaired summaries must not rebuild"),
+                    &move || current.clone(),
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn audit10_9_views_default_cap_load_does_not_rebuild_summaries() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (legacy, _, _) =
+            legacy_summary_checkout(storage.path(), root.path(), EmbedTextCaps::default());
+        let plane = new_plane(storage.path(), "model-a");
+        let checkout = Checkout::with_owner(root.path(), legacy.owner.clone(), &plane);
+        let snapshot = checkout.load();
+        let current = snapshot.clone();
+        let report = plane
+            .fill(
+                &checkout.owner,
+                &snapshot,
+                FillBudget::default(),
+                &mut |_| panic!("default-cap indexes need no summary repair"),
+                &move || current.clone(),
+            )
+            .unwrap();
+        assert_eq!(report.embedded_texts, 0);
+        assert_eq!(report.source_reads, 0);
+        assert!(plane.pending_work(&checkout.access, &snapshot).is_empty());
+    }
+
+    #[test]
+    fn audit10_9_views_repair_preserves_distinct_vectors_for_duplicate_inputs() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let source = "//! A module description longer than the tiny input budget.\npub fn exported_one() {\n    42;\n}\npub fn exported_two() {\n    43;\n}\n";
+        write_tree(root.path(), &[("src/summary.rs", source)]);
+        let path = RelPath::new(b"src/summary.rs".to_vec()).unwrap();
+        let relative = Path::new("src").join("summary.rs");
+        let caps = EmbedTextCaps {
+            total_chars: 10,
+            ..EmbedTextCaps::default()
+        };
+        let producer = SemanticProducer::current("model-a", caps);
+        let mut legacy_plane = SemanticPlane::new(storage.path().to_path_buf(), producer.clone());
+        legacy_plane.file_summary_format = 0;
+        let legacy_plane = Arc::new(legacy_plane);
+        let legacy = Checkout::open(
+            storage.path(),
+            "duplicate-scope",
+            root.path(),
+            &legacy_plane,
+        );
+        let mut chunks =
+            crate::semantic_index::chunk_view_file(root.path(), &relative, source.as_bytes(), caps)
+                .unwrap()
+                .unwrap();
+        let symbol_inputs = chunks
+            .iter()
+            .filter(|chunk| chunk.kind != crate::symbols::SymbolKind::FileSummary)
+            .map(|chunk| chunk.embed_text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(symbol_inputs.len(), 2);
+        assert_eq!(symbol_inputs[0], symbol_inputs[1]);
+        chunks
+            .iter_mut()
+            .find(|chunk| chunk.kind == crate::symbols::SymbolKind::FileSummary)
+            .unwrap()
+            .embed_text = crate::semantic_index::build_file_summary_chunk(
+            &root.path().join(&relative),
+            root.path(),
+            source,
+            &["exported_one", "exported_two"],
+            &[None, None],
+        )
+        .embed_text;
+        let runs = crate::semantic_index::embed_view_files(
+            vec![chunks],
+            &mut |texts: Vec<String>| {
+                Ok(texts
+                    .iter()
+                    .enumerate()
+                    .map(|(position, text)| {
+                        vector("model-a", text)
+                            .into_iter()
+                            .map(|value| value * (position + 1) as f32)
+                            .collect()
+                    })
+                    .collect())
+            },
+            64,
+        )
+        .unwrap();
+        legacy
+            .owner
+            .open_store(FamilyPlane::Semantic)
+            .unwrap()
+            .put_or_touch(
+                &producer.legacy_key(source.as_bytes(), &path),
+                &runs[0].encode_view_payload(&producer.payload()),
+            )
+            .unwrap();
+        let snapshot = legacy.load();
+        legacy.query(&snapshot, "model-a", "module");
+        let symbols = |index: Arc<SemanticIndex>| {
+            index
+                .entry_vectors_for_test()
+                .into_iter()
+                .filter(|(_, name, _)| name != "summary")
+                .map(|(_, name, vector)| (name, vector))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before = symbols(legacy_plane.cached_index(&legacy.access).unwrap());
+        assert_ne!(before["exported_one"], before["exported_two"]);
+        let plane = Arc::new(SemanticPlane::new(storage.path().to_path_buf(), producer));
+        let checkout = Checkout::with_owner(root.path(), legacy.owner.clone(), &plane);
+        let snapshot = checkout.load();
+        let current = snapshot.clone();
+        let mut embedded = 0;
+        plane
+            .fill(
+                &checkout.owner,
+                &snapshot,
+                FillBudget::default(),
+                &mut |texts: Vec<String>| {
+                    embedded += texts.len();
+                    Ok(texts.iter().map(|text| vector("model-a", text)).collect())
+                },
+                &move || current.clone(),
+            )
+            .unwrap();
+        assert!(embedded <= 1, "symbol rows must not be re-embedded");
+        let published = checkout.load();
+        checkout.query(&published, "model-a", "module");
+        assert_eq!(
+            symbols(plane.cached_index(&checkout.access).unwrap()),
+            before
+        );
     }
 
     const LARGE_DEFINITIONS: usize = 300;

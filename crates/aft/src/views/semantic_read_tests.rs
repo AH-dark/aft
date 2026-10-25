@@ -151,7 +151,7 @@ fn incremental_reuse_requires_matching_path_and_content() {
         panic!("missing member")
     };
     assert!(matches!(
-        SemanticPlane::vector_source(&state, &resident, &old, &unchanged, content),
+        SemanticPlane::vector_source(&state, &resident, &old, &unchanged, content, true),
         VectorSource::Base
     ));
     write_tree(
@@ -166,7 +166,7 @@ fn incremental_reuse_requires_matching_path_and_content() {
     };
     assert!(
         matches!(
-            SemanticPlane::vector_source(&state, &resident, &changed, &path, content),
+            SemanticPlane::vector_source(&state, &resident, &changed, &path, content, true),
             VectorSource::Pending
         ),
         "changed content reused an old generation's vector"

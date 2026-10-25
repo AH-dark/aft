@@ -1225,6 +1225,21 @@ fn semantic_payload(producer: &SemanticProducer, rows: &[(ChunkShape, Vec<u8>)])
     payload
 }
 
+fn capped_legacy_summary(current: &ChunkShape, legacy: &ChunkShape, budget: usize) -> bool {
+    if budget >= crate::semantic_index::EmbedTextCaps::default().total_chars
+        || current.kind != stored_kind(&crate::symbols::SymbolKind::FileSummary)
+        || legacy.kind != current.kind
+        || current.embed_text.chars().count() != budget
+        || legacy.embed_text.chars().count() <= budget
+        || crate::semantic_index::truncate_chars(&legacy.embed_text, budget) != current.embed_text
+    {
+        return false;
+    }
+    let mut capped = legacy.clone();
+    capped.embed_text = current.embed_text.clone();
+    capped == *current
+}
+
 /// Converts a legacy `semantic.bin` into view payloads under `producer`.
 ///
 /// The snapshot must carry exactly the producer's model fingerprint and the
@@ -1233,13 +1248,38 @@ fn semantic_payload(producer: &SemanticProducer, rows: &[(ChunkShape, Vec<u8>)])
 /// bytes into exactly the snapshot's rows (names, lines, snippets and
 /// embedded texts). Its vectors belong to the same producer and inputs as a
 /// cold fill, though a model invocation need not reproduce their float bytes.
+/// A legacy small-cap summary may instead be the exact uncapped input: keep
+/// that run under its old key so the owner can replace only the summary.
 /// Every other file is left for the plane to embed.
 fn convert_semantic(
     bytes: &[u8],
     root: &Path,
     producer: &SemanticProducer,
 ) -> Result<(Bundle, usize), String> {
-    let parsed = super::parse_legacy_snapshot(bytes, &producer.model_fingerprint)?;
+    let summary_budget = serde_json::from_str::<crate::semantic_index::SemanticIndexFingerprint>(
+        &producer.model_fingerprint,
+    )
+    .ok()
+    .filter(|identity| {
+        identity.embed_text_caps == producer.caps
+            && identity.embed_text_caps.total_chars
+                < crate::semantic_index::EmbedTextCaps::default().total_chars
+    })
+    .map(|identity| identity.embed_text_caps.total_chars);
+    let parsed = match super::parse_legacy_snapshot(bytes, &producer.model_fingerprint) {
+        Ok(parsed) => parsed,
+        Err(error)
+            if summary_budget.is_some() && error == "trailing bytes after semantic snapshot" =>
+        {
+            // The strict producer/version checks above already passed. Fold
+            // committed segments with the owner's normal reader before import.
+            let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+            let compact =
+                crate::semantic_index::SemanticIndex::from_bytes(bytes, &root)?.to_bytes();
+            super::parse_legacy_snapshot(&compact, &producer.model_fingerprint)?
+        }
+        Err(error) => return Err(error),
+    };
     let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
     let mut entries = Vec::new();
     let mut skipped = 0usize;
@@ -1293,6 +1333,7 @@ fn convert_semantic(
         }
         let chunk_count = chunks.len();
         let mut rows = Vec::with_capacity(chunk_count);
+        let mut summary_repair_pending = false;
         for chunk in chunks {
             let shape = ChunkShape {
                 name: chunk.name,
@@ -1304,20 +1345,39 @@ fn convert_semantic(
                 snippet: chunk.snippet,
                 embed_text: chunk.embed_text,
             };
-            let Some(vector) = stored.get_mut(&shape).and_then(Vec::pop) else {
+            if let Some(vector) = stored.get_mut(&shape).and_then(Vec::pop) {
+                rows.push((shape, vector));
+            } else if let Some(legacy) = summary_budget
+                .and_then(|budget| {
+                    stored
+                        .keys()
+                        .find(|legacy| capped_legacy_summary(&shape, legacy, budget))
+                })
+                .cloned()
+            {
+                let Some(vector) = stored.get_mut(&legacy).and_then(Vec::pop) else {
+                    break;
+                };
+                rows.push((legacy, vector));
+                summary_repair_pending = true;
+            } else {
                 break;
-            };
-            rows.push((shape, vector));
+            }
         }
         let all_matched = rows.len() == chunk_count && stored.values().all(Vec::is_empty);
         if !all_matched {
             skipped += 1;
             continue;
         }
+        let key = if summary_repair_pending {
+            producer.legacy_key(&source, &rel_path)
+        } else {
+            producer.key(&source, &rel_path)
+        };
         entries.push(BundleEntry {
             content: ContentHash::from_bytes(file.content_hash),
             size: source.len() as u64,
-            key: *producer.key(&source, &rel_path).as_bytes(),
+            key: *key.as_bytes(),
             payload: semantic_payload(producer, &rows),
             rel_path,
         });
