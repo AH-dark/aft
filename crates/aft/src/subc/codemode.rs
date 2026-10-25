@@ -322,6 +322,17 @@ pub(super) struct EffectiveSavedPolicy {
     params: Option<Value>,
 }
 
+#[cfg(test)]
+impl EffectiveSavedPolicy {
+    /// A saved policy that differs from the default one.
+    pub(super) fn confined_for_test() -> Self {
+        Self {
+            confined: true,
+            params: None,
+        }
+    }
+}
+
 pub(super) type SavedPolicyRead = Result<EffectiveSavedPolicy, subc_protocol::ErrorBody>;
 
 struct CandidatePolicy {
@@ -384,7 +395,10 @@ impl SavedPolicies {
     }
 }
 
-fn head_access_differences(head: &RouteIdentity, other: &RouteIdentity) -> Vec<&'static str> {
+pub(super) fn head_access_differences(
+    head: &RouteIdentity,
+    other: &RouteIdentity,
+) -> Vec<&'static str> {
     [
         ("root", other.root != head.root),
         ("project_root", other.project_root != head.project_root),

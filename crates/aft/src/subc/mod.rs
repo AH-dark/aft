@@ -200,6 +200,7 @@ type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>
 mod access_grants;
 mod bash;
 mod bind_log;
+mod call_policy;
 #[cfg(test)]
 mod content_v1_tests;
 // The grant tests run real shell commands, which need a POSIX shell.
@@ -222,6 +223,7 @@ mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
 mod manifest;
+mod page_collect;
 mod persistence;
 mod push;
 mod readiness;
@@ -4054,6 +4056,9 @@ fn run_subc_mode_inner(
         // Saved paused tasks may still owe their runner a cancel; send those
         // now rather than when (if ever) their projects bind again.
         crate::bash_background::note_storage_root(&storage_dir);
+        // Page snapshots an earlier daemon left behind are deleted now; the
+        // storage lease above makes this daemon their only user.
+        crate::page_collect::snapshot::SnapshotStore::for_storage(&storage_dir);
         let stream =
             connect_and_authenticate(connection_file_path, lifecycle_probe.as_ref()).await?;
         log::info!(
@@ -5581,6 +5586,7 @@ where
                                 &executor,
                                 &live_roots,
                                 &root_channels,
+                                &routes,
                                 &health_rollup_cache,
                                 &dispatch_path_metrics,
                                 management_routes.get(&route).and_then(Option::as_ref),
@@ -7944,6 +7950,7 @@ async fn handle_management_request(
     executor: &Arc<Executor>,
     live_roots: &HashMap<ProjectRootId, RootMeta>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
     health_rollup_cache: &Arc<HealthRollupCache>,
     metrics: &Arc<DispatchPathMetrics>,
     principal: Option<&Principal>,
@@ -8124,6 +8131,25 @@ async fn handle_management_request(
                 Some(ctx) => crate::commands::health_digest::handle_health_digest(&request, &ctx),
                 None => crate::commands::health_digest::root_not_bound_response(&request, root),
             }
+        }
+        operation if page_collect::is_page_operation(operation) => {
+            let params = decoded
+                .as_ref()
+                .and_then(|value| value.get("params"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            spawn_page_operation(
+                tx,
+                frame,
+                operation,
+                params,
+                principal.cloned(),
+                routes,
+                executor,
+                metrics,
+                storage_dir,
+            );
+            return Ok(());
         }
         _ => {
             let error = build_error_frame(
@@ -8350,6 +8376,125 @@ fn spawn_gh_relay(
             send_reliable_writer_frame(&tx, &metrics, response, "gh shim relay response").await
         {
             log::warn!("gh_shim relay: could not queue the reply: {error}");
+        }
+    });
+}
+
+/// Bit 0 of a frame's flags byte: the body is raw bytes, not JSON
+/// (`Flags::is_binary`). subc-protocol does not export the constant.
+const FRAME_FLAG_BINARY: u8 = 0b0000_0001;
+
+/// Run a page-bundle operation off the frame loop: a collection reads files
+/// and checks policy, and every operation touches the snapshot folder.
+#[allow(clippy::too_many_arguments)]
+fn spawn_page_operation(
+    tx: &WriterSender,
+    frame: &Frame,
+    operation: &str,
+    params: Value,
+    principal: Option<Principal>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    executor: &Arc<Executor>,
+    metrics: &Arc<DispatchPathMetrics>,
+    storage_dir: &Path,
+) {
+    use crate::page_collect as page;
+    let store = page::snapshot::SnapshotStore::for_storage(storage_dir);
+    // Only the named session's routes leave the frame loop.
+    let routes = match (
+        params.get("harness").and_then(Value::as_str),
+        params.get("session").and_then(Value::as_str),
+    ) {
+        (Some(harness), Some(session)) if operation == page::COLLECT_OPERATION => {
+            page_collect::session_routes(routes, harness, session)
+                .into_iter()
+                .collect()
+        }
+        _ => HashMap::new(),
+    };
+    let tx = tx.clone();
+    let frame = frame.clone();
+    let executor = Arc::clone(executor);
+    let metrics = Arc::clone(metrics);
+    let operation = operation.to_string();
+    tokio::spawn(async move {
+        let _response_task = ResponseTaskGuard::new(&metrics);
+        let id = format!("management-{}", operation.replace('.', "-"));
+        let internal = |error: tokio::task::JoinError| {
+            Response::error(id.as_str(), "internal_error", error.to_string())
+        };
+        let sent = match operation.as_str() {
+            page::COLLECT_OPERATION => {
+                let call = page_collect::CollectCall {
+                    params,
+                    principal,
+                    routes,
+                    executor,
+                    store: Arc::clone(&store),
+                };
+                let result = tokio::task::spawn_blocking(move || page_collect::collect(call))
+                    .await
+                    .unwrap_or_else(internal);
+                if result.success {
+                    // Delete the snapshot when it expires even if nobody
+                    // calls again.
+                    tokio::spawn(async move {
+                        tokio::time::sleep(page::snapshot::TTL + Duration::from_millis(50)).await;
+                        let _ = tokio::task::spawn_blocking(move || store.expire_due()).await;
+                    });
+                }
+                send_management_response(&tx, &frame, &operation, result, &metrics).await
+            }
+            page::READ_OPERATION => {
+                let reply = tokio::task::spawn_blocking(move || {
+                    page_collect::read(params, principal.as_ref(), &store)
+                })
+                .await;
+                match reply {
+                    Ok(page_collect::ReadReply::Bytes(bytes)) => {
+                        // The bytes are the whole body, flagged binary, as
+                        // subc-protocol's bulk lane carries raw bytes.
+                        match Frame::build_with_version(
+                            frame.header.ver,
+                            FrameType::Response,
+                            Flags(frame.header.flags.0 | FRAME_FLAG_BINARY),
+                            frame.header.channel,
+                            frame.header.epoch,
+                            frame.header.corr,
+                            bytes,
+                        ) {
+                            Ok(response) => {
+                                send_reliable_writer_frame(
+                                    &tx,
+                                    &metrics,
+                                    response,
+                                    "page.read bytes",
+                                )
+                                .await
+                            }
+                            Err(error) => Err(SubcError::FrameBuild(error)),
+                        }
+                    }
+                    Ok(page_collect::ReadReply::Refused(response)) => {
+                        send_management_response(&tx, &frame, &operation, response, &metrics).await
+                    }
+                    Err(error) => {
+                        send_management_response(&tx, &frame, &operation, internal(error), &metrics)
+                            .await
+                    }
+                }
+            }
+            _ => {
+                let result = tokio::task::spawn_blocking(move || {
+                    page_collect::release(params, principal.as_ref(), &store)
+                })
+                .await
+                .unwrap_or_else(internal);
+                send_management_response(&tx, &frame, &operation, result, &metrics).await
+            }
+        };
+        if let Err(error) = sent {
+            log::warn!("{operation}: could not queue the reply: {error}");
         }
     });
 }
@@ -8973,9 +9118,6 @@ impl PlainToolRun {
                 reply_deadline,
             } = run_spec;
             if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
-                ctx.mark_standalone_plugin_host();
-            }
-            if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
                 if let Some(args) = arguments.as_object_mut() {
                     args.remove("permissions_granted");
                 }
@@ -8997,52 +9139,45 @@ impl PlainToolRun {
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             phase_trace.mark_job_admitted();
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
-                let run = || {
-                    let finalizer = |response: &mut Response, text: &mut String| {
-                        crate::response_finalize::finalize_tool_response(
-                            response,
-                            text,
-                            ctx,
-                            &identity_for_run.session,
-                            &bare_name,
-                            bind_trust.allows_bash_observation()
-                                && !crate::context::confinement::active(),
-                        );
-                    };
-                    let outcome = remote_policy::with_call_policy(
+                // Both the tool's run and the reply's finishing use the trace.
+                let phase_trace = std::cell::RefCell::new(Some(phase_trace));
+                let finalizer = |response: &mut Response, text: &mut String| {
+                    crate::response_finalize::finalize_tool_response(
+                        response,
+                        text,
                         ctx,
-                        &identity_for_run,
-                        &request_id_for_force,
+                        &identity_for_run.session,
                         &bare_name,
-                        arguments,
-                        |arguments| {
-                            let tool_policy = (!tool_call_context.preview
-                                && manifest::tool_call_is_mutating(&bare_name, &arguments))
-                            .then(|| {
-                                crate::sandbox_spawn::ToolLaunchPolicy::for_session(
-                                    ctx,
-                                    identity_for_run.spawn_principal.clone(),
-                                    access_grants::alfonso_worker(&identity_for_run),
-                                )
-                            });
-                            crate::sandbox_spawn::ToolLaunchPolicy::with_current(
-                                tool_policy,
-                                || {
-                                    run_tool_call(
-                                        &bare_name,
-                                        arguments,
-                                        &format_context,
-                                        &tool_call_context,
-                                        ctx,
-                                        &dispatch,
-                                        Some(&finalizer),
-                                        Some(&mut phase_trace),
-                                    )
-                                },
-                            )
-                        },
-                    )
-                    .unwrap_or_else(|response| {
+                        bind_trust.allows_bash_observation()
+                            && !crate::context::confinement::active(),
+                    );
+                };
+                let work = |arguments: Value| {
+                    let tool_policy = (!tool_call_context.preview
+                        && manifest::tool_call_is_mutating(&bare_name, &arguments))
+                    .then(|| {
+                        crate::sandbox_spawn::ToolLaunchPolicy::for_session(
+                            ctx,
+                            identity_for_run.spawn_principal.clone(),
+                            access_grants::alfonso_worker(&identity_for_run),
+                        )
+                    });
+                    crate::sandbox_spawn::ToolLaunchPolicy::with_current(tool_policy, || {
+                        let mut trace = phase_trace.borrow_mut();
+                        run_tool_call(
+                            &bare_name,
+                            arguments,
+                            &format_context,
+                            &tool_call_context,
+                            ctx,
+                            &dispatch,
+                            Some(&finalizer),
+                            trace.as_mut(),
+                        )
+                    })
+                };
+                let finish = |outcome: Result<ToolCallOutcome, Response>| {
+                    let outcome = outcome.unwrap_or_else(|response| {
                         ToolCallOutcome::Unary(ToolCallResult {
                             text: crate::subc_format::format_response_with_context(
                                 &bare_name,
@@ -9097,7 +9232,10 @@ impl PlainToolRun {
                             let response = result.response;
                             let _ = done.send(ToolCallCompletion {
                                 text: result.text,
-                                phase_trace,
+                                phase_trace: phase_trace
+                                    .borrow_mut()
+                                    .take()
+                                    .expect("the phase trace is taken once"),
                             });
                             response
                         }
@@ -9111,21 +9249,21 @@ impl PlainToolRun {
                     .run_owner
                     .as_ref()
                     .map(|owner| owner.run_id.clone());
-                let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
-                crate::access_policy::with_scope(
-                    Some(access_grants::policy_scope_key(&identity_for_run)),
-                    || {
-                        crate::backup::with_request_harness(&harness, || {
-                            crate::backup::with_request_run(run_id.as_deref(), || {
-                                if matches!(bind_trust, BindTrust::Untrusted) {
-                                    ctx.with_force_restrict(&request_id_for_force, run)
-                                } else {
-                                    run()
-                                }
-                            })
-                        })
-                    },
-                )
+                crate::backup::with_request_harness(&harness, || {
+                    crate::backup::with_request_run(run_id.as_deref(), || {
+                        call_policy::with_tool_call_policy(
+                            ctx,
+                            &identity_for_run,
+                            &request_id_for_force,
+                            ask_route,
+                            bind_trust,
+                            &bare_name,
+                            arguments,
+                            work,
+                            finish,
+                        )
+                    })
+                })
             })
         })
     }

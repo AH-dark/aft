@@ -12856,6 +12856,9 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
             "gh_shim.session_context",
             "gh_shim.read_request",
             "backups.purge",
+            "page.collect",
+            "page.read",
+            "page.release",
         ])
     );
     let schema_count = serde_json::from_str::<serde_json::Map<String, Value>>(include_str!(
@@ -16130,3 +16133,6 @@ mod scope_revocation_test;
 
 #[path = "confine_admission_test.rs"]
 mod confine_admission_test;
+
+#[path = "page_collect_test.rs"]
+mod page_collect_test;
