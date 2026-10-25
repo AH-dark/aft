@@ -107,8 +107,18 @@ pub fn callgraph_paths_match_v2(
 pub(crate) fn resolve_derived_path(view_dir: &Path, generation: &str) -> Result<PathBuf> {
     ViewStore {
         view_dir: view_dir.to_path_buf(),
+        sweep_registry: None,
     }
     .derived_path(generation)
+}
+
+/// Synchronize a fixture that has stopped publishing before it audits closed
+/// SQLite files. Do not call while holding a view-pointer transaction or a
+/// family-registry write transaction; generation maintenance acquires those locks.
+#[doc(hidden)]
+pub fn wait_for_generation_maintenance_for_test(view_dir: &Path) {
+    generation::wait_for_derived_checkpoint_for_test(view_dir);
+    generation::wait_for_generation_sweep_for_test(view_dir);
 }
 
 /// Errors raised while constructing, verifying, or publishing a view.
@@ -737,6 +747,7 @@ pub struct PreparedPublication {
     store: ViewStore,
     generation: String,
     base_generation: Option<String>,
+    _pin: crate::pins::QueryPin,
     pointer: crate::db::file_identity::IdentityConnection,
 }
 
@@ -792,6 +803,8 @@ pub struct PointerPragmas {
 #[derive(Clone, Debug)]
 pub struct ViewStore {
     view_dir: PathBuf,
+    // Registered V2 views serialize cleanup with their family's pin admission.
+    sweep_registry: Option<registry::RegistryLocation>,
 }
 
 impl ViewStore {
@@ -807,7 +820,10 @@ impl ViewStore {
         let view_dir = Self::cache_key(storage.as_ref(), project_scope_key)?;
         crate::private_storage::open_dir(storage.as_ref(), &view_dir)
             .map_err(|error| ViewError::io_at("creating directory", &view_dir, error))?;
-        let store = Self { view_dir };
+        let store = Self {
+            view_dir,
+            sweep_registry: None,
+        };
         store.initialize_pointer()?;
         Ok(store)
     }
@@ -820,7 +836,10 @@ impl ViewStore {
             .map_err(|error| ViewError::io_at("opening writable view", &view_dir, error))?;
         crate::private_storage::open_dir(view_storage_root(&view_dir), &view_dir)
             .map_err(|error| ViewError::io_at("creating directory", &view_dir, error))?;
-        let store = Self { view_dir };
+        let store = Self {
+            view_dir,
+            sweep_registry: None,
+        };
         store.initialize_pointer()?;
         Ok(store)
     }
@@ -830,10 +849,15 @@ impl ViewStore {
     pub(crate) fn existing_dir(view_dir: PathBuf) -> Option<Self> {
         crate::root_cache::check_cache_access(&view_dir).ok()?;
         crate::private_storage::tighten_open_dir(view_storage_root(&view_dir), &view_dir);
-        view_dir
-            .join(POINTER_DATABASE)
-            .is_file()
-            .then_some(Self { view_dir })
+        view_dir.join(POINTER_DATABASE).is_file().then_some(Self {
+            view_dir,
+            sweep_registry: None,
+        })
+    }
+
+    pub(crate) fn with_sweep_registry(mut self, registry: registry::FamilyRegistry) -> Self {
+        self.sweep_registry = Some(registry.location());
+        self
     }
 
     pub fn view_dir(&self) -> &Path {
@@ -968,6 +992,7 @@ impl ViewStore {
                 request.generation.to_string(),
             ));
         }
+        let generation_pin = self.pin_prepared_generation(request.generation)?;
 
         let mut timing = profile::PublicationTiming::new(&self.view_dir);
         let blob_durability_barrier = crate::blob_store::publication_durability_barrier();
@@ -1013,7 +1038,6 @@ impl ViewStore {
 
         let pointer = self.open_pointer_connection()?;
         pointer.pragma_update(None, "synchronous", "FULL")?;
-        pointer.busy_timeout(Duration::from_millis(20))?;
         sync_directory(&self.view_dir)?;
         timing.phase("pointer_prepare");
         Ok(PreparedPublication {
@@ -1021,6 +1045,7 @@ impl ViewStore {
             store: self.clone(),
             generation: request.generation.to_owned(),
             base_generation: request.base_generation.map(str::to_owned),
+            _pin: generation_pin,
         })
     }
 
@@ -1092,6 +1117,7 @@ impl ViewStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let pin = crate::pins::QueryPin::acquire(self.view_dir(), generation)
             .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?;
+        bump_pointer_generation_epoch(&transaction)?;
         transaction.commit()?;
         Ok(pin)
     }
@@ -1117,6 +1143,9 @@ impl ViewStore {
             } else {
                 None
             };
+            if protect_result {
+                bump_pointer_generation_epoch(&transaction)?;
+            }
             transaction.commit()?;
             Ok((PublishOutcome::Published, pin))
         } else {
@@ -1133,6 +1162,9 @@ impl ViewStore {
             } else {
                 None
             };
+            if pin.is_some() {
+                bump_pointer_generation_epoch(&transaction)?;
+            }
             transaction.commit()?;
             Ok((
                 PublishOutcome::Conflict {
@@ -1143,6 +1175,21 @@ impl ViewStore {
             ))
         }
     }
+}
+
+// Filesystem-only protection/reference changes must invalidate a cleanup read
+// snapshot before it can promote that snapshot to an unlink claim. The epoch
+// lives in the header's user_version, so bumping it commits a real change
+// (which advances other connections' data_version) without adding a page.
+fn bump_pointer_generation_epoch(connection: &Connection) -> rusqlite::Result<()> {
+    let epoch: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    // user_version is a signed 32-bit header field.
+    let next = if epoch >= i64::from(i32::MAX) {
+        1
+    } else {
+        epoch + 1
+    };
+    connection.pragma_update(None, "user_version", next)
 }
 
 fn view_storage_root(view_dir: &Path) -> &Path {
@@ -1247,6 +1294,8 @@ fn configure_connection(connection: &Connection) -> Result<()> {
     })?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     connection.pragma_update(None, "foreign_keys", "OFF")?;
+    #[cfg(test)]
+    materialization::probe_connection(connection);
     Ok(())
 }
 
@@ -1295,11 +1344,16 @@ fn sqlite_full_sync_checkpoint(path: &Path, seam: &'static str) -> Result<(i64, 
     // and flushes the main database before the checkpoint returns. Keeping the
     // operation inside the VFS preserves its process-wide advisory locks.
     connection.pragma_update(None, "synchronous", "FULL")?;
-    connection
+    let result = connection
         .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })
-        .map_err(ViewError::from)
+        .map_err(ViewError::from)?;
+    #[cfg(test)]
+    unsafe {
+        materialization::probe_checkpoint(connection.handle(), result.0, result.1, result.2)
+    };
+    Ok(result)
 }
 
 fn checkpoint_pointer_after_cas(path: &Path) -> Result<()> {

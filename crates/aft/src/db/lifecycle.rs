@@ -443,6 +443,10 @@ unsafe extern "C" fn tracked_wal_hook(
 ) -> c_int {
     let state = unsafe { &*(context.cast::<WalHookState>()) };
     state.observe_commit(frame_count);
+    #[cfg(test)]
+    unsafe {
+        crate::views::materialization::probe_wal(db, frame_count)
+    };
     let threshold = state.threshold_pages.load(Ordering::Relaxed);
     if threshold <= 0 || frame_count < threshold {
         return rusqlite::ffi::SQLITE_OK;
@@ -462,6 +466,15 @@ unsafe extern "C" fn tracked_wal_hook(
         )
     };
     if result == rusqlite::ffi::SQLITE_OK {
+        #[cfg(test)]
+        unsafe {
+            crate::views::materialization::probe_checkpoint(
+                db,
+                0,
+                log_frames.into(),
+                checkpointed_frames.into(),
+            )
+        };
         let frames = state.record_checkpoint(log_frames, checkpointed_frames);
         state
             .checkpoint_counter
@@ -551,6 +564,47 @@ pub(crate) fn sqlite_open_path(path: &Path) -> std::borrow::Cow<'_, Path> {
     std::borrow::Cow::Borrowed(path)
 }
 
+/// An immutable read of a quiescent main file must not create empty WAL/SHM
+/// files. If frames already exist, normal read-only SQLite reads include them.
+/// A racing writer can make this census stale. Before unlinking, generation
+/// cleanup rechecks the pointer in its own transaction (which it can only
+/// promote to a writer if nothing committed since its census) and, for V2,
+/// rechecks membership under the family registry's write transaction.
+pub(crate) fn census_open_path(path: &Path) -> rusqlite::Result<PathBuf> {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let quiescent = match std::fs::metadata(PathBuf::from(wal)) {
+        Ok(metadata) => metadata.len() == 0,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                Some(error.to_string()),
+            ))
+        }
+    };
+    if !quiescent {
+        return Ok(sqlite_open_path(path).into_owned());
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                    Some(error.to_string()),
+                )
+            })?
+            .join(path)
+    };
+    let normalized = sqlite_open_path(&absolute);
+    let mut uri = url::Url::from_file_path(normalized.as_ref())
+        .map_err(|_| rusqlite::Error::InvalidPath(path.to_path_buf()))?;
+    uri.set_query(Some("immutable=1"));
+    Ok(PathBuf::from(uri.as_str()))
+}
+
 impl TrackedConnection {
     pub fn open(path: &Path, store: SqliteStore) -> rusqlite::Result<Self> {
         Self::open_attributed(path, store, path.display().to_string())
@@ -564,7 +618,14 @@ impl TrackedConnection {
         production_write_gate(path)?;
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(path, OpenFlags::default())?;
-        Self::from_connection_attributed(Connection::open(sqlite_open_path(path))?, store, root_id)
+        #[cfg(test)]
+        let connection = crate::views::materialization::open_probe_connection(
+            &sqlite_open_path(path),
+            OpenFlags::default(),
+        )?;
+        #[cfg(not(test))]
+        let connection = Connection::open(sqlite_open_path(path))?;
+        Self::from_connection_attributed(connection, store, root_id)
     }
 
     pub fn open_with_flags(
@@ -583,9 +644,21 @@ impl TrackedConnection {
         // store's `sqlite_readonly_uri`).
         let connection = if flags.contains(OpenFlags::SQLITE_OPEN_URI) && path.starts_with("file:")
         {
-            Connection::open_with_flags(path, flags)?
+            #[cfg(test)]
+            let connection =
+                crate::views::materialization::open_probe_connection(Path::new(path), flags)?;
+            #[cfg(not(test))]
+            let connection = Connection::open_with_flags(path, flags)?;
+            connection
         } else {
-            Connection::open_with_flags(sqlite_open_path(Path::new(path)), flags)?
+            #[cfg(test)]
+            let connection = crate::views::materialization::open_probe_connection(
+                &sqlite_open_path(Path::new(path)),
+                flags,
+            )?;
+            #[cfg(not(test))]
+            let connection = Connection::open_with_flags(sqlite_open_path(Path::new(path)), flags)?;
+            connection
         };
         Self::from_connection_attributed(connection, store, path.to_owned())
     }
@@ -600,11 +673,26 @@ impl TrackedConnection {
         }
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(path, flags)?;
-        Self::from_connection_attributed(
-            Connection::open_with_flags(sqlite_open_path(path), flags)?,
-            store,
-            path.display().to_string(),
-        )
+        #[cfg(test)]
+        let connection =
+            crate::views::materialization::open_probe_connection(&sqlite_open_path(path), flags)?;
+        #[cfg(not(test))]
+        let connection = Connection::open_with_flags(sqlite_open_path(path), flags)?;
+        Self::from_connection_attributed(connection, store, path.display().to_string())
+    }
+
+    pub(crate) fn open_census(path: &Path, store: SqliteStore) -> rusqlite::Result<Self> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let _guard = crate::db::file_identity::filesystem_guard();
+        crate::private_storage::prepare_sqlite(path, flags)?;
+        let connection = Connection::open_with_flags(census_open_path(path)?, flags)?;
+        connection.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
+        Self::from_connection_attributed(connection, store, path.display().to_string())
     }
 
     pub fn open_in_memory(store: SqliteStore) -> rusqlite::Result<Self> {
@@ -774,7 +862,8 @@ impl TrackedConnection {
         &self,
         mode: WalCheckpointMode,
     ) -> rusqlite::Result<WalCheckpointResult> {
-        self.connection
+        let result = self
+            .connection
             .as_ref()
             .expect("tracked SQLite connection accessed after drop")
             .query_row(mode.pragma_sql(), [], |row| {
@@ -783,7 +872,17 @@ impl TrackedConnection {
                     log_frames: row.get(1)?,
                     checkpointed_frames: row.get(2)?,
                 })
-            })
+            })?;
+        #[cfg(test)]
+        unsafe {
+            crate::views::materialization::probe_checkpoint(
+                self.connection.as_ref().unwrap().handle(),
+                result.busy,
+                result.log_frames,
+                result.checkpointed_frames,
+            )
+        };
+        Ok(result)
     }
 
     fn credit_checkpoint_result_as(&self, result: WalCheckpointResult, domain: WriteDomain) -> u64 {
