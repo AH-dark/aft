@@ -88,6 +88,7 @@ export async function probeGithubReleases(
   graceDays: number,
   fetchImpl: typeof fetch = fetch,
   warn: (message: string) => void = defaultWarn,
+  signal?: AbortSignal,
 ): Promise<GithubVersionPickResult | null> {
   const url = `https://api.github.com/repos/${githubRepo}/releases?per_page=30`;
   try {
@@ -97,7 +98,11 @@ export async function probeGithubReleases(
     }
     const res = await fetchImpl(url, {
       headers,
-      signal: AbortSignal.timeout(10_000),
+      // The caller's signal (plugin shutdown) cancels the probe as well as
+      // the fixed timeout.
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(10_000)])
+        : AbortSignal.timeout(10_000),
     });
     if (!res.ok) {
       warn(`[lsp] github releases probe failed for ${githubRepo}: HTTP ${res.status}`);

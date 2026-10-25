@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { getAftLspPackagesDir } from "../cache-paths.js";
 import { createGithubInstaller } from "../lsp-github-install.js";
+import { findGithubServerById } from "../lsp-github-table.js";
 import { withEnv } from "./test-utils/env-guard.js";
 
 type VersionCheck = { last_checked: string; latest_eligible: string | null };
@@ -60,6 +61,10 @@ async function cacheFixture(
   }
 }
 
+const config = { autoInstall: true, graceDays: 7, versions: {}, disabled: new Set<string>() };
+const clangd = findGithubServerById("clangd");
+if (!clangd) throw new Error("clangd fixture missing");
+
 describe("GitHub release lookups", () => {
   test("tag lookup strips credentials on cross-origin redirects", async () => {
     await cacheFixture(
@@ -85,4 +90,38 @@ describe("GitHub release lookups", () => {
       { GITHUB_TOKEN: "fixture-token-not-a-secret" },
     );
   });
+
+  for (const branch of ["cached", "live"] as const) {
+    test(`${branch} release lookup propagates caller cancellation`, async () => {
+      await cacheFixture(async () => {
+        const versionChecks = new Map<string, VersionCheck>();
+        if (branch === "cached") {
+          versionChecks.set(clangd.githubRepo, {
+            last_checked: new Date().toISOString(),
+            latest_eligible: "1.0.0",
+          });
+        }
+        const controller = new AbortController();
+        // The cached branch looks up one tag; the live branch lists releases.
+        // Record the signal each kind of request received separately so one
+        // branch's signal cannot stand in for the other's.
+        const signals = new Map<"tag" | "list", AbortSignal | null>();
+        const fakeFetch = (async (url: unknown, init?: RequestInit) => {
+          const kind = String(url).includes("/releases/tags/") ? "tag" : "list";
+          if (!signals.has(kind)) signals.set(kind, init?.signal ?? null);
+          controller.abort();
+          return new Response("failure", { status: 500 });
+        }) as typeof fetch;
+        await installerFixture(versionChecks)._resolveTargetTagForTesting(
+          clangd,
+          config,
+          fakeFetch,
+          controller.signal,
+        );
+        const observed = signals.get(branch === "cached" ? "tag" : "list");
+        expect(observed).toBeInstanceOf(AbortSignal);
+        expect(observed?.aborted).toBe(true);
+      });
+    });
+  }
 });

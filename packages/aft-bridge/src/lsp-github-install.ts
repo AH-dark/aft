@@ -633,7 +633,12 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     const cachedSafe = isSafeVersion(cachedTag);
     if (cached && !shouldRecheckVersion(cached, weeklyMs) && cachedSafe) {
       // Installations still need the selected tag's asset URLs.
-      const release = await fetchReleaseByTag(spec.githubRepo, cachedTag as string, fetchImpl);
+      const release = await fetchReleaseByTag(
+        spec.githubRepo,
+        cachedTag as string,
+        fetchImpl,
+        signal,
+      );
       if (release) {
         return {
           tag: release.tag,
@@ -645,7 +650,13 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     }
 
     // 3. Live probe.
-    const probe = await probeGithubReleases(spec.githubRepo, config.graceDays, fetchImpl, warn);
+    const probe = await probeGithubReleases(
+      spec.githubRepo,
+      config.graceDays,
+      fetchImpl,
+      warn,
+      signal,
+    );
     if (!probe) {
       // Probe failed. Return tag:null instead of
       // `cached.latest_eligible` with empty assets. Returning a non-null
