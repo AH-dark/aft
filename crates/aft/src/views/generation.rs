@@ -39,6 +39,27 @@ struct GenerationRetirement {
 
 static NEXT_RETIREMENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The pointer state a cleanup census was taken against. The epoch is the
+/// pointer header's user_version, which pin admission and derived-owner
+/// references bump; a publication changes the generation instead.
+#[derive(Debug, PartialEq, Eq)]
+struct PointerCensus {
+    generation: Option<String>,
+    epoch: i64,
+}
+
+fn read_pointer_census(connection: &Connection) -> rusqlite::Result<PointerCensus> {
+    let generation: String = connection.query_row(
+        "SELECT generation FROM pointer WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(PointerCensus {
+        generation: (!generation.is_empty()).then_some(generation),
+        epoch: connection.pragma_query_value(None, "user_version", |row| row.get(0))?,
+    })
+}
+
 fn sqlite_busy(error: &rusqlite::Error) -> bool {
     matches!(
         error.sqlite_error_code(),
@@ -424,6 +445,9 @@ impl ViewStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut removed = self.reap_generation_trash()?;
+        // Most passes find nothing superseded. This read-only preflight takes
+        // no admission barrier and opens no writable handle, so it leaves a
+        // quiescent view's files exactly as they were.
         if !self.has_superseded_artifacts()? {
             return Ok(removed);
         }
@@ -507,18 +531,55 @@ impl ViewStore {
         )))
     }
 
+    /// Runs `work` under the cleanup admission for this view: the family
+    /// registry barrier for a registered V2 view, or the retention pin barrier
+    /// for a V1 view. `Ok(None)` means cleanup must stop for now: the barrier
+    /// is busy, or this directory is no longer the registration's member
+    /// (for example because disk-limit eviction removed it).
+    fn with_cleanup_admission<T>(
+        &self,
+        registry: Option<&super::registry::FamilyRegistry>,
+        work: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let Some(registry) = registry else {
+            let _admission = crate::storage_retention::pin_barrier(self.view_dir())?;
+            return work().map(Some);
+        };
+        let result = registry.with_barrier(|tx| {
+            let scope = self
+                .view_dir()
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            let registered: Option<String> = tx
+                .query_row(
+                    "SELECT view_dir FROM members WHERE scope = ?1",
+                    [scope.as_ref()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            // SQLite compares text literally, but Windows registration and
+            // traversal can spell the same directory differently.
+            let owns = registered.is_some_and(|path| {
+                crate::production_storage::comparison_key(Path::new(&path), cfg!(windows))
+                    == crate::production_storage::comparison_key(self.view_dir(), cfg!(windows))
+            });
+            if !owns {
+                return Ok(None);
+            }
+            work()
+                .map(Some)
+                .map_err(super::registry::RegistryError::View)
+        });
+        match result {
+            Ok(outcome) => Ok(outcome),
+            Err(super::registry::RegistryError::Sqlite(error)) if sqlite_busy(&error) => Ok(None),
+            Err(error) => Err(ViewError::Io(std::io::Error::other(error.to_string()))),
+        }
+    }
+
     fn has_superseded_artifacts(&self) -> Result<bool> {
-        let connection = crate::db::file_identity::IdentityConnection::open_census(
-            &self.pointer_path(),
-            "views::generation::census_pointer",
-        )?;
-        let current: String = connection.query_row(
-            "SELECT generation FROM pointer WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        let current = (!current.is_empty()).then_some(current);
-        drop(connection);
+        let current = self.pointer_census()?.generation;
         for entry in generation_directory_entries(self.view_dir(), GENERATION_DIRECTORY_LIMIT)? {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -556,44 +617,34 @@ impl ViewStore {
         Ok(false)
     }
 
+    /// Reads the pointer state every later claim must still see, on a
+    /// read-only connection that creates no WAL or SHM file and is closed
+    /// before this returns.
+    fn pointer_census(&self) -> Result<PointerCensus> {
+        let connection = crate::db::file_identity::IdentityConnection::open_census(
+            &self.pointer_path(),
+            "views::generation::census_pointer",
+        )?;
+        Ok(read_pointer_census(&connection)?)
+    }
+
     fn sweep_generations_bounded(
         &self,
         registry: Option<&super::registry::FamilyRegistry>,
         limit: usize,
     ) -> Result<GenerationSweep> {
-        let pointer = crate::db::file_identity::IdentityConnection::open_with_flags(
-            self.pointer_path(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-            "views::generation::sweep_pointer",
-        )?;
-        pointer.set_db_config(
-            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
-            true,
-        )?;
-        // The publisher's pointer policy. A wait can only happen while this
-        // connection holds no lock: SQLite skips the busy handler when a read
-        // transaction asks to become a writer, so the claim's promotion below
-        // fails at once (and cleanup yields) while any other writer is active.
-        pointer.busy_timeout(super::POINTER_BUSY_TIMEOUT)?;
-        let mode: String = pointer.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
-        if !mode.eq_ignore_ascii_case("wal") {
+        // Read under the same admission as every claim, so no cleanup
+        // connection on this view is ever open outside that barrier.
+        let Some(census) = self.with_cleanup_admission(registry, || self.pointer_census())? else {
             return Ok(GenerationSweep::default());
-        }
-        let census = pointer.unchecked_transaction()?;
-        let _: String = census.query_row(
-            "SELECT generation FROM pointer WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        let census_version: i64 =
-            census.pragma_query_value(None, "data_version", |row| row.get(0))?;
+        };
         #[cfg(test)]
         crate::storage_retention::test_hook(self.view_dir(), "generation-census");
         let mut generations = std::collections::BTreeSet::new();
         let mut derived_owners = std::collections::BTreeSet::new();
         let mut temporaries: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        // This complete census holds only a WAL read snapshot, not a write lease.
-        // Reference creation commits a pointer epoch, so a changed census yields.
+        // The directory census holds no SQLite connection or lock. A reference
+        // created meanwhile bumps the pointer epoch, so every claim then yields.
         for entry in generation_directory_entries(self.view_dir(), limit)? {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -633,73 +684,25 @@ impl ViewStore {
                 generations.insert(generation.to_owned());
             }
         }
-        drop(census);
-        let trash = self.view_dir().join(".generation-trash");
-        crate::private_storage::open_dir(super::view_storage_root(self.view_dir()), &trash)?;
+        generations.retain(|generation| census.generation.as_deref() != Some(generation));
         let mut removed = GenerationSweep::default();
         for generation in generations {
             let claim = loop {
-                let claim = if let Some(registry) = registry {
-                    let result = registry.with_barrier(|tx| {
-                        let scope = self
-                            .view_dir()
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy();
-                        let registered: Option<String> = tx
-                            .query_row(
-                                "SELECT view_dir FROM members WHERE scope = ?1",
-                                [scope.as_ref()],
-                                |row| row.get(0),
-                            )
-                            .optional()?;
-                        let owns = registered.is_some_and(|path| {
-                            crate::production_storage::comparison_key(
-                                Path::new(&path),
-                                cfg!(windows),
-                            ) == crate::production_storage::comparison_key(
-                                self.view_dir(),
-                                cfg!(windows),
-                            )
-                        });
-                        if !owns {
-                            return Ok(GenerationRetirement::default());
-                        }
+                #[cfg(test)]
+                crate::storage_retention::test_hook(self.view_dir(), "generation-claim-wait");
+                let claim = self
+                    .with_cleanup_admission(registry, || {
                         self.claim_generation(
-                            &pointer,
-                            census_version,
+                            &census,
                             &generation,
                             derived_owners.contains(&generation),
                             temporaries.get(&generation),
-                            &trash,
                         )
-                        .map_err(super::registry::RegistryError::View)
+                    })?
+                    .unwrap_or(GenerationRetirement {
+                        yielded: true,
+                        ..Default::default()
                     });
-                    match result {
-                        Ok(claim) => claim,
-                        Err(super::registry::RegistryError::Sqlite(error))
-                            if sqlite_busy(&error) =>
-                        {
-                            GenerationRetirement {
-                                yielded: true,
-                                ..Default::default()
-                            }
-                        }
-                        Err(error) => {
-                            return Err(ViewError::Io(std::io::Error::other(error.to_string())))
-                        }
-                    }
-                } else {
-                    let _admission = crate::storage_retention::pin_barrier(self.view_dir())?;
-                    self.claim_generation(
-                        &pointer,
-                        census_version,
-                        &generation,
-                        derived_owners.contains(&generation),
-                        temporaries.get(&generation),
-                        &trash,
-                    )?
-                };
                 if claim.retry_filesystem {
                     removed.add(claim.removed);
                     // Wait only after dropping admission/registry transactions.
@@ -732,29 +735,48 @@ impl ViewStore {
 
     fn claim_generation(
         &self,
-        pointer: &Connection,
-        census_version: i64,
+        census: &PointerCensus,
         generation: &str,
         keep_derived: bool,
         temporaries: Option<&Vec<PathBuf>>,
-        trash: &Path,
     ) -> Result<GenerationRetirement> {
         let mut claim = GenerationRetirement::default();
         let result = (|| -> Result<()> {
             super::validate_generation(generation)?;
-            let transaction = pointer.unchecked_transaction()?;
-            let current: String = transaction.query_row(
-                "SELECT generation FROM pointer WHERE singleton = 1",
-                [],
-                |row| row.get(0),
+            // A fresh connection per claim, opened and closed inside the
+            // caller's admission barrier. Disk-limit eviction checks for open
+            // view connections under that same barrier, so cleanup never makes
+            // an idle view look open in this process.
+            let pointer = crate::db::file_identity::IdentityConnection::open_with_flags(
+                self.pointer_path(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+                "views::generation::claim_pointer",
             )?;
-            let version: i64 =
-                transaction.pragma_query_value(None, "data_version", |row| row.get(0))?;
-            if version != census_version {
+            pointer.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )?;
+            // The publisher's pointer policy. A wait can only happen while this
+            // connection holds no lock: SQLite skips the busy handler when a
+            // read transaction asks to become a writer, so the promotion below
+            // fails at once (and cleanup yields) while any other writer is active.
+            pointer.busy_timeout(super::POINTER_BUSY_TIMEOUT)?;
+            let mode: String =
+                pointer.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+            if !mode.eq_ignore_ascii_case("wal") {
                 claim.yielded = true;
                 return Ok(());
             }
-            if current == generation {
+            let transaction = pointer.unchecked_transaction()?;
+            let current = read_pointer_census(&transaction)?;
+            // A publication changes the generation; a pin admission or a new
+            // derived-owner reference bumps the epoch. Either makes the census
+            // (in particular its owner set) stale, so this cleanup yields.
+            if current != *census {
+                claim.yielded = true;
+                return Ok(());
+            }
+            if current.generation.as_deref() == Some(generation) {
                 return Ok(());
             }
             let (metadata_path, keys_path) = crate::pins::pin_paths(self.view_dir(), generation);
@@ -816,6 +838,7 @@ impl ViewStore {
                 .unwrap_or_default()
                 .as_nanos();
             let mut moves = Vec::new();
+            let trash = self.view_dir().join(".generation-trash");
             for path in paths {
                 if fs::symlink_metadata(&path)
                     .is_ok_and(|metadata| metadata.is_file() || metadata.is_symlink())
@@ -841,6 +864,9 @@ impl ViewStore {
             transaction.execute("UPDATE pointer SET generation = generation WHERE 0", [])?;
             #[cfg(test)]
             crate::storage_retention::test_hook(self.view_dir(), "generation-delete");
+            // Created only here, inside admission and after the membership
+            // check, so cleanup cannot recreate a directory eviction removed.
+            crate::private_storage::open_dir(super::view_storage_root(self.view_dir()), &trash)?;
             // Only bounded atomic detachment is inside the write reservation:
             // enumeration, marker parsing, stats and physical unlink are not.
             for (path, target) in moves {
@@ -2761,6 +2787,71 @@ mod storage_retention_tests {
         wait_for_generation_sweep_for_test(view.view_dir());
         assert!(!owner.exists());
         assert!(view.derived_path("independent").unwrap().exists());
+    }
+
+    /// Disk-limit eviction refuses a view while this process has any of its
+    /// SQLite files open, and checks that under the family registry barrier.
+    /// Cleanup waiting for that barrier must therefore hold no connection on
+    /// the view, or an idle view looks open and is never evicted.
+    #[test]
+    fn cleanup_waiting_for_admission_holds_no_view_connection() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry =
+            super::super::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
+        let registration = registry
+            .register_view_with_storage(
+                storage.path(),
+                "0000000000000001",
+                &storage.path().join("absent-root"),
+            )
+            .unwrap();
+        let view = registration.view_store().unwrap();
+        wait_for_generation_sweep_for_test(view.view_dir());
+        let old = view.derived_path("old").unwrap();
+        fs::write(&old, b"superseded database").unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let once = AtomicBool::new(false);
+        let _hook = crate::storage_retention::observe_test_hook(
+            view.view_dir(),
+            Arc::new(move |step| {
+                if step == "generation-claim-wait" && !once.swap(true, Ordering::SeqCst) {
+                    entered_tx.send(()).unwrap();
+                    go_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(15))
+                        .unwrap();
+                }
+            }),
+        );
+        let sweeping = view.clone();
+        let cleanup = std::thread::spawn(move || sweeping.sweep_generations_with_bytes());
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let open_view_connections = || {
+            fs::read_dir(view.view_dir())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "sqlite"))
+                .map(|path| crate::db::file_identity::open_connections(&path))
+                .sum::<usize>()
+        };
+        let observed = registry
+            .with_barrier(|_| {
+                // Let cleanup run on into the barrier this thread holds.
+                go_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(open_view_connections())
+            })
+            .unwrap();
+        let removed = cleanup.join().unwrap().unwrap();
+        assert_eq!(
+            observed, 0,
+            "cleanup kept a view connection open while waiting for admission"
+        );
+        assert_eq!(removed.removed_generations, 1);
+        assert!(!old.exists());
     }
 
     #[test]
