@@ -20,6 +20,23 @@ use super::*;
 const SESSION: &str = "bash-grant-forgery";
 const COMMAND: &str = "touch forged-proof";
 
+#[test]
+fn bash_permissions_unknown_cwd_reason_in_consent() {
+    let project = tempfile::tempdir().unwrap();
+    let command = "cd \"$DEST\" && shasum -c checksums";
+    let asks = crate::bash_permissions::scan::scan_with_project_root(
+        command,
+        project.path(),
+        project.path(),
+    );
+    let body = bash_elicitation_request_body(command, &asks);
+    let reason = crate::bash_permissions::scan::UNKNOWN_CWD_PERMISSION_REASON;
+    assert!(body["params"]["message"].as_str().unwrap().contains(reason));
+    assert_eq!(body["params"]["_meta"]["aft"]["asks"][0]["reason"], reason);
+    assert_eq!(asks[0].patterns, [command]);
+    assert!(asks[0].always.is_empty());
+}
+
 fn grant_test_context(root: &ProjectRootId, storage: &Path) -> Arc<AppContext> {
     Arc::new(AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),

@@ -4,10 +4,12 @@ import {
   BASH_RUNON_DESCRIPTION,
   BASH_RUNON_GUIDANCE,
   BashOutputPageDecoder,
+  BashPermissionLoopError,
   type BridgeRequestOptions,
   bashHostFallbackAskPattern,
   classifyBashHostFallbackError,
   coerceBoolean,
+  escalationAskText,
   formatWatchWaited,
   interruptedWatchTail,
   isBridgeTransportTimeout,
@@ -33,6 +35,7 @@ import {
   watchPollDelayMs,
   watchTimeoutSteer,
   watchUnavailableSteer,
+  withBashPermissionLoop,
   workerBackgroundTaskNote,
   workerWatchStillRunning,
 } from "@cortexkit/aft-bridge";
@@ -551,19 +554,6 @@ async function callBashBridge(
   });
 }
 
-interface BashPermissionAsk {
-  kind?: string;
-  command?: string;
-  cwd?: string;
-  grant_id?: string;
-  patterns?: string[];
-  always?: string[];
-}
-
-function piEscalationAskText(ask: BashPermissionAsk): string {
-  return `This command will run UNSANDBOXED on the host.\n\nExact command:\n${ask.command ?? ""}\n\nWorking directory:\n${ask.cwd ?? ""}`;
-}
-
 function piPowerShellAskText(command: string): string {
   return `PowerShell commands are conservatively approved one at a time because AFT's POSIX shell scanner cannot safely interpret PowerShell syntax.\n\nExact command:\n${command}`;
 }
@@ -575,74 +565,76 @@ async function callBashWithPermissionLoop(
   options?: BridgeRequestOptions,
   bridgeCommand = "bash",
 ): Promise<Record<string, unknown>> {
-  const granted: string[] = [];
-
-  for (let round = 0; round < 8; round++) {
-    try {
-      return await callBashBridge(
-        bridge,
-        bridgeCommand,
-        withHostPermissionGrants(params, granted),
-        extCtx,
-        options,
-      );
-    } catch (error) {
-      if (!(error instanceof BridgeError)) {
-        if (error instanceof Error && error.message.includes("permission_required")) {
-          throw new Error("Permission ask reached Pi adapter — this is a bug.");
+  try {
+    return await withBashPermissionLoop({
+      operation: bridgeCommand,
+      request: async (granted) => {
+        try {
+          return await callBashBridge(
+            bridge,
+            bridgeCommand,
+            withHostPermissionGrants(params, granted),
+            extCtx,
+            options,
+          );
+        } catch (error) {
+          if (!(error instanceof BridgeError)) {
+            if (error instanceof Error && error.message.includes("permission_required")) {
+              throw new Error("Permission ask reached Pi adapter — this is a bug.");
+            }
+            throw error;
+          }
+          if (error.code !== "permission_required") throw error;
+          return error.response ?? { success: false, code: "permission_required" };
         }
-        throw error;
-      }
-      if (error.code !== "permission_required") throw error;
-      const asks = Array.isArray(error.response?.asks)
-        ? (error.response.asks as BashPermissionAsk[])
-        : [];
-      if (asks.length === 0 || !extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
-        throw new BridgeError(
-          "Permission denied: command approval requires an interactive UI.",
-          "permission_denied",
-        );
-      }
-      for (const ask of asks) {
-        if (ask.kind === "escalation") {
+      },
+      approve: async (asks) => {
+        if (!extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
+          throw new BridgeError(
+            "Permission denied: command approval requires an interactive UI.",
+            "permission_denied",
+          );
+        }
+        for (const ask of asks) {
+          if (ask.kind === "escalation") {
+            const approved = await extCtx.ui.confirm(
+              "Run command unsandboxed on host?",
+              escalationAskText(ask),
+              { signal: extCtx.signal },
+            );
+            if (!approved) {
+              throw new BridgeError(
+                "Permission denied: unsandboxed host execution was denied.",
+                "permission_denied",
+              );
+            }
+            continue;
+          }
+          if (bridgeCommand !== "powershell") {
+            throw new Error(
+              "Permission ask reached Pi adapter without a host escalation grant — this is a bug.",
+            );
+          }
           const approved = await extCtx.ui.confirm(
-            "Run command unsandboxed on host?",
-            piEscalationAskText(ask),
+            "Allow PowerShell command?",
+            piPowerShellAskText(String(params.command ?? "")),
             { signal: extCtx.signal },
           );
           if (!approved) {
             throw new BridgeError(
-              "Permission denied: unsandboxed host execution was denied.",
+              "Permission denied: PowerShell command was denied.",
               "permission_denied",
             );
           }
-          if (ask.grant_id && !granted.includes(ask.grant_id)) granted.push(ask.grant_id);
-          continue;
         }
-        if (bridgeCommand !== "powershell") {
-          throw new Error(
-            "Permission ask reached Pi adapter without a host escalation grant — this is a bug.",
-          );
-        }
-        const approved = await extCtx.ui.confirm(
-          "Allow PowerShell command?",
-          piPowerShellAskText(String(params.command ?? "")),
-          { signal: extCtx.signal },
-        );
-        if (!approved) {
-          throw new BridgeError(
-            "Permission denied: PowerShell command was denied.",
-            "permission_denied",
-          );
-        }
-        for (const grant of [...(ask.always ?? []), ...(ask.patterns ?? [])]) {
-          if (!granted.includes(grant)) granted.push(grant);
-        }
-      }
+      },
+    });
+  } catch (error) {
+    if (error instanceof BashPermissionLoopError && error.cause instanceof BridgeError) {
+      throw new BridgeError(error.message, error.cause.code, error.cause.response);
     }
+    throw error;
   }
-
-  throw new Error("bash permission retry failed: too many rounds");
 }
 
 /** Truncate output to last N visual lines for terminal width. */

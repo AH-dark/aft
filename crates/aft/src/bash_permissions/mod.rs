@@ -17,6 +17,8 @@ pub struct PermissionAsk {
     pub kind: PermissionKind,
     pub patterns: Vec<String>,
     pub always: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Actual command targets, before an optional parent-folder scope is
     /// offered. Retry coverage must not depend on whether that probe succeeded.
     #[serde(skip)]

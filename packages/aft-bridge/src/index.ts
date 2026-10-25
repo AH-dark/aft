@@ -68,6 +68,15 @@ export {
   REGEX_WINDOW_SCAN_INCOMPLETE_TEXT,
   TERMINAL_SCAN_INCOMPLETE_TEXT,
 } from "./bash-output-page.js";
+export {
+  BASH_PERMISSION_NOT_SETTLED,
+  type BashPermissionAsk,
+  BashPermissionLoopError,
+  bashPermissionRetryGrants,
+  escalationAskText,
+  groupBashPermissionAsks,
+  withBashPermissionLoop,
+} from "./bash-permissions.js";
 // --- binary identity (no-exec cache trust) ---
 export type { BinaryIdentity, BinaryIdentityCheck } from "./binary-identity.js";
 export {

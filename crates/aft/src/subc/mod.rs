@@ -3026,11 +3026,16 @@ fn bash_elicitation_message(
         .into_iter()
         .collect::<Vec<_>>()
         .join(", ");
-    if ask_kinds.is_empty() {
+    let mut message = if ask_kinds.is_empty() {
         format!("Allow bash command `{command}`? Matched patterns: {pattern_text}")
     } else {
         format!("Allow bash command `{command}`? Matched {ask_kinds} patterns: {pattern_text}")
+    };
+    for reason in asks.iter().filter_map(|ask| ask.reason.as_deref()) {
+        message.push('\n');
+        message.push_str(reason);
     }
+    message
 }
 
 fn bash_elicitation_request_body(

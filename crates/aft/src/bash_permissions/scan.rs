@@ -11,6 +11,8 @@ const FILE_COMMANDS: &[&str] = &[
     "rm", "cp", "mv", "mkdir", "touch", "chmod", "chown", "cat", "cd", "source", ".",
 ];
 const CWD_COMMANDS: &[&str] = &["cd", "pushd", "popd"];
+pub const UNKNOWN_CWD_PERMISSION_REASON: &str =
+    "Working directory is unknown; approve this exact command.";
 /// File commands whose path arguments are only read. Only these (and `<`
 /// input redirects) may use a read exemption; a command that can modify,
 /// move or delete its arguments always gets the normal external-directory ask.
@@ -133,6 +135,7 @@ fn scan_with_read_exemption(
     let mut seen = HashSet::new();
     // Unknown directory changes must not resolve later paths against a stale base.
     let mut scan_cwd = Some(cwd.clone());
+    let mut unknown_cwd = false;
     // Directories pushed by `pushd` earlier in this command line. The shell's
     // own stack from before the command is unknown, so a `popd` past these
     // entries leaves the directory unknown.
@@ -156,8 +159,8 @@ fn scan_with_read_exemption(
                         let exemption = if input_only { read_exemption } else { None };
                         push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
                     }
-                    RedirectTarget::RelativeToUnknown(text) => {
-                        push_unknown_base_path(&mut asks, &mut seen, text);
+                    RedirectTarget::RelativeToUnknown => {
+                        unknown_cwd = true;
                     }
                     RedirectTarget::Dynamic => {}
                 },
@@ -173,6 +176,7 @@ fn scan_with_read_exemption(
             continue;
         }
 
+        unknown_cwd |= scan_cwd.is_none();
         if FILE_COMMANDS.contains(&head) {
             let exemption = if READ_ONLY_FILE_COMMANDS.contains(&head) {
                 read_exemption
@@ -184,8 +188,8 @@ fn scan_with_read_exemption(
                     PathArgTarget::Path(path) => {
                         push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
                     }
-                    PathArgTarget::RelativeToUnknown(text) => {
-                        push_unknown_base_path(&mut asks, &mut seen, text);
+                    PathArgTarget::RelativeToUnknown => {
+                        unknown_cwd = true;
                     }
                     // A dynamic target (e.g. `rm "$DEST/file"`) can't be
                     // resolved to a concrete directory. Matching native
@@ -207,8 +211,8 @@ fn scan_with_read_exemption(
                 let exemption = if input_only { read_exemption } else { None };
                 push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
             }
-            RedirectTarget::RelativeToUnknown(text) => {
-                push_unknown_base_path(&mut asks, &mut seen, text);
+            RedirectTarget::RelativeToUnknown => {
+                unknown_cwd = true;
             }
             // Dynamic redirect target (e.g. `echo hi > "$FOO/bar"`): no
             // external_directory ask, same rationale as dynamic path args
@@ -232,6 +236,18 @@ fn scan_with_read_exemption(
         }
     }
 
+    if unknown_cwd {
+        // A relative folder approval has no stable identity after a dynamic cd.
+        // Bind approval to the whole command instead of offering a reusable grant.
+        asks.retain(|ask| ask.kind != PermissionKind::Bash);
+        asks.push(PermissionAsk {
+            kind: PermissionKind::Bash,
+            patterns: vec![command.to_string()],
+            always: Vec::new(),
+            reason: Some(UNKNOWN_CWD_PERMISSION_REASON.into()),
+            targets: Vec::new(),
+        });
+    }
     asks
 }
 
@@ -240,6 +256,7 @@ fn parse_failed_ask() -> PermissionAsk {
         kind: PermissionKind::Bash,
         patterns: vec!["*".to_string()],
         always: Vec::new(),
+        reason: None,
         targets: Vec::new(),
     }
 }
@@ -883,13 +900,13 @@ enum RedirectTarget {
         path: PathBuf,
         input_only: bool,
     },
-    RelativeToUnknown(String),
+    RelativeToUnknown,
     Dynamic,
 }
 
 enum PathArgTarget {
     Path(PathBuf),
-    RelativeToUnknown(String),
+    RelativeToUnknown,
     Dynamic,
     None,
 }
@@ -971,8 +988,8 @@ fn collect_redirection_targets_from_node(
                     PathArgTarget::Path(path) => {
                         on_target(RedirectTarget::Path { path, input_only })
                     }
-                    PathArgTarget::RelativeToUnknown(text) => {
-                        on_target(RedirectTarget::RelativeToUnknown(text));
+                    PathArgTarget::RelativeToUnknown => {
+                        on_target(RedirectTarget::RelativeToUnknown);
                     }
                     PathArgTarget::Dynamic => on_target(RedirectTarget::Dynamic),
                     PathArgTarget::None => {}
@@ -1067,7 +1084,7 @@ fn path_args(parts: &[Part]) -> impl Iterator<Item = &str> {
 fn arg_path(arg: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     match path_arg_target(arg, cwd) {
         PathArgTarget::Path(path) => Some(path),
-        PathArgTarget::RelativeToUnknown(_) | PathArgTarget::Dynamic | PathArgTarget::None => None,
+        PathArgTarget::RelativeToUnknown | PathArgTarget::Dynamic | PathArgTarget::None => None,
     }
 }
 
@@ -1082,7 +1099,7 @@ fn path_arg_target(arg: &str, cwd: Option<&Path>) -> PathArgTarget {
         && !Path::new(&text).is_absolute()
         && !is_device_file(&text)
     {
-        return PathArgTarget::RelativeToUnknown(text);
+        return PathArgTarget::RelativeToUnknown;
     }
 
     let Some(text) = glob_prefix(&text) else {
@@ -1191,6 +1208,7 @@ fn push_bash_ask(
             kind: PermissionKind::Bash,
             patterns: vec![pattern],
             always: vec![format!("{stable} *")],
+            reason: None,
             targets: Vec::new(),
         },
     );
@@ -1263,21 +1281,8 @@ fn push_external_path(
             kind: PermissionKind::ExternalDirectory,
             patterns: vec![pattern.clone()],
             always: vec![pattern],
+            reason: None,
             targets: vec![grant],
-        },
-    );
-}
-
-// An unknown base cannot safely grant this relative name in every directory.
-fn push_unknown_base_path(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, text: String) {
-    push_ask(
-        asks,
-        seen,
-        PermissionAsk {
-            kind: PermissionKind::ExternalDirectory,
-            patterns: vec![text],
-            always: Vec::new(),
-            targets: Vec::new(),
         },
     );
 }
@@ -1543,22 +1548,30 @@ mod tests {
     #[test]
     fn relative_paths_after_an_unknown_directory_change_ask() {
         let project = tempfile::tempdir().unwrap();
-        for (command, path) in [
-            ("cd \"$TARGET\" && rm -rf build", "build"),
-            ("cd - && rm notes.txt", "notes.txt"),
-            ("popd && rm notes.txt", "notes.txt"),
-            ("pushd +1 && rm notes.txt", "notes.txt"),
-            ("pushd && rm notes.txt", "notes.txt"),
-            ("cd \"$TARGET\" && cd sub && rm notes.txt", "notes.txt"),
-            ("cd \"$TARGET\" && echo hi > out.txt", "out.txt"),
-            ("cd \"$TARGET\"; cat 'quoted name'/file", "quoted name/file"),
+        for command in [
+            "cd \"$TARGET\" && rm -rf build",
+            "cd - && rm notes.txt",
+            "popd && rm notes.txt",
+            "pushd +1 && rm notes.txt",
+            "pushd && rm notes.txt",
+            "cd \"$TARGET\" && cd sub && rm notes.txt",
+            "cd \"$TARGET\" && echo hi > out.txt",
+            "cd \"$TARGET\"; cat 'quoted name'/file",
         ] {
-            assert_eq!(
-                external_ask_shapes(command, project.path()),
-                vec![(vec![path.to_string()], Vec::new())],
-                "{command}"
-            );
+            assert_unknown_cwd_ask(command, project.path());
         }
+    }
+
+    fn assert_unknown_cwd_ask(command: &str, project: &Path) {
+        let asks = scan_with_project_root(command, project, project);
+        let exact = asks
+            .iter()
+            .find(|ask| ask.kind == PermissionKind::Bash)
+            .unwrap();
+        assert_eq!(exact.patterns, [command], "{command}");
+        assert!(exact.always.is_empty(), "{command}");
+        assert_eq!(exact.reason.as_deref(), Some(UNKNOWN_CWD_PERMISSION_REASON));
+        assert!(asks.iter().all(|ask| ask.kind != PermissionKind::ExternalDirectory || !ask.targets.is_empty()), "{asks:?}");
     }
 
     #[cfg(unix)]
@@ -1584,11 +1597,7 @@ mod tests {
             let command = format!(
                 "pushd /usr; pushd /etc; pushd '{project_path}'; {change}; popd; rm notes.txt"
             );
-            assert_eq!(
-                external_ask_shapes(&command, project.path()),
-                vec![(vec!["notes.txt".into()], Vec::new())],
-                "{command}"
-            );
+            assert_unknown_cwd_ask(&command, project.path());
         }
     }
 
@@ -1940,14 +1949,7 @@ mod tests {
             external_ask_shapes("cd \"$TARGET\" && make 2>&1 > /dev/null", project.path())
                 .is_empty()
         );
-        let asks = external_ask_shapes("cd \"$TARGET\" && rm -rf build '*/*.txt'", project.path());
-        assert_eq!(
-            asks,
-            vec![
-                (vec!["build".into()], vec![]),
-                (vec!["*/*.txt".into()], vec![])
-            ]
-        );
+        assert_unknown_cwd_ask("cd \"$TARGET\" && rm -rf build '*/*.txt'", project.path());
     }
 
     #[cfg(unix)]
@@ -2020,6 +2022,7 @@ mod tests {
                 kind: PermissionKind::ExternalDirectory,
                 patterns: vec![pattern.into()],
                 always: vec![pattern.into()],
+                reason: None,
                 targets: vec![target],
             };
             let mut asks = Vec::new();

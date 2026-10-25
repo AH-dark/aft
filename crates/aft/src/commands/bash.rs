@@ -597,6 +597,7 @@ fn conservative_powershell_permission_asks(
         kind: crate::bash_permissions::PermissionKind::Bash,
         patterns: vec![command.to_string()],
         always: Vec::new(),
+        reason: None,
         targets: Vec::new(),
     }]
 }
@@ -833,6 +834,97 @@ mod tests {
     }
 
     #[test]
+    fn bash_permissions_roundtrip_unknown_cwd_requires_exact_command() {
+        use crate::bash_permissions::{scan::scan_with_project_root, PermissionKind};
+        let project = tempfile::tempdir().unwrap();
+        for command in [
+            "cd \"$DEST\" && rm -rf build",
+            "mkdir -p \"$DEST\" && rsync -a source/ \"$DEST/\" && cd \"$DEST\" && shasum -c checksums",
+            "mkdir -p \"$DEST\" && rsync -a source/ \"$DEST/\" && cd \"$DEST\" && cat checksums",
+            "cd \"$DEST\" && cat < checksums",
+            "pushd \"$DEST\" && cp -R source/ copy/",
+        ] {
+            let first = scan_with_project_root(command, project.path(), project.path());
+            let grants: Vec<_> = first.iter().flat_map(|ask| {
+                if ask.always.is_empty() { &ask.patterns } else { &ask.always }
+            }).cloned().collect();
+            let retry = scan_with_project_root(command, project.path(), project.path());
+            assert!(permissions_granted_cover(&retry, &grants),
+                "command={command}, grants={grants:?}, asks={retry:?}");
+            assert_eq!(retry.len(), 1, "{retry:?}");
+            assert_eq!(retry[0].kind, PermissionKind::Bash);
+            assert_eq!(retry[0].patterns, [command]);
+            assert!(retry[0].always.is_empty(), "unknown cwd must not offer a wildcard");
+            assert!(!permissions_granted_cover(&retry, &["build".into(), "rm *".into(), "*".into()]),
+                "relative paths and reusable commands cannot approve an unknown cwd");
+        }
+    }
+
+    #[test]
+    fn bash_permissions_roundtrip_external_copy_shapes() {
+        use crate::bash_permissions::scan::scan_with_project_root;
+
+        let scratch = std::env::current_dir()
+            .unwrap()
+            .join("target/bash-roundtrip");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fixture = tempfile::tempdir_in(scratch).unwrap();
+        let project = fixture.path().join("project");
+        let source = fixture.path().join("source");
+        let worker = fixture.path().join("worker/.cortexkit/internal-docs/copy");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        #[cfg(unix)]
+        let destinations = {
+            let alias = fixture.path().join("home-alias");
+            std::os::unix::fs::symlink(fixture.path(), &alias).unwrap();
+            vec![worker, alias.join("worker/.cortexkit/internal-docs/copy")]
+        };
+        #[cfg(not(unix))]
+        let destinations = vec![worker];
+        for exists in [false, true] {
+            if exists {
+                std::fs::create_dir_all(&destinations[0]).unwrap();
+            }
+            for destination in &destinations {
+                let src = source.display();
+                let dst = destination.display();
+                let commands = [
+                    format!("mkdir -p '{dst}'"),
+                    format!("rsync -a '{src}' '{dst}'"),
+                    format!("rsync -a '{src}/' '{dst}'"),
+                    format!("rsync -a '{src}' '{dst}/'"),
+                    format!("rsync -a '{src}/' '{dst}/'"),
+                    format!("cp -R '{src}/' '{dst}/'"),
+                    format!("cd '{dst}' && cat checksums"),
+                    format!("mkdir -p '{dst}' && rsync -a '{src}/' '{dst}/' && cd '{dst}' && shasum -c checksums"),
+                    format!("mkdir -p '{dst}' && cp -R '{src}/' '{dst}/' && cd '{dst}' && cat checksums"),
+                ];
+                for command in commands {
+                    let first = scan_with_project_root(&command, &project, &project);
+                    assert!(!first.is_empty(), "{command}");
+                    for always in [false, true] {
+                        let grants: Vec<_> = first
+                            .iter()
+                            .flat_map(|ask| {
+                                if always && !ask.always.is_empty() {
+                                    &ask.always
+                                } else {
+                                    &ask.patterns
+                                }
+                            })
+                            .cloned()
+                            .collect();
+                        let retry = scan_with_project_root(&command, &project, &project);
+                        assert!(permissions_granted_cover(&retry, &grants),
+                            "command={command}, exists={exists}, always={always}, grants={grants:?}, asks={retry:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn external_approval_coverage_respects_path_and_kind() {
         use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
         let directory = std::env::current_dir()
@@ -893,6 +985,7 @@ mod tests {
             kind: crate::bash_permissions::PermissionKind::ExternalDirectory,
             patterns: vec![folder.clone()],
             always: vec![folder.clone()],
+            reason: None,
             targets: vec![target],
         };
         let serialized = serde_json::to_value(&ask).unwrap();
