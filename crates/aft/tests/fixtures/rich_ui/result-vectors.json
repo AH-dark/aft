@@ -36,8 +36,11 @@
     "items": [
       {
         "stream": "stdout",
-        "text": "hello\n",
-        "bytes": 6
+        "text": "hello",
+        "bytes": 6,
+        "continued": false,
+        "firstAvailableOffset": 0,
+        "prefixDropped": false
       }
     ],
     "next": null

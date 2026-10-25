@@ -22,7 +22,10 @@ fn fixture(name: &str) -> Value {
         "gate-contract.json",
         "target-arguments.json",
         "bound-task.json",
-        "transport-contract.json"
+        "transport-contract.json",
+        "view-record.json",
+        "bash-inputs.json",
+        "bash-output.json"
     );
     serde_json::from_slice(bytes).unwrap()
 }
@@ -529,7 +532,7 @@ fn gate_targets_bound_task_and_media_have_frozen_fixtures() {
 }
 
 #[test]
-fn transport_contract_pins_chunk_carrier_frame_key_and_bind_labels() {
+fn transport_contract_pins_chunk_carrier_frame_key_and_stamp_binding() {
     let contract = fixture("transport-contract.json");
     assert_eq!(contract["chunks"]["decodedBytesMax"], CHUNK_BYTES);
     assert_eq!(
@@ -552,8 +555,194 @@ fn transport_contract_pins_chunk_carrier_frame_key_and_bind_labels() {
     assert_eq!(contract["frameKey"]["freshPerReadOrAbsent"], true);
     assert_eq!(contract["frameKey"]["ledgerScope"], Value::Null);
     assert_eq!(
-        contract["binding"]["equalLabels"],
-        json!(["project_root", "harness", "session"])
+        contract["binding"]["equalStamp"],
+        json!(["owner", "ref", "epoch"])
     );
-    assert_eq!(contract["binding"]["mismatchCode"], "session_not_bound");
+    assert_eq!(
+        contract["binding"]["noPolicyRouteCode"],
+        "session_not_bound"
+    );
+    assert!(contract["binding"].get("equalLabels").is_none());
+    assert_eq!(contract["binding"]["projectCheck"], "Check the policy-route project against the stamp workdir/project_id under scope-workdir/v1.");
+}
+
+#[test]
+fn terminal_view_record_schema_vectors_and_provenance_are_frozen() {
+    use crate::bash_background::BgTaskStatus;
+    let record = fixture("view-record.json");
+    schema::check_schema(&record["schema"]).unwrap();
+    assert_eq!(
+        record["identity"],
+        manifest().value["views"][0]["viewRecord"]
+    );
+    let fields = record["schema"]["fields"].as_object().unwrap();
+    assert_eq!(record["fields"].as_array().unwrap().len(), fields.len() + 2);
+    for (key, field) in fields {
+        let row = record["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["key"] == key.as_str())
+            .unwrap();
+        assert_eq!(row["required"], true);
+        assert_eq!(row["nullable"], field["nullable"] == true);
+        assert!(!row["source"].as_str().unwrap().is_empty());
+    }
+    let mut terminal_codes = Vec::new();
+    for status in [
+        BgTaskStatus::Starting,
+        BgTaskStatus::Running,
+        BgTaskStatus::Killing,
+        BgTaskStatus::Completed,
+        BgTaskStatus::Failed,
+        BgTaskStatus::Killed,
+        BgTaskStatus::TimedOut,
+        BgTaskStatus::FateUnknown,
+    ] {
+        if status.is_terminal() {
+            terminal_codes.push(serde_json::to_value(status).unwrap());
+        }
+    }
+    assert_eq!(
+        record["schema"]["fields"]["endReason"]["enum"],
+        Value::Array(terminal_codes)
+    );
+    for vector in record["vectors"].as_array().unwrap() {
+        schema::validate(&record["schema"], vector).unwrap();
+        for (field, wrong) in [
+            ("phase", json!("running")),
+            ("durationMs", json!(-1)),
+            ("outputBytes", json!(-1)),
+            ("endReason", json!("memory_cap")),
+            ("mode", json!("background")),
+            ("output", json!("must not leave")),
+        ] {
+            let mut invalid = vector.clone();
+            invalid[field] = wrong;
+            assert!(
+                schema::validate(&record["schema"], &invalid).is_err(),
+                "{field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn bash_input_fields_match_every_pinned_definition() {
+    let inputs = fixture("bash-inputs.json");
+    assert_eq!(inputs["variants"].as_array().unwrap().len(), 4);
+    for variant in inputs["variants"].as_array().unwrap() {
+        let preset = if variant["preset"] == "head" {
+            CatalogPreset::Head
+        } else {
+            CatalogPreset::Worker
+        };
+        let tool = tools_for_session(
+            preset,
+            &[],
+            true,
+            variant["runon"].as_bool().unwrap(),
+            false,
+        )
+        .into_iter()
+        .find(|tool| tool.name == "bash")
+        .unwrap();
+        let required = tool.input_schema["required"].as_array().unwrap();
+        for key in inputs["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| key.as_str().unwrap())
+        {
+            let contract = &variant[if key == "runon" { "runonField" } else { key }];
+            let actual = tool.input_schema["properties"].get(key);
+            assert_eq!(
+                contract["present"],
+                actual.is_some(),
+                "{} runon={} {key}",
+                variant["preset"],
+                variant["runon"]
+            );
+            if let Some(actual) = actual {
+                assert_eq!(contract["type"], actual["type"], "{key}");
+                assert_eq!(
+                    contract["required"],
+                    required.iter().any(|value| value == key),
+                    "{key}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn bash_output_line_items_cursors_and_retention_vectors_are_frozen() {
+    let contract = fixture("bash-output.json");
+    let op = operations::operations()
+        .into_iter()
+        .find(|op| op["id"] == "bash_output")
+        .unwrap();
+    assert_eq!(op["item"]["fields"]["continued"], json!({"type":"boolean"}));
+    assert_eq!(
+        op["item"]["fields"]["prefixDropped"],
+        json!({"type":"boolean"})
+    );
+    assert_eq!(
+        contract["retention"]["perStreamBytes"],
+        crate::bash_background::buffer::DISK_LIMIT_BYTES
+    );
+    for vector in contract["vectors"].as_array().unwrap() {
+        let page = &vector["page"];
+        assert!(page.get("total").is_none());
+        assert_eq!(page["next"].is_null(), vector["terminal"] == true);
+        for item in page["items"].as_array().unwrap() {
+            schema::validate(&op["item"], item).unwrap();
+            assert!(!item["text"].as_str().unwrap().contains('\n'));
+            if item["prefixDropped"] == false {
+                assert_eq!(item["firstAvailableOffset"], 0);
+            } else {
+                assert!(
+                    item["firstAvailableOffset"].is_null()
+                        || item["firstAvailableOffset"].as_u64().unwrap() > 0
+                );
+            }
+        }
+        if vector["terminal"] == true {
+            for (stream, raw) in vector["raw"].as_object().unwrap() {
+                let consumed: u64 = page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|item| item["stream"] == stream.as_str())
+                    .map(|item| item["bytes"].as_u64().unwrap())
+                    .sum();
+                assert_eq!(
+                    consumed,
+                    raw.as_array().unwrap().len() as u64,
+                    "{} {stream}",
+                    vector["name"]
+                );
+            }
+        }
+    }
+    let legacy = &contract["retention"]["legacyTrim"];
+    assert_eq!(
+        legacy,
+        &json!({"firstAvailableOffset":null,"prefixDropped":true})
+    );
+}
+
+#[test]
+fn shell_projection_keeps_wide_windows_remote_exit_codes() {
+    for op in operations::operations()
+        .iter()
+        .filter(|op| matches!(op["id"].as_str(), Some("bash_status" | "bash_watch")))
+    {
+        let mut source = fixture("handler-replies.json")[op["id"].as_str().unwrap()].clone();
+        source["status"] = json!("completed");
+        source["exit_code"] = json!(4294967295_i64);
+        let result = operations::project_reply(op, &source);
+        assert_eq!(result["exitCode"], 4294967295_i64);
+        schema::validate(&op["result"], &result).unwrap();
+    }
 }

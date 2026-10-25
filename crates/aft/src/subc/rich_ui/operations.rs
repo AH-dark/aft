@@ -130,7 +130,7 @@ pub(crate) fn operations() -> Vec<Value> {
             true,
             record(json!({})),
             record(json!({
-                "running": boolean(), "exitCode": nullable(integer(-2147483648, 2147483647)),
+                "running": boolean(), "exitCode": nullable(integer(-9007199254740991, 9007199254740991)),
             })),
         ),
         query(
@@ -142,7 +142,7 @@ pub(crate) fn operations() -> Vec<Value> {
                 "timeoutMs": optional(integer(1, 20_000)),
             })),
             record(json!({
-                "running": boolean(), "exitCode": nullable(integer(-2147483648, 2147483647)),
+                "running": boolean(), "exitCode": nullable(integer(-9007199254740991, 9007199254740991)),
                 "waited": record(json!({
                     "reason": enumeration(&["match", "exit", "timeout"]),
                     "limit_ms": integer(1, 20_000),
@@ -230,7 +230,10 @@ pub(crate) fn operations() -> Vec<Value> {
         "scope": "call", "bound": {"task": "call"},
         "args": record(json!({"cursor": optional(string(1024)), "limit": optional(integer(1, 200))})),
         "item": record(json!({"stream": enumeration(&["stdout", "stderr", "pty"]),
-            "text": string(8192), "bytes": integer(1, 8192)})),
+            "text": string(8192), "bytes": integer(1, 8192),
+            "continued": boolean(),
+            "firstAvailableOffset": nullable(integer(0, 9007199254740991)),
+            "prefixDropped": boolean()})),
         "limits": {"argsBytes": 8192, "timeoutMs": 30000},
         "page": {"limitMax": 200, "cursorBytes": 1024, "pageBytes": 262144, "itemKey": null, "total": false},
     }));

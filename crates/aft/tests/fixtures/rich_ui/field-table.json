@@ -41,6 +41,18 @@
           "text": {
             "maxBytes": 8192,
             "type": "string"
+          },
+          "continued": {
+            "type": "boolean"
+          },
+          "firstAvailableOffset": {
+            "type": "integer",
+            "min": 0,
+            "max": 9007199254740991,
+            "nullable": true
+          },
+          "prefixDropped": {
+            "type": "boolean"
           }
         },
         "type": "record"
@@ -70,7 +82,7 @@
     "fields": [
       {
         "key": "bytes",
-        "source": "source byte count",
+        "source": "source bytes consumed by this part, including its terminator only on the final part",
         "required": true,
         "nullable": false,
         "placement": "items"
@@ -84,7 +96,7 @@
       },
       {
         "key": "text",
-        "source": "lossy UTF-8 whole-unit decode",
+        "source": "one lossy UTF-8 decoded physical line or whole-unit part, without LF/CRLF terminator",
         "required": true,
         "nullable": false,
         "placement": "items"
@@ -95,6 +107,27 @@
         "required": true,
         "nullable": true,
         "placement": "next"
+      },
+      {
+        "key": "continued",
+        "source": "true when more parts of this same physical line follow; false on the last part",
+        "required": true,
+        "nullable": false,
+        "placement": "items"
+      },
+      {
+        "key": "firstAvailableOffset",
+        "source": "durable per-stream cumulative dropped-prefix base; null only for legacy trimmed tasks with unknown original origin",
+        "required": true,
+        "nullable": true,
+        "placement": "items"
+      },
+      {
+        "key": "prefixDropped",
+        "source": "true after any prefix trim (including legacy unknown origin); false only with a verified original base of zero",
+        "required": true,
+        "nullable": false,
+        "placement": "items"
       }
     ]
   },
@@ -122,8 +155,8 @@
       "result": {
         "fields": {
           "exitCode": {
-            "max": 2147483647,
-            "min": -2147483648,
+            "max": 9007199254740991,
+            "min": -9007199254740991,
             "nullable": true,
             "type": "integer"
           },
@@ -196,8 +229,8 @@
       "result": {
         "fields": {
           "exitCode": {
-            "max": 2147483647,
-            "min": -2147483648,
+            "max": 9007199254740991,
+            "min": -9007199254740991,
             "nullable": true,
             "type": "integer"
           },
