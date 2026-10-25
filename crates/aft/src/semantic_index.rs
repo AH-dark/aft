@@ -7807,7 +7807,9 @@ impl SemanticIndex {
             let denom = query_norm * entry.norm;
             let mut score = if denom == 0.0 { 0.0 } else { dot / denom };
             if entry.chunk.exported {
-                score *= 1.1;
+                // Preserve nonnegative weighting; an export bonus must not
+                // lower a negative similarity.
+                score *= if score >= 0.0 { 1.1 } else { 0.9 };
             }
             scored.push((score, i));
         }
@@ -18799,6 +18801,53 @@ mod embedding_backend_retry_status_tests {
             valid.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
             vec![2, 4, 0, 1, 3]
         );
+    }
+
+    #[test]
+    fn audit10_3_positive_export_scores_keep_current_order_and_bits() {
+        let mut index = audit10_vector_index(vec![vec![1.0, 0.0], vec![1.0, 0.0], vec![0.0, 1.0]]);
+        index.entries[0].chunk.exported = true;
+        index.entries[2].chunk.exported = true;
+        let results = index.search(&[1.0, 0.0], 3);
+        assert_eq!(
+            results
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["audit_vector_0", "audit_vector_1", "audit_vector_2"]
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|row| row.score.to_bits())
+                .collect::<Vec<_>>(),
+            vec![0x3f8ccccd, 0x3f800000, 0]
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|row| row.rank_score.to_bits())
+                .collect::<Vec<_>>(),
+            vec![0x3f8ccccd, 0x3f800000, 0]
+        );
+    }
+
+    #[test]
+    fn audit10_3_negative_export_ranks_ahead_of_equal_non_export() {
+        let mut index = audit10_vector_index(vec![vec![-1.0, 0.0], vec![-1.0, 0.0]]);
+        index.entries[0].chunk.exported = true;
+        let results = index.search(&[1.0, 0.0], 2);
+        assert_eq!(
+            results
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["audit_vector_0", "audit_vector_1"]
+        );
+        assert_eq!(results[0].score.to_bits(), 0xbf666666);
+        assert_eq!(results[1].score.to_bits(), 0xbf800000);
+        assert_eq!(results[0].rank_score.to_bits(), 0xbf666666);
+        assert_eq!(results[1].rank_score.to_bits(), 0xbf800000);
     }
 
     #[test]
