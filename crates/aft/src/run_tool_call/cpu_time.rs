@@ -42,30 +42,10 @@ fn thread_cpu_time() -> Option<Duration> {
 
 #[cfg(windows)]
 fn thread_cpu_time() -> Option<Duration> {
-    use windows_sys::Win32::Foundation::FILETIME;
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
-
-    let mut creation = FILETIME::default();
-    let mut exit = FILETIME::default();
-    let mut kernel = FILETIME::default();
-    let mut user = FILETIME::default();
-    // The pseudo-handle names the calling thread and does not need closing.
-    if unsafe {
-        GetThreadTimes(
-            GetCurrentThread(),
-            &mut creation,
-            &mut exit,
-            &mut kernel,
-            &mut user,
-        )
-    } == 0
-    {
-        return None;
-    }
-    let ticks =
-        |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
-    let ticks = ticks(kernel).checked_add(ticks(user))?;
-    Some(Duration::from_secs(ticks / 10_000_000) + Duration::from_nanos((ticks % 10_000_000) * 100))
+    // GetThreadTimes is tick-quantized: a sub-millisecond phase can be charged
+    // an entire timer tick. Thread cycles have no reliable portable conversion
+    // to CPU time, so report unknown rather than a misleading duration.
+    None
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -76,8 +56,6 @@ fn thread_cpu_time() -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::hint::black_box;
-    use std::time::Instant;
 
     #[test]
     fn cpu_phase_clock_failure_is_unknown() {
@@ -85,9 +63,20 @@ mod tests {
         assert_eq!(ThreadCpuSample::elapsed(ThreadCpuSample::now(), None), None);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn cpu_phase_windows_clock_is_unknown() {
+        assert_eq!(thread_cpu_time(), None);
+        assert!(ThreadCpuSample::now().is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     #[ignore = "clock-read microbenchmark, run explicitly with --ignored --nocapture"]
     fn cpu_phase_clock_overhead() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
         const N: u32 = 100_000;
         let start = Instant::now();
         for _ in 0..N {

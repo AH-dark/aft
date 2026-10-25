@@ -14,8 +14,9 @@ pub type DispatchFn<'a> = dyn Fn(RawRequest, &AppContext) -> Response + 'a;
 /// append trailing lines (the AFT status bar) that every transport then delivers unchanged.
 pub type FinalizeFn<'a> = dyn Fn(&mut Response, &mut String) + 'a;
 
-/// Wall and thread-CPU timestamps for one subc tool call. Synchronous phase
-/// boundaries take one wall-clock read and one thread-CPU read, without I/O.
+/// Wall and optional thread-CPU timestamps for one subc tool call. Synchronous
+/// boundaries read thread CPU on Linux/macOS; Windows lacks a sufficiently fine
+/// clock and reports unknown CPU. Sampling does not perform file I/O.
 ///
 /// Causal wait state is harvested on the executor worker at `mark_execute_done`
 /// because `PhaseTrace::new` and `finish` run on different threads than execute.
@@ -63,6 +64,7 @@ struct PhaseCpuTrace {
 
 /// Only uninterrupted, same-thread intervals have an attributable CPU delta.
 /// Queueing, async writes, and aggregate egress span awaits or worker handoffs.
+/// Platforms without a sufficiently fine thread clock always report unknown.
 #[derive(Debug, Clone, Default)]
 pub struct ToolCallPhaseCpu {
     pub translate: Option<Duration>,
@@ -1016,6 +1018,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn cpu_phase_busy_loop_is_close_to_wall_time() {
         const TARGET_CPU: Duration = Duration::from_millis(10);
@@ -1054,6 +1057,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn cpu_phase_sleep_excludes_wait_time() {
         let mut trace = PhaseTrace::new(Instant::now());
@@ -1082,7 +1086,10 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(phases.cpu.translate, None);
-        assert!(phases.cpu.execute.is_some());
+        assert_eq!(
+            phases.cpu.execute.is_some(),
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
     }
 
     #[test]
@@ -1094,7 +1101,54 @@ mod tests {
         trace.mark_execute_done_after_await();
         let phases = finish_cpu_phase(trace);
         assert_eq!(phases.cpu.execute, None);
-        assert!(phases.cpu.format.is_some());
+        assert_eq!(
+            phases.cpu.format.is_some(),
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cpu_phase_windows_slow_line_reports_unknown() {
+        let mut trace = PhaseTrace::new(Instant::now());
+        trace.mark_executor_submitted();
+        trace.mark_job_admitted();
+        trace.mark_translate_done();
+        let mut phases = finish_cpu_phase(trace);
+        phases.total = crate::logging::SLOW_TOOL_CALL_THRESHOLD + Duration::from_millis(1);
+        let _ = crate::logging::take_slow_tool_call_logs_for_test();
+        crate::logging::note_tool_call_trace(
+            "read",
+            "windows-cpu",
+            std::path::Path::new("/repo"),
+            1,
+            1,
+            phases,
+            crate::logging::ToolCallCaller::Agent,
+        );
+        let lines = crate::logging::take_slow_tool_call_logs_for_test();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        for phase in [
+            "queue",
+            "translate",
+            "exec",
+            "format",
+            "finalize",
+            "egress",
+            "egress_enqueue",
+            "egress_queue",
+            "egress_prepare",
+            "egress_write",
+        ] {
+            let field = lines[0]
+                .split_whitespace()
+                .find(|field| field.starts_with(&format!("{phase}=")))
+                .unwrap();
+            assert!(
+                field.ends_with("ms/cpu=?"),
+                "Windows CPU must be unknown: {field}"
+            );
+        }
     }
 
     /// Run one agent `edit` call through `run_tool_call` with a phase trace,
@@ -1500,8 +1554,14 @@ mod tests {
         assert_eq!(phases.waiting_on, WaitingOn::Limiter);
         assert_eq!(phases.waiting_on_build_id.as_deref(), Some("b-1-1"));
         assert_eq!(phases.wait_ms, 42);
-        assert!(phases.cpu.translate.is_some());
-        assert!(phases.cpu.execute.is_some());
+        assert_eq!(
+            phases.cpu.translate.is_some(),
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
+        assert_eq!(
+            phases.cpu.execute.is_some(),
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
     }
 
     mod raw_request_construction {
