@@ -3852,8 +3852,14 @@ fn redaction_replay_shows_ticket_only_output_without_exposing_ticket() {
     let release = project.path().join("release-ticket");
     let release_guard = ReleaseOnDrop::new(release.clone());
     let ticket_path = project.path().join("seen-ticket");
+    // The child publishes the ticket with a rename: `wait_for_path` returns as
+    // soon as the path exists, and a plain `>` redirect creates the file
+    // before printf has written to it.
+    let ticket_staging = project.path().join("seen-ticket.partial");
     let command = format!(
-        "printf '%s' \"$AFT_GH_SHIM_TICKET\" > {}; while [ ! -e {} ]; do sleep 0.05; done; printf 'ticket=%s md5=0123456789abcdef0123456789abcdef\\n' \"$AFT_GH_SHIM_TICKET\"",
+        "printf '%s' \"$AFT_GH_SHIM_TICKET\" > {}; mv {} {}; while [ ! -e {} ]; do sleep 0.05; done; printf 'ticket=%s md5=0123456789abcdef0123456789abcdef\\n' \"$AFT_GH_SHIM_TICKET\"",
+        shell_quote_path(&ticket_staging),
+        shell_quote_path(&ticket_staging),
         shell_quote_path(&ticket_path),
         shell_quote_path(&release),
     );
