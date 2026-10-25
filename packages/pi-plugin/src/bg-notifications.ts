@@ -12,6 +12,7 @@ import {
   formatWatchLineBatch,
   mergeWatchLineBatches,
   resolveBridgeForNudge,
+  WatchBatchAdmissions,
 } from "@cortexkit/aft-bridge";
 import { sessionLog, sessionWarn } from "./logger.js";
 import type { PluginContext } from "./types.js";
@@ -74,6 +75,7 @@ type SessionBgState = {
   pendingCompletions: BgCompletion[];
   pendingLongRunning: BgLongRunningReminder[];
   pendingPatternMatches: PatternMatchEntry[];
+  batchAdmissions: WatchBatchAdmissions;
   explicitControlTasks: Set<string>;
   debounceTimer: NodeJS.Timeout | null;
   firstCompletionAt: number | null;
@@ -505,8 +507,9 @@ export async function appendToolResultBgCompletions(
   const reminder = formatCombinedSystemReminder(
     state.pendingCompletions,
     state.pendingLongRunning,
-    state.pendingPatternMatches,
+    state.batchAdmissions.unseen(deliveredPatternMatches),
   );
+  state.batchAdmissions.admit(deliveredPatternMatches);
   state.pendingCompletions = [];
   for (const completion of deliveredCompletions) {
     state.wakeDeferredTaskIds.delete(completion.task_id);
@@ -527,7 +530,7 @@ export async function appendToolResultBgCompletions(
   // pendingLongRunning are now drained, and firing the timer anyway would
   // build an empty-body "[BACKGROUND BASH STILL RUNNING]" reminder.
   clearWakeTimerIfNoPending(state);
-  return [...content, { type: "text", text: reminder }];
+  return reminder ? [...content, { type: "text", text: reminder }] : undefined;
 }
 
 export async function handleTurnEndBgCompletions(
@@ -737,6 +740,12 @@ async function triggerWakeIfPending(
       }
       const ackTargetIds = deliveredCompletions.map((completion) => completion.task_id);
       const ackKeys = deliveredCompletions.map(bashAckKey);
+      if (!reminder) {
+        state.batchAdmissions.admit(deliveredPatternMatches ?? []);
+        markDeliveredAwaitingAck(state, ackKeys);
+        if (await ackCompletions(drainContext, deliveredCompletions)) confirmAcked(state, ackKeys);
+        return;
+      }
       const watchIds = deliveredPatternMatches?.map((m) => m.watch_id) ?? [];
       const watchId = watchIds.join(",") || undefined;
       logPerTaskDeliveryHop(drainContext, "inject-start", "session inject start", ackTargetIds, {
@@ -746,6 +755,7 @@ async function triggerWakeIfPending(
       });
       try {
         drainContext.runtime.sendUserMessage(reminder, { deliverAs: "steer" });
+        state.batchAdmissions.admit(deliveredPatternMatches ?? []);
       } catch (err) {
         logPerTaskDeliveryHop(
           drainContext,
@@ -948,6 +958,7 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
     const drainedMatches = Array.isArray(response.pending_matches)
       ? response.pending_matches.filter(isPatternMatchEntry)
       : [];
+    state.batchAdmissions.reconcile(drainedMatches);
     const drainedTaskIds = [
       ...new Set([
         ...drainedCompletions.map((completion) => completion.task_id),
@@ -1022,6 +1033,7 @@ async function ackCompletions(
       );
       return false;
     }
+    stateFor(drainContext.sessionID).batchAdmissions.confirmed(completions);
     logPerTaskDeliveryHop(drainContext, "ack-ok", "ack ok", taskIds, {
       event: "bash_completion_ack_ok",
     });
@@ -1141,7 +1153,7 @@ function scheduleWake(
     const reminder = formatCombinedSystemReminder(
       pending,
       pendingLongRunning,
-      pendingPatternMatches,
+      state.batchAdmissions.unseen(pendingPatternMatches),
     );
     const deliveredTaskIds = new Set(pending.map((completion) => completion.task_id));
     state.pendingCompletions = state.pendingCompletions.filter(
@@ -1206,6 +1218,7 @@ function stateFor(sessionID: string | undefined): SessionBgState {
       pendingCompletions: [],
       pendingLongRunning: [],
       pendingPatternMatches: [],
+      batchAdmissions: new WatchBatchAdmissions(),
       explicitControlTasks: new Set(),
       debounceTimer: null,
       firstCompletionAt: null,

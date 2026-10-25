@@ -13,6 +13,7 @@ import {
   formatWatchLineBatch,
   mergeWatchLineBatches,
   resolveBridgeForNudge,
+  WatchBatchAdmissions,
 } from "@cortexkit/aft-bridge";
 import { sessionLog, sessionWarn } from "./logger.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
@@ -92,6 +93,7 @@ type SessionBgState = {
   pendingCompletions: BgCompletion[];
   pendingLongRunning: BgLongRunningReminder[];
   pendingPatternMatches: PatternMatchEntry[];
+  batchAdmissions: WatchBatchAdmissions;
   explicitControlTasks: Set<string>;
   debounceTimer: NodeJS.Timeout | null;
   firstCompletionAt: number | null;
@@ -700,9 +702,10 @@ export async function appendInTurnBgCompletions(
   const reminder = formatCombinedSystemReminder(
     state.pendingCompletions,
     state.pendingLongRunning,
-    state.pendingPatternMatches,
+    state.batchAdmissions.unseen(deliveredPatternMatches),
   );
-  output.output = appendReminder(output.output ?? "", reminder);
+  if (reminder) output.output = appendReminder(output.output ?? "", reminder);
+  state.batchAdmissions.admit(deliveredPatternMatches);
   cancelSatisfiedAdmissions(state, inTurnTasks);
   // Trace #7 of 7: reminder went out as part of an existing tool result
   // instead of through promptAsync. NO wake_prompt_async_start event
@@ -1349,6 +1352,13 @@ async function triggerWakeIfPending(
       }
       const taskIDs = deliveredCompletions.map((completion) => completion.task_id);
       const ackKeys = deliveredCompletions.map(bashAckKey);
+      if (!reminder) {
+        batch.accepted();
+        state.batchAdmissions.admit(deliveredPatternMatches ?? []);
+        markDeliveredAwaitingAck(state, ackKeys);
+        if (await ackCompletions(drainContext, deliveredCompletions)) confirmAcked(state, ackKeys);
+        return;
+      }
       const watchIds = deliveredPatternMatches?.map((m) => m.watch_id) ?? [];
       const watchId = watchIds.join(",") || undefined;
 
@@ -1507,6 +1517,7 @@ async function triggerWakeIfPending(
               onPending: batch.pending,
               onLateAcceptance: () => {
                 batch.accepted();
+                state.batchAdmissions.admit(deliveredPatternMatches ?? []);
                 markDeliveredAwaitingAck(state, ackKeys);
                 void ackCompletions(drainContext, deliveredCompletions, deliveryID)
                   .then((acked) => {
@@ -1602,6 +1613,7 @@ async function triggerWakeIfPending(
       if (!result.accepted) return;
       const { deliveryID } = result;
       batch.accepted();
+      state.batchAdmissions.admit(deliveredPatternMatches ?? []);
       // Session injection has resolved successfully. Only now may these task IDs
       // enter awaiting-ack state and become eligible for daemon acknowledgement.
       markDeliveredAwaitingAck(state, ackKeys);
@@ -1834,6 +1846,7 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
       ? response.pending_matches.filter(isPatternMatchEntry)
       : [];
     drainContext.delivery?.patternMatchesPending?.(drainContext.sessionID, drainedMatches);
+    state.batchAdmissions.reconcile(drainedMatches);
     const drainedTaskIds = [
       ...new Set([
         ...drainedCompletions.map((completion) => completion.task_id),
@@ -1915,6 +1928,7 @@ async function ackCompletions(
       if ("watch_id" in target)
         drainContext.delivery?.patternMatchAcked?.(drainContext.sessionID, target);
     }
+    stateFor(drainContext.sessionID).batchAdmissions.confirmed(completions);
     // Trace #6 of 7: bash_ack_completions succeeded on the Rust side.
     // Closes the wake chain: scheduled → fire → start → ok → ack_ok.
     // Note: ack also runs from appendInTurnBgCompletions without a
@@ -2060,7 +2074,7 @@ function scheduleWake(
     const reminder = formatCombinedSystemReminder(
       pending,
       pendingLongRunning,
-      pendingPatternMatches,
+      state.batchAdmissions.unseen(pendingPatternMatches),
     );
 
     // Trace #2 of 7: timer actually fired and we captured a non-empty
@@ -2194,6 +2208,7 @@ function stateFor(sessionID: string | undefined): SessionBgState {
       pendingCompletions: [],
       pendingLongRunning: [],
       pendingPatternMatches: [],
+      batchAdmissions: new WatchBatchAdmissions(),
       explicitControlTasks: new Set(),
       debounceTimer: null,
       firstCompletionAt: null,
