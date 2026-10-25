@@ -50,6 +50,11 @@ path = "tests/integration/main.rs"
 name = "watcher_integration"
 path = "tests/watcher_integration/main.rs"
 
+# Opt-in timing and allocation probe for the pre-dispatch edit path.
+[[test]]
+name = "edit_translate_probe"
+path = "tests/edit_translate_probe.rs"
+
 # CI runs sandbox probes single-threaded with mandatory Landlock on Linux.
 [[test]]
 name = "sandbox_launch_probe"

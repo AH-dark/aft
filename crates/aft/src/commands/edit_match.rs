@@ -606,7 +606,7 @@ pub(crate) fn is_glob_pattern(path: &str) -> bool {
 
 /// How an edit target is interpreted: one file, or a pattern over many.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EditTargetKind {
+pub enum EditTargetKind {
     /// A concrete file path: either spelled without glob characters, or one
     /// that names an existing path even though it contains them.
     Literal,
@@ -638,7 +638,7 @@ pub(crate) enum EditTargetKind {
 /// Both `edit_match` and the agent-facing `edit` translator (through
 /// `run_tool_call`) use this function so the two cannot disagree about which
 /// targets are files.
-pub(crate) fn classify_edit_target(file: &str, ctx: &AppContext, req_id: &str) -> EditTargetKind {
+pub fn classify_edit_target(file: &str, ctx: &AppContext, req_id: &str) -> EditTargetKind {
     if !is_glob_pattern(file) {
         return EditTargetKind::Literal;
     }
