@@ -238,6 +238,7 @@ mod stall_watchdog;
 mod standing;
 mod tool_provider;
 mod wire;
+mod work_step;
 
 pub(crate) use self::tool_provider::WORKER_REPLY_MARGIN_MS;
 
@@ -5045,14 +5046,29 @@ where
     // taken before the first select must be just as recoverable as a later one.
     dispatch_path_metrics.publish_frame_loop_wake_deadline(DRAIN_TICK_PERIOD);
     let loop_result: Result<ModuleLoopExit, SubcError> = 'module_loop: loop {
+        dispatch_path_metrics.mark_frame_loop_step("LedgerEdge::detach_shells", "", 0);
         for route in ledger_edge.unrouted_shells(&routes) {
             ledger_edge.detach_shells(&executor, Some(route)).await;
         }
         dispatch_path_metrics.mark_frame_loop_tick();
+        dispatch_path_metrics.mark_frame_loop_step("logging::perf_tick", "", 0);
+        #[cfg(test)]
+        if let Some(hook) = watchdog_test
+            .as_ref()
+            .and_then(|hooks| hooks.before_turn_work.as_ref())
+        {
+            hook();
+        }
         shared_app.set_open_route_count(routes.len() + management_routes.len());
         crate::logging::perf_tick(Some(&executor));
+        dispatch_path_metrics.mark_frame_loop_step("PendingSubcResponses::poll_if_woken", "", 0);
         let ready_inspects = pending_responses.poll_if_woken(executor.as_ref(), &deferred_wake);
         for resolved in ready_inspects {
+            dispatch_path_metrics.mark_frame_loop_step(
+                "deliver_resolved_subc_response",
+                &resolved.entry.bare_name,
+                resolved.entry.corr,
+            );
             if let Err(error) = deliver_resolved_subc_response(
                 &writer_tx,
                 resolved,
@@ -5069,6 +5085,7 @@ where
                 break 'module_loop Err(error);
             }
         }
+        dispatch_path_metrics.mark_frame_loop_step("expire_pending_bash_asks", "", 0);
         if let Err(error) = expire_pending_bash_asks(
             &writer_tx,
             &mut pending_bash_asks,
@@ -5086,6 +5103,11 @@ where
         // RouteBind completions are control-plane unblockers. Drain any completed
         // binds before entering other branch work so Push and maintenance bursts
         // can only add one loop-turn of latency.
+        dispatch_path_metrics.mark_frame_loop_step(
+            "drain_pending_route_bind_completions",
+            "route_bind",
+            0,
+        );
         match drain_pending_route_bind_completions(
             &mut control_completion_rx,
             &writer_tx,
@@ -5113,15 +5135,24 @@ where
         }
 
         if tokio::time::Instant::now() >= next_drain_at {
+            dispatch_path_metrics.mark_frame_loop_step("push::emit_bg_event_wakes", "", 0);
             push::emit_bg_event_wakes(
                 &writer_tx,
                 &dispatch_path_metrics,
                 &bg_subs,
                 &mut bg_wake_pending,
             );
+            dispatch_path_metrics.mark_frame_loop_step("warn_stuck_pending_watches", "", 0);
             dispatch_path_metrics.warn_stuck_pending_watches(&executor, &bg_sub_by_session);
+            dispatch_path_metrics.mark_frame_loop_step("warn_slow_pending_binds", "", 0);
             warn_slow_pending_binds(&mut pending_binds, &executor);
+            dispatch_path_metrics.mark_frame_loop_step("warn_slow_running_interactive_jobs", "", 0);
             warn_slow_running_interactive_jobs(&executor);
+            dispatch_path_metrics.mark_frame_loop_step(
+                "expire_overdue_route_binds",
+                "route_bind",
+                0,
+            );
             if let Err(error) = expire_overdue_route_binds(
                 &writer_tx,
                 &executor,
@@ -5134,6 +5165,11 @@ where
                 break Err(error);
             }
 
+            dispatch_path_metrics.mark_frame_loop_step(
+                "push::drain_retry_buffers_for_bound_routes",
+                "",
+                0,
+            );
             let retried = push::drain_retry_buffers_for_bound_routes(
                 &writer_tx,
                 &dispatch_path_metrics,
@@ -5154,6 +5190,11 @@ where
             let bash_drain_due = drain_progress
                 .as_ref()
                 .is_some_and(|progress| Instant::now() >= progress.bash_backstop_at);
+            dispatch_path_metrics.mark_frame_loop_step(
+                "bash::answer_held_bash_calls_from_module_loop",
+                "",
+                0,
+            );
             if let Err(error) = bash::answer_held_bash_calls_from_module_loop(
                 &writer_tx,
                 &routes,
@@ -5166,6 +5207,7 @@ where
             }
 
             if let Some(progress) = drain_progress.as_mut() {
+                dispatch_path_metrics.mark_frame_loop_step("drain::held_request_census", "", 0);
                 if !progress.quiesced_reported || !progress.deadline_reported {
                     let census = drain::held_request_census(
                         &active_tool_calls,
@@ -5201,8 +5243,10 @@ where
         // Merge queued and overflow updates before retrying pending status.
         // A slow writer must get the newest state, not an older pending copy
         // followed by the update that was already waiting in the channel.
+        dispatch_path_metrics.mark_frame_loop_step("push::drain_lossy_push_batch", "", 0);
         let batch = push::drain_lossy_push_batch(&mut lossy_rx, &lossy_overflow);
         if !batch.is_empty() {
+            dispatch_path_metrics.mark_frame_loop_step("push::drain_reliable_push_turn", "", 0);
             let (processed, deferred) = push::drain_reliable_push_turn(
                 &writer_tx,
                 &dispatch_path_metrics,
@@ -5226,6 +5270,11 @@ where
                 tokio::task::yield_now().await;
             }
 
+            dispatch_path_metrics.mark_frame_loop_step(
+                "push::process_lossy_push_envelope_batch",
+                "",
+                0,
+            );
             push::process_lossy_push_envelope_batch(
                 &writer_tx,
                 &dispatch_path_metrics,
@@ -5237,18 +5286,21 @@ where
             );
         }
 
+        dispatch_path_metrics.mark_frame_loop_step("StatusPushes::drain_turn", "", 0);
         status_pushes.drain_turn(&writer_tx, &dispatch_path_metrics, &routes, &root_channels);
 
         // The drain-tick arm below guarantees this select returns by
         // `next_drain_at`; publishing that promise lets the stall watchdog tell
         // an idle-but-ticking loop from one that stopped taking turns.
+        dispatch_path_metrics.mark_frame_loop_step("ScopeDescribes::routes", "", 0);
+        scope_describes.routes(&routes);
         dispatch_path_metrics.publish_frame_loop_wake_deadline(
             next_drain_at.saturating_duration_since(tokio::time::Instant::now()),
         );
-        scope_describes.routes(&routes);
         tokio::select! {
             biased;
             Some(ended) = scopes_ended_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("run_scopes::revoke", "", 0);
                 run_scopes.revoke(&ended.stamp);
                 ledger_edge.scope_ended(&ended.keys);
                 let keys: Vec<_> = pending_bash_asks.iter().filter(|(_, pending)| {
@@ -5265,6 +5317,7 @@ where
                 }
             }
             Some(completion) = control_completion_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("process_route_bind_completion", "route_bind", completion.corr);
                 if let Err(error) = process_route_bind_completion(
                     &writer_tx,
                     completion,
@@ -5288,10 +5341,12 @@ where
                 health_rollup_worker.request_refresh();
             }
             Some(query) = worker_read_scopes.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("gh_relay_route_scopes", "", 0);
                 let scopes = gh_relay_route_scopes(&routes);
                 let _ = query.reply.send(scopes.for_session(&query.session).cloned());
             }
             _ = shutdown.notified() => {
+                dispatch_path_metrics.mark_frame_loop_step("run_module_loop/shutdown", "", 0);
                 log::warn!("subc attach: fatal executor response requested teardown");
                 break Ok(ModuleLoopExit::SkipSearchFlush);
             }
@@ -5925,6 +5980,7 @@ where
                 }
             }
             Some(pending) = deferred_response_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("PendingSubcResponses::register", "", pending.corr);
                 if routes.contains_key(&pending.route)
                     && active_tool_call_is_registered(
                         &active_tool_calls,
@@ -5960,6 +6016,7 @@ where
                 }
             }
             Some((root_id, frame)) = reliable_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("push::drain_reliable_push_turn", "", 0);
                 // Reliable Push frames are FIFO and must-deliver, but draining an
                 // unbounded burst in one current-thread turn can starve RouteBind
                 // completions. The budget defers excess frames, never drops them.
@@ -5987,6 +6044,7 @@ where
                 }
             }
             Some((order, root_id, frame)) = lossy_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("push::process_lossy_push_envelope_batch", "", 0);
                 // When both push lanes have work, handle a small reliable slice before lossy work.
                 // That ordering lets completed task ids suppress stale BashLongRunning frames.
                 // The slice stays bounded so reliable bursts cannot monopolize this loop turn.
@@ -6032,6 +6090,7 @@ where
                 );
             }
             Some(done) = bash_deferred_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("bash::handle_bash_deferred_completion", "", 0);
                 decrement_counted_channel(&dispatch_path_metrics.bash_deferred_queued);
                 if let Err(error) = bash::handle_bash_deferred_completion(
                     &writer_tx,
@@ -6048,15 +6107,18 @@ where
                 }
             }
             Some(root_id) = bash_poll_touch_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("RootMeta::note_activity", "", 0);
                 decrement_counted_channel(&dispatch_path_metrics.bash_poll_touch_queued);
                 if let Some(meta) = live_roots.get_mut(&root_id) {
                     meta.note_activity();
                 }
             }
             Some(done) = identity_replay_done_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("finish_identity_replay", "route_bind", 0);
                 finish_identity_replay(&done, &mut live_roots, &routes, &executor);
             }
             Some(completion) = maintenance_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("note_maintenance_completion", "", 0);
                 decrement_counted_channel(&dispatch_path_metrics.maintenance_queued);
                 let root_id = completion.root_id.clone();
                 let response = completion.response;
@@ -6156,7 +6218,9 @@ where
                 // inbound route/control messages and push completions have run,
                 // so maintenance does not block the actor from handling the
                 // first request that arrives after a route bind is acknowledged.
+                dispatch_path_metrics.mark_frame_loop_step("logging::maybe_sweep_logs", "", 0);
                 crate::logging::maybe_sweep_logs();
+                dispatch_path_metrics.mark_frame_loop_step("compression_events::maybe_spawn_retention", "", 0);
                 let retention_registries = shared_app.try_memory_contexts().map(|contexts| {
                     contexts
                         .into_iter()
@@ -6172,9 +6236,12 @@ where
                         retention_registries,
                     );
                 }
+                dispatch_path_metrics.mark_frame_loop_step("spawn_orphaned_lsp_child_reap", "", 0);
                 spawn_orphaned_lsp_child_reap(shared_app.lsp_child_registry());
+                dispatch_path_metrics.mark_frame_loop_step("reap_idle_lsp_servers", "", 0);
                 let now = Instant::now();
                 reap_idle_lsp_servers(now, &live_roots, &executor);
+                dispatch_path_metrics.mark_frame_loop_step("reap_idle_roots_with_presence", "", 0);
                 let presence = root_presence.latest();
                 let reap = reap_idle_roots_with_presence(
                     now,
@@ -6187,6 +6254,7 @@ where
                 );
                 root_presence.request(live_roots.keys().cloned().collect());
                 for root_id in &reap.forgotten_deleted_roots {
+                    dispatch_path_metrics.mark_frame_loop_step("purge_deleted_root_residents", "", 0);
                     bg_unacked_keys_by_root.remove(root_id);
                     let reclaim_frames = purge_deleted_root_residents(
                         root_id,
@@ -6223,12 +6291,14 @@ where
                 if reap.evicted > 0 {
                     log::debug!("subc attach: reaped {} idle root(s)", reap.evicted);
                 }
+                dispatch_path_metrics.mark_frame_loop_step("record_bg_runtime_from_snapshots", "", 0);
                 record_bg_runtime_from_snapshots(
                     &dispatch_path_metrics,
                     bg_subs.len(),
                     bg_wake_pending.len(),
                     &bg_unacked_keys_by_root,
                 );
+                dispatch_path_metrics.mark_frame_loop_step("submit_due_maintenance_jobs", "", 0);
                 submit_due_maintenance_jobs(
                     &executor,
                     &mut live_roots,
@@ -6240,6 +6310,7 @@ where
                     &dispatch_path_metrics,
                 );
                 if tokio::time::Instant::now() >= next_standing_pass_at {
+                    dispatch_path_metrics.mark_frame_loop_step("StandingWorker::request", "", 0);
                     standing_worker.request();
                     next_standing_pass_at = tokio::time::Instant::now()
                         + standing::STANDING_MAINTENANCE_INTERVAL;
@@ -6259,6 +6330,11 @@ where
             }
         }
         if let Some(probe) = lifecycle_probe.as_ref() {
+            dispatch_path_metrics.mark_frame_loop_step(
+                "SubcTestLifecycleProbe::hold_reliable_push_turn",
+                "",
+                0,
+            );
             probe.hold_reliable_push_turn().await;
         }
     };
@@ -7512,6 +7588,7 @@ async fn handle_control_request(
     tool_response_body_limit: usize,
     run_scopes: Option<&run_scope::RunScopes>,
 ) -> Result<(), SubcError> {
+    metrics.mark_frame_loop_entry("handle_control_request", frame);
     let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
         Ok(request) => request,
         Err(error) => return refuse_undecodable_control_request(tx, frame, &error, metrics).await,
@@ -8002,6 +8079,7 @@ async fn handle_management_request(
     principal: Option<&Principal>,
     storage_dir: &Path,
 ) -> Result<(), SubcError> {
+    metrics.mark_frame_loop_entry("handle_management_request", frame);
     let decoded = serde_json::from_slice::<Value>(&frame.body).ok();
     let operation = decoded
         .as_ref()
@@ -9499,6 +9577,7 @@ async fn handle_tool_call(
     module_drain: &drain::ModuleDrainWindow,
     daemon_control: Option<&Arc<readiness::DaemonControl>>,
 ) -> Result<(), SubcError> {
+    metrics.mark_frame_loop_entry("handle_tool_call", frame);
     let module_draining = module_drain.is_active();
     let route_id = route_key(frame.header.channel, frame.header.epoch);
     if pending_binds.contains_key(&route_id) {
@@ -9882,6 +9961,7 @@ async fn handle_tool_call(
         .filter(|_| identity.role == tool_provider::RouteRole::ToolProviderV1)
         .map(|key| tool_provider::LedgerEdge::key(&identity, key));
     let bare_name = call.name;
+    metrics.mark_frame_loop_tool(&bare_name, frame.header.corr);
     codemode::audit_call(&identity, &bare_name, frame.header.corr);
     let arguments = strip_agent_preview_arg_owned(call.arguments);
     if bare_name == "bash_watch" {
@@ -22969,6 +23049,7 @@ mod pong_priority_tests {
         let _release = ReleaseOnDrop(gate.clone());
         let (setup_tx, mut setup_rx) = mpsc::unbounded_channel();
         let hooks = stall_watchdog::FrameLoopTestHooks {
+            before_turn_work: None,
             metrics: metrics.clone(),
             config: None,
             before_frame: Arc::new(|| {}),

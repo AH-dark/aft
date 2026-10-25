@@ -240,6 +240,7 @@ pub(super) struct FrameLoopTestHooks {
     pub(super) metrics: Arc<DispatchPathMetrics>,
     pub(super) config: Option<StallWatchdogConfig>,
     pub(super) before_frame: Arc<dyn Fn() + Send + Sync>,
+    pub(super) before_turn_work: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) writer_setup: Option<Arc<dyn Fn(super::WriterSender) + Send + Sync>>,
 }
 
@@ -795,6 +796,30 @@ mod tests {
     const TEST_PID: u32 = 4242;
 
     #[test]
+    fn frame_loop_context_names_decoded_tool_and_request() {
+        use super::super::*;
+        let metrics = DispatchPathMetrics::new();
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            125,
+            1,
+            892,
+            b"{}".to_vec(),
+        )
+        .unwrap();
+        metrics.mark_frame_loop_frame(&frame);
+        metrics.mark_frame_loop_tool("read", frame.header.corr);
+        let context = metrics.frame_loop_context();
+        assert!(
+            context.contains(
+                "entry=handle_tool_call command=\"read\" request_id=892 step_elapsed_ms="
+            ),
+            "{context}"
+        );
+    }
+
+    #[test]
     fn frame_loop_context_names_control_operation_root_and_session() {
         use super::super::*;
         let metrics = DispatchPathMetrics::new();
@@ -990,6 +1015,13 @@ mod tests {
 
     impl FrameLoopFixture {
         async fn start(before_frame: Arc<dyn Fn() + Send + Sync>) -> Self {
+            Self::start_with_turn_hook(before_frame, None).await
+        }
+
+        async fn start_with_turn_hook(
+            before_frame: Arc<dyn Fn() + Send + Sync>,
+            before_turn_work: Option<Arc<dyn Fn() + Send + Sync>>,
+        ) -> Self {
             use super::super::*;
             let storage = tempfile::tempdir().unwrap();
             let path = storage.path().to_path_buf();
@@ -1012,6 +1044,7 @@ mod tests {
                 metrics: Arc::clone(&metrics),
                 config: Some(config),
                 before_frame,
+                before_turn_work,
                 writer_setup: None,
             };
             let (mut daemon, module_stream) = tokio::io::duplex(64 * 1024);
@@ -1090,6 +1123,103 @@ mod tests {
         fn finish(self) {
             drop(self.daemon);
             self.module.join().unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_loop_answers_ping_while_watch_diagnostic_database_is_locked() {
+        use super::super::*;
+        let (storage, root) = test_support::test_root("watch-diagnostic-disk-lock");
+        let ctx = Arc::new(crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.as_path().into()),
+                storage_dir: Some(storage.path().join("storage")),
+                ..Default::default()
+            },
+        ));
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        let db = Arc::new(Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
+        ctx.bash_background().set_db_pool(Arc::clone(&db));
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx));
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let mut subscriptions = BgSubsBySession::new();
+        subscriptions.insert(
+            (root, "watch-session".into()),
+            HashSet::from([route_key(125, 1)]),
+        );
+        let held = db.lock().unwrap();
+        let mut fixture = FrameLoopFixture::start_with_turn_hook(
+            Arc::new(|| {}),
+            Some(Arc::new(move || {
+                metrics.warn_stuck_pending_watches(&executor, &subscriptions);
+            })),
+        )
+        .await;
+        fixture.send_ping(891).await;
+        let reply = tokio::time::timeout(TEST_THRESHOLD, read_frame(&mut fixture.daemon)).await;
+        drop(held);
+        fixture.finish();
+        let pong = reply
+            .expect("frame loop waited on the watch diagnostic's SQLite mutex")
+            .unwrap()
+            .unwrap();
+        assert_eq!((pong.header.ty, pong.header.corr), (FrameType::Pong, 891));
+    }
+
+    #[tokio::test]
+    async fn stalled_turn_work_snapshot_names_entry_without_waiting_for_loop() {
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let fixture = FrameLoopFixture::start_with_turn_hook(
+            Arc::new(|| {}),
+            Some(Arc::new(move || {
+                if !first.swap(false, Ordering::Relaxed) {
+                    return;
+                }
+                parked_tx.send(()).unwrap();
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+            })),
+        )
+        .await;
+        parked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        tokio::time::sleep(TEST_THRESHOLD * 5).await;
+        let terminal = fixture.stderr.lines();
+        let snapshots: Vec<_> = fixture
+            .capture
+            .calls()
+            .iter()
+            .map(|(_, path)| std::fs::read_to_string(path.with_extension("txt")).unwrap())
+            .collect();
+        release_tx.send(()).unwrap();
+        fixture.finish();
+        assert_eq!(
+            terminal.len(),
+            1,
+            "snapshot and watchdog exit must finish while the step is held"
+        );
+        assert_eq!(snapshots.len(), 1);
+        for text in terminal.iter().chain(snapshots.iter()) {
+            assert!(text.contains("phase=turn_work"), "{text}");
+            assert!(text.contains("entry=logging::perf_tick"), "{text}");
+            let elapsed: u64 = text
+                .split("step_elapsed_ms=")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(elapsed >= TEST_THRESHOLD.as_millis() as u64, "{text}");
         }
     }
 
@@ -1214,6 +1344,12 @@ mod tests {
         assert!(capture_written, "a capture was actually written");
         let line = &stderr[0];
         eprintln!("captured terminal stderr: {line}");
+        assert!(
+            line.contains("entry=run_module_loop/handle_frame"),
+            "{line}"
+        );
+        assert!(line.contains("command=\"ping\" request_id=91"), "{line}");
+        assert!(line.contains("step_elapsed_ms="), "{line}");
         assert!(
             line.starts_with("stall watchdog: exiting marker=subc_frame_loop stalled_for_ms="),
             "{line}"
