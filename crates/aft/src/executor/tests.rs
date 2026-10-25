@@ -495,6 +495,158 @@ fn actor_entries_return_roots_and_contexts() {
 }
 
 #[test]
+fn parked_maintenance_root_stat_leaves_submit_and_scheduler_lock_available() {
+    let (_dir, root) = test_root("parked-root-stat");
+    let executor = Arc::new(test_executor(2, 2, 2, 1));
+    executor.register_actor(root.clone(), test_ctx());
+    let (parked_tx, parked_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    *executor.inner.maintenance_root_check_hook.lock() = Some(Box::new(move || {
+        parked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    }));
+
+    let maintenance_executor = executor.clone();
+    let maintenance_root = root.clone();
+    let maintenance_thread = thread::spawn(move || {
+        maintenance_executor.submit_maintenance_async(
+            maintenance_root,
+            Lane::HeavyInit,
+            "parked-stat".into(),
+            Box::new(|_| ok("parked-stat")),
+        )
+    });
+    parked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    let (submitted_tx, submitted_rx) = crossbeam_channel::bounded(1);
+    let interactive_executor = executor.clone();
+    let interactive_thread = thread::spawn(move || {
+        let response = interactive_executor.submit_async(
+            root,
+            Lane::PureRead,
+            "interactive".into(),
+            Box::new(|_| ok("interactive")),
+        );
+        submitted_tx.send(response).unwrap();
+    });
+    let (locked_tx, locked_rx) = crossbeam_channel::bounded(1);
+    let lock_executor = executor.clone();
+    let lock_thread = thread::spawn(move || {
+        let _state = lock_executor.inner.state.lock();
+        locked_tx.send(()).unwrap();
+    });
+
+    let interactive = submitted_rx.recv_timeout(Duration::from_secs(5));
+    let lock_available = locked_rx.recv_timeout(Duration::from_secs(5));
+    // Release and join before asserting so a regression cannot strand the test's threads.
+    release_tx.send(()).unwrap();
+    let maintenance = maintenance_thread.join().unwrap();
+    interactive_thread.join().unwrap();
+    lock_thread.join().unwrap();
+
+    assert!(
+        interactive.is_ok(),
+        "another submit waited behind the parked maintenance root stat"
+    );
+    assert!(
+        lock_available.is_ok(),
+        "scheduler lock was held across the parked maintenance root stat"
+    );
+    assert!(recv_async(interactive.unwrap(), "interactive beside parked stat").success);
+    assert!(recv_async(maintenance, "maintenance after stat release").success);
+}
+
+#[test]
+fn parked_requeue_root_probe_leaves_submit_and_scheduler_lock_available() {
+    let (dir, root) = test_root("parked-requeue-stat");
+    let executor = Arc::new(test_executor(2, 2, 2, 1));
+    executor.register_actor(root.clone(), test_ctx());
+    // An in-flight epoch reader makes the bind start shared and request a requeue.
+    let reader = StuckReader::start(&executor, &root, "requeue-reader", "read");
+    let (parked_tx, parked_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let (bind, _token) =
+        submit_repeatable_bind(&executor, &root, "subc-bind-parked-requeue", move |_| {
+            assert!(
+                request_exclusive_rerun(),
+                "only the shared attempt should run"
+            );
+            let token = current_job_cancellation().expect("bind cancellation token");
+            *token.inner.root_probe_barrier.lock() = Some((parked_tx.clone(), release_rx.clone()));
+            ok("shared-attempt")
+        });
+    parked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    let (submitted_tx, submitted_rx) = crossbeam_channel::bounded(1);
+    let interactive_executor = executor.clone();
+    let interactive_thread = thread::spawn(move || {
+        let response = interactive_executor.submit_async(
+            root,
+            Lane::PureRead,
+            "interactive".into(),
+            Box::new(|_| ok("interactive")),
+        );
+        submitted_tx.send(response).unwrap();
+    });
+    let (locked_tx, locked_rx) = crossbeam_channel::bounded(1);
+    let lock_executor = executor.clone();
+    let lock_thread = thread::spawn(move || {
+        let _state = lock_executor.inner.state.lock();
+        locked_tx.send(()).unwrap();
+    });
+
+    let interactive = submitted_rx.recv_timeout(Duration::from_secs(5));
+    let lock_available = locked_rx.recv_timeout(Duration::from_secs(5));
+    // Deletion while the probe is parked must still cancel the requeue.
+    dir.close().unwrap();
+    release_tx.send(()).unwrap();
+    interactive_thread.join().unwrap();
+    lock_thread.join().unwrap();
+    let reader_response = reader.finish();
+
+    assert!(
+        interactive.is_ok(),
+        "another submit waited behind the parked requeue root probe"
+    );
+    assert!(
+        lock_available.is_ok(),
+        "scheduler lock was held across the parked requeue root probe"
+    );
+    assert!(
+        recv_async(
+            interactive.unwrap(),
+            "interactive beside parked requeue probe"
+        )
+        .success
+    );
+    let response = recv_async(bind, "requeue after root deletion");
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "request_cancelled");
+    assert!(reader_response.success);
+}
+
+#[test]
+fn missing_maintenance_root_preserves_admission_refusal() {
+    let (dir, root) = test_root("missing-maintenance-root");
+    let executor = test_executor(2, 2, 2, 1);
+    executor.register_actor(root.clone(), test_ctx());
+    dir.close().unwrap();
+    let response = executor.submit_maintenance_async(
+        root,
+        Lane::HeavyInit,
+        "missing-root".into(),
+        Box::new(|_| panic!("missing root admitted maintenance")),
+    );
+    let response = recv_async(response, "missing root refusal");
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "maintenance_cancelled");
+    assert_eq!(
+        response.data["message"],
+        "maintenance root is unbound or missing"
+    );
+}
+
+#[test]
 fn cancel_queued_maintenance_preserves_interactive_work_and_actor() {
     let executor = test_executor(1, 1, 1, 1);
     let (_dir, root) = test_root("cancel-maintenance");
