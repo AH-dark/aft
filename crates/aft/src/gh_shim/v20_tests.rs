@@ -88,6 +88,111 @@ fn reply(value: Value) -> ReadReply {
         next_page: None,
     })
 }
+
+#[cfg(unix)]
+#[test]
+fn v20_worker_diff_reader_closing_after_first_line_is_quiet() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    struct FirstLineWriter {
+        stream: UnixStream,
+        closed: std::sync::mpsc::Receiver<()>,
+        writes: usize,
+    }
+    impl Write for FirstLineWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.writes == 1 {
+                let end = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+                self.stream.write_all(&bytes[..end])?;
+                self.closed.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(end)
+            } else {
+                self.stream.write(bytes)
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
+    }
+
+    let (writer, reader) = UnixStream::pair().unwrap();
+    let (closed, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        drop(reader);
+        closed.send(()).unwrap();
+        line
+    });
+    let mut output = FirstLineWriter {
+        stream: writer,
+        closed: receive,
+        writes: 0,
+    };
+    let result = render::run(
+        &planned(&["pr", "diff", "285"]),
+        &mut |_| {
+            Ok(reply(json!(
+                "diff --git a/file b/file\n--- a/file\n+++ b/file\n"
+            )))
+        },
+        &mut output,
+    );
+    assert_eq!(reader.join().unwrap(), "diff --git a/file b/file\n");
+    assert_eq!(output.writes, 2, "stop at the first failed write");
+    assert!(
+        matches!(result, Ok(0)),
+        "closed reader must be quiet: {result:?}"
+    );
+}
+
+#[test]
+fn v20_worker_diff_real_output_errors_are_reported() {
+    struct FullDisk;
+    impl Write for FullDisk {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("disk full"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let error = render::run(
+        &planned(&["pr", "diff", "285"]),
+        &mut |_| Ok(reply(json!("diff\n"))),
+        &mut FullDisk,
+    )
+    .unwrap_err();
+    assert_eq!(error.status(), 1);
+    assert_eq!(error.message("bot"), "disk full");
+}
+
+#[test]
+fn v20_worker_read_oversize_names_size_and_cap() {
+    let wire = executor::wire_request(
+        "cortexkit/aft",
+        &ReadRequest::Get {
+            path: "/repos/cortexkit/aft/pulls/434".into(),
+            accept: Some("diff".into()),
+        },
+    )
+    .unwrap();
+    let error = executor::decode_reply(
+        &wire,
+        &json!({"isError":false,"result":{
+            "status":200,"body":"x".repeat(1_048_577),"next_page":null
+        }}),
+    )
+    .unwrap_err();
+    assert_eq!(error.status(), 86);
+    assert_eq!(
+        error.message("bot"),
+        "governed read response is 1048577 bytes; cap is 1048576 bytes (1 MiB); narrow the request"
+    );
+}
 fn log_reply(body: &[u8], offset: u64, total_bytes: u64) -> ReadReply {
     ReadReply::JobLog(LogReply {
         body: String::from_utf8(body.to_vec()).unwrap(),

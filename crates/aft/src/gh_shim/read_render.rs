@@ -369,6 +369,46 @@ pub(super) fn run(
     execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
     output: &mut impl Write,
 ) -> Result<i32, ReadError> {
+    // Remember the stdout error before renderers turn it into display text.
+    // A closed downstream reader is normal pipeline termination, unlike a
+    // failed jq child or a real output error such as a full disk.
+    struct Output<'a, W> {
+        writer: &'a mut W,
+        broken_pipe: bool,
+    }
+    impl<W: Write> Write for Output<'_, W> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let result = self.writer.write(bytes);
+            self.broken_pipe |= result
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe);
+            result
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            let result = self.writer.flush();
+            self.broken_pipe |= result
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe);
+            result
+        }
+    }
+    let mut output = Output {
+        writer: output,
+        broken_pipe: false,
+    };
+    let result = render(plan, execute, &mut output);
+    if output.broken_pipe {
+        Ok(0)
+    } else {
+        result
+    }
+}
+
+fn render(
+    plan: &Plan,
+    execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
+    output: &mut impl Write,
+) -> Result<i32, ReadError> {
     if let Some(request) = &plan.api {
         return api(plan, request, execute, output);
     }
