@@ -126,9 +126,10 @@ fn compress_build_like(output: &str) -> CompressionResult {
             // The block owns the diagnostic's own body only. A line that does
             // not continue it (another tool's verdict in a gate script) is not
             // the diagnostic's to lose when the block is capped.
+            let mut body = DiagnosticBody::default();
             while index < lines.len()
                 && !starts_next_build_message(lines[index])
-                && (lines[index].trim().is_empty() || is_diagnostic_continuation(lines[index]))
+                && body.continues(lines[index])
             {
                 index += 1;
             }
@@ -258,19 +259,84 @@ fn is_nextest_progress_line(trimmed: &str) -> bool {
             .is_some_and(|rest| rest.contains(" tests across "))
 }
 
-/// A line that continues the rustc diagnostic above it: the `-->` location,
-/// the source gutter (`   |`, `12 |`), `= note:` lines and elided-source dots.
-fn is_diagnostic_continuation(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    line.starts_with(char::is_whitespace)
-        || trimmed.starts_with("= ")
-        || trimmed.starts_with("...")
-        || trimmed.starts_with("help:")
-        || trimmed.starts_with("note:")
-        || trimmed.split_once('|').is_some_and(|(gutter, _)| {
-            let gutter = gutter.trim();
-            !gutter.is_empty() && gutter.chars().all(|char| char.is_ascii_digit())
+/// Follows the body of one rustc or clippy diagnostic line by line and says
+/// whether each line still belongs to it. A line belongs only when it has a
+/// shape the compiler prints; indentation alone proves nothing, because a gate
+/// script's indented verdict (`  win-check rc=101`) is just as indented. A
+/// blank line ends the body: rustc separates diagnostics with one and never
+/// puts one inside.
+#[derive(Default)]
+struct DiagnosticBody {
+    /// Column of the `=` of the last `= note:` / `= help:` line. rustc wraps a
+    /// long note onto following lines aligned past that `= label: ` prefix.
+    label_column: Option<usize>,
+}
+
+impl DiagnosticBody {
+    fn continues(&mut self, line: &str) -> bool {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if trimmed.is_empty() {
+            self.label_column = None;
+            return false;
+        }
+        if is_equals_label(trimmed) {
+            self.label_column = Some(indent);
+            return true;
+        }
+        // `= note: expected type `u32``
+        // `           found reference `&str``
+        if self
+            .label_column
+            .is_some_and(|column| indent > column + "= ".len())
+        {
+            return true;
+        }
+        self.label_column = None;
+        trimmed.starts_with("--> ")
+            || trimmed.starts_with("::: ")
+            || is_diagnostic_gutter(line)
+            || trimmed.starts_with('^')
+            || trimmed == "..."
+            || trimmed.starts_with("help:")
+            || trimmed.starts_with("note:")
+    }
+}
+
+/// `= note: ...`, `= help: ...` and the like: an indented `= ` followed by a
+/// lowercase word and a colon.
+fn is_equals_label(trimmed: &str) -> bool {
+    trimmed
+        .strip_prefix("= ")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(word, _)| {
+            !word.is_empty() && word.chars().all(|char| char.is_ascii_lowercase())
         })
+}
+
+/// The source gutter rustc draws down a diagnostic: `   |` (with carets,
+/// underlines or labels after it), `12 | code`, and a suggestion's diff lines
+/// `12 + code`, `12 - code`, `12 ~ code`. An unnumbered gutter is always
+/// indented; a diff marker always follows a line number.
+fn is_diagnostic_gutter(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let digits = trimmed.len()
+        - trimmed
+            .trim_start_matches(|char: char| char.is_ascii_digit())
+            .len();
+    let after_number = &trimmed[digits..];
+    let marker_text = after_number.trim_start();
+    let mut marker = marker_text.chars();
+    let Some(symbol) = marker.next() else {
+        return false;
+    };
+    let marker_ends = marker.next().is_none_or(char::is_whitespace);
+    if digits == 0 {
+        return line.starts_with(char::is_whitespace) && symbol == '|' && marker_ends;
+    }
+    after_number.starts_with(char::is_whitespace)
+        && matches!(symbol, '|' | '+' | '-' | '~')
+        && marker_ends
 }
 
 /// Mark the lines of a `cargo test` run that its summary may leave out because
@@ -279,23 +345,23 @@ fn is_diagnostic_continuation(line: &str) -> bool {
 /// somebody's report (a test's printed output, another check's verdict in a
 /// gate script) and must be kept verbatim and in order.
 fn test_noise_mask(lines: &[&str]) -> Vec<bool> {
-    let mut in_warning = false;
+    let mut warning: Option<DiagnosticBody> = None;
     lines
         .iter()
         .map(|line| {
             let trimmed = line.trim();
             if trimmed.is_empty() {
-                in_warning = false;
+                warning = None;
                 return true;
             }
             if trimmed.starts_with("warning:") {
-                in_warning = true;
+                warning = Some(DiagnosticBody::default());
                 return true;
             }
-            if in_warning && is_diagnostic_continuation(line) {
+            if warning.as_mut().is_some_and(|body| body.continues(line)) {
                 return true;
             }
-            in_warning = false;
+            warning = None;
             is_test_progress_line(trimmed) || is_cargo_status_line(line)
         })
         .collect()
@@ -796,6 +862,114 @@ error: could not compile `demo` (lib test) due to 1 previous error
             result.text
         );
         assert!(!result.text.contains("test a ... ok"), "{}", result.text);
+    }
+
+    /// One clippy-style warning carrying every continuation shape rustc and
+    /// clippy print: locators, gutters, labels under carets and underlines,
+    /// elided source, `= note:` text wrapped onto an aligned line, `= help:`,
+    /// a suggestion diff and bare `help:`/`note:` sub-diagnostics. Every line
+    /// names `w{index}`, so a test can tell whether the whole warning went.
+    fn full_warning(index: usize) -> String {
+        let line = index + 1;
+        format!(
+            "warning: mismatched value `w{index}`\n\
+             \x20 --> src/lib.rs:{line}:9\n\
+             \x20  | w{index}\n\
+             {line} |     let w{index}: u32 = \"w{index}\";\n\
+             \x20  |            ---   ^^^^^ expected `u32`, found `&str` for w{index}\n\
+             \x20  |            |\n\
+             \x20  |            expected due to this w{index}\n\
+             ...\n\
+             \x20  = note: expected type `u32` for w{index}\n\
+             \x20             found reference `&'static str` for w{index}\n\
+             \x20  = help: for further information visit https://example.invalid/w{index}\n\
+             help: try a number for w{index}\n\
+             \x20  |\n\
+             {line} -     let w{index}: u32 = \"w{index}\";\n\
+             {line} +     let w{index}: u32 = 1;\n\
+             \x20  | w{index}\n\
+             note: the lint level for w{index} is defined here\n\
+             \x20 ::: src/main.rs:1:9 w{index}\n"
+        )
+    }
+
+    /// Eleven full warnings, one over the warning cap, with `separator` and an
+    /// indented verdict from another tool after the eleventh.
+    fn capped_warnings_then_indented_verdict(separator: &str) -> String {
+        let mut output = String::from("    Checking demo v0.1.0 (/tmp/demo)\n");
+        for index in 0..11 {
+            if index > 0 {
+                output.push('\n');
+            }
+            output.push_str(&full_warning(index));
+        }
+        output.push_str(separator);
+        output.push_str("  win-check rc=101\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.50s\n");
+        output
+    }
+
+    #[test]
+    fn build_like_diagnostic_block_owns_every_continuation_shape() {
+        let output = capped_warnings_then_indented_verdict("\n");
+
+        let result = compress_build_like(&output);
+
+        assert_eq!(result.dropped_by_class.get(&DropClass::Warning), Some(&1));
+        // The capped eleventh warning goes whole: none of its lines is left
+        // behind as a separate line.
+        assert!(!result.text.contains("w10"), "{}", result.text);
+        // The kept warnings keep their whole bodies.
+        for shape in [
+            "  --> src/lib.rs:10:9",
+            "10 |     let w9: u32 = \"w9\";",
+            "expected due to this w9",
+            "              found reference `&'static str` for w9",
+            "   = help: for further information visit https://example.invalid/w9",
+            "10 +     let w9: u32 = 1;",
+            "  ::: src/main.rs:1:9 w9",
+        ] {
+            assert!(result.text.contains(shape), "{shape}: {}", result.text);
+        }
+    }
+
+    #[test]
+    fn build_like_summaries_keep_an_indented_verdict_after_a_capped_warning() {
+        for separator in ["", "\n"] {
+            let output = capped_warnings_then_indented_verdict(separator);
+            assert!(output.len() > SHORT_OUTPUT_BYTES);
+            for command in ["cargo build", "cargo check", "cargo clippy"] {
+                let result = CargoCompressor.compress_with_exit_code(command, &output, Some(0));
+
+                assert!(
+                    result.text.contains("\n  win-check rc=101\n"),
+                    "{command} {separator:?}: {}",
+                    result.text
+                );
+                assert!(
+                    !result.text.contains("w10"),
+                    "{command} {separator:?}: {}",
+                    result.text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_test_summary_keeps_an_indented_verdict_after_a_warning() {
+        for separator in ["", "\n"] {
+            let output = format!(
+                "{}{separator}  win-check rc=101\nrunning 1 test\ntest a ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
+                full_warning(0)
+            );
+
+            let result = compress_test(&output, Some(0));
+
+            assert_eq!(
+                result.text,
+                "  win-check rc=101\nrunning 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+                "{separator:?}"
+            );
+        }
     }
 
     #[test]
