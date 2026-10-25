@@ -511,7 +511,7 @@ impl BindAckLatencies {
 #[derive(Default)]
 struct FrameOperation {
     corr: u64,
-    op: String,
+    op: &'static str,
     root: String,
     session: String,
     awaited: &'static str,
@@ -864,7 +864,7 @@ impl DispatchPathMetrics {
             .store(self.now_ms(), Ordering::Relaxed);
     }
 
-    pub(super) fn mark_frame_loop_step(&self, entry: &str, command: &str, request_id: u64) {
+    pub(super) fn mark_frame_loop_step(&self, entry: &'static str, command: &str, request_id: u64) {
         self.frame_loop_step
             .enter(entry, command, request_id, self.now_ms());
         self.frame_loop_phase.store(0, Ordering::Relaxed);
@@ -911,25 +911,43 @@ impl DispatchPathMetrics {
         deadline != 0 && self.now_ms() >= deadline
     }
 
-    pub(super) fn mark_frame_loop_entry(&self, entry: &str, frame: &Frame) {
-        let body = serde_json::from_slice::<Value>(&frame.body).ok();
-        let command = body.as_ref().and_then(|body| {
-            body.get("name")
-                .or_else(|| body.get("command"))
-                .or_else(|| body.get("op"))
-                .and_then(Value::as_str)
-        });
-        self.frame_loop_step.enter(
-            entry,
-            command.unwrap_or(&format!("{:?}", frame.header.ty).to_lowercase()),
-            frame.header.corr,
-            self.now_ms(),
-        );
+    pub(super) fn mark_frame_loop_entry(&self, entry: &'static str, frame: &Frame) {
+        let command = match frame.header.ty {
+            super::FrameType::Ping => "ping",
+            super::FrameType::Pong => "pong",
+            _ => "",
+        };
+        self.frame_loop_step
+            .enter(entry, command, frame.header.corr, self.now_ms());
+    }
+
+    pub(super) fn mark_frame_loop_command(&self, entry: &'static str, name: &str, request_id: u64) {
+        self.frame_loop_step
+            .enter(entry, name, request_id, self.now_ms());
     }
 
     pub(super) fn mark_frame_loop_tool(&self, name: &str, request_id: u64) {
-        self.frame_loop_step
-            .enter("handle_tool_call", name, request_id, self.now_ms());
+        self.mark_frame_loop_command("handle_tool_call", name, request_id);
+    }
+
+    pub(super) fn mark_frame_loop_control(
+        &self,
+        request: &super::ModuleControlRequest,
+        frame: &Frame,
+    ) {
+        let (name, awaited) = match request {
+            super::ModuleControlRequest::RouteBind { .. } => ("route_bind", "control_validation"),
+            super::ModuleControlRequest::HealthCheck {} => ("health_check", "cached_health"),
+        };
+        self.mark_frame_loop_command("handle_control_request", name, frame.header.corr);
+        if let Ok(mut operation) = self.frame_operation.try_lock() {
+            operation.op = name;
+            operation.awaited = awaited;
+            if let super::ModuleControlRequest::RouteBind { identity, .. } = request {
+                operation.root = identity.project_root.to_string_lossy().into_owned();
+                operation.session.clone_from(&identity.session);
+            }
+        }
     }
 
     pub(super) fn mark_frame_loop_frame(&self, frame: &Frame) {
@@ -945,25 +963,20 @@ impl DispatchPathMetrics {
         if let Ok(mut operation) = self.frame_operation.try_lock() {
             *operation = FrameOperation {
                 corr: frame.header.corr,
-                op: format!("{:?}", frame.header.ty).to_lowercase(),
+                op: match frame.header.ty {
+                    super::FrameType::Request => "request",
+                    super::FrameType::Response => "response",
+                    super::FrameType::Ping => "ping",
+                    super::FrameType::Pong => "pong",
+                    super::FrameType::Error => "error",
+                    super::FrameType::Cancel => "cancel",
+                    super::FrameType::Goodbye => "goodbye",
+                    super::FrameType::Push => "push",
+                    _ => "frame",
+                },
                 awaited: "none",
                 ..FrameOperation::default()
             };
-            if frame.header.channel == 0 && frame.header.ty == super::FrameType::Request {
-                match serde_json::from_slice::<super::ModuleControlRequest>(&frame.body) {
-                    Ok(super::ModuleControlRequest::RouteBind { identity, .. }) => {
-                        operation.op = "route_bind".to_string();
-                        operation.root = identity.project_root.to_string_lossy().into_owned();
-                        operation.session = identity.session;
-                        operation.awaited = "control_validation";
-                    }
-                    Ok(super::ModuleControlRequest::HealthCheck {}) => {
-                        operation.op = "health_check".to_string();
-                        operation.awaited = "cached_health";
-                    }
-                    Err(_) => operation.op = "invalid_control_request".to_string(),
-                }
-            }
         }
         self.frame_loop_phase.store(2, Ordering::Release);
     }

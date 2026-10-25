@@ -823,34 +823,35 @@ mod tests {
     fn frame_loop_context_names_control_operation_root_and_session() {
         use super::super::*;
         let metrics = DispatchPathMetrics::new();
+        let request = ModuleControlRequest::RouteBind {
+            route_channel: 125,
+            epoch: 1,
+            target: subc_protocol::RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+            identity: subc_protocol::BindIdentity::new(
+                PathBuf::from("/isolated/root"),
+                "runner".to_string(),
+                "sidekick-session".to_string(),
+            ),
+            principal: None,
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        };
         let frame = Frame::build(
             FrameType::Request,
             control_flags(),
             0,
             0,
             133,
-            serde_json::to_vec(&ModuleControlRequest::RouteBind {
-                route_channel: 125,
-                epoch: 1,
-                target: subc_protocol::RouteTarget::ToolProvider {
-                    module_id: "aft".to_string(),
-                },
-                identity: subc_protocol::BindIdentity::new(
-                    PathBuf::from("/isolated/root"),
-                    "runner".to_string(),
-                    "sidekick-session".to_string(),
-                ),
-                principal: None,
-                consumer_capabilities: None,
-                admission_facts: Default::default(),
-                scope: None,
-                role_versions: None,
-                call_mode: None,
-            })
-            .unwrap(),
+            serde_json::to_vec(&request).unwrap(),
         )
         .unwrap();
         metrics.mark_frame_loop_frame(&frame);
+        metrics.mark_frame_loop_control(&request, &frame);
         let diagnostics = crate::lock_diagnostics::LockDiagnostics::new("executor_holder.rs");
         let _held = diagnostics.hold();
         metrics.mark_frame_loop_wait(

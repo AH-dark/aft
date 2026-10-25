@@ -7593,6 +7593,7 @@ async fn handle_control_request(
         Ok(request) => request,
         Err(error) => return refuse_undecodable_control_request(tx, frame, &error, metrics).await,
     };
+    metrics.mark_frame_loop_control(&request, frame);
     match request {
         ModuleControlRequest::RouteBind {
             route_channel,
@@ -8098,6 +8099,7 @@ async fn handle_management_request(
         return send_reliable_writer_frame(tx, metrics, error, "management refusal").await;
     };
 
+    metrics.mark_frame_loop_command("handle_management_request", operation, frame.header.corr);
     let result = match operation {
         crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION => {
             let params = decoded
