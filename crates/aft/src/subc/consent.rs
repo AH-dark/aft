@@ -11,6 +11,9 @@
 //! (never more than 100 s); an ask still open then ends the call with
 //! `access_pending`, and the persisted ask (see [`crate::db::access_asks`]) lets
 //! the retried call pick up the same Cingulate ask by its original call key.
+//! Once an answer arrives, local application gets a separate bounded wait;
+//! exhausting that wait asks for an immediate retry, not another notification
+//! from Cingulate.
 //!
 //! Wire contract (Cingulate's requester contract, `tool_permission` asks): a
 //! management-surface route to the `cingulate` module, opened by AFT's own
@@ -53,6 +56,20 @@ const MAX_HOLD: Duration = Duration::from_secs(100);
 const SIGNAL_POLL: Duration = Duration::from_millis(100);
 /// Bound on one `consent.request` or `consent.withdraw` round trip.
 const UNARY_TIMEOUT: Duration = Duration::from_secs(10);
+/// A received answer must not depend on a second notification from Cingulate.
+const SETTLED_WAIT: Duration = Duration::from_secs(5);
+const ACCESS_RETRY_MESSAGE: &str = "The permission answer has been received but is still being applied. Retry this same call now; do not wait for another resume.";
+
+fn settled_wait_budget() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = tests::SETTLED_WAIT_OVERRIDE_MS.load(Ordering::SeqCst);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    SETTLED_WAIT
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ConsentError {
@@ -603,9 +620,203 @@ enum Hold {
     },
     /// End the call with this response.
     Answer(Response),
+    /// An overlapping call owns the one-time approval; reuse its result only.
+    Shared((Response, Option<String>)),
     /// Nobody waits for this call any more (cancelled, route closed, transport
     /// gone); the caller sends nothing.
     Abandoned,
+}
+
+#[derive(Clone)]
+struct SharedReply {
+    success: bool,
+    data: Value,
+    text: Option<String>,
+}
+
+/// Tracks only overlapping dispatches, not a cache of reusable approvals.
+struct SettlementFlight {
+    root: PathBuf,
+    session: String,
+    binding: Value,
+    key: AskKey,
+    member: Arc<()>,
+    group: Arc<SettlementGroup>,
+}
+
+/// Members retain the result while they overlap, even after its publisher exits.
+/// The owner token identifies the only publisher without retaining its flight.
+struct SettlementGroup {
+    owner: StdMutex<Option<Arc<()>>>,
+    settled: AtomicBool,
+    done: tokio::sync::watch::Sender<Option<Option<SharedReply>>>,
+}
+
+static SETTLEMENT_FLIGHTS: LazyLock<StdMutex<Vec<std::sync::Weak<SettlementFlight>>>> =
+    LazyLock::new(|| StdMutex::new(Vec::new()));
+
+struct SettlementOwner(Arc<SettlementFlight>);
+
+impl SettlementOwner {
+    fn new(call: &HeldCall) -> Self {
+        let mut flight = SettlementFlight {
+            root: call.identity.root.clone().into(),
+            session: call.identity.session.clone(),
+            binding: serde_json::to_value(&call.identity.scope).expect("scope stamp is JSON"),
+            key: AskKey {
+                scope: access_grants::scope_key(&call.identity),
+                args_hash: args_hash(&call.identity, &call.tool, &call.arguments),
+            },
+            member: Arc::new(()),
+            group: Arc::new(SettlementGroup {
+                owner: StdMutex::new(None),
+                settled: AtomicBool::new(false),
+                done: tokio::sync::watch::channel(None).0,
+            }),
+        };
+        let mut flights = SETTLEMENT_FLIGHTS.lock().unwrap();
+        let retain_overlap = true;
+        #[cfg(test)]
+        let retain_overlap =
+            retain_overlap && tests::SETTLED_GROUP_RETENTION_ENABLED.load(Ordering::SeqCst);
+        if retain_overlap {
+            if let Some(other) = flights
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .find(|other| {
+                    other.root == flight.root
+                        && other.session == flight.session
+                        && other.binding == flight.binding
+                        && other.key == flight.key
+                    // A published group belongs to calls that overlapped it; a call that
+                    // arrives after publication needs its own approval.
+                    && other.group.done.borrow().is_none()
+                })
+            {
+                // Join before either receipt arrives. Looking up only settled
+                // flights can miss a publisher that already returned and dropped.
+                flight.group = Arc::clone(&other.group);
+            }
+        }
+        let flight = Arc::new(flight);
+        flights.push(Arc::downgrade(&flight));
+        Self(flight)
+    }
+
+    fn complete(&self, result: &Option<(Response, Option<String>)>) {
+        if !self.0.owns_group() {
+            return;
+        }
+        self.0
+            .group
+            .done
+            .send_replace(Some(result.as_ref().map(|(response, text)| SharedReply {
+                success: response.success,
+                data: response.data.clone(),
+                text: text.clone(),
+            })));
+    }
+}
+
+impl Drop for SettlementOwner {
+    fn drop(&mut self) {
+        if self.0.owns_group() && self.0.group.done.borrow().is_none() {
+            self.0.group.done.send_replace(Some(None));
+        }
+        SETTLEMENT_FLIGHTS.lock().unwrap().retain(|flight| {
+            flight
+                .upgrade()
+                .is_some_and(|flight| !Arc::ptr_eq(&flight, &self.0))
+        });
+    }
+}
+
+impl SettlementFlight {
+    fn owns_group(&self) -> bool {
+        self.group
+            .owner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, &self.member))
+    }
+
+    /// Elect one application owner even if two open awaits receive the answer.
+    fn other_settled(self: &Arc<Self>, receiving: bool) -> Option<Arc<SettlementGroup>> {
+        #[cfg(test)]
+        if !tests::SETTLED_JOIN_ENABLED.load(Ordering::SeqCst) {
+            return None;
+        }
+        let mut owner = self.group.owner.lock().unwrap();
+        if let Some(publisher) = owner.as_ref() {
+            if !Arc::ptr_eq(publisher, &self.member) {
+                return (receiving
+                    || self.group.settled.load(Ordering::SeqCst)
+                    || self.group.done.borrow().is_some())
+                .then(|| Arc::clone(&self.group));
+            }
+        } else if receiving {
+            *owner = Some(Arc::clone(&self.member));
+        }
+        if receiving {
+            self.group.settled.store(true, Ordering::SeqCst);
+        }
+        None
+    }
+}
+
+impl SettlementGroup {
+    async fn result(
+        &self,
+        call: &HeldCall,
+        grant: &AccessGrant,
+        route_hold: &RouteHold,
+    ) -> Option<(Response, Option<String>)> {
+        let mut done = self.done.subscribe();
+        #[cfg(test)]
+        tests::settled_waiter_joined();
+        let wait = settled_wait_budget().min(
+            call.reply_deadline
+                .saturating_duration_since(Instant::now()),
+        );
+        let waiting = tokio::time::timeout(wait, async {
+            loop {
+                if let Some(result) = done.borrow_and_update().clone() {
+                    break result;
+                }
+                if done.changed().await.is_err() {
+                    break None;
+                }
+            }
+        });
+        tokio::pin!(waiting);
+        let result = loop {
+            tokio::select! {
+                result = &mut waiting => break result,
+                _ = tokio::time::sleep(SIGNAL_POLL) => match stop_signal(call, route_hold) {
+                    Some(Stop::Detach | Stop::Withdraw) => return None,
+                    Some(Stop::RunEnded) => return Some((refused_answer(call, grant, "access_withdrawn", None), None)),
+                    None => {}
+                }
+            }
+        };
+        match result {
+            Ok(Some(reply)) => Some((
+                Response {
+                    id: call.request_id.clone(),
+                    success: reply.success,
+                    data: reply.data,
+                },
+                reply.text,
+            )),
+            _ => {
+                crate::log_ctx::with_session(Some(call.identity.session.clone()), || {
+                    crate::slog_warn!("consent settled result wait ended without completion");
+                });
+                Some((retry_answer(call, grant), None))
+            }
+        }
+    }
 }
 
 /// Keep ownership of an approval from the blocking claim through its rerun.
@@ -682,7 +893,7 @@ impl Drop for ClaimedAsk {
 pub(super) async fn run_with_consent<F, Fut>(
     call: HeldCall,
     first: (Response, String),
-    mut rerun: F,
+    rerun: F,
 ) -> Option<(Response, Option<String>)>
 where
     F: FnMut(AskRoute) -> Fut,
@@ -701,10 +912,29 @@ where
             None,
         ));
     }
-    let Some(mut grant) = requested_ask(&first.0) else {
+    let Some(grant) = requested_ask(&first.0) else {
         return Some((first.0, Some(first.1)));
     };
+    let owner = SettlementOwner::new(&call);
+    let result = run_held(&call, grant, rerun, &owner.0).await;
+    owner.complete(&result);
+    result
+}
+
+async fn run_held<F, Fut>(
+    call: &HeldCall,
+    mut grant: AccessGrant,
+    mut rerun: F,
+    flight: &Arc<SettlementFlight>,
+) -> Option<(Response, Option<String>)>
+where
+    F: FnMut(AskRoute) -> Fut,
+    Fut: Future<Output = (Response, String)>,
+{
     let route_hold = RouteHold::new(call.route);
+    if let Some(other) = flight.other_settled(false) {
+        return other.result(call, &grant, &route_hold).await;
+    }
     let deadline = (Instant::now() + hold_budget(None)).min(
         call.reply_deadline
             .checked_sub(RERUN_MARGIN)
@@ -713,7 +943,7 @@ where
     let mut holder: Option<Arc<ClaimedAsk>> = None;
     loop {
         let own = holder.as_ref().map(|claim| claim.holder.clone());
-        match hold(&call, grant, deadline, &route_hold, own).await {
+        match hold(call, grant, deadline, &route_hold, own, flight).await {
             Hold::Run { once, claim } => {
                 claim.retry_after_deadline.store(false, Ordering::SeqCst);
                 holder = Some(claim);
@@ -746,7 +976,11 @@ where
                     }
                 };
                 match requested_ask(&response) {
-                    Some(next) => grant = next,
+                    Some(next) => {
+                        // A new outside path has its own unanswered question.
+                        flight.group.settled.store(false, Ordering::SeqCst);
+                        grant = next;
+                    }
                     None => {
                         if let Some(claim) = holder.take() {
                             // The approvals are used up by this run, whatever it returned.
@@ -757,6 +991,7 @@ where
                 }
             }
             Hold::Answer(response) => return Some((response, None)),
+            Hold::Shared(result) => return Some(result),
             Hold::Abandoned => return None,
         }
     }
@@ -1580,6 +1815,10 @@ fn pending_answer(call: &HeldCall, grant: &AccessGrant) -> Response {
     )
 }
 
+fn retry_answer(call: &HeldCall, grant: &AccessGrant) -> Response {
+    answer(call, "access_retry", ACCESS_RETRY_MESSAGE.to_owned(), grant)
+}
+
 fn unavailable_answer(call: &HeldCall, grant: &AccessGrant, detail: &str) -> Response {
     answer(
         call,
@@ -1710,6 +1949,7 @@ async fn hold(
     deadline: Instant,
     route_hold: &RouteHold,
     own_holder: Option<String>,
+    flight: &Arc<SettlementFlight>,
 ) -> Hold {
     if !consent_path_representable(&grant.path) {
         let mut response = refused_answer(call, &grant, "access_not_placed", None);
@@ -1736,7 +1976,17 @@ async fn hold(
     .await;
     let prep = match prepared {
         Ok(Prep::Ask(prep)) => prep,
-        Ok(Prep::Busy) => return Hold::Answer(pending_answer(call, &grant)),
+        Ok(Prep::Busy) => {
+            return match flight.other_settled(false) {
+                Some(other) => match other.result(call, &grant, route_hold).await {
+                    Some(result) => Hold::Shared(result),
+                    None => Hold::Abandoned,
+                },
+                // A claimed row has already received an answer. Its owner may
+                // have been cancelled while asynchronous cleanup is still running.
+                None => Hold::Answer(retry_answer(call, &grant)),
+            };
+        }
         Err(error) => return Hold::Answer(unavailable_answer(call, &grant, &error)),
     };
     let Some(transport) = transport() else {
@@ -1789,6 +2039,9 @@ async fn hold(
         first = false;
         let wait = deadline.saturating_duration_since(now).min(MAX_AWAIT);
         let applied = Arc::new(StdMutex::new(None));
+        let settled_received = Arc::new(AtomicBool::new(false));
+        let receipt_settled = Arc::clone(&settled_received);
+        let receipt_flight = Arc::clone(flight);
         let retry_after_deadline = Arc::new(AtomicBool::new(false));
         let receipt_retry = Arc::clone(&retry_after_deadline);
         let received = Arc::clone(&applied);
@@ -1807,6 +2060,18 @@ async fn hold(
                 Box::pin(async move {
                     if let Ok(settled) = decode_record(&record) {
                         if settled != Settlement::Pending {
+                            receipt_settled.store(true, Ordering::SeqCst);
+                            if let Some(other) = receipt_flight.other_settled(true) {
+                                let route_hold = RouteHold::new(receipt_call.route);
+                                let result = other
+                                    .result(&receipt_call, &receipt_prep.grant, &route_hold)
+                                    .await;
+                                *received.lock().unwrap() = Some(match result {
+                                    Some(result) => Hold::Shared(result),
+                                    None => Hold::Abandoned,
+                                });
+                                return Ok(record);
+                            }
                             log_consent(
                                 &receipt_call.identity.session,
                                 ConsentEvent::Settled(&settled),
@@ -1831,6 +2096,7 @@ async fn hold(
             }),
         );
         tokio::pin!(awaited);
+        let mut local_deadline = None;
         let reply = loop {
             tokio::select! {
                 reply = &mut awaited => break Some(reply),
@@ -1846,6 +2112,25 @@ async fn hold(
                             return Hold::Answer(refused_answer(call, &prep.grant, "access_withdrawn", None));
                         }
                         None if Instant::now() >= deadline => {
+                            let received_settlement = settled_received.load(Ordering::SeqCst);
+                            #[cfg(test)]
+                            let received_settlement = received_settlement && tests::SETTLED_DEADLINE_ENABLED.load(Ordering::SeqCst);
+                            if received_settlement {
+                                if let Some(result) = applied.lock().unwrap().take() {
+                                    return result;
+                                }
+                                let bound = local_deadline.get_or_insert_with(|| (Instant::now() + settled_wait_budget()).min(call.reply_deadline));
+                                #[cfg(test)]
+                                tests::settled_deadline_waiting();
+                                if Instant::now() < *bound {
+                                    continue;
+                                }
+                                retry_after_deadline.store(true, Ordering::SeqCst);
+                                crate::log_ctx::with_session(Some(call.identity.session.clone()), || {
+                                    crate::slog_warn!("consent settled application exceeded local wait bound ask={elicitation}");
+                                });
+                                return Hold::Answer(retry_answer(call, &prep.grant));
+                            }
                             // Mark expiry before dropping the receipt: its blocking
                             // claim can still complete after we promise a retry.
                             retry_after_deadline.store(true, Ordering::SeqCst);
@@ -1908,6 +2193,13 @@ async fn finish(
     retry_after_deadline: Arc<AtomicBool>,
     elicitation: &str,
 ) -> Hold {
+    #[cfg(test)]
+    if matches!(settled, Settlement::Deny { .. } | Settlement::Refused(_)) {
+        let request = call.request_id.clone();
+        tokio::task::spawn_blocking(move || tests::wait_at_finish(&request, false))
+            .await
+            .expect("refusal application gate completes");
+    }
     match settled {
         Settlement::Pending => unreachable!("finish runs on settled answers"),
         Settlement::Deny { note } => {
@@ -1997,7 +2289,7 @@ async fn finish(
                     "access_declined",
                     Some("the head no longer holds this permission itself"),
                 )),
-                Ok(Applied::NotClaimed) => Hold::Answer(pending_answer(call, &prep.grant)),
+                Ok(Applied::NotClaimed) => Hold::Answer(retry_answer(call, &prep.grant)),
                 Err(error) => Hold::Answer(unavailable_answer(call, &prep.grant, &error)),
             }
         }
