@@ -686,9 +686,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "views/reference_sidecar.rs",
-        enclosing_item: "directory_has_room",
+        enclosing_item: "free_slots",
         location_or_primitive: "take(limit.saturating_add(1))",
-        reason: "internal count of view-directory entries before writing a reference sidecar; counting stops just past the limit because only 'over the limit or not' matters, and a skipped sidecar only means blob GC decodes that manifest",
+        reason: "internal count of view-directory entries, taken once per blob scan or publication, that bounds how many reference sidecars may be added; counting stops just past the limit because only the free slots below it matter, and a skipped sidecar only means blob GC decodes that manifest",
     },
     ExclusionEntry {
         file: "gc/mod.rs",

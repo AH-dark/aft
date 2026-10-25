@@ -566,6 +566,8 @@ fn publication_writes_a_reference_sidecar_matching_its_manifest() {
         std::time::Duration::from_secs(3600),
     );
     let mut seen = Vec::new();
+    // Room is not under test here.
+    let mut unlimited = usize::MAX;
     let source = sidecars
         .visit(
             view.view_dir(),
@@ -575,6 +577,7 @@ fn publication_writes_a_reference_sidecar_matching_its_manifest() {
                 seen = vec![[0_u8; 32]; keys.len()];
                 keys.read(0, &mut seen)
             },
+            &mut unlimited,
         )
         .unwrap();
     assert_eq!(source, crate::views::reference_sidecar::KeySource::Sidecar);

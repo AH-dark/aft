@@ -270,19 +270,22 @@ fn encode(stamp: &FileStamp, origin: u32, derived_at: i128, keys: &[[u8; 32]]) -
     bytes
 }
 
-/// Whether `view` can take `needed` more entries without exceeding `limit`,
-/// the directory size that blob scans and generation cleanup examine in one
-/// pass. Counting stops just past the limit.
-fn directory_has_room(view: &Path, needed: usize, limit: usize) -> bool {
+/// How many more entries `view` can take without exceeding `limit`, the
+/// directory size that blob scans and generation cleanup examine in one pass.
+/// One bounded listing; counting stops just past the limit.
+pub(crate) fn free_slots(view: &Path, limit: usize) -> usize {
+    #[cfg(test)]
+    super::generation::note_directory_listing(view);
     let Ok(entries) = fs::read_dir(view) else {
-        return false;
+        return 0;
     };
-    let present = entries.take(limit.saturating_add(1)).count();
-    present.saturating_add(needed) <= limit
+    limit.saturating_sub(entries.take(limit.saturating_add(1)).count())
 }
 
 /// Write `keys` (sorted, unique) as the sidecar of the manifest at
-/// `view/manifest-<generation>.json` whose stamp is `stamp`.
+/// `view/manifest-<generation>.json` whose stamp is `stamp`. `slots` is
+/// the caller's running count of entries the directory can still take; a
+/// written sidecar spends one, so a scan counts the directory only once.
 fn write_sidecar(
     view: &Path,
     generation: &str,
@@ -290,7 +293,7 @@ fn write_sidecar(
     origin: u32,
     derived_at: i128,
     keys: &[[u8; 32]],
-    directory_limit: usize,
+    slots: &mut usize,
 ) -> std::io::Result<()> {
     let path = view.join(sidecar_name(generation));
     crate::production_storage::refuse_write(&path)?;
@@ -298,8 +301,9 @@ fn write_sidecar(
     // sidecar itself. A sidecar must never be what pushes a view directory
     // over the limit: blob marking would then refuse the whole directory.
     // Without one, blob GC decodes this manifest's JSON instead.
-    let needed = if path.exists() { 1 } else { 2 };
-    if !directory_has_room(view, needed, directory_limit) {
+    let new = !path.exists();
+    let needed = if new { 2 } else { 1 };
+    if *slots < needed {
         return Err(std::io::Error::other(
             "view directory is at the generation directory limit; sidecar not written",
         ));
@@ -311,6 +315,10 @@ fn write_sidecar(
         &encode(stamp, origin, derived_at, keys),
         crate::durability::AtomicWriteDurability::File,
     )?;
+    // The temporary file is gone again; a new sidecar keeps one entry.
+    if new {
+        *slots -= 1;
+    }
     // Generation cleanup may have retired the manifest while the keys were
     // being written. A sidecar must not outlive its manifest, so take it back
     // out when the manifest is no longer the file it describes.
@@ -348,7 +356,7 @@ pub(crate) fn write_published(
         ORIGIN_PUBLISHER,
         derived_at,
         &keys,
-        super::generation::GENERATION_DIRECTORY_LIMIT,
+        &mut free_slots(view, super::generation::GENERATION_DIRECTORY_LIMIT),
     )
 }
 
@@ -390,15 +398,23 @@ impl ReferenceSidecars {
         self.verified().clear();
     }
 
+    /// Entries a view directory holding `listed` entries can still take for
+    /// new sidecars during one scan.
+    pub(crate) fn scan_slots(&self, listed: usize) -> usize {
+        self.directory_limit.saturating_sub(listed)
+    }
+
     /// Show `generation`'s keys to `visit` exactly once, from its sidecar when
     /// that is valid for the manifest on disk, and otherwise by decoding the
-    /// manifest JSON with `decode` (and saving a sidecar for next time).
+    /// manifest JSON with `decode` (and saving a sidecar for next time, if
+    /// `free_slots` leaves room for it).
     pub(crate) fn visit(
         &self,
         view: &Path,
         generation: &str,
         decode: impl FnOnce(&[u8]) -> super::Result<BTreeSet<[u8; 32]>>,
         visit: &mut dyn FnMut(&dyn SortedKeys) -> std::io::Result<()>,
+        free_slots: &mut usize,
     ) -> super::Result<KeySource> {
         let manifest = view.join(format!("manifest-{generation}.json"));
         let stamp = FileStamp::of(&fs::metadata(&manifest)?);
@@ -434,7 +450,7 @@ impl ReferenceSidecars {
             ORIGIN_DERIVED,
             now,
             &keys,
-            self.directory_limit,
+            free_slots,
         ) {
             Ok(()) => true,
             Err(error) => {
@@ -557,10 +573,16 @@ mod tests {
     ) -> (KeySource, Vec<[u8; 32]>) {
         let mut seen = Vec::new();
         let source = sidecars
-            .visit(view, generation, decode, &mut |keys| {
-                seen = vec![[0_u8; 32]; keys.len()];
-                keys.read(0, &mut seen)
-            })
+            .visit(
+                view,
+                generation,
+                decode,
+                &mut |keys| {
+                    seen = vec![[0_u8; 32]; keys.len()];
+                    keys.read(0, &mut seen)
+                },
+                &mut free_slots(view, sidecars.directory_limit),
+            )
             .unwrap();
         (source, seen)
     }
@@ -788,15 +810,23 @@ mod tests {
             .collect();
         write_manifest(view.path(), "g", &keys.concat());
         visit_keys(&sidecars, view.path(), "g");
+        // Room is not under test here.
+        let mut unlimited = usize::MAX;
         sidecars
-            .visit(view.path(), "g", decode, &mut |run| {
-                assert_eq!(run.len(), keys.len());
-                let mut window = [[0_u8; 32]; 7];
-                run.read(500, &mut window)?;
-                assert_eq!(window, keys[500..507]);
-                assert!(run.read(995, &mut window).is_err());
-                Ok(())
-            })
+            .visit(
+                view.path(),
+                "g",
+                decode,
+                &mut |run| {
+                    assert_eq!(run.len(), keys.len());
+                    let mut window = [[0_u8; 32]; 7];
+                    run.read(500, &mut window)?;
+                    assert_eq!(window, keys[500..507]);
+                    assert!(run.read(995, &mut window).is_err());
+                    Ok(())
+                },
+                &mut unlimited,
+            )
             .unwrap();
     }
 }

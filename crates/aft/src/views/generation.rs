@@ -195,6 +195,8 @@ fn bounded_directory_entries(
     skip: usize,
     limit: usize,
 ) -> Result<(Vec<fs::DirEntry>, bool)> {
+    #[cfg(test)]
+    note_directory_listing(directory);
     let mut entries = fs::read_dir(directory)?
         .skip(skip)
         .take(limit.saturating_add(1))
@@ -206,6 +208,29 @@ fn bounded_directory_entries(
 
 /// Where the next cleanup window starts in each oversized view directory.
 static OVERSIZED_WINDOWS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    /// Listings of each view directory made on this thread, for tests that
+    /// bound how often a scan enumerates a directory.
+    static DIRECTORY_LISTINGS: std::cell::RefCell<HashMap<PathBuf, usize>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+#[cfg(test)]
+pub(super) fn note_directory_listing(directory: &Path) {
+    DIRECTORY_LISTINGS.with(|listings| {
+        *listings
+            .borrow_mut()
+            .entry(directory.to_path_buf())
+            .or_default() += 1;
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn take_directory_listings(directory: &Path) -> usize {
+    DIRECTORY_LISTINGS.with(|listings| listings.borrow_mut().remove(directory).unwrap_or(0))
+}
 
 #[derive(Deserialize)]
 struct ReferenceCensus {
@@ -478,7 +503,12 @@ impl ViewStore {
             &dyn super::reference_sidecar::SortedKeys,
         ) -> std::io::Result<()>,
     ) -> Result<()> {
-        for entry in generation_directory_entries(self.view_dir(), GENERATION_DIRECTORY_LIMIT)? {
+        let entries = generation_directory_entries(self.view_dir(), GENERATION_DIRECTORY_LIMIT)?;
+        // The listing above is the only count of this directory in the scan:
+        // each sidecar written spends a slot, and once none are left the
+        // remaining manifests are decoded without trying to save one.
+        let mut free_slots = sidecars.scan_slots(entries.len());
+        for entry in entries {
             check()?;
             let name = entry.file_name();
             let Some(generation) = name
@@ -493,6 +523,7 @@ impl ViewStore {
                 generation,
                 |bytes| manifest_reference_keys(generation, bytes),
                 &mut |keys| visit(generation, keys),
+                &mut free_slots,
             )?;
         }
         Ok(())
@@ -3227,6 +3258,7 @@ mod storage_retention_tests {
                 generation,
                 |bytes| manifest_reference_keys(generation, bytes),
                 &mut |_| Ok(()),
+                &mut sidecars.scan_slots(fs::read_dir(view.view_dir()).unwrap().count()),
             )
             .unwrap()
     }
@@ -3467,6 +3499,88 @@ mod storage_retention_tests {
             assert!(view.trigram_path(&reader).unwrap().is_file(), "{reader}");
         }
         drop(markers);
+    }
+
+    fn sidecar_count(view: &ViewStore) -> usize {
+        fs::read_dir(view.view_dir())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".keys")
+            })
+            .count()
+    }
+
+    fn blob_scan(
+        view: &ViewStore,
+        sidecars: &super::super::reference_sidecar::ReferenceSidecars,
+    ) -> usize {
+        let mut visited = 0;
+        view.visit_blob_references(sidecars, &mut || Ok(()), &mut |_, _| {
+            visited += 1;
+            Ok(())
+        })
+        .unwrap();
+        visited
+    }
+
+    #[test]
+    fn reference_scan_lists_each_view_directory_once_per_pass() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "reference-scan-one-listing").unwrap();
+        for index in 0..6_u8 {
+            replace_manifest(
+                &view,
+                &format!("g{index}"),
+                &fixed_size_manifest([[index; 32]; 3]),
+            );
+        }
+        let sidecars = eager_sidecars();
+        take_directory_listings(view.view_dir());
+        // Six sidecars written in one pass, from one listing.
+        assert_eq!(blob_scan(&view, &sidecars), 6);
+        assert_eq!(sidecar_count(&view), 6);
+        assert_eq!(take_directory_listings(view.view_dir()), 1);
+        // Six sidecars read in the next pass, again from one listing.
+        assert_eq!(blob_scan(&view, &sidecars), 6);
+        assert_eq!(take_directory_listings(view.view_dir()), 1);
+    }
+
+    #[test]
+    fn reference_scan_near_the_limit_writes_what_fits_and_skips_the_rest_without_rescanning() {
+        use super::super::reference_sidecar::ReferenceSidecars;
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "reference-scan-near-limit").unwrap();
+        for index in 0..6_u8 {
+            replace_manifest(
+                &view,
+                &format!("g{index}"),
+                &fixed_size_manifest([[index; 32]; 3]),
+            );
+        }
+        let limit = 40;
+        let entries = || fs::read_dir(view.view_dir()).unwrap().count();
+        let mut filler = 0;
+        while entries() < limit - 3 {
+            fs::write(view.view_dir().join(format!("filler-{filler}")), b"").unwrap();
+            filler += 1;
+        }
+        let sidecars = ReferenceSidecars::with_directory_limit(Duration::ZERO, limit);
+        take_directory_listings(view.view_dir());
+        // Three free slots: each new sidecar briefly needs two (its temporary
+        // file and itself) and keeps one, so two fit and four are skipped.
+        assert_eq!(blob_scan(&view, &sidecars), 6);
+        assert_eq!(sidecar_count(&view), 2);
+        assert_eq!(entries(), limit - 1);
+        assert_eq!(take_directory_listings(view.view_dir()), 1);
+        // One slot left is not enough for another; nothing is rescanned.
+        assert_eq!(blob_scan(&view, &sidecars), 6);
+        assert_eq!(sidecar_count(&view), 2);
+        assert_eq!(take_directory_listings(view.view_dir()), 1);
     }
 
     #[test]
