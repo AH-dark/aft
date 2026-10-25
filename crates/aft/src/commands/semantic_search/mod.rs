@@ -2155,6 +2155,10 @@ fn attach_search_execution_metadata(
     if let (Some(structured_plan), Some(extension_plan)) =
         (structured_plan.as_object_mut(), extension_plan.as_object())
     {
+        structured_plan.insert(
+            "selected_lanes".to_string(),
+            serde_json::json!(plan.selected_lanes),
+        );
         for (key, value) in extension_plan {
             structured_plan
                 .entry(key.clone())
