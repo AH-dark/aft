@@ -30,6 +30,23 @@ thread_local! {
     static WALK_BUDGET: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::from_secs(10)) };
     static WALK_ENTRY_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
     static WALK_SORT_METADATA_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    /// Fallback filesystem walks started on this thread, by grep's bounded
+    /// walk or by aft_search's degraded lexical scan. Tests read it to prove
+    /// a request answered without walking the project, which a reply's
+    /// wall-clock time cannot show on a loaded machine.
+    static FALLBACK_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Records that a fallback filesystem walk started on this thread.
+#[cfg(test)]
+pub(crate) fn note_fallback_walk_for_test() {
+    FALLBACK_WALKS.with(|walks| walks.set(walks.get() + 1));
+}
+
+/// Fallback filesystem walks started on this thread so far.
+#[cfg(test)]
+pub(crate) fn fallback_walks_for_test() -> usize {
+    FALLBACK_WALKS.with(std::cell::Cell::get)
 }
 
 fn fallback_walk_limit() -> usize {
@@ -1921,6 +1938,8 @@ fn fallback_grep_with_limits_counted(
     ignored_target: bool,
     order: GrepScanOrder,
 ) -> GrepResult {
+    #[cfg(test)]
+    note_fallback_walk_for_test();
     let _io_scope = crate::bounded_io::enter_if_absent(budget);
     let total_matches = AtomicUsize::new(0);
     let files_searched = AtomicUsize::new(0);
