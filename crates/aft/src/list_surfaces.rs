@@ -54,6 +54,8 @@ pub struct SurfaceEntry {
     pub command: &'static str,
     pub mode: &'static str,
     pub list_id: &'static str,
+    /// A negotiated route capability required for this surface to exist.
+    pub requires: Option<&'static str>,
     pub unit: Unit,
     pub narrow: &'static [&'static str],
     pub reasons: &'static [ReasonEntry],
@@ -62,6 +64,7 @@ pub struct SurfaceEntry {
 /// Authoritative registry of every list-shaped surface in AFT.
 pub static LIST_SURFACES: &[SurfaceEntry] = &[
     SurfaceEntry {
+        requires: None,
         command: "callgraph",
         mode: "impact",
         list_id: "payload.sites",
@@ -81,6 +84,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "callgraph",
         mode: "callers",
         list_id: "payload.callers",
@@ -100,6 +104,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "callgraph",
         mode: "call_tree",
         list_id: "payload.tree",
@@ -123,6 +128,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
     // (`path: Option<Vec<...>>`), rather than a `paths` list. Truncation envelopes apply
     // only to multi-path lists (`trace_to`).
     SurfaceEntry {
+        requires: None,
         command: "callgraph",
         mode: "trace_to",
         list_id: "payload.paths",
@@ -147,6 +153,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "callgraph",
         mode: "trace_data",
         list_id: "payload.hops",
@@ -159,6 +166,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         }],
     },
     SurfaceEntry {
+        requires: None,
         command: "search",
         mode: "",
         list_id: "payload.results",
@@ -193,6 +201,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "grep",
         mode: "",
         list_id: "payload.matches",
@@ -222,6 +231,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: Some(crate::subc::result_body::RESULT_FORMAT),
         command: "ast_search",
         mode: "matches",
         list_id: "payload.matches",
@@ -234,6 +244,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         }],
     },
     SurfaceEntry {
+        requires: None,
         command: "glob",
         mode: "",
         list_id: "payload.files",
@@ -258,6 +269,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "outline",
         mode: "files",
         list_id: "payload.files",
@@ -282,6 +294,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "read",
         mode: "directory",
         list_id: "payload.entries",
@@ -301,6 +314,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "inspect",
         mode: "",
         list_id: "payload.details",
@@ -313,6 +327,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         }],
     },
     SurfaceEntry {
+        requires: None,
         command: "bash",
         mode: "",
         list_id: "bash.output",
@@ -324,8 +339,8 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             predicate_name: "cap_lines, compress_json, finish, middle_truncate, append_hunk, cap_git_lines, compress_add, compress_blame, compress_diff, flush_status_entries, looks_like_golangci_json, finish_folded, first_error_lines, truncate_line, parse_tree, compress_tsc, frozen_compress_tsc, compressor_line_dropping, render_cut, cap_lines_head_tail, cap_text_head_tail, apply_plain_cap_streaming, test_verdict, cap_test_verdict",
         }],
     },
-    SurfaceEntry { command: "bash", mode: "changed_files", list_id: "bash.changed_files", unit: Unit::Files, narrow: &[], reasons: &[ReasonEntry { reason: Reason::Cap, kind: ReasonKind::Selecting, predicate_name: "render" }, ReasonEntry { reason: Reason::TimeLimit, kind: ReasonKind::Bounding, predicate_name: "render" }] },
-    SurfaceEntry { command: "bash", mode: "diff_lines", list_id: "bash.diff_lines", unit: Unit::Lines, narrow: &[], reasons: &[ReasonEntry { reason: Reason::Cap, kind: ReasonKind::Selecting, predicate_name: "diff_file" }] },
+    SurfaceEntry { requires: None, command: "bash", mode: "changed_files", list_id: "bash.changed_files", unit: Unit::Files, narrow: &[], reasons: &[ReasonEntry { reason: Reason::Cap, kind: ReasonKind::Selecting, predicate_name: "render" }, ReasonEntry { reason: Reason::TimeLimit, kind: ReasonKind::Bounding, predicate_name: "render" }] },
+    SurfaceEntry { requires: None, command: "bash", mode: "diff_lines", list_id: "bash.diff_lines", unit: Unit::Lines, narrow: &[], reasons: &[ReasonEntry { reason: Reason::Cap, kind: ReasonKind::Selecting, predicate_name: "diff_file" }] },
 ];
 
 /// An entry in the discovery exclusions table with written justification.

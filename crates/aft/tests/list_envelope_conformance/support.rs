@@ -77,6 +77,7 @@ pub struct SurfaceSpec {
     pub command: &'static str,
     pub mode: &'static str,
     pub list_id: &'static str,
+    pub requires: Option<&'static str>,
     pub unit: Unit,
     pub narrow: &'static [&'static str],
     pub reasons: &'static [ReasonSpec],
@@ -213,6 +214,7 @@ const OUTLINE_REASONS: &[ReasonSpec] = &[
 
 pub const SURFACE_SPECS: &[SurfaceSpec] = &[
     SurfaceSpec {
+        requires: Some("tool-result/v1"),
         command: "ast_search",
         mode: "matches",
         list_id: "payload.matches",
@@ -224,6 +226,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         }],
     },
     SurfaceSpec {
+        requires: None,
         command: "callgraph",
         mode: "impact",
         list_id: "payload.sites",
@@ -232,6 +235,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: CAP_DEPTH,
     },
     SurfaceSpec {
+        requires: None,
         command: "callgraph",
         mode: "callers",
         list_id: "payload.callers",
@@ -240,6 +244,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: CAP_DEPTH,
     },
     SurfaceSpec {
+        requires: None,
         command: "callgraph",
         mode: "call_tree",
         list_id: "payload.tree",
@@ -248,6 +253,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: CAP_DEPTH,
     },
     SurfaceSpec {
+        requires: None,
         command: "callgraph",
         mode: "trace_to",
         list_id: "payload.paths",
@@ -256,6 +262,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: DEPTH_BUDGET_CAP,
     },
     SurfaceSpec {
+        requires: None,
         command: "callgraph",
         mode: "trace_data",
         list_id: "payload.hops",
@@ -264,6 +271,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: DEPTH_BOUNDING,
     },
     SurfaceSpec {
+        requires: None,
         command: "search",
         mode: "",
         list_id: "payload.results",
@@ -272,6 +280,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: SEARCH_REASONS,
     },
     SurfaceSpec {
+        requires: None,
         command: "grep",
         mode: "",
         list_id: "payload.matches",
@@ -280,6 +289,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: GREP_REASONS,
     },
     SurfaceSpec {
+        requires: None,
         command: "glob",
         mode: "",
         list_id: "payload.files",
@@ -288,6 +298,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: GLOB_REASONS,
     },
     SurfaceSpec {
+        requires: None,
         command: "outline",
         mode: "files",
         list_id: "payload.files",
@@ -296,6 +307,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: OUTLINE_REASONS,
     },
     SurfaceSpec {
+        requires: None,
         command: "read",
         mode: "directory",
         list_id: "payload.entries",
@@ -304,6 +316,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: WALK_CAP,
     },
     SurfaceSpec {
+        requires: None,
         command: "inspect",
         mode: "",
         list_id: "payload.details",
@@ -312,6 +325,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: CAP_SELECTING,
     },
     SurfaceSpec {
+        requires: None,
         command: "bash",
         mode: "",
         list_id: "bash.output",
@@ -320,6 +334,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: CAP_SELECTING,
     },
     SurfaceSpec {
+        requires: None,
         command: "bash",
         mode: "changed_files",
         list_id: "bash.changed_files",
@@ -328,6 +343,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: TIME_CAP,
     },
     SurfaceSpec {
+        requires: None,
         command: "bash",
         mode: "diff_lines",
         list_id: "bash.diff_lines",
@@ -656,6 +672,14 @@ pub fn validate_registry() -> Vec<String> {
             ));
             continue;
         };
+        if actual.requires != expected.requires {
+            errors.push(format!(
+                "{}: route requirement expected {:?}, got {:?}",
+                surface_name(*expected),
+                expected.requires,
+                actual.requires
+            ));
+        }
         if actual.unit != expected.unit {
             errors.push(format!(
                 "{}: registered unit expected {:?}, got {:?}",

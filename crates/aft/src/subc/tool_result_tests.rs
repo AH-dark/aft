@@ -220,6 +220,173 @@ fn tool_result_images_are_ordered_and_kept_in_structured_content() {
     }
 }
 
+#[tokio::test]
+async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route() {
+    let (project, root_id) = test_support::test_root("ast-search-t6");
+    let root = project.path().to_path_buf();
+    std::fs::write(root.join("small.js"), "console.log(1);\n".repeat(3)).unwrap();
+    std::fs::write(root.join("large.js"), "console.log(1);\n".repeat(24000)).unwrap();
+    let module_root = root.clone();
+    let executor = Arc::new(Executor::new());
+    let _actors = FixtureActors(executor.clone());
+    // Reuse a configured actor without starting unrelated background indexing.
+    let ctx = Arc::new(context(&root));
+    let app = ctx.app().clone();
+    executor.register_actor(root_id, ctx);
+    let loop_executor = executor.clone();
+    let (mut daemon, module) = tokio::io::duplex(64 * 1024);
+    let module_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (read, write) = tokio::io::split(module);
+        runtime.block_on(run_module_loop(
+            read,
+            write,
+            &module_root.join("absent-connection.json"),
+            app,
+            loop_executor,
+            |request, ctx| {
+                if request.command == "configure" {
+                    Response::success(request.id, json!({}))
+                } else {
+                    crate::commands::ast_search::handle_ast_search(&request, &ctx)
+                }
+            },
+            Some(module_root.join("absent-user-config.json")),
+            false,
+            usize::MAX,
+            None,
+            &module_root.join("storage"),
+            QuiescedLsp::ReapInBackground,
+            None,
+            None,
+        ))
+    });
+    async fn receive(daemon: &mut tokio::io::DuplexStream, channel: u16, corr: u64) -> Frame {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let frame = read_frame(daemon).await.unwrap().unwrap();
+                if frame.header.channel == channel && frame.header.corr == corr {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("AST route response timed out")
+    }
+    assert_eq!(
+        receive(&mut daemon, 0, HELLO_CORR).await.header.ty,
+        FrameType::Hello
+    );
+    write_frame(
+        &mut daemon,
+        &Frame::build(
+            FrameType::HelloAck,
+            control_flags(),
+            0,
+            0,
+            HELLO_CORR,
+            b"{}".to_vec(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: 1,
+        epoch: 1,
+        target: RouteTarget::ToolProvider {
+            module_id: "aft".into(),
+        },
+        identity: subc_protocol::BindIdentity::new(&root, "opencode", "ast-t6"),
+        principal: Some(Principal::Direct),
+        consumer_capabilities: Some(vec![result_body::RESULT_FORMAT.to_owned()]),
+        admission_facts: Default::default(),
+        scope: None,
+        role_versions: None,
+        call_mode: None,
+    };
+    write_frame(
+        &mut daemon,
+        &Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&bind).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let ack = receive(&mut daemon, 0, 1).await;
+    assert!(matches!(
+        serde_json::from_slice::<ModuleControlResponse>(&ack.body).unwrap(),
+        ModuleControlResponse::RouteBindAck {}
+    ));
+    let mut replies = Vec::new();
+    for (corr, file) in [(10, "small.js"), (11, "large.js")] {
+        let call = json!({"name":"ast_search", "arguments":{
+            "pattern":"console.log($X)", "lang":"javascript", "paths":[file]
+        }});
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::Request,
+                control_flags(),
+                1,
+                1,
+                corr,
+                serde_json::to_vec(&call).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        replies.push(receive(&mut daemon, 1, corr).await);
+    }
+    drop(daemon);
+    module_thread.join().unwrap().unwrap();
+    for (frame, total) in replies.iter().zip([3, 24000]) {
+        assert_eq!(frame.header.ty, FrameType::Response);
+        validate(&serde_json::from_slice::<ToolResult>(&frame.body).unwrap()).unwrap();
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["isError"], false, "{body}");
+        let data = &body["structuredContent"];
+        let text = body["content"][0]["text"].as_str().unwrap();
+        assert_eq!(data["total_matches"], total);
+        assert_eq!(data["skipped_files"], json!([]));
+        let shown = data["matches"].as_array().unwrap().len();
+        if total == 3 {
+            assert_eq!(shown, 3);
+            assert_eq!(data["complete"], true);
+            assert!(data.get("matches_list_envelope").is_none());
+            assert!(!text.contains("shown "));
+        } else {
+            assert!(shown > 0 && shown < 24000);
+            assert_eq!(data["complete"], false);
+            assert_eq!(data["truncated"], true);
+            let envelope = &data["matches_list_envelope"];
+            assert_eq!(envelope["shown"], shown);
+            assert_eq!(envelope["total"], json!({"kind":"exact", "value":24000}));
+            assert_eq!(envelope["reason"], "budget");
+            assert_eq!(envelope["narrow"], json!(["paths", "globs", "pattern"]));
+            let trailer =
+                format!("shown {shown} of 24000 results (budget) · narrow: paths, globs, pattern");
+            assert!(text.trim_end().ends_with(&trailer), "{text}");
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.starts_with("shown "))
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
 #[test]
 fn tool_result_builders_fit_large_images_and_bound_ast_matches() {
     let project = scratch_project();
@@ -1196,6 +1363,10 @@ fn tool_result_fixtures_release_descriptors() {
         (
             "route_binding",
             tool_result_capability_is_selected_per_bind_not_per_call,
+        ),
+        (
+            "ast_t6_route",
+            tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route,
         ),
         (
             "legacy_replay",
