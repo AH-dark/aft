@@ -1231,6 +1231,21 @@ fn classify_call_failure(
     }
 }
 
+fn classify_attempt_failure(
+    operation: &str,
+    error: &CallError,
+    deadline: tokio::time::Instant,
+) -> SynapseEmbeddingError {
+    // The SDK erases pre-send deadline causes into opaque NotSent errors.
+    // Use the attempt's own deadline, not diagnostic wording, to recognize
+    // expiry while waiting for route capacity or the writer.
+    if matches!(error, CallError::NotSent(_)) && tokio::time::Instant::now() >= deadline {
+        SynapseEmbeddingError::Timeout(operation.to_string())
+    } else {
+        classify_call_failure(operation, error)
+    }
+}
+
 impl SynapseState {
     async fn discover_model(
         &mut self,
@@ -1320,11 +1335,12 @@ impl SynapseState {
                 Ok(connection) => {
                     // Do not hold the connection-slot lock across a request. The
                     // SDK multiplexes up to 1024 requests on a management route.
-                    let request = connection.consumer.request(
-                        &connection.route,
-                        body.clone(),
-                        attempt_call_options(),
-                    );
+                    let options = attempt_call_options();
+                    let deadline = tokio::time::Instant::now() + options.timeout;
+                    let request =
+                        connection
+                            .consumer
+                            .request(&connection.route, body.clone(), options);
                     match request.await {
                         Ok(response) => {
                             if response.len() > MAX_RESULT_PAGE_BYTES {
@@ -1360,9 +1376,10 @@ impl SynapseState {
                                     error.to_string(),
                                 ));
                             }
+                            let failure = classify_attempt_failure(operation, &error, deadline);
                             if connection_is_gone(&error) {
                                 self.connection.reset(&connection).await;
-                            } else if error.outcome_cause() == Some(OutcomeUnknownCause::Deadline)
+                            } else if matches!(failure, SynapseEmbeddingError::Timeout(_))
                                 && !*timeout_counted
                             {
                                 // Only this call's first attempt deadline
@@ -1374,7 +1391,7 @@ impl SynapseState {
                                     return Err(SynapseEmbeddingError::CircuitOpen);
                                 }
                             }
-                            last_error = Some(classify_call_failure(operation, &error));
+                            last_error = Some(failure);
                         }
                     }
                 }
@@ -1974,6 +1991,18 @@ mod tests {
         )));
         assert!(matches!(
             classify_call_failure("embed.query", &transport),
+            SynapseEmbeddingError::DaemonUnavailable(_)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synapse_presend_failure_before_deadline_stays_unavailable() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let error = CallError::NotSent(Box::new(std::io::Error::other(
+            "timeout-model is unavailable",
+        )));
+        assert!(matches!(
+            classify_attempt_failure(QUERY_OPERATION, &error, deadline),
             SynapseEmbeddingError::DaemonUnavailable(_)
         ));
     }
