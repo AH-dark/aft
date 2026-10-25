@@ -108,16 +108,16 @@ this shipped-release exception: it cannot delete or corrupt v3; at worst its
 space estimate refuses a migration that could have fit. Forged v2 `view_dir`
 paths remain a corrupt-metadata caveat only, not an ordinary routing path.
 
-**Required before v3 registration in current code — slice 3a-2:** treat
-`blobs/v3` consistently in migration sizing and copying. V3 is rebuildable, so
-leave it out of **both** the source-size/free-space accounting and the migration
-items rather than copying it. Add a test seeding a v3 family/member tree which
-proves it contributes no migration byte requirement, is not copied, and remains
-unchanged at the source. Preserve accounting for actual migrated items and the
-existing destination-volume checks. This foundation does not edit
-`migrate_storage.rs` or `legacy_partitions.rs`; that follow-up requires its own
-file-fence grant. The exception must not be mistaken for a claim that current
-migration behavior already meets the requirement.
+**Completed in slice 3a-2:** current migration excludes the source-root-relative
+`blobs/v3` subtree from **both** source-size/free-space accounting and recursive
+copying. V3 is rebuildable and remains at the source. The change landed in
+`2cb838f2436f7d22ad4aee18043085a1d93539b2` (through #675); the test in
+`crates/aft/src/migrate_storage.rs` seeds an 8 GiB v3 payload, admits migration
+with space for only the actual migration fixtures, and verifies that no v3
+target is created and the source payload is unchanged. Accounting for actual
+migration items and destination-volume checks is preserved. This current-main
+fix does not change the explicit-migration exception in the two shipped
+releases audited above.
 
 ## Floor domains and publication protocol
 
@@ -522,11 +522,73 @@ of bytes and `st_mode` over `blobs/v3/` must be unchanged, and no v3 member
 may appear in a v2 registry. The tests are `#[ignore]`d (they take seven and
 thirteen minutes) and need `AFT_V0_60_0_BINARY`.
 
-## Deferred to slice 4
+## Deferred implementation register
 
-The manifest base header with PublishedFrontier, tombstones and
-readiness_overrides, donor seal records, the symbol plane, the v3 import
-ledger, persisted stat evidence, staging names and token rows.
+This register assigns the remaining formats **before their owners write them**.
+These are forward format assignments, not a claim that the schemas or files
+already exist. No 3a or 3b implementation is deferred here. Storage paths below
+are relative to `<storage>`; implementation-source paths are repository-relative
+(`gc/family.rs` abbreviates `crates/aft/src/gc/family.rs`). Define
+`F = blobs/v3/<family>` and `M = F/views/<scope>` for either a base or a worker.
+No storage artifact is assigned beneath `<storage>/views/v3`. The opening
+contract is [views-slice4-opening.md](views-slice4-opening.md).
+
+### Versions and upgrade boundaries
+
+- The implemented registry remains `views_v3_registry` format/schema **1/1**.
+  Reserve **2/2** for slice 4's base-reference protocol, **3/3** for 4v's token
+  and stat-evidence protocol, **4/4** for slice 5's donor-seal protocol, and
+  **5/5** for 6a's symbol/import protocol. These versions gate the whole member
+  protocol, including its sidecars; a version can advance without adding a
+  registry table. An owning slice
+  installs its complete schema through an explicit versioned upgrade, never a
+  lazy `CREATE TABLE` on read. Later versions preserve the earlier contracts;
+  an older reader refuses an unsupported version rather than interpreting it.
+- `views_v3_store` remains format/schema **1/1**, with the existing layout-tag
+  dispatch (new stores use layout 2). Sweeping rows and adding a symbol-plane
+  instance do not change the payload/digest schema or convert existing stores.
+- A v3 generation manifest uses **manifest format 3**, distinct from legacy
+  manifest format 2. Its path retains the existing
+  `manifest-<generation>.json` naming convention but lives only in `M`. Sidecar
+  formats below start at **1** and are not new `PersistedStore` names. Local
+  artifact versions are independent of registry/floor numbers: the manifest
+  records `format_version: 3`; new JSON sidecars and the plane-sweep cursor
+  record `format_version: 1`; stat-evidence SQLite records format/schema 1/1
+  in its `format_meta` singleton. The staging-name protocol's version 1 is a
+  naming contract, not a file header, and is identified by registry version 2.
+  Registry and plane format/schema numbers remain in their existing
+  `format_meta`; reader-floor requirements remain in `reader-floor.json`.
+  An incompatible artifact change requires a new local version and a
+  registry-floor version that makes unsupported readers refuse.
+- Every artifact publication uses the combined v3 floor boundary. Slice 4
+  requests registry floor 2 before its artifacts; 4v requests 3 before stat
+  evidence or tokens; 5 requests 4 before donor/seal publication; 6a requests 5
+  before **either** symbol-plane or import-ledger publication. Every publisher
+  also requests store floor 1. These are future written versions, not changes
+  to today's startup baseline.
+
+### Assigned paths and owners
+
+| Owner | Item and path | Assigned format / schema | Required contract |
+|---|---|---|---|
+| 4 | `M/manifest-<generation>.json`: optional `base` header and `PublishedFrontier` | Manifest 3, registry floor 2 | `base` records scope, membership digest, identity digest and diagnostic bound generation. The frontier records delta cut version, watcher epoch, publication time and optional verified `{E0, F, delivery_seq}`. No separate binding file; no base-reference chains. |
+| 4 | `entries`, `tombstones`, `readiness_overrides` in that same manifest | Manifest 3, registry floor 2 | Sections are disjoint. Tombstones mask inherited deletions. Override Ready keys participate in `ready_keys()`, marking and live-pin trimming. Slice-4 identity is membership-keyed, `head_tree=None`, with no proven `git_oid`. |
+| 4 | `F/members.sqlite`: `base_refs`, `base_builds`, `strict_rebuild`, base unreferenced counts, sweep epoch and reconciliation resume state | `views_v3_registry` 2/2 | Exact-generation edges, per-acquisition nonce, owner-token/attempt CAS, bounded epoch-aware reconciliation and two-sweep reclaim. A live claim holds an empty base. Published and intent rows have explicit terminal cleanup. |
+| 4 | `M/staging/a<attempt>-<owner_token>-<nonce>/`; `M/derived-<generation>-a<attempt>-<owner_token>.sqlite` and associated temporary/WAL/SHM names | Staging-name protocol 1, registry floor 2 | Every base-build staging and derived name carries the attempt and owner token. Never reuse a dead attempt's name. Reclaim only after its owner is known dead; a live claim is not abandoned work. |
+| 4 | Plane-row sweep over `F/{semantic,callgraph,trigram}.sqlite`; progress at `retention/cursors/v3-plane-rows/<family>.json` | Store 1/1; cursor 1; registry 2/2 for sweep coordination | Implement in `gc/family.rs` and `storage_retention.rs`. Mark the composed depth-one closure, including overrides, then delete only unmarked eligible rows under the epoch/lease protocol. Bound the producing iterator and deadline; resume rather than treating a partial scan as complete. Include later registered planes when they exist. |
+| 4 | `DiskBudget` wiring in `crates/aft/src/views/eviction.rs`, using `F/members.sqlite` reservations/accounting and the existing namespace inventory | Registry 2/2; no separate budget file or new config format | Preserve allocated-byte charging, the 2 GiB family target, 4 GiB hard/namespace limits and max(4 GiB, 5%) device floor. Refuse with the named storage gap and no legacy fallback. |
+| 4v | `M/stat-evidence-<generation>.sqlite` | Stat-evidence 1/1, registry floor 3 | Generation-paired path/root/file identity, size/times, stable content digest, proven Git OID if any, observation-time conversion-policy digest and per-plane keys. No stat-cache or current-policy-only proof. |
+| 4v | `F/members.sqlite`: `view_tokens` rows | `views_v3_registry` 3/3 | Single-use advisory token bound to identity at first consumption, with expiry and consume state. Stored in daemon storage, never the checkout. Stat evidence and tokens do not replace freshness validation. |
+| 5 | `M/donor-<generation>-<fingerprint>.seal.json` beside `M/donor-<generation>-<fingerprint>.sqlite` | Donor seal 1, registry floor 4 | Atomically publish fingerprint, size and `journal_mode=DELETE` only after the detached donor is checkpointed and synced and has no WAL/SHM. A published manifest names only a completed seal. Never copy/clone a live SQLite file set. |
+| 6a | `F/symbol.sqlite` | `views_v3_store` 1/1, new-store layout 2; registry floor 5 | The v3 symbol plane uses the same immutable `payload`/`payload_digest` contract and reservation protocol. No in-place legacy conversion. |
+| 6a | `F/members.sqlite`: `imports` rows | `views_v3_registry` 5/5 | Record completion/rejection per artifact, compatible producer and destination plane, with owner-token claim/recovery semantics. Import into v3 only, stream inputs above 1 GiB and retain legacy bytes. |
+
+The registry-version increments above are serial handoffs, not permission for
+an earlier slice to write a later owner's rows. Owners implement and test their
+assigned schema and encoding before publishing any such bytes. Registration
+does not enable a production path: unrouted entrypoints remain reachable only
+through the marker-gated harness. Existing cursor paths for family discovery
+and member retention remain unchanged.
 
 Slice 4's binder must honour the `evicting` contract above: when it finds its
 member in `evicting`, it never uses that view directory, and either treats the
