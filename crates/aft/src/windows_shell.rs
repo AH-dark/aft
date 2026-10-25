@@ -33,6 +33,22 @@ const POSIX_NAMES: &[&str] = &["bash", "sh", "zsh", "ksh", "dash"];
 /// user command; see [`WindowsShell::wrapper_script`].
 pub(crate) const CMD_WRAPPER_COMMAND_ENV: &str = "AFT_CMD_WRAPPER_COMMAND";
 
+// A private, namespaced transport key, overwritten after request overrides and
+// removed before user code runs. Task paths must never enter the command line:
+// Defender rescans pwsh launches whose command line has not been seen before.
+// Windows PowerShell 5.1 is not slowed by these Defender scans. Its existing
+// loader also appears in nonterminating error records, so changing it would
+// change stderr.
+pub(crate) const POWERSHELL_WRAPPER_PATH_ENV: &str =
+    "__AFT_POWERSHELL_WRAPPER_9D33FC29_5A4E_4BFE_877B_8C1C49F386B9";
+const POWERSHELL_WRAPPER_INVOCATION: &str = concat!(
+    "try { & (& { ",
+    "$path = [Environment]::GetEnvironmentVariable('__AFT_POWERSHELL_WRAPPER_9D33FC29_5A4E_4BFE_877B_8C1C49F386B9'); ",
+    "[Environment]::SetEnvironmentVariable('__AFT_POWERSHELL_WRAPPER_9D33FC29_5A4E_4BFE_877B_8C1C49F386B9', [System.Management.Automation.Language.NullString]::Value); ",
+    "[scriptblock]::Create([System.IO.File]::ReadAllText($path)) ",
+    "}) } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }"
+);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WindowsShell {
     /// PowerShell 7+ (cross-platform). Supports `&&` pipeline operator.
@@ -93,7 +109,13 @@ impl WindowsShell {
         match self {
             // Disable registry AutoRun before cmd reads and executes the wrapper.
             WindowsShell::Cmd => vec!["/D".into(), "/c".into(), wrapper_path.display().to_string()],
-            WindowsShell::Pwsh | WindowsShell::Powershell => vec![
+            WindowsShell::Pwsh => vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                POWERSHELL_WRAPPER_INVOCATION.into(),
+            ],
+            WindowsShell::Powershell => vec![
                 "-NoProfile".into(),
                 "-NonInteractive".into(),
                 // Execution policy can forbid unsigned .ps1 files, including
@@ -223,14 +245,21 @@ impl WindowsShell {
     }
 
     /// Environment the wrapper written by [`Self::wrapper_script`] needs at
-    /// run time. Only the cmd wrapper reads its command from the environment;
-    /// callers apply this after the request environment so it cannot be
-    /// overridden.
-    pub(crate) fn wrapper_environment<'a>(
+    /// run time. Apply after the request environment so user overrides cannot
+    /// replace the private command or wrapper-path transport.
+    pub(crate) fn wrapper_environment(
         &self,
-        command: &'a str,
-    ) -> Option<(&'static str, &'a str)> {
-        matches!(self, WindowsShell::Cmd).then_some((CMD_WRAPPER_COMMAND_ENV, command))
+        command: &str,
+        wrapper_path: &Path,
+    ) -> Option<(&'static str, std::ffi::OsString)> {
+        match self {
+            Self::Cmd => Some((CMD_WRAPPER_COMMAND_ENV, command.into())),
+            Self::Pwsh => Some((
+                POWERSHELL_WRAPPER_PATH_ENV,
+                wrapper_path.as_os_str().to_owned(),
+            )),
+            Self::Powershell | Self::Posix(_) => None,
+        }
     }
 
     pub(crate) fn wrapper_script_bytes(&self, command: &str, exit_path: &Path) -> Vec<u8> {
@@ -834,6 +863,7 @@ mod tests {
         let output = Command::new(waiter.program)
             .args(waiter.args)
             .env(waiter.environment.0, waiter.environment.1)
+            .envs(shell.wrapper_environment("", &wrapper))
             .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
             .env("AFT_EXIT_TEST_VALUE", "héllo ! '")
@@ -866,6 +896,9 @@ mod tests {
         if command.contains("aft_missing_command_7961") {
             assert!(String::from_utf8_lossy(&output.stderr).contains("aft_missing_command_7961"));
         }
+        if command.contains("[Console]::Error.WriteLine('user-error')") {
+            assert_eq!(output.stderr, b"user-error\r\n");
+        }
     }
 
     #[cfg(windows)]
@@ -894,6 +927,170 @@ mod tests {
                 3,
                 "héllo ! '\nTrue\n0\nTrue",
             );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_bootstrap_hides_transport_from_user_environment() {
+        for shell in [WindowsShell::Pwsh] {
+            assert_powershell_wrapper(
+                shell,
+                &format!("Write-Output ($null -eq [Environment]::GetEnvironmentVariable('{POWERSHELL_WRAPPER_PATH_ENV}')); cmd.exe /D /C echo child-output; [Console]::Error.WriteLine('user-error'); exit 7"),
+                7,
+                "True\nchild-output",
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_bootstrap_uses_literal_long_paths_and_constant_native_command_line() {
+        use std::os::windows::process::CommandExt;
+        for shell in [WindowsShell::Pwsh] {
+            for waited in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut command_lines = Vec::new();
+                for task in ["first", "second"] {
+                    let layout = crate::bash_background::windows_waiter::test_task_layout(
+                        temp.path(),
+                        task,
+                        "command-line",
+                    );
+                    let paths = &layout.paths;
+                    // Keep each component below the filesystem's component limit.
+                    let long = paths
+                        .dir
+                        .join("héllo [literal] %!&^' ".repeat(7).trim_end())
+                        .join("another long directory ".repeat(7).trim_end());
+                    std::fs::create_dir_all(&long).unwrap();
+                    let wrapper = long.join("wrapper.ps1");
+                    assert!(wrapper.as_os_str().len() > 260);
+                    shell
+                        .write_wrapper(
+                            "Write-Output ([Environment]::CommandLine); exit 0",
+                            &paths.exit,
+                            &wrapper,
+                        )
+                        .unwrap();
+                    let binary = which::which(shell.binary().as_ref()).unwrap();
+                    let args = shell
+                        .wrapper_file_args(&wrapper)
+                        .into_iter()
+                        .map(std::ffi::OsString::from)
+                        .collect::<Vec<_>>();
+                    let mut process = if waited {
+                        let waiter = crate::bash_background::windows_waiter::wrap(
+                            binary.as_os_str(),
+                            &args,
+                            paths,
+                            temp.path(),
+                            &std::collections::HashMap::new(),
+                            false,
+                            false,
+                        )
+                        .unwrap()
+                        .unwrap();
+                        let mut process = Command::new(waiter.program);
+                        process
+                            .args(waiter.args)
+                            .env(waiter.environment.0, waiter.environment.1);
+                        process
+                    } else {
+                        let mut process = Command::new(binary);
+                        process.args(args);
+                        process
+                    };
+                    let output = process
+                        .envs(shell.wrapper_environment("", &wrapper))
+                        .current_dir(temp.path())
+                        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+                        .output()
+                        .unwrap();
+                    assert_eq!(output.status.code(), Some(0), "{output:?}");
+                    assert!(output.stderr.is_empty(), "{output:?}");
+                    command_lines.push(output.stdout);
+                }
+                assert!(!command_lines[0].is_empty());
+                assert_eq!(
+                    command_lines[0], command_lines[1],
+                    "{shell:?} waited={waited}"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_bootstrap_failure_does_not_print_loader_text() {
+        use std::os::windows::process::CommandExt;
+        let temp = tempfile::tempdir().unwrap();
+        let wrapper = temp.path().join("wrapper.ps1");
+        for shell in [WindowsShell::Pwsh] {
+            for script in [None, Some("this is not valid { script")] {
+                if let Some(script) = script {
+                    std::fs::write(&wrapper, script).unwrap();
+                } else {
+                    let _ = std::fs::remove_file(&wrapper);
+                }
+                let output = Command::new(shell.binary().as_ref())
+                    .args(shell.wrapper_file_args(&wrapper))
+                    .envs(shell.wrapper_environment("", &wrapper))
+                    .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(1), "{output:?}");
+                assert!(output.stdout.is_empty(), "{output:?}");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.is_empty());
+                assert!(!stderr.contains(POWERSHELL_WRAPPER_PATH_ENV), "{stderr}");
+                assert!(!stderr.contains("try { &"), "{stderr}");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_bootstrap_preserves_output_and_error_records() {
+        use std::os::windows::process::CommandExt;
+        let temp = tempfile::tempdir().unwrap();
+        let wrapper = temp.path().join("wrapper.ps1");
+        for shell in [WindowsShell::Pwsh, WindowsShell::Powershell] {
+            for command in [
+                "Write-Output 'héllo'; [Console]::Error.WriteLine('err'); exit 7",
+                "throw 'user-throw'",
+                "Write-Error 'user-error'; Write-Output 'after-error'",
+                "cmd.exe /D /C exit /B 23",
+                "exit 0",
+            ] {
+                shell
+                    .write_direct_wrapper(command, &temp.path().join("exit"), &wrapper, false)
+                    .unwrap();
+                // Keep the old loader as a byte-for-byte compatibility oracle.
+                let reference = format!(
+                    "& ([scriptblock]::Create([System.IO.File]::ReadAllText({})))",
+                    powershell_single_quote(&wrapper.display().to_string())
+                );
+                let args = shell.wrapper_file_args(&wrapper);
+                let loader = args.last().unwrap();
+                let outputs = [reference.as_str(), loader.as_str()].map(|loader| {
+                    Command::new(shell.binary().as_ref())
+                        .args(["-NoProfile", "-NonInteractive", "-Command", loader])
+                        .envs(shell.wrapper_environment("", &wrapper))
+                        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+                        .output()
+                        .unwrap()
+                });
+                assert_eq!(
+                    outputs[0].status.code(),
+                    outputs[1].status.code(),
+                    "{shell:?} {command}"
+                );
+                assert_eq!(outputs[0].stdout, outputs[1].stdout, "{shell:?} {command}");
+                assert_eq!(outputs[0].stderr, outputs[1].stderr, "{shell:?} {command}");
+                assert!(!String::from_utf8_lossy(&outputs[1].stderr)
+                    .contains(POWERSHELL_WRAPPER_PATH_ENV));
+            }
         }
     }
 
@@ -949,6 +1146,7 @@ mod tests {
                 .env(waiter.environment.0, waiter.environment.1);
             for process in [&mut direct, &mut waited] {
                 process
+                    .envs(shell.wrapper_environment("", &wrapper))
                     .current_dir(temp.path())
                     .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
                     .env("ERRORLEVEL", "999")
@@ -1063,6 +1261,7 @@ mod tests {
                     .env(waiter.environment.0, waiter.environment.1);
                 for process in [&mut direct, &mut waited] {
                     process
+                        .envs(shell.wrapper_environment("", &wrapper))
                         .envs(&environment)
                         .current_dir(temp.path())
                         .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
@@ -1193,6 +1392,7 @@ mod tests {
                     .env(waiter.environment.0, waiter.environment.1);
                 for (route, process) in [("direct", &mut direct), ("cmd", &mut waited)] {
                     let output = process
+                        .envs(shell.wrapper_environment("", &wrapper))
                         .current_dir(cwd)
                         .env("AFT_CWD_PROBE", cwd)
                         .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
@@ -1321,6 +1521,7 @@ mod tests {
                 let start = std::time::Instant::now();
                 let direct = Command::new(&binary)
                     .args(&direct_args)
+                    .envs(shell.wrapper_environment("", &wrapper))
                     .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
                     .output()
                     .unwrap();
@@ -1329,6 +1530,7 @@ mod tests {
                 let start = std::time::Instant::now();
                 let waited = Command::new(&waiter.program)
                     .args(&waiter.args)
+                    .envs(shell.wrapper_environment("", &wrapper))
                     .env(&waiter.environment.0, &waiter.environment.1)
                     .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
                     .output()
@@ -1436,10 +1638,13 @@ mod tests {
         assert!(script.contains(r"C:\Temp\100%%\bash.exit"), "{script}");
         assert!(!script.contains(r"100%\"), "{script}");
         assert_eq!(
-            WindowsShell::Cmd.wrapper_environment("echo hi"),
-            Some((CMD_WRAPPER_COMMAND_ENV, "echo hi"))
+            WindowsShell::Cmd.wrapper_environment("echo hi", Path::new("wrapper.bat")),
+            Some((CMD_WRAPPER_COMMAND_ENV, "echo hi".into()))
         );
-        assert_eq!(WindowsShell::Pwsh.wrapper_environment("echo hi"), None);
+        assert_eq!(
+            WindowsShell::Pwsh.wrapper_environment("echo hi", Path::new("wrapper.ps1")),
+            Some((POWERSHELL_WRAPPER_PATH_ENV, "wrapper.ps1".into()))
+        );
     }
 
     /// The wrapper must run a command exactly as `cmd /D /S /C <command>`
@@ -1469,7 +1674,9 @@ mod tests {
                 WindowsShell::Cmd.wrapper_script_bytes(command, &marker),
             )
             .unwrap();
-            let (key, value) = WindowsShell::Cmd.wrapper_environment(command).unwrap();
+            let (key, value) = WindowsShell::Cmd
+                .wrapper_environment(command, &wrapper)
+                .unwrap();
             let actual = Command::new("cmd.exe")
                 .args(["/D", "/C"])
                 .arg(&wrapper)
@@ -1521,6 +1728,37 @@ mod tests {
     }
 
     #[test]
+    fn powershell_wrapper_command_line_is_constant_across_tasks() {
+        let first = Path::new(r"C:\cache\first task\wrapper.ps1");
+        let second = Path::new(r"C:\cache\other héllo [task]\wrapper.ps1");
+        for shell in [WindowsShell::Pwsh] {
+            assert_eq!(
+                shell.wrapper_file_args(first),
+                shell.wrapper_file_args(second),
+                "{shell:?}: a task path on the command line defeats the launch cache"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_5_wrapper_command_line_is_unchanged() {
+        let wrapper = Path::new(r"C:\tmp\owner's ! task.ps1");
+        assert_eq!(
+            WindowsShell::Powershell.wrapper_file_args(wrapper),
+            vec![
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                r"& ([scriptblock]::Create([System.IO.File]::ReadAllText('C:\tmp\owner''s ! task.ps1')))",
+            ]
+        );
+        assert_eq!(
+            WindowsShell::Powershell.wrapper_environment("exit 0", wrapper),
+            None
+        );
+    }
+
+    #[test]
     fn wrapper_file_args_are_owned_and_shell_specific() {
         let wrapper = PathBuf::from(r"C:\tmp\owner's ! task.bat");
         assert_eq!(
@@ -1537,7 +1775,7 @@ mod tests {
                 "-NoProfile".to_string(),
                 "-NonInteractive".to_string(),
                 "-Command".to_string(),
-                r"& ([scriptblock]::Create([System.IO.File]::ReadAllText('C:\tmp\owner''s ! task.bat')))".to_string(),
+                POWERSHELL_WRAPPER_INVOCATION.to_string(),
             ]
         );
         assert_eq!(

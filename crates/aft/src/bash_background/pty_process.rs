@@ -181,10 +181,11 @@ pub(crate) fn spawn_pty_for_command(
             }
 
             let mut wrapper_env;
-            let env = match shell.wrapper_environment(user_command) {
+            let env = match shell.wrapper_environment(user_command, &wrapper_path) {
                 Some((key, value)) => {
                     wrapper_env = env.clone();
-                    wrapper_env.insert(key.to_string(), value.to_string());
+                    wrapper_env.retain(|name, _| !name.eq_ignore_ascii_case(key));
+                    wrapper_env.insert(key.to_string(), value.to_string_lossy().into_owned());
                     &wrapper_env
                 }
                 None => env,
