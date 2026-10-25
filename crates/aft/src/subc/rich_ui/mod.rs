@@ -11,11 +11,11 @@
 //! - `jcs_number`: the number form JCS serializes with (ECMAScript
 //!   `Number::toString`), which differs from Rust's `f64` formatting.
 //!
-//! The manifest builder and the operation table arrive in later slices; this
-//! module is the foundation they build on. Nothing here touches the daemon,
-//! the database or the wire, and until those slices call in, the only user of
-//! the module is its own test suite: the crate compiles with `-D warnings` in
-//! CI, so the dead-code lint is told exactly that rather than left to fire.
+//! Nothing here touches the daemon, the database or the wire. The manifest
+//! builder and the operation table sit on top of these pieces and call in
+//! from outside the module; until they do, the only user is this module's
+//! test suite, so the dead-code lint is told exactly that (the crate compiles
+//! with `-D warnings` in CI) rather than left to fire.
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod canonical;

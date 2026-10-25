@@ -25,9 +25,9 @@ use serde_json::Value;
 
 use super::jcs_number::canonical_number_text;
 
-/// The largest IEEE 754 double JCS permits: 2^53-1. Integers above it would
-/// lose precision once a reader parses them as a double, so the manifest and
-/// template objects stay at or under this bound (deliverable 2, "Numbers").
+/// The largest integer a binary64 double represents exactly: 2^53-1. An
+/// integer above it loses precision once a reader parses it as a double, so
+/// manifest and template objects keep their integers at or under this bound.
 pub(crate) const MAX_SAFE_INTEGER: i128 = 9_007_199_254_740_991;
 
 /// Why a value has no JCS form.
@@ -35,9 +35,8 @@ pub(crate) const MAX_SAFE_INTEGER: i128 = 9_007_199_254_740_991;
 pub(crate) enum CanonicalError {
     /// NaN and the infinities are not JSON numbers (RFC 8785 section 3.2.2.3).
     NonFiniteNumber,
-    /// The caller rejected a number the canonicalizer itself accepts. This
-    /// slice refuses fractional and out-of-range numbers in manifest and
-    /// template objects (deliverable 2, "Numbers").
+    /// A manifest or template object carried a fraction, or an integer
+    /// outside ±(2^53-1), either of which a reader would not get back.
     NumberOutOfRange { value: String },
 }
 
@@ -78,8 +77,8 @@ impl NumberRule for AnyFiniteNumber {
 }
 
 /// The manifest and template rule: integers within ±(2^53-1) only, never
-/// fractions (deliverable 2, "Numbers"). A reader that parses the number as a
-/// double gets back exactly the value the writer meant.
+/// fractions. A reader that parses the number as a double gets back exactly
+/// the value the writer meant.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SafeIntegerNumber;
 
@@ -229,9 +228,10 @@ mod tests {
         String::from_utf8(canonicalize(&value).unwrap()).unwrap()
     }
 
-    /// RFC 8785 section 3.2.2 parses this object and section 3.2.3 publishes
-    /// its canonical form: primitives round to ECMAScript's number form,
-    /// strings escape per ECMA-262, and the members sort by UTF-16 value.
+    /// This is the object RFC 8785 section 3.2.2 canonicalizes, and its
+    /// canonical form printed by section 3.2.3: primitives take ECMAScript's
+    /// number form, strings escape per ECMA-262, and members sort by UTF-16
+    /// value.
     #[test]
     fn rfc_8785_primitive_and_sorting_example_matches_the_published_bytes() {
         let input: Value = serde_json::from_str(

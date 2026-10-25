@@ -3,10 +3,12 @@
 //! The published manifest's digest is the SHA-256 of AFT's canonical bytes, so
 //! a canonicalizer that is right for most inputs and wrong for one fails the
 //! phone's digest check for the whole manifest. The vectors in
-//! `tests/fixtures/rich_ui/` pin the exact bytes of both RFC 8785 examples
-//! plus the manifest and template number rule, and every number in them sits
-//! inside ±(2^53-1), so the same committed bytes serve as the RFC-level and
-//! the builder-level (fractional or out-of-range numbers are refused) proof.
+//! `tests/fixtures/rich_ui/` pin the manifest number rule (its exact
+//! ±(2^53-1) bounds and the two cases it must refuse, a fraction and one past
+//! 2^53), member ordering, string escaping and array order. The first case is
+//! RFC 8785's section 3.2.2 example with its fractions replaced by the
+//! integers it rounds to; `canonical.rs` runs the RFC example unchanged, since
+//! the general canonicalizer has no manifest number rule.
 //!
 //! The fixtures are read with `include_bytes!` and marked `-text` in
 //! `.gitattributes`, so a Windows checkout with `core.autocrlf=true` cannot
@@ -114,8 +116,9 @@ mod tests {
     }
 
     /// A file read with `include_bytes!` gives a Windows checkout whatever
-    /// bytes git wrote, so this asserts the fixtures really are `-text` and
-    /// kept at LF: a CRLF rewrite would change every digest above.
+    /// bytes git wrote, so this checks that the embedded bytes carry no CRLF:
+    /// a CRLF rewrite (which `.gitattributes`'s `-text` rule prevents) would
+    /// change every digest above.
     #[test]
     fn the_embedded_vector_file_kept_its_committed_bytes() {
         for vector in VECTORS {

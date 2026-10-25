@@ -1,8 +1,9 @@
 # Rich UI fixtures
 
-Byte-pinned inputs for AFT's published rich-UI manifest. Every file here is
-read with `include_bytes!` and marked `-text` in `.gitattributes`, so a Windows
-checkout with `core.autocrlf=true` cannot rewrite the bytes their digests cover.
+Byte-pinned inputs for AFT's published rich-UI manifest. The vector JSON is read
+with `include_bytes!`, and this directory is marked `-text` in `.gitattributes`,
+so a Windows checkout with `core.autocrlf=true` cannot rewrite the bytes its
+digests cover.
 
 ## `canonical_vectors.json`
 
@@ -14,16 +15,15 @@ Each entry is:
 | `name` | what the case pins |
 | `input` | the JSON value to canonicalize |
 | `canonical` | the exact canonical bytes as a string, or `null` when the manifest number rule must refuse the input |
-| `digest` | `sha256:` of `canonical` |
+| `digest` | `sha256:` of `canonical`, or `null` when `canonical` is `null` |
 
-The first two cases are the examples RFC 8785 publishes in sections 3.2.2 and
-3.2.3 (its expected output is also where the "ECMAScript-compatible number
-serialization" and "property sorting" byte strings come from). The rest pin the
-rules AFT adds on top of the RFC: object members sorted by UTF-16 code unit
-(every number below stays inside ±(2^53-1), so the same bytes serve as the
-entry's number-rule vectors), RFC 8785 string escaping, array order preserved,
-and a refusal for a fractional or out-of-range number in a manifest object.
+The second case reproduces RFC 8785's section 3.2.3 property-sorting example.
+The first is RFC 8785's section 3.2.2 example with its fractional numbers
+replaced by the integers they round to, because a manifest object carries
+integers only. The remaining cases pin member sorting by UTF-16 code unit,
+string escaping, preserved array order, the manifest number rule's exact
+±(2^53-1) bounds, and its refusals for a fractional and an out-of-range
+number.
 
-AFT does not write a template source yet, so the template directory has only
-this README: the placeholder template files arrive with the slice that builds
-templates, and they follow the same byte-pinning rules.
+No template source is published yet, so this directory holds no template file;
+template files added here follow the same byte-pinning rules.

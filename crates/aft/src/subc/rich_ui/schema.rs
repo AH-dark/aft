@@ -119,8 +119,8 @@ pub(crate) enum SchemaError {
     NotAnObject { path: String },
     /// `type` is missing or is not one of the seven construct names.
     UnknownType { path: String, found: String },
-    /// The schema carries a keyword that belongs to another construct, which
-    /// is a union or a reference spelled as a keyword.
+    /// The schema uses a keyword defined for a different construct than its
+    /// `type`, such as `fields` on an `integer`: a union in disguise.
     ForeignKeyword {
         path: String,
         construct: Construct,
@@ -141,7 +141,7 @@ pub(crate) enum SchemaError {
     BoundOutOfRange { path: String, keyword: String },
     /// A numeric bound pair is inverted (`min` above `max`).
     InvertedBounds { path: String },
-    /// `decimal.scale` is above 20, the most digits a double holds exactly.
+    /// `decimal.scale` is outside the 0 to 20 the language allows.
     ScaleTooLarge { path: String },
     /// `string.enum` has no members.
     EmptyEnum { path: String },
@@ -168,9 +168,9 @@ pub(crate) enum SchemaError {
         limit: i128,
         found: i128,
     },
-    /// An integer value is outside the schema's `min`/`max`. Integers travel
-    /// in the manifest and in carrier answers, so they follow the manifest's
-    /// number rule and must be exact as a double.
+    /// An integer value is outside ±(2^53-1) even though the schema set no
+    /// bound. Integers travel in the manifest and in carrier answers, so they
+    /// follow the manifest's number rule and must be exact as a double.
     IntegerOutOfRange { path: String, value: String },
 }
 
@@ -574,9 +574,9 @@ fn validate_at(schema: &Value, value: &Value, path: &String) -> Result<(), Schem
                 }
             }
             if let Some(scale) = object.get("scale").and_then(Value::as_u64) {
-                // A double cannot hold more decimals than its shortest
-                // round-trip form prints, so a longer fraction is a value the
-                // schema's stated precision cannot promise.
+                // The fraction is counted in the value's canonical text, so
+                // it is checked against the same spelling a reader compares:
+                // a longer fraction than the schema promises is refused.
                 let fraction_digits = text
                     .split_once('.')
                     .map(|(_, fraction)| fraction.split(['e', 'E']).next().unwrap_or("").len())
