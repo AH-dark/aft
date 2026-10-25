@@ -1,59 +1,21 @@
-//! Opt-in probes for the work a tool call does *before* its handler runs:
-//! the argument translation and the undo snapshot an edit takes first.
+//! Opt-in probes for the work a tool call does before its handler runs: the
+//! argument translation and the undo snapshot an edit takes first.
 //!
-//! Both tests are ignored because the numbers depend on the machine and on a
-//! process-wide allocator counter. Run them with:
+//! Both are `#[ignore]`d because the numbers depend on the machine. Run them
+//! with:
 //!
 //! ```text
-//! cargo test --release -p agent-file-tools --test edit_translate_probe -- --ignored --nocapture
+//! cargo test -p agent-file-tools --lib -- --ignored --nocapture edit_translate
 //! ```
 //!
 //! The recorded results live in
 //! `.cortexkit/internal-docs/investigations/edit-translate-latency.md`.
 
-use aft::backup::BackupStore;
-use aft::config::Config;
-use aft::context::AppContext;
-use aft::parser::TreeSitterProvider;
-use aft::subc_translate::{subc_translate_owned_with_edit_target_probe, TranslateContext};
 use serde_json::{json, Value};
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::hint::black_box;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const SAMPLES: usize = 50;
-
-/// Counts allocations for the whole process, so one translate call can be
-/// priced in allocator calls. Tests in one binary share the counter and run in
-/// parallel, so another test's allocations can only make a count larger, never
-/// smaller.
-unsafe impl GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        System.alloc(layout)
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout)
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        System.realloc(ptr, layout, new_size)
-    }
-}
-
-struct CountingAlloc;
-static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-
-#[global_allocator]
-static ALLOC: CountingAlloc = CountingAlloc;
-
-fn allocations() -> u64 {
-    ALLOCATIONS.load(Ordering::Relaxed)
-}
 
 fn root(name: &str) -> PathBuf {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -155,20 +117,20 @@ fn translate_cases() -> Vec<(&'static str, &'static str, Value)> {
     ]
 }
 
-fn translate(tool: &str, args: &Value, project_root: &Path, app_ctx: &AppContext) {
+fn translate(tool: &str, args: &Value, project_root: &Path, app_ctx: &crate::context::AppContext) {
     // The probe `run_tool_call` installs for a glob-spelled target. It is
     // consulted only for arguments that reach the glob branch, so a call it
     // receives names a filesystem validation the prepare performed.
     let probe = |resolved: &str| {
-        aft::commands::edit_match::classify_edit_target(resolved, app_ctx, "probe")
-            != aft::commands::edit_match::EditTargetKind::Literal
+        crate::commands::edit_match::classify_edit_target(resolved, app_ctx, "probe")
+            != crate::commands::edit_match::EditTargetKind::Literal
     };
     let typed = args.as_object().expect("probe arguments are an object");
-    if let Err(error) = subc_translate_owned_with_edit_target_probe(
+    if let Err(error) = crate::subc_translate::subc_translate_owned_with_edit_target_probe(
         tool,
         Value::Object(typed.clone()),
         project_root,
-        TranslateContext::default(),
+        crate::subc_translate::TranslateContext::default(),
         &probe,
     ) {
         panic!("probe arguments must translate: {:?}", error.message);
@@ -189,7 +151,10 @@ fn edit_translate_timing_probe() {
     fixture_file(&project_root, "one.ts", 400, "TOKEN_A");
     fixture_file(&project_root, "two.ts", 400, "TOKEN_A");
     fixture_file(&project_root, "three.ts", 400, "TOKEN_C");
-    let app_ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    let app_ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config::default(),
+    );
 
     println!(
         "{:12} {:28} {:>10} {:>10} {:>12}",
@@ -206,25 +171,29 @@ fn edit_translate_timing_probe() {
         }
         let (p50, p95) = pair(samples);
 
-        let before = allocations();
-        translate(tool, &args, &project_root, &app_ctx);
-        // `allocations()` takes a snapshot that may itself allocate once
-        // (test-harness bookkeeping around the load), so drop one from the
-        // delta; the printed count is then the translate call's own.
-        let used = allocations() - before - 1;
+        // The crate's test allocator counts this thread's allocations, so the
+        // number is the translate call's own.
+        let (_, used) = crate::test_allocations::count(|| {
+            translate(tool, &args, &project_root, &app_ctx);
+        });
         println!("{tool:12} {label:28} {p50:10.3} {p95:10.3} {used:12}");
     }
 }
 
-fn backup_store(root: &Path) -> BackupStore {
-    let mut store = BackupStore::new();
+fn backup_store(root: &Path) -> crate::backup::BackupStore {
+    let mut store = crate::backup::BackupStore::new();
     // The production layout: one storage directory holding per-session stacks.
     store.set_storage_dir(root.join("backups"), 24);
     store.set_db_project_key("edit-translate-probe".to_string());
     store
 }
 
-fn snapshot_samples(store: &mut BackupStore, session: &str, path: &Path, depth: usize) -> f64 {
+fn snapshot_samples(
+    store: &mut crate::backup::BackupStore,
+    session: &str,
+    path: &Path,
+    depth: usize,
+) -> f64 {
     // `depth` names the stack length the sample starts from, so the numbers
     // separate the first snapshot of a file from a later one that already has
     // history to rewrite.
