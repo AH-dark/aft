@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ChildProcess } from "node:child_process";
+import { type ChildProcess, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,6 +33,32 @@ function settlesWithin<T>(promise: Promise<T>, ms: number): Promise<boolean> {
     new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ms)),
   ]);
 }
+
+describe("shutdown hooks", () => {
+  test("beforeExit does not suppress later signal cleanup", () => {
+    const module = join(import.meta.dir, "..", "shutdown-hooks.ts");
+    // beforeExit fires with no cleanups registered; a cleanup registered
+    // afterwards must still run when SIGTERM arrives.
+    const result = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        `
+      const { registerShutdownCleanup } = await import(${JSON.stringify(module)});
+      registerShutdownCleanup(() => {})();
+      process.emit('beforeExit', 0);
+      await Promise.resolve();
+      registerShutdownCleanup(() => process.stdout.write('late-cleanup\\n'));
+      process.kill(process.pid, 'SIGTERM');
+      setInterval(() => {}, 1000);
+    `,
+      ],
+      { encoding: "utf8", timeout: 10_000, env: { ...process.env, NODE_ENV: "test" } },
+    );
+    expect(result.stdout).toBe("late-cleanup\n");
+    expect(result.status).toBe(143);
+  });
+});
 
 describe("npm deadline", () => {
   test("stalled npm settles only after deadline termination is confirmed", async () => {
