@@ -22660,6 +22660,7 @@ mod tests {
                     dir.path().into(),
                     HashMap::new(),
                     crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    None,
                     dir.path().into(),
                     slot,
                     true,
