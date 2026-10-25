@@ -98,7 +98,7 @@ pub fn register_lane(registry: &mut LaneRegistry, lane: Arc<dyn SearchLane>) {
 }
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -4786,17 +4786,35 @@ fn run_engine_ranking(
     // same kind of answer: the reply says so first, and the files that only
     // share its words are labelled similar rather than presented as matches.
     // Phrases shorter than a trigram cannot be checked, so they get no claim.
+    //
+    // Exact evidence alone does not show the literal is present: a
+    // declaration or mention of one of its words (`bash_wait_detach = true`
+    // for `bash_wait_detach(`) is exact evidence too. A file counts only when
+    // its text holds the whole literal, punctuation included, compared the way
+    // the exact lane compares phrases (case and runs of whitespace ignored).
+    // A file that cannot be read is assumed to hold it, so no claim is made.
     let literal_absent = (not_found.is_none()
         && plan.shape == SearchShape::CodeLiteral
-        && exact_candidates.is_empty()
         && exact_disclosures.is_empty()
         && index.is_ready())
     .then(|| exact_lane::exact_phrase(exact_input))
     .filter(|phrase| phrase.len() >= 3)
-    .filter(|_| {
-        snapshot
-            .whole_corpus_exact_pass(exact_input, project_root, None)
-            .is_empty()
+    .filter(|phrase| {
+        let normalized = exact_lane::normalize_exact_phrase(phrase);
+        let possible_holders = exact_candidates
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .chain(
+                snapshot
+                    .whole_corpus_exact_pass(exact_input, project_root, None)
+                    .into_iter()
+                    .map(|found| found.path),
+            )
+            .collect::<BTreeSet<_>>();
+        !possible_holders.iter().any(|path| {
+            crate::search_index::read_searchable_text(path)
+                .is_none_or(|text| exact_lane::normalize_exact_phrase(&text).contains(&normalized))
+        })
     })
     .map(str::to_string);
 
@@ -8676,17 +8694,26 @@ fn format_result_sections_within_budget_labelled(
             )),
             None => header.push_str(file),
         }
-        if groups[file].iter().any(|(_, result)| result.exact) {
-            header.push_str(" [exact]");
-        }
-        if groups[file]
+        let exact = groups[file].iter().any(|(_, result)| result.exact);
+        let lexical = groups[file]
             .iter()
-            .any(|(_, result)| result.source == "lexical")
-        {
-            header.push_str(match textual_hits {
-                TextualHits::Matches => " [lexical match]",
-                TextualHits::Similar => SIMILAR_LABEL,
-            });
+            .any(|(_, result)| result.source == "lexical");
+        match textual_hits {
+            TextualHits::Matches => {
+                if exact {
+                    header.push_str(" [exact]");
+                }
+                if lexical {
+                    header.push_str(" [lexical match]");
+                }
+            }
+            // The literal occurs in no file, so exact-tier evidence here is
+            // only a declaration or mention of one of its words: similar too.
+            TextualHits::Similar => {
+                if exact || lexical {
+                    header.push_str(SIMILAR_LABEL);
+                }
+            }
         }
         if !out.push(&header) {
             break;

@@ -3247,6 +3247,44 @@ fn issue_826_missing_punctuated_literal_is_not_labelled_a_lexical_match() {
     assert!(!present.contains("[similar]"), "{present}");
 }
 
+/// A literal that ends in punctuation is present only where its whole text
+/// is, punctuation included. Lines that hold the bare name
+/// (`bash_wait_detach = true`) do not contain `bash_wait_detach(`, so they
+/// must not suppress the missing-literal notice; a real call does.
+#[test]
+fn punctuated_literal_counts_only_lines_that_contain_its_whole_text() {
+    let mut files = vec![
+        (
+            "src/config.rs",
+            "pub fn defaults(flags: &mut Flags) {\n    let bash_wait_detach = true;\n    flags.bash_wait_detach = bash_wait_detach;\n}\n",
+        ),
+        ("config/settings.toml", "bash_wait_detach = true\n"),
+    ];
+    let notice =
+        "No file contains `bash_wait_detach(`. The files below only share words with it; none of them is a match.";
+
+    let (_project, response) = lexical_search(&files, "bash_wait_detach(");
+    let rendered = response["text"].as_str().unwrap();
+    assert!(
+        rendered.starts_with(notice),
+        "no file contains `bash_wait_detach(`: {rendered}"
+    );
+    assert!(!rendered.contains("[exact]"), "{rendered}");
+    assert!(!rendered.contains("[lexical match]"), "{rendered}");
+
+    files.push((
+        "src/run.rs",
+        "fn run(task: Task) {\n    bash_wait_detach(task);\n}\n",
+    ));
+    let (_project, response) = lexical_search(&files, "bash_wait_detach(");
+    let rendered = response["text"].as_str().unwrap();
+    assert!(
+        !rendered.contains("No file contains"),
+        "src/run.rs contains `bash_wait_detach(`: {rendered}"
+    );
+    assert!(!rendered.contains("[similar]"), "{rendered}");
+}
+
 /// A regex-only request ranks every matching file before it cuts the page,
 /// so the list trailer knows the exact number of file results, and the count
 /// line counts files first. The reply used to say `shown 3 of ≥4 results`
