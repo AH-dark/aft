@@ -1360,7 +1360,15 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
             ctx.view_runtime_snapshot()
                 .map(|snapshot| snapshot.pending_paths),
         ) {
-            if let Err(error) = crate::executor::view_publication::schedule(ctx, pending, true) {
+            if let Err(error) = crate::executor::view_publication::schedule_with_reason(
+                ctx,
+                pending,
+                true,
+                crate::views::publication_reason::Reason {
+                    events: crate::views::publication_reason::Reason::SEMANTIC,
+                    ..Default::default()
+                },
+            ) {
                 aft::slog_warn!("semantic-ready view publication failed: {}", error);
             }
         }
@@ -2109,8 +2117,15 @@ fn publish_semantic_ready_view(ctx: &AppContext) {
     let Some(root) = ctx.canonical_cache_root_opt() else {
         return;
     };
-    match crate::executor::view_publication::schedule(ctx, paths, !ctx.shared_artifacts_read_only())
-    {
+    match crate::executor::view_publication::schedule_with_reason(
+        ctx,
+        paths,
+        !ctx.shared_artifacts_read_only(),
+        crate::views::publication_reason::Reason {
+            events: crate::views::publication_reason::Reason::SEMANTIC,
+            ..Default::default()
+        },
+    ) {
         Ok(()) => crate::slog_info!(
             "content-addressed view publication scheduled after semantic refresh root={}",
             root.display()
@@ -3492,6 +3507,7 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
         // A quiet root still needs verification after ten minutes or restart.
         // The full request remains sticky through retries and later events.
         state.view_publication_full = true;
+        state.view_publication_reason.periodic = true;
         state.view_publication_due = Some(Instant::now());
     }
     if !ctx.config().views.enabled
@@ -3509,12 +3525,14 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
         state.view_publication_due = None;
         state.view_publication_paths.clear();
         state.view_publication_full = false;
+        state.view_publication_reason = Default::default();
         return;
     }
     if ctx.view_runtime_snapshot().is_none() {
         state.view_publication_due = None;
         state.view_publication_paths.clear();
         state.view_publication_full = false;
+        state.view_publication_reason = Default::default();
         return;
     }
     if let Some(due) = ctx
@@ -3542,10 +3560,11 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
             .collect::<Option<BTreeSet<_>>>()
             .unwrap_or_default()
     };
-    match crate::executor::view_publication::schedule(
+    match crate::executor::view_publication::schedule_with_reason(
         ctx,
         changed,
         !ctx.shared_artifacts_read_only(),
+        state.view_publication_reason,
     ) {
         Ok(()) => {
             aft::slog_info!(
@@ -3554,6 +3573,7 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
             );
             state.view_publication_paths.clear();
             state.view_publication_full = false;
+            state.view_publication_reason = Default::default();
             state.view_publication_due = None;
         }
         Err(error) => {
@@ -3561,6 +3581,7 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
                 state.view_publication_due = None;
                 state.view_publication_paths.clear();
                 state.view_publication_full = false;
+                state.view_publication_reason = Default::default();
                 return;
             }
             // Inline publication records and logs the failure in the same retry
@@ -3672,15 +3693,30 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     // TypeScript server a file gets.
                     ctx.lsp_note_watcher_batch(&paths, content_only);
                     if !state.rescan_required {
-                        state.pending_paths.extend(paths.into_iter().filter(|path| {
-                            !crate::watcher_filter::queued_path_is_ignored_by_matcher(
-                                &ctx.shared_gitignore(),
-                                path,
-                            )
-                        }));
+                        let mut accepted = false;
+                        state.pending_paths.extend(
+                            paths
+                                .into_iter()
+                                .filter(|path| {
+                                    !crate::watcher_filter::queued_path_is_ignored_by_matcher(
+                                        &ctx.shared_gitignore(),
+                                        path,
+                                    )
+                                })
+                                .inspect(|_| accepted = true),
+                        );
+                        if accepted {
+                            state.view_publication_reason.events |= if content_only {
+                                crate::views::publication_reason::Reason::CONTENT
+                            } else {
+                                crate::views::publication_reason::Reason::PATHS
+                            };
+                        }
                     }
                 }
                 Ok(WatcherDispatchEvent::RescanRequired(reason)) => {
+                    state.view_publication_reason.events |=
+                        crate::views::publication_reason::Reason::RESCAN;
                     state.view_publication_full = true;
                     dispatch_events_received += 1;
                     // A rescan means the watcher dropped the individual
@@ -3702,6 +3738,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     state.scheduler_changed_path_count = 0;
                 }
                 Ok(WatcherDispatchEvent::IgnoreRulesChanged { paths }) => {
+                    state.view_publication_reason.events |=
+                        crate::views::publication_reason::Reason::IGNORE;
                     dispatch_events_received += 1;
                     ctx.lsp_note_watcher_ignore_change();
                     if state.rescan_required {
@@ -3932,6 +3970,10 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 ctx.reset_view_publication_retry();
                 state.view_publication_paths.clear();
                 state.view_publication_full = true;
+                // An earlier publication can consume the event's reason while
+                // a follow-up rescan remains pending. Record the completed rescan's cause.
+                state.view_publication_reason.events |=
+                    crate::views::publication_reason::Reason::RESCAN;
                 state.view_publication_due = Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
             }
         }
@@ -3963,6 +4005,10 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     ctx.reset_view_publication_retry();
                     state.view_publication_paths.clear();
                     state.view_publication_full = true;
+                    // File edits can publish before the ignore refresh finishes
+                    // and consume its recorded reason. Record the completed refresh's cause.
+                    state.view_publication_reason.events |=
+                        crate::views::publication_reason::Reason::IGNORE;
                     state.view_publication_due =
                         Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
                 }
@@ -3995,6 +4041,10 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 } else {
                     BTreeSet::new()
                 };
+                if !git_head_paths.is_empty() {
+                    state.view_publication_reason.events |=
+                        crate::views::publication_reason::Reason::HEAD_METADATA;
+                }
                 paths.retain(|path| !git_head_paths.contains(path));
                 if ctx.config().views.enabled {
                     // An edit or a HEAD move: the main checkout's call graph no
@@ -4803,6 +4853,201 @@ mod tests {
         advance_ignore_rule_refresh_clock(Duration::from_millis(1));
         drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
         assert_eq!(ignore_rule_refreshes_for_test(), 1);
+    }
+
+    fn view_publication_context_for_reason_test(
+        root: &Path,
+        storage: &Path,
+    ) -> (
+        Arc<AppContext>,
+        crossbeam_channel::Sender<WatcherDispatchEvent>,
+    ) {
+        for arguments in [
+            vec!["init", "--quiet"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let (ctx, tx) = watcher_context(root);
+        ctx.update_config(|config| {
+            config.views.enabled = true;
+            config.indexes.semantic = false;
+            config.indexes.callgraph = false;
+        });
+        ctx.set_cache_writer_capabilities(true, true);
+        ctx.rebuild_gitignore();
+        let scope = crate::path_identity::project_scope_key(root);
+        let view = crate::views::ViewStore::open(storage, &scope).unwrap();
+        ctx.install_view_runtime(
+            crate::context::ViewRuntimeSnapshot {
+                query_pin: None,
+                storage: storage.to_path_buf(),
+                family: crate::search_index::artifact_cache_key(root),
+                scope,
+                view_dir: view.view_dir().to_path_buf(),
+                generation: None,
+                manifest: None,
+                head_fingerprint: String::new(),
+                head_metadata: crate::alias::capture_git_head_metadata(root, None).unwrap(),
+                pending_paths: BTreeSet::new(),
+                pending_inputs: Default::default(),
+            },
+            None,
+        );
+        // Seed a current manifest so periodic verification does not add an
+        // unrelated scheduling reason to these watcher publications.
+        ctx.publish_view_paths(BTreeSet::new(), true).unwrap();
+        (Arc::new(ctx), tx)
+    }
+
+    fn publish_due_view_for_reason_test(ctx: &AppContext) {
+        let mut state = ctx.watcher_drain_slice().lock().take().unwrap();
+        // Make the publication deadline runnable without advancing the ignore
+        // refresh test clock.
+        if state.view_publication_due.is_some() {
+            state.view_publication_due = Some(Instant::now());
+        }
+        publish_view_if_quiet(ctx, &mut state);
+        *ctx.watcher_drain_slice().lock() = Some(state);
+    }
+
+    #[test]
+    fn delayed_view_publication_retains_ignore_reason_after_edit() {
+        let _reset = begin_ignore_rule_refresh_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let source = root.join("changed.rs");
+        let ignore = root.join(".aftignore");
+        std::fs::write(&source, "pub fn value() -> i32 { 1 }\n").unwrap();
+        std::fs::write(&ignore, "old/\n").unwrap();
+        let (ctx, tx) = view_publication_context_for_reason_test(&root, storage.path());
+        let before = crate::views::assembly::publication_scheduling_for_test(&root).len();
+
+        std::fs::write(&source, "pub fn value() -> i32 { 2 }\n").unwrap();
+        std::fs::write(&ignore, "generated/\n").unwrap();
+        tx.send(WatcherDispatchEvent::Paths(vec![source])).unwrap();
+        send_ignore_rule_change(&tx, ignore);
+        drain_watcher_to_completion_for_test(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        publish_due_view_for_reason_test(&ctx);
+
+        let first = crate::views::assembly::publication_scheduling_for_test(&root);
+        assert_eq!(first.len(), before + 1);
+        assert!(
+            first[before].contains("schedule_event_kinds=paths,ignore_rules "),
+            "{}",
+            first[before]
+        );
+        assert_eq!(ignore_rule_refreshes_for_test(), 0);
+        assert_eq!(
+            ctx.watcher_drain_slice()
+                .lock()
+                .as_ref()
+                .unwrap()
+                .view_publication_reason
+                .events,
+            0
+        );
+
+        advance_ignore_rule_refresh_clock(Duration::from_millis(4_999));
+        drain_watcher_to_completion_for_test(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(ignore_rule_refreshes_for_test(), 0);
+        assert_eq!(
+            crate::views::assembly::publication_scheduling_for_test(&root).len(),
+            before + 1
+        );
+        advance_ignore_rule_refresh_clock(Duration::from_millis(1));
+        drain_watcher_to_completion_for_test(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(ignore_rule_refreshes_for_test(), 1);
+        publish_due_view_for_reason_test(&ctx);
+
+        let publications = crate::views::assembly::publication_scheduling_for_test(&root);
+        assert_eq!(publications.len(), before + 2);
+        let second = &publications[before + 1];
+        assert!(
+            second.contains("schedule_event_kinds=ignore_rules "),
+            "second publication lost ignore_rules: {second}"
+        );
+        assert!(second.contains("schedule_full_read=true"), "{second}");
+    }
+
+    #[test]
+    fn delayed_view_publication_retains_deferred_rescan_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.join("source.rs"), "pub fn value() {}\n").unwrap();
+        let (ctx, tx) = view_publication_context_for_reason_test(&root, storage.path());
+        let before = crate::views::assembly::publication_scheduling_for_test(&root).len();
+        ctx.watcher_counters().note_overflow_ignore_relevance(false);
+        tx.send(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown))
+            .unwrap();
+        let (reached, release) = install_watcher_rescan_gate_for_test(&ctx);
+        let worker_ctx = ctx.clone();
+        let drain = std::thread::spawn(move || {
+            drain_watcher_events_bounded(&worker_ctx, WATCHER_PATH_DRAIN_BATCH_CAP)
+        });
+        reached.recv_timeout(Duration::from_secs(5)).unwrap();
+        ctx.watcher_counters().note_overflow_ignore_relevance(false);
+        assert!(ctx
+            .watcher_counters()
+            .note_overflow(RescanReason::KernelDropped, Vec::new()));
+        release.send(()).unwrap();
+        assert!(drain.join().unwrap().has_more);
+        assert!(
+            ctx.watcher_drain_slice()
+                .lock()
+                .as_ref()
+                .unwrap()
+                .rescan_required
+        );
+        publish_due_view_for_reason_test(&ctx);
+        assert_eq!(
+            crate::views::assembly::publication_scheduling_for_test(&root).len(),
+            before + 1
+        );
+        assert_eq!(
+            ctx.watcher_drain_slice()
+                .lock()
+                .as_ref()
+                .unwrap()
+                .view_publication_reason
+                .events,
+            0
+        );
+
+        drain_watcher_to_completion_for_test(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        publish_due_view_for_reason_test(&ctx);
+        let publications = crate::views::assembly::publication_scheduling_for_test(&root);
+        assert_eq!(publications.len(), before + 2);
+        let second = &publications[before + 1];
+        assert!(
+            second.contains("schedule_event_kinds=rescan "),
+            "second publication lost rescan: {second}"
+        );
+        assert!(second.contains("schedule_full_read=true"), "{second}");
     }
 
     #[test]

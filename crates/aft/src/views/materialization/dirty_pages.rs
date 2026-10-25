@@ -36,7 +36,7 @@ fn absolute_sqlite_path(path: &Path) -> PathBuf {
 
 fn platform() -> *mut ffi::sqlite3_vfs {
     static PLATFORM: OnceLock<usize> = OnceLock::new();
-    *PLATFORM.get_or_init(|| unsafe { ffi::sqlite3_vfs_find(std::ptr::null()) as usize })
+    *PLATFORM.get_or_init(|| crate::views::write_accounting::vfs() as usize)
         as *mut ffi::sqlite3_vfs
 }
 
@@ -55,7 +55,7 @@ pub(crate) fn open_probe_connection(
     if measured {
         Connection::open_with_flags_and_vfs(path, flags, VFS_NAME)
     } else {
-        Connection::open_with_flags(path, flags)
+        crate::views::write_accounting::open_connection(path, flags)
     }
 }
 

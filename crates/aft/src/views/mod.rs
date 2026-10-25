@@ -22,6 +22,8 @@ pub(crate) mod io;
 pub mod lazy_read_benchmark;
 pub mod materialization;
 mod profile;
+pub(crate) mod publication_reason;
+pub(crate) mod write_accounting;
 #[cfg(test)]
 pub(crate) use profile::observe_publication_phases_for_test;
 pub(crate) mod read;
@@ -1415,9 +1417,12 @@ fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<[u8; 32]> {
             .open(&temporary)
             .map_err(|error| ViewError::io_at("creating", &temporary, error))?;
         let bytes = manifest.json_bytes()?;
-        file.write_all(&bytes)
+        let mut writer = write_accounting::ManifestWriter(&mut file);
+        writer
+            .write_all(&bytes)
             .map_err(|error| ViewError::io_at("writing", &temporary, error))?;
-        file.write_all(b"\n")
+        writer
+            .write_all(b"\n")
             .map_err(|error| ViewError::io_at("writing", &temporary, error))?;
         let mut digest = blake3::Hasher::new();
         digest.update(&bytes);

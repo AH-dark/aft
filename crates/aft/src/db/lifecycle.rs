@@ -624,7 +624,10 @@ impl TrackedConnection {
             OpenFlags::default(),
         )?;
         #[cfg(not(test))]
-        let connection = Connection::open(sqlite_open_path(path))?;
+        let connection = crate::views::write_accounting::open_connection(
+            &sqlite_open_path(path),
+            OpenFlags::default(),
+        )?;
         Self::from_connection_attributed(connection, store, root_id)
     }
 
@@ -648,7 +651,8 @@ impl TrackedConnection {
             let connection =
                 crate::views::materialization::open_probe_connection(Path::new(path), flags)?;
             #[cfg(not(test))]
-            let connection = Connection::open_with_flags(path, flags)?;
+            let connection =
+                crate::views::write_accounting::open_connection(Path::new(path), flags)?;
             connection
         } else {
             #[cfg(test)]
@@ -657,7 +661,10 @@ impl TrackedConnection {
                 flags,
             )?;
             #[cfg(not(test))]
-            let connection = Connection::open_with_flags(sqlite_open_path(Path::new(path)), flags)?;
+            let connection = crate::views::write_accounting::open_connection(
+                &sqlite_open_path(Path::new(path)),
+                flags,
+            )?;
             connection
         };
         Self::from_connection_attributed(connection, store, path.to_owned())
@@ -677,7 +684,8 @@ impl TrackedConnection {
         let connection =
             crate::views::materialization::open_probe_connection(&sqlite_open_path(path), flags)?;
         #[cfg(not(test))]
-        let connection = Connection::open_with_flags(sqlite_open_path(path), flags)?;
+        let connection =
+            crate::views::write_accounting::open_connection(&sqlite_open_path(path), flags)?;
         Self::from_connection_attributed(connection, store, path.display().to_string())
     }
 
