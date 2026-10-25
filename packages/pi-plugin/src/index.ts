@@ -49,6 +49,7 @@ import {
   resolveCortexKitStorageRoot,
   resolveIndexes,
   setActiveLogger,
+  shouldShowAnnouncement,
   unknownDisabledTools,
 } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -88,6 +89,7 @@ import { NPM_LSP_TABLE } from "./lsp-npm-table.js";
 import {
   type ConfigureWarning,
   deliverConfigureWarnings,
+  formatFeatureAnnouncement,
   formatLspInstallSummary,
   sendFeatureAnnouncement,
   sendLspInstallSummary,
@@ -938,13 +940,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   };
   ctx.startSessionWork = startSessionWork;
 
-  if (ANNOUNCEMENT_VERSION && ANNOUNCEMENT_FEATURES.length > 0) {
-    announcementPending = !sendFeatureAnnouncement(
-      ANNOUNCEMENT_VERSION,
-      ANNOUNCEMENT_FEATURES,
-      ANNOUNCEMENT_FOOTER,
-      storageDir,
+  if (
+    ANNOUNCEMENT_VERSION &&
+    ANNOUNCEMENT_FEATURES.length > 0 &&
+    shouldShowAnnouncement(storageDir, "pi", ANNOUNCEMENT_VERSION)
+  ) {
+    log(
+      formatFeatureAnnouncement(ANNOUNCEMENT_VERSION, ANNOUNCEMENT_FEATURES, ANNOUNCEMENT_FOOTER),
     );
+    announcementPending = true;
   }
 
   ctx.ompRouter = await loadOmpInternalUrlRouter(pi);

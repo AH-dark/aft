@@ -670,4 +670,26 @@ describe.skipIf(process.platform === "win32")("approved session UI binding", () 
     expect(warnings[0]?.message).toContain("fixture install failed");
     expect(warnings[0]?.message).not.toContain("routine-server");
   });
+
+  test("headless announcement retries log once and deliver once when UI becomes available", async () => {
+    const run = await notifications("notification-log-retry");
+    expect(run.code).toBe(0);
+    expect(run.stdout).toContain("EVENT headless-turns-done");
+    expect(run.stdout).toContain("EVENT ui-turns-done");
+    expect(run.stdout.split("EVENT headless-turns-done")[0]).not.toContain("EVENT ui-toast ");
+    const announcementLogs = run.stderr.match(/\] INFO \[aft-pi\] 🔧 AFT: ✨ v[^\r\n]+:/g);
+    expect(announcementLogs).toHaveLength(1);
+    const announcements = run.stdout
+      .split("\n")
+      .filter((line) => line.startsWith("EVENT ui-toast "))
+      .map((line) => JSON.parse(line.slice("EVENT ui-toast ".length)))
+      .filter((toast) => toast.type === "info" && toast.message.startsWith("🔧 AFT: ✨"));
+    expect(announcements).toHaveLength(1);
+    expect(announcements[0]?.sessionId).toBe("retry-session");
+    const version = JSON.parse(
+      readFileSync(join(import.meta.dir, "../../package.json"), "utf8"),
+    ).version;
+    expect(announcements[0]?.message).toContain(`v${version}:`);
+    expect(run.stdout).toContain(`EVENT announcement-marker ${version}`);
+  });
 });

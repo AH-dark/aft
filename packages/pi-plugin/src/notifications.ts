@@ -201,19 +201,11 @@ export async function deliverConfigureWarnings(
   }
 }
 
-export function sendFeatureAnnouncement(
+export function formatFeatureAnnouncement(
   version: string,
   features: string[],
   footer: string,
-  storageDir: string,
-  client?: unknown,
-): boolean {
-  // shouldShowAnnouncement silently seeds the marker on first-install /
-  // ephemeral-sandbox launches, so Docker/CI/disposable-VM users don't get
-  // changelog bullets spammed on every boot (per magic-context#99). Real
-  // upgrades from a persisted older version still surface here.
-  if (!shouldShowAnnouncement(storageDir, "pi", version)) return true;
-
+): string {
   // Blank-line separator pins the persistent footer (Discord invite, etc.)
   // below the version-specific bullets so the footer reads as "always here"
   // rather than as one more changelog item.
@@ -224,9 +216,21 @@ export function sendFeatureAnnouncement(
   if (typeof footer === "string" && footer.trim().length > 0) {
     sections.push("", footer);
   }
-  log(sections.join("\n"));
+  return sections.join("\n");
+}
 
-  if (!notifyPi(client, sections.join("\n"), "info")) return false;
+/** Retry UI delivery without repeating the announcement logged at startup. */
+export function sendFeatureAnnouncement(
+  version: string,
+  features: string[],
+  footer: string,
+  storageDir: string,
+  client?: unknown,
+): boolean {
+  // First installs silently seed the marker; upgrades stay pending until UI delivery.
+  if (!shouldShowAnnouncement(storageDir, "pi", version)) return true;
+
+  if (!notifyPi(client, formatFeatureAnnouncement(version, features, footer), "info")) return false;
   markAnnouncementSeen(storageDir, "pi", version);
   return true;
 }
