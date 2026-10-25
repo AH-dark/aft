@@ -1089,6 +1089,10 @@ async fn consent_deadline_during_settled_application_waits_for_the_real_answer()
 
 static SETTLED_DEADLINE_WAITING: AtomicBool = AtomicBool::new(false);
 static SETTLED_WAITER_JOINED: AtomicBool = AtomicBool::new(false);
+// Regression checks can disable either synchronization path without rebuilding
+// the non-test library.
+pub(super) static SETTLED_DEADLINE_ENABLED: AtomicBool = AtomicBool::new(true);
+pub(super) static SETTLED_JOIN_ENABLED: AtomicBool = AtomicBool::new(true);
 pub(super) static SETTLED_WAIT_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn settled_deadline_waiting() {
@@ -1903,12 +1907,14 @@ async fn consent_scope_stalled_prepare_probe_is_bounded_and_releases_database() 
     let started = Instant::now();
     let task = tokio::spawn(async move {
         let route = RouteHold::new(running_call.route);
+        let owner = SettlementOwner::new(&running_call);
         hold(
             &running_call,
             grant,
             Instant::now() + Duration::from_millis(100),
             &route,
             None,
+            &owner.0,
         )
         .await
     });
@@ -1962,10 +1968,13 @@ async fn consent_stalled_home_scope_probe_is_single_flight_and_file_only() {
         let call = scope_probe_call(&f, &target);
         tasks.spawn(async move {
             let route = RouteHold::new(call.route);
-            let result =
-                tokio::time::timeout(HANG_GUARD, hold(&call, grant, Instant::now(), &route, None))
-                    .await
-                    .expect("concurrent stalled probes must finish before the hang guard");
+            let owner = SettlementOwner::new(&call);
+            let result = tokio::time::timeout(
+                HANG_GUARD,
+                hold(&call, grant, Instant::now(), &route, None, &owner.0),
+            )
+            .await
+            .expect("concurrent stalled probes must finish before the hang guard");
             assert!(matches!(result, Hold::Answer(_)));
         });
     }

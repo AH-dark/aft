@@ -652,7 +652,7 @@ struct SettlementOwner(Arc<SettlementFlight>);
 impl SettlementOwner {
     fn new(call: &HeldCall) -> Self {
         let flight = Arc::new(SettlementFlight {
-            root: call.identity.root.clone(),
+            root: call.identity.root.clone().into(),
             session: call.identity.session.clone(),
             binding: serde_json::to_value(&call.identity.scope).expect("scope stamp is JSON"),
             key: AskKey {
@@ -696,6 +696,10 @@ impl Drop for SettlementOwner {
 impl SettlementFlight {
     /// Elect one application owner even if two open awaits receive the answer.
     fn other_settled(self: &Arc<Self>, receiving: bool) -> Option<Arc<Self>> {
+        #[cfg(test)]
+        if !tests::SETTLED_JOIN_ENABLED.load(Ordering::SeqCst) {
+            return None;
+        }
         let flights = SETTLEMENT_FLIGHTS.lock().unwrap();
         let other = flights
             .iter()
@@ -2060,7 +2064,10 @@ async fn hold(
                             return Hold::Answer(refused_answer(call, &prep.grant, "access_withdrawn", None));
                         }
                         None if Instant::now() >= deadline => {
-                            if settled_received.load(Ordering::SeqCst) {
+                            let received_settlement = settled_received.load(Ordering::SeqCst);
+                            #[cfg(test)]
+                            let received_settlement = received_settlement && tests::SETTLED_DEADLINE_ENABLED.load(Ordering::SeqCst);
+                            if received_settlement {
                                 if let Some(result) = applied.lock().unwrap().take() {
                                     return result;
                                 }
