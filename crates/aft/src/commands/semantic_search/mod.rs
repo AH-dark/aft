@@ -126,8 +126,8 @@ use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
 use crate::readonly_artifacts::{GitRootResolutionError, ReadOnlyArtifact, ReadOnlyDegradation};
 use crate::search_index::{
-    sort_grep_matches_by_mtime_desc, try_read_with_budget, walk_project_files_from, GrepMatch,
-    GrepPathExclusion, GrepResult, IndexStatus, PathFilters, SearchIndex,
+    sort_grep_matches_by_mtime_desc, try_read_with_budget, walk_project_files_from_matching,
+    GrepMatch, GrepPathExclusion, GrepResult, IndexStatus, PathFilters, SearchIndex,
     INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
 use crate::semantic_index::{
@@ -3545,7 +3545,7 @@ fn lexical_candidate_exactness(
     content_tokens: &[String],
 ) -> (bool, usize, Option<usize>) {
     #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read();
+    crate::search_hot_path_measurements::record_file_read_path(file);
     let Ok(bytes) = fs::read(file) else {
         return (false, 0, None);
     };
@@ -4528,6 +4528,8 @@ fn matching_line_from_source(
     symbol_range: Option<SymbolOffsetRange>,
 ) -> Option<(u32, String)> {
     let source = std::fs::read_to_string(file).ok()?;
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record_file_read_path(file);
     let normalized_phrase = exact_lane::normalize_exact_phrase(exact_lane::exact_phrase(query));
     if !normalized_phrase.is_empty() {
         if let Some((line_index, line)) = source
@@ -4664,6 +4666,8 @@ fn definition_line_from_source(
     symbol_range: SymbolOffsetRange,
 ) -> Option<(u32, String)> {
     let source = std::fs::read_to_string(file).ok()?;
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record_file_read_path(file);
     line_at_offset(&source, symbol_range.start)
 }
 
@@ -4671,6 +4675,8 @@ fn definition_matches_identifier_token(candidate: &CandidateResult, query: &str)
     let Some(range) = candidate.symbol_range else {
         return false;
     };
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record_file_read_path(&candidate.path);
     let Ok(source) = std::fs::read(&candidate.path) else {
         return false;
     };
@@ -4708,6 +4714,8 @@ fn identifier_has_code_reference(
     identifier: &str,
     parser: &mut crate::parser::FileParser,
 ) -> bool {
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record_file_read_path(path);
     let Ok(source) = std::fs::read_to_string(path) else {
         return false;
     };
@@ -5153,10 +5161,16 @@ fn run_engine_ranking(
             })
             .filter(|token| token.contains('.'))
             .collect::<Vec<_>>();
-        walk_project_files_from(project_root, project_root, &PathFilters::default())
-            .into_iter()
-            .filter(|path| candidate_filter(path))
-            .filter(|path| {
+        // Reject unrelated filenames before the walker builds metadata and
+        // canonical display keys for sorting; the surviving order is unchanged.
+        walk_project_files_from_matching(
+            project_root,
+            project_root,
+            &PathFilters::default(),
+            |path| {
+                if !candidate_filter(path) {
+                    return false;
+                }
                 let relative = path
                     .strip_prefix(project_root)
                     .unwrap_or(path)
@@ -5167,11 +5181,13 @@ fn run_engine_ranking(
                     let normalized = token.replace('\\', "/");
                     file_name == Some(normalized.as_str()) || relative.ends_with(&normalized)
                 })
-            })
-            .map(|path| {
-                CandidateResult::new_exact(path, None, EvidenceDescriptor::for_e1(1, true, false))
-            })
-            .collect()
+            },
+        )
+        .into_iter()
+        .map(|path| {
+            CandidateResult::new_exact(path, None, EvidenceDescriptor::for_e1(1, true, false))
+        })
+        .collect()
     } else {
         Vec::new()
     };
@@ -8508,6 +8524,8 @@ fn snippet_read_plans(
 
 fn read_bounded_snippet_lines(path: &Path, plan: SnippetReadPlan) -> Option<Vec<String>> {
     let file = fs::File::open(path).ok()?;
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record_file_read_path(path);
     let mut reader = std::io::BufReader::new(file);
     let mut lines = Vec::new();
     let mut nonempty_lines = 0usize;
@@ -9527,6 +9545,179 @@ mod tests {
         let response = response_value(handle_semantic_search(&request, ctx));
         assert_eq!(response["success"], true, "{response}");
         response["text"].as_str().expect("text").to_string()
+    }
+
+    #[test]
+    fn path_lookup_filters_before_sorting_unrelated_files() {
+        let (project, ctx) = presence_project(&[("src/indexed.rs", "pub fn indexed() {}\n")]);
+        for file in 0..32 {
+            fs::write(
+                project.path().join(format!("src/unrelated_{file}.rs")),
+                "pub fn unrelated() {}\n",
+            )
+            .unwrap();
+        }
+        fs::write(
+            project.path().join("src/new-file.rs"),
+            "pub fn fresh() {}\n",
+        )
+        .unwrap();
+        crate::search_hot_path_measurements::reset();
+        let text = presence_search(&ctx, "where is new-file.rs", 10, 0);
+        assert!(text.contains("new-file.rs"), "{text}");
+        let counts = crate::search_hot_path_measurements::counts();
+        assert_eq!(counts.project_walks, 1, "{counts:?}");
+        assert!(counts.project_walk_entries >= 34, "{counts:?}");
+        assert_eq!(counts.project_walk_files, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn path_lookup_keeps_live_unindexed_filename_matches() {
+        let (project, ctx) = presence_project(&[("src/indexed.rs", "pub fn indexed() {}\n")]);
+        fs::write(
+            project.path().join("src/new-file.rs"),
+            "pub fn fresh() {}\n",
+        )
+        .unwrap();
+        crate::search_hot_path_measurements::reset();
+        let text = presence_search(&ctx, "where is new-file.rs", 10, 0);
+        assert!(text.contains("new-file.rs"), "{text}");
+        assert!(crate::search_hot_path_measurements::counts().project_walks >= 1);
+    }
+
+    #[test]
+    #[ignore = "opt-in 20,000-file engine execution latency measurement"]
+    fn search_exec_latency_large_project() {
+        use crate::search_hot_path_measurements::{counts, reset};
+        let project = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(project.path()).unwrap();
+        for directory in 0..100 {
+            let dir = root.join(format!("src/subsystem_{directory:03}"));
+            fs::create_dir_all(&dir).unwrap();
+            for file in 0..200 {
+                let id = directory * 200 + file;
+                let path = dir.join(format!("module_{id:05}.rs"));
+                let content = format!(
+                    "//! Implementation of subsystem {directory}.\n\
+                    /// Processes domain events for module {id}.\n\
+                    pub fn module_{id}(value: usize) -> usize {{\n    value.saturating_add({id})\n}}\n\
+                    #[derive(Clone, Debug, Default)]\n\
+                    pub struct State{id} {{ pub value: usize, pub sequence: u64, pub pending: Vec<usize> }}\n\
+                    impl State{id} {{\n\
+                        pub fn record(&mut self, value: usize) {{\n\
+                            self.pending.push(value);\n\
+                            self.sequence = self.sequence.wrapping_add(1);\n\
+                            self.value = self.value.saturating_add(value);\n\
+                        }}\n\
+                        pub fn drain(&mut self) -> Vec<usize> {{ std::mem::take(&mut self.pending) }}\n\
+                        pub fn reset(&mut self) {{ self.value = 0; self.pending.clear(); }}\n\
+                        pub fn is_idle(&self) -> bool {{ self.pending.is_empty() }}\n\
+                    }}\n"
+                );
+                fs::write(&path, &content).unwrap();
+            }
+        }
+        let path = root.join("src/retry.rs");
+        let content = "/// The scheduler handles retries with a retry policy.\npub fn retry_policy() -> bool { true }\n// retry-policy-enabled\n";
+        fs::write(&path, content).unwrap();
+        let index = SearchIndex::build(&root);
+        assert_eq!(index.file_count(), 20_001);
+        let mut ctx = test_context(&root);
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Disabled;
+        *ctx.search_index().write().unwrap() = Some(index);
+        for (class, query, pattern) in [
+            (
+                "natural_language",
+                "how does the scheduler handle retries",
+                None,
+            ),
+            (
+                "broad_exact_window",
+                "how does subsystem module value",
+                None,
+            ),
+            (
+                "prose_identifier",
+                "how does retry_policy schedule work",
+                None,
+            ),
+            ("identifier", "retry_policy", None),
+            ("missing_identifier", "missing_retry_policy", None),
+            ("code_literal", "\"retry-policy-enabled\"", None),
+            ("path", "retry.rs", None),
+            ("unresolved_path", "absent.rs", None),
+            ("prose_path", "where is retry.rs implemented", None),
+            (
+                "split_identifier",
+                "how does retry_policy schedule work",
+                Some("retry_policy"),
+            ),
+            (
+                "split_path",
+                "where is retry.rs implemented",
+                Some("retry_policy"),
+            ),
+        ] {
+            // Start each query with fresh request caches while retaining the
+            // prepared corpus; context setup stays outside the timed samples.
+            let index = ctx.search_index().write().unwrap().take().unwrap();
+            ctx = test_context(&root);
+            *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Disabled;
+            *ctx.search_index().write().unwrap() = Some(index);
+            let mut timings = Vec::new();
+            let mut cold = None;
+            let mut repeat = None;
+            let mut digests = HashSet::new();
+            for sample in 0..31 {
+                let mut request = serde_json::json!({
+                    "id": "search-exec-latency", "command": "semantic_search",
+                    "query": query, "top_k": 10,
+                });
+                if let Some(pattern) = pattern {
+                    request["pattern"] = serde_json::json!(pattern);
+                }
+                let request: RawRequest = serde_json::from_value(request).unwrap();
+                reset();
+                let started = Instant::now();
+                let response = handle_semantic_search(&request, &ctx);
+                let elapsed = started.elapsed();
+                let response = response_value(response);
+                assert_eq!(response["success"], true, "{response}");
+                assert_eq!(
+                    response["structuredContent"]["plan"]["readiness"]["lexical_index"], true,
+                    "{response}"
+                );
+                assert_eq!(
+                    response["structuredContent"]["plan"]["readiness"]["semantic_index"], false,
+                    "{response}"
+                );
+                let text = response["text"].as_str().unwrap();
+                let millis = elapsed.as_secs_f64() * 1000.0;
+                if sample == 0 {
+                    cold = Some(serde_json::json!({
+                        "exec_ms": millis, "work": counts(),
+                        "plan": response["structuredContent"]["plan"],
+                    }));
+                } else {
+                    timings.push(millis);
+                    repeat = Some(counts());
+                }
+                let normalized = text.replace(root.to_string_lossy().as_ref(), "<fixture>");
+                digests.insert(blake3::hash(normalized.as_bytes()).to_hex().to_string());
+            }
+            timings.sort_by(f64::total_cmp);
+            println!(
+                "SEARCH_EXEC {}",
+                serde_json::json!({
+                    "class": class, "query": query, "pattern": pattern, "files": 20_001,
+                "cold": cold, "repeat_samples": timings.len(),
+                "repeat_p50_ms": (timings[14] + timings[15]) / 2.0,
+                "repeat_p95_ms": timings[28], "repeat_work": repeat,
+                "repeat_exec_ms": timings,
+                    "text_digests": digests,
+                })
+            );
+        }
     }
 
     const BASH_WAIT_DETACH_ABSENT: &str = "No file contains `bash_wait_detach(`.";

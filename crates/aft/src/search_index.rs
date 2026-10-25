@@ -1074,6 +1074,8 @@ impl SearchIndexSnapshot {
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         scope: &ExactEvidenceScope,
     ) -> std::io::Result<Vec<ExactPassMatch>> {
+        #[cfg(test)]
+        let measured_start = Instant::now();
         let phrase = exact_lane::exact_phrase(query);
         let norm_phrase = exact_lane::normalize_exact_phrase(phrase);
         let content_tokens = exact_lane::exact_verification_tokens(query);
@@ -1208,6 +1210,13 @@ impl SearchIndexSnapshot {
             }
         }
 
+        #[cfg(test)]
+        crate::search_hot_path_measurements::record(|counts| {
+            counts.exact_passes += 1;
+            counts.exact_pass_candidates += candidate_count;
+            counts.exact_pass_reads += files_read;
+            counts.exact_pass_micros += measured_start.elapsed().as_micros() as usize;
+        });
         crate::slog_debug!(
             "exact pass: {} of {} candidate files kept for {:?}, {} read, {} bytes, {} hashed, {} matches in {:?}",
             candidate_count,
@@ -4687,7 +4696,7 @@ fn read_search_corpus_file_with_metadata(
     }
 
     #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read();
+    crate::search_hot_path_measurements::record_file_read_path(path);
     // Bound the read itself as well as admission: the file can grow after stat.
     let mut bytes =
         Vec::with_capacity(usize::try_from(metadata.size.min(max_file_size)).unwrap_or(0));
@@ -6552,6 +6561,8 @@ where
     )
 }
 
+// Only the ordering regression needs the unfiltered, mtime-sorted walk.
+#[cfg(test)]
 pub(crate) fn walk_project_files_from(
     filter_root: &Path,
     search_root: &Path,
@@ -6559,6 +6570,28 @@ pub(crate) fn walk_project_files_from(
 ) -> Vec<PathBuf> {
     walk_project_files_from_inner(filter_root, search_root, filters, None, true)
         .expect("unbounded project walk cannot exceed a file limit")
+}
+
+/// Enumerate the same live tree and order as `walk_project_files_from`, but
+/// retain only matching paths before building metadata and display sort keys.
+pub(crate) fn walk_project_files_from_matching<F>(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    matches_file: F,
+) -> Vec<PathBuf>
+where
+    F: Fn(&Path) -> bool,
+{
+    walk_project_files_from_inner_matching(
+        filter_root,
+        search_root,
+        filters,
+        None,
+        matches_file,
+        true,
+    )
+    .expect("unbounded project walk cannot exceed a file limit")
 }
 
 fn walk_project_files_from_inner(
@@ -7054,8 +7087,12 @@ where
 {
     let builder = project_walk_builder(search_root);
 
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record(|counts| counts.project_walks += 1);
     let mut files = Vec::new();
     for entry in builder.build().filter_map(|entry| entry.ok()) {
+        #[cfg(test)]
+        crate::search_hot_path_measurements::record(|counts| counts.project_walk_entries += 1);
         if !entry
             .file_type()
             .map_or(false, |file_type| file_type.is_file())
@@ -7064,6 +7101,8 @@ where
         }
         let path = entry.into_path();
         if filters.matches(filter_root, &path) && matches_file(&path) {
+            #[cfg(test)]
+            crate::search_hot_path_measurements::record(|counts| counts.project_walk_files += 1);
             files.push(path);
             if max_files.is_some_and(|limit| files.len() > limit) {
                 return Err(files.len());
@@ -17328,6 +17367,54 @@ mod tests {
             walker_dirs < 50,
             "ignore walker should not descend deeply into ignored tree (dirs={walker_dirs})"
         );
+    }
+
+    #[test]
+    fn matching_project_walk_preserves_filtered_mtime_order() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, age) in [
+            ("src/a/retry.rs", 0),
+            ("src/b/retry.rs", 0),
+            ("src/c/retry.rs", 1),
+            ("tests/retry.rs", 2),
+            ("src/unrelated.rs", 3),
+        ] {
+            let path = dir.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "pub fn fixture() {}\n").unwrap();
+            filetime::set_file_mtime(
+                &path,
+                filetime::FileTime::from_unix_time(1_700_000_000 + age, 0),
+            )
+            .unwrap();
+        }
+        for suffix in ["retry.rs", "a/retry.rs", "missing.rs"] {
+            for include_tests in [false, true] {
+                let matches = |path: &Path| {
+                    let relative = path.strip_prefix(dir.path()).unwrap();
+                    (include_tests || !relative.starts_with("tests"))
+                        && relative
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                            .ends_with(suffix)
+                };
+                let expected =
+                    walk_project_files_from(dir.path(), dir.path(), &PathFilters::default())
+                        .into_iter()
+                        .filter(|path| matches(path))
+                        .collect::<Vec<_>>();
+                let actual = walk_project_files_from_matching(
+                    dir.path(),
+                    dir.path(),
+                    &PathFilters::default(),
+                    matches,
+                );
+                assert_eq!(
+                    actual, expected,
+                    "suffix={suffix}, include_tests={include_tests}"
+                );
+            }
+        }
     }
 
     #[test]
