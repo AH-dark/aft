@@ -1038,7 +1038,7 @@ impl ViewStore {
         drop(blob_durability_barrier);
         timing.phase("closure_probe");
 
-        write_manifest_once(&manifest_path, request.manifest)?;
+        let manifest_digest = write_manifest_once(&manifest_path, request.manifest)?;
         // Blob GC reads this generation's keys from the sidecar instead of the
         // JSON. A failure only means GC derives the sidecar from the JSON later.
         let reference_keys = request
@@ -1046,9 +1046,12 @@ impl ViewStore {
             .plane_keys()
             .filter_map(|(_, key)| crate::blob_store::v2::parse_hex32(key))
             .collect::<BTreeSet<_>>();
-        if let Err(error) =
-            reference_sidecar::write_published(&self.view_dir, request.generation, &reference_keys)
-        {
+        if let Err(error) = reference_sidecar::write_published(
+            &self.view_dir,
+            request.generation,
+            &reference_keys,
+            &manifest_digest,
+        ) {
             log::debug!(
                 "views: reference sidecar not written view={} generation={} error={error}",
                 self.view_dir.display(),
@@ -1386,7 +1389,9 @@ fn checkpoint_pointer_after_cas(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<()> {
+/// Returns the digest of the bytes written, which the generation's reference
+/// sidecar records so readers can prove it describes this file.
+fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<[u8; 32]> {
     crate::production_storage::refuse_write(path)
         .map_err(|error| ViewError::io_at("writing manifest", path, error))?;
     let parent = path.parent().ok_or_else(|| {
@@ -1403,16 +1408,20 @@ fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<()> {
             .unwrap_or_default()
             .as_nanos()
     ));
-    let write_result = (|| -> Result<()> {
+    let write_result = (|| -> Result<[u8; 32]> {
         let mut file = crate::private_storage::options()
             .create_new(true)
             .write(true)
             .open(&temporary)
             .map_err(|error| ViewError::io_at("creating", &temporary, error))?;
-        file.write_all(&manifest.json_bytes()?)
+        let bytes = manifest.json_bytes()?;
+        file.write_all(&bytes)
             .map_err(|error| ViewError::io_at("writing", &temporary, error))?;
         file.write_all(b"\n")
             .map_err(|error| ViewError::io_at("writing", &temporary, error))?;
+        let mut digest = blake3::Hasher::new();
+        digest.update(&bytes);
+        digest.update(b"\n");
         file.sync_all()
             .map_err(|error| ViewError::io_at("syncing", &temporary, error))?;
         drop(file);
@@ -1431,7 +1440,7 @@ fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<()> {
         // The hard link gives the generation its permanent name without an
         // overwrite race; fsync that name before its directory is persisted.
         sync_file(path)?;
-        Ok(())
+        Ok(*digest.finalize().as_bytes())
     })();
     let _ = fs::remove_file(&temporary);
     write_result

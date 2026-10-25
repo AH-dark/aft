@@ -9,22 +9,32 @@
 //!
 //! File layout (little endian):
 //!
-//! | bytes   | field                                                      |
-//! |---------|------------------------------------------------------------|
-//! | 0..8    | magic `AFTREFK1`                                           |
-//! | 8..12   | format version                                             |
-//! | 12..16  | origin: 1 written by the publisher, 2 derived from the JSON |
-//! | 16..24  | key count                                                  |
-//! | 24..32  | time the keys were derived, nanoseconds since 1970         |
-//! | 32..96  | [`FileStamp`] of the manifest the keys came from           |
-//! | 96..128 | BLAKE3 of bytes 0..96 followed by every key                |
-//! | 128..   | keys, strictly ascending                                   |
+//! | bytes    | field                                                       |
+//! |----------|-------------------------------------------------------------|
+//! | 0..8     | magic `AFTREFK1`                                            |
+//! | 8..12    | format version                                              |
+//! | 12..16   | origin: 1 written by the publisher, 2 derived from the JSON |
+//! | 16..24   | key count                                                   |
+//! | 24..32   | time the keys were last proven to match, ns since 1970      |
+//! | 32..96   | [`FileStamp`] of the manifest the keys came from            |
+//! | 96..128  | BLAKE3 of the manifest's bytes                              |
+//! | 128..160 | BLAKE3 of bytes 0..128 followed by every key                |
+//! | 160..    | keys, strictly ascending                                    |
 //!
 //! Safety rule: a sidecar is used only when its header, size, checksum and
-//! ordering are valid and the manifest's current stamp equals the recorded
-//! one. Anything else — no sidecar, a damaged one, a replaced manifest — means
-//! the JSON is decoded again and the sidecar rewritten. A sidecar problem can
-//! cost time; it can never make GC treat a referenced blob as unreferenced.
+//! ordering are valid, the manifest's current stamp equals the recorded one,
+//! and the keys provably belong to the manifest's current bytes. Timestamps
+//! alone are not proof: a same-length replacement written within one tick of
+//! the filesystem clock keeps size and times (and, through Windows creation-
+//! time tunnelling, even the creation time). Proof is either the manifest's
+//! content digest, re-read and compared, or, without reading it, a known file
+//! identity plus timestamps that had settled long before the keys were last
+//! proven. Anything else — no sidecar, a damaged one, a replaced manifest —
+//! means the JSON is decoded again, and a new sidecar is written when the
+//! manifest's stamp is usable, unchanged and settled and the directory has
+//! room. A sidecar
+//! problem can cost time; it can never make GC treat a referenced blob as
+//! unreferenced.
 use std::{
     collections::{BTreeSet, HashMap},
     fs::{self, File},
@@ -35,9 +45,11 @@ use std::{
 };
 
 const MAGIC: [u8; 8] = *b"AFTREFK1";
-const VERSION: u32 = 1;
-const HEADER_LEN: usize = 128;
-const CHECKSUM_AT: usize = 96;
+// Version 1 recorded no manifest digest; such sidecars are re-derived.
+const VERSION: u32 = 2;
+const HEADER_LEN: usize = 160;
+const DIGEST_AT: usize = 96;
+const CHECKSUM_AT: usize = 128;
 const KEY_LEN: usize = 32;
 const ORIGIN_PUBLISHER: u32 = 1;
 const ORIGIN_DERIVED: u32 = 2;
@@ -47,11 +59,12 @@ const VERIFY_CHUNK: usize = 64 * 1024;
 /// huge storage tree cannot grow it without limit; it is simply cleared when
 /// full and sidecars are re-verified on their next use.
 const MAX_VERIFIED: usize = 65_536;
-/// A sidecar derived from a manifest whose timestamps were younger than this is
-/// not trusted. On a filesystem with coarse timestamps (one or two seconds), a
-/// file replaced in the same tick, reusing the same inode and size, could
-/// otherwise present an identical stamp. Once a file is older than the
-/// coarsest tick, any later replacement necessarily carries a newer timestamp.
+/// A sidecar whose manifest's timestamps had settled for at least this long
+/// before its keys were last proven can be trusted on the manifest's stamp and
+/// file identity alone; any later change to that file then carries a newer
+/// timestamp, even on a filesystem with coarse (one or two second) times.
+/// Otherwise the manifest is re-read and its digest compared. The same window
+/// decides when the sweep may derive a sidecar from a manifest at all.
 pub(crate) const SETTLE: Duration = Duration::from_secs(5);
 
 /// The name of the sidecar for `generation`'s manifest.
@@ -66,8 +79,12 @@ pub(crate) fn sidecar_name(generation: &str) -> String {
 pub(crate) struct FileStamp {
     len: u64,
     modified: (i64, u32),
-    /// Device and inode on unix; zero elsewhere, where std exposes neither.
+    /// Device and inode on Unix, volume serial number and file index on
+    /// Windows (see `crate::file_identity`). A replacement is a different
+    /// file, so this changes even when size and every time match.
     file: (u64, u64),
+    /// Whether `file` was reported at all; zeros otherwise.
+    identity_known: bool,
     /// Status-change time on unix, which no ordinary API can set back: renames,
     /// rewrites, link changes and timestamp edits all advance it. Creation time
     /// elsewhere, when the platform reports one.
@@ -88,9 +105,21 @@ fn now_nanos() -> Option<i128> {
 }
 
 impl FileStamp {
-    /// `None` when the platform cannot report a usable modification time (or
-    /// reports one before 1970); such a file never gets a trusted sidecar.
-    pub(crate) fn of(metadata: &fs::Metadata) -> Option<Self> {
+    /// The stamp of the file at `path`, following symlinks. `Ok(None)` when
+    /// the platform cannot report a usable modification time (or reports one
+    /// before 1970); such a file never gets a trusted sidecar.
+    pub(crate) fn of_path(path: &Path) -> std::io::Result<Option<Self>> {
+        let (metadata, identity) = crate::file_identity::metadata(path)?;
+        Ok(Self::of(&metadata, identity))
+    }
+
+    /// The stamp of an open file.
+    fn of_file(file: &File) -> Option<Self> {
+        let metadata = file.metadata().ok()?;
+        Self::of(&metadata, crate::file_identity::FileIdentity::of_file(file))
+    }
+
+    fn of(metadata: &fs::Metadata, identity: crate::file_identity::FileIdentity) -> Option<Self> {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt as _;
         #[cfg(unix)]
@@ -102,13 +131,15 @@ impl FileStamp {
         if changed.is_none() {
             return None;
         }
+        let (file, identity_known) = match identity {
+            crate::file_identity::FileIdentity::Known { volume, index } => ((volume, index), true),
+            crate::file_identity::FileIdentity::Unavailable => ((0, 0), false),
+        };
         Some(Self {
             len: metadata.len(),
             modified: epoch_parts(metadata.modified().ok()?)?,
-            #[cfg(unix)]
-            file: (metadata.dev(), metadata.ino()),
-            #[cfg(not(unix))]
-            file: (0, 0),
+            file,
+            identity_known,
             changed,
         })
     }
@@ -134,6 +165,7 @@ impl FileStamp {
             out[44..48].copy_from_slice(&nanos.to_le_bytes());
             out[48] = 1;
         }
+        out[49] = u8::from(self.identity_known);
         out
     }
 }
@@ -247,6 +279,9 @@ pub(crate) struct ReferenceSidecars {
     memo_settle: Duration,
     /// The view-directory size sidecar writes must stay within.
     directory_limit: usize,
+    /// [`SETTLE`], the window that lets a sidecar be trusted on its
+    /// manifest's stamp alone; tests shorten it to exercise promotion.
+    proof_settle: Duration,
 }
 
 pub(crate) fn global() -> &'static ReferenceSidecars {
@@ -254,20 +289,32 @@ pub(crate) fn global() -> &'static ReferenceSidecars {
     SIDECARS.get_or_init(|| ReferenceSidecars::new(SETTLE))
 }
 
-fn encode(stamp: &FileStamp, origin: u32, derived_at: i128, keys: &[[u8; 32]]) -> Vec<u8> {
+fn encode(
+    stamp: &FileStamp,
+    origin: u32,
+    proven_at: i128,
+    manifest_digest: &[u8; 32],
+    keys: &[[u8; 32]],
+) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(HEADER_LEN + keys.len() * KEY_LEN);
     bytes.extend_from_slice(&MAGIC);
     bytes.extend_from_slice(&VERSION.to_le_bytes());
     bytes.extend_from_slice(&origin.to_le_bytes());
     bytes.extend_from_slice(&(keys.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(&(u64::try_from(derived_at).unwrap_or(0)).to_le_bytes());
+    bytes.extend_from_slice(&(u64::try_from(proven_at).unwrap_or(0)).to_le_bytes());
     bytes.extend_from_slice(&stamp.encode());
+    bytes.extend_from_slice(manifest_digest);
     let mut hasher = blake3::Hasher::new();
     hasher.update(&bytes);
     hasher.update(keys.as_flattened());
     bytes.extend_from_slice(hasher.finalize().as_bytes());
     bytes.extend_from_slice(keys.as_flattened());
     bytes
+}
+
+/// The digest a sidecar records for its manifest's bytes.
+pub(crate) fn manifest_digest(bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(bytes).as_bytes()
 }
 
 /// How many more entries `view` can take without exceeding `limit`, the
@@ -283,15 +330,18 @@ pub(crate) fn free_slots(view: &Path, limit: usize) -> usize {
 }
 
 /// Write `keys` (sorted, unique) as the sidecar of the manifest at
-/// `view/manifest-<generation>.json` whose stamp is `stamp`. `slots` is
-/// the caller's running count of entries the directory can still take; a
-/// written sidecar spends one, so a scan counts the directory only once.
+/// `view/manifest-<generation>.json` whose stamp is `stamp` and whose bytes
+/// hash to `manifest_digest`. `slots` is the caller's running count of entries
+/// the directory can still take; a written sidecar spends one, so a scan
+/// counts the directory only once.
+#[allow(clippy::too_many_arguments)]
 fn write_sidecar(
     view: &Path,
     generation: &str,
     stamp: &FileStamp,
     origin: u32,
-    derived_at: i128,
+    proven_at: i128,
+    manifest_digest: &[u8; 32],
     keys: &[[u8; 32]],
     slots: &mut usize,
 ) -> std::io::Result<()> {
@@ -312,7 +362,7 @@ fn write_sidecar(
     // before the rename but not a directory sync of its own.
     crate::durability::atomic_write(
         &path,
-        &encode(stamp, origin, derived_at, keys),
+        &encode(stamp, origin, proven_at, manifest_digest, keys),
         crate::durability::AtomicWriteDurability::File,
     )?;
     // The temporary file is gone again; a new sidecar keeps one entry.
@@ -323,9 +373,7 @@ fn write_sidecar(
     // being written. A sidecar must not outlive its manifest, so take it back
     // out when the manifest is no longer the file it describes.
     let manifest = view.join(format!("manifest-{generation}.json"));
-    let current = fs::metadata(&manifest)
-        .ok()
-        .and_then(|metadata| FileStamp::of(&metadata));
+    let current = FileStamp::of_path(&manifest).ok().flatten();
     if current != Some(*stamp) {
         let _ = fs::remove_file(&path);
         return Err(std::io::Error::other(
@@ -335,26 +383,29 @@ fn write_sidecar(
     Ok(())
 }
 
-/// Record the keys of a manifest this process has just published. The keys
-/// come from the in-memory manifest that was written, so no settle window is
-/// needed: generation names are unique per publication, and nothing else
-/// writes a file under that name.
+/// Record the keys of a manifest this process has just published.
+/// `manifest_digest` is the digest of the exact bytes the publisher wrote, and
+/// `keys` come from the in-memory manifest those bytes were serialized from,
+/// so the two describe the same content by construction. Readers compare the
+/// digest with the file until its timestamps have settled.
 pub(crate) fn write_published(
     view: &Path,
     generation: &str,
     keys: &BTreeSet<[u8; 32]>,
+    manifest_digest: &[u8; 32],
 ) -> std::io::Result<()> {
     let manifest = view.join(format!("manifest-{generation}.json"));
-    let stamp = FileStamp::of(&fs::metadata(&manifest)?)
+    let stamp = FileStamp::of_path(&manifest)?
         .ok_or_else(|| std::io::Error::other("manifest has no usable timestamp"))?;
-    let derived_at = now_nanos().ok_or_else(|| std::io::Error::other("clock before 1970"))?;
+    let proven_at = now_nanos().ok_or_else(|| std::io::Error::other("clock before 1970"))?;
     let keys: Vec<[u8; 32]> = keys.iter().copied().collect();
     write_sidecar(
         view,
         generation,
         &stamp,
         ORIGIN_PUBLISHER,
-        derived_at,
+        proven_at,
+        manifest_digest,
         &keys,
         &mut free_slots(view, super::generation::GENERATION_DIRECTORY_LIMIT),
     )
@@ -367,6 +418,15 @@ impl ReferenceSidecars {
             verified: Mutex::new(HashMap::new()),
             memo_settle: SETTLE,
             directory_limit: super::generation::GENERATION_DIRECTORY_LIMIT,
+            proof_settle: SETTLE,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_proof_settle(settle: Duration, proof_settle: Duration) -> Self {
+        Self {
+            proof_settle,
+            ..Self::new(settle)
         }
     }
 
@@ -417,14 +477,19 @@ impl ReferenceSidecars {
         free_slots: &mut usize,
     ) -> super::Result<KeySource> {
         let manifest = view.join(format!("manifest-{generation}.json"));
-        let stamp = FileStamp::of(&fs::metadata(&manifest)?);
+        let stamp = FileStamp::of_path(&manifest)?;
         if let Some(stamp) = &stamp {
-            if let Some(keys) = self.open_trusted(&view.join(sidecar_name(generation)), stamp) {
-                visit(&keys)?;
+            let sidecar = view.join(sidecar_name(generation));
+            if let Some(trusted) = self.open_trusted(&sidecar, &manifest, stamp) {
+                visit(&trusted.keys)?;
+                if let Some(digest) = trusted.promote {
+                    self.promote(view, generation, stamp, &digest, &trusted.keys, free_slots);
+                }
                 return Ok(KeySource::Sidecar);
             }
         }
         let bytes = fs::read(&manifest)?;
+        let digest = manifest_digest(&bytes);
         let keys: Vec<[u8; 32]> = decode(&bytes)?.into_iter().collect();
         drop(bytes);
         visit(&keys)?;
@@ -433,10 +498,7 @@ impl ReferenceSidecars {
         let Some(stamp) = stamp else {
             return Ok(KeySource::Decoded { written: false });
         };
-        let unchanged = fs::metadata(&manifest)
-            .ok()
-            .and_then(|metadata| FileStamp::of(&metadata))
-            == Some(stamp);
+        let unchanged = FileStamp::of_path(&manifest).ok().flatten() == Some(stamp);
         let Some(now) = now_nanos() else {
             return Ok(KeySource::Decoded { written: false });
         };
@@ -449,6 +511,7 @@ impl ReferenceSidecars {
             &stamp,
             ORIGIN_DERIVED,
             now,
+            &digest,
             &keys,
             free_slots,
         ) {
@@ -464,16 +527,61 @@ impl ReferenceSidecars {
         Ok(KeySource::Decoded { written })
     }
 
-    /// The sidecar at `path`, if it is intact and describes the manifest whose
-    /// current stamp is `manifest`. Every failure means "decode the JSON".
-    fn open_trusted(&self, path: &Path, manifest: &FileStamp) -> Option<SidecarKeys> {
+    /// Rewrite a sidecar whose keys were just proven by digest against a
+    /// manifest whose timestamps have since settled, recording the new proof
+    /// time so later visits can trust it without re-reading the manifest.
+    fn promote(
+        &self,
+        view: &Path,
+        generation: &str,
+        stamp: &FileStamp,
+        digest: &[u8; 32],
+        keys: &SidecarKeys,
+        free_slots: &mut usize,
+    ) {
+        let Some(now) = now_nanos() else {
+            return;
+        };
+        let mut all = vec![[0_u8; 32]; keys.len()];
+        if keys.read(0, &mut all).is_err() {
+            return;
+        }
+        if let Err(error) = write_sidecar(
+            view,
+            generation,
+            stamp,
+            ORIGIN_DERIVED,
+            now,
+            digest,
+            &all,
+            free_slots,
+        ) {
+            log::debug!(
+                "views: reference sidecar not promoted view={} generation={generation} error={error}",
+                view.display()
+            );
+        }
+    }
+
+    /// The sidecar at `path`, if it is intact and provably describes the
+    /// manifest at `manifest_path`, whose current stamp is `manifest`. Every
+    /// failure means "decode the JSON".
+    fn open_trusted(
+        &self,
+        path: &Path,
+        manifest_path: &Path,
+        manifest: &FileStamp,
+    ) -> Option<Trusted> {
         let mut file = File::open(path).ok()?;
-        let sidecar = FileStamp::of(&file.metadata().ok()?)?;
+        let sidecar = FileStamp::of_file(&file)?;
         if let Some(verified) = self.verified().get(path) {
             if verified.sidecar == sidecar && verified.manifest == *manifest {
-                return Some(SidecarKeys {
-                    file,
-                    count: verified.count,
+                return Some(Trusted {
+                    keys: SidecarKeys {
+                        file,
+                        count: verified.count,
+                    },
+                    promote: None,
                 });
             }
         }
@@ -482,19 +590,17 @@ impl ReferenceSidecars {
         if header[0..8] != MAGIC || le_u32(&header[8..12]) != VERSION {
             return None;
         }
-        let origin = le_u32(&header[12..16]);
-        let count = usize::try_from(le_u64(&header[16..24])).ok()?;
-        let derived_at = i128::from(le_u64(&header[24..32]));
-        if header[32..96] != manifest.encode() {
+        if !matches!(le_u32(&header[12..16]), ORIGIN_PUBLISHER | ORIGIN_DERIVED) {
             return None;
         }
-        let trusted = match origin {
-            ORIGIN_PUBLISHER => true,
-            ORIGIN_DERIVED => manifest.settled_by(derived_at, self.settle),
-            _ => false,
-        };
+        let count = usize::try_from(le_u64(&header[16..24])).ok()?;
+        let proven_at = i128::from(le_u64(&header[24..32]));
+        if header[32..DIGEST_AT] != manifest.encode() {
+            return None;
+        }
+        let recorded_digest: [u8; 32] = header[DIGEST_AT..CHECKSUM_AT].try_into().ok()?;
         let expected_len = count.checked_mul(KEY_LEN)?.checked_add(HEADER_LEN)? as u64;
-        if !trusted || sidecar.len != expected_len {
+        if sidecar.len != expected_len {
             return None;
         }
         // Stream the keys once: the checksum catches damage, and the order
@@ -520,25 +626,64 @@ impl ReferenceSidecars {
         if hasher.finalize().as_bytes()[..] != header[CHECKSUM_AT..HEADER_LEN] {
             return None;
         }
+        // Proof that these keys belong to the manifest's current bytes. A
+        // matching stamp is proof only if the file's identity is known and its
+        // times had settled before the keys were last proven: any later change
+        // to that file would then carry newer times. Otherwise (a sidecar
+        // written right after its manifest, or no file identity), re-read the
+        // manifest and compare its digest.
+        let now = now_nanos()?;
+        let by_stamp = manifest.identity_known && manifest.settled_by(proven_at, self.proof_settle);
+        let mut promote = None;
+        if !by_stamp {
+            let bytes = fs::read(manifest_path).ok()?;
+            if manifest_digest(&bytes) != recorded_digest {
+                return None;
+            }
+            // The digest describes the bytes read only if the file kept one
+            // identity across the read.
+            if FileStamp::of_path(manifest_path).ok()?? != *manifest {
+                return None;
+            }
+            if manifest.identity_known && manifest.settled_by(now, self.proof_settle) {
+                promote = Some(recorded_digest);
+            }
+        }
+        // Remember the verification only for a sidecar and a manifest whose
+        // stamps would both change on any later write (see `memo_settle`).
+        let memorable = sidecar.settled_by(now, self.memo_settle)
+            && (by_stamp
+                || (manifest.identity_known && manifest.settled_by(now, self.memo_settle)));
         let mut verified = self.verified();
-        if !now_nanos().is_some_and(|now| sidecar.settled_by(now, self.memo_settle)) {
+        if !memorable {
             // Verified for this visit only; checked again on the next one.
             verified.remove(path);
-            return Some(SidecarKeys { file, count });
+        } else {
+            if verified.len() >= MAX_VERIFIED {
+                verified.clear();
+            }
+            verified.insert(
+                path.to_path_buf(),
+                Verified {
+                    sidecar,
+                    manifest: *manifest,
+                    count,
+                },
+            );
         }
-        if verified.len() >= MAX_VERIFIED {
-            verified.clear();
-        }
-        verified.insert(
-            path.to_path_buf(),
-            Verified {
-                sidecar,
-                manifest: *manifest,
-                count,
-            },
-        );
-        Some(SidecarKeys { file, count })
+        Some(Trusted {
+            keys: SidecarKeys { file, count },
+            promote,
+        })
     }
+}
+
+/// A sidecar proven to describe its manifest. `promote` carries the manifest
+/// digest when the proof needed a re-read and the manifest has settled since,
+/// so the sidecar can be rewritten with a fresh proof time.
+struct Trusted {
+    keys: SidecarKeys,
+    promote: Option<[u8; 32]>,
 }
 
 #[cfg(test)]
@@ -628,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_sidecar_is_never_written_or_trusted_inside_the_settle_window() {
+    fn reference_sidecar_is_never_written_inside_the_settle_window_and_is_trusted_by_digest() {
         let view = tempfile::tempdir().unwrap();
         let strict = ReferenceSidecars::new(Duration::from_secs(3600));
         write_manifest(view.path(), "g", &manifest_bytes());
@@ -638,8 +783,8 @@ mod tests {
             (KeySource::Decoded { written: false }, expected.clone())
         );
         assert!(!view.path().join(sidecar_name("g")).exists());
-        // A sidecar derived moments after the manifest changed is not trusted
-        // by a policy whose window has not passed between the two.
+        // A sidecar written moments after its manifest changed cannot be
+        // trusted on timestamps, but it is proven by the manifest's digest.
         let eager = ReferenceSidecars::new(Duration::ZERO);
         assert_eq!(
             visit_keys(&eager, view.path(), "g").0,
@@ -647,8 +792,76 @@ mod tests {
         );
         assert_eq!(
             visit_keys(&strict, view.path(), "g"),
-            (KeySource::Decoded { written: false }, expected)
+            (KeySource::Sidecar, expected)
         );
+    }
+
+    #[test]
+    fn reference_sidecar_proven_by_digest_is_promoted_once_its_manifest_settles() {
+        let view = tempfile::tempdir().unwrap();
+        let sidecars = ReferenceSidecars::with_proof_settle(Duration::ZERO, Duration::ZERO);
+        write_manifest(view.path(), "g", &manifest_bytes());
+        let stamp = FileStamp::of_path(&view.path().join("manifest-g.json"))
+            .unwrap()
+            .unwrap();
+        // A proof time before the manifest's last change: only the digest can
+        // prove this sidecar.
+        let sidecar = view.path().join(sidecar_name("g"));
+        fs::write(
+            &sidecar,
+            encode(
+                &stamp,
+                ORIGIN_PUBLISHER,
+                0,
+                &manifest_digest(&manifest_bytes()),
+                &keys_of(&manifest_bytes()),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            visit_keys(&sidecars, view.path(), "g"),
+            (KeySource::Sidecar, keys_of(&manifest_bytes()))
+        );
+        // Rewritten with a fresh proof time and the same keys and digest.
+        let header = fs::read(&sidecar).unwrap();
+        assert!(le_u64(&header[24..32]) > 0);
+        assert_eq!(le_u32(&header[12..16]), ORIGIN_DERIVED);
+        assert_eq!(
+            header[DIGEST_AT..CHECKSUM_AT],
+            manifest_digest(&manifest_bytes())
+        );
+        assert_eq!(
+            visit_keys(&sidecars, view.path(), "g"),
+            (KeySource::Sidecar, keys_of(&manifest_bytes()))
+        );
+    }
+
+    #[test]
+    fn reference_sidecar_with_a_matching_stamp_is_trusted_only_for_the_bytes_it_was_proven_against()
+    {
+        // A sidecar whose recorded stamp equals the manifest's current stamp,
+        // but whose keys and digest belong to other bytes. This is what a
+        // same-size rewrite that no recorded field reveals would look like;
+        // constructing it directly makes the digest check the only defence on
+        // every platform.
+        let view = tempfile::tempdir().unwrap();
+        let sidecars = ReferenceSidecars::new(Duration::ZERO);
+        let current = [[2_u8; 32], [3; 32], [4; 32], [6; 32]].concat();
+        write_manifest(view.path(), "g", &current);
+        let stamp = FileStamp::of_path(&view.path().join("manifest-g.json"))
+            .unwrap()
+            .unwrap();
+        let stale = encode(
+            &stamp,
+            ORIGIN_PUBLISHER,
+            now_nanos().unwrap(),
+            &manifest_digest(&manifest_bytes()),
+            &keys_of(&manifest_bytes()),
+        );
+        fs::write(view.path().join(sidecar_name("g")), stale).unwrap();
+        let (source, keys) = visit_keys(&sidecars, view.path(), "g");
+        assert_eq!(keys, keys_of(&current));
+        assert_ne!(source, KeySource::Sidecar);
     }
 
     #[test]
@@ -656,7 +869,13 @@ mod tests {
         let view = tempfile::tempdir().unwrap();
         let strict = ReferenceSidecars::new(Duration::from_secs(3600));
         write_manifest(view.path(), "g", &manifest_bytes());
-        write_published(view.path(), "g", &decode(&manifest_bytes()).unwrap()).unwrap();
+        write_published(
+            view.path(),
+            "g",
+            &decode(&manifest_bytes()).unwrap(),
+            &manifest_digest(&manifest_bytes()),
+        )
+        .unwrap();
         assert_eq!(
             visit_keys(&strict, view.path(), "g"),
             (KeySource::Sidecar, keys_of(&manifest_bytes()))
@@ -668,7 +887,13 @@ mod tests {
         let view = tempfile::tempdir().unwrap();
         let strict = ReferenceSidecars::new(Duration::from_secs(3600));
         write_manifest(view.path(), "g", &manifest_bytes());
-        write_published(view.path(), "g", &decode(&manifest_bytes()).unwrap()).unwrap();
+        write_published(
+            view.path(),
+            "g",
+            &decode(&manifest_bytes()).unwrap(),
+            &manifest_digest(&manifest_bytes()),
+        )
+        .unwrap();
         assert_eq!(visit_keys(&strict, view.path(), "g").0, KeySource::Sidecar);
         // Same name and length, different keys, new file: a publisher sidecar
         // is trusted without a settle window, so only the recorded manifest
@@ -735,6 +960,66 @@ mod tests {
         assert_eq!(keys, expected);
     }
 
+    /// Rewrite `path` in place with `contents` of the same length and put its
+    /// modification (and, on Windows, creation) time back. The file identity
+    /// is unchanged. On Windows every recorded field then matches the original;
+    /// on Unix the status-change time still moves.
+    fn rewrite_in_place_keeping_times(path: &Path, contents: &[u8]) {
+        use std::io::Write as _;
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!(metadata.len(), contents.len() as u64);
+        let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.write_all(contents).unwrap();
+        let times = fs::FileTimes::new()
+            .set_accessed(metadata.accessed().unwrap())
+            .set_modified(metadata.modified().unwrap());
+        #[cfg(windows)]
+        let times = {
+            use std::os::windows::fs::FileTimesExt;
+            times.set_created(metadata.created().unwrap())
+        };
+        file.set_times(times).unwrap();
+        drop(file);
+        let after = fs::metadata(path).unwrap();
+        assert_eq!(after.modified().unwrap(), metadata.modified().unwrap());
+    }
+
+    #[test]
+    fn reference_sidecar_rejects_a_same_size_same_mtime_manifest_with_different_keys() {
+        let replacement = [[2_u8; 32], [3; 32], [4; 32], [6; 32]].concat();
+        assert_eq!(replacement.len(), manifest_bytes().len());
+        type Change = fn(&Path, &[u8]);
+        let changes: [(&str, Change); 2] = [
+            (
+                "replaced keeping times",
+                crate::file_identity::replace_keeping_times,
+            ),
+            (
+                "rewritten in place keeping times",
+                rewrite_in_place_keeping_times,
+            ),
+        ];
+        for (label, change) in changes {
+            let view = tempfile::tempdir().unwrap();
+            let sidecars = ReferenceSidecars::new(Duration::ZERO);
+            write_manifest(view.path(), "g", &manifest_bytes());
+            assert_eq!(
+                visit_keys(&sidecars, view.path(), "g").0,
+                KeySource::Decoded { written: true },
+                "{label}"
+            );
+            assert_eq!(
+                visit_keys(&sidecars, view.path(), "g").0,
+                KeySource::Sidecar,
+                "{label}"
+            );
+            change(&view.path().join("manifest-g.json"), &replacement);
+            let (source, keys) = visit_keys(&sidecars, view.path(), "g");
+            assert_eq!(keys, keys_of(&replacement), "{label}");
+            assert_ne!(source, KeySource::Sidecar, "{label}");
+        }
+    }
+
     #[test]
     fn reference_sidecar_damage_is_re_derived_never_read_as_empty() {
         let view = tempfile::tempdir().unwrap();
@@ -742,10 +1027,12 @@ mod tests {
         write_manifest(view.path(), "g", &manifest_bytes());
         let expected = keys_of(&manifest_bytes());
         let sidecar = view.path().join(sidecar_name("g"));
-        let stamp =
-            FileStamp::of(&fs::metadata(view.path().join("manifest-g.json")).unwrap()).unwrap();
+        let stamp = FileStamp::of_path(&view.path().join("manifest-g.json"))
+            .unwrap()
+            .unwrap();
         let now = now_nanos().unwrap();
-        let valid = encode(&stamp, ORIGIN_DERIVED, now, &expected);
+        let digest = manifest_digest(&manifest_bytes());
+        let valid = encode(&stamp, ORIGIN_DERIVED, now, &digest, &expected);
         let mut unsorted_keys = expected.clone();
         unsorted_keys.reverse();
         let damaged: Vec<(&str, Vec<u8>)> = vec![
@@ -775,10 +1062,10 @@ mod tests {
                 bytes[8..12].copy_from_slice(&(VERSION + 1).to_le_bytes());
                 bytes
             }),
-            ("unknown origin", encode(&stamp, 7, now, &expected)),
+            ("unknown origin", encode(&stamp, 7, now, &digest, &expected)),
             (
                 "unsorted with a valid checksum",
-                encode(&stamp, ORIGIN_DERIVED, now, &unsorted_keys),
+                encode(&stamp, ORIGIN_DERIVED, now, &digest, &unsorted_keys),
             ),
             ("empty file", Vec::new()),
         ];
