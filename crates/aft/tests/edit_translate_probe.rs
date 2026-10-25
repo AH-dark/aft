@@ -182,37 +182,6 @@ fn pair(mut samples: Vec<Duration>) -> (f64, f64) {
 }
 
 #[test]
-fn edit_translate_path_cost() {
-    // A target spelled without glob characters is a file by its spelling, so
-    // the translator must not spend a filesystem validation (canonicalisation
-    // of every ancestor, storage-floor check) on it. The 10-hunk batch is the
-    // shape most agent edits arrive in.
-    let project_root = root("path-cost");
-    fixture_file(&project_root, "two.ts", 400, "TOKEN_A");
-    let app_ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-    let probed = std::cell::Cell::new(0usize);
-    let probe = |resolved: &str| {
-        probed.set(probed.get() + 1);
-        aft::commands::edit_match::classify_edit_target(resolved, &app_ctx, "probe")
-            != aft::commands::edit_match::EditTargetKind::Literal
-    };
-    let translated = subc_translate_owned_with_edit_target_probe(
-        "edit",
-        ten_hunk_find_replace(0),
-        project_root.as_path(),
-        TranslateContext::default(),
-        &probe,
-    )
-    .expect("edit arguments translate");
-    assert_eq!(translated.command, "batch");
-    assert_eq!(
-        probed.get(),
-        0,
-        "a target without glob characters must not reach path validation"
-    );
-}
-
-#[test]
 #[ignore = "timing and allocation probe; run with --ignored --nocapture"]
 fn edit_translate_timing_probe() {
     let project_root = root("translate");

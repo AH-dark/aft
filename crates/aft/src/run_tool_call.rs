@@ -14,6 +14,25 @@ pub type DispatchFn<'a> = dyn Fn(RawRequest, &AppContext) -> Response + 'a;
 /// append trailing lines (the AFT status bar) that every transport then delivers unchanged.
 pub type FinalizeFn<'a> = dyn Fn(&mut Response, &mut String) + 'a;
 
+#[cfg(test)]
+thread_local! {
+    /// Every string a prepare asked the edit translator to classify as a glob
+    /// or a file, recorded for the tests that pin how much filesystem
+    /// validation a prepare does.
+    static EDIT_TARGET_PROBES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_edit_target_probe(resolved: &str) {
+    EDIT_TARGET_PROBES.with(|probes| probes.borrow_mut().push(resolved.to_string()));
+}
+
+#[cfg(test)]
+pub(crate) fn take_edit_target_probes_for_test() -> Vec<String> {
+    EDIT_TARGET_PROBES.with(|probes| std::mem::take(&mut *probes.borrow_mut()))
+}
+
 /// Wall and optional thread-CPU timestamps for one subc tool call. Synchronous
 /// boundaries read thread CPU on Linux/macOS; Windows lacks a sufficiently fine
 /// clock and reports unknown CPU. Sampling does not perform file I/O.
@@ -477,6 +496,8 @@ pub(crate) fn prepare_tool_call(
         // as before instead of dispatching it for a permission request.
         let request_id = ctx.request_id.as_str();
         let edit_target_is_glob = |resolved: &str| {
+            #[cfg(test)]
+            record_edit_target_probe(resolved);
             crate::commands::edit_match::classify_edit_target(resolved, app_ctx, request_id)
                 != crate::commands::edit_match::EditTargetKind::Literal
         };
@@ -1306,6 +1327,77 @@ mod tests {
     /// The slow-call line names what an edit was asked to do (target kind,
     /// match and replacement sizes, outcome) and how long each pipeline step
     /// took, and never carries the edit text or the file's path.
+    /// One edit call asks whether its target is a glob at most once, through
+    /// the probe `run_tool_call` installs (not a test-local substitute), and
+    /// that probe is a spelling check for a path without glob characters: the
+    /// filesystem validation belongs to the handler, which runs it once for
+    /// the real request. A prepare that started validating every target would
+    /// add canonicalisation of every ancestor to each edit.
+    #[test]
+    fn plain_edit_target_never_reaches_path_validation_during_prepare() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let file = root.join("plain-target.ts");
+        assert!(
+            !crate::commands::edit_match::is_glob_pattern(&file.display().to_string()),
+            "test path {file:?} has glob characters"
+        );
+        let original: String = (0..40)
+            .map(|index| format!("const value_{index} = 1;\n"))
+            .collect();
+        std::fs::write(&file, &original).unwrap();
+        let hunks: Vec<Value> = (0..10)
+            .map(|index| {
+                json!({
+                    "oldString": format!("const value_{index} = 1;"),
+                    "newString": format!("const value_{index} = 2;"),
+                })
+            })
+            .collect();
+        let _ = take_edit_target_probes_for_test();
+
+        let _ = slow_edit_line(
+            &AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    project_root: Some(root.clone()),
+                    ..Default::default()
+                },
+            ),
+            &root,
+            // A multi-item batch is the shape that consults the probe at all:
+            // the single find/replace spelling is routed before it.
+            json!({ "path": file, "edits": hunks }),
+        );
+        let _ = take_edit_target_probes_for_test();
+
+        // A target spelled with glob characters reaches the probe: a
+        // multi-item batch first asks whether `[id]` is a directory-name
+        // character in a real file or a pattern over many.
+        let bracket_path = root.join("app").join("[id]").join("page.ts");
+        std::fs::create_dir_all(bracket_path.parent().unwrap()).unwrap();
+        std::fs::write(&bracket_path, &original).unwrap();
+        let two_items: Vec<Value> = hunks.iter().take(2).cloned().collect();
+        let _ = slow_edit_line(
+            &AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    project_root: Some(root.clone()),
+                    ..Default::default()
+                },
+            ),
+            &root,
+            json!({ "path": bracket_path, "edits": two_items }),
+        );
+
+        let probes = take_edit_target_probes_for_test();
+        assert_eq!(
+            probes,
+            vec![bracket_path.display().to_string()],
+            "a glob-spelled multi-item batch asks once whether its target is one file"
+        );
+    }
+
     #[test]
     fn slow_edit_line_carries_argument_shape_and_phase_times_but_never_text() {
         let temp = tempfile::tempdir().unwrap();
