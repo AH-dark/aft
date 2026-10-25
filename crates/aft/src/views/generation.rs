@@ -852,14 +852,25 @@ impl ViewStore {
                 return Ok(());
             }
             let mut paths = Vec::new();
+            let sidecar = self
+                .view_dir()
+                .join(super::reference_sidecar::sidecar_name(generation));
+            // The reference sidecar is listed before its manifest: if the
+            // claim bound stops this pass partway, the manifest may be left
+            // without its sidecar (blob GC then decodes the JSON), but the
+            // sidecar is never left behind its manifest.
             for path in [
                 self.view_dir().join(format!("derived-{generation}.sqlite")),
                 self.view_dir().join(format!("derived-{generation}.ref")),
                 self.trigram_path(generation)?,
+                sidecar.clone(),
                 self.manifest_path(generation)?,
             ] {
                 let sqlite = path.extension().is_some_and(|ext| ext == "sqlite");
-                if keep_derived && (sqlite || path == self.manifest_path(generation)?) {
+                // A kept clone-baseline manifest keeps its sidecar too.
+                if keep_derived
+                    && (sqlite || path == sidecar || path == self.manifest_path(generation)?)
+                {
                     continue;
                 }
                 let suffixes = if sqlite {
@@ -998,11 +1009,13 @@ impl ViewStore {
             Ok(self.view_dir().join(format!("derived-{generation}.sqlite"))),
             Ok(self.view_dir().join(format!("derived-{generation}.ref"))),
             self.trigram_path(generation),
-            self.manifest_path(generation),
+            // Before the manifest, so an interrupted removal never leaves a
+            // sidecar naming a generation whose manifest is gone.
             super::validate_generation(generation).map(|()| {
                 self.view_dir()
                     .join(super::reference_sidecar::sidecar_name(generation))
             }),
+            self.manifest_path(generation),
         ]
         .into_iter()
         .flatten()

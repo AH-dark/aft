@@ -278,7 +278,21 @@ fn write_sidecar(
         &path,
         &encode(stamp, origin, derived_at, keys),
         crate::durability::AtomicWriteDurability::File,
-    )
+    )?;
+    // Generation cleanup may have retired the manifest while the keys were
+    // being written. A sidecar must not outlive its manifest, so take it back
+    // out when the manifest is no longer the file it describes.
+    let manifest = view.join(format!("manifest-{generation}.json"));
+    let current = fs::metadata(&manifest)
+        .ok()
+        .and_then(|metadata| FileStamp::of(&metadata));
+    if current != Some(*stamp) {
+        let _ = fs::remove_file(&path);
+        return Err(std::io::Error::other(
+            "manifest changed or was removed while its sidecar was written",
+        ));
+    }
+    Ok(())
 }
 
 /// Record the keys of a manifest this process has just published. The keys

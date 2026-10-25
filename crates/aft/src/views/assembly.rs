@@ -3685,6 +3685,58 @@ mod status_settlement_tests {
     }
 
     #[test]
+    fn views_post_publication_sweep_retires_reference_sidecars_with_their_manifests() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), SCOPE).unwrap();
+        let mut generations = Vec::new();
+        for index in 0..4 {
+            fs::write(
+                root.join("file_0.ts"),
+                format!("export function revision_{index}() {{}}\n"),
+            )
+            .unwrap();
+            let mut request = request(&root, storage.path(), &format!("head-{index}"));
+            request.callgraph = false;
+            let mut prepared = prepare_checkout(&request, &mut |_| Ok(())).unwrap();
+            prepared.derived_checkpoint.take();
+            let report = prepared.commit().unwrap();
+            assert!(report.published);
+            generations.push(report.generation.unwrap());
+            prepared.settle_status();
+            super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
+            let sidecar = |generation: &str| {
+                view.view_dir()
+                    .join(super::super::reference_sidecar::sidecar_name(generation))
+            };
+            let current = generations.last().unwrap();
+            assert!(sidecar(current).is_file(), "publication wrote no sidecar");
+            for generation in &generations[..generations.len() - 1] {
+                // A superseded manifest may survive as a clone baseline, but
+                // its sidecar never outlives it.
+                assert_eq!(
+                    sidecar(generation).exists(),
+                    view.manifest_path(generation).unwrap().exists(),
+                    "sidecar and manifest of {generation} diverged"
+                );
+            }
+        }
+        assert!(
+            generations[..generations.len() - 1]
+                .iter()
+                .any(|generation| !sidecar_exists(&view, generation)),
+            "no superseded generation was retired"
+        );
+    }
+
+    fn sidecar_exists(view: &ViewStore, generation: &str) -> bool {
+        view.view_dir()
+            .join(super::super::reference_sidecar::sidecar_name(generation))
+            .exists()
+    }
+
+    #[test]
     fn views_post_publication_sweep_runs_after_settlement_without_checkpoint() {
         let project = super::cold_fallback_tests::repository(1);
         let root = project.path().canonicalize().unwrap();
