@@ -191,16 +191,73 @@ pub(crate) fn spawn_pty_for_command(
             };
 
             let args: Vec<OsString> = shell
-                .pty_wrapper_args(&wrapper_path)
+                .wrapper_file_args(&wrapper_path)
                 .into_iter()
                 .map(OsString::from)
                 .collect();
+            let mut waiter_environment = None;
+            let mut memory_file_gate = shell.uses_memory_file_gate();
+            let (program, args) = if matches!(
+                shell,
+                crate::windows_shell::WindowsShell::Pwsh
+                    | crate::windows_shell::WindowsShell::Powershell
+            ) {
+                super::windows_waiter::wrap(
+                    std::ffi::OsStr::new(shell.binary().as_ref()),
+                    &args,
+                    paths,
+                    workdir,
+                    env,
+                    true,
+                    memory_monitor.is_some(),
+                )
+                .map_err(|error| crate::windows_shell::PtyAttemptError::Wrapper(error.to_string()))?
+                .map(|waiter| {
+                    waiter_environment = Some(waiter.environment);
+                    (waiter.program, waiter.args)
+                })
+                .unwrap_or_else(|| (OsString::from(shell.binary().as_ref()), args))
+            } else {
+                (OsString::from(shell.binary().as_ref()), args)
+            };
+            let mut waiter_env;
+            let env = if let Some((key, value)) = waiter_environment {
+                // The job is attached to the cmd root before its stdin gate is
+                // released. PowerShell must not wait on a second file gate.
+                memory_file_gate = false;
+                shell
+                    .write_wrapper(user_command, &paths.exit, &wrapper_path)
+                    .map_err(|error| {
+                        crate::windows_shell::PtyAttemptError::Wrapper(error.to_string())
+                    })?;
+                waiter_env = env.clone();
+                waiter_env.insert(key, value);
+                &waiter_env
+            } else {
+                if matches!(
+                    shell,
+                    crate::windows_shell::WindowsShell::Pwsh
+                        | crate::windows_shell::WindowsShell::Powershell
+                ) {
+                    shell
+                        .write_direct_wrapper(
+                            user_command,
+                            &paths.exit,
+                            &wrapper_path,
+                            memory_monitor.is_some(),
+                        )
+                        .map_err(|error| {
+                            crate::windows_shell::PtyAttemptError::Wrapper(error.to_string())
+                        })?;
+                }
+                env
+            };
 
             try_spawn_pty(
                 spawn_plan,
                 task_id,
                 session_id,
-                std::ffi::OsStr::new(shell.binary().as_ref()),
+                &program,
                 &args,
                 paths,
                 workdir,
@@ -212,7 +269,7 @@ pub(crate) fn spawn_pty_for_command(
                 spawned_pgid,
                 memory_monitor,
                 publish_memory_policy,
-                shell.uses_memory_file_gate(),
+                memory_file_gate,
             )
             .map_err(crate::windows_shell::PtyAttemptError::Spawn)
         });

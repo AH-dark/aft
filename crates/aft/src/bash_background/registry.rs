@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
 #[path = "launch_tests.rs"]
 mod launch_tests;
-#[cfg(not(windows))]
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
@@ -11259,6 +11258,7 @@ impl BgTaskRegistry {
                     },
                     TaskRuntime::Pty(Some(pty)) => {
                         pty.was_killed.store(true, Ordering::SeqCst);
+                        #[cfg(not(windows))]
                         if let Err(error) = pty.killer.kill() {
                             crate::slog_warn!(
                                 "[pty-kill] {task_id} ChildKiller::kill failed: {error}"
@@ -11399,6 +11399,18 @@ impl BgTaskRegistry {
             KillSignalPlan::Pty { pid, master } => {
                 if let Some(pid) = pid {
                     terminate_pty_group(pid);
+                }
+                #[cfg(windows)]
+                {
+                    // Keep the waiter alive until taskkill has enumerated its
+                    // PowerShell descendants. A direct handle kill comes last
+                    // as a fallback, outside the process-tree traversal.
+                    let mut state = task
+                        .lock_state()
+                        .map_err(|_| "background task lock poisoned".to_string())?;
+                    if let TaskRuntime::Pty(Some(pty)) = &mut state.runtime {
+                        let _ = pty.killer.kill();
+                    }
                 }
                 settle_killed_process_group(&task.task_id, pid.map(|pid| pid as i32));
                 close_pty_master(master);
@@ -14666,25 +14678,12 @@ fn detached_shell_command_for(
     paths: &TaskPaths,
     creation_flags: u32,
     memory_gated: bool,
-) -> Result<Command, String> {
+    workdir: &Path,
+    environment: &HashMap<String, String>,
+) -> Result<(Command, Option<(String, String)>, bool), String> {
     use crate::windows_shell::WindowsShell;
-    // Write the wrapper to a temp file alongside the other task files,
-    // then invoke the shell with the file path as a single clean
-    // argument. This sidesteps the entire Windows command-line quoting
-    // mess (Rust std-lib quoting + cmd /C parser + PowerShell -Command
-    // parser all interacting with embedded quotes in the wrapper).
-    //
-    // Path arguments don't need quoting in the same problematic way
-    // because: (1) we use no-space task IDs (bash-XXXXXXXX) so the path
-    // contains no characters that need shell escaping; (2) the wrapper
-    // body's internal quotes never reach the shell command line — the
-    // shell reads them from disk by file syntax rules, not command-line
-    // parser rules.
-    let wrapper_body = if memory_gated {
-        shell.memory_gated_wrapper_bytes(command, exit_path)
-    } else {
-        shell.wrapper_script_bytes(command, exit_path)
-    };
+    // User command text stays in a private file. Only generated loader text
+    // and paths are transported to the shell and its exit-status waiter.
     let wrapper_ext = match shell {
         WindowsShell::Pwsh | WindowsShell::Powershell => "ps1",
         WindowsShell::Cmd => "bat",
@@ -14702,23 +14701,19 @@ fn detached_shell_command_for(
             .unwrap_or("wrapper"),
         wrapper_ext
     ));
+    let wrapper_body = if memory_gated {
+        shell.memory_gated_wrapper_bytes(command, exit_path)
+    } else {
+        shell.wrapper_script_bytes(command, exit_path)
+    };
     crate::private_storage::write(&wrapper_path, wrapper_body)
         .map_err(|e| format!("failed to write background bash wrapper script: {e}"))?;
 
     let mut cmd = Command::new(shell.binary().as_ref());
     match shell {
         WindowsShell::Pwsh | WindowsShell::Powershell => {
-            // -File runs the script with no quoting issues. `-NoLogo`,
-            // `-NoProfile`, etc. apply to the host before the file runs.
-            cmd.args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-            ]);
-            cmd.arg(&wrapper_path);
+            cmd.args(["-NoLogo", "-ExecutionPolicy", "Bypass"]);
+            cmd.args(shell.wrapper_file_args(&wrapper_path));
         }
         WindowsShell::Cmd => {
             // `cmd /D /C "<bat-file-path>"` — invoking a .bat
@@ -14739,11 +14734,42 @@ fn detached_shell_command_for(
         }
     }
 
+    let mut waiter_environment = None;
+    let mut memory_file_gate = shell.uses_memory_file_gate();
+    if matches!(shell, WindowsShell::Pwsh | WindowsShell::Powershell) {
+        let args = cmd.get_args().map(OsString::from).collect::<Vec<_>>();
+        if let Some(waiter) = super::windows_waiter::wrap(
+            cmd.get_program(),
+            &args,
+            paths,
+            workdir,
+            environment,
+            false,
+            memory_gated,
+        )
+        .map_err(|error| format!("failed to prepare PowerShell waiter: {error}"))?
+        {
+            cmd = Command::new(waiter.program);
+            cmd.args(waiter.args);
+            waiter_environment = Some(waiter.environment);
+            // The cmd root blocks on stdin before creating PowerShell. Attach
+            // the Job Object to that root before the parent releases the gate.
+            memory_file_gate = false;
+            shell
+                .write_wrapper(command, exit_path, &wrapper_path)
+                .map_err(|error| format!("failed to write PowerShell payload: {error}"))?;
+        } else {
+            shell
+                .write_direct_wrapper(command, exit_path, &wrapper_path, memory_gated)
+                .map_err(|error| format!("failed to write direct PowerShell wrapper: {error}"))?;
+        }
+    }
+
     // Win32 process creation flags. Caller selects whether to include
     // CREATE_BREAKAWAY_FROM_JOB — see `detached_shell_command_for` callers
     // for the breakaway-fallback strategy.
     cmd.creation_flags(creation_flags);
-    Ok(cmd)
+    Ok((cmd, waiter_environment, memory_file_gate))
 }
 
 #[cfg(unix)]
@@ -14986,17 +15012,19 @@ fn spawn_detached_child(
                 let stderr = io_handles.clone_file(TaskArtifact::Stderr).map_err(|e| {
                     PipedAttemptError::Setup(format!("failed to clone stderr capture handle: {e}"))
                 })?;
-                let mut cmd = detached_shell_command_for(
+                let (mut cmd, waiter_environment, memory_file_gate) = detached_shell_command_for(
                     shell.clone(),
                     command,
                     &paths.exit,
                     paths,
                     flags,
                     memory_gated,
+                    workdir,
+                    env,
                 )
                 .map_err(PipedAttemptError::Setup)?;
                 cmd.current_dir(workdir)
-                    .stdin(if memory_gated && !shell.uses_memory_file_gate() {
+                    .stdin(if memory_gated && !memory_file_gate {
                         Stdio::piped()
                     } else {
                         Stdio::null()
@@ -15005,6 +15033,9 @@ fn spawn_detached_child(
                     .stderr(Stdio::from(stderr));
                 crate::agent_child_env::apply_to_command(&mut cmd, env);
                 crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut cmd, env);
+                if let Some((key, value)) = waiter_environment {
+                    cmd.env(key, value);
+                }
                 if let Some((key, value)) = shell.wrapper_environment(command) {
                     cmd.env(key, value);
                 }
@@ -22603,6 +22634,70 @@ mod tests {
         let content = wait_for_file(&exit_path);
 
         assert_eq!(content.trim(), "42");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_restart_recovers_explicit_exit_status_without_daemon() {
+        for slot in [
+            super::super::TaskSlot::Foreground,
+            super::super::TaskSlot::Background { max: 10 },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let release = dir.path().join("release");
+            let original = BgTaskRegistry::default();
+            let command = format!(
+                "while (!(Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 20 }}; Write-Output hi; exit 3",
+                release.display().to_string().replace('\'', "''")
+            );
+            let task_id = original
+                .spawn_with_shell_in_slot_typed(
+                    SpawnPlan::Unsandboxed,
+                    &command,
+                    crate::bash_background::BashShell::Powershell,
+                    PathBuf::from("pwsh.exe"),
+                    "session".into(),
+                    dir.path().into(),
+                    HashMap::new(),
+                    crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    dir.path().into(),
+                    slot,
+                    true,
+                    false,
+                    Some(dir.path().into()),
+                )
+                .unwrap();
+            let paths = original.task(&task_id).unwrap().paths.clone();
+            let before = read_task(&paths.json).unwrap();
+            original.detach();
+            drop(original);
+            let restarted = BgTaskRegistry::default();
+            let replayed = restarted.replay_session(dir.path(), "session");
+            let during = restarted.status(
+                &task_id,
+                "session",
+                Some(dir.path()),
+                Some(dir.path()),
+                8192,
+            );
+            fs::write(&release, "finish").unwrap();
+            assert_eq!(before.status, BgTaskStatus::Running);
+            replayed.unwrap();
+            assert_eq!(during.unwrap().info.status, BgTaskStatus::Running);
+            assert_eq!(wait_for_file(&paths.exit).trim(), "3");
+            let done = restarted
+                .status(
+                    &task_id,
+                    "session",
+                    Some(dir.path()),
+                    Some(dir.path()),
+                    8192,
+                )
+                .unwrap();
+            assert_eq!(done.exit_code, Some(3), "{done:?}");
+            assert_eq!(done.info.status, BgTaskStatus::Failed);
+            assert!(done.output_preview.contains("hi"), "{done:?}");
+        }
     }
 
     #[cfg(windows)]
