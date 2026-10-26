@@ -857,7 +857,7 @@ struct Fixture {
 }
 
 #[test]
-fn views_production_publication_indexes_rust_constructors_once_per_extraction() {
+fn views_production_publication_reuses_rust_receiver_source_index() {
     use crate::callgraph_store::join::extraction_work::measure;
 
     let fixture = Fixture::with_files(128);
@@ -868,6 +868,8 @@ fn views_production_publication_indexes_rust_constructors_once_per_extraction() 
         git(
             fixture.project.path(),
             &[
+                "-c",
+                "core.autocrlf=false",
                 "worktree",
                 "add",
                 "--quiet",
@@ -925,7 +927,7 @@ fn views_production_publication_indexes_rust_constructors_once_per_extraction() 
         });
         let inserted = blobs.usage().unwrap().rows - rows;
         eprintln!(
-            "production_receiver revision={revision} inserted={} elapsed_ms={} parses={} receiver_calls={} function_nodes={} constructor_scans={} constructor_nodes={}",
+            "production_receiver revision={revision} inserted={} elapsed_ms={} parses={} receiver_calls={} function_nodes={} constructor_scans={} constructor_nodes={} index_passes={} index_nodes={}",
             inserted,
             started.elapsed().as_millis(),
             work.whole_file_parses,
@@ -933,6 +935,8 @@ fn views_production_publication_indexes_rust_constructors_once_per_extraction() 
             work.receiver_function_nodes,
             work.receiver_constructor_scans,
             work.receiver_constructor_nodes,
+            work.receiver_index_passes,
+            work.receiver_index_nodes,
         );
         assert_ne!(ctx.view_runtime_snapshot().unwrap().generation, before);
         assert_eq!(inserted, 1);
@@ -966,6 +970,38 @@ fn views_production_publication_indexes_rust_constructors_once_per_extraction() 
         }
         checkouts.push(checkout);
     }
+    let source = format!(
+        "{}\n// publication revision 0\n",
+        include_str!("../views/assembly.rs")
+    );
+    let runtime = fixture.ctx.view_runtime_snapshot().unwrap();
+    let blobs = crate::blob_store::BlobStore::open(
+        &runtime.storage,
+        &runtime.family,
+        crate::blob_store::BlobPlane::Callgraph,
+    )
+    .unwrap();
+    let key = crate::blob_store::CallgraphKey::from_bytes(
+        source.as_bytes(),
+        "rust",
+        crate::views::callgraph::PRODUCER,
+    )
+    .full_key();
+    let reference = crate::callgraph_store::join::dispatch::with_unindexed_receiver_lookup(|| {
+        crate::callgraph_store::join::CallgraphBlob::extract(
+            &source,
+            "rust",
+            crate::views::callgraph::PRODUCER,
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap()
+    });
+    assert_eq!(
+        blobs.get(&key).unwrap().unwrap(),
+        reference,
+        "production payload bytes must equal the unindexed algorithm"
+    );
     assert_eq!(
         measurements[1].whole_file_parses, 2,
         "the verification pass independently reads the new content"
@@ -973,13 +1009,157 @@ fn views_production_publication_indexes_rust_constructors_once_per_extraction() 
     for work in measurements {
         assert!((1..=2).contains(&work.whole_file_parses));
         assert!(work.receiver_type_calls > 0);
-        assert!(work.receiver_constructor_nodes > 0);
-        assert!(
-            work.receiver_constructor_scans <= work.whole_file_parses,
-            "constructor facts must be indexed once per extracted file: {work:?}"
+        assert_eq!(
+            work.receiver_index_passes, work.whole_file_parses,
+            "one receiver source index per extraction: {work:?}"
         );
+        assert!(work.receiver_index_nodes > 0);
+        assert_eq!(
+            work.receiver_function_nodes, 0,
+            "receiver function subtrees must be borrowed: {work:?}"
+        );
+        assert_eq!(
+            work.receiver_constructor_scans, 0,
+            "constructor declarations must not be rescanned: {work:?}"
+        );
+        assert_eq!(work.receiver_constructor_nodes, 0);
     }
 }
+#[test]
+fn views_production_receiver_index_preserves_payload_database_and_query_bytes() {
+    use crate::callgraph_store::join::{dispatch::with_unindexed_receiver_lookup, CallgraphBlob};
+
+    const SOURCE: &str = r#"
+pub struct Good;
+impl Good { pub fn new() -> Self { Self } pub fn method(&self) {} }
+pub struct Named;
+impl Named { pub fn new() -> Named { Named } pub fn method(&self) {} }
+pub struct Wrong;
+impl Wrong { pub fn new() -> u32 { 0 } pub fn method(&self) {} }
+pub fn good_caller() { let value = Good::new(); value.method(); }
+pub fn named_caller() { let value = Named::new(); value.method(); }
+pub fn wrong_caller() { let value = Wrong::new(); value.method(); }
+"#;
+    let reference = Fixture::with_files(8);
+    let indexed = Fixture::with_files(8);
+    for fixture in [&reference, &indexed] {
+        std::fs::write(fixture.project.path().join("file_0.rs"), SOURCE).unwrap();
+    }
+    let publish = |fixture: &Fixture| {
+        fixture
+            .ctx
+            .publish_view_paths(
+                BTreeSet::from([b"file_0.rs".to_vec()]),
+                !fixture.ctx.shared_artifacts_read_only(),
+            )
+            .unwrap()
+    };
+    let before = with_unindexed_receiver_lookup(|| publish(&reference));
+    let after = publish(&indexed);
+    assert_eq!(before.blob_puts, 1);
+    assert_eq!(after.blob_puts, 1);
+    assert_eq!(
+        before.manifest.as_ref().unwrap().to_json_bytes().unwrap(),
+        after.manifest.as_ref().unwrap().to_json_bytes().unwrap()
+    );
+    let payload = |fixture: &Fixture| {
+        let runtime = fixture.ctx.view_runtime_snapshot().unwrap();
+        let blobs = crate::blob_store::BlobStore::open(
+            &runtime.storage,
+            &runtime.family,
+            crate::blob_store::BlobPlane::Callgraph,
+        )
+        .unwrap();
+        let key = crate::blob_store::CallgraphKey::from_bytes(
+            SOURCE.as_bytes(),
+            "rust",
+            crate::views::callgraph::PRODUCER,
+        )
+        .full_key();
+        blobs.get(&key).unwrap().unwrap()
+    };
+    let bytes = payload(&indexed);
+    assert_eq!(payload(&reference), bytes, "published payload bytes");
+    let CallgraphBlob::Parse(parse) = CallgraphBlob::from_bytes(&bytes).unwrap() else {
+        panic!("Rust parse payload expected");
+    };
+    let hints = parse
+        .dispatch
+        .sites
+        .iter()
+        .filter(|site| site.member.as_deref() == Some("method"))
+        .map(|site| (site.caller.clone().unwrap(), site.receiver.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        hints,
+        std::collections::BTreeMap::from([
+            ("good_caller".to_owned(), Some("Good".to_owned())),
+            ("named_caller".to_owned(), Some("Named".to_owned())),
+            ("wrong_caller".to_owned(), None),
+        ])
+    );
+    for fixture in [&reference, &indexed] {
+        crate::views::wait_for_derived_checkpoint_for_test(fixture.view.view_dir());
+        fixture.assert_cold_parity();
+    }
+    crate::views::materialization::parity::assert_logical_parity(
+        &reference
+            .view
+            .derived_path(before.generation.as_deref().unwrap())
+            .unwrap(),
+        &indexed
+            .view
+            .derived_path(after.generation.as_deref().unwrap())
+            .unwrap(),
+    );
+    let open = |fixture: &Fixture| {
+        let runtime = fixture.ctx.view_runtime_snapshot().unwrap();
+        crate::callgraph_store::ReadonlyCallGraphStore::open_pinned_derived(
+            fixture.ctx.canonical_cache_root(),
+            runtime.family,
+            fixture.view.view_dir().to_path_buf(),
+            runtime.generation.as_deref().unwrap(),
+        )
+        .unwrap()
+    };
+    let old = open(&reference);
+    let new = open(&indexed);
+    for symbol in [
+        "Good::method",
+        "Named::method",
+        "good_caller",
+        "wrong_caller",
+    ] {
+        let path = Path::new("file_0.rs");
+        let callers = new.callers_of(path, symbol, 5).unwrap();
+        if symbol == "Good::method" {
+            assert!(callers
+                .callers
+                .iter()
+                .any(|site| site.caller.symbol == "good_caller"));
+        }
+        assert_eq!(
+            format!("{callers:?}").as_bytes(),
+            format!("{:?}", old.callers_of(path, symbol, 5).unwrap()).as_bytes(),
+            "callers bytes for {symbol}"
+        );
+        assert_eq!(
+            format!("{:?}", new.impact_of(path, symbol, 5).unwrap()).as_bytes(),
+            format!("{:?}", old.impact_of(path, symbol, 5).unwrap()).as_bytes(),
+            "impact bytes for {symbol}"
+        );
+        assert_eq!(
+            serde_json::to_vec(&new.trace_to(path, symbol, 5).unwrap()).unwrap(),
+            serde_json::to_vec(&old.trace_to(path, symbol, 5).unwrap()).unwrap(),
+            "trace bytes for {symbol}"
+        );
+    }
+    eprintln!(
+        "receiver_parity entries=9 payload_bytes={} query_cases=4 operators=3",
+        bytes.len()
+    );
+}
+
 impl Fixture {
     fn new() -> Self {
         Self::with_files(0)

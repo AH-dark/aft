@@ -15,6 +15,8 @@ pub(crate) struct Work {
     pub receiver_function_nodes: usize,
     pub receiver_constructor_scans: usize,
     pub receiver_constructor_nodes: usize,
+    pub receiver_index_passes: usize,
+    pub receiver_index_nodes: usize,
     pub position_bytes: usize,
     pub call_kind_vectors: usize,
     pub kind_copies: usize,
