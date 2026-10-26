@@ -508,15 +508,48 @@ describe("registerAftBinding — request admission (OMP)", () => {
     expect(read.capabilities.sort()).toEqual(["native-url", "observation"].sort());
   });
 
-  test("stays silent when the host registry is unreadable (no answer, not an empty-tools answer)", () => {
+  test("registry read failures emit no binding and a later readable request recovers", () => {
     setHarnessOverrideForTesting("omp");
-    const { api, emitLifecycle, emitBus } = makeMockHost(); // no getAllTools at all
+    for (const failing of ["getAllTools", "getActiveTools"] as const) {
+      let unreadable = true;
+      const { api, emitLifecycle, emitBus } = makeMockHost({
+        getAllTools: () => {
+          if (unreadable && failing === "getAllTools") throw new Error("Registry not bound");
+          return [{ name: "read", sourceInfo: { path: TOOL_SOURCE_PATH } }];
+        },
+        getActiveTools: () => {
+          if (unreadable && failing === "getActiveTools") throw new Error("Registry not bound");
+          return ["read"];
+        },
+      });
+      const responses: unknown[] = [];
+      api.events.on("aft:binding", (payload) => responses.push(payload));
+      registerAftBinding(api, projectCtx());
+      emitLifecycle("session_start", undefined, makeExtContext(process.cwd(), "session-1"));
+      emitBus("aft:binding-request", { v: 1, sessionId: "session-1", requestId: "r1" });
+      expect(responses).toEqual([]);
+      unreadable = false;
+      emitBus("aft:binding-request", { v: 1, sessionId: "session-1", requestId: "r2" });
+      expect(responses).toMatchObject([{ requestId: "r2", tools: [{ name: "read" }] }]);
+    }
+  });
+
+  test("an initially empty registry can publish a later registration", () => {
+    setHarnessOverrideForTesting("omp");
+    const entries: Array<{ name: string; sourceInfo: { path: string } }> = [];
+    const { api, emitLifecycle, emitBus } = makeMockHost({
+      getAllTools: () => entries,
+      getActiveTools: () => ["read"],
+    });
     const responses: unknown[] = [];
     api.events.on("aft:binding", (payload) => responses.push(payload));
     registerAftBinding(api, projectCtx());
     emitLifecycle("session_start", undefined, makeExtContext(process.cwd(), "session-1"));
     emitBus("aft:binding-request", { v: 1, sessionId: "session-1", requestId: "r1" });
     expect(responses).toEqual([]);
+    entries.push({ name: "read", sourceInfo: { path: TOOL_SOURCE_PATH } });
+    emitBus("aft:binding-request", { v: 1, sessionId: "session-1", requestId: "r2" });
+    expect(responses).toMatchObject([{ requestId: "r2", tools: [{ name: "read" }] }]);
   });
 });
 

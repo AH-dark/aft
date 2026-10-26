@@ -162,7 +162,7 @@ event (the same pattern as the `adr`/`roadmap` plugins' `adr:binding-request`) w
 
 No answer means either AFT is not loaded, the request's session doesn't match, or the
 host's tool registry was not yet readable; callers retry rather than cache a negative.
-Implemented in `src/aft-contract.ts`.
+Binding registration lives in `src/tool-registration.ts`; scope projection lives in `src/omp-internal-urls.ts`.
 
 ## Logs
 
