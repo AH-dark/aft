@@ -6,6 +6,7 @@
 use crate::bash_background::process::is_process_alive;
 use crate::executor::Executor;
 use crate::run_tool_call::{ToolCallPhaseDurations, WaitingOn};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 #[cfg(unix)]
@@ -434,28 +435,37 @@ fn sanitize_index_value(value: &str) -> String {
     out
 }
 
-fn push_index_field(line: &mut String, key: &str, value: &str) {
+fn push_index_field(line: &mut String, key: &str, value: &str, max_bytes: usize) {
     let sanitized = sanitize_index_value(value);
     let addition = format!(" {key}={sanitized}");
-    if line.len() + addition.len() > INDEX_EVENT_MAX_BYTES {
+    if line.len() + addition.len() > max_bytes {
         return;
     }
     line.push_str(&addition);
 }
 
-/// Keep the distinctive suffix of a long root so the five required fields still fit.
+/// Keep the last two components when possible, with a stable hash to distinguish worktrees.
 fn left_truncate_root(root: &str, max_bytes: usize) -> String {
-    const MARKER: &str = "...";
     if root.len() <= max_bytes {
         return root.to_string();
     }
-    let max_bytes = max_bytes.max(MARKER.len());
-    let keep = max_bytes.saturating_sub(MARKER.len());
-    let mut start = root.len().saturating_sub(keep);
+    let hash = format!("{:x}", Sha256::digest(root.as_bytes()));
+    let marker = format!(".../{}", &hash[..8]);
+    if max_bytes <= marker.len() {
+        return marker[..max_bytes].to_string();
+    }
+    let root = root.trim_end_matches('/');
+    let suffix_start = root.rmatch_indices('/').nth(1).map_or(0, |(i, _)| i + 1);
+    let keep = max_bytes.saturating_sub(marker.len() + 1);
+    let mut start = suffix_start.max(root.len().saturating_sub(keep));
     while start < root.len() && !root.is_char_boundary(start) {
         start += 1;
     }
-    format!("{MARKER}{}", &root[start..])
+    if start == root.len() {
+        marker
+    } else {
+        format!("{marker}/{}", &root[start..])
+    }
 }
 
 fn format_index_event_line(event: &IndexEvent) -> String {
@@ -466,17 +476,28 @@ fn format_index_event_line(event: &IndexEvent) -> String {
     let mut root = sanitize_index_value(&normalize_index_root(&event.root));
     let prefix = format!("index_event kind={kind} plane={plane} build_id={build_id} root=");
     let key_field = format!(" key={key}");
+    // Reserve measurements before descriptive fields, and give the root only the
+    // remaining bytes. Keep root/key in their current positions so existing readers
+    // can parse the record.
+    let extra_budget = INDEX_EVENT_MAX_BYTES
+        .saturating_sub(prefix.len() + key_field.len())
+        .saturating_sub(root.len().min(".../00000000".len()));
+    let mut extra_fields = String::new();
+    for numeric in [true, false] {
+        for (key, value) in &event.extra {
+            if value.parse::<u64>().is_ok() == numeric {
+                push_index_field(&mut extra_fields, key, value, extra_budget);
+            }
+        }
+    }
     let root_budget = INDEX_EVENT_MAX_BYTES
         .saturating_sub(prefix.len())
-        .saturating_sub(key_field.len());
+        .saturating_sub(key_field.len())
+        .saturating_sub(extra_fields.len());
     if root.len() > root_budget {
         root = left_truncate_root(&root, root_budget);
     }
-    let mut line = format!("{prefix}{root}{key_field}");
-    for (key, value) in &event.extra {
-        push_index_field(&mut line, key, value);
-    }
-    line
+    format!("{prefix}{root}{key_field}{extra_fields}")
 }
 
 fn root_plane_key(root: &Path, plane: IndexPlane) -> (String, IndexPlane) {
@@ -4065,6 +4086,77 @@ mod tests {
         assert_eq!(fields.get("key").map(String::as_str), Some("keepkey"));
         assert!(fields.get("root").is_some(), "{lines:?}");
         assert_index_event_grammar(&lines);
+    }
+
+    #[test]
+    fn index_event_long_root_keeps_measurements_within_cap() {
+        let suffix = "/typescript-eslint/worker";
+        let root = format!("/{}{suffix}", "a".repeat(300 - 1 - suffix.len()));
+        assert_eq!(root.len(), 300);
+        let event = IndexEvent::new(
+            IndexEventKind::FirstQuery,
+            IndexPlane::Semantic,
+            "b-12345-123",
+            &root,
+            "workspace",
+        )
+        .field("tool", "semantic_search")
+        .field("queue_ms", 12)
+        .field("service_ms", 34)
+        .field("status", "ok")
+        .field("elapsed_ms", 5678)
+        .field("ready_to_first_query_ms", 9012)
+        .field("completed", 345)
+        .field("total", 678);
+        let line = format_index_event_line(&event);
+        assert!(line.len() <= INDEX_EVENT_MAX_BYTES, "{line}");
+        assert!(index_event_matches_grammar(&line), "{line}");
+        let fields = index_event_fields(&line);
+        for (key, value) in [
+            ("elapsed_ms", "5678"),
+            ("ready_to_first_query_ms", "9012"),
+            ("completed", "345"),
+            ("total", "678"),
+            ("queue_ms", "12"),
+            ("service_ms", "34"),
+        ] {
+            assert_eq!(fields.get(key).map(String::as_str), Some(value), "{line}");
+        }
+        assert!(fields["root"].ends_with(suffix), "{line}");
+        assert_eq!(
+            line,
+            include_str!("../../../scripts/telemetry/fixtures/index-event-long-root.txt").trim()
+        );
+    }
+
+    #[test]
+    fn index_event_measurements_take_priority_over_long_descriptions() {
+        let event = IndexEvent::new(
+            IndexEventKind::FirstQuery,
+            IndexPlane::Search,
+            "b-1-1",
+            "/work/repo",
+            "0123456789abcdef",
+        )
+        .field("tool", "x".repeat(190))
+        .field("status", "x".repeat(300))
+        .field("ready_to_first_query_ms", 42);
+        let line = format_index_event_line(&event);
+        assert!(line.len() <= INDEX_EVENT_MAX_BYTES, "{line}");
+        assert_eq!(index_event_fields(&line)["ready_to_first_query_ms"], "42");
+    }
+
+    #[test]
+    fn shortened_index_roots_are_distinct_and_bounded() {
+        let root = format!("/{}/typescript-eslint/worker", "a".repeat(300));
+        let other = root.replacen('a', "b", 1);
+        let shortened = left_truncate_root(&root, 50);
+        assert!(shortened.starts_with(".../"));
+        assert!(shortened.ends_with("/typescript-eslint/worker"));
+        assert_ne!(shortened, left_truncate_root(&other, 50));
+        for budget in 0..50 {
+            assert!(left_truncate_root(&root, budget).len() <= budget);
+        }
     }
 
     #[test]
