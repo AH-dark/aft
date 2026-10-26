@@ -201,6 +201,74 @@ fn bash_env_updates_live_for_future_commands() {
 }
 
 #[test]
+fn project_bash_env_and_runon_env_update_live() {
+    // A project's `bash.env` lives in `project_env` and a user's
+    // `bash.runon_env` in `runon_env`; editing either must take effect on the
+    // next command, and deleting it must clear the old value.
+    let fixture = Fixture::new(
+        r#"{ "bash": { "env": { "TZ": "UTC" }, "runon_env": ["TZ"] } }"#,
+        Some(r#"{ "bash": { "env": { "IBToolNeverDeque": "1" } } }"#),
+    );
+    assert_eq!(
+        fixture
+            .ctx
+            .config()
+            .bash
+            .project_env
+            .get("IBToolNeverDeque")
+            .map(String::as_str),
+        Some("1")
+    );
+
+    write(
+        &fixture.project_path,
+        r#"{ "bash": { "env": { "IBToolNeverDeque": "0", "SECOND": "2" } } }"#,
+    );
+    write(
+        &fixture.user_path,
+        r#"{ "bash": { "env": { "TZ": "UTC" } } }"#,
+    );
+    let outcome = fixture.reload();
+    assert!(
+        applied(&outcome).contains(&"bash.project_env"),
+        "{:?}",
+        applied(&outcome)
+    );
+    assert_eq!(
+        fixture
+            .ctx
+            .config()
+            .bash
+            .project_env
+            .get("IBToolNeverDeque")
+            .map(String::as_str),
+        Some("0"),
+        "an edited project value must apply live"
+    );
+    assert!(fixture.ctx.config().bash.runon_env.is_empty());
+    assert!(
+        applied(&outcome).contains(&"bash.runon_env"),
+        "{:?}",
+        applied(&outcome)
+    );
+
+    write(&fixture.project_path, "{}");
+    let outcome = fixture.reload();
+    assert!(
+        fixture.ctx.config().bash.project_env.is_empty(),
+        "a deleted project map must not keep its old values: {:?}",
+        fixture.ctx.config().bash.project_env
+    );
+    assert!(
+        applied(&outcome)
+            .iter()
+            .any(|key| *key == "bash.project_env"),
+        "{:?}",
+        applied(&outcome)
+    );
+}
+
+#[test]
 fn bash_env_updates_live_while_cache_dir_waits_for_reconfigure() {
     let published = Config::default();
     let mut candidate = published.clone();

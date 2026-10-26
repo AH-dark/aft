@@ -89,16 +89,71 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
-    let configured_env = ctx.config().bash.env.clone();
-    let configured_env_keys = configured_env.keys().cloned().collect::<Vec<_>>();
-    // The request map is the process-creation channel, with call-specific values
-    // taking precedence over the user's stable defaults.
-    for (key, value) in &configured_env {
-        params
-            .env
-            .entry(key.clone())
-            .or_insert_with(|| value.clone());
+    // Remote runs are resolved later, but whether `bash.env` travels with the
+    // job depends only on the request, so decide it up front: a `runon` job
+    // receives no configured value unless the user listed the name in
+    // `bash.runon_env`, and it never receives a project value.
+    let remote_requested = params.runon.is_some()
+        || crate::bash_background::remote_for_legacy_command(
+            &ctx.config(),
+            &params.command,
+            params.pty,
+            params.shell.is_powershell(),
+        )
+        .is_some();
+    // A project's `bash.env` applies only while the project root is trusted at
+    // the time of the call, so trusting or untrusting takes effect on the next
+    // command without a reload.
+    let project_trusted = project_env_trusted(ctx);
+    let remote_env_plan = if remote_requested {
+        crate::commands::bash_remote_env::plan(ctx.config().as_ref())
+    } else {
+        crate::commands::bash_remote_env::RemoteEnvPlan::default()
+    };
+    let mut applied_env = Vec::new();
+    // Every configured name, including one a remote job does receive: the
+    // remote request drops them all from its shell environment, so a value is
+    // sent only when `bash.runon_env` puts it in the request map explicitly.
+    let configured_env_names = ctx
+        .config()
+        .bash
+        .configured_env(true)
+        .iter()
+        .flat_map(|configured| configured.names.keys().cloned())
+        .collect::<Vec<_>>();
+    for configured in ctx.config().bash.configured_env(project_trusted) {
+        let names = if remote_requested {
+            crate::commands::bash_remote_env::forwarded_names(&remote_env_plan, &configured)
+        } else {
+            configured.names
+        };
+        // AFT's worker test-thread budget is written by `inject` below, which
+        // keeps a value the request already carries; configured thread counts
+        // must not reach it, and a value rejected at load could not apply
+        // anyway. The disclosure still names them, so nothing is silent.
+        let names = names
+            .into_iter()
+            .filter(|(key, _)| !crate::agent_child_env::is_worker_test_thread_env_name(key))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        // The request map is the process-creation channel, with call-specific
+        // values taking precedence over the configured stable defaults.
+        for (key, value) in &names {
+            params
+                .env
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+        applied_env.push(crate::config_resolve::ConfiguredBashEnv {
+            names,
+            tier: configured.tier,
+        });
     }
+    let disclosure = crate::commands::bash_remote_env::Disclosure::build(
+        &applied_env,
+        &ctx.config().bash.shadowed_project_env(project_trusted),
+        !project_trusted && !ctx.config().bash.project_env.is_empty(),
+        &remote_env_plan,
+    );
     // The dedicated external route is defensive as well as convenient: callers
     // cannot accidentally execute Bash merely by omitting the selector.
     if req.command == "powershell" {
@@ -125,7 +180,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // `runon` sends the whole line, as written, to the remote runner. Every
     // reason that cannot happen is refused here, before any local work (even
     // resolving a local shell).
-    let remote = match params.runon.as_deref() {
+    let mut remote = match params.runon.as_deref() {
         None => crate::bash_background::remote_for_legacy_command(
             &ctx.config(),
             &params.command,
@@ -150,6 +205,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         },
     };
 
+    if let Some(launch) = remote.as_mut() {
+        launch.configured_env_names = configured_env_names;
+    }
     let shell_path = match crate::bash_background::resolve_shell_path(params.pty, params.shell) {
         Ok(path) => path,
         // The only refusal here is a missing PowerShell. Rebuild its message so
@@ -481,12 +539,12 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 json!(format_duplicate_warning(&duplicate)),
             );
         }
-        if !configured_env_keys.is_empty()
+        if !disclosure.is_empty()
             && ctx
                 .bash_background()
                 .claim_bash_env_disclosure(req.session())
         {
-            object.insert("_bash_env_keys".to_string(), json!(configured_env_keys));
+            object.insert("_bash_env_keys".to_string(), json!(disclosure));
         }
     }
     response
@@ -526,6 +584,28 @@ fn validate_pty_dimensions(rows: Option<u16>, cols: Option<u16>) -> Result<(), &
         return Err("ptyCols must be an integer between 1 and 140");
     }
     Ok(())
+}
+
+/// Whether the session's project root is on the filter trust list right now. A
+/// linked worktree inherits its main checkout's trust.
+fn project_env_trusted(ctx: &AppContext) -> bool {
+    let Some(root) = ctx.config().project_root.clone() else {
+        return false;
+    };
+    // `aft doctor filters trust` writes the trust file under the configured
+    // storage directory; a routed session's task storage sits one segment
+    // deeper, so both are checked and the user's decision is found either way.
+    let staged = crate::bash_background::task_storage_dir(ctx);
+    if crate::compress::trust::is_project_env_trusted(Some(&staged), &root) {
+        return true;
+    }
+    ctx.config()
+        .storage_dir
+        .as_ref()
+        .filter(|configured| **configured != staged)
+        .is_some_and(|configured| {
+            crate::compress::trust::is_project_env_trusted(Some(configured), &root)
+        })
 }
 
 fn blocked_env_var(env: &HashMap<String, String>) -> Option<&str> {
@@ -2238,14 +2318,24 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let ctx = spawn_test_context(&project, storage.path());
 
+        // A per-call test-thread value cannot defeat the budget: the names are
+        // refused before the launch, so the worker still gets its budget.
         let mut explicit = worker_thread_output_request("budget-explicit");
         explicit.params["params"]["env"] = json!({
             "NEXTEST_TEST_THREADS": "13",
             "RUST_TEST_THREADS": "17"
         });
+        let refused = crate::bash_background::with_worker_preset(true, || handle(&explicit, &ctx));
+        assert!(!refused.success, "{:?}", refused.data);
+        assert_eq!(refused.data["code"], "blocked_env_var");
         assert_eq!(
-            bash_output_for_test(&ctx, &project, &explicit, true),
-            "13|17"
+            bash_output_for_test(
+                &ctx,
+                &project,
+                &worker_thread_output_request("budget"),
+                true
+            ),
+            "8|8"
         );
 
         let mut head = worker_thread_output_request("budget-head");
@@ -2267,10 +2357,6 @@ mod tests {
             "19|23"
         );
         assert_eq!(bash_output_for_test(&ctx, &project, &head, false), "19|23");
-        assert_eq!(
-            bash_output_for_test(&ctx, &project, &explicit, true),
-            "13|17"
-        );
     }
 
     #[cfg(unix)]
@@ -3027,8 +3113,8 @@ mod tests {
         let launcher = PathBuf::from("/bin/sh");
         crate::executable_cache::write_executable_with_mode(
             &launcher_script,
-            br#"printf '%s\n' "$0" "$@" > "$AFT_TEST_LAUNCH_ARGS.tmp"
-mv -f "$AFT_TEST_LAUNCH_ARGS.tmp" "$AFT_TEST_LAUNCH_ARGS"
+            br#"printf '%s\n' "$0" "$@" > "$BASHENV_TEST_LAUNCH_ARGS.tmp"
+mv -f "$BASHENV_TEST_LAUNCH_ARGS.tmp" "$BASHENV_TEST_LAUNCH_ARGS"
 [ "$1" = "--profile-json" ] || exit 92
 [ -n "$2" ] || exit 93
 [ "$3" = "--failure-fd" ] || exit 95
@@ -3060,7 +3146,7 @@ exec "$@"
             "params": {
                 "command": "printf launcher-wrapped",
                 "compressed": false,
-                "env": { "AFT_TEST_LAUNCH_ARGS": args_log.to_string_lossy() },
+                "env": { "BASHENV_TEST_LAUNCH_ARGS": args_log.to_string_lossy() },
             },
         }))
         .unwrap();
@@ -3289,4 +3375,7 @@ exec "$@"
         assert_eq!(observations[0].requested_tier, RequestedSandboxTier::Native);
         stop_spawned_test_task(&ctx, &retried);
     }
+    #[cfg(unix)]
+    #[path = "bash_env_tests.rs"]
+    mod bash_env_tests;
 }

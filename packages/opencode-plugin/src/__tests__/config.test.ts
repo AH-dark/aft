@@ -948,15 +948,18 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("Partial config loaded — invalid sections skipped");
   });
 
-  test("bash.env is retained from user config and ignored from project config", () => {
+  test("bash.env keeps the user map and carries the project map separately", () => {
+    // A project's values are applied by the engine only while the project is
+    // trusted, so the loader keeps them in `project_env` instead of ignoring
+    // them or overwriting the user's map.
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
-      JSON.stringify({ bash: { env: { TZ: "UTC", AFT_USER_ENV_TEST: "user-value" } } }),
+      JSON.stringify({ bash: { env: { TZ: "UTC", USER_ENV_TEST: "user-value" } } }),
     );
     writeFileSync(
       fixture.projectConfigPath,
-      JSON.stringify({ bash: { env: { TZ: "Mars", AFT_PROJECT_ENV_TEST: "project-value" } } }),
+      JSON.stringify({ bash: { env: { TZ: "Mars", PROJECT_ENV_TEST: "project-value" } } }),
     );
 
     const result = runConfigLoader(fixture.projectDirectory, {
@@ -964,12 +967,40 @@ describe("loadAftConfig", () => {
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    expect(JSON.parse(result.stdout).bash.env).toEqual({
-      TZ: "UTC",
-      AFT_USER_ENV_TEST: "user-value",
+    const bash = JSON.parse(result.stdout).bash;
+    expect(bash.env).toEqual({ TZ: "UTC", USER_ENV_TEST: "user-value" });
+    expect(bash.project_env).toEqual({ TZ: "Mars", PROJECT_ENV_TEST: "project-value" });
+  });
+
+  test("a project bash.env credential is refused and a project control name too", () => {
+    for (const env of [{ NPM_TOKEN: "x" }, { AFT_INTERNAL_LINUX_SCOPE: "1" }]) {
+      const fixture = createConfigFixture();
+      writeFileSync(fixture.projectConfigPath, JSON.stringify({ bash: { env } }));
+      const result = runRejectedConfigLoader(fixture.projectDirectory, {
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      });
+      expect(result.errors).toEqual(["invalid_security_config:bash"]);
+    }
+  });
+
+  test("a harness block merges bash.env names into the base map", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        bash: { env: { BASE_ENV_TEST: "base" } },
+        harnesses: { opencode: { bash: { env: { HARNESS_ENV_TEST: "harness" } } } },
+      }),
+    );
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
-    expect(result.stderr).toContain("bash.env");
-    expect(result.stderr).toContain("user-level config");
+    expect(JSON.parse(result.stdout).bash.env).toEqual({
+      BASE_ENV_TEST: "base",
+      HARNESS_ENV_TEST: "harness",
+    });
   });
 
   test("blocked bash.env keys are refused while loading user config", () => {

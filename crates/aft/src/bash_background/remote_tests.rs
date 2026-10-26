@@ -219,6 +219,7 @@ pub(crate) fn launch(connection: PathBuf) -> crate::bash_background::RemoteLaunc
         requested_platform: None,
         requested_vcpus: None,
         requested_network: false,
+        configured_env_names: Vec::new(),
         params: exec::FrozenParams {
             remote_exec: Some(exec::policy::RemoteExecPolicy {
                 enabled: true,
@@ -6753,6 +6754,55 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
     assert_eq!(remote_phase_note(&fallback, now), None);
     metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
     assert_eq!(remote_phase_note(&metadata, now), None);
+}
+
+/// A configured name the user forwarded through `bash.runon_env` travels to
+/// the job, and so does a per-call name. Both live in the request map, which is
+/// layered over the ambient environment rather than filtered like it.
+#[tokio::test]
+async fn runon_keeps_a_forwarded_configured_name_and_a_per_call_name() {
+    let daemon = daemon(Script::GatedAcceptance, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
+    let ctx = Arc::new(restarted_context(dir.path()));
+    let mut policy = launch(daemon.connection.clone());
+    policy.explicit_runon = true;
+    // `TZ` is configured and forwarded; `OTHER` is configured but not
+    // forwarded, so it is not in the request map at all.
+    policy.configured_env_names = vec!["TZ".to_string(), "OTHER".to_string()];
+    ctx.bash_background()
+        .spawn_remote(
+            policy,
+            SpawnPlan::Unsandboxed,
+            "uname -s",
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::from([
+                ("TZ".to_string(), "UTC".to_string()),
+                ("CALL_ONLY".to_string(), "call-value".to_string()),
+            ]),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
+            dir.path().into(),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+        .unwrap();
+    daemon.wait_for_requests("exec.run", 1).await;
+    let runs = exec_runs(&daemon);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let env = &runs[0]["env"];
+    assert_eq!(
+        env["TZ"], "UTC",
+        "a forwarded configured name must survive into the request: {env}"
+    );
+    assert_eq!(
+        env["CALL_ONLY"], "call-value",
+        "a per-call name must survive into the request: {env}"
+    );
 }
 
 #[tokio::test]

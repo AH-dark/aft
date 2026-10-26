@@ -24,7 +24,14 @@ OMP uses this same CortexKit user file; register its Pi-compatible plugin with `
 
 The list covers a time window, so changes made by other processes in that window can appear. It comes from the file watcher, so paths the watcher excludes (`.git`, `target`, `node_modules`, ignore rules) are not listed. Before reporting, AFT confirms the watcher has caught up by creating and removing an empty marker file (in `.git/`, or the project root when `.git` is not a folder), waiting at most 300 ms; if it can't confirm, the result says the list may be incomplete. Background commands report in their completion notice, and `runon` commands report only changes seen in the local project. Limits: 40 files and 64 KiB per report, 200 lines and 32 KiB per file diff. Files over 256 KiB, binary files and files that already had uncommitted changes are listed without a diff.
 
-`bash.env` adds fixed variables to every shell command from user config only (for example, `"env": { "TZ": "UTC" }`). Project config cannot set environment values. Per-call `env` entries override these defaults, and user-config changes apply to future commands without a restart. Loader, shell/interpreter startup, `PATH`, and other protected variables are rejected while loading config. The first bash reply in each session lists the configured keys only, never their values. When a command starts while the same trimmed command is already running in the same project and canonical working directory, AFT adds a warning with its task ID, age, and whether it belongs to this session; the command still runs.
+`bash.env` adds fixed variables to every local shell command (for example, `"env": { "TZ": "UTC" }`). Both tiers accept it, with one shape:
+
+- **User tier** always applies. **Project tier** applies only while the project is on the filter trust list (`aft doctor filters trust`), checked on every command, and a linked worktree inherits its main checkout's trust. Untrusting a project takes effect on the next command, with no reload.
+- On the same name, **the user value wins** and the project value is ignored; a project can add names but cannot undo a user's. A harness block's `bash.env` merges its names into that tier's base map instead of replacing it.
+- Refused names reject the whole config, naming the key: names that hijack startup, redirect a lookup root, inject into an interpreter or Git, or drive AFT, the sandbox, or a build worker are refused at both tiers, and credentials, identity, proxy, and TLS-trust names are refused at the project tier only. Matching is case-insensitive on every platform.
+- `bash.runon_env` (user tier only) lists the `bash.env` names whose value also goes to a `runon` build-server job. Every other value applies to local commands only, a project's values are never sent, and the job's disclosure names what it did not receive.
+
+Per-call `env` entries and the command's own `export` both override configured values, and config changes apply to future commands without a restart. The first bash reply in each session lists the applied names with their tier, never their values, and says when a project map was ignored as untrusted or shadowed by a user value. When a command starts while the same trimmed command is already running in the same project and canonical working directory, AFT adds a warning with its task ID, age, and whether it belongs to this session; the command still runs.
 
 On Linux, user config may set `bash.linux_scope: true` to launch non-PTY tool shells through `systemd-run --user --scope --collect --quiet`. The default is `false`. AFT uses the scope only when `systemd-run` exists and the user manager is reachable; otherwise it falls back to the normal process-group-isolated spawn and writes one informational log line. Native-sandbox launches also use the normal spawn because their launcher cannot contact the user manager. Project config cannot enable or disable this host-level containment option.
 
@@ -370,10 +377,15 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // Runtime gate. Default true.
     "enabled": true,
 
-    // Fixed extra variables for every shell command. User-tier only; project
-    // config cannot set environment values. Per-call env overrides these.
-    // Protected loader, shell/interpreter startup and PATH variables are refused.
+    // Fixed extra variables for every local shell command. A project's names
+    // apply only while the project is trusted; a user value wins on the same
+    // name. Per-call env and the command's own export override these.
+    // Startup hooks, lookup roots, interpreter injectors and protected
+    // variables are refused.
     "env": { "TZ": "UTC" },
+
+    // User-tier only: bash.env names that also go to a runon job.
+    "runon_env": ["TZ"],
 
     // Rewrite common shell commands (cat / grep / find / sed / ls / rg / cat >>)
     // to AFT tools. Adds a footer hint nudging the agent to call the AFT tool

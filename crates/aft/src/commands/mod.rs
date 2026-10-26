@@ -14,6 +14,7 @@ pub mod bash_orchestrate;
 pub mod bash_owned_tasks;
 pub mod bash_promote;
 pub mod bash_regex_match;
+pub(crate) mod bash_remote_env;
 pub mod bash_status;
 pub mod bash_wait_detach;
 pub mod bash_watch;

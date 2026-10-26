@@ -806,10 +806,23 @@ pub struct BashConfig {
     /// Pi-only fallback gate for its optional PowerShell default tool. The Rust
     /// executor accepts this solely to keep shared config parsing in parity.
     pub powershell_tool: bool,
-    /// Fixed environment entries merged into each bash request. Only trusted
-    /// user configuration supplies them; replies disclose names, never values.
+    /// Fixed environment entries merged into each local bash request. User
+    /// configuration supplies these, and a trusted project's `bash.env` adds
+    /// more in [`BashConfig::project_env`]; replies disclose names, never
+    /// values.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Validated project-tier `bash.env` values. The resolver never applies
+    /// them: `commands/bash.rs` merges them only while the project root is on
+    /// the filter trust list at the time of the call, and a name the user tier
+    /// already sets keeps the user value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_env: BTreeMap<String, String>,
+    /// User-only names whose `bash.env` value is also sent to a `runon` build
+    /// job. Every other configured name stays on this machine, and a project
+    /// value is never sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runon_env: Vec<String>,
 }
 
 impl Default for BashConfig {
@@ -828,6 +841,8 @@ impl Default for BashConfig {
             disclaim_privacy: false,
             powershell_tool: false,
             env: BTreeMap::new(),
+            project_env: BTreeMap::new(),
+            runon_env: Vec::new(),
         }
     }
 }
@@ -838,6 +853,48 @@ impl Default for BashConfig {
 pub struct ConfiguredCacheDir {
     pub spelling: PathBuf,
     pub resolved: PathBuf,
+}
+
+impl BashConfig {
+    /// The `bash.env` values a local command should start with, lowest tier
+    /// first, tagged with the tier that supplied them.
+    ///
+    /// `project_trusted` is the caller's per-command trust decision; an
+    /// untrusted project's map is not included at all. A name both tiers set
+    /// keeps the user value: user names are often protective
+    /// (`GIT_TERMINAL_PROMPT=0`), and a repository should add names rather
+    /// than undo the user's.
+    pub(crate) fn configured_env(
+        &self,
+        project_trusted: bool,
+    ) -> Vec<crate::config_resolve::ConfiguredBashEnv> {
+        let mut applied = Vec::new();
+        if !self.env.is_empty() {
+            applied.push(crate::config_resolve::ConfiguredBashEnv {
+                names: self.env.clone(),
+                tier: crate::bash_env::BashEnvTier::User,
+            });
+        }
+        if project_trusted && !self.project_env.is_empty() {
+            applied.push(crate::config_resolve::ConfiguredBashEnv {
+                names: self.project_env.clone(),
+                tier: crate::bash_env::BashEnvTier::Project,
+            });
+        }
+        applied
+    }
+
+    /// Project names that a user value already covers, and so do not apply.
+    pub(crate) fn shadowed_project_env(&self, project_trusted: bool) -> Vec<String> {
+        if !project_trusted {
+            return Vec::new();
+        }
+        self.project_env
+            .keys()
+            .filter(|name| self.env.contains_key(*name))
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -943,6 +943,11 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("bash.db_schema_hints", bash.db_schema_hints);
     live!("bash.changed_files", bash.changed_files);
     live!("bash.env", bash.env);
+    // A project's `bash.env` values and the user's runon allowlist apply to
+    // every later command, so an edit or a deletion must take effect without a
+    // reconfigure instead of waiting for the next connection.
+    live!("bash.project_env", bash.project_env);
+    live!("bash.runon_env", bash.runon_env);
     later!("bash.powershell_tool", bash.powershell_tool);
     live!(
         "bash.long_running_reminder_enabled",
@@ -1083,6 +1088,8 @@ fn classification_is_exhaustive(config: &Config) {
         disclaim_privacy: _,
         powershell_tool: _,
         env: _,
+        project_env: _,
+        runon_env: _,
     } = bash;
     let crate::config::SandboxConfig {
         profile: _,
