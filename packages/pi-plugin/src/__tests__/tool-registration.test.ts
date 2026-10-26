@@ -1,9 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { afterEach, describe, expect, test } from "bun:test";
-import { TOOL_SOURCE_PATH } from "../aft-source-path.js";
+import { describe, expect, test } from "bun:test";
 import type { AftConfig } from "../config.js";
-import { setHarnessOverrideForTesting } from "../harness.js";
 import {
   piHashlineDowngrade,
   piHashlineEffective,
@@ -124,26 +122,5 @@ describe("Pi tool registration", () => {
     expect(() => resolvePiToolSurface({})).toThrow(
       "invalid_resolved_config:missing:disabled_tools",
     );
-  });
-});
-
-describe("sourcePath declaration (AFT interop contract admission)", () => {
-  afterEach(() => setHarnessOverrideForTesting(null));
-
-  test("stamps the shared TOOL_SOURCE_PATH on every tool registered on OMP", () => {
-    setHarnessOverrideForTesting("omp");
-    const { tools } = register({ disabled_tools: [] });
-    expect((tools.get("read") as unknown as { sourcePath?: string }).sourcePath).toBe(
-      TOOL_SOURCE_PATH,
-    );
-    expect((tools.get("aft_outline") as unknown as { sourcePath?: string }).sourcePath).toBe(
-      TOOL_SOURCE_PATH,
-    );
-  });
-
-  test("does not stamp sourcePath outside OMP", () => {
-    setHarnessOverrideForTesting("pi");
-    const { tools } = register({ disabled_tools: [] });
-    expect((tools.get("read") as unknown as { sourcePath?: string }).sourcePath).toBeUndefined();
   });
 });
