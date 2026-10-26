@@ -3980,6 +3980,8 @@ fn requeue_as_exclusive(
     {
         return Err(cancelled());
     }
+    #[cfg(test)]
+    requeue_after_probe_hook_for_test(&run_job.request_id);
     let rerun = run_job
         .rerun
         .clone()
@@ -4004,17 +4006,15 @@ fn requeue_as_exclusive(
     })
 }
 
-/// Test hook: a job's request id and a callback run on the worker right after
-/// a requeued bind's token went back to pending, before the scheduler sees
-/// the requeue.
+/// A request id and callback for one worker-to-scheduler requeue handoff.
 #[cfg(test)]
 type RequeueHandoffHook = (String, Box<dyn FnOnce() + Send>);
 
 #[cfg(test)]
 static REQUEUE_HANDOFF_HOOK: Mutex<Option<RequeueHandoffHook>> = Mutex::new(None);
 
-/// Run `hook` on the worker between returning `request_id`'s token to pending
-/// and handing the requeue to the scheduler.
+/// Run `hook` after returning `request_id`'s token to pending, before the
+/// worker's full cancellation probe.
 #[cfg(test)]
 pub(crate) fn set_requeue_handoff_hook_for_test(
     request_id: &str,
@@ -4042,6 +4042,33 @@ fn requeue_handoff_hook_for_test(request_id: &str) {
 
 #[cfg(not(test))]
 fn requeue_handoff_hook_for_test(_request_id: &str) {}
+
+#[cfg(test)]
+static REQUEUE_AFTER_PROBE_HOOK: Mutex<Option<RequeueHandoffHook>> = Mutex::new(None);
+
+/// Run `hook` after the worker's cancellation probe passes, before the
+/// scheduler receives `request_id`'s requeue.
+#[cfg(test)]
+fn set_requeue_after_probe_hook_for_test(request_id: &str, hook: impl FnOnce() + Send + 'static) {
+    *REQUEUE_AFTER_PROBE_HOOK.lock() = Some((request_id.to_string(), Box::new(hook)));
+}
+
+#[cfg(test)]
+fn requeue_after_probe_hook_for_test(request_id: &str) {
+    let hook = {
+        let mut slot = REQUEUE_AFTER_PROBE_HOOK.lock();
+        match slot.take() {
+            Some((id, hook)) if id == request_id => Some(hook),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 /// How one dispatched job ended on its worker.
 enum LaneRun {

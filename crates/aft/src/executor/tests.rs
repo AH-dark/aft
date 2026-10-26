@@ -4004,11 +4004,8 @@ fn bind_needing_exclusive_use_is_rerun_after_a_polling_tail_steps_aside() {
     );
 }
 
-/// A cancel can land in the handoff window: the worker has put a requeued
-/// bind's token back to pending, but the scheduler has not queued the job yet,
-/// so `cancel_job` finds nothing to remove and only signals the token. The
-/// scheduler must settle that bind as cancelled when it takes the requeue,
-/// not queue cancelled writer demand behind the tail still holding the actor.
+/// A cancel after the token returns to pending but before the worker's full
+/// probe must be settled by the worker without queuing exclusive writer demand.
 #[test]
 fn bind_cancelled_during_the_requeue_handoff_is_settled_without_queuing() {
     let executor = Arc::new(test_executor(4, 2, 2, 2));
@@ -4055,7 +4052,7 @@ fn bind_cancelled_during_the_requeue_handoff_is_settled_without_queuing() {
         .recv_timeout(Duration::from_secs(5))
         .expect("the hook ran in the handoff window");
 
-    // The tail still holds the actor: only settlement at requeue answers now.
+    // The tail still holds the actor, so cancellation must settle before execution.
     let deadline = Instant::now() + Duration::from_secs(2);
     let response = loop {
         if let Ok(response) = bind.try_recv() {
@@ -4087,6 +4084,61 @@ fn bind_cancelled_during_the_requeue_handoff_is_settled_without_queuing() {
         demand_while_tail_held, 0,
         "no cancelled writer demand queued"
     );
+}
+
+/// Cancellation after the worker's full probe must be settled by the scheduler,
+/// not left as exclusive writer demand behind an existing reader.
+#[test]
+fn bind_cancelled_after_the_worker_probe_is_settled_without_queuing() {
+    let executor = Arc::new(test_executor(4, 2, 2, 2));
+    let (_dir, root) = test_root("bind-after-worker-probe-cancel");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+    let (_epoch, waiting_writers, _detached) = actor_epoch_and_demand(&executor, &root);
+    let reader = StuckReader::start(&executor, &root, "after-probe-reader", "read");
+    let (parked_tx, parked_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    set_requeue_after_probe_hook_for_test("subc-bind-after-worker-probe", move || {
+        parked_tx.send(()).expect("signal post-probe handoff");
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+    let (mut bind, token) =
+        submit_repeatable_bind(&executor, &root, "subc-bind-after-worker-probe", |_| {
+            assert!(
+                request_exclusive_rerun(),
+                "the held reader forces a shared attempt"
+            );
+            ok("subc-bind-after-worker-probe")
+        });
+    parked_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the worker's cancellation probe passed");
+    let cancel = executor.cancel_job(&root, &token);
+    release_tx.send(()).expect("release post-probe handoff");
+
+    // The reader prevents an incorrectly queued exclusive rerun from answering.
+    let response = try_recv_within(&mut bind, Duration::from_secs(2));
+    let demand_while_reader_held = waiting_writers.load(Ordering::Acquire);
+    let queued_while_reader_held = {
+        let state = executor.inner.state.lock();
+        state.actors[&root].has_queued_mutating_job("subc-bind-after-worker-probe")
+    };
+    assert!(reader.finish().success);
+    let response = response.unwrap_or_else(|| {
+        let late = recv_async(bind, "late post-probe cancellation");
+        panic!(
+            "scheduler left a cancelled post-probe requeue behind the reader \
+             (writer demand: {demand_while_reader_held}, queued: {queued_while_reader_held}): {:?}",
+            late.data
+        );
+    });
+    assert_eq!(cancel, JobCancelOutcome::RunningSignalled);
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "request_cancelled");
+    assert_eq!(
+        demand_while_reader_held, 0,
+        "no cancelled writer demand queued"
+    );
+    assert!(!queued_while_reader_held, "cancelled bind was queued");
 }
 
 /// A bind sent back for exclusive use waits in the actor's queue, not on a
