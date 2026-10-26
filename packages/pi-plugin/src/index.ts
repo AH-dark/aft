@@ -98,6 +98,7 @@ import {
 // Register our logger with @cortexkit/aft-bridge before any bridge code runs.
 setActiveLogger(bridgeLogger);
 
+import { registerAftBinding } from "./aft-contract.js";
 import { clearPendingBashWaitDetach, interruptBashWaitsForInput } from "./bash-wait-detach.js";
 import { registerPiConfigErrorState, resolvePiBootstrapConfig } from "./config-error-state.js";
 import { startPiLiveConfigReload } from "./config-live-reload.js";
@@ -953,6 +954,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   ctx.ompRouter = await loadOmpInternalUrlRouter(pi);
   registerPiToolSurface(pi, ctx, surface);
+  // AFT interop contract v1 (OMP only; see aft-contract.ts): answers
+  // `aft:binding-request` with the live set of tools actually registered
+  // above and a non-mutating per-call projection function. Installed here,
+  // at factory setup, so load order relative to consumer extensions never
+  // matters.
+  registerAftBinding(pi, ctx);
 
   // Pi binds its live tool registry after extension factories run. A modern Pi
   // can therefore reveal that its optional built-in PowerShell tool is active

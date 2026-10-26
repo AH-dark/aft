@@ -2,6 +2,7 @@ import { ADAPTER_UNIMPLEMENTED_TOOLS, CANONICAL_TOOLS } from "@cortexkit/aft-bri
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 
+import { TOOL_SOURCE_PATH } from "./aft-source-path.js";
 import type { AftConfig } from "./config.js";
 import { resolveBashConfig, resolvedDisabledTools } from "./config.js";
 import { detectPiHarness, type PiHarness } from "./harness.js";
@@ -242,6 +243,11 @@ export function bindToolRegistrationFunnel(
     );
     originalRegisterTool({
       ...prepared,
+      // Declared explicitly, not inferred: the AFT interop contract
+      // (`aft-contract.ts`) admits only tools whose host-recorded
+      // `sourceInfo.path` equals this same constant. Non-OMP hosts get no
+      // such field; they have no such contract to honor.
+      ...(effectiveHarness === "omp" ? { sourcePath: TOOL_SOURCE_PATH } : {}),
       execute(toolCallId, params, signal, onUpdate, context) {
         recordSessionCwd((context as { cwd?: unknown } | undefined)?.cwd);
         return withOutsidePermissionOperation(

@@ -81,7 +81,14 @@ export function bashHasInternalUrl(command: unknown, router: OmpInternalUrlRoute
   });
 }
 
-function internalTarget(
+/**
+ * The native-URL target a call would delegate to, or `undefined` if none of
+ * its path-bearing arguments resolve through the router. Exported so the AFT
+ * interop contract's projection function (`aft-contract.ts`) can classify a
+ * call as `native` using the exact same detection this wrapper's dispatch
+ * uses, instead of re-deriving it.
+ */
+export function internalTarget(
   name: string,
   params: unknown,
   router: OmpInternalUrlRouter,
