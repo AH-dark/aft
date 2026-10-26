@@ -521,6 +521,8 @@ struct JobCancellationInner {
     state: AtomicU8,
     wait_lock: Mutex<()>,
     wake: Condvar,
+    #[cfg(test)]
+    root_probe_barrier: Mutex<Option<(Sender<()>, Receiver<()>)>>,
 }
 
 const JOB_CANCEL_STATE_PENDING: u8 = 0;
@@ -535,6 +537,8 @@ impl JobCancellation {
                 state: AtomicU8::new(JOB_CANCEL_STATE_PENDING),
                 wait_lock: Mutex::new(()),
                 wake: Condvar::new(),
+                #[cfg(test)]
+                root_probe_barrier: Mutex::new(None),
             }),
             root: None,
             lifecycle: None,
@@ -750,11 +754,22 @@ impl JobCancellation {
             *last = Some((Arc::downgrade(&self.inner), state, 0, Instant::now()));
             true
         });
+        #[cfg(test)]
+        let barrier = self.inner.root_probe_barrier.lock().take();
+        #[cfg(test)]
+        let probe = probe || barrier.is_some();
         if !probe {
             return self.state() == JOB_CANCEL_STATE_CANCELLED;
         }
         #[cfg(test)]
         crate::search_index::audit_record(|work| work.cancel_probes += 1);
+        #[cfg(test)]
+        {
+            if let Some((parked, release)) = barrier {
+                parked.send(()).unwrap();
+                release.recv().unwrap();
+            }
+        }
         // A deleted checkout cannot publish useful work. Check here as well as
         // at admission so deletion during a batch does not wait for the reaper.
         // Permission/transient I/O failures do not prove that it was deleted.
@@ -1130,6 +1145,8 @@ impl Executor {
                 completed_maintenance,
                 dispatch_liveness,
                 dispatch_loop_liveness,
+                #[cfg(test)]
+                maintenance_root_check_hook: Mutex::new(None),
             }),
         }
     }
@@ -1825,6 +1842,10 @@ impl Executor {
         let mut completion = Some(completion);
         let mut duplicate_victims = Vec::new();
 
+        // A root stat can stall on disk I/O. Probe before taking the shared
+        // scheduler lock; execution checks again if the root disappears later.
+        let maintenance_root_exists =
+            job_class != JobClass::Maintenance || self.maintenance_root_is_dir(&root_id);
         let response = {
             let mut state = self.inner.state.lock();
             match state.actors.get_mut(&root_id) {
@@ -1841,7 +1862,7 @@ impl Executor {
                     if job_class == JobClass::Maintenance {
                         if (actor.ctx.subc_unbound_quiesced()
                             && command != "unbound-teardown-persist")
-                            || !root_id.as_path().is_dir()
+                            || !maintenance_root_exists
                         {
                             admission_error = Some(maintenance_cancelled_response(
                                 request_id.clone(),
@@ -1912,6 +1933,17 @@ impl Executor {
         }
 
         self.wake_scheduler();
+    }
+
+    fn maintenance_root_is_dir(&self, root_id: &ProjectRootId) -> bool {
+        #[cfg(test)]
+        {
+            let hook = self.inner.maintenance_root_check_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        root_id.as_path().is_dir()
     }
 
     /// Workers not running a job right now, for tests that assert nothing
@@ -2103,6 +2135,8 @@ struct ExecutorInner {
     completed_maintenance: Arc<AtomicU64>,
     dispatch_liveness: Arc<DispatchLivenessAtomics>,
     dispatch_loop_liveness: Arc<DispatchLoopLiveness>,
+    #[cfg(test)]
+    maintenance_root_check_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Drop for ExecutorInner {
@@ -3358,7 +3392,7 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) -> Option<Jo
             _ if queued
                 .cancellation
                 .as_ref()
-                .is_some_and(JobCancellation::cancel_requested_before_commit) =>
+                .is_some_and(JobCancellation::cancel_already_requested) =>
             {
                 queued.completion.send(Response::error(
                     queued.request_id,
@@ -3936,6 +3970,18 @@ fn requeue_as_exclusive(
         return Err(cancelled());
     }
     requeue_handoff_hook_for_test(&run_job.request_id);
+    // Root and lifecycle probes can block. Keep them on the worker; completion
+    // still checks the atomic cancellation state under the scheduler lock so a
+    // cancel in the handoff window cannot leave queued writer demand behind.
+    if run_job
+        .cancellation
+        .as_ref()
+        .is_some_and(JobCancellation::cancel_requested_before_commit)
+    {
+        return Err(cancelled());
+    }
+    #[cfg(test)]
+    requeue_after_probe_hook_for_test(&run_job.request_id);
     let rerun = run_job
         .rerun
         .clone()
@@ -3960,17 +4006,15 @@ fn requeue_as_exclusive(
     })
 }
 
-/// Test hook: a job's request id and a callback run on the worker right after
-/// a requeued bind's token went back to pending, before the scheduler sees
-/// the requeue.
+/// A request id and callback for one worker-to-scheduler requeue handoff.
 #[cfg(test)]
 type RequeueHandoffHook = (String, Box<dyn FnOnce() + Send>);
 
 #[cfg(test)]
 static REQUEUE_HANDOFF_HOOK: Mutex<Option<RequeueHandoffHook>> = Mutex::new(None);
 
-/// Run `hook` on the worker between returning `request_id`'s token to pending
-/// and handing the requeue to the scheduler.
+/// Run `hook` after returning `request_id`'s token to pending, before the
+/// worker's full cancellation probe.
 #[cfg(test)]
 pub(crate) fn set_requeue_handoff_hook_for_test(
     request_id: &str,
@@ -3998,6 +4042,33 @@ fn requeue_handoff_hook_for_test(request_id: &str) {
 
 #[cfg(not(test))]
 fn requeue_handoff_hook_for_test(_request_id: &str) {}
+
+#[cfg(test)]
+static REQUEUE_AFTER_PROBE_HOOK: Mutex<Option<RequeueHandoffHook>> = Mutex::new(None);
+
+/// Run `hook` after the worker's cancellation probe passes, before the
+/// scheduler receives `request_id`'s requeue.
+#[cfg(test)]
+fn set_requeue_after_probe_hook_for_test(request_id: &str, hook: impl FnOnce() + Send + 'static) {
+    *REQUEUE_AFTER_PROBE_HOOK.lock() = Some((request_id.to_string(), Box::new(hook)));
+}
+
+#[cfg(test)]
+fn requeue_after_probe_hook_for_test(request_id: &str) {
+    let hook = {
+        let mut slot = REQUEUE_AFTER_PROBE_HOOK.lock();
+        match slot.take() {
+            Some((id, hook)) if id == request_id => Some(hook),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 /// How one dispatched job ended on its worker.
 enum LaneRun {
