@@ -1738,6 +1738,77 @@ fn warm_up_embedding_fallback_route(query: &str) {
     handle.join().expect("warm-up embedding server thread");
 }
 
+fn capture_query_embedding_phases<T>(
+    started: Instant,
+    action: impl FnOnce() -> T,
+) -> (T, Vec<(&'static str, Instant)>) {
+    let phases = std::rc::Rc::new(std::cell::RefCell::new(vec![("search_start", started)]));
+    #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+    let value = {
+        let observed = std::rc::Rc::clone(&phases);
+        aft::semantic_index::with_query_embedding_phase_observer_for_test(
+            move |phase| observed.borrow_mut().push((phase, Instant::now())),
+            action,
+        )
+    };
+    #[cfg(not(any(debug_assertions, feature = "test-timing-hooks")))]
+    let value = action();
+    phases.borrow_mut().push(("reply", Instant::now()));
+    (value, std::rc::Rc::try_unwrap(phases).unwrap().into_inner())
+}
+
+fn format_query_embedding_phases(phases: &[(&str, Instant)], started: Instant) -> String {
+    [
+        "search_start",
+        "embed_query_entry",
+        "model_mutex_first_acquired",
+        "model_construction_start",
+        "model_construction_end",
+        "model_mutex_second_acquired",
+        "model_mutex_reacquired",
+        "request_send",
+        "deadline_fire_observed",
+        "fallback_start",
+        "reply",
+    ]
+    .iter()
+    .map(|phase| {
+        let offsets = phases
+            .iter()
+            .filter(|(name, _)| name == phase)
+            .map(|(_, at)| {
+                format!(
+                    "{:.3}ms",
+                    at.duration_since(started).as_secs_f64() * 1_000.0
+                )
+            })
+            .collect::<Vec<_>>();
+        let offset = if offsets.is_empty() {
+            "not reached".to_string()
+        } else {
+            offsets.join(" / ")
+        };
+        format!("{phase}={offset}")
+    })
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+#[test]
+fn query_embedding_phase_report_includes_missing_and_repeated_phases() {
+    let started = Instant::now();
+    let report = format_query_embedding_phases(
+        &[
+            ("search_start", started),
+            ("request_send", started + Duration::from_millis(10)),
+            ("request_send", started + Duration::from_millis(20)),
+            ("reply", started + Duration::from_millis(750)),
+        ],
+        started,
+    );
+    assert_eq!(report, "search_start=0.000ms, embed_query_entry=not reached, model_mutex_first_acquired=not reached, model_construction_start=not reached, model_construction_end=not reached, model_mutex_second_acquired=not reached, model_mutex_reacquired=not reached, request_send=10.000ms / 20.000ms, deadline_fire_observed=not reached, fallback_start=not reached, reply=750.000ms");
+}
+
 #[test]
 fn slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh() {
     let query = "where is the needle symbol implementation";
@@ -1752,7 +1823,9 @@ fn slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh() {
 
     let semantic_request = request_with(query, Some("semantic"));
     let started = Instant::now();
-    let degraded = response_value(handle_semantic_search(&semantic_request, &ctx));
+    let (degraded, phases) = capture_query_embedding_phases(started, || {
+        response_value(handle_semantic_search(&semantic_request, &ctx))
+    });
     let elapsed = started.elapsed();
 
     // Checked first so a budget that is not enforced reports as a budget
@@ -1760,7 +1833,26 @@ fn slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh() {
     // which arrives well after this bound.
     assert!(
         elapsed < Duration::from_millis(1_000),
-        "500ms query budget took {elapsed:?}"
+        "500ms query budget took {elapsed:?}; phases: {}",
+        format_query_embedding_phases(&phases, started)
+    );
+    #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+    assert_eq!(
+        phases.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        [
+            "search_start",
+            "embed_query_entry",
+            "model_mutex_first_acquired",
+            "model_construction_start",
+            "model_construction_end",
+            "model_mutex_second_acquired",
+            "request_send",
+            "deadline_fire_observed",
+            "fallback_start",
+            "reply",
+        ],
+        "phase capture must explain pre-request work as well as timeout and fallback: {}",
+        format_query_embedding_phases(&phases, started)
     );
     assert_lexical_fallback(&degraded, "unavailable");
     assert!(
