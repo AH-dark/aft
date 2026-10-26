@@ -4,7 +4,7 @@
 //! must also be old, and all writers, pins, readers and local SQLite handles must
 //! have gone. Unknown keys receive a fresh observation grace instead of treating
 //! an old payload mtime as proof that a root has not recently been bound.
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, ReadDir};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -41,6 +41,7 @@ const STARTUP_GRACE: Duration = Duration::from_secs(5 * 60);
 const PASS_BUDGET: Duration = Duration::from_secs(5);
 const PASS_ENTRIES: usize = 64;
 const TREE_ENTRIES: usize = 4096;
+const TRASH_SCAN_HANDLES: usize = 64;
 const HISTORY_ENTRIES: usize = 8192;
 static REPORTED_BINDING_READ_ERRORS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 const DOMAINS: [&str; 6] = [
@@ -209,6 +210,35 @@ struct State {
     reaping: bool,
     trash: TrashReport,
     reaper_cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+struct TrashScan {
+    identity: (u64, u64),
+    entries: Option<ReadDir>,
+    deferred: VecDeque<fs::DirEntry>,
+    omitted_prefix: bool,
+    touched: Instant,
+}
+
+type TrashScans = HashMap<(PathBuf, PathBuf), Option<TrashScan>>;
+
+fn trash_scans() -> &'static Mutex<TrashScans> {
+    static SCANS: OnceLock<Mutex<TrashScans>> = OnceLock::new();
+    SCANS.get_or_init(Mutex::default)
+}
+
+struct TrashScanLease(Option<(PathBuf, PathBuf)>);
+
+impl Drop for TrashScanLease {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take() {
+            let cursor = trash_scans()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key);
+            drop(cursor);
+        }
+    }
 }
 
 pub(crate) fn startup_sweeps_ready(storage: &Path) -> bool {
@@ -2508,6 +2538,102 @@ fn reap_trash(
     budget: &mut crate::bash_background::persistence::RepairBudget,
     report: &mut TrashReport,
 ) -> io::Result<bool> {
+    reap_trash_with_snapshot_budget(
+        storage,
+        trash,
+        mount_local,
+        deadline,
+        budget,
+        report,
+        Duration::from_millis(10),
+    )
+}
+
+fn reap_trash_with_snapshot_budget(
+    storage: &StoragePaths,
+    trash: &Path,
+    mount_local: bool,
+    deadline: Instant,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+    report: &mut TrashReport,
+    admission_budget: Duration,
+) -> io::Result<bool> {
+    let key = (storage.artifacts.clone(), trash.to_path_buf());
+    let (mut cursor, full, expired) = {
+        let mut scans = trash_scans()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Close idle cached iterators after two retention intervals. Active
+        // passes keep their reserved slots until they finish or unwind.
+        let expired = scans
+            .extract_if(|_, scan| {
+                scan.as_ref()
+                    .is_some_and(|scan| scan.touched.elapsed() >= INTERVAL * 2)
+            })
+            .map(|(_, scan)| scan)
+            .collect::<Vec<_>>();
+        let (cursor, full) = if let Some(slot) = scans.get_mut(&key) {
+            let cursor = slot.take();
+            let busy = cursor.is_none();
+            (cursor, busy)
+        } else if scans.len() < TRASH_SCAN_HANDLES {
+            // A None slot reserves a handle for the active pass, so concurrent
+            // reapers cannot exceed the bound before publishing their cursors.
+            scans.insert(key.clone(), None);
+            (None, false)
+        } else {
+            (None, true)
+        };
+        (cursor, full, expired)
+    };
+    drop(expired);
+    if full {
+        report.incomplete = true;
+        report.keep(
+            trash,
+            "cursor_capacity",
+            "waiting for an open trash scan to finish",
+        );
+        return Ok(true);
+    }
+    let mut lease = TrashScanLease(Some(key.clone()));
+    let result = reap_trash_with_cursor(
+        storage,
+        trash,
+        mount_local,
+        deadline,
+        budget,
+        report,
+        admission_budget,
+        &mut cursor,
+    );
+    if let Some(mut cursor) = cursor.filter(|scan| {
+        (scan.entries.is_some() || !scan.deferred.is_empty())
+            && (scan.omitted_prefix || !scan.deferred.is_empty())
+    }) {
+        cursor.touched = Instant::now();
+        let previous = {
+            trash_scans()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, Some(cursor))
+        };
+        drop(previous);
+        lease.0 = None;
+    }
+    result
+}
+
+fn reap_trash_with_cursor(
+    storage: &StoragePaths,
+    trash: &Path,
+    mount_local: bool,
+    deadline: Instant,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+    report: &mut TrashReport,
+    admission_budget: Duration,
+    cursor: &mut Option<TrashScan>,
+) -> io::Result<bool> {
     let entries = {
         // Snapshot mount-local tombstones under admission so a concurrent
         // retirement finishes moving entries before any of them are unlinked.
@@ -2527,22 +2653,56 @@ fn reap_trash(
         } else {
             None
         };
-        match fs::read_dir(trash) {
-            Ok(entries) if fs::symlink_metadata(trash)?.is_dir() => {
+        let previous = cursor.take();
+        match fs::symlink_metadata(trash) {
+            Ok(metadata) if metadata.is_dir() => {
                 if mount_local && crate::cross_volume::is_mount_point(trash)? {
                     return Err(io::Error::other(
                         "foreign retention trash filesystem retained",
                     ));
                 }
+                let identity =
+                    crate::bash_background::persistence::PinnedDir::repair_open_path(trash)?
+                        .directory_identity()?;
+                // Keep the live iterator, not a name to skip after reopening:
+                // rereading a retained prefix can itself exhaust admission.
+                let scan = match previous.filter(|scan| scan.identity == identity) {
+                    Some(scan) => scan,
+                    None => TrashScan {
+                        identity,
+                        entries: Some(fs::read_dir(trash)?),
+                        deferred: VecDeque::new(),
+                        omitted_prefix: false,
+                        touched: Instant::now(),
+                    },
+                };
+                if scan.omitted_prefix {
+                    report.incomplete = true;
+                    report.keep(
+                        trash,
+                        "scan_resumed",
+                        "earlier entries in this lap were examined by previous passes",
+                    );
+                }
+                *cursor = Some(scan);
+                let scan = cursor.as_mut().unwrap();
                 let mut snapshot = Vec::new();
-                let mut entries = entries;
                 // Mount-local retirement needs admission only for the snapshot.
                 // Yield promptly to binders and cap this lock hold separately
                 // from the much slower, admission-free unlink work.
-                let admission_deadline = Instant::now() + Duration::from_millis(10);
+                let admission_deadline = Instant::now() + admission_budget;
                 #[cfg(test)]
                 test_hook(trash, "trash-snapshot");
                 loop {
+                    if snapshot.len() == PASS_ENTRIES {
+                        report.incomplete = true;
+                        report.keep(
+                            trash,
+                            "snapshot_entries",
+                            "trash snapshot entry limit reached",
+                        );
+                        break;
+                    }
                     if mount_local && bind_pending(&storage.durable) {
                         report.incomplete = true;
                         report.keep(
@@ -2566,14 +2726,27 @@ fn reap_trash(
                         report.keep(trash, "enumeration_budget", error);
                         break;
                     }
-                    match entries.next() {
-                        Some(Ok(entry)) => snapshot.push(entry),
+                    let next = scan
+                        .deferred
+                        .pop_front()
+                        .map(Ok)
+                        .or_else(|| scan.entries.as_mut().and_then(Iterator::next));
+                    match next {
+                        Some(Ok(entry)) => {
+                            snapshot.push(entry);
+                            #[cfg(test)]
+                            test_hook(trash, "trash-snapshot-entry");
+                        }
                         Some(Err(error)) => {
+                            scan.entries = None;
                             report.incomplete = true;
                             report.keep(trash, "enumeration_error", error);
                             break;
                         }
-                        None => break,
+                        None => {
+                            scan.entries = None;
+                            break;
+                        }
                     }
                 }
                 snapshot
@@ -2601,6 +2774,7 @@ fn reap_trash(
     )
     .and_then(|parent| parent.repair_child_same_mount(std::ffi::OsStr::new(".retention-trash")));
     let mut pending = report.incomplete;
+    let mut retained = false;
     let mut entries = entries.into_iter();
     while entries.len() != 0 {
         if let Err(error) = budget.enter(0) {
@@ -2610,6 +2784,7 @@ fn reap_trash(
             break;
         }
         let entry = entries.next().unwrap();
+        cursor.as_mut().unwrap().omitted_prefix = true;
         report.entries += 1;
         let path = entry.path();
         let age = entry
@@ -2628,6 +2803,7 @@ fn reap_trash(
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let mut bytes = 0;
+        let mut measured = false;
         let result = (|| -> Result<(), (&str, io::Error)> {
             budget.enter(0).map_err(|error| ("budget", error))?;
             // Measure only safe, same-filesystem trees. Measurements omit unsafe
@@ -2635,6 +2811,7 @@ fn reap_trash(
             let files = validate_tree_with_admission(&path, deadline, true, &|| budget.enter(0))
                 .map_err(|error| ("tree_guard", error))?;
             bytes = files.iter().map(|(_, size)| *size).sum();
+            measured = true;
             if !name.strip_prefix("retired-").is_some_and(|nonce| {
                 nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
             }) {
@@ -2689,7 +2866,8 @@ fn reap_trash(
         })();
         if let Err((reason, error)) = result {
             pending = true;
-            report.incomplete |= bytes == 0;
+            retained = true;
+            report.incomplete |= !measured;
             report.bytes_estimate = report.bytes_estimate.saturating_add(bytes);
             if let Some(age) = age {
                 report.oldest_age_ms = Some(report.oldest_age_ms.unwrap_or(0).max(age));
@@ -2700,6 +2878,11 @@ fn reap_trash(
             report.removed_entries += 1;
         }
     }
+    // A stopped unlink/measurement lane must retry its prefetched tail before
+    // advancing the directory iterator in a later pass.
+    for entry in entries.rev() {
+        cursor.as_mut().unwrap().deferred.push_front(entry);
+    }
     if mount_local {
         // Never recursively delete the container: a concurrent retirement may
         // have populated it since the snapshot. An empty-directory unlink is
@@ -2709,7 +2892,12 @@ fn reap_trash(
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
                 pending = true;
-                report.incomplete = true;
+                // DirectoryNotEmpty is expected when a scanned entry was
+                // retained, not an incomplete census. Otherwise an unseen
+                // entry arrived, so the census must be marked incomplete.
+                if !retained {
+                    report.incomplete = true;
+                }
                 report.keep(trash, "container_not_empty", error);
             }
             Err(error) => return Err(error),
@@ -4928,6 +5116,274 @@ fn record_v3_removal(domain: &mut DomainReport, bytes: Option<u64>) {
 
 #[cfg(test)]
 mod storage_retention_tests {
+    fn followup_trash_fixture(count: usize) -> (tempfile::TempDir, Vec<PathBuf>) {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("retention")).unwrap();
+        for key in 0..count {
+            let view = temp.path().join(format!("views/{key:016x}"));
+            fs::create_dir_all(&view).unwrap();
+            fs::write(view.join("payload"), b"retired view bytes").unwrap();
+            retire_directory(temp.path(), &view).unwrap();
+        }
+        let entries = fs::read_dir(temp.path().join("views/.retention-trash"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        (temp, entries)
+    }
+
+    #[test]
+    fn retention_trash_followup_retained_prefix_does_not_starve_verified_tail() {
+        let (temp, entries) = followup_trash_fixture(9);
+        // Use the filesystem's actual enumeration order, not a name-order
+        // assumption: only the last entry in that order is reclaimable.
+        let tail = entries.last().unwrap();
+        for entry in &entries[..entries.len() - 1] {
+            fs::remove_file(entry.join(RETIREMENT_WITNESS)).unwrap();
+        }
+        let trash = tail.parent().unwrap();
+        let _hook = observe_test_hook(
+            trash,
+            Arc::new(|step| {
+                if step == "trash-snapshot-entry" {
+                    std::thread::sleep(Duration::from_millis(12));
+                }
+            }),
+        );
+        let mut examined = 0;
+        for _ in 0..entries.len() * 2 {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut budget = crate::bash_background::persistence::RepairBudget::new();
+            let mut report = TrashReport::default();
+            assert!(reap_trash(
+                &StoragePaths::same(temp.path()),
+                trash,
+                true,
+                deadline,
+                &mut budget,
+                &mut report
+            )
+            .unwrap());
+            let window = report.entries + report.removed_entries;
+            assert!(
+                window <= 1,
+                "injected delay must bound the snapshot: {report:?}"
+            );
+            examined += window;
+            if !tail.exists() {
+                break;
+            }
+        }
+        assert!(
+            !tail.exists(),
+            "verified tail was starved by retained prefixes"
+        );
+        assert!(
+            examined >= entries.len(),
+            "each pass must report its examined window"
+        );
+        for entry in &entries[..entries.len() - 1] {
+            assert!(
+                entry.join("payload").exists(),
+                "unverified trash must remain"
+            );
+        }
+    }
+
+    #[test]
+    fn retention_trash_followup_fully_measured_leftovers_are_not_incomplete() {
+        let (temp, entries) = followup_trash_fixture(1);
+        fs::remove_file(entries[0].join(RETIREMENT_WITNESS)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        assert!(reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            entries[0].parent().unwrap(),
+            true,
+            deadline,
+            &mut budget,
+            &mut report,
+            NO_TIME_BOUND
+        )
+        .unwrap());
+        assert_eq!(report.entries, 1, "{report:?}");
+        assert_eq!(
+            report.bytes_estimate,
+            b"retired view bytes".len() as u64,
+            "{report:?}"
+        );
+        assert_eq!(report.kept_by_reason.get("witness"), Some(&1), "{report:?}");
+        assert!(
+            !report.incomplete,
+            "known retained trash is not an incomplete census: {report:?}"
+        );
+        assert!(entries[0].join("payload").exists());
+    }
+
+    #[test]
+    fn retention_trash_followup_budget_stop_is_incomplete() {
+        let (temp, entries) = followup_trash_fixture(1);
+        let deadline = Instant::now();
+        let mut budget =
+            crate::bash_background::persistence::RepairBudget::until(deadline, Arc::new(|| false));
+        let mut report = TrashReport::default();
+        assert!(reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            entries[0].parent().unwrap(),
+            true,
+            deadline,
+            &mut budget,
+            &mut report,
+            NO_TIME_BOUND
+        )
+        .unwrap());
+        assert!(
+            report.incomplete,
+            "a stopped iterator must leave an incomplete census"
+        );
+        assert_eq!(report.entries + report.removed_entries, 0);
+        assert_eq!(report.kept_by_reason.get("enumeration_budget"), Some(&1));
+        assert!(entries[0].join("payload").exists());
+    }
+
+    #[test]
+    fn retention_trash_cursor_retries_prefetched_unprocessed_entries() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (temp, entries) = followup_trash_fixture(3);
+        let trash = entries[0].parent().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "reap-root" {
+                    signal.store(true, Ordering::SeqCst);
+                }
+            }),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::until(
+            deadline,
+            Arc::new(move || cancelled.load(Ordering::SeqCst)),
+        );
+        let mut report = TrashReport::default();
+        assert!(reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            trash,
+            true,
+            deadline,
+            &mut budget,
+            &mut report,
+            NO_TIME_BOUND
+        )
+        .unwrap());
+        assert!(report.incomplete);
+        assert_eq!(report.entries, 1);
+        drop(hook);
+        for expected_removed in [2, 1] {
+            let mut budget = crate::bash_background::persistence::RepairBudget::new();
+            let mut report = TrashReport::default();
+            reap_trash_with_snapshot_budget(
+                &StoragePaths::same(temp.path()),
+                trash,
+                true,
+                Instant::now() + Duration::from_secs(60),
+                &mut budget,
+                &mut report,
+                NO_TIME_BOUND,
+            )
+            .unwrap();
+            assert_eq!(report.removed_entries, expected_removed, "{report:?}");
+        }
+        assert!(
+            !trash.exists(),
+            "the prefetched tail and cancelled entry must all be retried"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_trash_cursor_resets_when_container_identity_changes() {
+        let (temp, entries) = followup_trash_fixture(3);
+        for entry in &entries {
+            fs::remove_file(entry.join(RETIREMENT_WITNESS)).unwrap();
+        }
+        let trash = entries[0].parent().unwrap();
+        let hook = observe_test_hook(
+            trash,
+            Arc::new(|step| {
+                if step == "trash-snapshot-entry" {
+                    std::thread::sleep(Duration::from_millis(12));
+                }
+            }),
+        );
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        reap_trash(
+            &StoragePaths::same(temp.path()),
+            trash,
+            true,
+            Instant::now() + Duration::from_secs(60),
+            &mut budget,
+            &mut TrashReport::default(),
+        )
+        .unwrap();
+        drop(hook);
+        let old = temp.path().join("old-trash");
+        fs::rename(trash, &old).unwrap();
+        let fresh = temp.path().join("views/ffffffffffffffff");
+        fs::create_dir(&fresh).unwrap();
+        fs::write(fresh.join("payload"), b"fresh verified bytes").unwrap();
+        retire_directory(temp.path(), &fresh).unwrap();
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            trash,
+            true,
+            Instant::now() + Duration::from_secs(60),
+            &mut budget,
+            &mut report,
+            NO_TIME_BOUND,
+        )
+        .unwrap();
+        assert_eq!(
+            report.removed_entries, 1,
+            "replacement must start a new scan: {report:?}"
+        );
+        for entry in &entries {
+            assert!(old
+                .join(entry.file_name().unwrap())
+                .join("payload")
+                .exists());
+        }
+    }
+
+    #[test]
+    fn retention_trash_fully_measured_empty_unverified_directory_is_not_incomplete() {
+        let (temp, entries) = followup_trash_fixture(1);
+        fs::remove_file(entries[0].join("payload")).unwrap();
+        fs::remove_file(entries[0].join(RETIREMENT_WITNESS)).unwrap();
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        assert!(reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            entries[0].parent().unwrap(),
+            true,
+            Instant::now() + Duration::from_secs(60),
+            &mut budget,
+            &mut report,
+            NO_TIME_BOUND
+        )
+        .unwrap());
+        assert!(
+            !report.incomplete,
+            "zero measured bytes do not mean measurement failed: {report:?}"
+        );
+        assert_eq!(report.bytes_estimate, 0);
+        assert!(entries[0].exists());
+    }
+
     fn retired_view_fixture() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path().join("retention")).unwrap();
@@ -5010,16 +5466,48 @@ mod storage_retention_tests {
         assert_eq!(report.entries, 1, "{report:?}");
         assert_eq!(report.removed_entries, 0, "{report:?}");
         assert_eq!(report.kept_by_reason.get(reason), Some(&1), "{report:?}");
-        let warning = format!(
-            "storage retention trash={} retained reason={reason}:",
-            entry.display()
-        );
         assert_eq!(
-            logs.iter().filter(|line| line.contains(&warning)).count(),
+            logs.iter()
+                .filter(|line| warning_names_entry(line, entry, reason))
+                .count(),
             1,
             "one retention warning per kept entry: {logs:?}"
         );
         report
+    }
+
+    fn warning_names_entry(line: &str, entry: &Path, reason: &str) -> bool {
+        let Some(rest) = line.strip_prefix("WARN storage retention trash=") else {
+            return false;
+        };
+        let Some((logged_path, _)) = rest.split_once(&format!(" retained reason={reason}:")) else {
+            return false;
+        };
+        // Windows TEMP may use an 8.3 alias or different separators. Compare
+        // resolved identities of the path spellings, not the displayed bytes.
+        match (fs::canonicalize(logged_path), fs::canonicalize(entry)) {
+            (Ok(logged), Ok(expected)) => logged == expected,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn retention_trash_warning_matches_equivalent_path_spellings_only() {
+        let (temp, entries) = followup_trash_fixture(2);
+        let entry = &entries[0];
+        let alias = entry
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(entry.file_name().unwrap());
+        let line = format!(
+            "WARN storage retention trash={} retained reason=witness: missing",
+            alias.display()
+        );
+        assert!(warning_names_entry(&line, entry, "witness"));
+        assert!(!warning_names_entry(&line, &entries[1], "witness"));
+        assert!(!warning_names_entry(&line, entry, "foreign_name"));
+        drop(temp);
     }
 
     #[test]
@@ -5118,6 +5606,10 @@ mod storage_retention_tests {
         let nested = retired.join("foreign-mount");
         fs::create_dir(&nested).unwrap();
         fs::write(nested.join("canary"), b"foreign").unwrap();
+        // Windows raw metadata has no baseline device id; inject both sides
+        // so the portable boundary comparison is exercised on every platform.
+        let _baseline =
+            crate::walk_boundary::simulated_volumes::simulate(temp.path(), u64::MAX - 20);
         let _mount = crate::walk_boundary::simulated_volumes::simulate(&nested, u64::MAX - 21);
         assert_trash_kept_once(temp.path(), &retired, "tree_guard");
         assert!(nested.join("canary").exists());
@@ -5225,6 +5717,8 @@ mod storage_retention_tests {
     #[test]
     fn retention_trash_guard_mount_root_is_logged_and_counted() {
         let (temp, retired) = retired_view_fixture();
+        let _baseline =
+            crate::walk_boundary::simulated_volumes::simulate(temp.path(), u64::MAX - 23);
         let _mount = crate::walk_boundary::simulated_volumes::simulate(&retired, u64::MAX - 22);
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut budget = crate::bash_background::persistence::RepairBudget::new();
@@ -5244,6 +5738,74 @@ mod storage_retention_tests {
             "{report:?}"
         );
         assert!(retired.join("derived-abc.sqlite").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retention_trash_windows_pinned_removal_refuses_volume_and_mount_mismatch() {
+        use crate::bash_background::persistence::{PinnedDir, REPAIR_IDENTITIES, REPAIR_MOUNTS};
+        let (_temp, retired) = retired_view_fixture();
+        let parent = PinnedDir::repair_open_path(retired.parent().unwrap()).unwrap();
+        let name = retired.file_name().unwrap();
+        let child = parent.repair_child(name).unwrap();
+        let expected = child.directory_identity().unwrap();
+        let child_path = child.path().to_path_buf();
+        drop(child);
+        for foreign_volume in [true, false] {
+            if foreign_volume {
+                REPAIR_IDENTITIES.with(|ids| {
+                    ids.borrow_mut()
+                        .insert(child_path.clone(), (expected.0 ^ 1, expected.1))
+                });
+            } else {
+                REPAIR_MOUNTS.with(|ids| ids.borrow_mut().insert(child_path.clone(), u64::MAX));
+            }
+            let mut removed = 0;
+            let result = parent.repair_remove_child(name, expected, &[], &mut removed);
+            REPAIR_IDENTITIES.with(|ids| ids.borrow_mut().remove(&child_path));
+            REPAIR_MOUNTS.with(|ids| ids.borrow_mut().remove(&child_path));
+            let error = result.expect_err("pinned deletion must refuse a foreign handle boundary");
+            assert!(
+                error.to_string().contains("mounted or protected directory"),
+                "{error}"
+            );
+            assert_eq!(removed, 0);
+            assert!(retired.join("derived-abc.sqlite").exists());
+            assert!(retired.join(RETIREMENT_WITNESS).exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retention_trash_windows_pinned_removal_refuses_junction() {
+        use crate::bash_background::persistence::PinnedDir;
+        let temp = tempfile::tempdir().unwrap();
+        let parent_path = temp.path().join("parent");
+        let target = temp.path().join("foreign-target");
+        fs::create_dir(&parent_path).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("canary"), b"foreign junction bytes").unwrap();
+        let junction = parent_path.join("junction");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "mklink /J failed: {output:?}");
+        let parent = PinnedDir::repair_open_path(&parent_path).unwrap();
+        let mut removed = 0;
+        let error = parent
+            .repair_remove_child(junction.file_name().unwrap(), (0, 0), &[], &mut removed)
+            .expect_err("pinned removal must reject the junction before its target");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(error.to_string().contains("reparse point"), "{error}");
+        assert_eq!(removed, 0);
+        assert_eq!(
+            fs::read(target.join("canary")).unwrap(),
+            b"foreign junction bytes"
+        );
+        fs::remove_dir(junction).unwrap();
     }
 
     #[test]
