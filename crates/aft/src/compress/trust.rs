@@ -616,6 +616,9 @@ mod tests {
         assert!(!is_project_env_trusted(Some(storage.path()), &worktree));
     }
 
+    // Creating symlinks needs elevated rights on Windows, so these two run on
+    // Unix only; the guards they exercise are platform-independent.
+    #[cfg(unix)]
     #[test]
     fn a_marker_reached_through_a_symlink_is_refused_outright() {
         // The attack: a folder whose `.git` is a symlink to a real linked
@@ -642,6 +645,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_worktree_root_reached_through_a_symlink_is_refused() {
         // The same trick one level up: the whole project path is a link to the
