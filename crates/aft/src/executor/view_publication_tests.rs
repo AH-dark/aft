@@ -855,6 +855,131 @@ struct Fixture {
     view: crate::views::ViewStore,
     initial: String,
 }
+
+#[test]
+fn views_production_publication_indexes_rust_constructors_once_per_extraction() {
+    use crate::callgraph_store::join::extraction_work::measure;
+
+    let fixture = Fixture::with_files(128);
+    let mut checkouts = Vec::new();
+    let mut measurements = Vec::new();
+    for revision in 0..3 {
+        let checkout = tempfile::tempdir().unwrap();
+        git(
+            fixture.project.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                checkout.path().to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let root = std::fs::canonicalize(checkout.path()).unwrap();
+        let ctx = fixture.linked_context(&root);
+        // Linked checkouts do not migrate shared semantic payloads. The context's
+        // publication path enables their immutable callgraph blob contributions.
+        let allow_semantic_blob_put = !ctx.shared_artifacts_read_only();
+        let runtime = ctx.view_runtime_snapshot().unwrap();
+        let blobs = crate::blob_store::BlobStore::open(
+            &runtime.storage,
+            &runtime.family,
+            crate::blob_store::BlobPlane::Callgraph,
+        )
+        .unwrap();
+        let rows = blobs.usage().unwrap().rows;
+        let (_, clean_work) =
+            measure(|| super::schedule(&ctx, BTreeSet::new(), allow_semantic_blob_put).unwrap());
+        assert!(ctx.view_runtime_snapshot().unwrap().generation.is_some());
+        assert_eq!(blobs.usage().unwrap().rows, rows);
+        assert_eq!(clean_work.whole_file_parses, 0);
+        // Real assembler source exercises receiver analysis in a large Rust
+        // file; changing only a trailing comment models a small source edit.
+        std::fs::write(
+            root.join("file_0.rs"),
+            format!(
+                "{}\n// publication revision {revision}\n",
+                include_str!("../views/assembly.rs")
+            ),
+        )
+        .unwrap();
+        if revision == 1 {
+            let runtime = ctx.view_runtime_snapshot().unwrap();
+            crate::views::assembly::expire_verification_for_test(&runtime.view_dir);
+        }
+        let started = Instant::now();
+        let before = ctx.view_runtime_snapshot().unwrap().generation;
+        let (_, work) = measure(|| {
+            super::schedule_with_reason(
+                &ctx,
+                BTreeSet::from([b"file_0.rs".to_vec()]),
+                allow_semantic_blob_put,
+                crate::views::publication_reason::Reason {
+                    events: crate::views::publication_reason::Reason::PATHS
+                        | crate::views::publication_reason::Reason::CONTENT,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        });
+        let inserted = blobs.usage().unwrap().rows - rows;
+        eprintln!(
+            "production_receiver revision={revision} inserted={} elapsed_ms={} parses={} receiver_calls={} function_nodes={} constructor_scans={} constructor_nodes={}",
+            inserted,
+            started.elapsed().as_millis(),
+            work.whole_file_parses,
+            work.receiver_type_calls,
+            work.receiver_function_nodes,
+            work.receiver_constructor_scans,
+            work.receiver_constructor_nodes,
+        );
+        assert_ne!(ctx.view_runtime_snapshot().unwrap().generation, before);
+        assert_eq!(inserted, 1);
+        measurements.push(work);
+        if revision == 2 {
+            std::fs::write(
+                root.join("file_0.rs"),
+                format!(
+                    "{}\n// publication revision 0\n",
+                    include_str!("../views/assembly.rs")
+                ),
+            )
+            .unwrap();
+            let (_, reused) = measure(|| {
+                super::schedule(
+                    &ctx,
+                    BTreeSet::from([b"file_0.rs".to_vec()]),
+                    allow_semantic_blob_put,
+                )
+                .unwrap()
+            });
+            eprintln!(
+                "production_receiver shared_edit parses={} receiver_calls={} inserted={}",
+                reused.whole_file_parses,
+                reused.receiver_type_calls,
+                blobs.usage().unwrap().rows - rows - inserted
+            );
+            assert_eq!(reused.whole_file_parses, 0);
+            assert_eq!(reused.receiver_type_calls, 0);
+            assert_eq!(blobs.usage().unwrap().rows - rows, 1);
+        }
+        checkouts.push(checkout);
+    }
+    assert_eq!(
+        measurements[1].whole_file_parses, 2,
+        "the verification pass independently reads the new content"
+    );
+    for work in measurements {
+        assert!((1..=2).contains(&work.whole_file_parses));
+        assert!(work.receiver_type_calls > 0);
+        assert!(work.receiver_constructor_nodes > 0);
+        assert!(
+            work.receiver_constructor_scans <= work.whole_file_parses,
+            "constructor facts must be indexed once per extracted file: {work:?}"
+        );
+    }
+}
 impl Fixture {
     fn new() -> Self {
         Self::with_files(0)
@@ -931,6 +1056,42 @@ impl Fixture {
             view,
             initial,
         }
+    }
+
+    fn linked_context(&self, root: &Path) -> Arc<AppContext> {
+        let mut config = Config {
+            project_root: Some(root.to_path_buf()),
+            storage_dir: Some(self._storage.path().to_path_buf()),
+            indexes: crate::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
+            ..Config::default()
+        };
+        config.views.enabled = true;
+        let ctx = Arc::new(AppContext::new(Box::new(TreeSitterProvider::new()), config));
+        ctx.set_canonical_cache_root(root.to_path_buf());
+        let common = std::fs::canonicalize(self.project.path().join(".git")).unwrap();
+        ctx.set_cache_role(true, Some(common.clone()));
+        ctx.set_cache_writer_capabilities(false, true);
+        assert!(ctx.shared_artifacts_read_only());
+        assert!(ctx.defer_callgraph_build());
+        let scope = crate::path_identity::project_scope_key(root);
+        let view = crate::views::ViewStore::open(self._storage.path(), &scope).unwrap();
+        let mut snapshot = self.ctx.view_runtime_snapshot().unwrap();
+        snapshot.query_pin = None;
+        snapshot.scope = scope;
+        snapshot.view_dir = view.view_dir().to_path_buf();
+        snapshot.generation = None;
+        snapshot.manifest = None;
+        snapshot.head_fingerprint.clear();
+        snapshot.head_metadata =
+            crate::alias::capture_git_head_metadata(root, Some(&common)).unwrap();
+        snapshot.pending_paths.clear();
+        snapshot.pending_inputs.clear();
+        ctx.install_view_runtime(snapshot, None);
+        ctx
     }
     /// The root spelling the publication job records and reports: the context's
     /// canonical cache root (a `std::fs::canonicalize` result, verbatim on

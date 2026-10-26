@@ -798,6 +798,8 @@ fn receiver_type(
     language: &str,
     facts: &DispatchFacts,
 ) -> Option<String> {
+    #[cfg(test)]
+    super::extraction_work::note(|work| work.receiver_type_calls += 1);
     let value = text(receiver, source);
     let function = enclosing(call, FUNCTIONS)?;
     let current_owner = owner(function, source, language).map(|(o, _)| o);
@@ -891,6 +893,8 @@ fn receiver_type(
             }));
         }
     }
+    #[cfg(test)]
+    super::extraction_work::note(|work| work.receiver_function_nodes += nodes.len());
     for declaration in &nodes {
         if ![
             "required_parameter",
@@ -1091,15 +1095,19 @@ fn receiver_type(
                     if method != "new" {
                         return Some(format!("@return:{name}"));
                     }
-                    let valid = descendants(enclosing(function, &["source_file"])?)
-                        .into_iter()
-                        .any(|n| {
-                            n.kind() == "function_item"
-                                && named(n, source).as_deref() == Some("new")
-                                && owner(n, source, language).is_some_and(|(o, _)| o == ty)
-                                && field(n, &["return_type"])
-                                    .is_some_and(|t| ["Self", ty].contains(&text(t, source)))
-                        });
+                    let constructor_nodes = descendants(enclosing(function, &["source_file"])?);
+                    #[cfg(test)]
+                    super::extraction_work::note(|work| {
+                        work.receiver_constructor_scans += 1;
+                        work.receiver_constructor_nodes += constructor_nodes.len();
+                    });
+                    let valid = constructor_nodes.into_iter().any(|n| {
+                        n.kind() == "function_item"
+                            && named(n, source).as_deref() == Some("new")
+                            && owner(n, source, language).is_some_and(|(o, _)| o == ty)
+                            && field(n, &["return_type"])
+                                .is_some_and(|t| ["Self", ty].contains(&text(t, source)))
+                    });
                     if valid {
                         return Some(ty.to_string());
                     }
