@@ -408,7 +408,7 @@ impl ExactMemoStore {
                 continue;
             };
             #[cfg(test)]
-            crate::search_hot_path_measurements::record_file_read();
+            crate::search_hot_path_measurements::record_memo_file_read(&candidate.path);
             let live_bytes = fs::read(&candidate.path).map_err(|_| candidate.path.clone())?;
             let live_digest = compute_content_digest(&live_bytes);
             if &live_digest != expected_digest {
@@ -915,6 +915,79 @@ mod tests {
         assert!(replacement.epoch > old.epoch);
         assert_eq!(memo.get_epoch(&observed), Some(replacement.epoch));
         assert!(!memo.is_key_poisoned(&observed));
+    }
+
+    #[test]
+    #[ignore = "opt-in warm exact-memo scaling measurement"]
+    fn warm_exact_memo_cost_by_file_count() {
+        use crate::search_hot_path_measurements::{counts, reset};
+        for file_count in [10, 100, 1_000] {
+            let temp = tempfile::tempdir().unwrap();
+            let bytes = format!("pub fn symbol() {{}}\n{}", "// source payload\n".repeat(60));
+            let paths = (0..file_count)
+                .map(|ordinal| {
+                    let path = temp.path().join(format!("file_{ordinal}.rs"));
+                    fs::write(&path, &bytes).unwrap();
+                    path
+                })
+                .collect::<Vec<_>>();
+            let digests = paths
+                .iter()
+                .map(|path| (path.clone(), compute_content_digest(bytes.as_bytes())))
+                .collect::<HashMap<_, _>>();
+            for candidates_per_file in [1, 3] {
+                let memo = ExactMemoStore::new();
+                let key = MemoKey::new(
+                    temp.path(),
+                    GenerationToken::new_with_str("ready"),
+                    "symbol",
+                    true,
+                );
+                let results = paths
+                    .iter()
+                    .flat_map(|path| {
+                        (0..candidates_per_file).map(move |ordinal| {
+                            CandidateResult::new_exact(
+                                path.clone(),
+                                Some(SymbolOffsetRange::new(ordinal, ordinal + 1)),
+                                EvidenceDescriptor::for_e1(1, true, false),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                memo.get_or_verify(&key, 0, usize::MAX, || {
+                    Ok(VerifiedExactSet {
+                        results,
+                        file_digests: digests.clone(),
+                        bound_disclosure: None,
+                        stability_void: false,
+                    })
+                })
+                .unwrap();
+                let mut times = Vec::new();
+                for _ in 0..30 {
+                    reset();
+                    let start = std::time::Instant::now();
+                    let hit = memo
+                        .get_or_verify(&key, 0, usize::MAX, || panic!("warm hit reverified"))
+                        .unwrap();
+                    times.push(start.elapsed().as_secs_f64() * 1000.0);
+                    assert_eq!(hit.results.len(), file_count * candidates_per_file as usize);
+                    assert!(!hit.stability_void);
+                }
+                times.sort_by(f64::total_cmp);
+                println!(
+                    "WARM_EXACT_MEMO {}",
+                    serde_json::json!({
+                        "files": file_count, "candidates_per_file": candidates_per_file,
+                        "bytes_per_file": bytes.len(), "samples": times.len(),
+                    "p50_ms": (times[14] + times[15]) / 2.0, "p95_ms": times[28],
+                    "repeat_exec_ms": times,
+                    "verifier_calls": memo.verifier_call_count(), "work": counts(),
+                    })
+                );
+            }
+        }
     }
 
     #[test]
