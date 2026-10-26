@@ -1,1 +1,1 @@
-Rust call-graph publication now reuses an extraction-local index of function subtrees and same-file constructors instead of repeatedly walking the syntax tree for each receiver. Published graph facts and query outputs are unchanged; no process-wide extraction cache or store-write permission change is introduced.
+- Publishing a Rust project's call graph after an edit does far less work: AFT indexes each file's syntax once instead of re-walking it for every method call, with identical results.
