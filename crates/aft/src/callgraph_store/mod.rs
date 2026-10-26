@@ -684,7 +684,7 @@ mod write_amplification_tests {
             .unwrap();
         assert_eq!(
             busy_timeout, 0,
-            "request readers must never wait for a writer"
+            "readiness probes must never wait for a writer"
         );
         let error = database_ready(&reader).unwrap_err();
         assert!(error.is_transient_lock_contention(), "{error}");
@@ -909,7 +909,7 @@ mod write_amplification_tests {
             matches!(CallGraphStore::open_readonly(store_dir.clone(), root.clone()),
             Err(error) if error.is_transient_lock_contention())
         );
-        // Request readers use an expired busy deadline, so they must not wait
+        // Readiness opens use an expired busy deadline, so they must not wait
         // for the writer. A regression would wait for a 5 s busy timeout; 2 s
         // tells that apart from a slow open on a loaded CI runner.
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -955,6 +955,43 @@ mod write_amplification_tests {
             synchronous, 2,
             "readers retain SQLite's default durability setting"
         );
+    }
+
+    #[test]
+    fn callgraph_serving_reads_keep_outlasting_locks_busy() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("main.rs");
+        fs::write(&source, "fn leaf() {}\npub fn entry() { leaf(); }\n").unwrap();
+        let dir = temp.path().join("store");
+        let store = CallGraphStore::open(dir.clone(), root.clone()).unwrap();
+        store.cold_build(&[source]).unwrap();
+        let blocker = store.lock_readiness_for_test();
+        blocker.execute_batch("ROLLBACK").unwrap();
+        let reader = CallGraphStore::open_readonly(dir, root).unwrap().unwrap();
+        let snapshot = reader.read_snapshot().unwrap();
+        for conn in [&reader.inner.conn, &snapshot.conn] {
+            let timeout: u64 = conn
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(timeout, 100, "serving reads need a short, bounded wait");
+        }
+
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        for reader in [&reader.inner, &snapshot] {
+            let error = reader
+                .call_tree(Path::new("main.rs"), "entry", 1)
+                .unwrap_err();
+            assert!(error.is_transient_lock_contention(), "{error}");
+        }
+        blocker.execute_batch("ROLLBACK").unwrap();
+        for reader in [&reader.inner, &snapshot] {
+            let tree = reader.call_tree(Path::new("main.rs"), "entry", 1).unwrap();
+            assert_eq!(tree.children[0].name, "leaf");
+        }
     }
 
     /// A store whose pointer is published and whose `meta` says ready must be
@@ -3970,6 +4007,8 @@ struct RefreshWorkerTestSeam {
     /// parked paths back to the queue, until the test releases it.
     #[cfg(test)]
     open_failure_replay_hold: Option<TestHold>,
+    #[cfg(test)]
+    open_lock_hold: Option<TestHold>,
     /// Makes the writer lease look held by another live process, so a
     /// waiting batch stays waiting without a second process.
     #[cfg(test)]
@@ -3999,6 +4038,46 @@ struct RetireSnapshotHold {
 struct TestHold {
     held: crossbeam_channel::Sender<()>,
     release: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+pub(crate) fn hold_refresh_open_lock_for_test(
+    project_root: PathBuf,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (held, held_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release) = crossbeam_channel::bounded(1);
+    REFRESH_WORKER_TEST_SEAMS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(project_root)
+        .or_default()
+        .open_lock_hold = Some(TestHold { held, release });
+    (held_rx, release_tx)
+}
+
+#[cfg(test)]
+fn hold_refresh_connection_lock_for_test(project_root: &Path, conn: &TrackedConnection) {
+    let hold = REFRESH_WORKER_TEST_SEAMS.get().and_then(|seams| {
+        seams
+            .lock()
+            .unwrap()
+            .get_mut(project_root)
+            .and_then(|seam| seam.open_lock_hold.take())
+    });
+    if let Some(hold) = hold {
+        // Lengthen the exclusive-lock window of a rollback-journal writer open
+        // on the actual refresh connection, before it switches the file to WAL.
+        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        hold.held.send(()).unwrap();
+        // If the test panics, dropping its sender unblocks this receive so the
+        // refresh connection still rolls back and releases its SQLite lock.
+        let _ = hold.release.recv();
+        conn.execute_batch("ROLLBACK").unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -5956,6 +6035,7 @@ impl CallGraphStore {
             if !readonly_readiness(database_ready(&conn))? {
                 return Ok(None);
             }
+            configure_serving_reader(&conn)?;
             let marker_label = generation.as_deref().unwrap_or("legacy");
             let read_marker = crate::root_cache::ReadMarker::create(&callgraph_dir, marker_label)?;
             return Ok(Some(ReadonlyCallGraphStore::from_inner(
@@ -5985,6 +6065,7 @@ impl CallGraphStore {
         if !readonly_readiness(database_ready(&conn))? {
             return Ok(None);
         }
+        configure_serving_reader(&conn)?;
         let marker_label =
             legacy_read_marker_label(&target.sqlite_path, target.generation.as_deref());
         let read_marker = crate::root_cache::ReadMarker::create(&callgraph_dir, &marker_label)?;
@@ -6690,6 +6771,10 @@ impl CallGraphStore {
             store,
             project_root.display().to_string(),
         )?;
+        #[cfg(test)]
+        if role == WriterConnectionRole::Refresh {
+            hold_refresh_connection_lock_for_test(&project_root, &conn);
+        }
         match role {
             WriterConnectionRole::Generation => configure_connection(&conn)?,
             WriterConnectionRole::Refresh => configure_generation_connection(&conn, role)?,
@@ -8345,6 +8430,7 @@ impl CallGraphStore {
     /// this store for the snapshot's lifetime to keep its generation pinned.
     pub(crate) fn read_snapshot(&self) -> Result<CallGraphStore> {
         let conn = open_readonly_connection(&self.sqlite_path)?;
+        configure_serving_reader(&conn)?;
         conn.execute_batch("BEGIN DEFERRED")?;
         let mut snapshot = CallGraphStore::from_connection(
             self.project_root.clone(),
@@ -8889,6 +8975,7 @@ impl ReadonlyCallGraphStore {
             .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?;
         let conn = open_readonly_connection(&sqlite_path)?;
         ensure_database_ready(&conn)?;
+        configure_serving_reader(&conn)?;
         let mut inner = CallGraphStore::from_connection(
             project_root,
             family,
@@ -8919,6 +9006,7 @@ impl ReadonlyCallGraphStore {
         let sqlite_path = manifest_view_database_path(&view_dir, generation)?;
         let conn = open_readonly_connection(&sqlite_path)?;
         ensure_database_ready(&conn)?;
+        configure_serving_reader(&conn)?;
         let mut inner = CallGraphStore::from_connection(
             project_root,
             family,
@@ -10849,6 +10937,7 @@ fn open_legacy_fallback_store(
     if !readonly_readiness(database_ready(&conn))? {
         return Ok(None);
     }
+    configure_serving_reader(&conn)?;
     let marker_label = legacy_read_marker_label(&target.sqlite_path, target.generation.as_deref());
     let read_marker = crate::root_cache::ReadMarker::create(callgraph_dir, &marker_label)?;
     Ok(Some(CallGraphStore::from_connection(
@@ -11510,11 +11599,19 @@ fn open_readonly_connection_before(path: &Path, deadline: Instant) -> Result<Tra
     )?;
     // Readers do not change durability or journal settings: even synchronous
     // reads the schema and can block behind an exclusive writer before setup.
-    // Request readers pass an expired deadline and fail fast; maintenance probes
+    // Readiness opens pass an expired deadline and fail fast; maintenance probes
     // may wait within their bounded budget without changing durability settings.
     conn.busy_timeout(deadline.saturating_duration_since(Instant::now()))?;
     conn.execute_batch("PRAGMA query_only=ON;")?;
     Ok(conn)
+}
+
+fn configure_serving_reader(conn: &TrackedConnection) -> Result<()> {
+    // Readiness was checked without waiting, but a ready store can still race a
+    // refresh opening its writer or checkpointing. Let normal queries outwait
+    // short exclusive locks without hiding contention that exceeds this bound.
+    conn.busy_timeout(Duration::from_millis(100))?;
+    Ok(())
 }
 
 fn sqlite_readonly_uri(path: &Path) -> String {
@@ -11601,9 +11698,9 @@ fn configure_build_connection(conn: &TrackedConnection) -> Result<()> {
 /// switch is a write transaction that needs an exclusive lock on the file. The
 /// writer waits for that lock (up to its busy timeout) for as long as any other
 /// connection, in this process or another, keeps a read open, and while it
-/// waits SQLite refuses every new reader with SQLITE_BUSY. Query readers do not
-/// wait on a busy store, so a store that was published and ready answered
-/// "building" for that whole time. Switching here, before the pointer names the
+/// waits SQLite refuses every new reader with SQLITE_BUSY. Readiness probes fail
+/// fast and serving readers wait only briefly, so a published, ready store can
+/// still answer busy during a delayed switch. Switching before the pointer names the
 /// file, means a published generation is already in WAL mode, where writers
 /// never need an exclusive lock and never block readers.
 ///

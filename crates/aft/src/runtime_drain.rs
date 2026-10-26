@@ -6410,17 +6410,39 @@ mod tests {
         drain_callgraph_store_events(&ctx);
         assert!(ctx.callgraph_store_rx().lock().is_some());
         blocker.execute_batch("ROLLBACK").unwrap();
+        let (refresh_locked, release_refresh) =
+            crate::callgraph_store::hold_refresh_open_lock_for_test(
+                ctx.callgraph_project_root().unwrap(),
+            );
         drain_callgraph_store_events(&ctx);
         assert!(ctx.callgraph_store_rx().lock().is_none());
         assert!(ctx.callgraph_store().read().unwrap().is_some());
         assert_eq!(ctx.pending_callgraph_store_force_token(), None);
+        refresh_locked
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        // Keep the refresh connection's exclusive lock through the first read.
+        // An early error releases the worker too, so a failing assertion cannot
+        // leave the shared refresh worker parked for the rest of the suite.
+        let (read_done, read_finished) = crossbeam_channel::bounded(1);
+        let release = std::thread::spawn(move || {
+            let early = read_finished.recv_timeout(Duration::from_millis(25));
+            release_refresh.send(()).unwrap();
+            early
+        });
         let resident = ctx.callgraph_store().read().unwrap();
         let tree = resident
             .as_ref()
             .unwrap()
-            .call_tree(Path::new("main.rs"), "entry", 1)
-            .unwrap();
+            .call_tree(Path::new("main.rs"), "entry", 1);
+        let _ = read_done.send(());
+        let released = release.join().unwrap();
+        let tree = tree.unwrap();
+        assert!(released.is_err(), "the read must wait for the refresh lock");
         assert_eq!(tree.children[0].name, "leaf");
+        crate::callgraph_store::clear_callgraph_refresh_worker_test_seam(
+            &ctx.callgraph_project_root().unwrap(),
+        );
     }
 
     #[test]
