@@ -99,6 +99,9 @@ const COLD_BUILD_EXTRACT_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 // Source bytes alone do not bound retained extracts or cancellation latency for
 // empty/tiny files. Keep a finite ceiling while allowing bulk-load commits.
 const COLD_BUILD_EXTRACT_MAX_FILES: usize = 4096;
+// A bulk commit does not need every parsed graph resident at once. Bound
+// those graphs separately because call records can dwarf their source bytes.
+const COLD_BUILD_PARSE_MAX_FILES: usize = 16;
 // A 20k-reference resolver window kept peak RSS working-set shaped in the
 // committed 20k/40k corpus harness; 100k rows did not.
 const COLD_BUILD_RESOLVE_WINDOW: usize = 20_000;
@@ -7191,9 +7194,9 @@ impl CallGraphStore {
                     let mut inserts = ColdBuildInsertStatements::new(&tx)?;
                     // An outer batch can contain thousands of small sources, whose parsed
                     // call records take far more memory than their source bytes. Insert and
-                    // drop each configured parse chunk while keeping one transaction and
+                    // drop each bounded parse chunk while keeping one transaction and
                     // statement set for the whole outer batch.
-                    for paths in needs_extract.chunks(batch_files) {
+                    for paths in needs_extract.chunks(batch_files.min(COLD_BUILD_PARSE_MAX_FILES)) {
                         let build =
                             pool.build_extracts(&self.project_root, paths, &extraction_memo);
                         for extract in &build.extracts {
@@ -11620,9 +11623,9 @@ fn configure_build_connection(conn: &TrackedConnection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.set_wal_autocheckpoint(crate::db::lifecycle::DEFAULT_WAL_AUTOCHECKPOINT_PAGES)?;
-    // Only staged builds get this cache. The two production cold-build slots
-    // bound its aggregate page-cache budget to 512 MiB.
-    conn.pragma_update(None, "cache_size", -262_144)?;
+    // Bulk commits and statement reuse keep the build fast without retaining
+    // a whole-database page cache beside the parser and resolver working sets.
+    conn.pragma_update(None, "cache_size", CALLGRAPH_SQLITE_CACHE_KIB)?;
     Ok(())
 }
 

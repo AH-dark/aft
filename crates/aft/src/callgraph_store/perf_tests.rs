@@ -668,8 +668,8 @@ fn callgraph_io_extraction_residency_is_bounded_inside_bulk_commits() {
     let (before, after) = *commit_samples.lock().unwrap();
     assert_eq!(after.unwrap().checked_sub(before.unwrap()), Some(1));
     assert!(
-        peak_residents <= 100,
-        "resident extracts {peak_residents} exceeded the configured parse chunk of 100"
+        peak_residents <= 16,
+        "resident extracts {peak_residents} exceeded the 16-file cold-build residency bound"
     );
 }
 
@@ -744,18 +744,18 @@ fn callgraph_io_tiny_file_cancellation_stops_after_one_capped_batch() {
 }
 
 #[test]
-fn callgraph_io_large_cache_is_build_only() {
+fn callgraph_io_build_cache_matches_bounded_reader_budget() {
     let conn = TrackedConnection::open_in_memory(SqliteStore::CallgraphColdGeneration).unwrap();
     configure_build_connection(&conn).unwrap();
     let cache: i64 = conn
         .pragma_query_value(None, "cache_size", |row| row.get(0))
         .unwrap();
-    assert_eq!(cache, -262144);
+    assert_eq!(cache, -8192);
     configure_connection(&conn).unwrap();
     let cache: i64 = conn
         .pragma_query_value(None, "cache_size", |row| row.get(0))
         .unwrap();
-    assert_eq!(cache, CALLGRAPH_SQLITE_CACHE_KIB);
+    assert_eq!(cache, -8192);
 }
 
 #[test]
