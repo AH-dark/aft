@@ -825,21 +825,23 @@ impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
             functions: HashMap::new(),
             constructors: HashSet::new(),
         };
-        let mut ancestors = Vec::<(Node<'tree>, usize)>::new();
+        let mut ancestors = Vec::<(Node<'tree>, usize, usize)>::new();
         for (position, &node) in nodes.iter().enumerate() {
-            let parent = node.parent().map(|parent| parent.id());
-            // Node identities, not byte containment, distinguish siblings with
-            // identical or zero-width spans in incomplete source.
+            // Named-child counts close subtrees without parent searches or
+            // ambiguous byte containment at identical and zero-width spans.
             while ancestors
                 .last()
-                .is_some_and(|(ancestor, _)| Some(ancestor.id()) != parent)
+                .is_some_and(|(_, _, remaining)| *remaining == 0)
             {
-                let (ancestor, start) = ancestors.pop().unwrap();
+                let (ancestor, start, _) = ancestors.pop().unwrap();
                 if FUNCTIONS.contains(&ancestor.kind()) {
                     index.functions.insert(ancestor.id(), (start, position));
                 }
             }
-            ancestors.push((node, position));
+            if let Some((_, _, remaining)) = ancestors.last_mut() {
+                *remaining -= 1;
+            }
+            ancestors.push((node, position, node.named_child_count()));
             if node.kind() == "function_item" && named(node, source).as_deref() == Some("new") {
                 if let Some((owner, _)) = owner(node, source, "rust") {
                     if field(node, &["return_type"])
@@ -850,7 +852,7 @@ impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
                 }
             }
         }
-        for (ancestor, start) in ancestors {
+        for (ancestor, start, _) in ancestors {
             if FUNCTIONS.contains(&ancestor.kind()) {
                 index.functions.insert(ancestor.id(), (start, nodes.len()));
             }

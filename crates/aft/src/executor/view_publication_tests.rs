@@ -1112,10 +1112,13 @@ pub fn wrong_caller() { let value = Wrong::new(); value.method(); }
             .derived_path(after.generation.as_deref().unwrap())
             .unwrap(),
     );
+    // Compare identical query inputs even though the publications used separate
+    // checkout roots and stores. Both source trees contain the same file bytes.
+    let query_root = reference.ctx.canonical_cache_root();
     let open = |fixture: &Fixture| {
         let runtime = fixture.ctx.view_runtime_snapshot().unwrap();
         crate::callgraph_store::ReadonlyCallGraphStore::open_pinned_derived(
-            fixture.ctx.canonical_cache_root(),
+            query_root.clone(),
             runtime.family,
             fixture.view.view_dir().to_path_buf(),
             runtime.generation.as_deref().unwrap(),
