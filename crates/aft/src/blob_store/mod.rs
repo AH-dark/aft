@@ -263,6 +263,23 @@ pub struct SemanticKey {
 }
 
 impl SemanticKey {
+    /// Uses a saved source hash with the same canonical encoding as `from_bytes`.
+    pub(crate) fn from_source_hash(
+        source_digest: [u8; 32],
+        rel_path: &[u8],
+        chunker_version: impl Into<String>,
+        embed_template_version: impl Into<String>,
+        model_fingerprint: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_digest,
+            rel_path: rel_path.to_vec(),
+            chunker_version: chunker_version.into(),
+            embed_template_version: embed_template_version.into(),
+            model_fingerprint: model_fingerprint.into(),
+        }
+    }
+
     pub fn from_bytes(
         bytes: &[u8],
         rel_path: &[u8],
@@ -307,6 +324,19 @@ impl SemanticKey {
                 self.embed_template_version.as_bytes(),
                 self.model_fingerprint.as_bytes(),
             ],
+        )
+    }
+
+    /// A file-run format revision never changes its model or chunk-vector keys.
+    pub(crate) fn file_key_for_summary_format(&self, format: u32) -> FullKey {
+        let legacy = self.full_key();
+        if format == 0 {
+            return legacy;
+        }
+        full_key(
+            BlobPlane::Semantic,
+            b"aft/blob-store/semantic-summary-budget/v1",
+            &[legacy.as_bytes(), &format.to_le_bytes()],
         )
     }
 
@@ -1021,6 +1051,40 @@ fn move_corrupt_database_aside(path: &Path) -> Result<PathBuf, BlobStoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_source_hash_constructor_preserves_canonical_keys() {
+        for bytes in [
+            Vec::new(),
+            b"pub fn example() {}\n".to_vec(),
+            vec![0xff, 0, 0x80],
+            vec![b'x'; 1024 * 1024],
+        ] {
+            let from_hash = SemanticKey::from_source_hash(
+                *crate::views::io::source_hash(&bytes).as_bytes(),
+                b"src/example.rs",
+                "chunker",
+                "template",
+                "model",
+            );
+            let from_bytes =
+                SemanticKey::from_bytes(&bytes, b"src/example.rs", "chunker", "template", "model");
+            assert_eq!(from_hash, from_bytes);
+            assert_eq!(from_hash.full_key(), from_bytes.full_key());
+            assert_eq!(
+                from_hash.file_key_for_summary_format(0),
+                from_bytes.full_key()
+            );
+            assert_eq!(
+                from_hash.file_key_for_summary_format(1),
+                from_bytes.file_key_for_summary_format(1)
+            );
+            assert_ne!(
+                from_hash.file_key_for_summary_format(1),
+                from_hash.full_key()
+            );
+        }
+    }
 
     #[test]
     fn fresh_blob_stores_enable_incremental_vacuum_before_schema_creation() {

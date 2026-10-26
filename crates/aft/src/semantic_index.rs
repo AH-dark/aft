@@ -1665,6 +1665,23 @@ fn default_chunking_version() -> u32 {
     2
 }
 
+/// Per-file key revision for capped summaries; it does not change model identity.
+pub(crate) const FILE_SUMMARY_BUDGET_KEY_FORMAT: u32 = 1;
+
+/// Artifact metadata is separate from model identity, which is also used by
+/// view producers and chunk-vector keys.
+#[derive(Serialize, Deserialize)]
+struct StoredSemanticIdentity {
+    #[serde(flatten)]
+    fingerprint: SemanticIndexFingerprint,
+    #[serde(default, skip_serializing_if = "legacy_summary_budget")]
+    file_summary_budget_limited: bool,
+}
+
+fn legacy_summary_budget(limited: &bool) -> bool {
+    !*limited
+}
+
 impl SemanticIndexFingerprint {
     fn from_config(config: &SemanticBackendConfig, dimension: usize) -> Self {
         // Use normalized URL for fingerprinting so cosmetic differences
@@ -4829,6 +4846,7 @@ struct SharedSemanticBase {
     file_hashes: HashMap<PathBuf, blake3::Hash>,
     dimension: usize,
     fingerprint: Option<SemanticIndexFingerprint>,
+    summary_budget_limited: bool,
     deferred_files: HashSet<PathBuf>,
     skipped_rows: usize,
     persistence: Arc<Mutex<Option<SemanticPersistenceState>>>,
@@ -5117,6 +5135,8 @@ pub struct SemanticIndex {
     /// Embedding dimension (384 for MiniLM-L6-v2)
     dimension: usize,
     fingerprint: Option<SemanticIndexFingerprint>,
+    /// Saved summary input format, not part of model or vector identity.
+    summary_budget_limited: bool,
     project_root: PathBuf,
     deferred_files: HashSet<PathBuf>,
     shared_base: Option<Arc<SharedSemanticBase>>,
@@ -5150,6 +5170,7 @@ impl Clone for SemanticIndex {
             file_hashes: self.file_hashes.clone(),
             dimension: self.dimension,
             fingerprint: self.fingerprint.clone(),
+            summary_budget_limited: self.summary_budget_limited,
             project_root: self.project_root.clone(),
             deferred_files: self.deferred_files.clone(),
             shared_base: self.shared_base.clone(),
@@ -5553,6 +5574,7 @@ impl SemanticIndex {
             file_hashes: HashMap::new(),
             dimension: shared_base.dimension,
             fingerprint: shared_base.fingerprint.clone(),
+            summary_budget_limited: shared_base.summary_budget_limited,
             project_root: project_root.clone(),
             deferred_files: shared_base
                 .deferred_files
@@ -5747,6 +5769,7 @@ impl SemanticIndex {
             file_hashes,
             dimension: self.dimension,
             fingerprint: self.fingerprint,
+            summary_budget_limited: self.summary_budget_limited,
             deferred_files,
             skipped_rows: self.skipped_rows,
             persistence: Arc::new(Mutex::new(persistence)),
@@ -5893,6 +5916,7 @@ impl SemanticIndex {
             file_hashes: HashMap::new(),
             dimension,
             fingerprint: None,
+            summary_budget_limited: true,
             project_root,
             deferred_files: HashSet::new(),
             shared_base: None,
@@ -6574,6 +6598,7 @@ impl SemanticIndex {
                     .collect(),
                 dimension: DEFAULT_DIMENSION,
                 fingerprint: None,
+                summary_budget_limited: true,
                 project_root: project_root.to_path_buf(),
                 deferred_files: HashSet::new(),
                 shared_base: None,
@@ -6743,6 +6768,7 @@ impl SemanticIndex {
             dimension,
             fingerprint: None,
             project_root: project_root.to_path_buf(),
+            summary_budget_limited: true,
             deferred_files: HashSet::new(),
             shared_base: None,
             tombstones: HashSet::new(),
@@ -8145,11 +8171,126 @@ impl SemanticIndex {
         self.fingerprint = Some(fingerprint);
     }
 
+    pub(crate) fn set_summary_budget_limited(&mut self, limited: bool) {
+        self.summary_budget_limited = limited;
+    }
+
+    fn limited_summary_budget(&self) -> Option<usize> {
+        self.fingerprint
+            .as_ref()
+            .map(|identity| identity.embed_text_caps.total_chars)
+            .filter(|budget| *budget < EmbedTextCaps::default().total_chars)
+    }
+
+    pub(crate) fn summaries_need_repair(&self) -> bool {
+        !self.summary_budget_limited && self.limited_summary_budget().is_some()
+    }
+
+    pub(crate) fn note_borrowed_summary_format(&self) {
+        if self.summaries_need_repair() {
+            slog_info!("borrowed semantic cache has legacy small-budget summaries; serving the owner's published artifact until owner repair");
+        }
+    }
+
+    fn persisted_summary_budget(&self) -> bool {
+        self.limited_summary_budget().is_some() && self.summary_budget_limited
+    }
+
+    fn stored_identity(&self) -> Option<String> {
+        self.fingerprint.as_ref().and_then(|fingerprint| {
+            serde_json::to_string(&StoredSemanticIdentity {
+                fingerprint: fingerprint.clone(),
+                file_summary_budget_limited: self.persisted_summary_budget(),
+            })
+            .ok()
+        })
+    }
+
+    /// A cached summary's new input is an exact prefix of its old input. Repair
+    /// that row directly: unchanged symbol vectors do not need parsing or calls
+    /// to the embedding backend. The marker is checked before examining rows.
+    pub(crate) fn repair_legacy_file_summaries<F>(
+        &mut self,
+        embed: &mut F,
+        max_batch_size: usize,
+    ) -> Result<bool, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+    {
+        if !self.summaries_need_repair() {
+            return Ok(false);
+        }
+        if self.shared_base.is_some() || !self.view_runs.is_empty() {
+            // Refresh workers fork the published cache into a frozen base.
+            // Materialize a private snapshot, never the published vector slots.
+            *self = Self::from_bytes(&self.to_bytes(), &self.project_root)?;
+        }
+        let budget = self
+            .limited_summary_budget()
+            .expect("legacy small-cap identity");
+        let candidates = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(position, entry)| {
+                if entry.chunk.kind != SymbolKind::FileSummary {
+                    return None;
+                }
+                let mut chunk = entry.chunk.clone();
+                chunk.embed_text = truncate_chars(&chunk.embed_text, budget);
+                (chunk.embed_text != entry.chunk.embed_text).then_some((position, chunk))
+            })
+            .collect::<Vec<_>>();
+        let mut replacements = Vec::new();
+        for batch in candidates.chunks(max_batch_size.max(1)) {
+            let texts = batch
+                .iter()
+                .map(|(_, chunk)| chunk.embed_text.clone())
+                .collect();
+            let rows = execute_build_embedding_batch(texts, embed)?;
+            for ((position, chunk), row) in batch.iter().zip(rows) {
+                let BuildEmbeddingRow::Embedded {
+                    embedded_text,
+                    vector,
+                } = row
+                else {
+                    return Err(
+                        "cached file-summary repair was rejected by the embedding backend"
+                            .to_string(),
+                    );
+                };
+                if vector.len() != self.dimension {
+                    return Err(format!(
+                        "file-summary repair dimension mismatch: expected {}, got {}",
+                        self.dimension,
+                        vector.len()
+                    ));
+                }
+                let mut chunk = chunk.clone();
+                chunk.embed_text = embedded_text;
+                replacements.push((*position, EmbeddingEntry::new(chunk, vector)));
+            }
+        }
+        // No entry or marker changes until every replacement has been validated.
+        for (position, entry) in replacements {
+            self.entries[position] = entry;
+        }
+        self.summary_budget_limited = true;
+        self.set_persistence(None);
+        self.mark_all_dirty();
+        slog_info!(
+            "semantic cache repaired {} legacy small-budget file summaries",
+            candidates.len()
+        );
+        Ok(true)
+    }
+
     fn scan_artifact_for_append(
         data_path: &Path,
         expected: SemanticPersistenceState,
         expected_fingerprint: &str,
         expected_dimension: usize,
+        expected_summary_budget: bool,
     ) -> Result<SemanticArtifactLayout, String> {
         let mut file = fs::File::open(data_path).map_err(|error| error.to_string())?;
         let identity = semantic_artifact_identity(data_path)
@@ -8183,8 +8324,22 @@ impl SemanticIndex {
         let mut fingerprint = vec![0_u8; fingerprint_len];
         file.read_exact(&mut fingerprint)
             .map_err(|error| error.to_string())?;
-        if fingerprint != expected_fingerprint.as_bytes() {
-            return Err("semantic artifact fingerprint changed".to_string());
+        if fingerprint != expected_fingerprint.as_bytes() || expected_summary_budget {
+            let mut stored: serde_json::Value = serde_json::from_slice(&fingerprint)
+                .map_err(|error| format!("invalid stored semantic identity: {error}"))?;
+            let fields = stored
+                .as_object_mut()
+                .ok_or("invalid stored semantic identity object")?;
+            let limited = match fields.remove("file_summary_budget_limited") {
+                None => false,
+                Some(serde_json::Value::Bool(limited)) => limited,
+                Some(_) => return Err("invalid stored summary-budget marker".to_string()),
+            };
+            let expected: serde_json::Value = serde_json::from_str(expected_fingerprint)
+                .map_err(|error| format!("invalid expected semantic identity: {error}"))?;
+            if stored != expected || limited != expected_summary_budget {
+                return Err("semantic artifact fingerprint changed".to_string());
+            }
         }
 
         file.seek(SeekFrom::Start(expected.base_bytes as u64))
@@ -8324,6 +8479,7 @@ impl SemanticIndex {
 
     fn persistence_identity_matches(&self, previous: &Self) -> bool {
         self.dimension == previous.dimension
+            && self.persisted_summary_budget() == previous.persisted_summary_budget()
             && self
                 .fingerprint
                 .as_ref()
@@ -8337,6 +8493,7 @@ impl SemanticIndex {
     fn delta_for_paths(&self, paths: &BTreeSet<PathBuf>) -> Self {
         let mut delta = Self::new(self.project_root.clone(), self.dimension);
         delta.fingerprint = self.fingerprint.clone();
+        delta.summary_budget_limited = self.summary_budget_limited;
         delta.skipped_rows = self.skipped_rows;
         delta.entries = self
             .live_entries()
@@ -8564,6 +8721,7 @@ impl SemanticIndex {
                     persistence,
                     &fingerprint,
                     self.dimension,
+                    self.persisted_summary_budget(),
                 ) {
                     Ok(layout) => Some(layout),
                     Err(error) => {
@@ -8813,9 +8971,15 @@ impl SemanticIndex {
             .as_ref()
             .map(SemanticIndexFingerprint::as_string)
             .unwrap_or_default();
-        Self::scan_artifact_for_append(&data_path, persistence, &fingerprint, self.dimension)
-            .ok()
-            .map(|layout| layout.bytes_read)
+        Self::scan_artifact_for_append(
+            &data_path,
+            persistence,
+            &fingerprint,
+            self.dimension,
+            self.persisted_summary_budget(),
+        )
+        .ok()
+        .map(|layout| layout.bytes_read)
     }
 
     #[doc(hidden)]
@@ -9013,6 +9177,8 @@ impl SemanticIndex {
                 index.dimension,
                 canonical_parents,
             )?;
+            // An older writer may append uncapped summaries to a repaired base.
+            index.summary_budget_limited &= delta.summary_budget_limited;
             let tombstones = tombstones.into_iter().collect::<Vec<_>>();
             index.remove_indexed_files(&tombstones);
             index.entries.extend(delta.entries);
@@ -9186,6 +9352,44 @@ impl SemanticIndex {
         }
     }
 
+    pub(crate) fn read_from_disk_with_summary_repair<F>(
+        storage_dir: &Path,
+        project_key: &str,
+        current_canonical_root: &Path,
+        is_worktree_bridge: bool,
+        expected_fingerprint: Option<&str>,
+        embed: &mut F,
+        max_batch_size: usize,
+    ) -> Result<Option<(Self, bool)>, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+    {
+        let Some(mut index) = Self::read_from_disk(
+            storage_dir,
+            project_key,
+            current_canonical_root,
+            is_worktree_bridge,
+            expected_fingerprint,
+        ) else {
+            return Ok(None);
+        };
+        let repaired = match index.repair_legacy_file_summaries(embed, max_batch_size) {
+            Ok(repaired) => repaired,
+            Err(error)
+                if embedding_failure_is_transient(&error)
+                    || crate::synapse_embed::LanePause::from_error(&error).is_some() =>
+            {
+                slog_warn!(
+                    "summary budget repair deferred; keeping saved semantic vectors: {}",
+                    strip_transient_embedding_marker(&error)
+                );
+                false
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Some((index, repaired)))
+    }
+
     /// Refuse, by name, a `semantic.bin` whose base snapshot version byte is
     /// above [`SEMANTIC_BASE_FORMAT_VERSION`] (or any snapshot while the
     /// storage root's reader floor is above it). Reads one byte. Delta segments
@@ -9252,6 +9456,9 @@ impl SemanticIndex {
             project_key,
             current_canonical_root,
         );
+        if let Some(index) = loaded.as_ref() {
+            index.note_borrowed_summary_format();
+        }
         let outcome = if loaded.is_some() { "ready" } else { "denied" };
         let build_id = crate::logging::in_flight_build_id(
             crate::logging::IndexPlane::Semantic,
@@ -9380,14 +9587,7 @@ impl SemanticIndex {
 
     fn write_to_writer<W: Write>(&self, writer: &mut W) -> io::Result<usize> {
         let mut bytes_written = 0usize;
-        let fingerprint = self.fingerprint.as_ref().and_then(|fingerprint| {
-            let encoded = fingerprint.as_string();
-            if encoded.is_empty() {
-                None
-            } else {
-                Some(encoded)
-            }
-        });
+        let fingerprint = self.stored_identity();
         let fp_bytes_ref = fingerprint.as_deref().map(str::as_bytes).unwrap_or(&[]);
         let mut file_metadata = self
             .indexed_paths()
@@ -9655,7 +9855,7 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V5
             || version == SEMANTIC_INDEX_VERSION_V6
             || version == SEMANTIC_INDEX_VERSION_V7;
-        let fingerprint = if has_fingerprint_field {
+        let (fingerprint, summary_budget_limited) = if has_fingerprint_field {
             let fingerprint_len = read_u32_stream(&mut reader)? as usize;
             if total_len
                 .is_some_and(|len| reader.bytes_read().saturating_add(fingerprint_len) > len)
@@ -9663,7 +9863,7 @@ impl SemanticIndex {
                 return Err("unexpected end of data reading fingerprint".to_string());
             }
             if fingerprint_len == 0 {
-                None
+                (None, false)
             } else {
                 let mut raw = vec![0u8; fingerprint_len];
                 read_exact_stream(
@@ -9672,13 +9872,12 @@ impl SemanticIndex {
                     "unexpected end of data reading fingerprint",
                 )?;
                 let raw = String::from_utf8_lossy(&raw).to_string();
-                Some(
-                    serde_json::from_str::<SemanticIndexFingerprint>(&raw)
-                        .map_err(|error| format!("invalid semantic fingerprint: {error}"))?,
-                )
+                let stored: StoredSemanticIdentity = serde_json::from_str(&raw)
+                    .map_err(|error| format!("invalid semantic fingerprint: {error}"))?;
+                (Some(stored.fingerprint), stored.file_summary_budget_limited)
             }
         } else {
-            None
+            (None, false)
         };
 
         // File mtimes
@@ -9878,6 +10077,7 @@ impl SemanticIndex {
                 file_hashes,
                 dimension,
                 fingerprint,
+                summary_budget_limited,
                 project_root: current_canonical_root.to_path_buf(),
                 deferred_files: HashSet::new(),
                 shared_base: None,
@@ -10146,7 +10346,7 @@ impl Default for EmbedTextCaps {
     }
 }
 
-fn truncate_chars(value: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
@@ -10799,7 +10999,7 @@ impl SemanticVectors {
         rel_path: &Path,
         producer: &ViewPayloadProducer<'_>,
     ) -> Result<Self, String> {
-        Self::decode_view_payload_inner(payload, rel_path, producer, None)
+        Self::decode_view_payload_inner(payload, rel_path, producer, None, false)
     }
 
     /// Decodes like [`Self::decode_view_payload`] and also returns the BLAKE3
@@ -10812,8 +11012,24 @@ impl SemanticVectors {
         producer: &ViewPayloadProducer<'_>,
     ) -> Result<(Self, Vec<blake3::Hash>), String> {
         let mut digests = Vec::new();
-        let run = Self::decode_view_payload_inner(payload, rel_path, producer, Some(&mut digests))?;
+        let run = Self::decode_view_payload_inner(
+            payload,
+            rel_path,
+            producer,
+            Some(&mut digests),
+            false,
+        )?;
         Ok((run, digests))
+    }
+
+    /// Retains exact persisted inputs only while repairing an old file run.
+    /// Ordinary loads keep their compact, text-free resident representation.
+    pub(crate) fn decode_view_payload_for_summary_repair(
+        payload: &[u8],
+        rel_path: &Path,
+        producer: &ViewPayloadProducer<'_>,
+    ) -> Result<Self, String> {
+        Self::decode_view_payload_inner(payload, rel_path, producer, None, true)
     }
 
     fn decode_view_payload_inner(
@@ -10821,6 +11037,7 @@ impl SemanticVectors {
         rel_path: &Path,
         producer: &ViewPayloadProducer<'_>,
         mut text_digests: Option<&mut Vec<blake3::Hash>>,
+        retain_embed_text: bool,
     ) -> Result<Self, String> {
         let mut cursor = 0usize;
         let version = take_view_slice(payload, &mut cursor, 1)?[0];
@@ -10883,7 +11100,13 @@ impl SemanticVectors {
                     start_line,
                     end_line,
                     exported,
-                    embed_text: String::new(),
+                    embed_text: if retain_embed_text {
+                        std::str::from_utf8(embed_text)
+                            .map_err(|error| format!("invalid cached embedding text: {error}"))?
+                            .to_string()
+                    } else {
+                        String::new()
+                    },
                     snippet,
                 },
                 vector,
@@ -10909,6 +11132,30 @@ impl SemanticVectors {
         self.entries
             .iter()
             .map(|entry| (entry.chunk.embed_text.as_str(), &entry.vector))
+    }
+
+    /// The file key already binds these rows to unchanged source bytes. Keep
+    /// their exact metadata and vector slots, replacing only oversized summary
+    /// inputs; equal text in two symbol rows need not have equal float bytes.
+    pub(crate) fn into_summary_repair_chunks(
+        self,
+        caps: EmbedTextCaps,
+    ) -> (Vec<SemanticChunk>, Vec<Option<Arc<[f32]>>>) {
+        let budget = caps.total_chars.min(EmbedTextCaps::default().total_chars);
+        self.entries
+            .into_iter()
+            .map(|entry| {
+                let mut chunk = entry.chunk;
+                if chunk.kind == SymbolKind::FileSummary {
+                    let limited = truncate_chars(&chunk.embed_text, budget);
+                    if limited != chunk.embed_text {
+                        chunk.embed_text = limited;
+                        return (chunk, None);
+                    }
+                }
+                (chunk, Some(entry.vector))
+            })
+            .unzip()
     }
 }
 
@@ -10989,6 +11236,7 @@ where
 }
 
 /// Assembles the same canonical file runs from validated fresh or reused rows.
+#[cfg(test)]
 pub(crate) fn embed_view_files_with_rows<F>(
     files: Vec<Vec<SemanticChunk>>,
     rows_fn: &mut F,
@@ -10996,6 +11244,20 @@ pub(crate) fn embed_view_files_with_rows<F>(
 ) -> Result<Vec<SemanticVectors>, String>
 where
     F: FnMut(Vec<String>) -> Result<Vec<BuildEmbeddingRow>, String>,
+{
+    embed_view_files_with_rows_at_offset(files, &mut |_, texts| rows_fn(texts), max_batch_size)
+}
+
+/// The offset is the checkpoint's flattened chunk cursor, including batches
+/// completed by an earlier attempt. Callers can align their reused-row slots
+/// without consuming the beginning of a resumed file twice.
+pub(crate) fn embed_view_files_with_rows_at_offset<F>(
+    files: Vec<Vec<SemanticChunk>>,
+    rows_fn: &mut F,
+    max_batch_size: usize,
+) -> Result<Vec<SemanticVectors>, String>
+where
+    F: FnMut(usize, Vec<String>) -> Result<Vec<BuildEmbeddingRow>, String>,
 {
     let resume = prepared_pause_job()
         .and_then(|job| job.borrow_mut().view.take())
@@ -11031,7 +11293,7 @@ where
             .iter()
             .map(|(_, chunk)| chunk.embed_text.clone())
             .collect();
-        let rows = match rows_fn(texts) {
+        let rows = match rows_fn(batch_start, texts) {
             Ok(rows) => rows,
             Err(error) => {
                 if let Some(job) = observe_lane_pause(&error) {
@@ -11111,6 +11373,7 @@ impl ViewSemanticBase {
                 dimension,
                 fingerprint: None,
                 deferred_files: HashSet::new(),
+                summary_budget_limited: false,
                 skipped_rows: 0,
                 persistence: Arc::new(Mutex::new(None)),
             }),
@@ -11241,6 +11504,9 @@ fn u8_to_symbol_kind(v: u8) -> Result<SymbolKind, String> {
         _ => return Err(format!("invalid semantic symbol kind: {v}")),
     })
 }
+
+#[cfg(test)]
+pub(crate) use tests::saved_pre_budget_summary_fixture;
 
 #[cfg(test)]
 mod tests {
@@ -18320,6 +18586,306 @@ public class Greeter {
         );
         assert_eq!(summary.embed_text.chars().count(), 1600);
         assert!(summary.embed_text.ends_with('x'));
+    }
+
+    pub(crate) fn saved_pre_budget_summary_fixture(
+        small: bool,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        SemanticIndexFingerprint,
+    ) {
+        saved_summary_fixture_for_tokens(small.then_some(20))
+    }
+
+    fn saved_summary_fixture_for_tokens(
+        max_input_tokens: Option<usize>,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        SemanticIndexFingerprint,
+    ) {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let file = root.join("summary.rs");
+        let source = "//! A long module description that deliberately exceeds the configured small embedding budget.\npub fn exported() {\n    42;\n}\n";
+        fs::write(&file, source).unwrap();
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Ollama,
+            max_input_tokens,
+            ..Default::default()
+        };
+        let fingerprint = SemanticIndexFingerprint::from_config(&config, 4);
+        let mut embedder = RecordingEmbedder::default();
+        let mut index = SemanticIndex::build_with_caps(
+            &root,
+            &[file.clone()],
+            &mut |texts| embedder.embed(texts),
+            16,
+            fingerprint.embed_text_caps,
+        )
+        .unwrap();
+        let old = build_file_summary_chunk(
+            &file,
+            &root,
+            source,
+            &["exported"],
+            &[Some("pub fn exported()")],
+        );
+        let summary = index
+            .entries
+            .iter_mut()
+            .find(|entry| entry.chunk.kind == SymbolKind::FileSummary)
+            .unwrap();
+        *summary = EmbeddingEntry::new(old.clone(), deterministic_test_vector(&old.embed_text));
+        index.set_fingerprint(fingerprint.clone());
+        assert!(index.write_to_disk(storage.path(), "summary-budget"));
+        let path = storage.path().join("semantic/summary-budget/semantic.bin");
+        let mut bytes = fs::read(&path).unwrap();
+        let len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+        let mut identity: serde_json::Value = serde_json::from_slice(&bytes[13..13 + len]).unwrap();
+        identity
+            .as_object_mut()
+            .unwrap()
+            .remove("file_summary_budget_limited");
+        let legacy_identity = serde_json::to_vec(&identity).unwrap();
+        bytes.splice(13..13 + len, legacy_identity.iter().copied());
+        bytes[9..13].copy_from_slice(&(legacy_identity.len() as u32).to_le_bytes());
+        fs::write(path, bytes).unwrap();
+        (project, storage, root, fingerprint)
+    }
+
+    #[test]
+    fn audit10_9_legacy_small_cap_load_repairs_only_summaries_and_borrowers_adopt() {
+        let (_project, storage, root, fingerprint) = saved_pre_budget_summary_fixture(true);
+        let before =
+            SemanticIndex::read_from_disk_borrow_tolerant(storage.path(), "summary-budget", &root)
+                .unwrap();
+        assert!(!before.search(&[1.0, 0.0, 0.0, 0.0], 100).is_empty());
+        assert!(before
+            .live_entries()
+            .any(|(_, entry)| entry.chunk.kind == SymbolKind::FileSummary
+                && entry.chunk.embed_text.chars().count() > 70));
+        let symbols = |index: &SemanticIndex| {
+            index
+                .live_entries()
+                .filter(|(_, entry)| entry.chunk.kind != SymbolKind::FileSummary)
+                .map(|(_, entry)| (entry.chunk.name.clone(), entry.vector.to_vec()))
+                .collect::<Vec<_>>()
+        };
+        let symbols_before = symbols(&before);
+        assert_eq!(
+            symbols_before.len(),
+            1,
+            "the fixture must contain a reusable symbol vector"
+        );
+        let mut embedder = RecordingEmbedder::default();
+        let (repaired, changed) = SemanticIndex::read_from_disk_with_summary_repair(
+            storage.path(),
+            "summary-budget",
+            &root,
+            false,
+            Some(&fingerprint.as_string()),
+            &mut |texts| embedder.embed(texts),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            changed,
+            "a legacy small-cap cache needs summary invalidation"
+        );
+        assert_eq!(embedder.total_embedded_texts(), 1);
+        assert!(embedder
+            .embedded_texts()
+            .iter()
+            .all(|text| text.contains("kind:file-summary") && text.chars().count() <= 70));
+        assert_eq!(symbols_before, symbols(&repaired));
+        assert!(repaired.write_to_disk(storage.path(), "summary-budget"));
+        let scanned = repaired
+            .append_scan_bytes_for_test(storage.path(), "summary-budget")
+            .unwrap();
+        assert!(
+            scanned
+                < fs::metadata(storage.path().join("semantic/summary-budget/semantic.bin"))
+                    .unwrap()
+                    .len() as usize
+        );
+        let after =
+            SemanticIndex::read_from_disk_borrow_tolerant(storage.path(), "summary-budget", &root)
+                .unwrap();
+        assert!(!after.search(&[1.0, 0.0, 0.0, 0.0], 100).is_empty());
+        assert!(after
+            .live_entries()
+            .filter(|(_, entry)| entry.chunk.kind == SymbolKind::FileSummary)
+            .all(|(_, entry)| entry.chunk.embed_text.chars().count() <= 70));
+        let mut again = RecordingEmbedder::default();
+        let (_, changed) = SemanticIndex::read_from_disk_with_summary_repair(
+            storage.path(),
+            "summary-budget",
+            &root,
+            false,
+            Some(&fingerprint.as_string()),
+            &mut |texts| again.embed(texts),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(again.total_embedded_texts(), 0);
+    }
+
+    #[test]
+    fn audit10_9_legacy_default_cap_load_does_not_rebuild_summaries() {
+        let (_project, storage, root, fingerprint) = saved_pre_budget_summary_fixture(false);
+        let path = storage.path().join("semantic/summary-budget/semantic.bin");
+        let before = fs::read(&path).unwrap();
+        let mut embedder = RecordingEmbedder::default();
+        let (_, changed) = SemanticIndex::read_from_disk_with_summary_repair(
+            storage.path(),
+            "summary-budget",
+            &root,
+            false,
+            Some(&fingerprint.as_string()),
+            &mut |texts| embedder.embed(texts),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(embedder.total_embedded_texts(), 0);
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn audit10_9_legacy_small_cap_fitting_summaries_persist_marker_without_embedding() {
+        let (_project, storage, root, identity) = saved_summary_fixture_for_tokens(Some(256));
+        let mut embedder = RecordingEmbedder::default();
+        let (index, changed) = SemanticIndex::read_from_disk_with_summary_repair(
+            storage.path(),
+            "summary-budget",
+            &root,
+            false,
+            Some(&identity.as_string()),
+            &mut |texts| embedder.embed(texts),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(changed);
+        assert_eq!(embedder.total_embedded_texts(), 0);
+        assert!(index.write_to_disk(storage.path(), "summary-budget"));
+        let (_, changed) = SemanticIndex::read_from_disk_with_summary_repair(
+            storage.path(),
+            "summary-budget",
+            &root,
+            false,
+            Some(&identity.as_string()),
+            &mut |_| panic!("metadata-only repair must persist"),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn audit10_9_older_writer_delta_reopens_summary_repair() {
+        let (_project, storage, root, identity) = saved_pre_budget_summary_fixture(true);
+        let old =
+            SemanticIndex::read_from_disk(storage.path(), "summary-budget", &root, false, None)
+                .unwrap();
+        let (fixed, _) = SemanticIndex::read_from_disk_with_summary_repair(
+            storage.path(),
+            "summary-budget",
+            &root,
+            false,
+            Some(&identity.as_string()),
+            &mut |texts: Vec<String>| {
+                Ok(texts
+                    .iter()
+                    .map(|text| deterministic_test_vector(text))
+                    .collect())
+            },
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(fixed.write_to_disk(storage.path(), "summary-budget"));
+        let paths = BTreeSet::from([root.join("summary.rs")]);
+        let frame = old.build_segment_frame(1, &paths).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(storage.path().join("semantic/summary-budget/semantic.bin"))
+            .unwrap()
+            .write_all(&frame)
+            .unwrap();
+        let mut embedder = RecordingEmbedder::default();
+        let (_, changed) = SemanticIndex::read_from_disk_with_summary_repair(
+            storage.path(),
+            "summary-budget",
+            &root,
+            false,
+            Some(&identity.as_string()),
+            &mut |texts| embedder.embed(texts),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            changed,
+            "an old writer's delta cannot retain the repaired marker"
+        );
+        assert_eq!(embedder.total_embedded_texts(), 1);
+    }
+
+    #[test]
+    fn audit10_9_summary_repair_failure_keeps_rows_and_marker_unchanged() {
+        let (_project, storage, root, _) = saved_pre_budget_summary_fixture(true);
+        let mut index =
+            SemanticIndex::read_from_disk(storage.path(), "summary-budget", &root, false, None)
+                .unwrap();
+        let file = root.join("second.rs");
+        let source = "//! Another description long enough to exceed the small embedding budget.\npub fn second() {}\n";
+        fs::write(&file, source).unwrap();
+        let chunk = build_file_summary_chunk(
+            &file,
+            &root,
+            source,
+            &["second"],
+            &[Some("pub fn second()")],
+        );
+        let vector = deterministic_test_vector(&chunk.embed_text);
+        index.entries.push(EmbeddingEntry::new(chunk, vector));
+        let metadata = fs::metadata(&file).unwrap();
+        index
+            .file_mtimes
+            .insert(file.clone(), metadata.modified().unwrap());
+        index.file_sizes.insert(file.clone(), metadata.len());
+        index
+            .file_hashes
+            .insert(file, blake3::hash(source.as_bytes()));
+        let before = index.to_bytes();
+        let mut calls = 0;
+        let result = index.repair_legacy_file_summaries(
+            &mut |texts: Vec<String>| {
+                calls += 1;
+                if calls == 2 {
+                    return Err("backend interrupted".to_string());
+                }
+                Ok(texts
+                    .iter()
+                    .map(|text| deterministic_test_vector(text))
+                    .collect())
+            },
+            1,
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
+        assert_eq!(index.to_bytes(), before);
     }
 
     #[test]
