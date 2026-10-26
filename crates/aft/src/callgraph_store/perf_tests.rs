@@ -599,6 +599,80 @@ fn callgraph_io_extraction_commits_by_bytes_not_chunk_files() {
     assert_eq!(*batches.lock().unwrap(), vec![300]);
 }
 
+#[test]
+fn callgraph_io_extraction_residency_is_bounded_inside_bulk_commits() {
+    fn heap_in_use() -> usize {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            // mallinfo2 is thread-safe and takes no pointer arguments.
+            unsafe { libc::mallinfo2().uordblks }
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        {
+            0
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let source = format!(
+        "function leaf() {{}}\nexport function run() {{\n{}}}\n",
+        "  leaf();\n".repeat(128)
+    );
+    let files = (0..300)
+        .map(|index| write(&root, &format!("f{index:03}.ts"), &source))
+        .collect::<Vec<_>>();
+    let store = CallGraphStore::open(dir.path().join("store"), root).unwrap();
+    let commit_samples = Arc::new(std::sync::Mutex::new((None, None)));
+    let observed_commits = Arc::clone(&commit_samples);
+    let project_key = store.project_key().to_owned();
+    set_cold_build_slice_observer(Some(Arc::new(move |stage, completed, total| {
+        if stage != "extraction" {
+            return;
+        }
+        let mut samples = observed_commits.lock().unwrap();
+        if completed == 0 && samples.0.is_none() {
+            samples.0 = Some(callgraph_write_metrics_for_project(&project_key).commits_60s);
+        } else if completed == total && samples.1.is_none() {
+            samples.1 = Some(callgraph_write_metrics_for_project(&project_key).commits_60s);
+        }
+    })));
+    let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&batches);
+    set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+        observed.lock().unwrap().push(paths.len());
+    })));
+    let residents = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&residents);
+    let heap_before = heap_in_use();
+    set_cold_build_resident_extract_observer(Some(Arc::new(move |count| {
+        observed.lock().unwrap().push((count, heap_in_use()));
+    })));
+    let result = store.cold_build_chunked(&files, 100);
+    set_cold_build_extract_observer(None);
+    set_cold_build_resident_extract_observer(None);
+    set_cold_build_slice_observer(None);
+    result.unwrap();
+
+    let residents = residents.lock().unwrap();
+    let peak_residents = residents.iter().map(|(count, _)| *count).max().unwrap();
+    let peak_heap = residents.iter().map(|(_, bytes)| *bytes).max().unwrap();
+    eprintln!(
+        "extraction residency: peak_extracts={peak_residents} heap_before={heap_before} \
+         peak_glibc_heap_in_use={peak_heap} heap_delta={}",
+        peak_heap.saturating_sub(heap_before)
+    );
+    // One database commit can cover all 300 files without keeping their parsed
+    // graphs in memory together.
+    assert_eq!(*batches.lock().unwrap(), vec![300]);
+    let (before, after) = *commit_samples.lock().unwrap();
+    assert_eq!(after.unwrap().checked_sub(before.unwrap()), Some(1));
+    assert!(
+        peak_residents <= 16,
+        "resident extracts {peak_residents} exceeded the 16-file cold-build residency bound"
+    );
+}
+
 fn tiny_file_fixture(root: &Path) -> Vec<PathBuf> {
     (0..COLD_BUILD_EXTRACT_MAX_FILES + 17)
         .map(|index| {
@@ -670,18 +744,18 @@ fn callgraph_io_tiny_file_cancellation_stops_after_one_capped_batch() {
 }
 
 #[test]
-fn callgraph_io_large_cache_is_build_only() {
+fn callgraph_io_build_cache_matches_bounded_reader_budget() {
     let conn = TrackedConnection::open_in_memory(SqliteStore::CallgraphColdGeneration).unwrap();
     configure_build_connection(&conn).unwrap();
     let cache: i64 = conn
         .pragma_query_value(None, "cache_size", |row| row.get(0))
         .unwrap();
-    assert_eq!(cache, -262144);
+    assert_eq!(cache, -8192);
     configure_connection(&conn).unwrap();
     let cache: i64 = conn
         .pragma_query_value(None, "cache_size", |row| row.get(0))
         .unwrap();
-    assert_eq!(cache, CALLGRAPH_SQLITE_CACHE_KIB);
+    assert_eq!(cache, -8192);
 }
 
 #[test]

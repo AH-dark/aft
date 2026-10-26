@@ -99,6 +99,9 @@ const COLD_BUILD_EXTRACT_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 // Source bytes alone do not bound retained extracts or cancellation latency for
 // empty/tiny files. Keep a finite ceiling while allowing bulk-load commits.
 const COLD_BUILD_EXTRACT_MAX_FILES: usize = 4096;
+// A bulk commit does not need every parsed graph resident at once. Bound
+// those graphs separately because call records can dwarf their source bytes.
+const COLD_BUILD_PARSE_MAX_FILES: usize = 16;
 // A 20k-reference resolver window kept peak RSS working-set shaped in the
 // committed 20k/40k corpus harness; 100k rows did not.
 const COLD_BUILD_RESOLVE_WINDOW: usize = 20_000;
@@ -1595,6 +1598,8 @@ mod write_amplification_tests {
 
 #[cfg(test)]
 type ColdBuildBeforePublishObserver = dyn Fn() + Send + Sync + 'static;
+#[cfg(test)]
+type ColdBuildResidentExtractObserver = dyn Fn(usize) + Send + Sync + 'static;
 // THREAD-LOCAL, not a process-global: tests install and clear the observer on
 // their own thread. Context workers explicitly inherit the initiating thread's
 // hooks so simulated disk availability and build observations cover background
@@ -1613,6 +1618,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     #[cfg(test)]
     static COLD_BUILD_EXTRACT_OBSERVER: std::cell::RefCell<Option<Arc<ColdBuildExtractObserver>>> =
+        const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static COLD_BUILD_RESIDENT_EXTRACT_OBSERVER: std::cell::RefCell<Option<Arc<ColdBuildResidentExtractObserver>>> =
         const { std::cell::RefCell::new(None) };
     static MIGRATION_AVAILABLE_DISK_OVERRIDE: std::cell::RefCell<Option<u64>> =
         const { std::cell::RefCell::new(None) };
@@ -1702,6 +1710,21 @@ fn notify_cold_build_extract_observer(paths: &[PathBuf]) {
 
 #[cfg(not(test))]
 fn notify_cold_build_extract_observer(_paths: &[PathBuf]) {}
+
+#[cfg(test)]
+fn set_cold_build_resident_extract_observer(
+    observer: Option<Arc<ColdBuildResidentExtractObserver>>,
+) {
+    COLD_BUILD_RESIDENT_EXTRACT_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[cfg(test)]
+fn notify_cold_build_resident_extract_observer(count: usize) {
+    let observer = COLD_BUILD_RESIDENT_EXTRACT_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer(count);
+    }
+}
 
 #[doc(hidden)]
 pub fn set_legacy_migration_available_disk_for_test(bytes: Option<u64>) {
@@ -7147,68 +7170,82 @@ impl CallGraphStore {
                     break;
                 };
                 after_path = batch.last_path;
-                let batch_files = batch.paths.len();
+                let admitted_files = batch.paths.len();
 
-                let mut needs_extract = Vec::with_capacity(batch_files);
+                let mut needs_extract = Vec::with_capacity(admitted_files);
                 for path in batch.paths {
                     if !staged_content_matches(&conn, &self.project_root, &path)? {
                         needs_extract.push(path);
                     }
                 }
                 if needs_extract.is_empty() {
-                    completed_files = completed_files.saturating_add(batch_files);
+                    completed_files = completed_files.saturating_add(admitted_files);
                     crate::cold_build_limiter::progress::completed(completed_files);
                     ensure_cold_build_current("extraction", completed_files, total_files)?;
                     continue;
                 }
 
                 notify_cold_build_extract_observer(&needs_extract);
-                let build =
-                    pool.build_extracts(&self.project_root, &needs_extract, &extraction_memo);
-                for extract in &build.extracts {
-                    retained_callers.retain(&extract.rel_path, &extract.data);
-                }
                 self.verify_writer_lease()?;
                 let total_changes_before = conn.total_changes();
                 let tx = conn.transaction()?;
                 let mut extracted_bytes = 0u64;
                 {
                     let mut inserts = ColdBuildInsertStatements::new(&tx)?;
-                    for extract in &build.extracts {
-                        delete_staged_file_rows(&tx, &extract.rel_path)?;
-                        insert_file_extract_prepared(&mut inserts, &workspace_root, extract)?;
-                        if resolution_config::resolution_config_kind(Path::new(&extract.rel_path))
-                            .is_some()
-                        {
-                            store_resolution_config_fields(
-                                &tx,
+                    // An outer batch can contain thousands of small sources, whose parsed
+                    // call records take far more memory than their source bytes. Insert and
+                    // drop each bounded parse chunk while keeping one transaction and
+                    // statement set for the whole outer batch.
+                    for paths in needs_extract.chunks(batch_files.min(COLD_BUILD_PARSE_MAX_FILES)) {
+                        let build =
+                            pool.build_extracts(&self.project_root, paths, &extraction_memo);
+                        for extract in &build.extracts {
+                            retained_callers.retain(&extract.rel_path, &extract.data);
+                        }
+                        #[cfg(test)]
+                        notify_cold_build_resident_extract_observer(
+                            build.extracts.len() + build.failures.len(),
+                        );
+                        self.verify_writer_lease()?;
+                        for extract in &build.extracts {
+                            delete_staged_file_rows(&tx, &extract.rel_path)?;
+                            insert_file_extract_prepared(&mut inserts, &workspace_root, extract)?;
+                            if resolution_config::resolution_config_kind(Path::new(
                                 &extract.rel_path,
-                                resolution_config::resolution_fields(
-                                    &self.project_root.join(&extract.rel_path),
-                                )
-                                .as_deref(),
+                            ))
+                            .is_some()
+                            {
+                                store_resolution_config_fields(
+                                    &tx,
+                                    &extract.rel_path,
+                                    resolution_config::resolution_fields(
+                                        &self.project_root.join(&extract.rel_path),
+                                    )
+                                    .as_deref(),
+                                )?;
+                            }
+                            for raw in &extract.raw_refs {
+                                insert_staged_ref_prepared(&mut inserts, raw)?;
+                            }
+                            extracted_bytes =
+                                extracted_bytes.saturating_add(extract.freshness.size);
+                        }
+                        for failure in &build.failures {
+                            insert_backend_state_prepared(
+                                &mut inserts.backend_state,
+                                &workspace_root,
+                                &failure.rel_path,
+                                failure
+                                    .freshness
+                                    .as_ref()
+                                    .map(|freshness| &freshness.content_hash),
+                                if failure.undecodable {
+                                    BACKEND_STATUS_UNDECODABLE
+                                } else {
+                                    "stale"
+                                },
                             )?;
                         }
-                        for raw in &extract.raw_refs {
-                            insert_staged_ref_prepared(&mut inserts, raw)?;
-                        }
-                        extracted_bytes = extracted_bytes.saturating_add(extract.freshness.size);
-                    }
-                    for failure in &build.failures {
-                        insert_backend_state_prepared(
-                            &mut inserts.backend_state,
-                            &workspace_root,
-                            &failure.rel_path,
-                            failure
-                                .freshness
-                                .as_ref()
-                                .map(|freshness| &freshness.content_hash),
-                            if failure.undecodable {
-                                BACKEND_STATUS_UNDECODABLE
-                            } else {
-                                "stale"
-                            },
-                        )?;
                     }
                 }
                 increment_staged_extracted_bytes(&tx, extracted_bytes)?;
@@ -7222,7 +7259,7 @@ impl CallGraphStore {
                 // unexplained. This is the connection's own db-status counter, so
                 // no second fd is ever opened on the live staging file set.
                 conn.sample_write_pages();
-                completed_files = completed_files.saturating_add(batch_files);
+                completed_files = completed_files.saturating_add(admitted_files);
                 crate::cold_build_limiter::progress::completed(completed_files);
                 ensure_cold_build_current("extraction", completed_files, total_files)?;
             }
@@ -11586,9 +11623,9 @@ fn configure_build_connection(conn: &TrackedConnection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.set_wal_autocheckpoint(crate::db::lifecycle::DEFAULT_WAL_AUTOCHECKPOINT_PAGES)?;
-    // Only staged builds get this cache. The two production cold-build slots
-    // bound its aggregate page-cache budget to 512 MiB.
-    conn.pragma_update(None, "cache_size", -262_144)?;
+    // Bulk commits and statement reuse keep the build fast without retaining
+    // a whole-database page cache beside the parser and resolver working sets.
+    conn.pragma_update(None, "cache_size", CALLGRAPH_SQLITE_CACHE_KIB)?;
     Ok(())
 }
 
